@@ -1154,7 +1154,7 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 		# Migration successful, remove backups
 		rm -f "${SERVER_AWG_CONF}.bak" "${AMNEZIAWG_DIR}/params.bak"
 		
-				# Rename existing client config files that don't have the new parameters
+		# Rename existing client config files that don't have the new parameters
 		# This prevents confusion when users try to use old configs after migration
 		# Only rename configs that are actually outdated (missing S3/S4 parameters)
 		echo -e "${GREEN}Marking old client configurations as outdated...${NC}"
