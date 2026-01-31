@@ -293,25 +293,25 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	
 	# H4 range (segment 3, with gap after H3's segment)
 	local H4_SEGMENT_START=$((MIN_VAL + (SEGMENT_SIZE + GAP) * 3))
-	local H4_START=$((H4_SEGMENT_START + $(shuf -i0-${RANDOM_OFFSET_MAX} -n1)))
 	
-	# Ensure H4 range maintains consistent size by shifting start if end would exceed MAX_VAL
-	# but never encroach into H3's segment (must stay >= H4_SEGMENT_START)
-	local H4_END=$((H4_START + RANGE_SIZE))
-	if (( H4_END > MAX_VAL )); then
-		# Shift start back to maintain RANGE_SIZE
-		local H4_SHIFTED_START=$((MAX_VAL - RANGE_SIZE))
-		
-		# Ensure we don't encroach into H3's segment
-		if (( H4_SHIFTED_START >= H4_SEGMENT_START )); then
-			H4_START=${H4_SHIFTED_START}
-			H4_END=$((H4_START + RANGE_SIZE))
-		else
-			# Cannot fit full RANGE_SIZE in H4's segment without overlap
-			# Keep original position but clamp end to MAX_VAL (reduced range size)
-			H4_END=${MAX_VAL}
-		fi
+	# Adjust H4 segment start if necessary so that a full RANGE_SIZE fits before MAX_VAL
+	# This prevents the edge case where randomization could produce a truncated range
+	local H4_SEGMENT_MAX_START=$((MAX_VAL - RANGE_SIZE))
+	if (( H4_SEGMENT_START > H4_SEGMENT_MAX_START )); then
+		H4_SEGMENT_START=${H4_SEGMENT_MAX_START}
 	fi
+	
+	# Recalculate RANDOM_OFFSET_MAX for H4 based on potentially adjusted segment
+	local H4_RANDOM_OFFSET_MAX=$((MAX_VAL - H4_SEGMENT_START - RANGE_SIZE))
+	if (( H4_RANDOM_OFFSET_MAX < 0 )); then
+		H4_RANDOM_OFFSET_MAX=0
+	fi
+	
+	local H4_START=$((H4_SEGMENT_START + $(shuf -i0-${H4_RANDOM_OFFSET_MAX} -n1)))
+	
+	# H4 range is guaranteed to fit within bounds due to pre-adjusted segment start
+	local H4_END=$((H4_START + RANGE_SIZE))
+	
 	RANDOM_AWG_H4_MIN=${H4_START}
 	RANDOM_AWG_H4_MAX=${H4_END}
 	
@@ -541,7 +541,7 @@ function installQuestions() {
 	# randomized sizes within a range. The protocol accepts Jmin <= Jmax.
 	readJminAndJmax
 	until [ "${SERVER_AWG_JMIN}" -le "${SERVER_AWG_JMAX}" ]; do
-		echo "AmneziaWG requires Jmin <= Jmax"
+		echo "Jmin must be less than or equal to Jmax"
 		readJminAndJmax
 	done
 
@@ -973,17 +973,17 @@ function loadParams() {
 		
 		if [[ -n "${CONF_S3}" ]] && [[ -n "${CONF_S4}" ]]; then
 			# Validate that loaded values are numeric, within valid range [15-150],
-			# and satisfy the constraint S3 + 56 != S4
+			# and satisfy the bidirectional constraint S3 + 56 != S4 and S4 + 56 != S3
 			if [[ "${CONF_S3}" =~ ^[0-9]+$ ]] && [[ "${CONF_S4}" =~ ^[0-9]+$ ]] && \
 			   (( CONF_S3 >= 15 )) && (( CONF_S3 <= 150 )) && \
 			   (( CONF_S4 >= 15 )) && (( CONF_S4 <= 150 )) && \
-			   (( CONF_S3 + 56 != CONF_S4 )); then
+			   (( CONF_S3 + 56 != CONF_S4 )) && (( CONF_S4 + 56 != CONF_S3 )); then
 				SERVER_AWG_S3="${CONF_S3}"
 				SERVER_AWG_S4="${CONF_S4}"
 			else
 				# Fallback: regenerate S3/S4 if config values are invalid
 				generateS3AndS4
-				while (( RANDOM_AWG_S3 + 56 == RANDOM_AWG_S4 )); do
+				while (( RANDOM_AWG_S3 + 56 == RANDOM_AWG_S4 )) || (( RANDOM_AWG_S4 + 56 == RANDOM_AWG_S3 )); do
 					generateS3AndS4
 				done
 				SERVER_AWG_S3=${RANDOM_AWG_S3}
@@ -991,10 +991,10 @@ function loadParams() {
 			fi
 		else
 			# Generate random S3/S4 values within the valid range [15-150]
-			# ensuring they satisfy the constraint S3 + 56 != S4
+			# ensuring they satisfy the bidirectional constraint S3 + 56 != S4 and S4 + 56 != S3
 			# (56 is the WireGuard handshake initiation message size)
 			generateS3AndS4
-			while (( RANDOM_AWG_S3 + 56 == RANDOM_AWG_S4 )); do
+			while (( RANDOM_AWG_S3 + 56 == RANDOM_AWG_S4 )) || (( RANDOM_AWG_S4 + 56 == RANDOM_AWG_S3 )); do
 				generateS3AndS4
 			done
 			SERVER_AWG_S3=${RANDOM_AWG_S3}
