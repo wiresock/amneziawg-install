@@ -148,8 +148,16 @@ function parseRange() {
 	local MAX_VAR_NAME=$3
 	
 	if [[ ${INPUT} =~ ^([0-9]+)-([0-9]+)$ ]]; then
-		printf -v "$MIN_VAR_NAME" '%s' "${BASH_REMATCH[1]}"
-		printf -v "$MAX_VAR_NAME" '%s' "${BASH_REMATCH[2]}"
+		local MIN=${BASH_REMATCH[1]}
+		local MAX=${BASH_REMATCH[2]}
+		
+		# Validate that min <= max
+		if (( MIN > MAX )); then
+			return 1
+		fi
+		
+		printf -v "$MIN_VAR_NAME" '%s' "${MIN}"
+		printf -v "$MAX_VAR_NAME" '%s' "${MAX}"
 	elif [[ ${INPUT} =~ ^[0-9]+$ ]]; then
 		printf -v "$MIN_VAR_NAME" '%s' "${INPUT}"
 		printf -v "$MAX_VAR_NAME" '%s' "${INPUT}"
@@ -199,7 +207,7 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	local MAX_VAL=2147483647
 	local GAP=1  # Minimum gap between segments to prevent boundary overlap
 	
-	# Calculate available range, rounding down to multiple of 4 to prevent integer division overflow
+	# Calculate available range, rounding down to a multiple of 4 to ensure even distribution among 4 segments
 	local RAW_AVAILABLE=$((MAX_VAL - MIN_VAL - GAP * 3))
 	local AVAILABLE_RANGE=$((RAW_AVAILABLE - RAW_AVAILABLE % 4))
 	
@@ -208,7 +216,9 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	
 	# Validate that segment size is larger than range size
 	if (( SEGMENT_SIZE <= RANGE_SIZE )); then
-		# Fall back to fixed non-overlapping ranges (consistent GAP usage)
+		# Fallback to deterministic fixed non-overlapping ranges when the calculated segment
+		# size is too small to randomize positions for all four ranges. This ensures each
+		# range has size RANGE_SIZE and is separated by at least GAP units.
 		RANDOM_AWG_H1_MIN=5
 		RANDOM_AWG_H1_MAX=$((5 + RANGE_SIZE))
 		RANDOM_AWG_H2_MIN=$((RANDOM_AWG_H1_MAX + GAP))
@@ -240,7 +250,12 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	# H4 range (segment 3, with gap after H3's segment)
 	local H4_START=$((MIN_VAL + (SEGMENT_SIZE + GAP) * 3 + $(shuf -i0-${RANDOM_OFFSET_MAX} -n1)))
 	RANDOM_AWG_H4_MIN=${H4_START}
-	RANDOM_AWG_H4_MAX=$((H4_START + RANGE_SIZE))
+	# Ensure H4 end does not exceed MAX_VAL
+	local H4_END=$((H4_START + RANGE_SIZE))
+	if (( H4_END > MAX_VAL )); then
+		H4_END=${MAX_VAL}
+	fi
+	RANDOM_AWG_H4_MAX=${H4_END}
 	
 	# Clamp and resolve overlaps using helper function
 	clampAndResolveOverlap "RANDOM_AWG_H1" ${MIN_VAL} ${MAX_VAL} ${RANGE_SIZE} ${GAP} "" ""
@@ -248,19 +263,24 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	clampAndResolveOverlap "RANDOM_AWG_H3" ${MIN_VAL} ${MAX_VAL} ${RANGE_SIZE} ${GAP} ${RANDOM_AWG_H2_MIN} ${RANDOM_AWG_H2_MAX}
 	clampAndResolveOverlap "RANDOM_AWG_H4" ${MIN_VAL} ${MAX_VAL} ${RANGE_SIZE} ${GAP} ${RANDOM_AWG_H3_MIN} ${RANDOM_AWG_H3_MAX}
 	
-	# Final validation: ensure all four ranges are non-overlapping
+	# Final validation: ensure all four ranges are non-overlapping using independent checks
 	local HAS_OVERLAP=0
 	if (( RANDOM_AWG_H1_MIN <= RANDOM_AWG_H2_MAX && RANDOM_AWG_H1_MAX >= RANDOM_AWG_H2_MIN )); then
 		HAS_OVERLAP=1
-	elif (( RANDOM_AWG_H1_MIN <= RANDOM_AWG_H3_MAX && RANDOM_AWG_H1_MAX >= RANDOM_AWG_H3_MIN )); then
+	fi
+	if (( RANDOM_AWG_H1_MIN <= RANDOM_AWG_H3_MAX && RANDOM_AWG_H1_MAX >= RANDOM_AWG_H3_MIN )); then
 		HAS_OVERLAP=1
-	elif (( RANDOM_AWG_H1_MIN <= RANDOM_AWG_H4_MAX && RANDOM_AWG_H1_MAX >= RANDOM_AWG_H4_MIN )); then
+	fi
+	if (( RANDOM_AWG_H1_MIN <= RANDOM_AWG_H4_MAX && RANDOM_AWG_H1_MAX >= RANDOM_AWG_H4_MIN )); then
 		HAS_OVERLAP=1
-	elif (( RANDOM_AWG_H2_MIN <= RANDOM_AWG_H3_MAX && RANDOM_AWG_H2_MAX >= RANDOM_AWG_H3_MIN )); then
+	fi
+	if (( RANDOM_AWG_H2_MIN <= RANDOM_AWG_H3_MAX && RANDOM_AWG_H2_MAX >= RANDOM_AWG_H3_MIN )); then
 		HAS_OVERLAP=1
-	elif (( RANDOM_AWG_H2_MIN <= RANDOM_AWG_H4_MAX && RANDOM_AWG_H2_MAX >= RANDOM_AWG_H4_MIN )); then
+	fi
+	if (( RANDOM_AWG_H2_MIN <= RANDOM_AWG_H4_MAX && RANDOM_AWG_H2_MAX >= RANDOM_AWG_H4_MIN )); then
 		HAS_OVERLAP=1
-	elif (( RANDOM_AWG_H3_MIN <= RANDOM_AWG_H4_MAX && RANDOM_AWG_H3_MAX >= RANDOM_AWG_H4_MIN )); then
+	fi
+	if (( RANDOM_AWG_H3_MIN <= RANDOM_AWG_H4_MAX && RANDOM_AWG_H3_MAX >= RANDOM_AWG_H4_MIN )); then
 		HAS_OVERLAP=1
 	fi
 	
@@ -291,6 +311,12 @@ function clampAndResolveOverlap() {
 	local MAX_VAR="${VAR_PREFIX}_MAX"
 	local CURR_MIN=${!MIN_VAR}
 	local CURR_MAX=${!MAX_VAR}
+	
+	# Validate RANGE_SIZE doesn't exceed available space
+	local AVAILABLE_SPACE=$((MAX_VAL - MIN_VAL))
+	if (( RANGE_SIZE > AVAILABLE_SPACE )); then
+		RANGE_SIZE=${AVAILABLE_SPACE}
+	fi
 	
 	# Clamp to minimum bound
 	if (( CURR_MIN < MIN_VAL )); then
@@ -400,6 +426,18 @@ function readH1AndH2AndH3AndH4Ranges() {
 	SERVER_AWG_H4="${SERVER_AWG_H4_MIN}-${SERVER_AWG_H4_MAX}"
 }
 
+# Helper function to convert a single H value to range format if needed
+function convertHToRangeIfNeeded() {
+	local VAR_NAME=$1
+	local VALUE=${!VAR_NAME}
+	
+	if [[ -n "${VALUE}" ]] && [[ ! "${VALUE}" =~ ^[0-9]+-[0-9]+$ ]]; then
+		printf -v "$VAR_NAME" '%s' "${VALUE}-${VALUE}"
+		return 0  # Conversion was needed
+	fi
+	return 1  # No conversion needed
+}
+
 function installQuestions() {
 	echo "AmneziaWG server installer (https://github.com/varckin/amneziawg-install)"
 	echo ""
@@ -481,7 +519,7 @@ function installQuestions() {
 	done
 	readS1AndS2
 	while (( ${SERVER_AWG_S1} + 56 == ${SERVER_AWG_S2} )); do
-		echo "AmneziaWG requires S1 + 56 must not equal S2"
+		echo "AmneziaWG requires S1 + 56 != S2"
 		readS1AndS2
 	done
 
@@ -494,7 +532,7 @@ function installQuestions() {
 	done
 	readS3AndS4
 	while (( ${SERVER_AWG_S3} + 56 == ${SERVER_AWG_S4} )); do
-		echo "AmneziaWG requires S3 + 56 must not equal S4"
+		echo "AmneziaWG requires S3 + 56 != S4"
 		readS3AndS4
 	done
 
@@ -884,29 +922,26 @@ function loadParams() {
 		NEEDS_UPDATE=1
 	fi
 	
-	# Migration for pre-2.0 installations: check if H1-H4 are single values instead of ranges
-	if [[ -n "${SERVER_AWG_H1}" ]] && [[ ! "${SERVER_AWG_H1}" =~ ^[0-9]+-[0-9]+$ ]]; then
+	# Migration for pre-2.0 installations: check each H1-H4 independently for conversion
+	local H_CONVERTED=0
+	if convertHToRangeIfNeeded "SERVER_AWG_H1"; then H_CONVERTED=1; fi
+	if convertHToRangeIfNeeded "SERVER_AWG_H2"; then H_CONVERTED=1; fi
+	if convertHToRangeIfNeeded "SERVER_AWG_H3"; then H_CONVERTED=1; fi
+	if convertHToRangeIfNeeded "SERVER_AWG_H4"; then H_CONVERTED=1; fi
+	
+	if [[ ${H_CONVERTED} == 1 ]]; then
 		echo -e "${ORANGE}WARNING: Your installation uses legacy single-value H1-H4 parameters.${NC}"
 		echo -e "${ORANGE}Converting to range format for AmneziaWG 2.0 compatibility.${NC}"
 		echo ""
-		
-		# Convert single values to ranges (value-value), only if they are non-empty
-		SERVER_AWG_H1="${SERVER_AWG_H1}-${SERVER_AWG_H1}"
-		if [[ -n "${SERVER_AWG_H2}" ]]; then
-			SERVER_AWG_H2="${SERVER_AWG_H2}-${SERVER_AWG_H2}"
-		fi
-		if [[ -n "${SERVER_AWG_H3}" ]]; then
-			SERVER_AWG_H3="${SERVER_AWG_H3}-${SERVER_AWG_H3}"
-		fi
-		if [[ -n "${SERVER_AWG_H4}" ]]; then
-			SERVER_AWG_H4="${SERVER_AWG_H4}-${SERVER_AWG_H4}"
-		fi
 		NEEDS_UPDATE=1
 	fi
 	
 	# Persist migrated values to params file and update server config
 	if [[ ${NEEDS_UPDATE} == 1 ]]; then
 		echo -e "${GREEN}Updating params file with migrated values...${NC}"
+		
+		# Create backup of configuration file before migration
+		cp "${SERVER_AWG_CONF}" "${SERVER_AWG_CONF}.bak"
 		
 		if ! echo "SERVER_PUB_IP=${SERVER_PUB_IP}
 SERVER_PUB_NIC=${SERVER_PUB_NIC}
@@ -940,12 +975,14 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 		# Insert or update S3 (try update first, then insert after S2)
 		if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
 			if ! sed -i "s/^S3 = .*/S3 = ${SERVER_AWG_S3}/" "${SERVER_AWG_CONF}"; then
-				echo -e "${RED}Failed to update S3 in server configuration file.${NC}"
+				echo -e "${RED}Failed to update S3 in server configuration file. Restoring backup.${NC}"
+				cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
 				exit 1
 			fi
 		else
 			if ! sed -i "/^S2 = .*/a S3 = ${SERVER_AWG_S3}" "${SERVER_AWG_CONF}"; then
-				echo -e "${RED}Failed to insert S3 into server configuration file.${NC}"
+				echo -e "${RED}Failed to insert S3 into server configuration file. Restoring backup.${NC}"
+				cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
 				exit 1
 			fi
 		fi
@@ -953,17 +990,20 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 		# Insert or update S4 (try update first, then insert after S3, fallback to after S2)
 		if grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
 			if ! sed -i "s/^S4 = .*/S4 = ${SERVER_AWG_S4}/" "${SERVER_AWG_CONF}"; then
-				echo -e "${RED}Failed to update S4 in server configuration file.${NC}"
+				echo -e "${RED}Failed to update S4 in server configuration file. Restoring backup.${NC}"
+				cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
 				exit 1
 			fi
 		elif grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
 			if ! sed -i "/^S3 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
-				echo -e "${RED}Failed to insert S4 after S3 in server configuration file.${NC}"
+				echo -e "${RED}Failed to insert S4 after S3 in server configuration file. Restoring backup.${NC}"
+				cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
 				exit 1
 			fi
 		else
 			if ! sed -i "/^S2 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
-				echo -e "${RED}Failed to insert S4 after S2 in server configuration file.${NC}"
+				echo -e "${RED}Failed to insert S4 after S2 in server configuration file. Restoring backup.${NC}"
+				cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
 				exit 1
 			fi
 		fi
@@ -973,9 +1013,13 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 		   ! sed -i "s/^H2 = .*/H2 = ${SERVER_AWG_H2}/" "${SERVER_AWG_CONF}" || \
 		   ! sed -i "s/^H3 = .*/H3 = ${SERVER_AWG_H3}/" "${SERVER_AWG_CONF}" || \
 		   ! sed -i "s/^H4 = .*/H4 = ${SERVER_AWG_H4}/" "${SERVER_AWG_CONF}"; then
-			echo -e "${RED}Failed to update H1-H4 in server configuration file.${NC}"
+			echo -e "${RED}Failed to update H1-H4 in server configuration file. Restoring backup.${NC}"
+			cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
 			exit 1
 		fi
+		
+		# Migration successful, remove backup
+		rm -f "${SERVER_AWG_CONF}.bak"
 		
 		# Reload AmneziaWG configuration
 		if systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
