@@ -694,6 +694,7 @@ function newClient() {
 	local IPV4_EXISTS=""
 	local IPV6_EXISTS=""
 	local DOT_IP=""
+	local DOT_EXISTS=""
 	
 	# If SERVER_PUB_IP is IPv6, add brackets if missing
 	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
