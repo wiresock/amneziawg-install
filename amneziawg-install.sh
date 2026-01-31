@@ -317,69 +317,6 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	fi
 }
 
-# Helper function to clamp a range and resolve overlap with previous range
-function clampAndResolveOverlap() {
-	local VAR_PREFIX=$1
-	local MIN_VAL=$2
-	local MAX_VAL=$3
-	local RANGE_SIZE=$4
-	local GAP=$5
-	local PREV_MIN=$6
-	local PREV_MAX=$7
-	
-	local MIN_VAR="${VAR_PREFIX}_MIN"
-	local MAX_VAR="${VAR_PREFIX}_MAX"
-	local CURR_MIN=${!MIN_VAR}
-	local CURR_MAX=${!MAX_VAR}
-	
-	# Validate RANGE_SIZE doesn't exceed available space
-	local AVAILABLE_SPACE=$((MAX_VAL - MIN_VAL))
-	if (( RANGE_SIZE > AVAILABLE_SPACE )); then
-		RANGE_SIZE=${AVAILABLE_SPACE}
-	fi
-	
-	# Clamp to minimum bound
-	if (( CURR_MIN < MIN_VAL )); then
-		CURR_MIN=${MIN_VAL}
-		CURR_MAX=$((CURR_MIN + RANGE_SIZE))
-	fi
-	
-	# Clamp to maximum bound
-	if (( CURR_MAX > MAX_VAL )); then
-		CURR_MAX=${MAX_VAL}
-		CURR_MIN=$((CURR_MAX - RANGE_SIZE))
-		if (( CURR_MIN < MIN_VAL )); then
-			CURR_MIN=${MIN_VAL}
-		fi
-	fi
-	
-	# Resolve overlap with previous range if provided
-	if [[ -n "${PREV_MIN}" ]] && [[ -n "${PREV_MAX}" ]]; then
-		if (( CURR_MIN <= PREV_MAX && CURR_MAX >= PREV_MIN )); then
-			local NEW_MIN=$((PREV_MAX + GAP))
-			local NEW_MAX=$((NEW_MIN + RANGE_SIZE))
-			
-			if (( NEW_MAX <= MAX_VAL )); then
-				CURR_MIN=${NEW_MIN}
-				CURR_MAX=${NEW_MAX}
-			else
-				# Try placing before previous range
-				NEW_MAX=$((PREV_MIN - GAP))
-				NEW_MIN=$((NEW_MAX - RANGE_SIZE))
-				
-				if (( NEW_MIN >= MIN_VAL )); then
-					CURR_MIN=${NEW_MIN}
-					CURR_MAX=${NEW_MAX}
-				fi
-			fi
-		fi
-	fi
-	
-	# Update global variables
-	printf -v "$MIN_VAR" '%s' "${CURR_MIN}"
-	printf -v "$MAX_VAR" '%s' "${CURR_MAX}"
-}
-
 function readHRange() {
 	local H_NAME=$1
 	local DEFAULT_MIN=$2
@@ -987,14 +924,30 @@ function loadParams() {
 	
 	# Persist migrated values to params file and update server config
 	if [[ ${NEEDS_UPDATE} == 1 ]]; then
-		echo -e "${GREEN}Updating params file with migrated values...${NC}"
+		echo -e "${GREEN}Updating configuration with migrated values...${NC}"
 		
-		# Create backup of configuration file before migration
-		# Note: If the script is interrupted, the .bak file will remain for manual recovery
+		# Create backups of both files before migration
+		# Note: If the script is interrupted, the .bak files will remain for manual recovery
 		if ! cp "${SERVER_AWG_CONF}" "${SERVER_AWG_CONF}.bak"; then
 			echo -e "${RED}ERROR: Failed to create backup of configuration file.${NC}"
 			exit 1
 		fi
+		
+		if ! cp "${AMNEZIAWG_DIR}/params" "${AMNEZIAWG_DIR}/params.bak"; then
+			echo -e "${RED}ERROR: Failed to create backup of params file.${NC}"
+			rm -f "${SERVER_AWG_CONF}.bak"
+			exit 1
+		fi
+		
+		# Helper function to restore backups and exit on failure
+		restoreBackupsAndExit() {
+			local ERROR_MSG=$1
+			echo -e "${RED}${ERROR_MSG} Restoring backups.${NC}"
+			cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
+			cp "${AMNEZIAWG_DIR}/params.bak" "${AMNEZIAWG_DIR}/params"
+			rm -f "${SERVER_AWG_CONF}.bak" "${AMNEZIAWG_DIR}/params.bak"
+			exit 1
+		}
 		
 		if ! echo "SERVER_PUB_IP=${SERVER_PUB_IP}
 SERVER_PUB_NIC=${SERVER_PUB_NIC}
@@ -1018,8 +971,7 @@ SERVER_AWG_H1=${SERVER_AWG_H1}
 SERVER_AWG_H2=${SERVER_AWG_H2}
 SERVER_AWG_H3=${SERVER_AWG_H3}
 SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
-			echo -e "${RED}ERROR: Failed to write params file.${NC}"
-			exit 1
+			restoreBackupsAndExit "ERROR: Failed to write params file."
 		fi
 		
 		# Update server configuration file with migrated values
@@ -1028,49 +980,39 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 		# Insert or update S3 (try update first, then insert after S2)
 		if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
 			if ! sed -i "s/^S3 = .*/S3 = ${SERVER_AWG_S3}/" "${SERVER_AWG_CONF}"; then
-				echo -e "${RED}Failed to update S3 in server configuration file. Restoring backup.${NC}"
-				cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
-				exit 1
+				restoreBackupsAndExit "Failed to update S3 in server configuration file."
 			fi
 		else
 			if ! sed -i "/^S2 = .*/a S3 = ${SERVER_AWG_S3}" "${SERVER_AWG_CONF}"; then
-				echo -e "${RED}Failed to insert S3 into server configuration file. Restoring backup.${NC}"
-				cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
-				exit 1
+				restoreBackupsAndExit "Failed to insert S3 into server configuration file."
 			fi
 		fi
 		
 		# Insert or update S4 (try update first, then insert after S3, fallback to after S2)
 		if grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
 			if ! sed -i "s/^S4 = .*/S4 = ${SERVER_AWG_S4}/" "${SERVER_AWG_CONF}"; then
-				echo -e "${RED}Failed to update S4 in server configuration file. Restoring backup.${NC}"
-				cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
-				exit 1
+				restoreBackupsAndExit "Failed to update S4 in server configuration file."
 			fi
 		elif grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
 			if ! sed -i "/^S3 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
-				echo -e "${RED}Failed to insert S4 after S3 in server configuration file. Restoring backup.${NC}"
-				cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
-				exit 1
+				restoreBackupsAndExit "Failed to insert S4 after S3 in server configuration file."
 			fi
 		else
 			if ! sed -i "/^S2 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
-				echo -e "${RED}Failed to insert S4 after S2 in server configuration file. Restoring backup.${NC}"
-				cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
-				exit 1
+				restoreBackupsAndExit "Failed to insert S4 after S2 in server configuration file."
 			fi
 		fi
 		
 		# Update H1-H4 values (verify existence first, insert if missing)
-		for H_PARAM in H1 H2 H3 H4; do
+		# Process in reverse order (H4, H3, H2, H1) so that when inserting after
+		# the same anchor point, the final order is correct (H1, H2, H3, H4)
+		for H_PARAM in H4 H3 H2 H1; do
 			local H_VAR="SERVER_AWG_${H_PARAM}"
 			local H_VALUE="${!H_VAR}"
 			
 			if grep -q "^${H_PARAM} = " "${SERVER_AWG_CONF}"; then
 				if ! sed -i "s/^${H_PARAM} = .*/${H_PARAM} = ${H_VALUE}/" "${SERVER_AWG_CONF}"; then
-					echo -e "${RED}Failed to update ${H_PARAM} in server configuration file. Restoring backup.${NC}"
-					cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
-					exit 1
+					restoreBackupsAndExit "Failed to update ${H_PARAM} in server configuration file."
 				fi
 			else
 				# Parameter doesn't exist, insert after S4 (or S3, S2 as fallback)
@@ -1084,33 +1026,30 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 					fi
 				done
 				if [[ ${INSERTED} == 0 ]]; then
-					echo -e "${RED}Failed to insert ${H_PARAM} into server configuration file. Restoring backup.${NC}"
-					cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}"
-					exit 1
+					restoreBackupsAndExit "Failed to insert ${H_PARAM} into server configuration file."
 				fi
 			fi
 		done
 		
-		# Migration successful, remove backup
-		# Note: If the script was interrupted before reaching this point, the .bak file
+		# Migration successful, remove backups
+		# Note: If the script was interrupted before reaching this point, the .bak files
 		# will remain in ${AMNEZIAWG_DIR} for manual recovery. After verifying a successful
 		# migration, administrators can safely remove any leftover *.bak files.
-		rm -f "${SERVER_AWG_CONF}.bak"
+		rm -f "${SERVER_AWG_CONF}.bak" "${AMNEZIAWG_DIR}/params.bak"
 		
 		# Reload AmneziaWG configuration
 		if systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
 			echo -e "${GREEN}Reloading AmneziaWG configuration...${NC}"
 			
 			# Validate configuration before reloading to prevent VPN disconnection
-			# Note: If validation fails, the backup has already been removed at this point,
-			# but the config file should still be valid since all sed operations succeeded.
-			# Users should have backup access to the server in case VPN connection is lost.
 			if awg-quick strip "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
 				awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
 			else
-				echo -e "${ORANGE}WARNING: Configuration validation failed. Skipping reload.${NC}"
-				echo -e "${ORANGE}The VPN will continue running with the old configuration.${NC}"
-				echo -e "${ORANGE}Please review ${SERVER_AWG_CONF} manually and restart the service.${NC}"
+				echo -e "${ORANGE}WARNING: Configuration validation failed. Skipping live reload.${NC}"
+				echo -e "${ORANGE}The configuration file has been updated successfully, but the running${NC}"
+				echo -e "${ORANGE}VPN service could not be reloaded and is still using the previous settings.${NC}"
+				echo -e "${ORANGE}To apply the new configuration, manually restart the service:${NC}"
+				echo -e "${ORANGE}  systemctl restart awg-quick@${SERVER_AWG_NIC}${NC}"
 			fi
 		fi
 		
