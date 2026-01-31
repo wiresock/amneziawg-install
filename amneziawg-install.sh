@@ -10,6 +10,15 @@ NC='\033[0m'
 
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 
+# Safely quote a value for inclusion in a sourced params file
+# Escapes single quotes and wraps in single quotes to prevent shell injection
+function safeQuoteParam() {
+	local VALUE=$1
+	# Replace single quotes with '\'' (end quote, escaped quote, start quote)
+	local ESCAPED="${VALUE//\'/\'\\\'\'}"
+	echo "'${ESCAPED}'"
+}
+
 function isRoot() {
 	if [ "${EUID}" -ne 0 ]; then
 		echo "You need to run this script as root"
@@ -617,17 +626,18 @@ function installAmneziaWG() {
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | awg pubkey)
 
 	# Save WireGuard settings
-	echo "SERVER_PUB_IP=${SERVER_PUB_IP}
-SERVER_PUB_NIC=${SERVER_PUB_NIC}
-SERVER_AWG_NIC=${SERVER_AWG_NIC}
-SERVER_AWG_IPV4=${SERVER_AWG_IPV4}
-SERVER_AWG_IPV6=${SERVER_AWG_IPV6}
+	# Use safe quoting for string values to prevent shell injection when sourced
+	echo "SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
+SERVER_PUB_NIC=$(safeQuoteParam "${SERVER_PUB_NIC}")
+SERVER_AWG_NIC=$(safeQuoteParam "${SERVER_AWG_NIC}")
+SERVER_AWG_IPV4=$(safeQuoteParam "${SERVER_AWG_IPV4}")
+SERVER_AWG_IPV6=$(safeQuoteParam "${SERVER_AWG_IPV6}")
 SERVER_PORT=${SERVER_PORT}
-SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
-SERVER_PUB_KEY=${SERVER_PUB_KEY}
+SERVER_PRIV_KEY=$(safeQuoteParam "${SERVER_PRIV_KEY}")
+SERVER_PUB_KEY=$(safeQuoteParam "${SERVER_PUB_KEY}")
 CLIENT_DNS_1=${CLIENT_DNS_1}
 CLIENT_DNS_2=${CLIENT_DNS_2}
-ALLOWED_IPS=${ALLOWED_IPS}
+ALLOWED_IPS=$(safeQuoteParam "${ALLOWED_IPS}")
 SERVER_AWG_JC=${SERVER_AWG_JC}
 SERVER_AWG_JMIN=${SERVER_AWG_JMIN}
 SERVER_AWG_JMAX=${SERVER_AWG_JMAX}
@@ -635,10 +645,10 @@ SERVER_AWG_S1=${SERVER_AWG_S1}
 SERVER_AWG_S2=${SERVER_AWG_S2}
 SERVER_AWG_S3=${SERVER_AWG_S3}
 SERVER_AWG_S4=${SERVER_AWG_S4}
-SERVER_AWG_H1=${SERVER_AWG_H1}
-SERVER_AWG_H2=${SERVER_AWG_H2}
-SERVER_AWG_H3=${SERVER_AWG_H3}
-SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"
+SERVER_AWG_H1=$(safeQuoteParam "${SERVER_AWG_H1}")
+SERVER_AWG_H2=$(safeQuoteParam "${SERVER_AWG_H2}")
+SERVER_AWG_H3=$(safeQuoteParam "${SERVER_AWG_H3}")
+SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")" >"${AMNEZIAWG_DIR}/params"
 
 	# Add server interface
 	echo "[Interface]
@@ -988,10 +998,51 @@ function loadParams() {
 	
 	# Migration for pre-2.0 installations: check each H1-H4 independently for conversion
 	local H_CONVERTED=0
-	if convertHToRangeIfNeeded "SERVER_AWG_H1"; then H_CONVERTED=1; fi
-	if convertHToRangeIfNeeded "SERVER_AWG_H2"; then H_CONVERTED=1; fi
-	if convertHToRangeIfNeeded "SERVER_AWG_H3"; then H_CONVERTED=1; fi
-	if convertHToRangeIfNeeded "SERVER_AWG_H4"; then H_CONVERTED=1; fi
+	local H_INVALID=0
+	local H_RC
+	
+	convertHToRangeIfNeeded "SERVER_AWG_H1"
+	H_RC=$?
+	if [[ ${H_RC} -eq 0 ]]; then
+		H_CONVERTED=1
+	elif [[ ${H_RC} -eq 2 ]]; then
+		H_INVALID=1
+	fi
+	
+	convertHToRangeIfNeeded "SERVER_AWG_H2"
+	H_RC=$?
+	if [[ ${H_RC} -eq 0 ]]; then
+		H_CONVERTED=1
+	elif [[ ${H_RC} -eq 2 ]]; then
+		H_INVALID=1
+	fi
+	
+	convertHToRangeIfNeeded "SERVER_AWG_H3"
+	H_RC=$?
+	if [[ ${H_RC} -eq 0 ]]; then
+		H_CONVERTED=1
+	elif [[ ${H_RC} -eq 2 ]]; then
+		H_INVALID=1
+	fi
+	
+	convertHToRangeIfNeeded "SERVER_AWG_H4"
+	H_RC=$?
+	if [[ ${H_RC} -eq 0 ]]; then
+		H_CONVERTED=1
+	elif [[ ${H_RC} -eq 2 ]]; then
+		H_INVALID=1
+	fi
+	
+	# If any H value failed validation (return code 2), regenerate all H1-H4 ranges
+	# We regenerate all to ensure non-overlapping ranges
+	if [[ ${H_INVALID} == 1 ]]; then
+		generateH1AndH2AndH3AndH4Ranges
+		SERVER_AWG_H1="${RANDOM_AWG_H1_MIN}-${RANDOM_AWG_H1_MAX}"
+		SERVER_AWG_H2="${RANDOM_AWG_H2_MIN}-${RANDOM_AWG_H2_MAX}"
+		SERVER_AWG_H3="${RANDOM_AWG_H3_MIN}-${RANDOM_AWG_H3_MAX}"
+		SERVER_AWG_H4="${RANDOM_AWG_H4_MIN}-${RANDOM_AWG_H4_MAX}"
+		H_CONVERTED=1
+	fi
 	
 	if [[ ${H_CONVERTED} == 1 ]]; then
 		NEEDS_UPDATE=1
@@ -1008,6 +1059,24 @@ function loadParams() {
 		echo -e "${RED}  You MUST regenerate all client configurations for them to connect.${NC}"
 		echo -e "${RED}================================================================================${NC}"
 		echo ""
+		
+		# Require explicit user confirmation before proceeding with migration
+		while true; do
+			read -rp "Do you want to proceed with migration to AmneziaWG 2.0? [y/N]: " RESP
+			case "${RESP}" in
+				[Yy])
+					break
+					;;
+				[Nn]|"")
+					echo -e "${ORANGE}Migration cancelled. The script cannot continue without migration.${NC}"
+					echo -e "${ORANGE}Your existing configuration remains unchanged.${NC}"
+					exit 0
+					;;
+				*)
+					echo "Please answer y or n."
+					;;
+			esac
+		done
 		
 		echo -e "${GREEN}Updating configuration with migrated values...${NC}"
 		
@@ -1069,17 +1138,18 @@ function loadParams() {
 			exit 1
 		}
 		
-		if ! echo "SERVER_PUB_IP=${SERVER_PUB_IP}
-SERVER_PUB_NIC=${SERVER_PUB_NIC}
-SERVER_AWG_NIC=${SERVER_AWG_NIC}
-SERVER_AWG_IPV4=${SERVER_AWG_IPV4}
-SERVER_AWG_IPV6=${SERVER_AWG_IPV6}
+		# Use safe quoting for string values to prevent shell injection when sourced
+		if ! echo "SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
+SERVER_PUB_NIC=$(safeQuoteParam "${SERVER_PUB_NIC}")
+SERVER_AWG_NIC=$(safeQuoteParam "${SERVER_AWG_NIC}")
+SERVER_AWG_IPV4=$(safeQuoteParam "${SERVER_AWG_IPV4}")
+SERVER_AWG_IPV6=$(safeQuoteParam "${SERVER_AWG_IPV6}")
 SERVER_PORT=${SERVER_PORT}
-SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
-SERVER_PUB_KEY=${SERVER_PUB_KEY}
+SERVER_PRIV_KEY=$(safeQuoteParam "${SERVER_PRIV_KEY}")
+SERVER_PUB_KEY=$(safeQuoteParam "${SERVER_PUB_KEY}")
 CLIENT_DNS_1=${CLIENT_DNS_1}
 CLIENT_DNS_2=${CLIENT_DNS_2}
-ALLOWED_IPS=${ALLOWED_IPS}
+ALLOWED_IPS=$(safeQuoteParam "${ALLOWED_IPS}")
 SERVER_AWG_JC=${SERVER_AWG_JC}
 SERVER_AWG_JMIN=${SERVER_AWG_JMIN}
 SERVER_AWG_JMAX=${SERVER_AWG_JMAX}
@@ -1087,10 +1157,10 @@ SERVER_AWG_S1=${SERVER_AWG_S1}
 SERVER_AWG_S2=${SERVER_AWG_S2}
 SERVER_AWG_S3=${SERVER_AWG_S3}
 SERVER_AWG_S4=${SERVER_AWG_S4}
-SERVER_AWG_H1=${SERVER_AWG_H1}
-SERVER_AWG_H2=${SERVER_AWG_H2}
-SERVER_AWG_H3=${SERVER_AWG_H3}
-SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
+SERVER_AWG_H1=$(safeQuoteParam "${SERVER_AWG_H1}")
+SERVER_AWG_H2=$(safeQuoteParam "${SERVER_AWG_H2}")
+SERVER_AWG_H3=$(safeQuoteParam "${SERVER_AWG_H3}")
+SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")" >"${AMNEZIAWG_DIR}/params"; then
 			restoreBackupsAndExit "ERROR: Failed to write params file."
 		fi
 		
@@ -1103,8 +1173,16 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 				restoreBackupsAndExit "Failed to update S3 in server configuration file."
 			fi
 		else
+			# Verify S2 exists before attempting insertion
+			if ! grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
+				restoreBackupsAndExit "Cannot insert S3: S2 parameter not found in configuration file."
+			fi
 			if ! sed -i "/^S2 = .*/a S3 = ${SERVER_AWG_S3}" "${SERVER_AWG_CONF}"; then
 				restoreBackupsAndExit "Failed to insert S3 into server configuration file."
+			fi
+			# Verify insertion succeeded
+			if ! grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
+				restoreBackupsAndExit "S3 insertion appeared to succeed but S3 not found in configuration file."
 			fi
 		fi
 		
@@ -1113,13 +1191,26 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 			if ! sed -i "s|^S4 = .*|S4 = ${SERVER_AWG_S4}|" "${SERVER_AWG_CONF}"; then
 				restoreBackupsAndExit "Failed to update S4 in server configuration file."
 			fi
-		elif grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
-			if ! sed -i "/^S3 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
-				restoreBackupsAndExit "Failed to insert S4 after S3 in server configuration file."
-			fi
 		else
-			if ! sed -i "/^S2 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
-				restoreBackupsAndExit "Failed to insert S4 after S2 in server configuration file."
+			local S4_INSERTED=0
+			# Try inserting after S3 first (preferred position)
+			if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
+				if sed -i "/^S3 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
+					S4_INSERTED=1
+				fi
+			fi
+			# Fallback to inserting after S2
+			if [[ ${S4_INSERTED} == 0 ]] && grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
+				if sed -i "/^S2 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
+					S4_INSERTED=1
+				fi
+			fi
+			if [[ ${S4_INSERTED} == 0 ]]; then
+				restoreBackupsAndExit "Failed to insert S4: neither S3 nor S2 found in configuration file."
+			fi
+			# Verify insertion succeeded
+			if ! grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
+				restoreBackupsAndExit "S4 insertion appeared to succeed but S4 not found in configuration file."
 			fi
 		fi
 		
@@ -1164,12 +1255,15 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 				# Only rename if the config doesn't already have S3 parameter
 				# (indicating it's a pre-2.0 config that needs regeneration)
 				if ! grep -q "^S3 = " "${CLIENT_CONF}"; then
-					mv "${CLIENT_CONF}" "${CLIENT_CONF}.old"
-					echo -e "${ORANGE}  Renamed: ${CLIENT_CONF} -> ${CLIENT_CONF}.old${NC}"
-					CLIENT_CONFIGS_RENAMED=$((CLIENT_CONFIGS_RENAMED + 1))
+					if mv "${CLIENT_CONF}" "${CLIENT_CONF}.old"; then
+						echo -e "${ORANGE}  Renamed: ${CLIENT_CONF} -> ${CLIENT_CONF}.old${NC}"
+						CLIENT_CONFIGS_RENAMED=$((CLIENT_CONFIGS_RENAMED + 1))
+					else
+						echo -e "${RED}  WARNING: Failed to rename ${CLIENT_CONF}${NC}"
+					fi
 				fi
 			fi
-		done < <(find /home /root -name "${SERVER_AWG_NIC}-client-*.conf" 2>/dev/null)
+		done < <(find /home /root -maxdepth 5 -xdev -type f -name "${SERVER_AWG_NIC}-client-*.conf" 2>/dev/null)
 		
 		if (( CLIENT_CONFIGS_RENAMED > 0 )); then
 			echo -e "${ORANGE}  ${CLIENT_CONFIGS_RENAMED} client config(s) renamed with .old suffix${NC}"
