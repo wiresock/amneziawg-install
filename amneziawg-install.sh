@@ -944,7 +944,7 @@ function loadParams() {
 	
 	local NEEDS_UPDATE=0
 	
-		# Migration for pre-2.0 installations: check for missing S3/S4 parameters
+	# Migration for pre-2.0 installations: check for missing S3/S4 parameters
 	if [[ -z "${SERVER_AWG_S3}" ]] || [[ -z "${SERVER_AWG_S4}" ]]; then
 		# Try to read existing S3/S4 from config file before using defaults
 		# This handles cases where params file is missing values but config file has them
