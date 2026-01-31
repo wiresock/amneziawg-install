@@ -13,7 +13,7 @@ AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 # Safely quote a value for inclusion in a sourced params file
 # Escapes single quotes and wraps in single quotes to prevent shell injection
 function safeQuoteParam() {
-	local VALUE=$1
+	local VALUE="$1"
 	# Replace single quotes with '\'' (end quote, escaped quote, start quote)
 	local ESCAPED="${VALUE//\'/\'\\\'\'}"
 	echo "'${ESCAPED}'"
@@ -152,10 +152,14 @@ function readS3AndS4() {
 
 # Parse a range string "min-max" or single value into MIN and MAX variables
 # Uses indirect variable assignment via printf -v to set caller's variables by name
+#
+# NOTE: This function only validates format and that min <= max. It does NOT
+# validate bounds - callers must use validateRange() to check domain-specific
+# bounds (e.g., [5-2147483647] for H parameters, [15-150] for S parameters).
 function parseRange() {
-	local INPUT=$1
-	local MIN_VAR_NAME=$2  # Name of variable to store min value (indirect assignment)
-	local MAX_VAR_NAME=$3  # Name of variable to store max value (indirect assignment)
+	local INPUT="$1"  # SECURITY: Must quote to prevent shell injection
+	local MIN_VAR_NAME="$2"  # Name of variable to store min value (indirect assignment)
+	local MAX_VAR_NAME="$3"  # Name of variable to store max value (indirect assignment)
 	
 	# Validate input is not empty
 	if [[ -z "${INPUT}" ]]; then
@@ -426,15 +430,18 @@ function readH1AndH2AndH3AndH4Ranges() {
 
 # Helper function to convert a single H value to range format if needed
 # Validates that the value is numeric and within bounds [5-2147483647]
-# Returns 0 if conversion was needed and successful, 1 if no conversion needed,
-# 2 if validation failed (caller should regenerate the value)
+#
+# Return codes (non-standard to convey conversion status):
+#   0 = CONVERTED:    Conversion was needed and successful
+#   1 = NO_CHANGE:    No conversion needed (empty or already valid range format)
+#   2 = INVALID:      Validation failed (caller should regenerate the value)
 function convertHToRangeIfNeeded() {
 	local VAR_NAME=$1
 	local VALUE=${!VAR_NAME}
 	
-	# No conversion needed if empty or already in range format
+	# No conversion needed if empty
 	if [[ -z "${VALUE}" ]]; then
-		return 1  # No conversion needed (empty)
+		return 1  # NO_CHANGE
 	fi
 	
 	if [[ "${VALUE}" =~ ^[0-9]+-[0-9]+$ ]]; then
@@ -442,11 +449,10 @@ function convertHToRangeIfNeeded() {
 		local RANGE_MIN RANGE_MAX
 		if parseRange "${VALUE}" "RANGE_MIN" "RANGE_MAX"; then
 			if validateRange "${RANGE_MIN}" "${RANGE_MAX}" 5 2147483647; then
-				return 1  # No conversion needed (valid range format)
+				return 1  # NO_CHANGE (valid range format)
 			fi
 		fi
-		# Invalid range format - signal caller to regenerate
-		return 2
+		return 2  # INVALID (malformed range)
 	fi
 	
 	# Single value - validate it's numeric and within bounds
@@ -456,12 +462,11 @@ function convertHToRangeIfNeeded() {
 		if (( NUM_VALUE >= 5 )) && (( NUM_VALUE <= 2147483647 )); then
 			# Valid single value - convert to range format
 			printf -v "$VAR_NAME" '%s' "${NUM_VALUE}-${NUM_VALUE}"
-			return 0  # Conversion was needed and successful
+			return 0  # CONVERTED
 		fi
 	fi
 	
-	# Invalid value (non-numeric or out of bounds) - signal caller to regenerate
-	return 2
+	return 2  # INVALID (non-numeric or out of bounds)
 }
 
 function installQuestions() {
@@ -997,6 +1002,7 @@ function loadParams() {
 	fi
 	
 	# Migration for pre-2.0 installations: check each H1-H4 independently for conversion
+	# Return codes: 0=converted, 1=no change needed, 2=invalid (needs regeneration)
 	local H_CONVERTED=0
 	local H_INVALID=0
 	local H_RC
@@ -1033,7 +1039,31 @@ function loadParams() {
 		H_INVALID=1
 	fi
 	
-	# If any H value failed validation (return code 2), regenerate all H1-H4 ranges
+	# Check for overlapping ranges after conversion (even if all values were valid)
+	# This catches cases like H1=100, H2=100 which both convert to "100-100"
+	if [[ ${H_INVALID} == 0 ]] && [[ ${H_CONVERTED} == 1 || -n "${SERVER_AWG_H1}" ]]; then
+		# Parse all H ranges to check for overlaps
+		local H1_MIN H1_MAX H2_MIN H2_MAX H3_MIN H3_MAX H4_MIN H4_MAX
+		if parseRange "${SERVER_AWG_H1}" "H1_MIN" "H1_MAX" && \
+		   parseRange "${SERVER_AWG_H2}" "H2_MIN" "H2_MAX" && \
+		   parseRange "${SERVER_AWG_H3}" "H3_MIN" "H3_MAX" && \
+		   parseRange "${SERVER_AWG_H4}" "H4_MIN" "H4_MAX"; then
+			# Check all pairwise combinations for overlap
+			if rangesOverlap "${H1_MIN}" "${H1_MAX}" "${H2_MIN}" "${H2_MAX}" || \
+			   rangesOverlap "${H1_MIN}" "${H1_MAX}" "${H3_MIN}" "${H3_MAX}" || \
+			   rangesOverlap "${H1_MIN}" "${H1_MAX}" "${H4_MIN}" "${H4_MAX}" || \
+			   rangesOverlap "${H2_MIN}" "${H2_MAX}" "${H3_MIN}" "${H3_MAX}" || \
+			   rangesOverlap "${H2_MIN}" "${H2_MAX}" "${H4_MIN}" "${H4_MAX}" || \
+			   rangesOverlap "${H3_MIN}" "${H3_MAX}" "${H4_MIN}" "${H4_MAX}"; then
+				H_INVALID=1
+			fi
+		else
+			# Failed to parse one or more ranges - regenerate all
+			H_INVALID=1
+		fi
+	fi
+	
+	# If any H value failed validation or ranges overlap, regenerate all H1-H4 ranges
 	# We regenerate all to ensure non-overlapping ranges
 	if [[ ${H_INVALID} == 1 ]]; then
 		generateH1AndH2AndH3AndH4Ranges
@@ -1187,27 +1217,35 @@ SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")" >"${AMNEZIAWG_DIR}/params"; 
 		fi
 		
 		# Insert or update S4 (try update first, then insert after S3, fallback to after S2)
+		# Note: Backups were created at the start of migration, so any failure will restore
+		# the original files via restoreBackupsAndExit(). GNU sed -i is atomic (writes to
+		# temp file then renames), so partial modifications within a single sed call are unlikely.
 		if grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
 			if ! sed -i "s|^S4 = .*|S4 = ${SERVER_AWG_S4}|" "${SERVER_AWG_CONF}"; then
 				restoreBackupsAndExit "Failed to update S4 in server configuration file."
 			fi
 		else
 			local S4_INSERTED=0
-			# Try inserting after S3 first (preferred position)
+			local S4_ANCHOR=""
+			
+			# Determine anchor point for insertion (prefer S3, fallback to S2)
 			if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
-				if sed -i "/^S3 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
-					S4_INSERTED=1
-				fi
-			fi
-			# Fallback to inserting after S2
-			if [[ ${S4_INSERTED} == 0 ]] && grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
-				if sed -i "/^S2 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
-					S4_INSERTED=1
-				fi
-			fi
-			if [[ ${S4_INSERTED} == 0 ]]; then
+				S4_ANCHOR="S3"
+			elif grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
+				S4_ANCHOR="S2"
+			else
 				restoreBackupsAndExit "Failed to insert S4: neither S3 nor S2 found in configuration file."
 			fi
+			
+			# Perform single insertion after determined anchor
+			if sed -i "/^${S4_ANCHOR} = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
+				S4_INSERTED=1
+			fi
+			
+			if [[ ${S4_INSERTED} == 0 ]]; then
+				restoreBackupsAndExit "Failed to insert S4 after ${S4_ANCHOR} in server configuration file."
+			fi
+			
 			# Verify insertion succeeded
 			if ! grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
 				restoreBackupsAndExit "S4 insertion appeared to succeed but S4 not found in configuration file."
@@ -1248,6 +1286,12 @@ SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")" >"${AMNEZIAWG_DIR}/params"; 
 		# Rename existing client config files that don't have the new parameters
 		# This prevents confusion when users try to use old configs after migration
 		# Only rename configs that are actually outdated (missing S3/S4 parameters)
+		#
+		# Note on find options:
+		# - maxdepth 5: Prevents excessive traversal; client configs are typically in user home dirs
+		# - xdev: Prevents crossing filesystem boundaries (security: avoids mounted network shares,
+		#   external drives, or potentially malicious symlinks to other filesystems)
+		# - If configs are stored in unusual locations, users can manually rename them
 		echo -e "${GREEN}Marking old client configurations as outdated...${NC}"
 		local CLIENT_CONFIGS_RENAMED=0
 		while IFS= read -r CLIENT_CONF; do
