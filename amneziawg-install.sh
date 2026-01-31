@@ -144,14 +144,15 @@ function readS3AndS4() {
 # Parse a range string "min-max" or single value into MIN and MAX variables
 function parseRange() {
 	local INPUT=$1
-	local VAR_PREFIX=$2
+	local MIN_VAR_NAME=$2
+	local MAX_VAR_NAME=$3
 	
 	if [[ ${INPUT} =~ ^([0-9]+)-([0-9]+)$ ]]; then
-		eval "${VAR_PREFIX}_MIN=${BASH_REMATCH[1]}"
-		eval "${VAR_PREFIX}_MAX=${BASH_REMATCH[2]}"
+		printf -v "$MIN_VAR_NAME" '%s' "${BASH_REMATCH[1]}"
+		printf -v "$MAX_VAR_NAME" '%s' "${BASH_REMATCH[2]}"
 	elif [[ ${INPUT} =~ ^[0-9]+$ ]]; then
-		eval "${VAR_PREFIX}_MIN=${INPUT}"
-		eval "${VAR_PREFIX}_MAX=${INPUT}"
+		printf -v "$MIN_VAR_NAME" '%s' "${INPUT}"
+		printf -v "$MAX_VAR_NAME" '%s' "${INPUT}"
 	else
 		return 1
 	fi
@@ -195,8 +196,8 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	local MAX_VAL=2147483647
 	local AVAILABLE_RANGE=$((MAX_VAL - MIN_VAL))
 	
-	# Generate 4 non-overlapping ranges by dividing the available space
-	local SEGMENT_SIZE=$((AVAILABLE_RANGE / 5))
+	# Generate 4 non-overlapping ranges by dividing the available space into 4 segments
+	local SEGMENT_SIZE=$((AVAILABLE_RANGE / 4))
 	
 	# H1 range
 	local H1_START=$((MIN_VAL + SEGMENT_SIZE * 0 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
@@ -223,8 +224,8 @@ function readHRange() {
 	local H_NAME=$1
 	local DEFAULT_MIN=$2
 	local DEFAULT_MAX=$3
-	local RESULT_VAR_MIN="${H_NAME}_MIN"
-	local RESULT_VAR_MAX="${H_NAME}_MAX"
+	local RESULT_VAR_MIN="SERVER_AWG_${H_NAME}_MIN"
+	local RESULT_VAR_MAX="SERVER_AWG_${H_NAME}_MAX"
 	
 	local INPUT=""
 	local VALID=0
@@ -232,10 +233,10 @@ function readHRange() {
 	until [[ ${VALID} == 1 ]]; do
 		read -rp "Server AmneziaWG ${H_NAME} [5-2147483647] (format: min-max or single value): " -e -i "${DEFAULT_MIN}-${DEFAULT_MAX}" INPUT
 		
-		if parseRange "${INPUT}" "TEMP"; then
+		if parseRange "${INPUT}" "TEMP_MIN" "TEMP_MAX"; then
 			if validateRange "${TEMP_MIN}" "${TEMP_MAX}" 5 2147483647; then
-				eval "${RESULT_VAR_MIN}=${TEMP_MIN}"
-				eval "${RESULT_VAR_MAX}=${TEMP_MAX}"
+				printf -v "$RESULT_VAR_MIN" '%s' "${TEMP_MIN}"
+				printf -v "$RESULT_VAR_MAX" '%s' "${TEMP_MAX}"
 				VALID=1
 			else
 				echo -e "${ORANGE}Invalid range. Min must be <= Max and both must be between 5 and 2147483647.${NC}"
@@ -247,53 +248,40 @@ function readHRange() {
 }
 
 function readH1AndH2AndH3AndH4Ranges() {
-	# Read H1 range
-	readHRange "H1" "${RANDOM_AWG_H1_MIN}" "${RANDOM_AWG_H1_MAX}"
+	local H_NAMES=("H1" "H2" "H3" "H4")
+	local RANDOM_MINS=("${RANDOM_AWG_H1_MIN}" "${RANDOM_AWG_H2_MIN}" "${RANDOM_AWG_H3_MIN}" "${RANDOM_AWG_H4_MIN}")
+	local RANDOM_MAXS=("${RANDOM_AWG_H1_MAX}" "${RANDOM_AWG_H2_MAX}" "${RANDOM_AWG_H3_MAX}" "${RANDOM_AWG_H4_MAX}")
 	
-	# Read H2 range and check for overlap with H1
-	local H2_VALID=0
-	until [[ ${H2_VALID} == 1 ]]; do
-		readHRange "H2" "${RANDOM_AWG_H2_MIN}" "${RANDOM_AWG_H2_MAX}"
-		if rangesOverlap "${H1_MIN}" "${H1_MAX}" "${H2_MIN}" "${H2_MAX}"; then
-			echo -e "${ORANGE}H2 range overlaps with H1. Please enter a non-overlapping range.${NC}"
-		else
-			H2_VALID=1
-		fi
+	for i in "${!H_NAMES[@]}"; do
+		local H_NAME="${H_NAMES[$i]}"
+		local VALID=0
+		
+		until [[ ${VALID} == 1 ]]; do
+			readHRange "${H_NAME}" "${RANDOM_MINS[$i]}" "${RANDOM_MAXS[$i]}"
+			VALID=1
+			
+			# Check for overlap with all previously defined ranges
+			for j in $(seq 0 $((i - 1))); do
+				local PREV_H="${H_NAMES[$j]}"
+				local PREV_MIN_VAR="SERVER_AWG_${PREV_H}_MIN"
+				local PREV_MAX_VAR="SERVER_AWG_${PREV_H}_MAX"
+				local CURR_MIN_VAR="SERVER_AWG_${H_NAME}_MIN"
+				local CURR_MAX_VAR="SERVER_AWG_${H_NAME}_MAX"
+				
+				if rangesOverlap "${!PREV_MIN_VAR}" "${!PREV_MAX_VAR}" "${!CURR_MIN_VAR}" "${!CURR_MAX_VAR}"; then
+					echo -e "${ORANGE}${H_NAME} range overlaps with ${PREV_H}. Please enter a non-overlapping range.${NC}"
+					VALID=0
+					break
+				fi
+			done
+		done
 	done
 	
-	# Read H3 range and check for overlap with H1 and H2
-	local H3_VALID=0
-	until [[ ${H3_VALID} == 1 ]]; do
-		readHRange "H3" "${RANDOM_AWG_H3_MIN}" "${RANDOM_AWG_H3_MAX}"
-		if rangesOverlap "${H1_MIN}" "${H1_MAX}" "${H3_MIN}" "${H3_MAX}"; then
-			echo -e "${ORANGE}H3 range overlaps with H1. Please enter a non-overlapping range.${NC}"
-		elif rangesOverlap "${H2_MIN}" "${H2_MAX}" "${H3_MIN}" "${H3_MAX}"; then
-			echo -e "${ORANGE}H3 range overlaps with H2. Please enter a non-overlapping range.${NC}"
-		else
-			H3_VALID=1
-		fi
-	done
-	
-	# Read H4 range and check for overlap with H1, H2, and H3
-	local H4_VALID=0
-	until [[ ${H4_VALID} == 1 ]]; do
-		readHRange "H4" "${RANDOM_AWG_H4_MIN}" "${RANDOM_AWG_H4_MAX}"
-		if rangesOverlap "${H1_MIN}" "${H1_MAX}" "${H4_MIN}" "${H4_MAX}"; then
-			echo -e "${ORANGE}H4 range overlaps with H1. Please enter a non-overlapping range.${NC}"
-		elif rangesOverlap "${H2_MIN}" "${H2_MAX}" "${H4_MIN}" "${H4_MAX}"; then
-			echo -e "${ORANGE}H4 range overlaps with H2. Please enter a non-overlapping range.${NC}"
-		elif rangesOverlap "${H3_MIN}" "${H3_MAX}" "${H4_MIN}" "${H4_MAX}"; then
-			echo -e "${ORANGE}H4 range overlaps with H3. Please enter a non-overlapping range.${NC}"
-		else
-			H4_VALID=1
-		fi
-	done
-	
-	# Set the final SERVER_AWG_H* variables
-	SERVER_AWG_H1="${H1_MIN}-${H1_MAX}"
-	SERVER_AWG_H2="${H2_MIN}-${H2_MAX}"
-	SERVER_AWG_H3="${H3_MIN}-${H3_MAX}"
-	SERVER_AWG_H4="${H4_MIN}-${H4_MAX}"
+	# Set the final SERVER_AWG_H* variables (combined min-max format for config files)
+	SERVER_AWG_H1="${SERVER_AWG_H1_MIN}-${SERVER_AWG_H1_MAX}"
+	SERVER_AWG_H2="${SERVER_AWG_H2_MIN}-${SERVER_AWG_H2_MAX}"
+	SERVER_AWG_H3="${SERVER_AWG_H3_MIN}-${SERVER_AWG_H3_MAX}"
+	SERVER_AWG_H4="${SERVER_AWG_H4_MIN}-${SERVER_AWG_H4_MAX}"
 }
 
 function installQuestions() {
