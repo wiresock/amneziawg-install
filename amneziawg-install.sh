@@ -154,8 +154,10 @@ function parseRange() {
 	fi
 	
 	if [[ ${INPUT} =~ ^([0-9]+)-([0-9]+)$ ]]; then
-		local MIN=${BASH_REMATCH[1]}
-		local MAX=${BASH_REMATCH[2]}
+		# Force base-10 interpretation to avoid octal issues with leading zeros
+		# e.g., "010" would be interpreted as 8 (octal) without 10# prefix
+		local MIN=$((10#${BASH_REMATCH[1]}))
+		local MAX=$((10#${BASH_REMATCH[2]}))
 		
 		# Validate that min <= max
 		if (( MIN > MAX )); then
@@ -167,8 +169,10 @@ function parseRange() {
 		printf -v "$MAX_VAR_NAME" '%s' "${MAX}"
 	elif [[ ${INPUT} =~ ^[0-9]+$ ]]; then
 		# Single value: use as both min and max
-		printf -v "$MIN_VAR_NAME" '%s' "${INPUT}"
-		printf -v "$MAX_VAR_NAME" '%s' "${INPUT}"
+		# Force base-10 interpretation here as well
+		local VAL=$((10#${INPUT}))
+		printf -v "$MIN_VAR_NAME" '%s' "${VAL}"
+		printf -v "$MAX_VAR_NAME" '%s' "${VAL}"
 	else
 		return 1
 	fi
@@ -1112,6 +1116,22 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 		# Migration successful, remove backups
 		rm -f "${SERVER_AWG_CONF}.bak" "${AMNEZIAWG_DIR}/params.bak"
 		
+		# Rename existing client config files to indicate they're outdated
+		# This prevents confusion when users try to use old configs after migration
+		echo -e "${GREEN}Marking old client configurations as outdated...${NC}"
+		local CLIENT_CONFIGS_RENAMED=0
+		while IFS= read -r CLIENT_CONF; do
+			if [[ -f "${CLIENT_CONF}" ]]; then
+				mv "${CLIENT_CONF}" "${CLIENT_CONF}.old"
+				echo -e "${ORANGE}  Renamed: ${CLIENT_CONF} -> ${CLIENT_CONF}.old${NC}"
+				CLIENT_CONFIGS_RENAMED=$((CLIENT_CONFIGS_RENAMED + 1))
+			fi
+		done < <(find /home /root -name "${SERVER_AWG_NIC}-client-*.conf" 2>/dev/null)
+		
+		if (( CLIENT_CONFIGS_RENAMED > 0 )); then
+			echo -e "${ORANGE}  ${CLIENT_CONFIGS_RENAMED} client config(s) renamed with .old suffix${NC}"
+		fi
+		
 		# Reload AmneziaWG configuration
 		if systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
 			echo -e "${GREEN}Reloading AmneziaWG configuration...${NC}"
@@ -1130,6 +1150,10 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 		
 		echo -e "${GREEN}Migration completed successfully.${NC}"
 		echo ""
+		if (( CLIENT_CONFIGS_RENAMED > 0 )); then
+			echo -e "${ORANGE}NOTE: ${CLIENT_CONFIGS_RENAMED} old client config(s) were renamed with .old suffix.${NC}"
+			echo -e "${ORANGE}You can delete them after regenerating new configs, or keep them for reference.${NC}"
+		fi
 		echo -e "${ORANGE}REMINDER: All existing client configurations must be regenerated.${NC}"
 		echo -e "${ORANGE}Use option 1 (Add a new user) to create new client configs with updated parameters.${NC}"
 		echo ""
