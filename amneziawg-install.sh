@@ -931,8 +931,19 @@ function loadParams() {
 		CONF_S4=$(grep -E "^S4 = " "${SERVER_AWG_CONF}" 2>/dev/null | sed 's/^S4 = //')
 		
 		if [[ -n "${CONF_S3}" ]] && [[ -n "${CONF_S4}" ]]; then
-			SERVER_AWG_S3="${CONF_S3}"
-			SERVER_AWG_S4="${CONF_S4}"
+			# Validate that loaded values are numeric and satisfy S3 + 56 != S4
+			if [[ "${CONF_S3}" =~ ^[0-9]+$ ]] && [[ "${CONF_S4}" =~ ^[0-9]+$ ]] && (( CONF_S3 + 56 != CONF_S4 )); then
+				SERVER_AWG_S3="${CONF_S3}"
+				SERVER_AWG_S4="${CONF_S4}"
+			else
+				# Fallback: regenerate S3/S4 if config values are invalid
+				generateS3AndS4
+				while (( RANDOM_AWG_S3 + 56 == RANDOM_AWG_S4 )); do
+					generateS3AndS4
+				done
+				SERVER_AWG_S3=${RANDOM_AWG_S3}
+				SERVER_AWG_S4=${RANDOM_AWG_S4}
+			fi
 		else
 			# Generate random S3/S4 values within the valid range [15-150]
 			# ensuring they satisfy the constraint S3 + 56 != S4
