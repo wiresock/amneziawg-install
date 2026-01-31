@@ -546,29 +546,29 @@ function installQuestions() {
 	done
 
 	# S1 && S2
-	# Note: The constraint S1 + 56 != S2 is required by the AmneziaWG protocol
-	# to ensure proper packet obfuscation. The value 56 is the WireGuard handshake
-	# initiation message size, and this offset must be avoided.
+	# Note: The constraints S1 + 56 != S2 and S2 + 56 != S1 are required by the AmneziaWG
+	# protocol to ensure proper packet obfuscation. The value 56 is the WireGuard handshake
+	# initiation message size, and this offset must be avoided in both directions.
 	generateS1AndS2
-	while (( ${RANDOM_AWG_S1} + 56 == ${RANDOM_AWG_S2} )); do
+	while (( ${RANDOM_AWG_S1} + 56 == ${RANDOM_AWG_S2} )) || (( ${RANDOM_AWG_S2} + 56 == ${RANDOM_AWG_S1} )); do
 		generateS1AndS2
 	done
 	readS1AndS2
-	while (( ${SERVER_AWG_S1} + 56 == ${SERVER_AWG_S2} )); do
-		echo "AmneziaWG requires S1 + 56 != S2"
+	while (( ${SERVER_AWG_S1} + 56 == ${SERVER_AWG_S2} )) || (( ${SERVER_AWG_S2} + 56 == ${SERVER_AWG_S1} )); do
+		echo "AmneziaWG requires S1 + 56 != S2 and S2 + 56 != S1"
 		readS1AndS2
 	done
 
 	# S3 && S4 (AmneziaWG 2.0)
-	# Note: Same constraint as S1/S2 - the 56-byte offset must be avoided
+	# Note: Same constraint as S1/S2 - the 56-byte offset must be avoided in both directions
 	echo -e "\n${GREEN}AmneziaWG 2.0 Features:${NC}"
 	generateS3AndS4
-	while (( ${RANDOM_AWG_S3} + 56 == ${RANDOM_AWG_S4} )); do
+	while (( ${RANDOM_AWG_S3} + 56 == ${RANDOM_AWG_S4} )) || (( ${RANDOM_AWG_S4} + 56 == ${RANDOM_AWG_S3} )); do
 		generateS3AndS4
 	done
 	readS3AndS4
-	while (( ${SERVER_AWG_S3} + 56 == ${SERVER_AWG_S4} )); do
-		echo "AmneziaWG requires S3 + 56 != S4"
+	while (( ${SERVER_AWG_S3} + 56 == ${SERVER_AWG_S4} )) || (( ${SERVER_AWG_S4} + 56 == ${SERVER_AWG_S3} )); do
+		echo "AmneziaWG requires S3 + 56 != S4 and S4 + 56 != S3"
 		readS3AndS4
 	done
 
