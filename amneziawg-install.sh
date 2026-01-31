@@ -191,18 +191,23 @@ function validateRange() {
 
 # Generate non-overlapping random ranges for H1-H4
 function generateH1AndH2AndH3AndH4Ranges() {
-	local RANGE_SIZE=100000000  # Size of each range
+	# Size of each H1-H4 range (1e8). Chosen to provide a large randomization space
+	# while staying well below the 32-bit signed int max (2,147,483,647) so that
+	# four ranges plus minimum 1-unit gaps between them all fit within [MIN_VAL, MAX_VAL]
+	local RANGE_SIZE=100000000
 	local MIN_VAL=5
 	local MAX_VAL=2147483647
 	local GAP=1  # Minimum gap between segments to prevent boundary overlap
-	local AVAILABLE_RANGE=$((MAX_VAL - MIN_VAL - GAP * 3))  # Account for gaps between 4 segments
+	
+	# Calculate available range, rounding down to multiple of 4 to prevent integer division overflow
+	local RAW_AVAILABLE=$((MAX_VAL - MIN_VAL - GAP * 3))
+	local AVAILABLE_RANGE=$((RAW_AVAILABLE - RAW_AVAILABLE % 4))
 	
 	# Generate 4 non-overlapping ranges by dividing the available space into 4 segments
 	local SEGMENT_SIZE=$((AVAILABLE_RANGE / 4))
 	
 	# Validate that segment size is larger than range size
 	if (( SEGMENT_SIZE <= RANGE_SIZE )); then
-		echo -e "${ORANGE}Warning: Segment size (${SEGMENT_SIZE}) must be greater than range size (${RANGE_SIZE}); using fallback fixed ranges.${NC}" >&2
 		# Fall back to fixed non-overlapping ranges (consistent GAP usage)
 		RANDOM_AWG_H1_MIN=5
 		RANDOM_AWG_H1_MAX=$((5 + RANGE_SIZE))
@@ -237,95 +242,96 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	RANDOM_AWG_H4_MIN=${H4_START}
 	RANDOM_AWG_H4_MAX=$((H4_START + RANGE_SIZE))
 	
-	# Validate and clamp all generated ranges to [MIN_VAL, MAX_VAL]
-	if (( RANDOM_AWG_H1_MIN < MIN_VAL )) || (( RANDOM_AWG_H1_MAX > MAX_VAL )) ||
-	   (( RANDOM_AWG_H2_MIN < MIN_VAL )) || (( RANDOM_AWG_H2_MAX > MAX_VAL )) ||
-	   (( RANDOM_AWG_H3_MIN < MIN_VAL )) || (( RANDOM_AWG_H3_MAX > MAX_VAL )) ||
-	   (( RANDOM_AWG_H4_MIN < MIN_VAL )) || (( RANDOM_AWG_H4_MAX > MAX_VAL )); then
-		echo -e "${ORANGE}Warning: Generated ranges exceeded bounds. Using clamped values.${NC}" >&2
+	# Clamp and resolve overlaps using helper function
+	clampAndResolveOverlap "RANDOM_AWG_H1" ${MIN_VAL} ${MAX_VAL} ${RANGE_SIZE} ${GAP} "" ""
+	clampAndResolveOverlap "RANDOM_AWG_H2" ${MIN_VAL} ${MAX_VAL} ${RANGE_SIZE} ${GAP} ${RANDOM_AWG_H1_MIN} ${RANDOM_AWG_H1_MAX}
+	clampAndResolveOverlap "RANDOM_AWG_H3" ${MIN_VAL} ${MAX_VAL} ${RANGE_SIZE} ${GAP} ${RANDOM_AWG_H2_MIN} ${RANDOM_AWG_H2_MAX}
+	clampAndResolveOverlap "RANDOM_AWG_H4" ${MIN_VAL} ${MAX_VAL} ${RANGE_SIZE} ${GAP} ${RANDOM_AWG_H3_MIN} ${RANDOM_AWG_H3_MAX}
+	
+	# Final validation: ensure all four ranges are non-overlapping
+	local HAS_OVERLAP=0
+	if (( RANDOM_AWG_H1_MIN <= RANDOM_AWG_H2_MAX && RANDOM_AWG_H1_MAX >= RANDOM_AWG_H2_MIN )); then
+		HAS_OVERLAP=1
+	elif (( RANDOM_AWG_H1_MIN <= RANDOM_AWG_H3_MAX && RANDOM_AWG_H1_MAX >= RANDOM_AWG_H3_MIN )); then
+		HAS_OVERLAP=1
+	elif (( RANDOM_AWG_H1_MIN <= RANDOM_AWG_H4_MAX && RANDOM_AWG_H1_MAX >= RANDOM_AWG_H4_MIN )); then
+		HAS_OVERLAP=1
+	elif (( RANDOM_AWG_H2_MIN <= RANDOM_AWG_H3_MAX && RANDOM_AWG_H2_MAX >= RANDOM_AWG_H3_MIN )); then
+		HAS_OVERLAP=1
+	elif (( RANDOM_AWG_H2_MIN <= RANDOM_AWG_H4_MAX && RANDOM_AWG_H2_MAX >= RANDOM_AWG_H4_MIN )); then
+		HAS_OVERLAP=1
+	elif (( RANDOM_AWG_H3_MIN <= RANDOM_AWG_H4_MAX && RANDOM_AWG_H3_MAX >= RANDOM_AWG_H4_MIN )); then
+		HAS_OVERLAP=1
 	fi
 	
-	# Clamp H1
-	if (( RANDOM_AWG_H1_MIN < MIN_VAL )); then
+	# If overlaps remain, fall back to deterministic non-overlapping layout
+	if (( HAS_OVERLAP )); then
 		RANDOM_AWG_H1_MIN=${MIN_VAL}
 		RANDOM_AWG_H1_MAX=$((RANDOM_AWG_H1_MIN + RANGE_SIZE))
-	fi
-	if (( RANDOM_AWG_H1_MAX > MAX_VAL )); then
-		RANDOM_AWG_H1_MAX=${MAX_VAL}
-		RANDOM_AWG_H1_MIN=$((RANDOM_AWG_H1_MAX - RANGE_SIZE))
-		if (( RANDOM_AWG_H1_MIN < MIN_VAL )); then
-			RANDOM_AWG_H1_MIN=${MIN_VAL}
-		fi
-	fi
-	
-	# Clamp H2 and ensure no overlap with H1
-	if (( RANDOM_AWG_H2_MIN < MIN_VAL )); then
-		RANDOM_AWG_H2_MIN=${MIN_VAL}
-		RANDOM_AWG_H2_MAX=$((RANDOM_AWG_H2_MIN + RANGE_SIZE))
-	fi
-	if (( RANDOM_AWG_H2_MAX > MAX_VAL )); then
-		RANDOM_AWG_H2_MAX=${MAX_VAL}
-		RANDOM_AWG_H2_MIN=$((RANDOM_AWG_H2_MAX - RANGE_SIZE))
-		if (( RANDOM_AWG_H2_MIN < MIN_VAL )); then
-			RANDOM_AWG_H2_MIN=${MIN_VAL}
-		fi
-	fi
-	# Ensure H2 does not overlap with H1 after clamping
-	if (( RANDOM_AWG_H2_MIN <= RANDOM_AWG_H1_MAX && RANDOM_AWG_H2_MAX >= RANDOM_AWG_H1_MIN )); then
 		RANDOM_AWG_H2_MIN=$((RANDOM_AWG_H1_MAX + GAP))
 		RANDOM_AWG_H2_MAX=$((RANDOM_AWG_H2_MIN + RANGE_SIZE))
-	fi
-	
-	# Clamp H3 and ensure no overlap with H2
-	if (( RANDOM_AWG_H3_MIN < MIN_VAL )); then
-		RANDOM_AWG_H3_MIN=${MIN_VAL}
-		RANDOM_AWG_H3_MAX=$((RANDOM_AWG_H3_MIN + RANGE_SIZE))
-	fi
-	if (( RANDOM_AWG_H3_MAX > MAX_VAL )); then
-		RANDOM_AWG_H3_MAX=${MAX_VAL}
-		RANDOM_AWG_H3_MIN=$((RANDOM_AWG_H3_MAX - RANGE_SIZE))
-		if (( RANDOM_AWG_H3_MIN < MIN_VAL )); then
-			RANDOM_AWG_H3_MIN=${MIN_VAL}
-		fi
-	fi
-	# Ensure H3 does not overlap with H2 after clamping
-	if (( RANDOM_AWG_H3_MIN <= RANDOM_AWG_H2_MAX && RANDOM_AWG_H3_MAX >= RANDOM_AWG_H2_MIN )); then
 		RANDOM_AWG_H3_MIN=$((RANDOM_AWG_H2_MAX + GAP))
 		RANDOM_AWG_H3_MAX=$((RANDOM_AWG_H3_MIN + RANGE_SIZE))
-	fi
-	
-	# Clamp H4 and ensure no overlap with H3
-	if (( RANDOM_AWG_H4_MIN < MIN_VAL )); then
-		RANDOM_AWG_H4_MIN=${MIN_VAL}
+		RANDOM_AWG_H4_MIN=$((RANDOM_AWG_H3_MAX + GAP))
 		RANDOM_AWG_H4_MAX=$((RANDOM_AWG_H4_MIN + RANGE_SIZE))
 	fi
-	if (( RANDOM_AWG_H4_MAX > MAX_VAL )); then
-		RANDOM_AWG_H4_MAX=${MAX_VAL}
-		RANDOM_AWG_H4_MIN=$((RANDOM_AWG_H4_MAX - RANGE_SIZE))
-		if (( RANDOM_AWG_H4_MIN < MIN_VAL )); then
-			RANDOM_AWG_H4_MIN=${MIN_VAL}
+}
+
+# Helper function to clamp a range and resolve overlap with previous range
+function clampAndResolveOverlap() {
+	local VAR_PREFIX=$1
+	local MIN_VAL=$2
+	local MAX_VAL=$3
+	local RANGE_SIZE=$4
+	local GAP=$5
+	local PREV_MIN=$6
+	local PREV_MAX=$7
+	
+	local MIN_VAR="${VAR_PREFIX}_MIN"
+	local MAX_VAR="${VAR_PREFIX}_MAX"
+	local CURR_MIN=${!MIN_VAR}
+	local CURR_MAX=${!MAX_VAR}
+	
+	# Clamp to minimum bound
+	if (( CURR_MIN < MIN_VAL )); then
+		CURR_MIN=${MIN_VAL}
+		CURR_MAX=$((CURR_MIN + RANGE_SIZE))
+	fi
+	
+	# Clamp to maximum bound
+	if (( CURR_MAX > MAX_VAL )); then
+		CURR_MAX=${MAX_VAL}
+		CURR_MIN=$((CURR_MAX - RANGE_SIZE))
+		if (( CURR_MIN < MIN_VAL )); then
+			CURR_MIN=${MIN_VAL}
 		fi
 	fi
-	# Ensure H4 does not overlap with H3 after clamping
-	if (( RANDOM_AWG_H4_MIN <= RANDOM_AWG_H3_MAX && RANDOM_AWG_H4_MAX >= RANDOM_AWG_H3_MIN )); then
-		local NEW_H4_MIN=$((RANDOM_AWG_H3_MAX + GAP))
-		local NEW_H4_MAX=$((NEW_H4_MIN + RANGE_SIZE))
-		
-		if (( NEW_H4_MAX <= MAX_VAL )); then
-			RANDOM_AWG_H4_MIN=${NEW_H4_MIN}
-			RANDOM_AWG_H4_MAX=${NEW_H4_MAX}
-		else
-			# If we can't place H4 after H3 within bounds, try placing it before H3
-			NEW_H4_MAX=$((RANDOM_AWG_H3_MIN - GAP))
-			NEW_H4_MIN=$((NEW_H4_MAX - RANGE_SIZE))
+	
+	# Resolve overlap with previous range if provided
+	if [[ -n "${PREV_MIN}" ]] && [[ -n "${PREV_MAX}" ]]; then
+		if (( CURR_MIN <= PREV_MAX && CURR_MAX >= PREV_MIN )); then
+			local NEW_MIN=$((PREV_MAX + GAP))
+			local NEW_MAX=$((NEW_MIN + RANGE_SIZE))
 			
-			if (( NEW_H4_MIN >= MIN_VAL )); then
-				RANDOM_AWG_H4_MIN=${NEW_H4_MIN}
-				RANDOM_AWG_H4_MAX=${NEW_H4_MAX}
+			if (( NEW_MAX <= MAX_VAL )); then
+				CURR_MIN=${NEW_MIN}
+				CURR_MAX=${NEW_MAX}
+			else
+				# Try placing before previous range
+				NEW_MAX=$((PREV_MIN - GAP))
+				NEW_MIN=$((NEW_MAX - RANGE_SIZE))
+				
+				if (( NEW_MIN >= MIN_VAL )); then
+					CURR_MIN=${NEW_MIN}
+					CURR_MAX=${NEW_MAX}
+				fi
 			fi
-			# If neither adjustment fits, leave as-is to avoid breaking bounds
 		fi
 	fi
+	
+	# Update global variables
+	printf -v "$MIN_VAR" '%s' "${CURR_MIN}"
+	printf -v "$MAX_VAR" '%s' "${CURR_MAX}"
 }
 
 function readHRange() {
@@ -461,22 +467,26 @@ function installQuestions() {
 	# Jmin && Jmax
 	readJminAndJmax
 	until [ "${SERVER_AWG_JMIN}" -le "${SERVER_AWG_JMAX}" ]; do
-		echo "AmneziaWG require Jmin < Jmax"
+		echo "AmneziaWG requires Jmin <= Jmax"
 		readJminAndJmax
 	done
 
 	# S1 && S2
+	# Note: The constraint S1 + 56 != S2 is required by the AmneziaWG protocol
+	# to ensure proper packet obfuscation. The value 56 is the WireGuard handshake
+	# initiation message size, and this offset must be avoided.
 	generateS1AndS2
 	while (( ${RANDOM_AWG_S1} + 56 == ${RANDOM_AWG_S2} )); do
 		generateS1AndS2
 	done
 	readS1AndS2
 	while (( ${SERVER_AWG_S1} + 56 == ${SERVER_AWG_S2} )); do
-		echo "AmneziaWG require S1 + 56 <> S2"
+		echo "AmneziaWG requires S1 + 56 must not equal S2"
 		readS1AndS2
 	done
 
 	# S3 && S4 (AmneziaWG 2.0)
+	# Note: Same constraint as S1/S2 - the 56-byte offset must be avoided
 	echo -e "\n${GREEN}AmneziaWG 2.0 Features:${NC}"
 	generateS3AndS4
 	while (( ${RANDOM_AWG_S3} + 56 == ${RANDOM_AWG_S4} )); do
@@ -484,7 +494,7 @@ function installQuestions() {
 	done
 	readS3AndS4
 	while (( ${SERVER_AWG_S3} + 56 == ${SERVER_AWG_S4} )); do
-		echo "AmneziaWG require S3 + 56 <> S4"
+		echo "AmneziaWG requires S3 + 56 must not equal S4"
 		readS3AndS4
 	done
 
@@ -867,14 +877,9 @@ function loadParams() {
 		
 		# Generate default S3/S4 values.
 		# Values 15 and 150 satisfy the constraint S3 + 56 != S4 (15 + 56 = 71 != 150)
+		# The 56-byte offset corresponds to the WireGuard handshake initiation message size
 		SERVER_AWG_S3=15
 		SERVER_AWG_S4=150
-		
-		# Validate defaults
-		if (( SERVER_AWG_S3 + 56 == SERVER_AWG_S4 )); then
-			echo -e "${RED}ERROR: Invalid S3/S4 defaults: S3 + 56 must not equal S4.${NC}"
-			exit 1
-		fi
 		
 		NEEDS_UPDATE=1
 	fi
