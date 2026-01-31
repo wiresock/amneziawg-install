@@ -127,10 +127,10 @@ function readS1AndS2() {
 	SERVER_AWG_S1=0
 	SERVER_AWG_S2=0
 	until [[ ${SERVER_AWG_S1} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_S1} >= 15 )) && (( ${SERVER_AWG_S1} <= 150 )); do
-		read -rp "Server AmneziaWG S1 [15-150]: " -e -i ${RANDOM_AWG_S1} SERVER_AWG_S1
+		read -rp "Server AmneziaWG S1 [15-150]: " -e -i "${RANDOM_AWG_S1}" SERVER_AWG_S1
 	done
 	until [[ ${SERVER_AWG_S2} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_S2} >= 15 )) && (( ${SERVER_AWG_S2} <= 150 )); do
-		read -rp "Server AmneziaWG S2 [15-150]: " -e -i ${RANDOM_AWG_S2} SERVER_AWG_S2
+		read -rp "Server AmneziaWG S2 [15-150]: " -e -i "${RANDOM_AWG_S2}" SERVER_AWG_S2
 	done
 }
 
@@ -143,10 +143,10 @@ function readS3AndS4() {
 	SERVER_AWG_S3=0
 	SERVER_AWG_S4=0
 	until [[ ${SERVER_AWG_S3} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_S3} >= 15 )) && (( ${SERVER_AWG_S3} <= 150 )); do
-		read -rp "Server AmneziaWG S3 [15-150]: " -e -i ${RANDOM_AWG_S3} SERVER_AWG_S3
+		read -rp "Server AmneziaWG S3 [15-150]: " -e -i "${RANDOM_AWG_S3}" SERVER_AWG_S3
 	done
 	until [[ ${SERVER_AWG_S4} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_S4} >= 15 )) && (( ${SERVER_AWG_S4} <= 150 )); do
-		read -rp "Server AmneziaWG S4 [15-150]: " -e -i ${RANDOM_AWG_S4} SERVER_AWG_S4
+		read -rp "Server AmneziaWG S4 [15-150]: " -e -i "${RANDOM_AWG_S4}" SERVER_AWG_S4
 	done
 }
 
@@ -533,7 +533,7 @@ function installQuestions() {
 	# Jc
 	RANDOM_AWG_JC=$(shuf -i3-10 -n1)
 	until [[ ${SERVER_AWG_JC} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_JC} >= 1 )) && (( ${SERVER_AWG_JC} <= 128 )); do
-		read -rp "Server AmneziaWG Jc [1-128]: " -e -i ${RANDOM_AWG_JC} SERVER_AWG_JC
+		read -rp "Server AmneziaWG Jc [1-128]: " -e -i "${RANDOM_AWG_JC}" SERVER_AWG_JC
 	done
 
 	# Jmin && Jmax
@@ -1172,6 +1172,8 @@ function loadParams() {
 		}
 		
 		# Use safe quoting for string values to prevent shell injection when sourced
+		# Write to a temporary file first, then atomically rename to prevent partial writes
+		local PARAMS_TMP="${AMNEZIAWG_DIR}/params.tmp.$$"
 		if ! echo "SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
 SERVER_PUB_NIC=$(safeQuoteParam "${SERVER_PUB_NIC}")
 SERVER_AWG_NIC=$(safeQuoteParam "${SERVER_AWG_NIC}")
@@ -1193,8 +1195,15 @@ SERVER_AWG_S4=${SERVER_AWG_S4}
 SERVER_AWG_H1=$(safeQuoteParam "${SERVER_AWG_H1}")
 SERVER_AWG_H2=$(safeQuoteParam "${SERVER_AWG_H2}")
 SERVER_AWG_H3=$(safeQuoteParam "${SERVER_AWG_H3}")
-SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")" >"${AMNEZIAWG_DIR}/params"; then
-			restoreBackupsAndExit "ERROR: Failed to write params file."
+SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")" >"${PARAMS_TMP}"; then
+			rm -f "${PARAMS_TMP}"
+			restoreBackupsAndExit "Failed to write temporary params file."
+		fi
+		
+		# Atomically replace the params file to avoid partial writes on interruption
+		if ! mv -f "${PARAMS_TMP}" "${AMNEZIAWG_DIR}/params"; then
+			rm -f "${PARAMS_TMP}"
+			restoreBackupsAndExit "Failed to atomically replace params file."
 		fi
 		
 		# Update server configuration file with migrated values
