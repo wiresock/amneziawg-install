@@ -47,7 +47,7 @@ Run the script again to add or remove clients!
 
 This installer supports AmneziaWG 2.0 parameters:
 
-- **S3/S4**: Additional obfuscation parameters (with constraint S3 + 56 ? S4)
+- **S3/S4**: Additional obfuscation parameters (with constraint S3 + 56 != S4)
 - **H1-H4 Ranges**: Header randomization using non-overlapping ranges for enhanced traffic obfuscation
 
 ### Migration from Pre-2.0
