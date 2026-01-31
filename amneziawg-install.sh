@@ -202,15 +202,15 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	
 	# Validate that segment size is larger than range size
 	if (( SEGMENT_SIZE <= RANGE_SIZE )); then
-		echo -e "${RED}Error: Segment size (${SEGMENT_SIZE}) must be greater than range size (${RANGE_SIZE}).${NC}" >&2
-		# Fall back to fixed non-overlapping ranges
+		echo -e "${ORANGE}Warning: Segment size (${SEGMENT_SIZE}) must be greater than range size (${RANGE_SIZE}); using fallback fixed ranges.${NC}" >&2
+		# Fall back to fixed non-overlapping ranges (consistent GAP usage)
 		RANDOM_AWG_H1_MIN=5
 		RANDOM_AWG_H1_MAX=$((5 + RANGE_SIZE))
-		RANDOM_AWG_H2_MIN=$((RANDOM_AWG_H1_MAX + GAP + 1))
+		RANDOM_AWG_H2_MIN=$((RANDOM_AWG_H1_MAX + GAP))
 		RANDOM_AWG_H2_MAX=$((RANDOM_AWG_H2_MIN + RANGE_SIZE))
-		RANDOM_AWG_H3_MIN=$((RANDOM_AWG_H2_MAX + GAP + 1))
+		RANDOM_AWG_H3_MIN=$((RANDOM_AWG_H2_MAX + GAP))
 		RANDOM_AWG_H3_MAX=$((RANDOM_AWG_H3_MIN + RANGE_SIZE))
-		RANDOM_AWG_H4_MIN=$((RANDOM_AWG_H3_MAX + GAP + 1))
+		RANDOM_AWG_H4_MIN=$((RANDOM_AWG_H3_MAX + GAP))
 		RANDOM_AWG_H4_MAX=$((RANDOM_AWG_H4_MIN + RANGE_SIZE))
 		return
 	fi
@@ -237,16 +237,63 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	RANDOM_AWG_H4_MIN=${H4_START}
 	RANDOM_AWG_H4_MAX=$((H4_START + RANGE_SIZE))
 	
-	# Validate all generated ranges are within bounds
+	# Validate and clamp all generated ranges to [MIN_VAL, MAX_VAL]
 	if (( RANDOM_AWG_H1_MIN < MIN_VAL )) || (( RANDOM_AWG_H1_MAX > MAX_VAL )) ||
 	   (( RANDOM_AWG_H2_MIN < MIN_VAL )) || (( RANDOM_AWG_H2_MAX > MAX_VAL )) ||
 	   (( RANDOM_AWG_H3_MIN < MIN_VAL )) || (( RANDOM_AWG_H3_MAX > MAX_VAL )) ||
 	   (( RANDOM_AWG_H4_MIN < MIN_VAL )) || (( RANDOM_AWG_H4_MAX > MAX_VAL )); then
 		echo -e "${ORANGE}Warning: Generated ranges exceeded bounds. Using clamped values.${NC}" >&2
-		# Clamp H4_MAX to MAX_VAL if it exceeds
-		if (( RANDOM_AWG_H4_MAX > MAX_VAL )); then
-			RANDOM_AWG_H4_MAX=${MAX_VAL}
-			RANDOM_AWG_H4_MIN=$((MAX_VAL - RANGE_SIZE))
+	fi
+	
+	# Clamp H1
+	if (( RANDOM_AWG_H1_MIN < MIN_VAL )); then
+		RANDOM_AWG_H1_MIN=${MIN_VAL}
+		RANDOM_AWG_H1_MAX=$((RANDOM_AWG_H1_MIN + RANGE_SIZE))
+	fi
+	if (( RANDOM_AWG_H1_MAX > MAX_VAL )); then
+		RANDOM_AWG_H1_MAX=${MAX_VAL}
+		RANDOM_AWG_H1_MIN=$((RANDOM_AWG_H1_MAX - RANGE_SIZE))
+		if (( RANDOM_AWG_H1_MIN < MIN_VAL )); then
+			RANDOM_AWG_H1_MIN=${MIN_VAL}
+		fi
+	fi
+	
+	# Clamp H2
+	if (( RANDOM_AWG_H2_MIN < MIN_VAL )); then
+		RANDOM_AWG_H2_MIN=${MIN_VAL}
+		RANDOM_AWG_H2_MAX=$((RANDOM_AWG_H2_MIN + RANGE_SIZE))
+	fi
+	if (( RANDOM_AWG_H2_MAX > MAX_VAL )); then
+		RANDOM_AWG_H2_MAX=${MAX_VAL}
+		RANDOM_AWG_H2_MIN=$((RANDOM_AWG_H2_MAX - RANGE_SIZE))
+		if (( RANDOM_AWG_H2_MIN < MIN_VAL )); then
+			RANDOM_AWG_H2_MIN=${MIN_VAL}
+		fi
+	fi
+	
+	# Clamp H3
+	if (( RANDOM_AWG_H3_MIN < MIN_VAL )); then
+		RANDOM_AWG_H3_MIN=${MIN_VAL}
+		RANDOM_AWG_H3_MAX=$((RANDOM_AWG_H3_MIN + RANGE_SIZE))
+	fi
+	if (( RANDOM_AWG_H3_MAX > MAX_VAL )); then
+		RANDOM_AWG_H3_MAX=${MAX_VAL}
+		RANDOM_AWG_H3_MIN=$((RANDOM_AWG_H3_MAX - RANGE_SIZE))
+		if (( RANDOM_AWG_H3_MIN < MIN_VAL )); then
+			RANDOM_AWG_H3_MIN=${MIN_VAL}
+		fi
+	fi
+	
+	# Clamp H4
+	if (( RANDOM_AWG_H4_MIN < MIN_VAL )); then
+		RANDOM_AWG_H4_MIN=${MIN_VAL}
+		RANDOM_AWG_H4_MAX=$((RANDOM_AWG_H4_MIN + RANGE_SIZE))
+	fi
+	if (( RANDOM_AWG_H4_MAX > MAX_VAL )); then
+		RANDOM_AWG_H4_MAX=${MAX_VAL}
+		RANDOM_AWG_H4_MIN=$((RANDOM_AWG_H4_MAX - RANGE_SIZE))
+		if (( RANDOM_AWG_H4_MIN < MIN_VAL )); then
+			RANDOM_AWG_H4_MIN=${MIN_VAL}
 		fi
 	fi
 }
@@ -316,8 +363,6 @@ function readH1AndH2AndH3AndH4Ranges() {
 	SERVER_AWG_H3="${SERVER_AWG_H3_MIN}-${SERVER_AWG_H3_MAX}"
 	SERVER_AWG_H4="${SERVER_AWG_H4_MIN}-${SERVER_AWG_H4_MAX}"
 }
-
-function installQuestions() {
 
 function installQuestions() {
 	echo "AmneziaWG server installer (https://github.com/varckin/amneziawg-install)"
@@ -790,9 +835,17 @@ function loadParams() {
 		echo -e "${ORANGE}Setting default values for S3 and S4 for compatibility.${NC}"
 		echo ""
 		
-		# Generate default S3/S4 values that satisfy S3 + 56 != S4
+		# Generate default S3/S4 values.
+		# Values 15 and 150 satisfy the constraint S3 + 56 != S4 (15 + 56 = 71 ? 150)
 		SERVER_AWG_S3=15
 		SERVER_AWG_S4=150
+		
+		# Validate defaults
+		if (( SERVER_AWG_S3 + 56 == SERVER_AWG_S4 )); then
+			echo -e "${RED}ERROR: Invalid S3/S4 defaults: S3 + 56 must not equal S4.${NC}"
+			exit 1
+		fi
+		
 		NEEDS_UPDATE=1
 	fi
 	
@@ -838,10 +891,24 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"
 		
 		# Update server configuration file with migrated values
 		echo -e "${GREEN}Updating server configuration file...${NC}"
-		sed -i "s/^S3 = .*/S3 = ${SERVER_AWG_S3}/" "${SERVER_AWG_CONF}" 2>/dev/null || \
+		
+		# Insert or update S3 (try update first, then insert after S2)
+		if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
+			sed -i "s/^S3 = .*/S3 = ${SERVER_AWG_S3}/" "${SERVER_AWG_CONF}"
+		else
 			sed -i "/^S2 = .*/a S3 = ${SERVER_AWG_S3}" "${SERVER_AWG_CONF}"
-		sed -i "s/^S4 = .*/S4 = ${SERVER_AWG_S4}/" "${SERVER_AWG_CONF}" 2>/dev/null || \
+		fi
+		
+		# Insert or update S4 (try update first, then insert after S3, fallback to after S2)
+		if grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
+			sed -i "s/^S4 = .*/S4 = ${SERVER_AWG_S4}/" "${SERVER_AWG_CONF}"
+		elif grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
 			sed -i "/^S3 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"
+		else
+			sed -i "/^S2 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"
+		fi
+		
+		# Update H1-H4 values
 		sed -i "s/^H1 = .*/H1 = ${SERVER_AWG_H1}/" "${SERVER_AWG_CONF}"
 		sed -i "s/^H2 = .*/H2 = ${SERVER_AWG_H2}/" "${SERVER_AWG_CONF}"
 		sed -i "s/^H3 = .*/H3 = ${SERVER_AWG_H3}/" "${SERVER_AWG_CONF}"
@@ -852,6 +919,9 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"
 			echo -e "${GREEN}Reloading AmneziaWG configuration...${NC}"
 			awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
 		fi
+		
+		echo -e "${ORANGE}NOTE: Existing client configurations were not updated.${NC}"
+		echo -e "${ORANGE}Regenerate clients to apply new S3/S4 and H1-H4 parameters.${NC}"
 		echo ""
 	fi
 }
