@@ -7,11 +7,9 @@
 Supported distributions:
 
 - AlmaLinux >= 9
-- CentOS >= 9
 - Debian >= 11
-- Fedora >= 39
 - Rocky Linux >= 9
-- Ubuntu >= 20.04
+- Ubuntu >= 22.04
 
 2GB of free space is required for temporary files.
 
