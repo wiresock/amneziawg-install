@@ -170,7 +170,7 @@ function parseRange() {
 # Check if two ranges overlap
 # Note: Ranges that share a boundary point (e.g., [5-100] and [100-200]) ARE considered
 # overlapping. This is intentional to ensure ranges are fully separated. Use a GAP of at
-# least 1 when generating ranges to ensure no overlap (e.g., [5-100] and [102-200]).
+# least 1 when generating ranges to ensure no overlap (e.g., [5-100] and [101-200]).
 function rangesOverlap() {
 	local MIN1=$1
 	local MAX1=$2
