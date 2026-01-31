@@ -194,28 +194,29 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	local RANGE_SIZE=100000000  # Size of each range
 	local MIN_VAL=5
 	local MAX_VAL=2147483647
-	local AVAILABLE_RANGE=$((MAX_VAL - MIN_VAL))
+	local GAP=1  # Minimum gap between segments to prevent boundary overlap
+	local AVAILABLE_RANGE=$((MAX_VAL - MIN_VAL - GAP * 3))  # Account for gaps between 4 segments
 	
 	# Generate 4 non-overlapping ranges by dividing the available space into 4 segments
 	local SEGMENT_SIZE=$((AVAILABLE_RANGE / 4))
 	
-	# H1 range
-	local H1_START=$((MIN_VAL + SEGMENT_SIZE * 0 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	# H1 range (segment 0)
+	local H1_START=$((MIN_VAL + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
 	RANDOM_AWG_H1_MIN=${H1_START}
 	RANDOM_AWG_H1_MAX=$((H1_START + RANGE_SIZE))
 	
-	# H2 range
-	local H2_START=$((MIN_VAL + SEGMENT_SIZE * 1 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	# H2 range (segment 1, with gap after H1's segment)
+	local H2_START=$((MIN_VAL + SEGMENT_SIZE + GAP + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
 	RANDOM_AWG_H2_MIN=${H2_START}
 	RANDOM_AWG_H2_MAX=$((H2_START + RANGE_SIZE))
 	
-	# H3 range
-	local H3_START=$((MIN_VAL + SEGMENT_SIZE * 2 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	# H3 range (segment 2, with gap after H2's segment)
+	local H3_START=$((MIN_VAL + (SEGMENT_SIZE + GAP) * 2 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
 	RANDOM_AWG_H3_MIN=${H3_START}
 	RANDOM_AWG_H3_MAX=$((H3_START + RANGE_SIZE))
 	
-	# H4 range
-	local H4_START=$((MIN_VAL + SEGMENT_SIZE * 3 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	# H4 range (segment 3, with gap after H3's segment)
+	local H4_START=$((MIN_VAL + (SEGMENT_SIZE + GAP) * 3 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
 	RANDOM_AWG_H4_MIN=${H4_START}
 	RANDOM_AWG_H4_MAX=$((H4_START + RANGE_SIZE))
 }
@@ -260,22 +261,31 @@ function readH1AndH2AndH3AndH4Ranges() {
 			readHRange "${H_NAME}" "${RANDOM_MINS[$i]}" "${RANDOM_MAXS[$i]}"
 			VALID=1
 			
-			# Check for overlap with all previously defined ranges
-			for j in $(seq 0 $((i - 1))); do
-				local PREV_H="${H_NAMES[$j]}"
-				local PREV_MIN_VAR="SERVER_AWG_${PREV_H}_MIN"
-				local PREV_MAX_VAR="SERVER_AWG_${PREV_H}_MAX"
-				local CURR_MIN_VAR="SERVER_AWG_${H_NAME}_MIN"
-				local CURR_MAX_VAR="SERVER_AWG_${H_NAME}_MAX"
-				
-				if rangesOverlap "${!PREV_MIN_VAR}" "${!PREV_MAX_VAR}" "${!CURR_MIN_VAR}" "${!CURR_MAX_VAR}"; then
-					echo -e "${ORANGE}${H_NAME} range overlaps with ${PREV_H}. Please enter a non-overlapping range.${NC}"
-					VALID=0
-					break
-				fi
-			done
+			# Check for overlap with all previously defined ranges (skip for first range)
+			if (( i > 0 )); then
+				for (( j = 0; j < i; j++ )); do
+					local PREV_H="${H_NAMES[$j]}"
+					local PREV_MIN_VAR="SERVER_AWG_${PREV_H}_MIN"
+					local PREV_MAX_VAR="SERVER_AWG_${PREV_H}_MAX"
+					local CURR_MIN_VAR="SERVER_AWG_${H_NAME}_MIN"
+					local CURR_MAX_VAR="SERVER_AWG_${H_NAME}_MAX"
+					
+					if rangesOverlap "${!PREV_MIN_VAR}" "${!PREV_MAX_VAR}" "${!CURR_MIN_VAR}" "${!CURR_MAX_VAR}"; then
+						echo -e "${ORANGE}${H_NAME} range overlaps with ${PREV_H}. Please enter a non-overlapping range.${NC}"
+						VALID=0
+						break
+					fi
+				done
+			fi
 		done
 	done
+	
+	# Set the final SERVER_AWG_H* variables (combined min-max format for config files)
+	SERVER_AWG_H1="${SERVER_AWG_H1_MIN}-${SERVER_AWG_H1_MAX}"
+	SERVER_AWG_H2="${SERVER_AWG_H2_MIN}-${SERVER_AWG_H2_MAX}"
+	SERVER_AWG_H3="${SERVER_AWG_H3_MIN}-${SERVER_AWG_H3_MAX}"
+	SERVER_AWG_H4="${SERVER_AWG_H4_MIN}-${SERVER_AWG_H4_MAX}"
+}
 	
 	# Set the final SERVER_AWG_H* variables (combined min-max format for config files)
 	SERVER_AWG_H1="${SERVER_AWG_H1_MIN}-${SERVER_AWG_H1_MAX}"
@@ -746,6 +756,31 @@ function uninstallAmneziaWG() {
 function loadParams() {
 	source "${AMNEZIAWG_DIR}/params"
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+	
+	# Migration for pre-2.0 installations: check for missing S3/S4 parameters
+	if [[ -z "${SERVER_AWG_S3}" ]] || [[ -z "${SERVER_AWG_S4}" ]]; then
+		echo -e "${ORANGE}WARNING: Your installation predates AmneziaWG 2.0 and is missing S3/S4 parameters.${NC}"
+		echo -e "${ORANGE}Please consider reinstalling to enable full AmneziaWG 2.0 support.${NC}"
+		echo -e "${ORANGE}Setting default values for S3 and S4 for compatibility.${NC}"
+		echo ""
+		
+		# Generate default S3/S4 values that satisfy S3 + 56 != S4
+		SERVER_AWG_S3=15
+		SERVER_AWG_S4=150
+	fi
+	
+	# Migration for pre-2.0 installations: check if H1-H4 are single values instead of ranges
+	if [[ -n "${SERVER_AWG_H1}" ]] && [[ ! "${SERVER_AWG_H1}" =~ ^[0-9]+-[0-9]+$ ]]; then
+		echo -e "${ORANGE}WARNING: Your installation uses legacy single-value H1-H4 parameters.${NC}"
+		echo -e "${ORANGE}Converting to range format for AmneziaWG 2.0 compatibility.${NC}"
+		echo ""
+		
+		# Convert single values to ranges (value-value)
+		SERVER_AWG_H1="${SERVER_AWG_H1}-${SERVER_AWG_H1}"
+		SERVER_AWG_H2="${SERVER_AWG_H2}-${SERVER_AWG_H2}"
+		SERVER_AWG_H3="${SERVER_AWG_H3}-${SERVER_AWG_H3}"
+		SERVER_AWG_H4="${SERVER_AWG_H4}-${SERVER_AWG_H4}"
+	fi
 }
 
 function manageMenu() {
