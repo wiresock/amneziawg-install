@@ -416,21 +416,43 @@ function readH1AndH2AndH3AndH4Ranges() {
 }
 
 # Helper function to convert a single H value to range format if needed
-# Note: This function only checks format, not range validity (min <= max).
-# Range validity is enforced separately by validateRange() during user input
-# and by the AmneziaWG service when loading the configuration.
+# Validates that the value is numeric and within bounds [5-2147483647]
+# Returns 0 if conversion was needed and successful, 1 if no conversion needed,
+# 2 if validation failed (caller should regenerate the value)
 function convertHToRangeIfNeeded() {
 	local VAR_NAME=$1
 	local VALUE=${!VAR_NAME}
 	
-	# Only convert if value exists and is not already in range format
-	# Range format: "min-max" (e.g., "100-200")
-	if [[ -n "${VALUE}" ]] && [[ ! "${VALUE}" =~ ^[0-9]+-[0-9]+$ ]]; then
-		# Convert single value to range format (e.g., "100" -> "100-100")
-		printf -v "$VAR_NAME" '%s' "${VALUE}-${VALUE}"
-		return 0  # Conversion was needed
+	# No conversion needed if empty or already in range format
+	if [[ -z "${VALUE}" ]]; then
+		return 1  # No conversion needed (empty)
 	fi
-	return 1  # No conversion needed (already range format or empty)
+	
+	if [[ "${VALUE}" =~ ^[0-9]+-[0-9]+$ ]]; then
+		# Already in range format - validate the range
+		local RANGE_MIN RANGE_MAX
+		if parseRange "${VALUE}" "RANGE_MIN" "RANGE_MAX"; then
+			if validateRange "${RANGE_MIN}" "${RANGE_MAX}" 5 2147483647; then
+				return 1  # No conversion needed (valid range format)
+			fi
+		fi
+		# Invalid range format - signal caller to regenerate
+		return 2
+	fi
+	
+	# Single value - validate it's numeric and within bounds
+	if [[ "${VALUE}" =~ ^[0-9]+$ ]]; then
+		# Force base-10 interpretation to avoid octal issues
+		local NUM_VALUE=$((10#${VALUE}))
+		if (( NUM_VALUE >= 5 )) && (( NUM_VALUE <= 2147483647 )); then
+			# Valid single value - convert to range format
+			printf -v "$VAR_NAME" '%s' "${NUM_VALUE}-${NUM_VALUE}"
+			return 0  # Conversion was needed and successful
+		fi
+	fi
+	
+	# Invalid value (non-numeric or out of bounds) - signal caller to regenerate
+	return 2
 }
 
 function installQuestions() {
@@ -932,8 +954,12 @@ function loadParams() {
 		CONF_S4=$(grep -E "^S4 = " "${SERVER_AWG_CONF}" 2>/dev/null | sed 's/^S4 = //')
 		
 		if [[ -n "${CONF_S3}" ]] && [[ -n "${CONF_S4}" ]]; then
-			# Validate that loaded values are numeric and satisfy S3 + 56 != S4
-			if [[ "${CONF_S3}" =~ ^[0-9]+$ ]] && [[ "${CONF_S4}" =~ ^[0-9]+$ ]] && (( CONF_S3 + 56 != CONF_S4 )); then
+			# Validate that loaded values are numeric, within valid range [15-150],
+			# and satisfy the constraint S3 + 56 != S4
+			if [[ "${CONF_S3}" =~ ^[0-9]+$ ]] && [[ "${CONF_S4}" =~ ^[0-9]+$ ]] && \
+			   (( CONF_S3 >= 15 )) && (( CONF_S3 <= 150 )) && \
+			   (( CONF_S4 >= 15 )) && (( CONF_S4 <= 150 )) && \
+			   (( CONF_S3 + 56 != CONF_S4 )); then
 				SERVER_AWG_S3="${CONF_S3}"
 				SERVER_AWG_S4="${CONF_S4}"
 			else
@@ -1128,15 +1154,20 @@ SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"; then
 		# Migration successful, remove backups
 		rm -f "${SERVER_AWG_CONF}.bak" "${AMNEZIAWG_DIR}/params.bak"
 		
-		# Rename existing client config files to indicate they're outdated
+				# Rename existing client config files that don't have the new parameters
 		# This prevents confusion when users try to use old configs after migration
+		# Only rename configs that are actually outdated (missing S3/S4 parameters)
 		echo -e "${GREEN}Marking old client configurations as outdated...${NC}"
 		local CLIENT_CONFIGS_RENAMED=0
 		while IFS= read -r CLIENT_CONF; do
 			if [[ -f "${CLIENT_CONF}" ]]; then
-				mv "${CLIENT_CONF}" "${CLIENT_CONF}.old"
-				echo -e "${ORANGE}  Renamed: ${CLIENT_CONF} -> ${CLIENT_CONF}.old${NC}"
-				CLIENT_CONFIGS_RENAMED=$((CLIENT_CONFIGS_RENAMED + 1))
+				# Only rename if the config doesn't already have S3 parameter
+				# (indicating it's a pre-2.0 config that needs regeneration)
+				if ! grep -q "^S3 = " "${CLIENT_CONF}"; then
+					mv "${CLIENT_CONF}" "${CLIENT_CONF}.old"
+					echo -e "${ORANGE}  Renamed: ${CLIENT_CONF} -> ${CLIENT_CONF}.old${NC}"
+					CLIENT_CONFIGS_RENAMED=$((CLIENT_CONFIGS_RENAMED + 1))
+				fi
 			fi
 		done < <(find /home /root -name "${SERVER_AWG_NIC}-client-*.conf" 2>/dev/null)
 		
