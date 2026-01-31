@@ -200,25 +200,55 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	# Generate 4 non-overlapping ranges by dividing the available space into 4 segments
 	local SEGMENT_SIZE=$((AVAILABLE_RANGE / 4))
 	
+	# Validate that segment size is larger than range size
+	if (( SEGMENT_SIZE <= RANGE_SIZE )); then
+		echo -e "${RED}Error: Segment size (${SEGMENT_SIZE}) must be greater than range size (${RANGE_SIZE}).${NC}" >&2
+		# Fall back to fixed non-overlapping ranges
+		RANDOM_AWG_H1_MIN=5
+		RANDOM_AWG_H1_MAX=$((5 + RANGE_SIZE))
+		RANDOM_AWG_H2_MIN=$((RANDOM_AWG_H1_MAX + GAP + 1))
+		RANDOM_AWG_H2_MAX=$((RANDOM_AWG_H2_MIN + RANGE_SIZE))
+		RANDOM_AWG_H3_MIN=$((RANDOM_AWG_H2_MAX + GAP + 1))
+		RANDOM_AWG_H3_MAX=$((RANDOM_AWG_H3_MIN + RANGE_SIZE))
+		RANDOM_AWG_H4_MIN=$((RANDOM_AWG_H3_MAX + GAP + 1))
+		RANDOM_AWG_H4_MAX=$((RANDOM_AWG_H4_MIN + RANGE_SIZE))
+		return
+	fi
+	
+	local RANDOM_OFFSET_MAX=$((SEGMENT_SIZE - RANGE_SIZE))
+	
 	# H1 range (segment 0)
-	local H1_START=$((MIN_VAL + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	local H1_START=$((MIN_VAL + $(shuf -i0-${RANDOM_OFFSET_MAX} -n1)))
 	RANDOM_AWG_H1_MIN=${H1_START}
 	RANDOM_AWG_H1_MAX=$((H1_START + RANGE_SIZE))
 	
 	# H2 range (segment 1, with gap after H1's segment)
-	local H2_START=$((MIN_VAL + SEGMENT_SIZE + GAP + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	local H2_START=$((MIN_VAL + SEGMENT_SIZE + GAP + $(shuf -i0-${RANDOM_OFFSET_MAX} -n1)))
 	RANDOM_AWG_H2_MIN=${H2_START}
 	RANDOM_AWG_H2_MAX=$((H2_START + RANGE_SIZE))
 	
 	# H3 range (segment 2, with gap after H2's segment)
-	local H3_START=$((MIN_VAL + (SEGMENT_SIZE + GAP) * 2 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	local H3_START=$((MIN_VAL + (SEGMENT_SIZE + GAP) * 2 + $(shuf -i0-${RANDOM_OFFSET_MAX} -n1)))
 	RANDOM_AWG_H3_MIN=${H3_START}
 	RANDOM_AWG_H3_MAX=$((H3_START + RANGE_SIZE))
 	
 	# H4 range (segment 3, with gap after H3's segment)
-	local H4_START=$((MIN_VAL + (SEGMENT_SIZE + GAP) * 3 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	local H4_START=$((MIN_VAL + (SEGMENT_SIZE + GAP) * 3 + $(shuf -i0-${RANDOM_OFFSET_MAX} -n1)))
 	RANDOM_AWG_H4_MIN=${H4_START}
 	RANDOM_AWG_H4_MAX=$((H4_START + RANGE_SIZE))
+	
+	# Validate all generated ranges are within bounds
+	if (( RANDOM_AWG_H1_MIN < MIN_VAL )) || (( RANDOM_AWG_H1_MAX > MAX_VAL )) ||
+	   (( RANDOM_AWG_H2_MIN < MIN_VAL )) || (( RANDOM_AWG_H2_MAX > MAX_VAL )) ||
+	   (( RANDOM_AWG_H3_MIN < MIN_VAL )) || (( RANDOM_AWG_H3_MAX > MAX_VAL )) ||
+	   (( RANDOM_AWG_H4_MIN < MIN_VAL )) || (( RANDOM_AWG_H4_MAX > MAX_VAL )); then
+		echo -e "${ORANGE}Warning: Generated ranges exceeded bounds. Using clamped values.${NC}" >&2
+		# Clamp H4_MAX to MAX_VAL if it exceeds
+		if (( RANDOM_AWG_H4_MAX > MAX_VAL )); then
+			RANDOM_AWG_H4_MAX=${MAX_VAL}
+			RANDOM_AWG_H4_MIN=$((MAX_VAL - RANGE_SIZE))
+		fi
+	fi
 }
 
 function readHRange() {
@@ -286,13 +316,8 @@ function readH1AndH2AndH3AndH4Ranges() {
 	SERVER_AWG_H3="${SERVER_AWG_H3_MIN}-${SERVER_AWG_H3_MAX}"
 	SERVER_AWG_H4="${SERVER_AWG_H4_MIN}-${SERVER_AWG_H4_MAX}"
 }
-	
-	# Set the final SERVER_AWG_H* variables (combined min-max format for config files)
-	SERVER_AWG_H1="${SERVER_AWG_H1_MIN}-${SERVER_AWG_H1_MAX}"
-	SERVER_AWG_H2="${SERVER_AWG_H2_MIN}-${SERVER_AWG_H2_MAX}"
-	SERVER_AWG_H3="${SERVER_AWG_H3_MIN}-${SERVER_AWG_H3_MAX}"
-	SERVER_AWG_H4="${SERVER_AWG_H4_MIN}-${SERVER_AWG_H4_MAX}"
-}
+
+function installQuestions() {
 
 function installQuestions() {
 	echo "AmneziaWG server installer (https://github.com/varckin/amneziawg-install)"
@@ -384,7 +409,7 @@ function installQuestions() {
 	done
 	readS3AndS4
 	while (( ${SERVER_AWG_S3} + 56 == ${SERVER_AWG_S4} )); do
-		echo "AmneziaWG require S3 + 56 <> S4"
+		echo "AmneziaWG requires S3 + 56 <> S4"
 		readS3AndS4
 	done
 
@@ -757,16 +782,18 @@ function loadParams() {
 	source "${AMNEZIAWG_DIR}/params"
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 	
+	local NEEDS_UPDATE=0
+	
 	# Migration for pre-2.0 installations: check for missing S3/S4 parameters
 	if [[ -z "${SERVER_AWG_S3}" ]] || [[ -z "${SERVER_AWG_S4}" ]]; then
 		echo -e "${ORANGE}WARNING: Your installation predates AmneziaWG 2.0 and is missing S3/S4 parameters.${NC}"
-		echo -e "${ORANGE}Please consider reinstalling to enable full AmneziaWG 2.0 support.${NC}"
 		echo -e "${ORANGE}Setting default values for S3 and S4 for compatibility.${NC}"
 		echo ""
 		
 		# Generate default S3/S4 values that satisfy S3 + 56 != S4
 		SERVER_AWG_S3=15
 		SERVER_AWG_S4=150
+		NEEDS_UPDATE=1
 	fi
 	
 	# Migration for pre-2.0 installations: check if H1-H4 are single values instead of ranges
@@ -780,6 +807,52 @@ function loadParams() {
 		SERVER_AWG_H2="${SERVER_AWG_H2}-${SERVER_AWG_H2}"
 		SERVER_AWG_H3="${SERVER_AWG_H3}-${SERVER_AWG_H3}"
 		SERVER_AWG_H4="${SERVER_AWG_H4}-${SERVER_AWG_H4}"
+		NEEDS_UPDATE=1
+	fi
+	
+	# Persist migrated values to params file and update server config
+	if [[ ${NEEDS_UPDATE} == 1 ]]; then
+		echo -e "${GREEN}Updating params file with migrated values...${NC}"
+		echo "SERVER_PUB_IP=${SERVER_PUB_IP}
+SERVER_PUB_NIC=${SERVER_PUB_NIC}
+SERVER_AWG_NIC=${SERVER_AWG_NIC}
+SERVER_AWG_IPV4=${SERVER_AWG_IPV4}
+SERVER_AWG_IPV6=${SERVER_AWG_IPV6}
+SERVER_PORT=${SERVER_PORT}
+SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
+SERVER_PUB_KEY=${SERVER_PUB_KEY}
+CLIENT_DNS_1=${CLIENT_DNS_1}
+CLIENT_DNS_2=${CLIENT_DNS_2}
+ALLOWED_IPS=${ALLOWED_IPS}
+SERVER_AWG_JC=${SERVER_AWG_JC}
+SERVER_AWG_JMIN=${SERVER_AWG_JMIN}
+SERVER_AWG_JMAX=${SERVER_AWG_JMAX}
+SERVER_AWG_S1=${SERVER_AWG_S1}
+SERVER_AWG_S2=${SERVER_AWG_S2}
+SERVER_AWG_S3=${SERVER_AWG_S3}
+SERVER_AWG_S4=${SERVER_AWG_S4}
+SERVER_AWG_H1=${SERVER_AWG_H1}
+SERVER_AWG_H2=${SERVER_AWG_H2}
+SERVER_AWG_H3=${SERVER_AWG_H3}
+SERVER_AWG_H4=${SERVER_AWG_H4}" >"${AMNEZIAWG_DIR}/params"
+		
+		# Update server configuration file with migrated values
+		echo -e "${GREEN}Updating server configuration file...${NC}"
+		sed -i "s/^S3 = .*/S3 = ${SERVER_AWG_S3}/" "${SERVER_AWG_CONF}" 2>/dev/null || \
+			sed -i "/^S2 = .*/a S3 = ${SERVER_AWG_S3}" "${SERVER_AWG_CONF}"
+		sed -i "s/^S4 = .*/S4 = ${SERVER_AWG_S4}/" "${SERVER_AWG_CONF}" 2>/dev/null || \
+			sed -i "/^S3 = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"
+		sed -i "s/^H1 = .*/H1 = ${SERVER_AWG_H1}/" "${SERVER_AWG_CONF}"
+		sed -i "s/^H2 = .*/H2 = ${SERVER_AWG_H2}/" "${SERVER_AWG_CONF}"
+		sed -i "s/^H3 = .*/H3 = ${SERVER_AWG_H3}/" "${SERVER_AWG_CONF}"
+		sed -i "s/^H4 = .*/H4 = ${SERVER_AWG_H4}/" "${SERVER_AWG_CONF}"
+		
+		# Reload AmneziaWG configuration
+		if systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
+			echo -e "${GREEN}Reloading AmneziaWG configuration...${NC}"
+			awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+		fi
+		echo ""
 	fi
 }
 
