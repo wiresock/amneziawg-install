@@ -125,30 +125,175 @@ function readS1AndS2() {
 	done
 }
 
-function generateH1AndH2AndH3AndH4() {
-	RANDOM_AWG_H1=$(shuf -i5-2147483647 -n1)
-	RANDOM_AWG_H2=$(shuf -i5-2147483647 -n1)
-	RANDOM_AWG_H3=$(shuf -i5-2147483647 -n1)
-	RANDOM_AWG_H4=$(shuf -i5-2147483647 -n1)
+function generateS3AndS4() {
+	RANDOM_AWG_S3=$(shuf -i15-150 -n1)
+	RANDOM_AWG_S4=$(shuf -i15-150 -n1)
 }
 
-function readH1AndH2AndH3AndH4() {
-	SERVER_AWG_H1=0
-	SERVER_AWG_H2=0
-	SERVER_AWG_H3=0
-	SERVER_AWG_H4=0
-	until [[ ${SERVER_AWG_H1} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_H1} >= 5 )) && (( ${SERVER_AWG_H1} <= 2147483647 )); do
-		read -rp "Server AmneziaWG H1 [5-2147483647]: " -e -i ${RANDOM_AWG_H1} SERVER_AWG_H1
+function readS3AndS4() {
+	SERVER_AWG_S3=0
+	SERVER_AWG_S4=0
+	until [[ ${SERVER_AWG_S3} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_S3} >= 15 )) && (( ${SERVER_AWG_S3} <= 150 )); do
+		read -rp "Server AmneziaWG S3 [15-150]: " -e -i ${RANDOM_AWG_S3} SERVER_AWG_S3
 	done
-	until [[ ${SERVER_AWG_H2} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_H2} >= 5 )) && (( ${SERVER_AWG_H2} <= 2147483647 )); do
-		read -rp "Server AmneziaWG H2 [5-2147483647]: " -e -i ${RANDOM_AWG_H2} SERVER_AWG_H2
+	until [[ ${SERVER_AWG_S4} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_S4} >= 15 )) && (( ${SERVER_AWG_S4} <= 150 )); do
+		read -rp "Server AmneziaWG S4 [15-150]: " -e -i ${RANDOM_AWG_S4} SERVER_AWG_S4
 	done
-	until [[ ${SERVER_AWG_H3} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_H3} >= 5 )) && (( ${SERVER_AWG_H3} <= 2147483647 )); do
-		read -rp "Server AmneziaWG H3 [5-2147483647]: " -e -i ${RANDOM_AWG_H3} SERVER_AWG_H3
+}
+
+# Parse a range string "min-max" or single value into MIN and MAX variables
+function parseRange() {
+	local INPUT=$1
+	local VAR_PREFIX=$2
+	
+	if [[ ${INPUT} =~ ^([0-9]+)-([0-9]+)$ ]]; then
+		eval "${VAR_PREFIX}_MIN=${BASH_REMATCH[1]}"
+		eval "${VAR_PREFIX}_MAX=${BASH_REMATCH[2]}"
+	elif [[ ${INPUT} =~ ^[0-9]+$ ]]; then
+		eval "${VAR_PREFIX}_MIN=${INPUT}"
+		eval "${VAR_PREFIX}_MAX=${INPUT}"
+	else
+		return 1
+	fi
+	return 0
+}
+
+# Check if two ranges overlap
+function rangesOverlap() {
+	local MIN1=$1
+	local MAX1=$2
+	local MIN2=$3
+	local MAX2=$4
+	
+	# Ranges overlap if NOT (max1 < min2 OR max2 < min1)
+	if (( MAX1 < MIN2 )) || (( MAX2 < MIN1 )); then
+		return 1  # No overlap
+	fi
+	return 0  # Overlap exists
+}
+
+# Validate that a range is valid (min <= max) and within bounds
+function validateRange() {
+	local MIN=$1
+	local MAX=$2
+	local LOWER_BOUND=$3
+	local UPPER_BOUND=$4
+	
+	if (( MIN > MAX )); then
+		return 1
+	fi
+	if (( MIN < LOWER_BOUND )) || (( MAX > UPPER_BOUND )); then
+		return 1
+	fi
+	return 0
+}
+
+# Generate non-overlapping random ranges for H1-H4
+function generateH1AndH2AndH3AndH4Ranges() {
+	local RANGE_SIZE=100000000  # Size of each range
+	local MIN_VAL=5
+	local MAX_VAL=2147483647
+	local AVAILABLE_RANGE=$((MAX_VAL - MIN_VAL))
+	
+	# Generate 4 non-overlapping ranges by dividing the available space
+	local SEGMENT_SIZE=$((AVAILABLE_RANGE / 5))
+	
+	# H1 range
+	local H1_START=$((MIN_VAL + SEGMENT_SIZE * 0 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	RANDOM_AWG_H1_MIN=${H1_START}
+	RANDOM_AWG_H1_MAX=$((H1_START + RANGE_SIZE))
+	
+	# H2 range
+	local H2_START=$((MIN_VAL + SEGMENT_SIZE * 1 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	RANDOM_AWG_H2_MIN=${H2_START}
+	RANDOM_AWG_H2_MAX=$((H2_START + RANGE_SIZE))
+	
+	# H3 range
+	local H3_START=$((MIN_VAL + SEGMENT_SIZE * 2 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	RANDOM_AWG_H3_MIN=${H3_START}
+	RANDOM_AWG_H3_MAX=$((H3_START + RANGE_SIZE))
+	
+	# H4 range
+	local H4_START=$((MIN_VAL + SEGMENT_SIZE * 3 + $(shuf -i0-$((SEGMENT_SIZE - RANGE_SIZE)) -n1)))
+	RANDOM_AWG_H4_MIN=${H4_START}
+	RANDOM_AWG_H4_MAX=$((H4_START + RANGE_SIZE))
+}
+
+function readHRange() {
+	local H_NAME=$1
+	local DEFAULT_MIN=$2
+	local DEFAULT_MAX=$3
+	local RESULT_VAR_MIN="${H_NAME}_MIN"
+	local RESULT_VAR_MAX="${H_NAME}_MAX"
+	
+	local INPUT=""
+	local VALID=0
+	
+	until [[ ${VALID} == 1 ]]; do
+		read -rp "Server AmneziaWG ${H_NAME} [5-2147483647] (format: min-max or single value): " -e -i "${DEFAULT_MIN}-${DEFAULT_MAX}" INPUT
+		
+		if parseRange "${INPUT}" "TEMP"; then
+			if validateRange "${TEMP_MIN}" "${TEMP_MAX}" 5 2147483647; then
+				eval "${RESULT_VAR_MIN}=${TEMP_MIN}"
+				eval "${RESULT_VAR_MAX}=${TEMP_MAX}"
+				VALID=1
+			else
+				echo -e "${ORANGE}Invalid range. Min must be <= Max and both must be between 5 and 2147483647.${NC}"
+			fi
+		else
+			echo -e "${ORANGE}Invalid format. Use 'min-max' for a range or a single number.${NC}"
+		fi
 	done
-	until [[ ${SERVER_AWG_H4} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_H4} >= 5 )) && (( ${SERVER_AWG_H4} <= 2147483647 )); do
-		read -rp "Server AmneziaWG H4 [5-2147483647]: " -e -i ${RANDOM_AWG_H4} SERVER_AWG_H4
+}
+
+function readH1AndH2AndH3AndH4Ranges() {
+	# Read H1 range
+	readHRange "H1" "${RANDOM_AWG_H1_MIN}" "${RANDOM_AWG_H1_MAX}"
+	
+	# Read H2 range and check for overlap with H1
+	local H2_VALID=0
+	until [[ ${H2_VALID} == 1 ]]; do
+		readHRange "H2" "${RANDOM_AWG_H2_MIN}" "${RANDOM_AWG_H2_MAX}"
+		if rangesOverlap "${H1_MIN}" "${H1_MAX}" "${H2_MIN}" "${H2_MAX}"; then
+			echo -e "${ORANGE}H2 range overlaps with H1. Please enter a non-overlapping range.${NC}"
+		else
+			H2_VALID=1
+		fi
 	done
+	
+	# Read H3 range and check for overlap with H1 and H2
+	local H3_VALID=0
+	until [[ ${H3_VALID} == 1 ]]; do
+		readHRange "H3" "${RANDOM_AWG_H3_MIN}" "${RANDOM_AWG_H3_MAX}"
+		if rangesOverlap "${H1_MIN}" "${H1_MAX}" "${H3_MIN}" "${H3_MAX}"; then
+			echo -e "${ORANGE}H3 range overlaps with H1. Please enter a non-overlapping range.${NC}"
+		elif rangesOverlap "${H2_MIN}" "${H2_MAX}" "${H3_MIN}" "${H3_MAX}"; then
+			echo -e "${ORANGE}H3 range overlaps with H2. Please enter a non-overlapping range.${NC}"
+		else
+			H3_VALID=1
+		fi
+	done
+	
+	# Read H4 range and check for overlap with H1, H2, and H3
+	local H4_VALID=0
+	until [[ ${H4_VALID} == 1 ]]; do
+		readHRange "H4" "${RANDOM_AWG_H4_MIN}" "${RANDOM_AWG_H4_MAX}"
+		if rangesOverlap "${H1_MIN}" "${H1_MAX}" "${H4_MIN}" "${H4_MAX}"; then
+			echo -e "${ORANGE}H4 range overlaps with H1. Please enter a non-overlapping range.${NC}"
+		elif rangesOverlap "${H2_MIN}" "${H2_MAX}" "${H4_MIN}" "${H4_MAX}"; then
+			echo -e "${ORANGE}H4 range overlaps with H2. Please enter a non-overlapping range.${NC}"
+		elif rangesOverlap "${H3_MIN}" "${H3_MAX}" "${H4_MIN}" "${H4_MAX}"; then
+			echo -e "${ORANGE}H4 range overlaps with H3. Please enter a non-overlapping range.${NC}"
+		else
+			H4_VALID=1
+		fi
+	done
+	
+	# Set the final SERVER_AWG_H* variables
+	SERVER_AWG_H1="${H1_MIN}-${H1_MAX}"
+	SERVER_AWG_H2="${H2_MIN}-${H2_MAX}"
+	SERVER_AWG_H3="${H3_MIN}-${H3_MAX}"
+	SERVER_AWG_H4="${H4_MIN}-${H4_MAX}"
 }
 
 function installQuestions() {
@@ -233,16 +378,22 @@ function installQuestions() {
 		readS1AndS2
 	done
 
-	# H1 && H2 && H3 && H4
-	generateH1AndH2AndH3AndH4
-	while (( ${RANDOM_AWG_H1} == ${RANDOM_AWG_H2} )) || (( ${RANDOM_AWG_H1} == ${RANDOM_AWG_H3} )) || (( ${RANDOM_AWG_H1} == ${RANDOM_AWG_H4} )) || (( ${RANDOM_AWG_H2} == ${RANDOM_AWG_H3} )) || (( ${RANDOM_AWG_H2} == ${RANDOM_AWG_H4} )) || (( ${RANDOM_AWG_H3} == ${RANDOM_AWG_H4} )); do
-		generateH1AndH2AndH3AndH4
+	# S3 && S4 (AmneziaWG 2.0)
+	echo -e "\n${GREEN}AmneziaWG 2.0 Features:${NC}"
+	generateS3AndS4
+	while (( ${RANDOM_AWG_S3} + 56 == ${RANDOM_AWG_S4} )); do
+		generateS3AndS4
 	done
-	readH1AndH2AndH3AndH4
-	while (( ${SERVER_AWG_H1} == ${SERVER_AWG_H2} )) || (( ${SERVER_AWG_H1} == ${SERVER_AWG_H3} )) || (( ${SERVER_AWG_H1} == ${SERVER_AWG_H4} )) || (( ${SERVER_AWG_H2} == ${SERVER_AWG_H3} )) || (( ${SERVER_AWG_H2} == ${SERVER_AWG_H4} )) || (( ${SERVER_AWG_H3} == ${SERVER_AWG_H4} )); do
-		echo "AmneziaWG require H1 and H2 and H3 and H4 be different"
-		readH1AndH2AndH3AndH4
+	readS3AndS4
+	while (( ${SERVER_AWG_S3} + 56 == ${SERVER_AWG_S4} )); do
+		echo "AmneziaWG require S3 + 56 <> S4"
+		readS3AndS4
 	done
+
+	# H1-H4 Ranged Headers (AmneziaWG 2.0)
+	echo -e "\n${GREEN}H1-H4 Ranged Headers (ranges must not overlap):${NC}"
+	generateH1AndH2AndH3AndH4Ranges
+	readH1AndH2AndH3AndH4Ranges
 
 	echo ""
 	echo "Okay, that was all I needed. We are ready to setup your AmneziaWG server now."
@@ -314,6 +465,8 @@ SERVER_AWG_JMIN=${SERVER_AWG_JMIN}
 SERVER_AWG_JMAX=${SERVER_AWG_JMAX}
 SERVER_AWG_S1=${SERVER_AWG_S1}
 SERVER_AWG_S2=${SERVER_AWG_S2}
+SERVER_AWG_S3=${SERVER_AWG_S3}
+SERVER_AWG_S4=${SERVER_AWG_S4}
 SERVER_AWG_H1=${SERVER_AWG_H1}
 SERVER_AWG_H2=${SERVER_AWG_H2}
 SERVER_AWG_H3=${SERVER_AWG_H3}
@@ -329,6 +482,8 @@ Jmin = ${SERVER_AWG_JMIN}
 Jmax = ${SERVER_AWG_JMAX}
 S1 = ${SERVER_AWG_S1}
 S2 = ${SERVER_AWG_S2}
+S3 = ${SERVER_AWG_S3}
+S4 = ${SERVER_AWG_S4}
 H1 = ${SERVER_AWG_H1}
 H2 = ${SERVER_AWG_H2}
 H3 = ${SERVER_AWG_H3}
@@ -467,6 +622,8 @@ Jmin = ${SERVER_AWG_JMIN}
 Jmax = ${SERVER_AWG_JMAX}
 S1 = ${SERVER_AWG_S1}
 S2 = ${SERVER_AWG_S2}
+S3 = ${SERVER_AWG_S3}
+S4 = ${SERVER_AWG_S4}
 H1 = ${SERVER_AWG_H1}
 H2 = ${SERVER_AWG_H2}
 H3 = ${SERVER_AWG_H3}
