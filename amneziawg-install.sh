@@ -260,6 +260,9 @@ function generateH1AndH2AndH3AndH4Ranges() {
 		# Note: With current constants (RANGE_SIZE=100M, MAX_VAL=2.1B), four ranges plus gaps
 		# total ~400M which fits comfortably. This fallback exists for future-proofing if
 		# constants are changed to values that reduce available randomization space.
+		#
+		# IMPORTANT: Constants must satisfy: MIN_VAL + 4*RANGE_SIZE + 3*GAP <= MAX_VAL
+		# With current values: 5 + 4*100000000 + 3*1 = 400,000,008 <= 2,147,483,647 (OK)
 		RANDOM_AWG_H1_MIN=${MIN_VAL}
 		RANDOM_AWG_H1_MAX=$((MIN_VAL + RANGE_SIZE))
 		RANDOM_AWG_H2_MIN=$((RANDOM_AWG_H1_MAX + GAP))
