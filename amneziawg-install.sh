@@ -625,6 +625,14 @@ function installAmneziaWG() {
 		dnf install -y amneziawg-dkms amneziawg-tools qrencode iptables
 	fi
 
+	# Rebuild module dependency cache (required for DKMS + compressed modules, especially on ARM/Ubuntu)
+	depmod -a
+
+	# Ensure AmneziaWG kernel module is loaded at boot (before awg-quick service starts)
+	if [[ ! -f /etc/modules-load.d/amneziawg.conf ]]; then
+		echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
+	fi
+
 	# Ensure configuration directory exists
 	mkdir -p "${AMNEZIAWG_DIR}"
 
