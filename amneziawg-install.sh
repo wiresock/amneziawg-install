@@ -626,11 +626,19 @@ function installAmneziaWG() {
 	fi
 
 	# Rebuild module dependency cache (required for DKMS + compressed modules, especially on ARM/Ubuntu)
-	depmod -a
+	if command -v depmod &>/dev/null; then
+		if ! depmod -a; then
+			echo -e "${ORANGE}WARNING: depmod -a failed. The kernel module may not load correctly.${NC}"
+			echo -e "${ORANGE}You may need to reboot after installation.${NC}"
+		fi
+	else
+		echo -e "${ORANGE}WARNING: depmod not found. Skipping module dependency cache rebuild.${NC}"
+	fi
 
 	# Ensure AmneziaWG kernel module is loaded at boot (before awg-quick service starts)
-	if ! grep -qFx "amneziawg" /etc/modules-load.d/amneziawg.conf 2>/dev/null; then
-		echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
+	mkdir -p /etc/modules-load.d
+	if ! grep -qx "amneziawg" /etc/modules-load.d/amneziawg.conf 2>/dev/null; then
+		echo "amneziawg" >> /etc/modules-load.d/amneziawg.conf
 	fi
 
 	# Ensure configuration directory exists
