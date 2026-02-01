@@ -629,7 +629,7 @@ function installAmneziaWG() {
 	depmod -a
 
 	# Ensure AmneziaWG kernel module is loaded at boot (before awg-quick service starts)
-	if [[ ! -f /etc/modules-load.d/amneziawg.conf ]]; then
+	if ! grep -qFx "amneziawg" /etc/modules-load.d/amneziawg.conf 2>/dev/null; then
 		echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
 	fi
 
