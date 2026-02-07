@@ -926,7 +926,7 @@ function uninstallAmneziaWG() {
 		sysctl --system
 
 		# Remove config files
-		rm -rf ${AMNEZIAWG_DIR}/*
+		rm -rf "${AMNEZIAWG_DIR:?}"/*
 
 		if [[ ${OS} == 'ubuntu' ]]; then
 			apt remove -y amneziawg amneziawg-tools
