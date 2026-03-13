@@ -1742,6 +1742,7 @@ function validateParamsFile() {
 		fi
 	fi
 
+	# shellcheck source=/etc/amnezia/amneziawg/params
 	if ! source "${AMNEZIAWG_DIR}/params"; then
 		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}"
 		echo -e "${ORANGE}The file may be corrupted or contain a syntax error. Fix or regenerate it and rerun the installer.${NC}"
