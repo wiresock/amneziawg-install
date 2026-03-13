@@ -1439,7 +1439,7 @@ function uninstallAmneziaWG() {
 		systemctl disable "awg-quick@${SERVER_AWG_NIC}"
 
 		# Remove systemd drop-in override created during install
-		rm -rf "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC}.service.d"
+		rm -rf "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC:?}.service.d"
 		systemctl daemon-reload
 
 		# Remove module auto-load entry
@@ -1452,7 +1452,7 @@ function uninstallAmneziaWG() {
 		rm -f /etc/sysctl.d/awg.conf
 
 		# Remove config files
-		rm -rf "${AMNEZIAWG_DIR}"
+		rm -rf "${AMNEZIAWG_DIR:?}"
 
 		if [[ ${OS} == 'ubuntu' ]]; then
 			apt remove -y amneziawg amneziawg-tools
