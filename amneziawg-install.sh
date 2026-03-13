@@ -1639,10 +1639,23 @@ function validateParamsFile() {
 	# Require mode 600 or 400: the file contains SERVER_PRIV_KEY and must not be
 	# readable or writable by group/other. Modes like 644 would leak the private key.
 	if [[ "${PARAMS_PERMS}" != "600" ]] && [[ "${PARAMS_PERMS}" != "400" ]]; then
-		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params has insecure permissions (${PARAMS_PERMS}).${NC}"
+		echo -e "${RED}WARNING: ${AMNEZIAWG_DIR}/params has insecure permissions (${PARAMS_PERMS}).${NC}"
 		echo -e "${RED}This file contains the server private key and must not be accessible by non-root users.${NC}"
-		echo -e "${ORANGE}Fix with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
-		exit 1
+		# For legacy installs created before strict umask/chmod logic, try to auto-remediate
+		# when running as root and the file is owned by root, to avoid locking out management actions.
+		if [[ "${EUID}" -eq 0 ]] && [[ "${PARAMS_OWNER}" == "0" ]]; then
+			echo -e "${ORANGE}Attempting to fix permissions by setting mode 600 on ${AMNEZIAWG_DIR}/params...${NC}"
+			if chmod 600 "${AMNEZIAWG_DIR}/params"; then
+				echo -e "${GREEN}Permissions on ${AMNEZIAWG_DIR}/params updated to 600. Continuing.${NC}"
+			else
+				echo -e "${RED}ERROR: Failed to automatically fix permissions on ${AMNEZIAWG_DIR}/params.${NC}"
+				echo -e "${ORANGE}Fix manually with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
+				exit 1
+			fi
+		else
+			echo -e "${ORANGE}Fix with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
+			exit 1
+		fi
 	fi
 
 	if ! source "${AMNEZIAWG_DIR}/params"; then
