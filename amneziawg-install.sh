@@ -720,10 +720,12 @@ function installQuestions() {
 	read -rp "Public IPv4 or IPv6 address or domain: " -e -i "${SERVER_PUB_IP}" SERVER_PUB_IP
 
 	# Detect public interface and pre-fill for the user
-	SERVER_NIC="$(ip -4 route ls | awk '/default/ {print $5}' | head -1)"
+	# Extract the token after 'dev' to handle both 'default via ... dev <if>'
+	# and 'default dev <if>' (no gateway) route formats
+	SERVER_NIC="$(ip -4 route ls | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev" && i<NF) {print $(i+1); exit}}' | head -1)"
 	if [[ -z "${SERVER_NIC}" ]]; then
 		# Fallback to IPv6 default route for IPv6-only servers
-		SERVER_NIC="$(ip -6 route ls | awk '/default/ {print $5}' | head -1)"
+		SERVER_NIC="$(ip -6 route ls | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev" && i<NF) {print $(i+1); exit}}' | head -1)"
 	fi
 	until [[ ${SERVER_PUB_NIC} =~ ^[a-zA-Z0-9_.-]+$ ]]; do
 		read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
@@ -879,13 +881,21 @@ function installAmneziaWG() {
 		fi
 		mkdir -p /etc/apt/keyrings
 		local KEY_FETCH_OK=0
+		# Save current pipefail state so we can restore it after the key fetch.
+		# This avoids disabling pipefail if the caller already had it enabled.
+		local PREV_PIPEFAIL=0
+		if shopt -qo pipefail 2>/dev/null; then
+			PREV_PIPEFAIL=1
+		fi
 		set -o pipefail
 		if command -v curl &>/dev/null; then
 			curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor -o /etc/apt/keyrings/amneziawg.gpg && KEY_FETCH_OK=1
 		elif command -v wget &>/dev/null; then
 			wget -qO- "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor -o /etc/apt/keyrings/amneziawg.gpg && KEY_FETCH_OK=1
 		fi
-		set +o pipefail
+		if [[ ${PREV_PIPEFAIL} -eq 0 ]]; then
+			set +o pipefail
+		fi
 		if [[ ${KEY_FETCH_OK} -ne 1 ]] || [[ ! -s /etc/apt/keyrings/amneziawg.gpg ]]; then
 			echo -e "${RED}ERROR: Failed to download or import the AmneziaWG APT signing key.${NC}"
 			echo -e "${ORANGE}Verify network connectivity and that curl/wget and gnupg are installed.${NC}"
