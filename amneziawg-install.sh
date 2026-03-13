@@ -1554,7 +1554,10 @@ function regenerateClients() {
 		fi
 
 		# Write the new client config file with current server parameters
-		echo "[Interface]
+		local TMP_CONF="${CLIENT_CONF}.tmp.$$"
+
+		if cat <<EOF >"${TMP_CONF}" && chmod 600 "${TMP_CONF}" && mv "${TMP_CONF}" "${CLIENT_CONF}"; then
+[Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
 Address = ${CLIENT_ADDRESS}
 DNS = ${CLIENT_DNS}
@@ -1570,7 +1573,6 @@ H2 = ${SERVER_AWG_H2}
 H3 = ${SERVER_AWG_H3}
 H4 = ${SERVER_AWG_H4}
 
-if cat <<EOF >"${CLIENT_CONF}" && chmod 600 "${CLIENT_CONF}"; then
 [Peer]
 PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
