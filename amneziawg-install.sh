@@ -1570,12 +1570,13 @@ H2 = ${SERVER_AWG_H2}
 H3 = ${SERVER_AWG_H3}
 H4 = ${SERVER_AWG_H4}
 
+if cat <<EOF >"${CLIENT_CONF}" && chmod 600 "${CLIENT_CONF}"; then
 [Peer]
 PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
-AllowedIPs = ${ALLOWED_IPS}" >"${CLIENT_CONF}"
-		chmod 600 "${CLIENT_CONF}"
+AllowedIPs = ${ALLOWED_IPS}
+EOF
 
 		# Remove the .old file if regeneration succeeded
 		rm -f "${CLIENT_CONF}.old"
@@ -1589,6 +1590,10 @@ AllowedIPs = ${ALLOWED_IPS}" >"${CLIENT_CONF}"
 		fi
 
 		REGENERATED=$((REGENERATED + 1))
+	else
+		echo -e "${RED}  ${CLIENT_NAME}: failed to regenerate client config, leaving existing backup at ${CLIENT_CONF}.old${NC}"
+		FAILED=$((FAILED + 1))
+	fi
 	done < <(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
 
 	# If any server-side peer keys were updated, sync the running config
