@@ -14,8 +14,11 @@ AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 # Some minimal or non-login root shells may not include these by default
 export PATH="/sbin:/usr/sbin:${PATH}"
 
-# Set a standard umask so system files and directories remain accessible as expected
-umask 022
+# Restrict file creation to owner-only by default. This protects private keys and
+# config files from being briefly world-readable before chmod runs.
+# System files that need wider access (apt sources, systemd overrides, sysctl, etc.)
+# are explicitly chmod'd after creation.
+umask 077
 
 # Safely quote a value for inclusion in a sourced params file
 # Escapes single quotes and wraps in single quotes to prevent shell injection
@@ -845,6 +848,7 @@ function installAmneziaWG() {
 				# The guard above ensures at least one stanza is binary-only,
 				# and transforming all stanzas to deb-src is harmless (apt deduplicates).
 				sed -i 's/^Types: .*/Types: deb-src/' /etc/apt/sources.list.d/amneziawg.sources
+				chmod 644 /etc/apt/sources.list.d/amneziawg.sources
 			elif ! grep -q '^Types:' /etc/apt/sources.list.d/ubuntu.sources; then
 				echo -e "${ORANGE}NOTE: /etc/apt/sources.list.d/ubuntu.sources has no Types: lines (unexpected format).${NC}"
 				echo -e "${ORANGE}Skipping deb-src source generation. DKMS builds may fail if source repos are unavailable.${NC}"
@@ -856,6 +860,7 @@ function installAmneziaWG() {
 				cat /etc/apt/sources.list >> /etc/apt/sources.list.d/amneziawg.sources.list
 				# Anchor to line-start 'deb ' with trailing space to avoid matching deb-src lines
 				sed -i 's/^deb /deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
+				chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 			fi
 		fi
 		apt install -y software-properties-common
@@ -871,6 +876,7 @@ function installAmneziaWG() {
 			cat /etc/apt/sources.list >> /etc/apt/sources.list.d/amneziawg.sources.list
 			# Anchor to line-start 'deb ' with trailing space to avoid matching deb-src lines
 			sed -i 's/^deb /deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
+			chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 		fi
 		# Ensure required tools are available for key download/dearmor on minimal systems
 		if ! command -v gpg &>/dev/null; then
@@ -882,6 +888,7 @@ function installAmneziaWG() {
 			apt-get install -y curl || { echo -e "${RED}ERROR: Failed to install curl required for key download.${NC}"; exit 1; }
 		fi
 		mkdir -p /etc/apt/keyrings
+		chmod 755 /etc/apt/keyrings
 		# Full 40-character fingerprint of the AmneziaWG APT signing key.
 		# Short key IDs (e.g., 0x57290828) are collision-prone; always fetch and
 		# verify by full fingerprint to prevent keyserver substitution attacks.
@@ -934,6 +941,7 @@ function installAmneziaWG() {
 		# would create it without the sentinel, causing uninstall to leave it behind.
 		if [[ ! -f /etc/apt/sources.list.d/amneziawg.sources.list ]]; then
 			echo "# Managed by amneziawg-install" > /etc/apt/sources.list.d/amneziawg.sources.list
+			chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 		fi
 		# Append PPA repo lines only if not already present (idempotent on re-run)
 		if ! grep -q 'ppa.launchpadcontent.net/amnezia/ppa' /etc/apt/sources.list.d/amneziawg.sources.list; then
@@ -976,6 +984,7 @@ function installAmneziaWG() {
 	if ! grep -qx "amneziawg" /etc/modules-load.d/amneziawg.conf 2>/dev/null; then
 		echo "amneziawg" >> /etc/modules-load.d/amneziawg.conf
 	fi
+	chmod 644 /etc/modules-load.d/amneziawg.conf
 
 	# Ensure configuration directory exists
 	mkdir -p "${AMNEZIAWG_DIR}"
@@ -1035,6 +1044,7 @@ PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >
 	# Enable routing on the server
 	echo "net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/awg.conf
+	chmod 644 /etc/sysctl.d/awg.conf
 
 	sysctl -p /etc/sysctl.d/awg.conf
 
@@ -1043,6 +1053,7 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/awg.conf
 	#  - Waits for network-online so the interface is available for routing
 	# This survives reboots and kernel upgrades without manual intervention.
 	mkdir -p "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC}.service.d"
+	chmod 755 "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC}.service.d"
 	cat > "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC}.service.d/override.conf" <<'EOF'
 [Unit]
 After=network-online.target
@@ -1051,6 +1062,7 @@ Wants=network-online.target
 [Service]
 ExecStartPre=/sbin/modprobe amneziawg
 EOF
+	chmod 644 "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC}.service.d/override.conf"
 	systemctl daemon-reload
 
 	# Gate the service start on the kernel module actually being loadable.
