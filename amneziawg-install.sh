@@ -2217,7 +2217,10 @@ function quietIPv6Rewrite() {
 }
 
 function loadParams() {
-	validateParamsFile
+	if ! validateParamsFile; then
+		echo -e "${RED}Failed to validate params file. Aborting parameter loading.${NC}"
+		return 1
+	fi
 
 	local NEEDS_UPDATE=0
 	# Track IPv6 normalization separately from protocol migration;
