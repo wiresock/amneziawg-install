@@ -14,8 +14,8 @@ AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 # Some minimal or non-login root shells may not include these by default
 export PATH="/sbin:/usr/sbin:${PATH}"
 
-# Restrict all file creation to owner-only (protects private keys and config files)
-umask 077
+# Set a standard umask so system files and directories remain accessible as expected
+umask 022
 
 # Safely quote a value for inclusion in a sourced params file
 # Escapes single quotes and wraps in single quotes to prevent shell injection
