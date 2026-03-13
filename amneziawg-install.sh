@@ -872,7 +872,23 @@ function installAmneziaWG() {
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		# This is critical on Raspberry Pi / ARM where the default headers package
 		# (linux-headers-generic) may not match the actual raspi kernel flavour.
-		apt install -y "linux-headers-$(uname -r)" dkms amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		# Try several candidates in order: exact versioned headers, Raspberry Pi headers,
+		# then the generic meta package as a last resort.
+		HEADER_INSTALLED=0
+		HEADER_CANDIDATES=("linux-headers-$(uname -r)" "raspberrypi-kernel-headers" "linux-headers-generic")
+		for HEADER_PKG in "${HEADER_CANDIDATES[@]}"; do
+			if apt install -y "${HEADER_PKG}"; then
+				HEADER_INSTALLED=1
+				break
+			else
+				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HEADER_PKG}'. Trying next candidate...${NC}"
+			fi
+		done
+		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
+			echo -e "${RED}ERROR: Failed to install any suitable kernel headers package. DKMS module build cannot proceed.${NC}"
+			exit 1
+		fi
+		apt install -y dkms amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
 			# Tag managed file with sentinel so uninstall can verify ownership
