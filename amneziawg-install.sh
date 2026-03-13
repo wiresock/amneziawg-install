@@ -1700,12 +1700,12 @@ function validateParamsFile() {
 	if [[ ! -f "${AMNEZIAWG_DIR}/params" ]]; then
 		echo -e "${RED}ERROR: Params file not found or is not a regular file: ${AMNEZIAWG_DIR}/params${NC}"
 		echo -e "${ORANGE}The installer cannot continue without a valid params file.${NC}"
-		exit 1
+		return 1
 	fi
 	if [[ ! -r "${AMNEZIAWG_DIR}/params" ]]; then
 		echo -e "${RED}ERROR: Params file is not readable: ${AMNEZIAWG_DIR}/params${NC}"
 		echo -e "${ORANGE}Ensure the file is readable by root and try again.${NC}"
-		exit 1
+		return 1
 	fi
 	local PARAMS_OWNER PARAMS_PERMS
 	PARAMS_OWNER=$(stat -c '%u' "${AMNEZIAWG_DIR}/params" 2>/dev/null)
@@ -1713,12 +1713,12 @@ function validateParamsFile() {
 	if [[ -z "${PARAMS_OWNER}" ]] || [[ -z "${PARAMS_PERMS}" ]]; then
 		echo -e "${RED}ERROR: Failed to read file metadata for ${AMNEZIAWG_DIR}/params.${NC}"
 		echo -e "${ORANGE}Ensure the file exists and is accessible, then retry.${NC}"
-		exit 1
+		return 1
 	fi
 	if [[ "${PARAMS_OWNER}" != "0" ]]; then
 		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params is not owned by root (owner UID: ${PARAMS_OWNER}).${NC}"
 		echo -e "${ORANGE}This is a security risk. Fix with: chown root:root ${AMNEZIAWG_DIR}/params${NC}"
-		exit 1
+		return 1
 	fi
 	# Require mode 600 or 400: the file contains SERVER_PRIV_KEY and must not be
 	# readable or writable by group/other. Modes like 644 would leak the private key.
@@ -1746,7 +1746,7 @@ function validateParamsFile() {
 	if ! source "${AMNEZIAWG_DIR}/params"; then
 		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}"
 		echo -e "${ORANGE}The file may be corrupted or contain a syntax error. Fix or regenerate it and rerun the installer.${NC}"
-		exit 1
+		return 1
 	fi
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
@@ -1754,7 +1754,7 @@ function validateParamsFile() {
 	if [[ ! -f "${SERVER_AWG_CONF}" ]]; then
 		echo -e "${RED}ERROR: Server configuration file not found: ${SERVER_AWG_CONF}${NC}"
 		echo -e "${ORANGE}The params file exists but the config file is missing.${NC}"
-		exit 1
+		return 1
 	fi
 
 	# Validate and normalize SERVER_AWG_IPV6 from params file
@@ -1762,7 +1762,7 @@ function validateParamsFile() {
 	if ! isValidIPv6 "${SERVER_AWG_IPV6}"; then
 		echo -e "${RED}ERROR: Invalid IPv6 address in params file: ${SERVER_AWG_IPV6}${NC}"
 		echo -e "${ORANGE}Fix the SERVER_AWG_IPV6 value in ${AMNEZIAWG_DIR}/params${NC}"
-		exit 1
+		return 1
 	fi
 	# Global used by loadParams to detect IPv6 normalization changes;
 	# prefixed with _ to denote script-internal cross-function state
