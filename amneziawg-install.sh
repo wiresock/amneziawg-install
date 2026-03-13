@@ -10,6 +10,13 @@ NC='\033[0m'
 
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 
+# Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
+# Some minimal or non-login root shells may not include these by default
+export PATH="/sbin:/usr/sbin:${PATH}"
+
+# Restrict all file creation to owner-only (protects private keys and config files)
+umask 077
+
 # Safely quote a value for inclusion in a sourced params file
 # Escapes single quotes and wraps in single quotes to prevent shell injection
 function safeQuoteParam() {
@@ -19,20 +26,179 @@ function safeQuoteParam() {
 	echo "'${ESCAPED}'"
 }
 
+# Serialize all server parameters to a params file
+# Uses safe quoting for string values to prevent shell injection when sourced
+# Arguments:
+#   $1 - Output file path to write the serialized params to
+function serializeParams() {
+	local OUTPUT_FILE="$1"
+	if [[ -z "${OUTPUT_FILE}" ]]; then
+		echo "ERROR: serializeParams() requires an output file path" >&2
+		return 1
+	fi
+	echo "SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
+SERVER_PUB_NIC=$(safeQuoteParam "${SERVER_PUB_NIC}")
+SERVER_AWG_NIC=$(safeQuoteParam "${SERVER_AWG_NIC}")
+SERVER_AWG_IPV4=$(safeQuoteParam "${SERVER_AWG_IPV4}")
+SERVER_AWG_IPV6=$(safeQuoteParam "${SERVER_AWG_IPV6}")
+SERVER_PORT=${SERVER_PORT}
+SERVER_PRIV_KEY=$(safeQuoteParam "${SERVER_PRIV_KEY}")
+SERVER_PUB_KEY=$(safeQuoteParam "${SERVER_PUB_KEY}")
+CLIENT_DNS_1=$(safeQuoteParam "${CLIENT_DNS_1}")
+CLIENT_DNS_2=$(safeQuoteParam "${CLIENT_DNS_2}")
+ALLOWED_IPS=$(safeQuoteParam "${ALLOWED_IPS}")
+SERVER_AWG_JC=${SERVER_AWG_JC}
+SERVER_AWG_JMIN=${SERVER_AWG_JMIN}
+SERVER_AWG_JMAX=${SERVER_AWG_JMAX}
+SERVER_AWG_S1=${SERVER_AWG_S1}
+SERVER_AWG_S2=${SERVER_AWG_S2}
+SERVER_AWG_S3=${SERVER_AWG_S3}
+SERVER_AWG_S4=${SERVER_AWG_S4}
+SERVER_AWG_H1=$(safeQuoteParam "${SERVER_AWG_H1}")
+SERVER_AWG_H2=$(safeQuoteParam "${SERVER_AWG_H2}")
+SERVER_AWG_H3=$(safeQuoteParam "${SERVER_AWG_H3}")
+SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")" >"${OUTPUT_FILE}"
+}
+
+# Validate an IPv6 address string
+# Handles full form (8 hextets), compressed form (with ::), and mixed forms
+# Returns 0 if valid, 1 if invalid
+# Note: Does not support IPv4-mapped addresses (e.g., ::ffff:192.0.2.1)
+function isValidIPv6() {
+	local ADDR="$1"
+
+	if [[ -z "${ADDR}" ]]; then
+		return 1
+	fi
+
+	# Must only contain hex digits and colons
+	if ! [[ "${ADDR}" =~ ^[a-fA-F0-9:]+$ ]]; then
+		return 1
+	fi
+
+	# Must not start or end with a single colon (:: at boundaries is OK)
+	if [[ "${ADDR}" =~ ^:[^:] ]] || [[ "${ADDR}" =~ [^:]:$ ]]; then
+		return 1
+	fi
+
+	# Count :: occurrences (at most one allowed)
+	local WITHOUT_DC="${ADDR//::}"
+	local DC_COUNT=$(( (${#ADDR} - ${#WITHOUT_DC}) / 2 ))
+
+	if (( DC_COUNT > 1 )); then
+		return 1
+	fi
+
+	local -a PARTS=() LEFT_PARTS=() RIGHT_PARTS=()
+	local PART LEFT RIGHT LEFT_COUNT RIGHT_COUNT
+
+	if (( DC_COUNT == 1 )); then
+		LEFT="${ADDR%%::*}"
+		RIGHT="${ADDR#*::}"
+		LEFT_COUNT=0
+		RIGHT_COUNT=0
+
+		if [[ -n "${LEFT}" ]]; then
+			IFS=':' read -ra LEFT_PARTS <<< "${LEFT}"
+			LEFT_COUNT=${#LEFT_PARTS[@]}
+			for PART in "${LEFT_PARTS[@]}"; do
+				if [[ -z "${PART}" ]] || (( ${#PART} > 4 )); then
+					return 1
+				fi
+			done
+		fi
+
+		if [[ -n "${RIGHT}" ]]; then
+			IFS=':' read -ra RIGHT_PARTS <<< "${RIGHT}"
+			RIGHT_COUNT=${#RIGHT_PARTS[@]}
+			for PART in "${RIGHT_PARTS[@]}"; do
+				if [[ -z "${PART}" ]] || (( ${#PART} > 4 )); then
+					return 1
+				fi
+			done
+		fi
+
+		# With :: present, total groups must be fewer than 8
+		if (( LEFT_COUNT + RIGHT_COUNT >= 8 )); then
+			return 1
+		fi
+	else
+		# No :: compression - must have exactly 8 colon-separated groups
+		IFS=':' read -ra PARTS <<< "${ADDR}"
+		if (( ${#PARTS[@]} != 8 )); then
+			return 1
+		fi
+		for PART in "${PARTS[@]}"; do
+			if [[ -z "${PART}" ]] || (( ${#PART} > 4 )); then
+				return 1
+			fi
+		done
+	fi
+
+	return 0
+}
+
+# Expand an IPv6 address to its full 8-group form without :: compression
+# Each group is lowercase with leading zeros stripped
+# e.g., fd42:42:42::1 -> fd42:42:42:0:0:0:0:1
+# Used for semantic comparison and reliable prefix extraction
+function normalizeIPv6() {
+	local ADDR="$1"
+	local -a HEXTETS=() LEFT_PARTS=() RIGHT_PARTS=()
+	local LEFT RIGHT FILL_COUNT i RESULT NORMALIZED
+
+	if [[ "${ADDR}" == *"::"* ]]; then
+		LEFT="${ADDR%%::*}"
+		RIGHT="${ADDR#*::}"
+
+		if [[ -n "${LEFT}" ]]; then
+			IFS=':' read -ra LEFT_PARTS <<< "${LEFT}"
+		fi
+		if [[ -n "${RIGHT}" ]]; then
+			IFS=':' read -ra RIGHT_PARTS <<< "${RIGHT}"
+		fi
+
+		FILL_COUNT=$((8 - ${#LEFT_PARTS[@]} - ${#RIGHT_PARTS[@]}))
+
+		HEXTETS=("${LEFT_PARTS[@]}")
+		for (( i = 0; i < FILL_COUNT; i++ )); do
+			HEXTETS+=("0")
+		done
+		HEXTETS+=("${RIGHT_PARTS[@]}")
+	else
+		IFS=':' read -ra HEXTETS <<< "${ADDR}"
+	fi
+
+	RESULT=""
+	for (( i = 0; i < 8; i++ )); do
+		if (( i > 0 )); then
+			RESULT+=":"
+		fi
+		printf -v NORMALIZED '%x' "0x${HEXTETS[$i]:-0}"
+		RESULT+="${NORMALIZED}"
+	done
+
+	echo "${RESULT}"
+}
+
 function isRoot() {
-	if [ "${EUID}" -ne 0 ]; then
+	if [[ "${EUID}" -ne 0 ]]; then
 		echo "You need to run this script as root"
 		exit 1
 	fi
 }
 
 function checkVirt() {
-	if [ "$(systemd-detect-virt)" == "openvz" ]; then
+	if ! command -v systemd-detect-virt &>/dev/null; then
+		return
+	fi
+
+	if [[ "$(systemd-detect-virt)" == "openvz" ]]; then
 		echo "OpenVZ is not supported"
 		exit 1
 	fi
 
-	if [ "$(systemd-detect-virt)" == "lxc" ]; then
+	if [[ "$(systemd-detect-virt)" == "lxc" ]]; then
 		echo "LXC is not supported (yet)."
 		echo "WireGuard can technically run in an LXC container,"
 		echo "but the kernel module has to be installed on the host,"
@@ -43,26 +209,57 @@ function checkVirt() {
 }
 
 function checkOS() {
+	if [[ ! -f /etc/os-release ]] || [[ ! -r /etc/os-release ]]; then
+		echo "Cannot detect OS: /etc/os-release is missing or not readable"
+		exit 1
+	fi
 	source /etc/os-release
 	OS="${ID}"
+	if [[ -z "${OS}" ]]; then
+		echo "Cannot detect OS: /etc/os-release is missing the ID field"
+		exit 1
+	fi
 	if [[ ${OS} == "debian" || ${OS} == "raspbian" ]]; then
-		if [[ ${VERSION_ID} -lt 11 ]]; then
+		if [[ -z "${VERSION_ID}" ]]; then
+			echo "Cannot detect Debian version: VERSION_ID is missing from /etc/os-release"
+			exit 1
+		fi
+		# Extract major version to handle point-release formats (e.g., "11.7")
+		local DEBIAN_MAJOR
+		DEBIAN_MAJOR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
+		if ! [[ ${DEBIAN_MAJOR} =~ ^[0-9]+$ ]] || [[ ${DEBIAN_MAJOR} -lt 11 ]]; then
 			echo "Your version of Debian (${VERSION_ID}) is not supported. Please use Debian 11 Bullseye or later"
 			exit 1
 		fi
 		OS=debian # overwrite if raspbian
 	elif [[ ${OS} == "ubuntu" ]]; then
+		if [[ -z "${VERSION_ID}" ]]; then
+			echo "Cannot detect Ubuntu version: VERSION_ID is missing from /etc/os-release"
+			exit 1
+		fi
+		local RELEASE_YEAR
 		RELEASE_YEAR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
-		if [[ ${RELEASE_YEAR} -lt 20 ]]; then
+		if ! [[ ${RELEASE_YEAR} =~ ^[0-9]+$ ]] || [[ ${RELEASE_YEAR} -lt 20 ]]; then
 			echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 20.04 or later"
 			exit 1
 		fi
 	elif [[ ${OS} == "fedora" ]]; then
-		if [[ ${VERSION_ID} -lt 39 ]]; then
+		if [[ -z "${VERSION_ID}" ]]; then
+			echo "Cannot detect Fedora version: VERSION_ID is missing from /etc/os-release"
+			exit 1
+		fi
+		# Extract major version to handle potential future format changes
+		local FEDORA_MAJOR
+		FEDORA_MAJOR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
+		if ! [[ ${FEDORA_MAJOR} =~ ^[0-9]+$ ]] || [[ ${FEDORA_MAJOR} -lt 39 ]]; then
 			echo "Your version of Fedora (${VERSION_ID}) is not supported. Please use Fedora 39 or later"
 			exit 1
 		fi
 	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+		if [[ -z "${VERSION_ID}" ]]; then
+			echo "Cannot detect CentOS/AlmaLinux/Rocky version: VERSION_ID is missing from /etc/os-release"
+			exit 1
+		fi
 		if [[ ${VERSION_ID} == 7* ]] || [[ ${VERSION_ID} == 8* ]]; then
 			echo "Your version of CentOS (${VERSION_ID}) is not supported. Please use CentOS 9 or later"
 			exit 1
@@ -76,29 +273,33 @@ function checkOS() {
 function getHomeDirForClient() {
 	local CLIENT_NAME=$1
 
-	if [ -z "${CLIENT_NAME}" ]; then
+	if [[ -z "${CLIENT_NAME}" ]]; then
 		echo "Error: getHomeDirForClient() requires a client name as argument"
 		exit 1
 	fi
 
 	# Home directory of the user, where the client configuration will be written
-	if [ -e "/home/${CLIENT_NAME}" ]; then
-		# if $1 is a user name
-		HOME_DIR="/home/${CLIENT_NAME}"
-	elif [ "${SUDO_USER}" ]; then
-		# if not, use SUDO_USER
-		if [ "${SUDO_USER}" == "root" ]; then
-			# If running sudo as root
-			HOME_DIR="/root"
+	# Use getent passwd for reliable lookup (supports LDAP, custom home paths, etc.)
+	local PASSWD_HOME
+	local RESULT_DIR
+	PASSWD_HOME=$(getent passwd "${CLIENT_NAME}" 2>/dev/null | cut -d: -f6)
+	if [[ -n "${PASSWD_HOME}" ]] && [[ -d "${PASSWD_HOME}" ]]; then
+		RESULT_DIR="${PASSWD_HOME}"
+	elif [[ "${SUDO_USER}" ]]; then
+		# if not a system user, use SUDO_USER
+		local SUDO_HOME
+		SUDO_HOME=$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)
+		if [[ -n "${SUDO_HOME}" ]] && [[ -d "${SUDO_HOME}" ]]; then
+			RESULT_DIR="${SUDO_HOME}"
 		else
-			HOME_DIR="/home/${SUDO_USER}"
+			RESULT_DIR="/root"
 		fi
 	else
 		# if not SUDO_USER, use /root
-		HOME_DIR="/root"
+		RESULT_DIR="/root"
 	fi
 
-	echo "$HOME_DIR"
+	echo "${RESULT_DIR}"
 }
 
 function initialCheck() {
@@ -261,16 +462,16 @@ function generateH1AndH2AndH3AndH4Ranges() {
 		# total ~400M which fits comfortably. This fallback exists for future-proofing if
 		# constants are changed to values that reduce available randomization space.
 		#
-		# IMPORTANT: Constants must satisfy: MIN_VAL + 4*RANGE_SIZE + 3*GAP <= MAX_VAL
-		# With current values: 5 + 4*100000000 + 3*1 = 400,000,008 <= 2,147,483,647 (OK)
+		# IMPORTANT: Constants must satisfy: MIN_VAL + 4*(RANGE_SIZE - 1) + 3*GAP <= MAX_VAL
+		# With current values: 5 + 4*99999999 + 3*1 = 400,000,004 <= 2,147,483,647 (OK)
 		RANDOM_AWG_H1_MIN=${MIN_VAL}
-		RANDOM_AWG_H1_MAX=$((MIN_VAL + RANGE_SIZE))
+		RANDOM_AWG_H1_MAX=$((MIN_VAL + RANGE_SIZE - 1))
 		RANDOM_AWG_H2_MIN=$((RANDOM_AWG_H1_MAX + GAP))
-		RANDOM_AWG_H2_MAX=$((RANDOM_AWG_H2_MIN + RANGE_SIZE))
+		RANDOM_AWG_H2_MAX=$((RANDOM_AWG_H2_MIN + RANGE_SIZE - 1))
 		RANDOM_AWG_H3_MIN=$((RANDOM_AWG_H2_MAX + GAP))
-		RANDOM_AWG_H3_MAX=$((RANDOM_AWG_H3_MIN + RANGE_SIZE))
+		RANDOM_AWG_H3_MAX=$((RANDOM_AWG_H3_MIN + RANGE_SIZE - 1))
 		RANDOM_AWG_H4_MIN=$((RANDOM_AWG_H3_MAX + GAP))
-		RANDOM_AWG_H4_MAX=$((RANDOM_AWG_H4_MIN + RANGE_SIZE))
+		RANDOM_AWG_H4_MAX=$((RANDOM_AWG_H4_MIN + RANGE_SIZE - 1))
 		return
 	fi
 	
@@ -279,30 +480,30 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	# H1 range (segment 0)
 	local H1_START=$((MIN_VAL + $(shuf -i0-${RANDOM_OFFSET_MAX} -n1)))
 	RANDOM_AWG_H1_MIN=${H1_START}
-	RANDOM_AWG_H1_MAX=$((H1_START + RANGE_SIZE))
+	RANDOM_AWG_H1_MAX=$((H1_START + RANGE_SIZE - 1))
 	
 	# H2 range (segment 1, with gap after H1's segment)
 	local H2_START=$((MIN_VAL + SEGMENT_SIZE + GAP + $(shuf -i0-${RANDOM_OFFSET_MAX} -n1)))
 	RANDOM_AWG_H2_MIN=${H2_START}
-	RANDOM_AWG_H2_MAX=$((H2_START + RANGE_SIZE))
+	RANDOM_AWG_H2_MAX=$((H2_START + RANGE_SIZE - 1))
 	
 	# H3 range (segment 2, with gap after H2's segment)
 	local H3_START=$((MIN_VAL + (SEGMENT_SIZE + GAP) * 2 + $(shuf -i0-${RANDOM_OFFSET_MAX} -n1)))
 	RANDOM_AWG_H3_MIN=${H3_START}
-	RANDOM_AWG_H3_MAX=$((H3_START + RANGE_SIZE))
+	RANDOM_AWG_H3_MAX=$((H3_START + RANGE_SIZE - 1))
 	
 	# H4 range (segment 3, with gap after H3's segment)
 	local H4_SEGMENT_START=$((MIN_VAL + (SEGMENT_SIZE + GAP) * 3))
 	
 	# Adjust H4 segment start if necessary so that a full RANGE_SIZE fits before MAX_VAL
 	# This prevents the edge case where randomization could produce a truncated range
-	local H4_SEGMENT_MAX_START=$((MAX_VAL - RANGE_SIZE))
+	local H4_SEGMENT_MAX_START=$((MAX_VAL - RANGE_SIZE + 1))
 	if (( H4_SEGMENT_START > H4_SEGMENT_MAX_START )); then
 		H4_SEGMENT_START=${H4_SEGMENT_MAX_START}
 	fi
-	
+
 	# Recalculate RANDOM_OFFSET_MAX for H4 based on potentially adjusted segment
-	local H4_RANDOM_OFFSET_MAX=$((MAX_VAL - H4_SEGMENT_START - RANGE_SIZE))
+	local H4_RANDOM_OFFSET_MAX=$((MAX_VAL - H4_SEGMENT_START - RANGE_SIZE + 1))
 	if (( H4_RANDOM_OFFSET_MAX < 0 )); then
 		H4_RANDOM_OFFSET_MAX=0
 	fi
@@ -310,7 +511,7 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	local H4_START=$((H4_SEGMENT_START + $(shuf -i0-${H4_RANDOM_OFFSET_MAX} -n1)))
 	
 	# H4 range is guaranteed to fit within bounds due to pre-adjusted segment start
-	local H4_END=$((H4_START + RANGE_SIZE))
+	local H4_END=$((H4_START + RANGE_SIZE - 1))
 	
 	RANDOM_AWG_H4_MIN=${H4_START}
 	RANDOM_AWG_H4_MAX=${H4_END}
@@ -341,13 +542,13 @@ function generateH1AndH2AndH3AndH4Ranges() {
 	# If overlaps remain, fall back to deterministic non-overlapping layout
 	if (( HAS_OVERLAP )); then
 		RANDOM_AWG_H1_MIN=${MIN_VAL}
-		RANDOM_AWG_H1_MAX=$((RANDOM_AWG_H1_MIN + RANGE_SIZE))
+		RANDOM_AWG_H1_MAX=$((RANDOM_AWG_H1_MIN + RANGE_SIZE - 1))
 		RANDOM_AWG_H2_MIN=$((RANDOM_AWG_H1_MAX + GAP))
-		RANDOM_AWG_H2_MAX=$((RANDOM_AWG_H2_MIN + RANGE_SIZE))
+		RANDOM_AWG_H2_MAX=$((RANDOM_AWG_H2_MIN + RANGE_SIZE - 1))
 		RANDOM_AWG_H3_MIN=$((RANDOM_AWG_H2_MAX + GAP))
-		RANDOM_AWG_H3_MAX=$((RANDOM_AWG_H3_MIN + RANGE_SIZE))
+		RANDOM_AWG_H3_MAX=$((RANDOM_AWG_H3_MIN + RANGE_SIZE - 1))
 		RANDOM_AWG_H4_MIN=$((RANDOM_AWG_H3_MAX + GAP))
-		RANDOM_AWG_H4_MAX=$((RANDOM_AWG_H4_MIN + RANGE_SIZE))
+		RANDOM_AWG_H4_MAX=$((RANDOM_AWG_H4_MIN + RANGE_SIZE - 1))
 	fi
 }
 
@@ -473,6 +674,25 @@ function convertHToRangeIfNeeded() {
 }
 
 function installQuestions() {
+	# Reset all interactive variables to prevent pre-set environment variables
+	# from bypassing prompt validation loops
+	SERVER_PUB_IP=""
+	SERVER_PUB_NIC=""
+	SERVER_AWG_NIC=""
+	SERVER_AWG_IPV4=""
+	SERVER_AWG_IPV6=""
+	SERVER_PORT=""
+	CLIENT_DNS_1=""
+	CLIENT_DNS_2=""
+	ALLOWED_IPS=""
+	SERVER_AWG_JC=""
+	SERVER_AWG_JMIN=""
+	SERVER_AWG_JMAX=""
+	SERVER_AWG_S1=""
+	SERVER_AWG_S2=""
+	SERVER_AWG_S3=""
+	SERVER_AWG_S4=""
+
 	echo "AmneziaWG server installer (https://github.com/wiresock/amneziawg-install)"
 	echo ""
 	echo "I need to ask you a few questions before starting the setup."
@@ -481,33 +701,39 @@ function installQuestions() {
 
 	# Detect public IPv4 or IPv6 address and pre-fill for the user
 	SERVER_PUB_IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)
-	if [[ -z ${SERVER_PUB_IP} ]]; then
+	if [[ -z "${SERVER_PUB_IP}" ]]; then
 		# Detect public IPv6 address
 		SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
 	fi
 	read -rp "Public IPv4 or IPv6 address or domain: " -e -i "${SERVER_PUB_IP}" SERVER_PUB_IP
 
 	# Detect public interface and pre-fill for the user
-	SERVER_NIC="$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)"
-	until [[ ${SERVER_PUB_NIC} =~ ^[a-zA-Z0-9_]+$ ]]; do
+	SERVER_NIC="$(ip -4 route ls | awk '/default/ {print $5}' | head -1)"
+	if [[ -z "${SERVER_NIC}" ]]; then
+		# Fallback to IPv6 default route for IPv6-only servers
+		SERVER_NIC="$(ip -6 route ls | awk '/default/ {print $5}' | head -1)"
+	fi
+	until [[ ${SERVER_PUB_NIC} =~ ^[a-zA-Z0-9_.-]+$ ]]; do
 		read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
 	done
 
-	until [[ ${SERVER_AWG_NIC} =~ ^[a-zA-Z0-9_]+$ && ${#SERVER_AWG_NIC} -lt 16 ]]; do
+	until [[ ${SERVER_AWG_NIC} =~ ^[a-zA-Z0-9_.-]+$ && ${#SERVER_AWG_NIC} -lt 16 ]]; do
 		read -rp "AmneziaWG interface name: " -e -i awg0 SERVER_AWG_NIC
 	done
 
-	until [[ ${SERVER_AWG_IPV4} =~ ^([0-9]{1,3}\.){3} ]]; do
+	until [[ ${SERVER_AWG_IPV4} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
 		read -rp "Server AmneziaWG IPv4: " -e -i 10.66.66.1 SERVER_AWG_IPV4
 	done
 
-	until [[ ${SERVER_AWG_IPV6} =~ ^([a-f0-9]{1,4}:){3,4}: ]]; do
+	until isValidIPv6 "${SERVER_AWG_IPV6}"; do
 		read -rp "Server AmneziaWG IPv6: " -e -i fd42:42:42::1 SERVER_AWG_IPV6
 	done
+	# Normalize to expanded form for consistent storage and comparison
+	SERVER_AWG_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
 
 	# Generate random number within private ports range
 	RANDOM_PORT=$(shuf -i49152-65535 -n1)
-	until [[ ${SERVER_PORT} =~ ^[0-9]+$ ]] && [ "${SERVER_PORT}" -ge 1 ] && [ "${SERVER_PORT}" -le 65535 ]; do
+	until [[ ${SERVER_PORT} =~ ^[0-9]+$ ]] && [[ "${SERVER_PORT}" -ge 1 ]] && [[ "${SERVER_PORT}" -le 65535 ]]; do
 		read -rp "Server AmneziaWG port [1-65535]: " -e -i "${RANDOM_PORT}" SERVER_PORT
 	done
 
@@ -515,11 +741,8 @@ function installQuestions() {
 	until [[ ${CLIENT_DNS_1} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
 		read -rp "First DNS resolver to use for the clients: " -e -i 1.1.1.1 CLIENT_DNS_1
 	done
-	until [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
+	until [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]] || [[ -z ${CLIENT_DNS_2} ]]; do
 		read -rp "Second DNS resolver to use for the clients (optional): " -e -i 1.0.0.1 CLIENT_DNS_2
-		if [[ ${CLIENT_DNS_2} == "" ]]; then
-			CLIENT_DNS_2="${CLIENT_DNS_1}"
-		fi
 	done
 
 	until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
@@ -540,7 +763,7 @@ function installQuestions() {
 	# Note: Jmin == Jmax is valid - it results in fixed-size junk packets rather than
 	# randomized sizes within a range. The protocol accepts Jmin <= Jmax.
 	readJminAndJmax
-	until [ "${SERVER_AWG_JMIN}" -le "${SERVER_AWG_JMAX}" ]; do
+	until [[ "${SERVER_AWG_JMIN}" -le "${SERVER_AWG_JMAX}" ]]; do
 		echo "Jmin must be less than or equal to Jmax"
 		readJminAndJmax
 	done
@@ -590,39 +813,82 @@ function installAmneziaWG() {
 	# Install AmneziaWG tools and module
 	if [[ ${OS} == 'ubuntu' ]]; then
 		if [[ -e /etc/apt/sources.list.d/ubuntu.sources ]]; then
-			if ! grep -q "deb-src" /etc/apt/sources.list.d/ubuntu.sources; then
-				cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/amneziawg.sources
-				sed -i 's/deb/deb-src/' /etc/apt/sources.list.d/amneziawg.sources
+			# Check whether any Types: line lacks deb-src. A single stanza with
+			# deb-src shouldn't suppress source entries for other binary-only stanzas.
+			if grep -q '^Types:' /etc/apt/sources.list.d/ubuntu.sources && \
+			   grep '^Types:' /etc/apt/sources.list.d/ubuntu.sources | grep -qv 'deb-src'; then
+				# Tag managed file with sentinel so uninstall can verify ownership
+				echo "# Managed by amneziawg-install" > /etc/apt/sources.list.d/amneziawg.sources
+				cat /etc/apt/sources.list.d/ubuntu.sources >> /etc/apt/sources.list.d/amneziawg.sources
+				# Rewrite every Types field in the DEB822 copy to deb-src.
+				# The guard above ensures at least one stanza is binary-only,
+				# and transforming all stanzas to deb-src is harmless (apt deduplicates).
+				sed -i 's/^Types: .*/Types: deb-src/' /etc/apt/sources.list.d/amneziawg.sources
+			elif ! grep -q '^Types:' /etc/apt/sources.list.d/ubuntu.sources; then
+				echo -e "${ORANGE}NOTE: /etc/apt/sources.list.d/ubuntu.sources has no Types: lines (unexpected format).${NC}"
+				echo -e "${ORANGE}Skipping deb-src source generation. DKMS builds may fail if source repos are unavailable.${NC}"
 			fi
 		else
 			if ! grep -q "^deb-src" /etc/apt/sources.list; then
-				cp /etc/apt/sources.list /etc/apt/sources.list.d/amneziawg.sources.list
-				sed -i 's/^deb/deb-src/' /etc/apt/sources.list.d/amneziawg.sources.list
+				# Tag managed file with sentinel so uninstall can verify ownership
+				echo "# Managed by amneziawg-install" > /etc/apt/sources.list.d/amneziawg.sources.list
+				cat /etc/apt/sources.list >> /etc/apt/sources.list.d/amneziawg.sources.list
+				# Anchor to line-start 'deb ' with trailing space to avoid matching deb-src lines
+				sed -i 's/^deb /deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
 			fi
 		fi
 		apt install -y software-properties-common
 		add-apt-repository -y ppa:amnezia/ppa
-		apt install -y amneziawg amneziawg-tools qrencode
+		# Install kernel headers for the running kernel so DKMS can compile the module.
+		# This is critical on Raspberry Pi / ARM where the default headers package
+		# (linux-headers-generic) may not match the actual raspi kernel flavour.
+		apt install -y "linux-headers-$(uname -r)" dkms amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
-			cp /etc/apt/sources.list /etc/apt/sources.list.d/amneziawg.sources.list
-			sed -i 's/^deb/deb-src/' /etc/apt/sources.list.d/amneziawg.sources.list
+			# Tag managed file with sentinel so uninstall can verify ownership
+			echo "# Managed by amneziawg-install" > /etc/apt/sources.list.d/amneziawg.sources.list
+			cat /etc/apt/sources.list >> /etc/apt/sources.list.d/amneziawg.sources.list
+			# Anchor to line-start 'deb ' with trailing space to avoid matching deb-src lines
+			sed -i 's/^deb /deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
 		fi
-		apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 57290828
-		echo "deb https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
-		echo "deb-src https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
+		mkdir -p /etc/apt/keyrings
+		if command -v curl &>/dev/null; then
+			curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor -o /etc/apt/keyrings/amneziawg.gpg
+		else
+			wget -qO- "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor -o /etc/apt/keyrings/amneziawg.gpg
+		fi
+		chmod 644 /etc/apt/keyrings/amneziawg.gpg
+		# Ensure the managed file exists with sentinel before appending PPA lines.
+		# When /etc/apt/sources.list already has deb-src, the copy block above is
+		# skipped and the file doesn't exist yet — without this guard the >> below
+		# would create it without the sentinel, causing uninstall to leave it behind.
+		if [[ ! -f /etc/apt/sources.list.d/amneziawg.sources.list ]]; then
+			echo "# Managed by amneziawg-install" > /etc/apt/sources.list.d/amneziawg.sources.list
+		fi
+		# Append PPA repo lines only if not already present (idempotent on re-run)
+		if ! grep -q 'ppa.launchpadcontent.net/amnezia/ppa' /etc/apt/sources.list.d/amneziawg.sources.list; then
+			echo "deb [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
+			echo "deb-src [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
+		fi
 		apt update
-		apt install -y amneziawg amneziawg-tools qrencode iptables
+		apt install -y "linux-headers-$(uname -r)" dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
-		dnf install -y amneziawg-dkms amneziawg-tools qrencode iptables
+		dnf install -y "kernel-devel-$(uname -r)" dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
-		dnf install -y amneziawg-dkms amneziawg-tools qrencode iptables
+		dnf install -y "kernel-devel-$(uname -r)" dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+	fi
+
+	# Force DKMS to build the module
+	# The package post-install hook may not trigger if headers were installed in the
+	# same apt transaction, so an explicit autoinstall guarantees the .ko is present.
+	if command -v dkms &>/dev/null; then
+		dkms autoinstall || true
 	fi
 
 	# Rebuild module dependency cache (required for DKMS + compressed modules, especially on ARM/Ubuntu)
@@ -650,29 +916,8 @@ function installAmneziaWG() {
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | awg pubkey)
 
 	# Save WireGuard settings
-	# Use safe quoting for string values to prevent shell injection when sourced
-	echo "SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
-SERVER_PUB_NIC=$(safeQuoteParam "${SERVER_PUB_NIC}")
-SERVER_AWG_NIC=$(safeQuoteParam "${SERVER_AWG_NIC}")
-SERVER_AWG_IPV4=$(safeQuoteParam "${SERVER_AWG_IPV4}")
-SERVER_AWG_IPV6=$(safeQuoteParam "${SERVER_AWG_IPV6}")
-SERVER_PORT=${SERVER_PORT}
-SERVER_PRIV_KEY=$(safeQuoteParam "${SERVER_PRIV_KEY}")
-SERVER_PUB_KEY=$(safeQuoteParam "${SERVER_PUB_KEY}")
-CLIENT_DNS_1=${CLIENT_DNS_1}
-CLIENT_DNS_2=${CLIENT_DNS_2}
-ALLOWED_IPS=$(safeQuoteParam "${ALLOWED_IPS}")
-SERVER_AWG_JC=${SERVER_AWG_JC}
-SERVER_AWG_JMIN=${SERVER_AWG_JMIN}
-SERVER_AWG_JMAX=${SERVER_AWG_JMAX}
-SERVER_AWG_S1=${SERVER_AWG_S1}
-SERVER_AWG_S2=${SERVER_AWG_S2}
-SERVER_AWG_S3=${SERVER_AWG_S3}
-SERVER_AWG_S4=${SERVER_AWG_S4}
-SERVER_AWG_H1=$(safeQuoteParam "${SERVER_AWG_H1}")
-SERVER_AWG_H2=$(safeQuoteParam "${SERVER_AWG_H2}")
-SERVER_AWG_H3=$(safeQuoteParam "${SERVER_AWG_H3}")
-SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")" >"${AMNEZIAWG_DIR}/params"
+	serializeParams "${AMNEZIAWG_DIR}/params" || { echo -e "${RED}ERROR: Failed to write params file.${NC}"; exit 1; }
+	chmod 600 "${AMNEZIAWG_DIR}/params"
 
 	# Add server interface
 	echo "[Interface]
@@ -690,12 +935,14 @@ H1 = ${SERVER_AWG_H1}
 H2 = ${SERVER_AWG_H2}
 H3 = ${SERVER_AWG_H3}
 H4 = ${SERVER_AWG_H4}" >"${SERVER_AWG_CONF}"
+	chmod 600 "${SERVER_AWG_CONF}"
 
-	if pgrep firewalld; then
+	if systemctl is-active --quiet firewalld; then
 		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_AWG_IPV4}" | cut -d"." -f1-3)".0"
-		FIREWALLD_IPV6_ADDRESS=$(echo "${SERVER_AWG_IPV6}" | sed 's/:[^:]*$/:0/')
-		echo "PostUp = firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'
-PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'" >>"${SERVER_AWG_CONF}"
+		# Derive /64 network address from the normalized IPv6 (first 4 groups + :0:0:0:0)
+		FIREWALLD_IPV6_ADDRESS="$(echo "${SERVER_AWG_IPV6}" | cut -d':' -f1-4):0:0:0:0"
+		echo "PostUp = firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'
+PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'" >>"${SERVER_AWG_CONF}"
 	else
 		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
@@ -719,13 +966,59 @@ PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >
 	echo "net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/awg.conf
 
-	sysctl --system
+	sysctl -p /etc/sysctl.d/awg.conf
 
-	systemctl start "awg-quick@${SERVER_AWG_NIC}"
-	systemctl enable "awg-quick@${SERVER_AWG_NIC}"
+	# Add a systemd drop-in override that:
+	#  - Ensures the amneziawg module is loaded before awg-quick starts (ExecStartPre)
+	#  - Waits for network-online so the interface is available for routing
+	# This survives reboots and kernel upgrades without manual intervention.
+	mkdir -p "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC}.service.d"
+	cat > "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC}.service.d/override.conf" <<'EOF'
+[Unit]
+After=network-online.target
+Wants=network-online.target
 
-	newClient
-	echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
+[Service]
+ExecStartPre=/sbin/modprobe amneziawg
+EOF
+	systemctl daemon-reload
+
+	# Gate the service start on the kernel module actually being loadable.
+	# If modprobe fails here, the module wasn't built for this kernel — starting
+	# the service would just produce a confusing "Unknown device type" error.
+	local MODULE_READY=0
+	if modprobe amneziawg; then
+		systemctl start "awg-quick@${SERVER_AWG_NIC}"
+		systemctl enable "awg-quick@${SERVER_AWG_NIC}"
+		MODULE_READY=1
+	else
+		local HEADERS_HINT="matching kernel headers"
+		local INSTALL_HINT="Install matching kernel headers"
+		if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' ]]; then
+			HEADERS_HINT="linux-headers-$(uname -r)"
+			INSTALL_HINT="apt install -y \"linux-headers-$(uname -r)\""
+		elif [[ ${OS} == 'fedora' ]] || [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+			HEADERS_HINT="kernel-devel-$(uname -r)"
+			INSTALL_HINT="dnf install -y \"kernel-devel-$(uname -r)\""
+		fi
+
+		echo -e "${RED}ERROR: amneziawg kernel module could not be loaded for kernel $(uname -r).${NC}"
+		echo -e "${ORANGE}The service was NOT started. To fix:${NC}"
+		echo -e "${ORANGE}  1. Ensure ${HEADERS_HINT} is installed${NC}"
+		echo -e "${ORANGE}     ${INSTALL_HINT}${NC}"
+		echo -e "${ORANGE}  2. Run: dkms autoinstall && depmod -a${NC}"
+		echo -e "${ORANGE}  3. Run: modprobe amneziawg${NC}"
+		echo -e "${ORANGE}  4. Run: systemctl start awg-quick@${SERVER_AWG_NIC}${NC}"
+		echo -e "${ORANGE}  Or simply reboot the server.${NC}"
+		systemctl enable "awg-quick@${SERVER_AWG_NIC}"
+	fi
+
+	if [[ ${MODULE_READY} -eq 1 ]]; then
+		newClient
+		echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
+	else
+		echo -e "${ORANGE}Skipping client generation because the server interface is not active.${NC}"
+	fi
 
 	# Check if AmneziaWG is running
 	systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"
@@ -735,6 +1028,21 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/awg.conf
 	if [[ ${AWG_RUNNING} -ne 0 ]]; then
 		echo -e "\n${RED}WARNING: AmneziaWG does not seem to be running.${NC}"
 		echo -e "${ORANGE}You can check if AmneziaWG is running with: systemctl status awg-quick@${SERVER_AWG_NIC}${NC}"
+		if ! lsmod | grep -q amneziawg; then
+			local HEADERS_HINT="matching kernel headers"
+			local INSTALL_HINT="Install matching kernel headers"
+			if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' ]]; then
+				HEADERS_HINT="linux-headers-$(uname -r)"
+				INSTALL_HINT="apt install -y \"linux-headers-$(uname -r)\""
+			elif [[ ${OS} == 'fedora' ]] || [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+				HEADERS_HINT="kernel-devel-$(uname -r)"
+				INSTALL_HINT="dnf install -y \"kernel-devel-$(uname -r)\""
+			fi
+
+			echo -e "${ORANGE}The amneziawg kernel module is NOT loaded.${NC}"
+			echo -e "${ORANGE}This usually means the module was not built for kernel $(uname -r).${NC}"
+			echo -e "${ORANGE}Install ${HEADERS_HINT} and rebuild: ${INSTALL_HINT} && dkms autoinstall && depmod -a${NC}"
+		fi
 		echo -e "${ORANGE}If you get something like \"Cannot find device ${SERVER_AWG_NIC}\", please reboot!${NC}"
 	else # AmneziaWG is running
 		echo -e "\n${GREEN}AmneziaWG is running.${NC}"
@@ -752,11 +1060,11 @@ function newClient() {
 	local DOT_IP=""
 	local DOT_EXISTS=""
 	
-	# If SERVER_PUB_IP is IPv6, add brackets if missing
+	# If SERVER_PUB_IP is IPv6, normalize brackets
 	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
-		if [[ ${SERVER_PUB_IP} != *"["* ]] || [[ ${SERVER_PUB_IP} != *"]"* ]]; then
-			SERVER_PUB_IP="[${SERVER_PUB_IP}]"
-		fi
+		SERVER_PUB_IP="${SERVER_PUB_IP#\[}"
+		SERVER_PUB_IP="${SERVER_PUB_IP%\]}"
+		SERVER_PUB_IP="[${SERVER_PUB_IP}]"
 	fi
 	ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
 
@@ -776,8 +1084,10 @@ function newClient() {
 		fi
 	done
 
+	BASE_IP=$(echo "$SERVER_AWG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
+
 	for DOT_IP in {2..254}; do
-		DOT_EXISTS=$(grep -c "${SERVER_AWG_IPV4::-1}${DOT_IP}" "${SERVER_AWG_CONF}")
+		DOT_EXISTS=$(grep -cF "${BASE_IP}.${DOT_IP}/32" "${SERVER_AWG_CONF}")
 		if [[ ${DOT_EXISTS} == '0' ]]; then
 			break
 		fi
@@ -789,11 +1099,20 @@ function newClient() {
 		exit 1
 	fi
 
-	BASE_IP=$(echo "$SERVER_AWG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
 	until [[ ${IPV4_EXISTS} == '0' ]]; do
 		read -rp "Client AmneziaWG IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
+
+		# Validate host number is between 2 and 254
+		if ! [[ ${DOT_IP} =~ ^[0-9]+$ ]] || (( DOT_IP < 2 )) || (( DOT_IP > 254 )); then
+			echo ""
+			echo -e "${ORANGE}Invalid host number. Must be between 2 and 254.${NC}"
+			echo ""
+			IPV4_EXISTS='1'
+			continue
+		fi
+
 		CLIENT_AWG_IPV4="${BASE_IP}.${DOT_IP}"
-		IPV4_EXISTS=$(grep -c "$CLIENT_AWG_IPV4/32" "${SERVER_AWG_CONF}")
+		IPV4_EXISTS=$(grep -cF "$CLIENT_AWG_IPV4/32" "${SERVER_AWG_CONF}")
 
 		if [[ ${IPV4_EXISTS} != 0 ]]; then
 			echo ""
@@ -802,11 +1121,33 @@ function newClient() {
 		fi
 	done
 
-	BASE_IP=$(echo "$SERVER_AWG_IPV6" | awk -F '::' '{ print $1 }')
+	# Normalize server IPv6 and extract /64 prefix (first 4 groups)
+	local NORMALIZED_SERVER_IPV6
+	NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
+	BASE_IP=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
+
 	until [[ ${IPV6_EXISTS} == '0' ]]; do
 		read -rp "Client AmneziaWG IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
-		CLIENT_AWG_IPV6="${BASE_IP}::${DOT_IP}"
-		IPV6_EXISTS=$(grep -c "${CLIENT_AWG_IPV6}/128" "${SERVER_AWG_CONF}")
+
+		# Validate IPv6 host part is a valid hex segment (1-4 hex characters)
+		if ! [[ ${DOT_IP} =~ ^[a-fA-F0-9]{1,4}$ ]]; then
+			echo ""
+			echo -e "${ORANGE}Invalid IPv6 host part. Must be 1-4 hexadecimal characters.${NC}"
+			echo ""
+			IPV6_EXISTS='1'
+			continue
+		fi
+
+		CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IP}::${DOT_IP}")
+		# Semantic duplicate check: normalize all existing IPv6 in config for comparison
+		IPV6_EXISTS=0
+		local EXISTING_IPV6_RAW
+		while IFS= read -r EXISTING_IPV6_RAW; do
+			if [[ "$(normalizeIPv6 "${EXISTING_IPV6_RAW%/128}")" == "${CLIENT_AWG_IPV6}" ]]; then
+				IPV6_EXISTS=1
+				break
+			fi
+		done < <(grep -oE '[a-fA-F0-9:]+/128' "${SERVER_AWG_CONF}")
 
 		if [[ ${IPV6_EXISTS} != 0 ]]; then
 			echo ""
@@ -820,13 +1161,20 @@ function newClient() {
 	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | awg pubkey)
 	CLIENT_PRE_SHARED_KEY=$(awg genpsk)
 
+	local HOME_DIR
 	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
+
+	# Build DNS line: include second resolver only if provided
+	local CLIENT_DNS="${CLIENT_DNS_1}"
+	if [[ -n "${CLIENT_DNS_2}" ]]; then
+		CLIENT_DNS="${CLIENT_DNS_1},${CLIENT_DNS_2}"
+	fi
 
 	# Create client file and add the server as a peer
 	echo "[Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
 Address = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6}/128
-DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
+DNS = ${CLIENT_DNS}
 Jc = ${SERVER_AWG_JC}
 Jmin = ${SERVER_AWG_JMIN}
 Jmax = ${SERVER_AWG_JMAX}
@@ -844,6 +1192,7 @@ PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
 AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+	chmod 600 "${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# Add the client as a peer to the server
 	echo -e "\n### Client ${CLIENT_NAME}
@@ -887,7 +1236,7 @@ function revokeClient() {
 	echo "Select the existing client you want to revoke"
 	grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3 | nl -s ') '
 	local CLIENT_NUMBER=""
-	until [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
+	until [[ ${CLIENT_NUMBER} =~ ^[0-9]+$ ]] && [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
 		if [[ ${NUMBER_OF_CLIENTS} == '1' ]]; then
 			read -rp "Select one client [1]: " CLIENT_NUMBER
 		else
@@ -898,15 +1247,183 @@ function revokeClient() {
 	# match the selected number to a client name
 	CLIENT_NAME=$(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
 
+	# Validate client name contains only characters safe for sed regex patterns.
+	# Names created by this script are always [a-zA-Z0-9_-], but a manually
+	# edited config could introduce regex metacharacters (e.g., '.', '*').
+	if ! [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+		echo -e "${RED}ERROR: Client name '${CLIENT_NAME}' contains unsafe characters. Please fix the config manually.${NC}"
+		exit 1
+	fi
+
 	# remove [Peer] block matching $CLIENT_NAME
 	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "${SERVER_AWG_CONF}"
 
 	# remove generated client file
+	local HOME_DIR
 	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
 	rm -f "${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# restart AmneziaWG to apply changes
 	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+}
+
+function regenerateClients() {
+	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${SERVER_AWG_CONF}")
+	if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
+		echo ""
+		echo "You have no existing clients!"
+		exit 1
+	fi
+
+	# If SERVER_PUB_IP is IPv6, normalize brackets
+	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
+		SERVER_PUB_IP="${SERVER_PUB_IP#\[}"
+		SERVER_PUB_IP="${SERVER_PUB_IP%\]}"
+		SERVER_PUB_IP="[${SERVER_PUB_IP}]"
+	fi
+	ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
+
+	echo ""
+	echo "Regenerating all client configurations with current server parameters..."
+	echo ""
+
+	local REGENERATED=0
+	local FAILED=0
+	local NEWKEYS=0
+
+	# Iterate over each client peer block in the server config
+	while IFS= read -r CLIENT_NAME; do
+		# Validate client name contains only characters safe for sed regex patterns.
+		# Names created by this script are always [a-zA-Z0-9_-], but a manually
+		# edited config could introduce regex metacharacters (e.g., '.', '*').
+		if ! [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+			echo -e "${RED}  SKIP: '${CLIENT_NAME}' - name contains unsafe characters${NC}"
+			FAILED=$((FAILED + 1))
+			continue
+		fi
+
+		# Extract peer details from the server config for this client
+		# The block starts with "### Client <name>" and ends at the next empty line
+		local PEER_BLOCK
+		PEER_BLOCK=$(sed -n "/^### Client ${CLIENT_NAME}\$/,/^$/p" "${SERVER_AWG_CONF}")
+
+		local CLIENT_PUB_KEY
+		CLIENT_PUB_KEY=$(echo "${PEER_BLOCK}" | grep -E "^PublicKey = " | sed 's/^PublicKey = //')
+		local CLIENT_PRE_SHARED_KEY
+		CLIENT_PRE_SHARED_KEY=$(echo "${PEER_BLOCK}" | grep -E "^PresharedKey = " | sed 's/^PresharedKey = //')
+		local CLIENT_ALLOWED_IPS
+		CLIENT_ALLOWED_IPS=$(echo "${PEER_BLOCK}" | grep -E "^AllowedIPs = " | sed 's/^AllowedIPs = //')
+
+		if [[ -z "${CLIENT_PUB_KEY}" ]] || [[ -z "${CLIENT_PRE_SHARED_KEY}" ]] || [[ -z "${CLIENT_ALLOWED_IPS}" ]]; then
+			echo -e "${RED}  SKIP: ${CLIENT_NAME} - could not parse peer block from server config${NC}"
+			FAILED=$((FAILED + 1))
+			continue
+		fi
+
+		# Parse IPv4 and IPv6 addresses from AllowedIPs (e.g., "10.66.66.2/32,fd42:42:42::2/128")
+		local CLIENT_AWG_IPV4
+		CLIENT_AWG_IPV4=$(echo "${CLIENT_ALLOWED_IPS}" | tr ',' '\n' | grep -E '^[0-9]+\.' | sed 's|/.*||')
+		local CLIENT_AWG_IPV6
+		CLIENT_AWG_IPV6=$(echo "${CLIENT_ALLOWED_IPS}" | tr ',' '\n' | grep -E ':' | sed 's|/.*||')
+
+		if [[ -z "${CLIENT_AWG_IPV4}" ]]; then
+			echo -e "${RED}  SKIP: ${CLIENT_NAME} - could not parse IPv4 from AllowedIPs${NC}"
+			FAILED=$((FAILED + 1))
+			continue
+		fi
+
+		# Build address string, including IPv6 only if present in AllowedIPs
+		local CLIENT_ADDRESS="${CLIENT_AWG_IPV4}/32"
+		if [[ -n "${CLIENT_AWG_IPV6}" ]]; then
+			CLIENT_ADDRESS="${CLIENT_ADDRESS},${CLIENT_AWG_IPV6}/128"
+		fi
+
+		# Determine home directory and locate existing client config file
+		local HOME_DIR
+		HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
+		local CLIENT_CONF="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+		local CLIENT_PRIV_KEY=""
+
+		# Try to recover the client's private key from existing config file
+		# Check both .conf and .conf.old (renamed during migration)
+		for CANDIDATE in "${CLIENT_CONF}" "${CLIENT_CONF}.old"; do
+			if [[ -f "${CANDIDATE}" ]]; then
+				CLIENT_PRIV_KEY=$(grep -E "^PrivateKey = " "${CANDIDATE}" | sed 's/^PrivateKey = //')
+				if [[ -n "${CLIENT_PRIV_KEY}" ]]; then
+					break
+				fi
+			fi
+		done
+
+		if [[ -z "${CLIENT_PRIV_KEY}" ]]; then
+			# No existing private key found - generate a new key pair
+			# This means the client will need the new config to reconnect
+			echo -e "${ORANGE}  ${CLIENT_NAME}: no existing private key found, generating new key pair${NC}"
+			CLIENT_PRIV_KEY=$(awg genkey)
+			local NEW_CLIENT_PUB_KEY
+			NEW_CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | awg pubkey)
+
+			# Update the server config with the new public key
+			sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/ s|^PublicKey = .*|PublicKey = ${NEW_CLIENT_PUB_KEY}|" "${SERVER_AWG_CONF}"
+			CLIENT_PUB_KEY="${NEW_CLIENT_PUB_KEY}"
+			NEWKEYS=$((NEWKEYS + 1))
+		fi
+
+		# Build DNS line: include second resolver only if provided
+		local CLIENT_DNS="${CLIENT_DNS_1}"
+		if [[ -n "${CLIENT_DNS_2}" ]]; then
+			CLIENT_DNS="${CLIENT_DNS_1},${CLIENT_DNS_2}"
+		fi
+
+		# Write the new client config file with current server parameters
+		echo "[Interface]
+PrivateKey = ${CLIENT_PRIV_KEY}
+Address = ${CLIENT_ADDRESS}
+DNS = ${CLIENT_DNS}
+Jc = ${SERVER_AWG_JC}
+Jmin = ${SERVER_AWG_JMIN}
+Jmax = ${SERVER_AWG_JMAX}
+S1 = ${SERVER_AWG_S1}
+S2 = ${SERVER_AWG_S2}
+S3 = ${SERVER_AWG_S3}
+S4 = ${SERVER_AWG_S4}
+H1 = ${SERVER_AWG_H1}
+H2 = ${SERVER_AWG_H2}
+H3 = ${SERVER_AWG_H3}
+H4 = ${SERVER_AWG_H4}
+
+[Peer]
+PublicKey = ${SERVER_PUB_KEY}
+PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+Endpoint = ${ENDPOINT}
+AllowedIPs = ${ALLOWED_IPS}" >"${CLIENT_CONF}"
+		chmod 600 "${CLIENT_CONF}"
+
+		# Remove the .old file if regeneration succeeded
+		rm -f "${CLIENT_CONF}.old"
+
+		# Generate QR code if qrencode is installed
+		if command -v qrencode &>/dev/null; then
+			echo -e "${GREEN}  ${CLIENT_NAME}: regenerated (QR code below)${NC}"
+			qrencode -t ansiutf8 -l L <"${CLIENT_CONF}"
+		else
+			echo -e "${GREEN}  ${CLIENT_NAME}: regenerated -> ${CLIENT_CONF}${NC}"
+		fi
+
+		REGENERATED=$((REGENERATED + 1))
+	done < <(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
+
+	# If any server-side peer keys were updated, sync the running config
+	if (( NEWKEYS > 0 )); then
+		awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+	fi
+
+	echo ""
+	echo -e "${GREEN}Regeneration complete: ${REGENERATED} succeeded, ${FAILED} failed.${NC}"
+	if (( NEWKEYS > 0 )); then
+		echo -e "${ORANGE}${NEWKEYS} client(s) had new key pairs generated (old private key was not found).${NC}"
+	fi
+	echo -e "${ORANGE}Distribute the new .conf files to your clients.${NC}"
 }
 
 function uninstallAmneziaWG() {
@@ -915,31 +1432,58 @@ function uninstallAmneziaWG() {
 	echo -e "${ORANGE}Please backup the /etc/amnezia/amneziawg directory if you want to keep your configuration files.\n${NC}"
 	read -rp "Do you really want to remove AmneziaWG? [y/n]: " -e REMOVE
 	REMOVE=${REMOVE:-n}
-	if [[ $REMOVE == 'y' ]]; then
+	if [[ $REMOVE == [yY] ]]; then
 		checkOS
 
 		systemctl stop "awg-quick@${SERVER_AWG_NIC}"
 		systemctl disable "awg-quick@${SERVER_AWG_NIC}"
 
+		# Remove systemd drop-in override created during install
+		rm -rf "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC}.service.d"
+		systemctl daemon-reload
+
+		# Remove module auto-load entry
+		rm -f /etc/modules-load.d/amneziawg.conf
+
 		# Disable routing
+		# Only remove our conf file; do NOT force ip_forward=0 at runtime because
+		# other services (Docker, libvirt, other VPNs) may depend on forwarding.
+		# The setting will revert to the system default on next reboot.
 		rm -f /etc/sysctl.d/awg.conf
-		sysctl --system
 
 		# Remove config files
-		rm -rf ${AMNEZIAWG_DIR}/*
+		rm -rf "${AMNEZIAWG_DIR}"
 
 		if [[ ${OS} == 'ubuntu' ]]; then
 			apt remove -y amneziawg amneziawg-tools
 			add-apt-repository -ry ppa:amnezia/ppa
+			# Only remove source files that we created (identified by sentinel comment)
 			if [[ -e /etc/apt/sources.list.d/ubuntu.sources ]]; then
-				rm -f /etc/apt/sources.list.d/amneziawg.sources
+				if [[ -f /etc/apt/sources.list.d/amneziawg.sources ]] && head -1 /etc/apt/sources.list.d/amneziawg.sources | grep -q '# Managed by amneziawg-install'; then
+					rm -f /etc/apt/sources.list.d/amneziawg.sources
+				elif [[ -f /etc/apt/sources.list.d/amneziawg.sources ]]; then
+					echo -e "${ORANGE}NOTE: /etc/apt/sources.list.d/amneziawg.sources was not created by this installer (missing sentinel). Leaving it in place.${NC}"
+				fi
 			else
-				rm -f /etc/apt/sources.list.d/amneziawg.sources.list
+				if [[ -f /etc/apt/sources.list.d/amneziawg.sources.list ]] && head -1 /etc/apt/sources.list.d/amneziawg.sources.list | grep -q '# Managed by amneziawg-install'; then
+					rm -f /etc/apt/sources.list.d/amneziawg.sources.list
+				elif [[ -f /etc/apt/sources.list.d/amneziawg.sources.list ]]; then
+					echo -e "${ORANGE}NOTE: /etc/apt/sources.list.d/amneziawg.sources.list was not created by this installer (missing sentinel). Leaving it in place.${NC}"
+				fi
 			fi
 		elif [[ ${OS} == 'debian' ]]; then
 			apt-get remove -y amneziawg amneziawg-tools
-			rm -f /etc/apt/sources.list.d/amneziawg.sources.list
-			apt-key del 57290828
+			# Only remove source file and keyring if the source file has our sentinel on line 1
+			if [[ -f /etc/apt/sources.list.d/amneziawg.sources.list ]] && head -1 /etc/apt/sources.list.d/amneziawg.sources.list | grep -q '# Managed by amneziawg-install'; then
+				rm -f /etc/apt/sources.list.d/amneziawg.sources.list
+				rm -f /etc/apt/keyrings/amneziawg.gpg
+			elif [[ -f /etc/apt/sources.list.d/amneziawg.sources.list ]]; then
+				echo -e "${ORANGE}NOTE: /etc/apt/sources.list.d/amneziawg.sources.list was not created by this installer (missing sentinel). Leaving it and keyring in place.${NC}"
+			elif [[ -f /etc/apt/keyrings/amneziawg.gpg ]]; then
+				# Source file is gone (manually deleted) but orphaned keyring remains
+				echo -e "${ORANGE}NOTE: Managed source file not found but orphaned keyring detected. Removing keyring.${NC}"
+				rm -f /etc/apt/keyrings/amneziawg.gpg
+			fi
 			apt update
 		elif [[ ${OS} == 'fedora' ]]; then
 			dnf remove -y amneziawg-dkms amneziawg-tools
@@ -966,49 +1510,74 @@ function uninstallAmneziaWG() {
 	fi
 }
 
-function loadParams() {
+function validateParamsFile() {
+	# Security: verify params file is safe to source (owned by root, not readable/writable by others)
+	# This mitigates the risk of arbitrary code execution or private key exposure
+	local PARAMS_OWNER PARAMS_PERMS
+	PARAMS_OWNER=$(stat -c '%u' "${AMNEZIAWG_DIR}/params" 2>/dev/null)
+	PARAMS_PERMS=$(stat -c '%a' "${AMNEZIAWG_DIR}/params" 2>/dev/null)
+	if [[ "${PARAMS_OWNER}" != "0" ]]; then
+		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params is not owned by root (owner UID: ${PARAMS_OWNER}).${NC}"
+		echo -e "${ORANGE}This is a security risk. Fix with: chown root:root ${AMNEZIAWG_DIR}/params${NC}"
+		exit 1
+	fi
+	# Require mode 600 or 400: the file contains SERVER_PRIV_KEY and must not be
+	# readable or writable by group/other. Modes like 644 would leak the private key.
+	if [[ "${PARAMS_PERMS}" != "600" ]] && [[ "${PARAMS_PERMS}" != "400" ]]; then
+		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params has insecure permissions (${PARAMS_PERMS}).${NC}"
+		echo -e "${RED}This file contains the server private key and must not be accessible by non-root users.${NC}"
+		echo -e "${ORANGE}Fix with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
+		exit 1
+	fi
+
 	source "${AMNEZIAWG_DIR}/params"
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
-	
+
 	# Verify server config file exists before attempting migration
 	if [[ ! -f "${SERVER_AWG_CONF}" ]]; then
 		echo -e "${RED}ERROR: Server configuration file not found: ${SERVER_AWG_CONF}${NC}"
 		echo -e "${ORANGE}The params file exists but the config file is missing.${NC}"
 		exit 1
 	fi
-	
-	local NEEDS_UPDATE=0
-	
-	# Migration for pre-2.0 installations: check for missing S3/S4 parameters
-	if [[ -z "${SERVER_AWG_S3}" ]] || [[ -z "${SERVER_AWG_S4}" ]]; then
-		# Try to read existing S3/S4 from config file before using defaults
-		# This handles cases where params file is missing values but config file has them
-		local CONF_S3 CONF_S4
-		CONF_S3=$(grep -E "^S3 = " "${SERVER_AWG_CONF}" 2>/dev/null | sed 's/^S3 = //')
-		CONF_S4=$(grep -E "^S4 = " "${SERVER_AWG_CONF}" 2>/dev/null | sed 's/^S4 = //')
-		
-		if [[ -n "${CONF_S3}" ]] && [[ -n "${CONF_S4}" ]]; then
-			# Validate that loaded values are numeric, within valid range [15-150],
-			# and satisfy the bidirectional constraint S3 + 56 != S4 and S4 + 56 != S3
-			if [[ "${CONF_S3}" =~ ^[0-9]+$ ]] && [[ "${CONF_S4}" =~ ^[0-9]+$ ]] && \
-			   (( CONF_S3 >= 15 )) && (( CONF_S3 <= 150 )) && \
-			   (( CONF_S4 >= 15 )) && (( CONF_S4 <= 150 )) && \
-			   (( CONF_S3 + 56 != CONF_S4 )) && (( CONF_S4 + 56 != CONF_S3 )); then
-				SERVER_AWG_S3="${CONF_S3}"
-				SERVER_AWG_S4="${CONF_S4}"
-			else
-				# Fallback: regenerate S3/S4 if config values are invalid
-				generateS3AndS4
-				while (( RANDOM_AWG_S3 + 56 == RANDOM_AWG_S4 )) || (( RANDOM_AWG_S4 + 56 == RANDOM_AWG_S3 )); do
-					generateS3AndS4
-				done
-				SERVER_AWG_S3=${RANDOM_AWG_S3}
-				SERVER_AWG_S4=${RANDOM_AWG_S4}
-			fi
+
+	# Validate and normalize SERVER_AWG_IPV6 from params file
+	# Older installations may have stored non-normalized or oddly formatted IPv6
+	if ! isValidIPv6 "${SERVER_AWG_IPV6}"; then
+		echo -e "${RED}ERROR: Invalid IPv6 address in params file: ${SERVER_AWG_IPV6}${NC}"
+		echo -e "${ORANGE}Fix the SERVER_AWG_IPV6 value in ${AMNEZIAWG_DIR}/params${NC}"
+		exit 1
+	fi
+	# Global used by loadParams to detect IPv6 normalization changes;
+	# prefixed with _ to denote script-internal cross-function state
+	_MIGRATE_ORIG_IPV6="${SERVER_AWG_IPV6}"
+	SERVER_AWG_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
+}
+
+# Migration for pre-2.0 installations: check for missing S3/S4 parameters
+# Sets SERVER_AWG_S3 and SERVER_AWG_S4 if they are missing or invalid
+# Returns 0 if migration was needed, 1 if no change
+function migrateS3S4() {
+	if [[ -n "${SERVER_AWG_S3}" ]] && [[ -n "${SERVER_AWG_S4}" ]]; then
+		return 1
+	fi
+
+	# Try to read existing S3/S4 from config file before using defaults
+	# This handles cases where params file is missing values but config file has them
+	local CONF_S3 CONF_S4
+	CONF_S3=$(grep -E "^S3 = " "${SERVER_AWG_CONF}" 2>/dev/null | sed 's/^S3 = //')
+	CONF_S4=$(grep -E "^S4 = " "${SERVER_AWG_CONF}" 2>/dev/null | sed 's/^S4 = //')
+
+	if [[ -n "${CONF_S3}" ]] && [[ -n "${CONF_S4}" ]]; then
+		# Validate that loaded values are numeric, within valid range [15-150],
+		# and satisfy the bidirectional constraint S3 + 56 != S4 and S4 + 56 != S3
+		if [[ "${CONF_S3}" =~ ^[0-9]+$ ]] && [[ "${CONF_S4}" =~ ^[0-9]+$ ]] && \
+		   (( CONF_S3 >= 15 )) && (( CONF_S3 <= 150 )) && \
+		   (( CONF_S4 >= 15 )) && (( CONF_S4 <= 150 )) && \
+		   (( CONF_S3 + 56 != CONF_S4 )) && (( CONF_S4 + 56 != CONF_S3 )); then
+			SERVER_AWG_S3="${CONF_S3}"
+			SERVER_AWG_S4="${CONF_S4}"
 		else
-			# Generate random S3/S4 values within the valid range [15-150]
-			# ensuring they satisfy the bidirectional constraint S3 + 56 != S4 and S4 + 56 != S3
-			# (56 is the WireGuard handshake initiation message size)
+			# Fallback: regenerate S3/S4 if config values are invalid
 			generateS3AndS4
 			while (( RANDOM_AWG_S3 + 56 == RANDOM_AWG_S4 )) || (( RANDOM_AWG_S4 + 56 == RANDOM_AWG_S3 )); do
 				generateS3AndS4
@@ -1016,16 +1585,30 @@ function loadParams() {
 			SERVER_AWG_S3=${RANDOM_AWG_S3}
 			SERVER_AWG_S4=${RANDOM_AWG_S4}
 		fi
-		
-		NEEDS_UPDATE=1
+	else
+		# Generate random S3/S4 values within the valid range [15-150]
+		# ensuring they satisfy the bidirectional constraint S3 + 56 != S4 and S4 + 56 != S3
+		# (56 is the WireGuard handshake initiation message size)
+		generateS3AndS4
+		while (( RANDOM_AWG_S3 + 56 == RANDOM_AWG_S4 )) || (( RANDOM_AWG_S4 + 56 == RANDOM_AWG_S3 )); do
+			generateS3AndS4
+		done
+		SERVER_AWG_S3=${RANDOM_AWG_S3}
+		SERVER_AWG_S4=${RANDOM_AWG_S4}
 	fi
-	
-	# Migration for pre-2.0 installations: check each H1-H4 independently for conversion
+
+	return 0
+}
+
+# Migration for pre-2.0 installations: convert/validate H1-H4 range parameters
+# Returns 0 if migration was needed, 1 if no change
+function migrateH1H4() {
+	# Check each H1-H4 independently for conversion
 	# Return codes: 0=converted, 1=no change needed, 2=invalid (needs regeneration)
 	local H_CONVERTED=0
 	local H_INVALID=0
 	local H_RC
-	
+
 	convertHToRangeIfNeeded "SERVER_AWG_H1"
 	H_RC=$?
 	if [[ ${H_RC} -eq 0 ]]; then
@@ -1033,7 +1616,7 @@ function loadParams() {
 	elif [[ ${H_RC} -eq 2 ]]; then
 		H_INVALID=1
 	fi
-	
+
 	convertHToRangeIfNeeded "SERVER_AWG_H2"
 	H_RC=$?
 	if [[ ${H_RC} -eq 0 ]]; then
@@ -1041,7 +1624,7 @@ function loadParams() {
 	elif [[ ${H_RC} -eq 2 ]]; then
 		H_INVALID=1
 	fi
-	
+
 	convertHToRangeIfNeeded "SERVER_AWG_H3"
 	H_RC=$?
 	if [[ ${H_RC} -eq 0 ]]; then
@@ -1049,7 +1632,7 @@ function loadParams() {
 	elif [[ ${H_RC} -eq 2 ]]; then
 		H_INVALID=1
 	fi
-	
+
 	convertHToRangeIfNeeded "SERVER_AWG_H4"
 	H_RC=$?
 	if [[ ${H_RC} -eq 0 ]]; then
@@ -1057,7 +1640,14 @@ function loadParams() {
 	elif [[ ${H_RC} -eq 2 ]]; then
 		H_INVALID=1
 	fi
-	
+
+	# If any H value is still empty after conversion attempts, force regeneration
+	# This handles pre-2.0 installations where H1-H4 were never set
+	if [[ -z "${SERVER_AWG_H1}" ]] || [[ -z "${SERVER_AWG_H2}" ]] || \
+	   [[ -z "${SERVER_AWG_H3}" ]] || [[ -z "${SERVER_AWG_H4}" ]]; then
+		H_INVALID=1
+	fi
+
 	# Check for overlapping ranges after conversion (even if all values were valid)
 	# This catches cases like H1=100, H2=100 which both convert to "100-100"
 	if [[ ${H_INVALID} == 0 ]] && [[ ${H_CONVERTED} == 1 || -n "${SERVER_AWG_H1}" ]]; then
@@ -1081,7 +1671,7 @@ function loadParams() {
 			H_INVALID=1
 		fi
 	fi
-	
+
 	# If any H value failed validation or ranges overlap, regenerate all H1-H4 ranges
 	# We regenerate all to ensure non-overlapping ranges
 	if [[ ${H_INVALID} == 1 ]]; then
@@ -1092,284 +1682,335 @@ function loadParams() {
 		SERVER_AWG_H4="${RANDOM_AWG_H4_MIN}-${RANDOM_AWG_H4_MAX}"
 		H_CONVERTED=1
 	fi
-	
+
 	if [[ ${H_CONVERTED} == 1 ]]; then
+		return 0
+	fi
+	return 1
+}
+
+# Restore migration backups and exit on failure
+# Must only be called from persistMigration after backups have been created
+# Provides detailed error context and allows investigation before exiting
+function _migrationRestoreAndExit() {
+	local ERROR_MSG=$1
+	echo ""
+	echo -e "${RED}================================================================================${NC}"
+	echo -e "${RED}  MIGRATION FAILED${NC}"
+	echo -e "${RED}================================================================================${NC}"
+	echo -e "${RED}  Error: ${ERROR_MSG}${NC}"
+	echo -e "${RED}================================================================================${NC}"
+	echo ""
+	echo -e "${GREEN}Restoring configuration from backups...${NC}"
+
+	local RESTORE_FAILED=0
+	if ! cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}" 2>/dev/null; then
+		echo -e "${RED}  WARNING: Failed to restore ${SERVER_AWG_CONF}${NC}"
+		RESTORE_FAILED=1
+	else
+		echo -e "${GREEN}  Restored: ${SERVER_AWG_CONF}${NC}"
+	fi
+
+	if ! cp "${AMNEZIAWG_DIR}/params.bak" "${AMNEZIAWG_DIR}/params" 2>/dev/null; then
+		echo -e "${RED}  WARNING: Failed to restore ${AMNEZIAWG_DIR}/params${NC}"
+		RESTORE_FAILED=1
+	else
+		echo -e "${GREEN}  Restored: ${AMNEZIAWG_DIR}/params${NC}"
+	fi
+
+	if (( RESTORE_FAILED )); then
+		echo ""
+		echo -e "${RED}Some backups could not be restored automatically.${NC}"
+		echo -e "${ORANGE}Backup files remain at:${NC}"
+		echo -e "${ORANGE}  ${SERVER_AWG_CONF}.bak${NC}"
+		echo -e "${ORANGE}  ${AMNEZIAWG_DIR}/params.bak${NC}"
+	else
+		rm -f "${SERVER_AWG_CONF}.bak" "${AMNEZIAWG_DIR}/params.bak"
+		echo -e "${GREEN}Backup restoration complete. Original configuration preserved.${NC}"
+	fi
+
+	echo ""
+	echo -e "${ORANGE}You can investigate the issue and re-run the script to retry migration.${NC}"
+	echo -e "${ORANGE}The VPN service should still be operational with the original configuration.${NC}"
+	exit 1
+}
+
+# Persist migrated values to params and server config files
+# Handles backup, atomic writes, config file updates, and client config renaming
+# Arguments:
+#   $1 - ORIG_IPV6: Original IPv6 before normalization (for Address line update)
+#   $2 - IPV6_CHANGED: 1 if IPv6 was normalized, 0 otherwise
+function persistMigration() {
+	local ORIG_IPV6="$1"
+	local IPV6_CHANGED="$2"
+
+	# Show prominent warning BEFORE migration begins
+	echo ""
+	echo -e "${RED}================================================================================${NC}"
+	echo -e "${RED}  IMPORTANT: Migration to AmneziaWG 2.0 format required${NC}"
+	echo -e "${RED}================================================================================${NC}"
+	echo -e "${RED}  After this migration, existing client configurations will be INCOMPATIBLE.${NC}"
+	echo -e "${RED}  You MUST regenerate all client configurations for them to connect.${NC}"
+	echo -e "${RED}================================================================================${NC}"
+	echo ""
+
+	# Require explicit user confirmation before proceeding with migration
+	while true; do
+		read -rp "Do you want to proceed with migration to AmneziaWG 2.0? [y/N]: " RESP
+		case "${RESP}" in
+			[Yy])
+				break
+				;;
+			[Nn]|"")
+				echo -e "${ORANGE}Migration cancelled. The script cannot continue without migration.${NC}"
+				echo -e "${ORANGE}Your existing configuration remains unchanged.${NC}"
+				exit 0
+				;;
+			*)
+				echo "Please answer y or n."
+				;;
+		esac
+	done
+
+	echo -e "${GREEN}Updating configuration with migrated values...${NC}"
+
+	# Create backups of both files before migration
+	# Note: If the script is interrupted, the .bak files will remain for manual recovery
+	if ! cp "${SERVER_AWG_CONF}" "${SERVER_AWG_CONF}.bak"; then
+		echo -e "${RED}ERROR: Failed to create backup of configuration file.${NC}"
+		exit 1
+	fi
+
+	if ! cp "${AMNEZIAWG_DIR}/params" "${AMNEZIAWG_DIR}/params.bak"; then
+		echo -e "${RED}ERROR: Failed to create backup of params file.${NC}"
+		rm -f "${SERVER_AWG_CONF}.bak"
+		exit 1
+	fi
+
+	# Write to a temporary file first, then atomically rename to prevent partial writes
+	local PARAMS_TMP="${AMNEZIAWG_DIR}/params.tmp.$$"
+	if ! serializeParams "${PARAMS_TMP}"; then
+		rm -f "${PARAMS_TMP}"
+		_migrationRestoreAndExit "Failed to write temporary params file."
+	fi
+
+	# Atomically replace the params file to avoid partial writes on interruption
+	if ! mv -f "${PARAMS_TMP}" "${AMNEZIAWG_DIR}/params"; then
+		rm -f "${PARAMS_TMP}"
+		_migrationRestoreAndExit "Failed to atomically replace params file."
+	fi
+
+	# Update server configuration file with migrated values
+	echo -e "${GREEN}Updating server configuration file...${NC}"
+
+	# Insert or update S3 (try update first, then insert after S2)
+	if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
+		if ! sed -i "s|^S3 = .*|S3 = ${SERVER_AWG_S3}|" "${SERVER_AWG_CONF}"; then
+			_migrationRestoreAndExit "Failed to update S3 in server configuration file."
+		fi
+	else
+		# Verify S2 exists before attempting insertion
+		if ! grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
+			_migrationRestoreAndExit "Cannot insert S3: S2 parameter not found in configuration file."
+		fi
+		if ! sed -i "/^S2 = .*/a S3 = ${SERVER_AWG_S3}" "${SERVER_AWG_CONF}"; then
+			_migrationRestoreAndExit "Failed to insert S3 into server configuration file."
+		fi
+		# Verify insertion succeeded
+		if ! grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
+			_migrationRestoreAndExit "S3 insertion appeared to succeed but S3 not found in configuration file."
+		fi
+	fi
+
+	# Insert or update S4 (try update first, then insert after S3, fallback to after S2)
+	# Note: Backups were created at the start of migration, so any failure will restore
+	# the original files via _migrationRestoreAndExit(). GNU sed -i is atomic (writes to
+	# temp file then renames), so partial modifications within a single sed call are unlikely.
+	if grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
+		if ! sed -i "s|^S4 = .*|S4 = ${SERVER_AWG_S4}|" "${SERVER_AWG_CONF}"; then
+			_migrationRestoreAndExit "Failed to update S4 in server configuration file."
+		fi
+	else
+		local S4_INSERTED=0
+		local S4_ANCHOR=""
+
+		# Determine anchor point for insertion (prefer S3, fallback to S2)
+		if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
+			S4_ANCHOR="S3"
+		elif grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
+			S4_ANCHOR="S2"
+		else
+			_migrationRestoreAndExit "Failed to insert S4: neither S3 nor S2 found in configuration file."
+		fi
+
+		# Perform single insertion after determined anchor
+		if sed -i "/^${S4_ANCHOR} = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
+			S4_INSERTED=1
+		fi
+
+		if [[ ${S4_INSERTED} == 0 ]]; then
+			_migrationRestoreAndExit "Failed to insert S4 after ${S4_ANCHOR} in server configuration file."
+		fi
+
+		# Verify insertion succeeded
+		if ! grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
+			_migrationRestoreAndExit "S4 insertion appeared to succeed but S4 not found in configuration file."
+		fi
+	fi
+
+	# Update H1-H4 values (verify existence first, insert if missing)
+	# Process in reverse order (H4, H3, H2, H1) so that when inserting after
+	# the same anchor point, the final order is correct (H1, H2, H3, H4)
+	for H_PARAM in H4 H3 H2 H1; do
+		local H_VAR="SERVER_AWG_${H_PARAM}"
+		local H_VALUE="${!H_VAR}"
+
+		if grep -q "^${H_PARAM} = " "${SERVER_AWG_CONF}"; then
+			if ! sed -i "s|^${H_PARAM} = .*|${H_PARAM} = ${H_VALUE}|" "${SERVER_AWG_CONF}"; then
+				_migrationRestoreAndExit "Failed to update ${H_PARAM} in server configuration file."
+			fi
+		else
+			# Parameter doesn't exist, insert after S4 (or S3, S2 as fallback)
+			local INSERTED=0
+			for AFTER_PARAM in S4 S3 S2; do
+				if grep -q "^${AFTER_PARAM} = " "${SERVER_AWG_CONF}"; then
+					if sed -i "/^${AFTER_PARAM} = .*/a ${H_PARAM} = ${H_VALUE}" "${SERVER_AWG_CONF}"; then
+						INSERTED=1
+						break
+					fi
+				fi
+			done
+			if [[ ${INSERTED} == 0 ]]; then
+				_migrationRestoreAndExit "Failed to insert ${H_PARAM} into server configuration file."
+			fi
+		fi
+	done
+
+	# Normalize the Address line IPv6 if it changed (cosmetic, covered by backup)
+	# Scoped to ^Address to avoid touching PostUp/PostDown firewalld rules
+	if [[ ${IPV6_CHANGED} == 1 ]]; then
+		if sed -i "/^Address = /s|${ORIG_IPV6}/64|${SERVER_AWG_IPV6}/64|" "${SERVER_AWG_CONF}" 2>/dev/null; then
+			echo -e "${GREEN}Normalized Address IPv6: ${ORIG_IPV6} -> ${SERVER_AWG_IPV6}${NC}"
+		fi
+	fi
+
+	# Migration successful, remove backups
+	rm -f "${SERVER_AWG_CONF}.bak" "${AMNEZIAWG_DIR}/params.bak"
+
+	# Rename existing client config files that don't have the new parameters
+	# This prevents confusion when users try to use old configs after migration
+	# Only rename configs that are actually outdated (missing S3/S4 parameters)
+	#
+	# Note on find options:
+	# - maxdepth 5: Prevents excessive traversal; client configs are typically in user home dirs
+	# - xdev: Prevents crossing filesystem boundaries (security: avoids mounted network shares,
+	#   external drives, or potentially malicious symlinks to other filesystems)
+	# - If configs are stored in unusual locations, users can manually rename them
+	echo -e "${GREEN}Marking old client configurations as outdated...${NC}"
+	local CLIENT_CONFIGS_RENAMED=0
+	while IFS= read -r CLIENT_CONF; do
+		if [[ -f "${CLIENT_CONF}" ]]; then
+			# Only rename if the config doesn't already have S3 parameter
+			# (indicating it's a pre-2.0 config that needs regeneration)
+			if ! grep -q "^S3 = " "${CLIENT_CONF}"; then
+				if mv "${CLIENT_CONF}" "${CLIENT_CONF}.old"; then
+					echo -e "${ORANGE}  Renamed: ${CLIENT_CONF} -> ${CLIENT_CONF}.old${NC}"
+					CLIENT_CONFIGS_RENAMED=$((CLIENT_CONFIGS_RENAMED + 1))
+				else
+					echo -e "${RED}  WARNING: Failed to rename ${CLIENT_CONF}${NC}"
+				fi
+			fi
+		fi
+	done < <(find /home /root -maxdepth 5 -xdev -type f -name "${SERVER_AWG_NIC}-client-*.conf" 2>/dev/null)
+
+	if (( CLIENT_CONFIGS_RENAMED > 0 )); then
+		echo -e "${ORANGE}  ${CLIENT_CONFIGS_RENAMED} client config(s) renamed with .old suffix${NC}"
+	else
+		echo -e "${ORANGE}  NOTE: Only searched /home and /root (maxdepth 5). Client configs in other locations must be manually updated.${NC}"
+	fi
+
+	# Reload AmneziaWG configuration
+	if systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
+		echo -e "${GREEN}Reloading AmneziaWG configuration...${NC}"
+
+		# Validate configuration before reloading to prevent VPN disconnection
+		if awg-quick strip "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
+			awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+		else
+			echo -e "${ORANGE}WARNING: Configuration validation failed. Skipping live reload.${NC}"
+			echo -e "${ORANGE}The configuration file has been updated successfully, but the running${NC}"
+			echo -e "${ORANGE}VPN service could not be reloaded and is still using the previous settings.${NC}"
+			echo -e "${ORANGE}To apply the new configuration, manually restart the service:${NC}"
+			echo -e "${ORANGE}  systemctl restart awg-quick@${SERVER_AWG_NIC}${NC}"
+		fi
+	fi
+
+	echo -e "${GREEN}Migration completed successfully.${NC}"
+	echo ""
+	if (( CLIENT_CONFIGS_RENAMED > 0 )); then
+		echo -e "${ORANGE}NOTE: ${CLIENT_CONFIGS_RENAMED} old client config(s) were renamed with .old suffix.${NC}"
+		echo -e "${ORANGE}You can delete them after regenerating new configs, or keep them for reference.${NC}"
+	fi
+	echo -e "${ORANGE}REMINDER: All existing client configurations must be regenerated.${NC}"
+	echo -e "${ORANGE}Use option 4 (Regenerate all client configs) to update them automatically.${NC}"
+	echo ""
+}
+
+# Quiet params rewrite when only IPv6 normalization changed (no protocol migration)
+# This keeps the params file in canonical form without alarming the user
+# Arguments:
+#   $1 - ORIG_IPV6: Original IPv6 before normalization
+function quietIPv6Rewrite() {
+	local ORIG_IPV6="$1"
+
+	local PARAMS_TMP="${AMNEZIAWG_DIR}/params.tmp.$$"
+	if serializeParams "${PARAMS_TMP}" && 
+	   mv -f "${PARAMS_TMP}" "${AMNEZIAWG_DIR}/params"; then
+		chmod 600 "${AMNEZIAWG_DIR}/params"
+	else
+		rm -f "${PARAMS_TMP}"
+		echo -e "${ORANGE}WARNING: Failed to rewrite params with normalized IPv6. Non-critical.${NC}"
+	fi
+
+	# Also normalize the Address line in the server config for full consistency.
+	# Scoped to ^Address to avoid touching PostUp/PostDown firewalld rules,
+	# which must keep the original form so removal matches on shutdown.
+	if sed -i "/^Address = /s|${ORIG_IPV6}/64|${SERVER_AWG_IPV6}/64|" "${SERVER_AWG_CONF}" 2>/dev/null; then
+		echo -e "${GREEN}Normalized Address IPv6: ${ORIG_IPV6} -> ${SERVER_AWG_IPV6}${NC}"
+	fi
+}
+
+function loadParams() {
+	validateParamsFile
+
+	local NEEDS_UPDATE=0
+	# Track IPv6 normalization separately from protocol migration;
+	# a cosmetic rewrite should not trigger the migration warning
+	local IPV6_CHANGED=0
+	if [[ "${_MIGRATE_ORIG_IPV6}" != "${SERVER_AWG_IPV6}" ]]; then
+		IPV6_CHANGED=1
+	fi
+
+	if migrateS3S4; then
 		NEEDS_UPDATE=1
 	fi
-	
+
+	if migrateH1H4; then
+		NEEDS_UPDATE=1
+	fi
+
 	# Persist migrated values to params file and update server config
 	if [[ ${NEEDS_UPDATE} == 1 ]]; then
-		# Show prominent warning BEFORE migration begins
-		echo ""
-		echo -e "${RED}================================================================================${NC}"
-		echo -e "${RED}  IMPORTANT: Migration to AmneziaWG 2.0 format required${NC}"
-		echo -e "${RED}================================================================================${NC}"
-		echo -e "${RED}  After this migration, existing client configurations will be INCOMPATIBLE.${NC}"
-		echo -e "${RED}  You MUST regenerate all client configurations for them to connect.${NC}"
-		echo -e "${RED}================================================================================${NC}"
-		echo ""
-		
-		# Require explicit user confirmation before proceeding with migration
-		while true; do
-			read -rp "Do you want to proceed with migration to AmneziaWG 2.0? [y/N]: " RESP
-			case "${RESP}" in
-				[Yy])
-					break
-					;;
-				[Nn]|"")
-					echo -e "${ORANGE}Migration cancelled. The script cannot continue without migration.${NC}"
-					echo -e "${ORANGE}Your existing configuration remains unchanged.${NC}"
-					exit 0
-					;;
-				*)
-					echo "Please answer y or n."
-					;;
-			esac
-		done
-		
-		echo -e "${GREEN}Updating configuration with migrated values...${NC}"
-		
-		# Create backups of both files before migration
-		# Note: If the script is interrupted, the .bak files will remain for manual recovery
-		if ! cp "${SERVER_AWG_CONF}" "${SERVER_AWG_CONF}.bak"; then
-			echo -e "${RED}ERROR: Failed to create backup of configuration file.${NC}"
-			exit 1
-		fi
-		
-		if ! cp "${AMNEZIAWG_DIR}/params" "${AMNEZIAWG_DIR}/params.bak"; then
-			echo -e "${RED}ERROR: Failed to create backup of params file.${NC}"
-			rm -f "${SERVER_AWG_CONF}.bak"
-			exit 1
-		fi
-		
-		# Helper function to restore backups and exit on failure
-		# Provides detailed error context and allows investigation before exiting
-		restoreBackupsAndExit() {
-			local ERROR_MSG=$1
-			echo ""
-			echo -e "${RED}================================================================================${NC}"
-			echo -e "${RED}  MIGRATION FAILED${NC}"
-			echo -e "${RED}================================================================================${NC}"
-			echo -e "${RED}  Error: ${ERROR_MSG}${NC}"
-			echo -e "${RED}================================================================================${NC}"
-			echo ""
-			echo -e "${GREEN}Restoring configuration from backups...${NC}"
-			
-			local RESTORE_FAILED=0
-			if ! cp "${SERVER_AWG_CONF}.bak" "${SERVER_AWG_CONF}" 2>/dev/null; then
-				echo -e "${RED}  WARNING: Failed to restore ${SERVER_AWG_CONF}${NC}"
-				RESTORE_FAILED=1
-			else
-				echo -e "${GREEN}  Restored: ${SERVER_AWG_CONF}${NC}"
-			fi
-			
-			if ! cp "${AMNEZIAWG_DIR}/params.bak" "${AMNEZIAWG_DIR}/params" 2>/dev/null; then
-				echo -e "${RED}  WARNING: Failed to restore ${AMNEZIAWG_DIR}/params${NC}"
-				RESTORE_FAILED=1
-			else
-				echo -e "${GREEN}  Restored: ${AMNEZIAWG_DIR}/params${NC}"
-			fi
-			
-			if (( RESTORE_FAILED )); then
-				echo ""
-				echo -e "${RED}Some backups could not be restored automatically.${NC}"
-				echo -e "${ORANGE}Backup files remain at:${NC}"
-				echo -e "${ORANGE}  ${SERVER_AWG_CONF}.bak${NC}"
-				echo -e "${ORANGE}  ${AMNEZIAWG_DIR}/params.bak${NC}"
-			else
-				rm -f "${SERVER_AWG_CONF}.bak" "${AMNEZIAWG_DIR}/params.bak"
-				echo -e "${GREEN}Backup restoration complete. Original configuration preserved.${NC}"
-			fi
-			
-			echo ""
-			echo -e "${ORANGE}You can investigate the issue and re-run the script to retry migration.${NC}"
-			echo -e "${ORANGE}The VPN service should still be operational with the original configuration.${NC}"
-			exit 1
-		}
-		
-		# Use safe quoting for string values to prevent shell injection when sourced
-		# Write to a temporary file first, then atomically rename to prevent partial writes
-		local PARAMS_TMP="${AMNEZIAWG_DIR}/params.tmp.$$"
-		if ! echo "SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
-SERVER_PUB_NIC=$(safeQuoteParam "${SERVER_PUB_NIC}")
-SERVER_AWG_NIC=$(safeQuoteParam "${SERVER_AWG_NIC}")
-SERVER_AWG_IPV4=$(safeQuoteParam "${SERVER_AWG_IPV4}")
-SERVER_AWG_IPV6=$(safeQuoteParam "${SERVER_AWG_IPV6}")
-SERVER_PORT=${SERVER_PORT}
-SERVER_PRIV_KEY=$(safeQuoteParam "${SERVER_PRIV_KEY}")
-SERVER_PUB_KEY=$(safeQuoteParam "${SERVER_PUB_KEY}")
-CLIENT_DNS_1=${CLIENT_DNS_1}
-CLIENT_DNS_2=${CLIENT_DNS_2}
-ALLOWED_IPS=$(safeQuoteParam "${ALLOWED_IPS}")
-SERVER_AWG_JC=${SERVER_AWG_JC}
-SERVER_AWG_JMIN=${SERVER_AWG_JMIN}
-SERVER_AWG_JMAX=${SERVER_AWG_JMAX}
-SERVER_AWG_S1=${SERVER_AWG_S1}
-SERVER_AWG_S2=${SERVER_AWG_S2}
-SERVER_AWG_S3=${SERVER_AWG_S3}
-SERVER_AWG_S4=${SERVER_AWG_S4}
-SERVER_AWG_H1=$(safeQuoteParam "${SERVER_AWG_H1}")
-SERVER_AWG_H2=$(safeQuoteParam "${SERVER_AWG_H2}")
-SERVER_AWG_H3=$(safeQuoteParam "${SERVER_AWG_H3}")
-SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")" >"${PARAMS_TMP}"; then
-			rm -f "${PARAMS_TMP}"
-			restoreBackupsAndExit "Failed to write temporary params file."
-		fi
-		
-		# Atomically replace the params file to avoid partial writes on interruption
-		if ! mv -f "${PARAMS_TMP}" "${AMNEZIAWG_DIR}/params"; then
-			rm -f "${PARAMS_TMP}"
-			restoreBackupsAndExit "Failed to atomically replace params file."
-		fi
-		
-		# Update server configuration file with migrated values
-		echo -e "${GREEN}Updating server configuration file...${NC}"
-		
-		# Insert or update S3 (try update first, then insert after S2)
-		if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
-			if ! sed -i "s|^S3 = .*|S3 = ${SERVER_AWG_S3}|" "${SERVER_AWG_CONF}"; then
-				restoreBackupsAndExit "Failed to update S3 in server configuration file."
-			fi
-		else
-			# Verify S2 exists before attempting insertion
-			if ! grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
-				restoreBackupsAndExit "Cannot insert S3: S2 parameter not found in configuration file."
-			fi
-			if ! sed -i "/^S2 = .*/a S3 = ${SERVER_AWG_S3}" "${SERVER_AWG_CONF}"; then
-				restoreBackupsAndExit "Failed to insert S3 into server configuration file."
-			fi
-			# Verify insertion succeeded
-			if ! grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
-				restoreBackupsAndExit "S3 insertion appeared to succeed but S3 not found in configuration file."
-			fi
-		fi
-		
-		# Insert or update S4 (try update first, then insert after S3, fallback to after S2)
-		# Note: Backups were created at the start of migration, so any failure will restore
-		# the original files via restoreBackupsAndExit(). GNU sed -i is atomic (writes to
-		# temp file then renames), so partial modifications within a single sed call are unlikely.
-		if grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
-			if ! sed -i "s|^S4 = .*|S4 = ${SERVER_AWG_S4}|" "${SERVER_AWG_CONF}"; then
-				restoreBackupsAndExit "Failed to update S4 in server configuration file."
-			fi
-		else
-			local S4_INSERTED=0
-			local S4_ANCHOR=""
-			
-			# Determine anchor point for insertion (prefer S3, fallback to S2)
-			if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
-				S4_ANCHOR="S3"
-			elif grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
-				S4_ANCHOR="S2"
-			else
-				restoreBackupsAndExit "Failed to insert S4: neither S3 nor S2 found in configuration file."
-			fi
-			
-			# Perform single insertion after determined anchor
-			if sed -i "/^${S4_ANCHOR} = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
-				S4_INSERTED=1
-			fi
-			
-			if [[ ${S4_INSERTED} == 0 ]]; then
-				restoreBackupsAndExit "Failed to insert S4 after ${S4_ANCHOR} in server configuration file."
-			fi
-			
-			# Verify insertion succeeded
-			if ! grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
-				restoreBackupsAndExit "S4 insertion appeared to succeed but S4 not found in configuration file."
-			fi
-		fi
-		
-		# Update H1-H4 values (verify existence first, insert if missing)
-		# Process in reverse order (H4, H3, H2, H1) so that when inserting after
-		# the same anchor point, the final order is correct (H1, H2, H3, H4)
-		for H_PARAM in H4 H3 H2 H1; do
-			local H_VAR="SERVER_AWG_${H_PARAM}"
-			local H_VALUE="${!H_VAR}"
-			
-			if grep -q "^${H_PARAM} = " "${SERVER_AWG_CONF}"; then
-				if ! sed -i "s|^${H_PARAM} = .*|${H_PARAM} = ${H_VALUE}|" "${SERVER_AWG_CONF}"; then
-					restoreBackupsAndExit "Failed to update ${H_PARAM} in server configuration file."
-				fi
-			else
-				# Parameter doesn't exist, insert after S4 (or S3, S2 as fallback)
-				local INSERTED=0
-				for AFTER_PARAM in S4 S3 S2; do
-					if grep -q "^${AFTER_PARAM} = " "${SERVER_AWG_CONF}"; then
-						if sed -i "/^${AFTER_PARAM} = .*/a ${H_PARAM} = ${H_VALUE}" "${SERVER_AWG_CONF}"; then
-							INSERTED=1
-							break
-						fi
-					fi
-				done
-				if [[ ${INSERTED} == 0 ]]; then
-					restoreBackupsAndExit "Failed to insert ${H_PARAM} into server configuration file."
-				fi
-			fi
-		done
-		
-		# Migration successful, remove backups
-		rm -f "${SERVER_AWG_CONF}.bak" "${AMNEZIAWG_DIR}/params.bak"
-		
-		# Rename existing client config files that don't have the new parameters
-		# This prevents confusion when users try to use old configs after migration
-		# Only rename configs that are actually outdated (missing S3/S4 parameters)
-		#
-		# Note on find options:
-		# - maxdepth 5: Prevents excessive traversal; client configs are typically in user home dirs
-		# - xdev: Prevents crossing filesystem boundaries (security: avoids mounted network shares,
-		#   external drives, or potentially malicious symlinks to other filesystems)
-		# - If configs are stored in unusual locations, users can manually rename them
-		echo -e "${GREEN}Marking old client configurations as outdated...${NC}"
-		local CLIENT_CONFIGS_RENAMED=0
-		while IFS= read -r CLIENT_CONF; do
-			if [[ -f "${CLIENT_CONF}" ]]; then
-				# Only rename if the config doesn't already have S3 parameter
-				# (indicating it's a pre-2.0 config that needs regeneration)
-				if ! grep -q "^S3 = " "${CLIENT_CONF}"; then
-					if mv "${CLIENT_CONF}" "${CLIENT_CONF}.old"; then
-						echo -e "${ORANGE}  Renamed: ${CLIENT_CONF} -> ${CLIENT_CONF}.old${NC}"
-						CLIENT_CONFIGS_RENAMED=$((CLIENT_CONFIGS_RENAMED + 1))
-					else
-						echo -e "${RED}  WARNING: Failed to rename ${CLIENT_CONF}${NC}"
-					fi
-				fi
-			fi
-		done < <(find /home /root -maxdepth 5 -xdev -type f -name "${SERVER_AWG_NIC}-client-*.conf" 2>/dev/null)
-		
-		if (( CLIENT_CONFIGS_RENAMED > 0 )); then
-			echo -e "${ORANGE}  ${CLIENT_CONFIGS_RENAMED} client config(s) renamed with .old suffix${NC}"
-		fi
-		
-		# Reload AmneziaWG configuration
-		if systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
-			echo -e "${GREEN}Reloading AmneziaWG configuration...${NC}"
-			
-			# Validate configuration before reloading to prevent VPN disconnection
-			if awg-quick strip "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
-				awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
-			else
-				echo -e "${ORANGE}WARNING: Configuration validation failed. Skipping live reload.${NC}"
-				echo -e "${ORANGE}The configuration file has been updated successfully, but the running${NC}"
-				echo -e "${ORANGE}VPN service could not be reloaded and is still using the previous settings.${NC}"
-				echo -e "${ORANGE}To apply the new configuration, manually restart the service:${NC}"
-				echo -e "${ORANGE}  systemctl restart awg-quick@${SERVER_AWG_NIC}${NC}"
-			fi
-		fi
-		
-		echo -e "${GREEN}Migration completed successfully.${NC}"
-		echo ""
-		if (( CLIENT_CONFIGS_RENAMED > 0 )); then
-			echo -e "${ORANGE}NOTE: ${CLIENT_CONFIGS_RENAMED} old client config(s) were renamed with .old suffix.${NC}"
-			echo -e "${ORANGE}You can delete them after regenerating new configs, or keep them for reference.${NC}"
-		fi
-		echo -e "${ORANGE}REMINDER: All existing client configurations must be regenerated.${NC}"
-		echo -e "${ORANGE}Use option 1 (Add a new user) to create new client configs with updated parameters.${NC}"
-		echo ""
+		persistMigration "${_MIGRATE_ORIG_IPV6}" "${IPV6_CHANGED}"
+	fi
+
+	if [[ ${NEEDS_UPDATE} == 0 ]] && [[ ${IPV6_CHANGED} == 1 ]]; then
+		quietIPv6Rewrite "${_MIGRATE_ORIG_IPV6}"
 	fi
 }
 
 function manageMenu() {
+	local MENU_OPTION=""
 	echo "AmneziaWG server installer (https://github.com/wiresock/amneziawg-install)"
 	echo ""
 	echo "It looks like AmneziaWG is already installed."
@@ -1378,10 +2019,11 @@ function manageMenu() {
 	echo "   1) Add a new user"
 	echo "   2) List all users"
 	echo "   3) Revoke existing user"
-	echo "   4) Uninstall AmneziaWG"
-	echo "   5) Exit"
-	until [[ ${MENU_OPTION} =~ ^[1-5]$ ]]; do
-		read -rp "Select an option [1-5]: " MENU_OPTION
+	echo "   4) Regenerate all client configs (update obfuscation parameters)"
+	echo "   5) Uninstall AmneziaWG"
+	echo "   6) Exit"
+	until [[ ${MENU_OPTION} =~ ^[1-6]$ ]]; do
+		read -rp "Select an option [1-6]: " MENU_OPTION
 	done
 	case "${MENU_OPTION}" in
 	1)
@@ -1394,9 +2036,12 @@ function manageMenu() {
 		revokeClient
 		;;
 	4)
-		uninstallAmneziaWG
+		regenerateClients
 		;;
 	5)
+		uninstallAmneziaWG
+		;;
+	6)
 		exit 0
 		;;
 	esac
