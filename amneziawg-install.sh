@@ -1063,7 +1063,7 @@ H3 = ${SERVER_AWG_H3}
 H4 = ${SERVER_AWG_H4}" >"${SERVER_AWG_CONF}"
 	chmod 600 "${SERVER_AWG_CONF}"
 
-	if systemctl is-active --quiet firewalld; then
+	if systemctl is-active --quiet firewalld 2>/dev/null; then
 		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_AWG_IPV4}" | cut -d"." -f1-3)".0"
 		# Derive /64 network address from the normalized IPv6 (first 4 groups + :0:0:0:0)
 		FIREWALLD_IPV6_ADDRESS="$(echo "${SERVER_AWG_IPV6}" | cut -d':' -f1-4):0:0:0:0"
