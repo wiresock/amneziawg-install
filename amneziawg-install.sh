@@ -15,7 +15,7 @@ AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 if [ -n "${PATH}" ]; then
 	export PATH="/sbin:/usr/sbin:${PATH}"
 else
-	export PATH="/sbin:/usr/sbin"
+	export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 fi
 
 # Restrict file creation to owner-only by default. This protects private keys and
