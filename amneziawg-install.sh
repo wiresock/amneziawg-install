@@ -1004,9 +1004,14 @@ EOF
 	# If modprobe fails here, the module wasn't built for this kernel — starting
 	# the service would just produce a confusing "Unknown device type" error.
 	local MODULE_READY=0
+
+	# Always enable the service so it starts on next boot. Even if modprobe fails
+	# now (e.g., missing kernel headers), a reboot after installing headers or
+	# running dkms autoinstall will load the module via the ExecStartPre override.
+	systemctl enable "awg-quick@${SERVER_AWG_NIC}"
+
 	if modprobe amneziawg; then
 		systemctl start "awg-quick@${SERVER_AWG_NIC}"
-		systemctl enable "awg-quick@${SERVER_AWG_NIC}"
 		MODULE_READY=1
 	else
 		local HEADERS_HINT="matching kernel headers"
@@ -1020,14 +1025,14 @@ EOF
 		fi
 
 		echo -e "${RED}ERROR: amneziawg kernel module could not be loaded for kernel $(uname -r).${NC}"
-		echo -e "${ORANGE}The service was NOT started. To fix:${NC}"
+		echo -e "${ORANGE}The service was NOT started but is enabled for next boot.${NC}"
+		echo -e "${ORANGE}To fix:${NC}"
 		echo -e "${ORANGE}  1. Ensure ${HEADERS_HINT} is installed${NC}"
 		echo -e "${ORANGE}     ${INSTALL_HINT}${NC}"
 		echo -e "${ORANGE}  2. Run: dkms autoinstall && depmod -a${NC}"
 		echo -e "${ORANGE}  3. Run: modprobe amneziawg${NC}"
 		echo -e "${ORANGE}  4. Run: systemctl start awg-quick@${SERVER_AWG_NIC}${NC}"
 		echo -e "${ORANGE}  Or simply reboot the server.${NC}"
-		systemctl enable "awg-quick@${SERVER_AWG_NIC}"
 	fi
 
 	if [[ ${MODULE_READY} -eq 1 ]]; then
