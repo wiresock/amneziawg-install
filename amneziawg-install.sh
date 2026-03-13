@@ -924,17 +924,29 @@ function installAmneziaWG() {
 			exit 1
 		fi
 		# Fingerprint verified — import the key into the dedicated keyring
-		if ! gpg --dearmor < "${TMP_KEY_ASC}" > /etc/apt/keyrings/amneziawg.gpg 2>/dev/null; then
+		local TMP_KEYRING
+		TMP_KEYRING=$(mktemp /etc/apt/keyrings/amneziawg.gpg.tmp.XXXXXX) || {
 			rm -f "${TMP_KEY_ASC}"
+			echo -e "${RED}ERROR: Failed to create temporary file for AmneziaWG APT signing keyring.${NC}"
+			exit 1
+		}
+		if ! gpg --dearmor < "${TMP_KEY_ASC}" > "${TMP_KEYRING}" 2>/dev/null; then
+			rm -f "${TMP_KEY_ASC}" "${TMP_KEYRING}"
 			echo -e "${RED}ERROR: Failed to import the AmneziaWG APT signing key into keyring.${NC}"
 			exit 1
 		fi
 		rm -f "${TMP_KEY_ASC}"
+		if [[ ! -s "${TMP_KEYRING}" ]]; then
+			rm -f "${TMP_KEYRING}"
+			echo -e "${RED}ERROR: AmneziaWG APT keyring file is empty after import.${NC}"
+			exit 1
+		fi
+		chmod 644 "${TMP_KEYRING}"
+		mv "${TMP_KEYRING}" /etc/apt/keyrings/amneziawg.gpg
 		if [[ ! -s /etc/apt/keyrings/amneziawg.gpg ]]; then
 			echo -e "${RED}ERROR: AmneziaWG APT keyring file is empty after import.${NC}"
 			exit 1
 		fi
-		chmod 644 /etc/apt/keyrings/amneziawg.gpg
 		# Ensure the managed file exists with sentinel before appending PPA lines.
 		# When /etc/apt/sources.list already has deb-src, the copy block above is
 		# skipped and the file doesn't exist yet — without this guard the >> below
