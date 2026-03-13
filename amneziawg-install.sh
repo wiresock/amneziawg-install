@@ -301,6 +301,12 @@ function getHomeDirForClient() {
 	fi
 	if [[ -n "${PASSWD_HOME}" ]] && [[ -d "${PASSWD_HOME}" ]]; then
 		RESULT_DIR="${PASSWD_HOME}"
+	elif [[ -d "/home/${CLIENT_NAME}" ]]; then
+		# Fallback to traditional /home path for the client when getent is unavailable or misconfigured
+		RESULT_DIR="/home/${CLIENT_NAME}"
+	elif [[ "${CLIENT_NAME}" == "root" ]]; then
+		# Explicitly handle root client
+		RESULT_DIR="/root"
 	elif [[ "${SUDO_USER}" ]]; then
 		# if not a system user, use SUDO_USER
 		local SUDO_HOME=""
