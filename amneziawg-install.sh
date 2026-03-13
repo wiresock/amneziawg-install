@@ -1227,7 +1227,7 @@ function newClient() {
 
 	BASE_IP=$(echo "$SERVER_AWG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
 
-	FREE_DOT_IP_FOUND=0
+	local FREE_DOT_IP_FOUND=0
 	for DOT_IP in {2..254}; do
 		DOT_EXISTS=$(grep -cF "${BASE_IP}.${DOT_IP}/32" "${SERVER_AWG_CONF}")
 		if [[ ${DOT_EXISTS} == '0' ]]; then
