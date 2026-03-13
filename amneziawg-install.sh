@@ -2248,7 +2248,7 @@ function manageMenu() {
 	echo "   1) Add a new user"
 	echo "   2) List all users"
 	echo "   3) Revoke existing user"
-	echo "   4) Regenerate all client configs (update obfuscation parameters)"
+	echo "   4) Regenerate all client configs (using current server parameters)"
 	echo "   5) Uninstall AmneziaWG"
 	echo "   6) Exit"
 	until [[ ${MENU_OPTION} =~ ^[1-6]$ ]]; do
