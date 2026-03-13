@@ -981,7 +981,21 @@ function installAmneziaWG() {
 			echo "deb-src [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
 		fi
 		apt update
-		apt install -y "linux-headers-$(uname -r)" dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		# Try to install appropriate kernel headers, but don't hard-fail if the
+		# exact versioned package is unavailable (e.g., on some Raspberry Pi kernels).
+		HEADER_PKG=""
+		if apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1; then
+			HEADER_PKG="linux-headers-$(uname -r)"
+		elif apt-cache show raspberrypi-kernel-headers >/dev/null 2>&1; then
+			HEADER_PKG="raspberrypi-kernel-headers"
+		fi
+
+		if [[ -n "${HEADER_PKG}" ]]; then
+			apt install -y "${HEADER_PKG}" dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		else
+			echo -e "${ORANGE}WARNING: No suitable kernel headers package found. Continuing without installing headers; DKMS module builds may fail.${NC}"
+			apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		fi
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
