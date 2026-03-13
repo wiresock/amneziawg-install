@@ -278,18 +278,26 @@ function getHomeDirForClient() {
 		exit 1
 	fi
 
-	# Home directory of the user, where the client configuration will be written
+	# Home directory of the user, where the client configuration will be written.
 	# Use getent passwd for reliable lookup (supports LDAP, custom home paths, etc.),
 	# but gracefully handle systems where getent is unavailable or misconfigured.
-	local PASSWD_HOME
+	local PASSWD_HOME=""
 	local RESULT_DIR
-	PASSWD_HOME=$(getent passwd "${CLIENT_NAME}" 2>/dev/null | cut -d: -f6)
+	local HAVE_GETENT=false
+	if command -v getent &>/dev/null; then
+		HAVE_GETENT=true
+	fi
+	if [[ "${HAVE_GETENT}" == true ]]; then
+		PASSWD_HOME=$(getent passwd "${CLIENT_NAME}" 2>/dev/null | cut -d: -f6)
+	fi
 	if [[ -n "${PASSWD_HOME}" ]] && [[ -d "${PASSWD_HOME}" ]]; then
 		RESULT_DIR="${PASSWD_HOME}"
 	elif [[ "${SUDO_USER}" ]]; then
 		# if not a system user, use SUDO_USER
-		local SUDO_HOME
-		SUDO_HOME=$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)
+		local SUDO_HOME=""
+		if [[ "${HAVE_GETENT}" == true ]]; then
+			SUDO_HOME=$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)
+		fi
 		if [[ -n "${SUDO_HOME}" ]] && [[ -d "${SUDO_HOME}" ]]; then
 			RESULT_DIR="${SUDO_HOME}"
 		elif [[ -d "/home/${SUDO_USER}" ]]; then
@@ -745,8 +753,13 @@ function installQuestions() {
 	until [[ ${CLIENT_DNS_1} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
 		read -rp "First DNS resolver to use for the clients: " -e -i 1.1.1.1 CLIENT_DNS_1
 	done
-	until [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]] || [[ -z ${CLIENT_DNS_2} ]]; do
+	while true; do
 		read -rp "Second DNS resolver to use for the clients (optional): " -e -i 1.0.0.1 CLIENT_DNS_2
+		# Accept empty input (skip second DNS) or a valid IPv4 address
+		if [[ -z "${CLIENT_DNS_2}" ]] || [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; then
+			break
+		fi
+		echo -e "${ORANGE}Invalid IPv4 address. Enter a valid address or leave empty to skip.${NC}"
 	done
 
 	until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
