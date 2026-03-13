@@ -1481,9 +1481,32 @@ function regenerateClients() {
 		local CLIENT_CONF="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 		local CLIENT_PRIV_KEY=""
 
-		# Try to recover the client's private key from existing config file
-		# Check both .conf and .conf.old (renamed during migration)
-		for CANDIDATE in "${CLIENT_CONF}" "${CLIENT_CONF}.old"; do
+		# Try to recover the client's private key from an existing config file.
+		# Search multiple common locations to avoid regenerating keys just because
+		# getHomeDirForClient guessed a different home than where the config was created.
+		local -a CLIENT_CONF_CANDIDATES=()
+
+		# 1) Config under the resolved HOME_DIR (if any)
+		if [[ -n "${HOME_DIR}" ]]; then
+			CLIENT_CONF_CANDIDATES+=("${CLIENT_CONF}" "${CLIENT_CONF}.old")
+		fi
+
+		# 2) Root's home (common when run as root or via sudo)
+		if [[ -d "/root" ]]; then
+			CLIENT_CONF_CANDIDATES+=("/root/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf" \
+									 "/root/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf.old")
+		fi
+
+		# 3) All user homes under /home
+		for SEARCH_DIR in /home/*; do
+			if [[ -d "${SEARCH_DIR}" ]]; then
+				CLIENT_CONF_CANDIDATES+=("${SEARCH_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf" \
+										 "${SEARCH_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf.old")
+			fi
+		done
+
+		# Scan candidate config files (including .conf.old, renamed during migration)
+		for CANDIDATE in "${CLIENT_CONF_CANDIDATES[@]}"; do
 			if [[ -f "${CANDIDATE}" ]]; then
 				CLIENT_PRIV_KEY=$(grep -E "^PrivateKey = " "${CANDIDATE}" | sed 's/^PrivateKey = //')
 				if [[ -n "${CLIENT_PRIV_KEY}" ]]; then
