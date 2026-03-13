@@ -1901,32 +1901,36 @@ function persistMigration() {
 	# This prevents confusion when users try to use old configs after migration
 	# Only rename configs that are actually outdated (missing S3/S4 parameters)
 	#
-	# Note on find options:
-	# - maxdepth 5: Prevents excessive traversal; client configs are typically in user home dirs
-	# - xdev: Prevents crossing filesystem boundaries (security: avoids mounted network shares,
-	#   external drives, or potentially malicious symlinks to other filesystems)
-	# - If configs are stored in unusual locations, users can manually rename them
+	# Iterates over clients listed in the server config and uses getHomeDirForClient
+	# to locate each config file, matching how regenerateClients works. This is more
+	# robust than a filesystem search, as it handles home directories outside /home
+	# and /root (e.g., LDAP users, custom paths, SUDO_USER fallback).
 	echo -e "${GREEN}Marking old client configurations as outdated...${NC}"
 	local CLIENT_CONFIGS_RENAMED=0
-	while IFS= read -r CLIENT_CONF; do
-		if [[ -f "${CLIENT_CONF}" ]]; then
+	while IFS= read -r MIGRATE_CLIENT_NAME; do
+		if ! [[ ${MIGRATE_CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+			continue
+		fi
+		local MIGRATE_HOME_DIR
+		MIGRATE_HOME_DIR=$(getHomeDirForClient "${MIGRATE_CLIENT_NAME}")
+		local MIGRATE_CLIENT_CONF="${MIGRATE_HOME_DIR}/${SERVER_AWG_NIC}-client-${MIGRATE_CLIENT_NAME}.conf"
+
+		if [[ -f "${MIGRATE_CLIENT_CONF}" ]]; then
 			# Only rename if the config doesn't already have S3 parameter
 			# (indicating it's a pre-2.0 config that needs regeneration)
-			if ! grep -q "^S3 = " "${CLIENT_CONF}"; then
-				if mv "${CLIENT_CONF}" "${CLIENT_CONF}.old"; then
-					echo -e "${ORANGE}  Renamed: ${CLIENT_CONF} -> ${CLIENT_CONF}.old${NC}"
+			if ! grep -q "^S3 = " "${MIGRATE_CLIENT_CONF}"; then
+				if mv "${MIGRATE_CLIENT_CONF}" "${MIGRATE_CLIENT_CONF}.old"; then
+					echo -e "${ORANGE}  Renamed: ${MIGRATE_CLIENT_CONF} -> ${MIGRATE_CLIENT_CONF}.old${NC}"
 					CLIENT_CONFIGS_RENAMED=$((CLIENT_CONFIGS_RENAMED + 1))
 				else
-					echo -e "${RED}  WARNING: Failed to rename ${CLIENT_CONF}${NC}"
+					echo -e "${RED}  WARNING: Failed to rename ${MIGRATE_CLIENT_CONF}${NC}"
 				fi
 			fi
 		fi
-	done < <(find /home /root -maxdepth 5 -xdev -type f -name "${SERVER_AWG_NIC}-client-*.conf" 2>/dev/null)
+	done < <(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
 
 	if (( CLIENT_CONFIGS_RENAMED > 0 )); then
 		echo -e "${ORANGE}  ${CLIENT_CONFIGS_RENAMED} client config(s) renamed with .old suffix${NC}"
-	else
-		echo -e "${ORANGE}  NOTE: Only searched /home and /root (maxdepth 5). Client configs in other locations must be manually updated.${NC}"
 	fi
 
 	# Reload AmneziaWG configuration
