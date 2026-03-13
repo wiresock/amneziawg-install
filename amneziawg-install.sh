@@ -11,8 +11,12 @@ NC='\033[0m'
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
-# Some minimal or non-login root shells may not include these by default
-export PATH="/sbin:/usr/sbin:${PATH}"
+# Some minimal or non-login root shells may not include these by default.
+if [ -n "${PATH}" ]; then
+	export PATH="/sbin:/usr/sbin:${PATH}"
+else
+	export PATH="/sbin:/usr/sbin"
+fi
 
 # Restrict file creation to owner-only by default. This protects private keys and
 # config files from being briefly world-readable before chmod runs.
