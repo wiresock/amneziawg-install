@@ -880,25 +880,49 @@ function installAmneziaWG() {
 			apt-get install -y curl || { echo -e "${RED}ERROR: Failed to install curl required for key download.${NC}"; exit 1; }
 		fi
 		mkdir -p /etc/apt/keyrings
+		# Full 40-character fingerprint of the AmneziaWG APT signing key.
+		# Short key IDs (e.g., 0x57290828) are collision-prone; always fetch and
+		# verify by full fingerprint to prevent keyserver substitution attacks.
+		local AMNEZIAWG_APT_FPR="75C9DD72C799870E310542E24166F2C257290828"
+		local KEY_URL="https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${AMNEZIAWG_APT_FPR}"
+		local TMP_KEY_ASC
+		TMP_KEY_ASC=$(mktemp /tmp/amneziawg-apt-key.XXXXXX) || { echo -e "${RED}ERROR: Failed to create temporary file for APT signing key.${NC}"; exit 1; }
 		local KEY_FETCH_OK=0
-		# Save current pipefail state so we can restore it after the key fetch.
-		# This avoids disabling pipefail if the caller already had it enabled.
-		local PREV_PIPEFAIL=0
-		if shopt -qo pipefail 2>/dev/null; then
-			PREV_PIPEFAIL=1
-		fi
-		set -o pipefail
 		if command -v curl &>/dev/null; then
-			curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor -o /etc/apt/keyrings/amneziawg.gpg && KEY_FETCH_OK=1
+			curl -fsSL "${KEY_URL}" -o "${TMP_KEY_ASC}" && KEY_FETCH_OK=1
 		elif command -v wget &>/dev/null; then
-			wget -qO- "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor -o /etc/apt/keyrings/amneziawg.gpg && KEY_FETCH_OK=1
+			wget -qO "${TMP_KEY_ASC}" "${KEY_URL}" && KEY_FETCH_OK=1
 		fi
-		if [[ ${PREV_PIPEFAIL} -eq 0 ]]; then
-			set +o pipefail
-		fi
-		if [[ ${KEY_FETCH_OK} -ne 1 ]] || [[ ! -s /etc/apt/keyrings/amneziawg.gpg ]]; then
-			echo -e "${RED}ERROR: Failed to download or import the AmneziaWG APT signing key.${NC}"
+		if [[ ${KEY_FETCH_OK} -ne 1 ]] || [[ ! -s "${TMP_KEY_ASC}" ]]; then
+			rm -f "${TMP_KEY_ASC}"
+			echo -e "${RED}ERROR: Failed to download the AmneziaWG APT signing key.${NC}"
 			echo -e "${ORANGE}Verify network connectivity and that curl/wget and gnupg are installed.${NC}"
+			exit 1
+		fi
+		# Verify the downloaded key's fingerprint matches before importing.
+		# This prevents importing a substituted key from a compromised keyserver.
+		local DOWNLOADED_FPR
+		DOWNLOADED_FPR=$(gpg --show-keys --with-colons "${TMP_KEY_ASC}" 2>/dev/null | awk -F: '/^fpr:/ { print $10; exit }')
+		if [[ -z "${DOWNLOADED_FPR}" ]]; then
+			rm -f "${TMP_KEY_ASC}"
+			echo -e "${RED}ERROR: Unable to read fingerprint from downloaded AmneziaWG APT signing key.${NC}"
+			exit 1
+		fi
+		if [[ "${DOWNLOADED_FPR^^}" != "${AMNEZIAWG_APT_FPR^^}" ]]; then
+			rm -f "${TMP_KEY_ASC}"
+			echo -e "${RED}ERROR: Downloaded key fingerprint (${DOWNLOADED_FPR}) does not match expected (${AMNEZIAWG_APT_FPR}).${NC}"
+			echo -e "${ORANGE}The key may have been tampered with. Aborting.${NC}"
+			exit 1
+		fi
+		# Fingerprint verified — import the key into the dedicated keyring
+		if ! gpg --dearmor < "${TMP_KEY_ASC}" > /etc/apt/keyrings/amneziawg.gpg 2>/dev/null; then
+			rm -f "${TMP_KEY_ASC}"
+			echo -e "${RED}ERROR: Failed to import the AmneziaWG APT signing key into keyring.${NC}"
+			exit 1
+		fi
+		rm -f "${TMP_KEY_ASC}"
+		if [[ ! -s /etc/apt/keyrings/amneziawg.gpg ]]; then
+			echo -e "${RED}ERROR: AmneziaWG APT keyring file is empty after import.${NC}"
 			exit 1
 		fi
 		chmod 644 /etc/apt/keyrings/amneziawg.gpg
@@ -1563,9 +1587,19 @@ function uninstallAmneziaWG() {
 function validateParamsFile() {
 	# Security: verify params file is safe to source (owned by root, not readable/writable by others)
 	# This mitigates the risk of arbitrary code execution or private key exposure
+	if [[ ! -r "${AMNEZIAWG_DIR}/params" ]]; then
+		echo -e "${RED}ERROR: Params file not found or not readable: ${AMNEZIAWG_DIR}/params${NC}"
+		echo -e "${ORANGE}The installer cannot continue without a valid params file.${NC}"
+		exit 1
+	fi
 	local PARAMS_OWNER PARAMS_PERMS
 	PARAMS_OWNER=$(stat -c '%u' "${AMNEZIAWG_DIR}/params" 2>/dev/null)
 	PARAMS_PERMS=$(stat -c '%a' "${AMNEZIAWG_DIR}/params" 2>/dev/null)
+	if [[ -z "${PARAMS_OWNER}" ]] || [[ -z "${PARAMS_PERMS}" ]]; then
+		echo -e "${RED}ERROR: Failed to read file metadata for ${AMNEZIAWG_DIR}/params.${NC}"
+		echo -e "${ORANGE}Ensure the file exists and is accessible, then retry.${NC}"
+		exit 1
+	fi
 	if [[ "${PARAMS_OWNER}" != "0" ]]; then
 		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params is not owned by root (owner UID: ${PARAMS_OWNER}).${NC}"
 		echo -e "${ORANGE}This is a security risk. Fix with: chown root:root ${AMNEZIAWG_DIR}/params${NC}"
