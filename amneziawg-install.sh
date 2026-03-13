@@ -36,7 +36,8 @@ function serializeParams() {
 		echo "ERROR: serializeParams() requires an output file path" >&2
 		return 1
 	fi
-	echo "SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
+	cat >"${OUTPUT_FILE}" <<EOF
+SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
 SERVER_PUB_NIC=$(safeQuoteParam "${SERVER_PUB_NIC}")
 SERVER_AWG_NIC=$(safeQuoteParam "${SERVER_AWG_NIC}")
 SERVER_AWG_IPV4=$(safeQuoteParam "${SERVER_AWG_IPV4}")
@@ -57,7 +58,8 @@ SERVER_AWG_S4=$(safeQuoteParam "${SERVER_AWG_S4}")
 SERVER_AWG_H1=$(safeQuoteParam "${SERVER_AWG_H1}")
 SERVER_AWG_H2=$(safeQuoteParam "${SERVER_AWG_H2}")
 SERVER_AWG_H3=$(safeQuoteParam "${SERVER_AWG_H3}")
-SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")" >"${OUTPUT_FILE}"
+SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")
+EOF
 }
 
 # Validate an IPv6 address string
