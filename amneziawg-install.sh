@@ -1894,6 +1894,11 @@ function persistMigration() {
 		_migrationRestoreAndExit "Failed to atomically replace params file."
 	fi
 
+	# Explicitly enforce secure permissions on the new params file
+	if ! chmod 600 "${AMNEZIAWG_DIR}/params"; then
+		_migrationRestoreAndExit "Failed to set secure permissions on params file."
+	fi
+
 	# Update server configuration file with migrated values
 	echo -e "${GREEN}Updating server configuration file...${NC}"
 
