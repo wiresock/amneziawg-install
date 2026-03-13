@@ -1601,9 +1601,14 @@ function uninstallAmneziaWG() {
 function validateParamsFile() {
 	# Security: verify params file is safe to source (owned by root, not readable/writable by others)
 	# This mitigates the risk of arbitrary code execution or private key exposure
-	if [[ ! -r "${AMNEZIAWG_DIR}/params" ]]; then
-		echo -e "${RED}ERROR: Params file not found or not readable: ${AMNEZIAWG_DIR}/params${NC}"
+	if [[ ! -f "${AMNEZIAWG_DIR}/params" ]]; then
+		echo -e "${RED}ERROR: Params file not found or is not a regular file: ${AMNEZIAWG_DIR}/params${NC}"
 		echo -e "${ORANGE}The installer cannot continue without a valid params file.${NC}"
+		exit 1
+	fi
+	if [[ ! -r "${AMNEZIAWG_DIR}/params" ]]; then
+		echo -e "${RED}ERROR: Params file is not readable: ${AMNEZIAWG_DIR}/params${NC}"
+		echo -e "${ORANGE}Ensure the file is readable by root and try again.${NC}"
 		exit 1
 	fi
 	local PARAMS_OWNER PARAMS_PERMS
@@ -1628,7 +1633,11 @@ function validateParamsFile() {
 		exit 1
 	fi
 
-	source "${AMNEZIAWG_DIR}/params"
+	if ! source "${AMNEZIAWG_DIR}/params"; then
+		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}"
+		echo -e "${ORANGE}The file may be corrupted or contain a syntax error. Fix or regenerate it and rerun the installer.${NC}"
+		exit 1
+	fi
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
 	# Verify server config file exists before attempting migration
