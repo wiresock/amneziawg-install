@@ -1580,8 +1580,7 @@ Endpoint = ${ENDPOINT}
 AllowedIPs = ${ALLOWED_IPS}
 EOF
 
-		# Remove the .old file if regeneration succeeded
-		rm -f "${CLIENT_CONF}.old"
+		# Regeneration succeeded; existing client config has been updated.
 
 		# Generate QR code if qrencode is installed
 		if command -v qrencode &>/dev/null; then
@@ -1593,7 +1592,7 @@ EOF
 
 		REGENERATED=$((REGENERATED + 1))
 	else
-		echo -e "${RED}  ${CLIENT_NAME}: failed to regenerate client config, leaving existing backup at ${CLIENT_CONF}.old${NC}"
+		echo -e "${RED}  ${CLIENT_NAME}: failed to regenerate client config, existing config left unchanged.${NC}"
 		FAILED=$((FAILED + 1))
 	fi
 	done < <(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
