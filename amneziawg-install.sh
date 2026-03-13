@@ -279,7 +279,8 @@ function getHomeDirForClient() {
 	fi
 
 	# Home directory of the user, where the client configuration will be written
-	# Use getent passwd for reliable lookup (supports LDAP, custom home paths, etc.)
+	# Use getent passwd for reliable lookup (supports LDAP, custom home paths, etc.),
+	# but gracefully handle systems where getent is unavailable or misconfigured.
 	local PASSWD_HOME
 	local RESULT_DIR
 	PASSWD_HOME=$(getent passwd "${CLIENT_NAME}" 2>/dev/null | cut -d: -f6)
@@ -291,6 +292,9 @@ function getHomeDirForClient() {
 		SUDO_HOME=$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)
 		if [[ -n "${SUDO_HOME}" ]] && [[ -d "${SUDO_HOME}" ]]; then
 			RESULT_DIR="${SUDO_HOME}"
+		elif [[ -d "/home/${SUDO_USER}" ]]; then
+			# Fallback to traditional /home path when getent is unavailable or misconfigured
+			RESULT_DIR="/home/${SUDO_USER}"
 		else
 			RESULT_DIR="/root"
 		fi
@@ -1081,7 +1085,8 @@ function newClient() {
 	local IPV6_EXISTS=""
 	local DOT_IP=""
 	local DOT_EXISTS=""
-	
+	local BASE_IP=""
+
 	# If SERVER_PUB_IP is IPv6, normalize brackets
 	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
 		SERVER_PUB_IP="${SERVER_PUB_IP#\[}"
@@ -1575,12 +1580,22 @@ function validateParamsFile() {
 	SERVER_AWG_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
 }
 
-# Migration for pre-2.0 installations: check for missing S3/S4 parameters
+# Migration for pre-2.0 installations: check for missing or invalid S3/S4 parameters
 # Sets SERVER_AWG_S3 and SERVER_AWG_S4 if they are missing or invalid
 # Returns 0 if migration was needed, 1 if no change
 function migrateS3S4() {
+	# If both S3/S4 are present, validate them before skipping migration.
+	# This catches invalid values from manual edits or partial writes.
 	if [[ -n "${SERVER_AWG_S3}" ]] && [[ -n "${SERVER_AWG_S4}" ]]; then
-		return 1
+		if [[ "${SERVER_AWG_S3}" =~ ^[0-9]+$ ]] && [[ "${SERVER_AWG_S4}" =~ ^[0-9]+$ ]] && \
+		   (( SERVER_AWG_S3 >= 15 )) && (( SERVER_AWG_S3 <= 150 )) && \
+		   (( SERVER_AWG_S4 >= 15 )) && (( SERVER_AWG_S4 <= 150 )) && \
+		   (( SERVER_AWG_S3 + 56 != SERVER_AWG_S4 )) && (( SERVER_AWG_S4 + 56 != SERVER_AWG_S3 )); then
+			return 1
+		fi
+		# Values are present but invalid — clear them so the logic below regenerates
+		SERVER_AWG_S3=""
+		SERVER_AWG_S4=""
 	fi
 
 	# Try to read existing S3/S4 from config file before using defaults
