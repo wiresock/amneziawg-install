@@ -1007,12 +1007,24 @@ function installAmneziaWG() {
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
-		dnf install -y "kernel-devel-$(uname -r)" dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		if ! dnf install -y "kernel-devel-$(uname -r)"; then
+			echo -e "${ORANGE}WARNING: Failed to install kernel-devel for the running kernel ($(uname -r)). Attempting to install the latest kernel-devel instead.${NC}"
+			if ! dnf install -y kernel-devel; then
+				echo -e "${ORANGE}WARNING: Failed to install any kernel-devel package. Continuing without kernel headers; DKMS module builds may fail until headers are installed and the system is rebooted.${NC}"
+			fi
+		fi
+		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
-		dnf install -y "kernel-devel-$(uname -r)" dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		if ! dnf install -y "kernel-devel-$(uname -r)"; then
+			echo -e "${ORANGE}WARNING: Failed to install kernel-devel for the running kernel ($(uname -r)). Attempting to install the latest kernel-devel instead.${NC}"
+			if ! dnf install -y kernel-devel; then
+				echo -e "${ORANGE}WARNING: Failed to install any kernel-devel package. Continuing without kernel headers; DKMS module builds may fail until headers are installed and the system is rebooted.${NC}"
+			fi
+		fi
+		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	fi
 
 	# Force DKMS to build the module
