@@ -869,6 +869,7 @@ function installAmneziaWG() {
 		fi
 		apt install -y software-properties-common
 		add-apt-repository -y ppa:amnezia/ppa
+		apt-get update || { echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		# This is critical on Raspberry Pi / ARM where the default headers package
 		# (linux-headers-generic) may not match the actual raspi kernel flavour.
