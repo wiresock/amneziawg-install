@@ -851,11 +851,28 @@ function installAmneziaWG() {
 			# Anchor to line-start 'deb ' with trailing space to avoid matching deb-src lines
 			sed -i 's/^deb /deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
 		fi
+		# Ensure required tools are available for key download/dearmor on minimal systems
+		if ! command -v gpg &>/dev/null; then
+			apt-get update
+			apt-get install -y gnupg || { echo -e "${RED}ERROR: Failed to install gnupg required for key import.${NC}"; exit 1; }
+		fi
+		if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+			apt-get update
+			apt-get install -y curl || { echo -e "${RED}ERROR: Failed to install curl required for key download.${NC}"; exit 1; }
+		fi
 		mkdir -p /etc/apt/keyrings
+		local KEY_FETCH_OK=0
+		set -o pipefail
 		if command -v curl &>/dev/null; then
-			curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor -o /etc/apt/keyrings/amneziawg.gpg
-		else
-			wget -qO- "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor -o /etc/apt/keyrings/amneziawg.gpg
+			curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor -o /etc/apt/keyrings/amneziawg.gpg && KEY_FETCH_OK=1
+		elif command -v wget &>/dev/null; then
+			wget -qO- "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor -o /etc/apt/keyrings/amneziawg.gpg && KEY_FETCH_OK=1
+		fi
+		set +o pipefail
+		if [[ ${KEY_FETCH_OK} -ne 1 ]] || [[ ! -s /etc/apt/keyrings/amneziawg.gpg ]]; then
+			echo -e "${RED}ERROR: Failed to download or import the AmneziaWG APT signing key.${NC}"
+			echo -e "${ORANGE}Verify network connectivity and that curl/wget and gnupg are installed.${NC}"
+			exit 1
 		fi
 		chmod 644 /etc/apt/keyrings/amneziawg.gpg
 		# Ensure the managed file exists with sentinel before appending PPA lines.
