@@ -889,7 +889,7 @@ function installAmneziaWG() {
 			echo -e "${RED}ERROR: Failed to install any suitable kernel headers package. DKMS module build cannot proceed.${NC}"
 			exit 1
 		fi
-		apt install -y dkms amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
 			# Tag managed file with sentinel so uninstall can verify ownership
