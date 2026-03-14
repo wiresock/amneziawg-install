@@ -38,13 +38,10 @@ function safeQuoteParam() {
 if [[ "${SAFE_QUOTE_PARAM_SELFTEST:-0}" == "1" ]]; then
 	TEST_VALUE="O'Reilly"
 	QUOTED="$(safeQuoteParam "${TEST_VALUE}")"
-	# Evaluate the quoted value and ensure it round-trips to the original
-	if ! ROUNDTRIP_VALUE="$(eval "printf '%s' ${QUOTED}")"; then
-		echo "ERROR: safeQuoteParam self-test failed to evaluate quoted value" >&2
-		exit 1
-	fi
-	if [[ "${ROUNDTRIP_VALUE}" != "${TEST_VALUE}" ]]; then
-		echo "ERROR: safeQuoteParam self-test failed: expected '${TEST_VALUE}', got '${ROUNDTRIP_VALUE}'" >&2
+	# Verify the quoted form matches the known-good shell-safe literal; no eval needed
+	EXPECTED="'O'\"'\"'Reilly'"
+	if [[ "${QUOTED}" != "${EXPECTED}" ]]; then
+		echo "ERROR: safeQuoteParam self-test failed: expected '${EXPECTED}', got '${QUOTED}'" >&2
 		exit 1
 	fi
 fi
