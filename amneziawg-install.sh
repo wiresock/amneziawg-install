@@ -1502,7 +1502,24 @@ function regenerateClients() {
 		# Determine home directory and locate existing client config file
 		local HOME_DIR
 		HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
-		local CLIENT_CONF="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+		# CLIENT_CONF is the canonical "home-based" path for this client's config.
+		local CLIENT_CONF
+		# CLIENT_CONF_OUTPUT is the path we will ultimately write the regenerated
+		# config to. By default it matches CLIENT_CONF, but if we discover an
+		# existing config in another location (one of the candidates below),
+		# later code should update CLIENT_CONF_OUTPUT to that path so that the
+		# regenerated config overwrites/updates the file we actually used to
+		# recover the client's private key.
+		local CLIENT_CONF_OUTPUT=""
+		if [[ -n "${HOME_DIR}" ]]; then
+			CLIENT_CONF="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+			CLIENT_CONF_OUTPUT="${CLIENT_CONF}"
+		else
+			# If HOME_DIR could not be determined, leave CLIENT_CONF empty and let
+			# later logic choose an appropriate output path based on where an
+			# existing config is actually found (if any).
+			CLIENT_CONF=""
+		fi
 		local CLIENT_PRIV_KEY=""
 
 		# Try to recover the client's private key from an existing config file.
@@ -1511,7 +1528,7 @@ function regenerateClients() {
 		local -a CLIENT_CONF_CANDIDATES=()
 
 		# 1) Config under the resolved HOME_DIR (if any)
-		if [[ -n "${HOME_DIR}" ]]; then
+		if [[ -n "${CLIENT_CONF}" ]]; then
 			CLIENT_CONF_CANDIDATES+=("${CLIENT_CONF}" "${CLIENT_CONF}.old")
 		fi
 
