@@ -1520,11 +1520,11 @@ function regenerateClients() {
 		# multi-line values corrupting the generated Address = ... line.
 		local CLIENT_AWG_IPV4
 		local CLIENT_AWG_IPV4_CANDIDATES
-		CLIENT_AWG_IPV4_CANDIDATES=$(echo "${CLIENT_ALLOWED_IPS}" | tr ',' '\n' | grep -E '^[0-9]+\.' | sed 's|/.*||')
+		CLIENT_AWG_IPV4_CANDIDATES=$(echo "${CLIENT_ALLOWED_IPS}" | tr ',' '\n' | sed 's/^[[:space:]]*//' | grep -E '^[0-9]+\.' | sed 's|/.*||')
 
 		local CLIENT_AWG_IPV6
 		local CLIENT_AWG_IPV6_CANDIDATES
-		CLIENT_AWG_IPV6_CANDIDATES=$(echo "${CLIENT_ALLOWED_IPS}" | tr ',' '\n' | grep -E ':' | sed 's|/.*||')
+		CLIENT_AWG_IPV6_CANDIDATES=$(echo "${CLIENT_ALLOWED_IPS}" | tr ',' '\n' | sed 's/^[[:space:]]*//' | grep -E ':' | sed 's|/.*||')
 
 		if [[ -z "${CLIENT_AWG_IPV4_CANDIDATES}" ]]; then
 			echo -e "${RED}  SKIP: ${CLIENT_NAME} - could not parse IPv4 from AllowedIPs${NC}"
