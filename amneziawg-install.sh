@@ -1682,6 +1682,16 @@ Endpoint = ${ENDPOINT}
 AllowedIPs = ${ALLOWED_IPS}
 EOF
 
+		# If running as root and the output directory is owned by a non-root user,
+		# ensure the regenerated client config is owned by that user so they can
+		# actually read it (while keeping permissions at 600).
+		if [ "$(id -u)" -eq 0 ]; then
+			OUTPUT_DIR_OWNER="$(stat -c '%U' "$(dirname "${OUTPUT_CONF}")" 2>/dev/null || echo "")"
+			if [ -n "${OUTPUT_DIR_OWNER}" ] && [ "${OUTPUT_DIR_OWNER}" != "root" ]; then
+				chown "${OUTPUT_DIR_OWNER}:${OUTPUT_DIR_OWNER}" "${OUTPUT_CONF}" 2>/dev/null || :
+			fi
+		fi
+
 		# Regeneration succeeded; existing client config has been updated.
 
 		# Generate QR code if qrencode is installed
