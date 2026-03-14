@@ -2541,9 +2541,15 @@ function quietIPv6Rewrite() {
 		return 1
 	}
 
+	# Preserve existing params file mode (e.g., 400 vs 600) across the rewrite.
+	local PARAMS_MODE="600"
+	if [ -e "${AMNEZIAWG_DIR}/params" ]; then
+		PARAMS_MODE="$(stat -c '%a' "${AMNEZIAWG_DIR}/params" 2>/dev/null || echo "600")"
+	fi
+
 	if serializeParams "${PARAMS_TMP}" && 
 	   mv -f "${PARAMS_TMP}" "${AMNEZIAWG_DIR}/params"; then
-		chmod 600 "${AMNEZIAWG_DIR}/params"
+		chmod "${PARAMS_MODE}" "${AMNEZIAWG_DIR}/params"
 	else
 		rm -f "${PARAMS_TMP}"
 		echo -e "${ORANGE}WARNING: Failed to rewrite params with normalized IPv6. Non-critical.${NC}"
