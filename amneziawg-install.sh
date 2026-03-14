@@ -1368,8 +1368,11 @@ PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
 AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+	local client_conf owner_group
 	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
-	chmod 600 "${client_conf}"
+	if ! chmod 600 "${client_conf}"; then
+		echo "Warning: failed to set permissions on ${client_conf}" >&2
+	fi
 
 	# Ensure the generated client config is readable by the intended non-root user.
 	# When running under sudo, HOME_DIR may point to the sudo user's home while the
