@@ -2316,6 +2316,18 @@ function persistMigration() {
 		exit 1
 	fi
 
+	# Capture original params file permissions so we can preserve secure read-only (400)
+	# vs read-write (600) settings chosen by the admin. If detection fails or an
+	# unexpected mode is found, default to 600 to preserve existing behavior.
+	local original_params_mode
+	if original_params_mode="$(stat -c '%a' "${AMNEZIAWG_DIR}/params" 2>/dev/null)"; then
+		if [ "${original_params_mode}" != "400" ]; then
+			original_params_mode="600"
+		fi
+	else
+		original_params_mode="600"
+	fi
+
 	if ! cp "${AMNEZIAWG_DIR}/params" "${AMNEZIAWG_DIR}/params.bak"; then
 		echo -e "${RED}ERROR: Failed to create backup of params file.${NC}"
 		rm -f "${SERVER_AWG_CONF}.bak"
@@ -2338,8 +2350,9 @@ function persistMigration() {
 		_migrationRestoreAndExit "Failed to atomically replace params file."
 	fi
 
-	# Explicitly enforce secure permissions on the new params file
-	if ! chmod 600 "${AMNEZIAWG_DIR}/params"; then
+	# Explicitly enforce secure permissions on the new params file, preserving any
+	# intentional read-only (400) setting; otherwise default to 600.
+	if ! chmod "${original_params_mode}" "${AMNEZIAWG_DIR}/params"; then
 		_migrationRestoreAndExit "Failed to set secure permissions on params file."
 	fi
 
