@@ -1553,18 +1553,41 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 	fi
 
 	# 1. If CLIENT_NAME corresponds to an existing user, chown to that user.
+	client_chown_ok=1
 	if [ -n "${CLIENT_NAME:-}" ] && id -u "${CLIENT_NAME}" >/dev/null 2>&1; then
-		chown "${CLIENT_NAME}:${CLIENT_NAME}" "${client_conf}" || true
-	# 2. Otherwise, if we know the owner of HOME_DIR, match that ownership.
-	elif [ -n "${owner_group:-}" ]; then
-		chown "${owner_group}" "${client_conf}" || true
+		client_chown_target="${CLIENT_NAME}"
+		if command -v id >/dev/null 2>&1; then
+			client_primary_group="$(id -gn "${CLIENT_NAME}" 2>/dev/null || true)"
+			if [ -n "${client_primary_group}" ]; then
+				client_chown_target="${CLIENT_NAME}:${client_primary_group}"
+			fi
+		fi
+		if chown "${client_chown_target}" "${client_conf}" 2>/dev/null; then
+			client_chown_ok=0
+		fi
+	fi
+
+	# 2. If CLIENT_NAME chown did not succeed and we know the owner of HOME_DIR, match that ownership.
+	if [ ${client_chown_ok} -ne 0 ] && [ -n "${owner_group:-}" ]; then
+		if chown "${owner_group}" "${client_conf}" 2>/dev/null; then
+			client_chown_ok=0
+		fi
+	fi
+
 	# 3. As a last resort, fall back to SUDO_USER only when HOME_DIR is the sudo user's home.
-	elif [ -n "${SUDO_USER:-}" ] && id -u "${SUDO_USER}" >/dev/null 2>&1; then
+	if [ ${client_chown_ok} -ne 0 ] && [ -n "${SUDO_USER:-}" ] && id -u "${SUDO_USER}" >/dev/null 2>&1; then
 		if command -v getent >/dev/null 2>&1; then
 			sudo_home="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
 		fi
 		if [ -n "${sudo_home:-}" ] && [ "${sudo_home}" = "${HOME_DIR}" ]; then
-			chown "${SUDO_USER}:${SUDO_USER}" "${client_conf}" || true
+			sudo_chown_target="${SUDO_USER}"
+			if command -v id >/dev/null 2>&1; then
+				sudo_primary_group="$(id -gn "${SUDO_USER}" 2>/dev/null || true)"
+				if [ -n "${sudo_primary_group}" ]; then
+					sudo_chown_target="${SUDO_USER}:${sudo_primary_group}"
+				fi
+			fi
+			chown "${sudo_chown_target}" "${client_conf}" || true
 		fi
 	fi
 
