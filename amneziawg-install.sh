@@ -1861,10 +1861,11 @@ EOF
 		# ensure the regenerated client config is owned by that user so they can
 		# actually read it (while keeping permissions at 600).
 		if [ "$(id -u)" -eq 0 ]; then
-			local OUTPUT_DIR_OWNER
-			OUTPUT_DIR_OWNER="$(stat -c '%U' "$(dirname "${OUTPUT_CONF}")" 2>/dev/null || echo "")"
-			if [ -n "${OUTPUT_DIR_OWNER}" ] && [ "${OUTPUT_DIR_OWNER}" != "root" ]; then
-				chown "${OUTPUT_DIR_OWNER}:${OUTPUT_DIR_OWNER}" "${OUTPUT_CONF}" 2>/dev/null || :
+			local OUTPUT_OWNER_GROUP OUTPUT_OWNER
+			OUTPUT_OWNER_GROUP="$(stat -c '%U:%G' "$(dirname "${OUTPUT_CONF}")" 2>/dev/null || echo "")"
+			OUTPUT_OWNER="${OUTPUT_OWNER_GROUP%%:*}"
+			if [ -n "${OUTPUT_OWNER_GROUP}" ] && [ -n "${OUTPUT_OWNER}" ] && [ "${OUTPUT_OWNER}" != "root" ]; then
+				chown "${OUTPUT_OWNER_GROUP}" "${OUTPUT_CONF}" 2>/dev/null || :
 			fi
 		fi
 
