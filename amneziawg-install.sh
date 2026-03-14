@@ -1563,14 +1563,28 @@ function regenerateClients() {
 		done
 
 		# Scan candidate config files (including .conf.old, renamed during migration)
+		local MATCHED_CONF=""
 		for CANDIDATE in "${CLIENT_CONF_CANDIDATES[@]}"; do
 			if [[ -f "${CANDIDATE}" ]]; then
 				CLIENT_PRIV_KEY=$(grep -E "^PrivateKey = " "${CANDIDATE}" | sed 's/^PrivateKey = //')
 				if [[ -n "${CLIENT_PRIV_KEY}" ]]; then
+					MATCHED_CONF="${CANDIDATE}"
 					break
 				fi
 			fi
 		done
+
+		# If we recovered an existing private key, align CLIENT_CONF_OUTPUT
+		# with the location where that key/config was found. If the matched
+		# config is a ".conf.old", strip the suffix so we regenerate the
+		# non-.old config in the same directory.
+		if [[ -n "${CLIENT_PRIV_KEY}" && -n "${MATCHED_CONF}" ]]; then
+			if [[ "${MATCHED_CONF}" == *.old ]]; then
+				CLIENT_CONF_OUTPUT="${MATCHED_CONF%.old}"
+			else
+				CLIENT_CONF_OUTPUT="${MATCHED_CONF}"
+			fi
+		fi
 
 		if [[ -z "${CLIENT_PRIV_KEY}" ]]; then
 			# No existing private key found - generate a new key pair
