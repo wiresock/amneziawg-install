@@ -1967,6 +1967,12 @@ function uninstallAmneziaWG() {
 function validateParamsFile() {
 	# Security: verify params file is safe to source (owned by root, not readable/writable by others)
 	# This mitigates the risk of arbitrary code execution or private key exposure
+	# Reject symlinks explicitly so we don't accidentally source an unexpected file via a link.
+	if [[ -L "${AMNEZIAWG_DIR}/params" ]] || [[ -h "${AMNEZIAWG_DIR}/params" ]]; then
+		echo -e "${RED}ERROR: Params file must not be a symbolic link: ${AMNEZIAWG_DIR}/params${NC}"
+		echo -e "${ORANGE}Remove the symlink and create a regular file owned by root with mode 600 or 400.${NC}"
+		return 1
+	fi
 	if [[ ! -f "${AMNEZIAWG_DIR}/params" ]]; then
 		echo -e "${RED}ERROR: Params file not found or is not a regular file: ${AMNEZIAWG_DIR}/params${NC}"
 		echo -e "${ORANGE}The installer cannot continue without a valid params file.${NC}"
