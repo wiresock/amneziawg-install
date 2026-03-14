@@ -2214,9 +2214,9 @@ function persistMigration() {
 	# Only rename configs that are actually outdated (missing S3/S4 parameters)
 	#
 	# Iterates over clients listed in the server config and uses getHomeDirForClient
-	# to locate each config file, matching how regenerateClients works. This is more
-	# robust than a filesystem search, as it handles home directories outside /home
-	# and /root (e.g., LDAP users, custom paths, SUDO_USER fallback).
+	# to locate each config file. If the expected path does not exist (e.g., because
+	# the installer is being re-run under a different context than when configs were
+	# created), fall back to a bounded search under /home and /root.
 	echo -e "${GREEN}Marking old client configurations as outdated...${NC}"
 	local CLIENT_CONFIGS_RENAMED=0
 	while IFS= read -r MIGRATE_CLIENT_NAME; do
@@ -2225,7 +2225,19 @@ function persistMigration() {
 		fi
 		local MIGRATE_HOME_DIR
 		MIGRATE_HOME_DIR=$(getHomeDirForClient "${MIGRATE_CLIENT_NAME}")
-		local MIGRATE_CLIENT_CONF="${MIGRATE_HOME_DIR}/${SERVER_AWG_NIC}-client-${MIGRATE_CLIENT_NAME}.conf"
+		local MIGRATE_CLIENT_CONF_BASE="${SERVER_AWG_NIC}-client-${MIGRATE_CLIENT_NAME}.conf"
+		local MIGRATE_CLIENT_CONF="${MIGRATE_HOME_DIR}/${MIGRATE_CLIENT_CONF_BASE}"
+
+		# If the config is not found at the expected home directory, search common
+		# locations (/home and /root) for a matching filename. This helps when the
+		# installer is re-run under a different user/root context.
+		if [[ ! -f "${MIGRATE_CLIENT_CONF}" ]]; then
+			local FOUND_MIGRATE_CONF
+			FOUND_MIGRATE_CONF=$(find /home /root -xdev -maxdepth 5 -type f -name "${MIGRATE_CLIENT_CONF_BASE}" 2>/dev/null | head -n 1)
+			if [[ -n "${FOUND_MIGRATE_CONF}" ]]; then
+				MIGRATE_CLIENT_CONF="${FOUND_MIGRATE_CONF}"
+			fi
+		fi
 
 		if [[ -f "${MIGRATE_CLIENT_CONF}" ]]; then
 			# Only rename if the config doesn't already have S3 parameter
