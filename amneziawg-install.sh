@@ -1531,24 +1531,40 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 	# Restore default umask
 	umask "${OLD_UMASK}"
 
-	local client_conf owner_group
+	local client_conf owner_group home_owner sudo_home
 	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 	if ! chmod 600 "${client_conf}"; then
 		echo "Warning: failed to set permissions on ${client_conf}" >&2
 	fi
 
-	# Ensure the generated client config is readable by the intended non-root user.
-	# When running under sudo, HOME_DIR may point to the sudo user's home while the
-	# file is owned by root, so chown it to SUDO_USER (or the owner of HOME_DIR).
-	if [ -n "${SUDO_USER:-}" ] && id -u "${SUDO_USER}" >/dev/null 2>&1; then
-		chown "${SUDO_USER}:${SUDO_USER}" "${client_conf}" || true
-	else
-		# Fallback: match the ownership of HOME_DIR if stat is available.
-		if command -v stat >/dev/null 2>&1; then
-			owner_group="$(stat -c '%U:%G' "${HOME_DIR}" 2>/dev/null || true)"
-			if [ -n "${owner_group}" ]; then
-				chown "${owner_group}" "${client_conf}" || true
-			fi
+	# Ensure the generated client config is readable by the intended non-root user,
+	# without unintentionally granting access to the sudo-invoking user.
+	# Prefer:
+	#   1. CLIENT_NAME, if it is a real system user.
+	#   2. The owner of HOME_DIR.
+	#   3. SUDO_USER, but only if HOME_DIR is SUDO_USER's home directory.
+
+	# Try to determine the ownership of HOME_DIR, if stat is available.
+	if command -v stat >/dev/null 2>&1; then
+		owner_group="$(stat -c '%U:%G' "${HOME_DIR}" 2>/dev/null || true)"
+		if [ -n "${owner_group}" ]; then
+			home_owner="${owner_group%%:*}"
+		fi
+	fi
+
+	# 1. If CLIENT_NAME corresponds to an existing user, chown to that user.
+	if [ -n "${CLIENT_NAME:-}" ] && id -u "${CLIENT_NAME}" >/dev/null 2>&1; then
+		chown "${CLIENT_NAME}:${CLIENT_NAME}" "${client_conf}" || true
+	# 2. Otherwise, if we know the owner of HOME_DIR, match that ownership.
+	elif [ -n "${owner_group:-}" ]; then
+		chown "${owner_group}" "${client_conf}" || true
+	# 3. As a last resort, fall back to SUDO_USER only when HOME_DIR is the sudo user's home.
+	elif [ -n "${SUDO_USER:-}" ] && id -u "${SUDO_USER}" >/dev/null 2>&1; then
+		if command -v getent >/dev/null 2>&1; then
+			sudo_home="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
+		fi
+		if [ -n "${sudo_home:-}" ] && [ "${sudo_home}" = "${HOME_DIR}" ]; then
+			chown "${SUDO_USER}:${SUDO_USER}" "${client_conf}" || true
 		fi
 	fi
 
