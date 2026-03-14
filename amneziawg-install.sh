@@ -12,10 +12,13 @@ AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
-if [ -n "${PATH:-}" ]; then
-	export PATH="/sbin:/usr/sbin:${PATH:-}"
-else
-	export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Only adjust PATH when the script is executed directly, not when sourced.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	if [ -n "${PATH:-}" ]; then
+		export PATH="/sbin:/usr/sbin:${PATH:-}"
+	else
+		export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	fi
 fi
 
 # For sensitive files (private keys, params, configs), a restrictive umask (077)
