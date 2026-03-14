@@ -744,6 +744,10 @@ function installQuestions() {
 		CLIENT_DNS_2=${CLIENT_DNS_2:-1.0.0.1}
 		ALLOWED_IPS=${ALLOWED_IPS:-0.0.0.0/0,::/0}
 
+		if ! isValidIPv6 "${SERVER_AWG_IPV6}"; then
+			echo -e "${RED}ERROR: Invalid IPv6 address specified in SERVER_AWG_IPV6: ${SERVER_AWG_IPV6}.${NC}"
+			exit 1
+		fi
 		SERVER_AWG_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
 
 		SERVER_AWG_JC=$(shuf -i3-10 -n1)
@@ -1766,6 +1770,7 @@ EOF
 		# ensure the regenerated client config is owned by that user so they can
 		# actually read it (while keeping permissions at 600).
 		if [ "$(id -u)" -eq 0 ]; then
+			local OUTPUT_DIR_OWNER
 			OUTPUT_DIR_OWNER="$(stat -c '%U' "$(dirname "${OUTPUT_CONF}")" 2>/dev/null || echo "")"
 			if [ -n "${OUTPUT_DIR_OWNER}" ] && [ "${OUTPUT_DIR_OWNER}" != "root" ]; then
 				chown "${OUTPUT_DIR_OWNER}:${OUTPUT_DIR_OWNER}" "${OUTPUT_CONF}" 2>/dev/null || :
