@@ -33,9 +33,10 @@ case "${ID}" in
 	*) echo "Unsupported OS: ${ID}"; exit 1 ;;
 esac
 
-# Create mock commands in /sbin which is first in PATH after the script's
-# PATH manipulation: export PATH="/sbin:/usr/sbin:${PATH}"
-# This ensures mocks take precedence over any real binaries.
+# Create mock commands in /sbin and ensure /sbin mocks take precedence in PATH.
+# PATH is explicitly manipulated so that /sbin and /usr/sbin come before the
+# existing PATH entries. This ensures mocks take precedence over any real binaries.
+export PATH="/sbin:/usr/sbin:${PATH}"
 create_mock() {
 	local CMD="$1"
 	local BODY="$2"
