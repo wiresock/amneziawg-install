@@ -1004,7 +1004,7 @@ function installAmneziaWG() {
 			fi
 		done
 		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
-			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKOM module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
+			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi
 		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'debian' ]]; then
