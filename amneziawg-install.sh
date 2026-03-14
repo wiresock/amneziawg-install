@@ -28,10 +28,26 @@ umask 077
 # Escapes single quotes and wraps in single quotes to prevent shell injection
 function safeQuoteParam() {
 	local VALUE="$1"
-	# Replace single quotes with '\'' (end quote, escaped quote, start quote)
-	local ESCAPED="${VALUE//\'/\'\\\'\'}"
-	echo "'${ESCAPED}'"
+	# Replace each single quote with '\'' (end quote, escaped quote, start quote)
+	local ESCAPED
+	ESCAPED="$(printf '%s' "${VALUE}" | sed "s/'/'\\\\''/g")"
+	printf "'%s'\n" "${ESCAPED}"
 }
+
+# Optional self-test for safeQuoteParam; run by setting SAFE_QUOTE_PARAM_SELFTEST=1
+if [[ "${SAFE_QUOTE_PARAM_SELFTEST:-0}" == "1" ]]; then
+	TEST_VALUE="O'Reilly"
+	QUOTED="$(safeQuoteParam "${TEST_VALUE}")"
+	# Evaluate the quoted value and ensure it round-trips to the original
+	if ! ROUNDTRIP_VALUE="$(eval "printf '%s' ${QUOTED}")"; then
+		echo "ERROR: safeQuoteParam self-test failed to evaluate quoted value" >&2
+		exit 1
+	fi
+	if [[ "${ROUNDTRIP_VALUE}" != "${TEST_VALUE}" ]]; then
+		echo "ERROR: safeQuoteParam self-test failed: expected '${TEST_VALUE}', got '${ROUNDTRIP_VALUE}'" >&2
+		exit 1
+	fi
+fi
 
 # Serialize all server parameters to a params file
 # Uses safe quoting for string values to prevent shell injection when sourced
