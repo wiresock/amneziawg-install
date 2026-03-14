@@ -2278,7 +2278,12 @@ function persistMigration() {
 function quietIPv6Rewrite() {
 	local ORIG_IPV6="$1"
 
-	local PARAMS_TMP="${AMNEZIAWG_DIR}/params.tmp.$$"
+	local PARAMS_TMP
+	PARAMS_TMP="$(mktemp "${AMNEZIAWG_DIR}/params.tmp.XXXXXX")" || {
+		echo -e "${ORANGE}WARNING: Unable to create temporary file for IPv6 normalization. Non-critical.${NC}"
+		return 1
+	}
+
 	if serializeParams "${PARAMS_TMP}" && 
 	   mv -f "${PARAMS_TMP}" "${AMNEZIAWG_DIR}/params"; then
 		chmod 600 "${AMNEZIAWG_DIR}/params"
