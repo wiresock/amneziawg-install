@@ -28,9 +28,9 @@ umask 077
 # Escapes single quotes and wraps in single quotes to prevent shell injection
 function safeQuoteParam() {
 	local VALUE="$1"
-	# Replace each single quote with '\'' (end quote, escaped quote, start quote)
+	# Replace each single quote with '"'"' (end quote, literal quote, start quote)
 	local ESCAPED
-	ESCAPED="$(printf '%s' "${VALUE}" | sed "s/'/'\\''/g")"
+	ESCAPED="$(printf '%s' "${VALUE}" | sed "s/'/'\"'\"'/g")"
 	printf "'%s'\n" "${ESCAPED}"
 }
 
