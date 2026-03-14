@@ -1391,10 +1391,10 @@ function newClient() {
 
 		CLIENT_AWG_IPV4="${BASE_IP}.${DOT_IP}"
 
-		local NORMALIZED_SERVER_IPV6
+		local NORMALIZED_SERVER_IPV6 BASE_IPV6_PREFIX
 		NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
-		BASE_IP=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
-		CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IP}::${DOT_IP}")
+		BASE_IPV6_PREFIX=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
+		CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IPV6_PREFIX}::${DOT_IP}")
 	else
 		echo ""
 		echo "Client configuration"
