@@ -346,6 +346,138 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+# ============================================================
+# Phase 2: Test regenerateClients flow
+# ============================================================
+echo ""
+echo "=== Phase 2: regenerateClients ==="
+
+# Source the install script to load function definitions
+# (main block is guarded by BASH_SOURCE check, so only functions are loaded)
+source "${PROJECT_ROOT}/amneziawg-install.sh"
+
+# Source params to set server variables
+source /etc/amnezia/amneziawg/params
+SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+
+# --- 2a: Add a second client ---
+newClient
+
+if grep -q "^### Client client2$" "${SERVER_AWG_CONF}"; then
+	echo "OK: Second client 'client2' added"
+else
+	echo "FAIL: Second client 'client2' not found in server config"
+	FAILED=$((FAILED + 1))
+fi
+
+CLIENT2_CONF=$(find /root /home -maxdepth 2 -name "awg0-client-client2.conf" 2>/dev/null | head -1)
+if [[ -n "${CLIENT2_CONF}" ]] && [[ -f "${CLIENT2_CONF}" ]]; then
+	echo "OK: Second client config exists at ${CLIENT2_CONF}"
+else
+	echo "FAIL: Second client config not found"
+	FAILED=$((FAILED + 1))
+fi
+
+# --- 2b: Regenerate with modified parameter, verify configs updated ---
+ORIG_H1="${SERVER_AWG_H1}"
+SERVER_AWG_H1="999-9999"
+
+# Strip ANSI color codes from output so grep patterns match cleanly
+REGEN_OUTPUT=$(regenerateClients 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+
+# Verify client configs were updated with the new H1 value
+CLIENT1_CONF="/root/awg0-client-client.conf"
+if grep -q "^H1 = 999-9999$" "${CLIENT1_CONF}"; then
+	echo "OK: client config updated with new H1 value"
+else
+	echo "FAIL: client config H1 not updated (expected '999-9999')"
+	FAILED=$((FAILED + 1))
+fi
+
+CLIENT2_CONF=$(find /root /home -maxdepth 2 -name "awg0-client-client2.conf" 2>/dev/null | head -1)
+if [[ -n "${CLIENT2_CONF}" ]] && grep -q "^H1 = 999-9999$" "${CLIENT2_CONF}"; then
+	echo "OK: client2 config updated with new H1 value"
+else
+	echo "FAIL: client2 config H1 not updated"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify old H1 value was replaced
+if grep -q "^H1 = ${ORIG_H1}$" "${CLIENT1_CONF}"; then
+	echo "FAIL: client config still has old H1 value"
+	FAILED=$((FAILED + 1))
+else
+	echo "OK: Old H1 value replaced in client config"
+fi
+
+# Verify private keys were preserved (no "generating new key pair" messages)
+if echo "${REGEN_OUTPUT}" | grep -q "no existing private key found"; then
+	echo "FAIL: Unexpected key regeneration when all client configs exist"
+	FAILED=$((FAILED + 1))
+else
+	echo "OK: Private keys preserved (no regeneration needed)"
+fi
+
+# Verify regeneration summary
+if echo "${REGEN_OUTPUT}" | grep -q "2 succeeded, 0 failed"; then
+	echo "OK: Regeneration summary shows 2 succeeded, 0 failed"
+else
+	echo "FAIL: Unexpected regeneration summary"
+	echo "  Output: $(echo "${REGEN_OUTPUT}" | grep -i 'regeneration complete')"
+	FAILED=$((FAILED + 1))
+fi
+
+# --- 2c: Key regeneration when client config is missing ---
+echo ""
+echo "--- Key regeneration test ---"
+
+# Delete client2's config to force key regeneration on next run
+rm -f "${CLIENT2_CONF}"
+rm -f "${CLIENT2_CONF}.old" 2>/dev/null
+
+REGEN_OUTPUT2=$(regenerateClients 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+
+# Verify key regeneration was triggered for client2
+if echo "${REGEN_OUTPUT2}" | grep -q "client2.*no existing private key found"; then
+	echo "OK: Key regeneration triggered for client2 (config was missing)"
+else
+	echo "FAIL: Key regeneration not triggered for client2 despite missing config"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify client1's key was NOT regenerated (its config still exists)
+# Match "  client:" with a word boundary to avoid matching "client2:"
+if echo "${REGEN_OUTPUT2}" | grep -E "^  client: .*no existing private key" > /dev/null; then
+	echo "FAIL: client1 key unexpectedly regenerated"
+	FAILED=$((FAILED + 1))
+else
+	echo "OK: client1 key preserved during second regeneration"
+fi
+
+# Verify client2's config was recreated
+CLIENT2_REGEN_CONF=$(find /root /home -maxdepth 2 -name "awg0-client-client2.conf" 2>/dev/null | head -1)
+if [[ -n "${CLIENT2_REGEN_CONF}" ]] && [[ -f "${CLIENT2_REGEN_CONF}" ]]; then
+	echo "OK: client2 config recreated at ${CLIENT2_REGEN_CONF}"
+else
+	echo "FAIL: client2 config was not recreated"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify server config's PublicKey for client2 was updated
+if echo "${REGEN_OUTPUT2}" | grep -q "1 client.*new key pairs generated"; then
+	echo "OK: Regeneration summary shows 1 new key pair"
+else
+	echo "FAIL: Regeneration summary doesn't show 1 new key pair"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${REGEN_OUTPUT2}" | grep -q "2 succeeded, 0 failed"; then
+	echo "OK: All clients regenerated successfully"
+else
+	echo "FAIL: Unexpected regeneration summary in key regen test"
+	FAILED=$((FAILED + 1))
+fi
+
 echo ""
 echo "=========================================="
 if [[ ${FAILED} -eq 0 ]]; then
