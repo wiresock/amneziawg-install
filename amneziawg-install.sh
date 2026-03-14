@@ -1400,7 +1400,7 @@ function newClient() {
 		# Auto mode: use default client name and first available IPs
 		CLIENT_NAME="client"
 		local CLIENT_NUM=2
-		while [[ $(grep -c -E "^### Client ${CLIENT_NAME}$" "${SERVER_AWG_CONF}") != 0 ]]; do
+		while [[ $(grep -c -xF "### Client ${CLIENT_NAME}" "${SERVER_AWG_CONF}") != 0 ]]; do
 			CLIENT_NAME="client${CLIENT_NUM}"
 			CLIENT_NUM=$((CLIENT_NUM + 1))
 		done
@@ -1419,7 +1419,7 @@ function newClient() {
 
 		until [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ && ${CLIENT_EXISTS} == '0' && ${#CLIENT_NAME} -lt 16 ]]; do
 			read -rp "Client name: " -e CLIENT_NAME
-			CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "${SERVER_AWG_CONF}")
+			CLIENT_EXISTS=$(grep -c -xF "### Client ${CLIENT_NAME}" "${SERVER_AWG_CONF}")
 
 			if [[ ${CLIENT_EXISTS} != 0 ]]; then
 				echo ""
