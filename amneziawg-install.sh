@@ -1062,6 +1062,7 @@ function installAmneziaWG() {
 
 	# Ensure AmneziaWG kernel module is loaded at boot (before awg-quick service starts)
 	mkdir -p /etc/modules-load.d
+	chmod 755 /etc/modules-load.d
 	if ! grep -qx "amneziawg" /etc/modules-load.d/amneziawg.conf 2>/dev/null; then
 		echo "amneziawg" >> /etc/modules-load.d/amneziawg.conf
 	fi
