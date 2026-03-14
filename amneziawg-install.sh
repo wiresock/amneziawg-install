@@ -1678,6 +1678,8 @@ EOF
 
 		REGENERATED=$((REGENERATED + 1))
 	else
+		# Cleanup temporary file on failure to avoid leaking sensitive data
+		rm -f "${TMP_CONF}"
 		echo -e "${RED}  ${CLIENT_NAME}: failed to regenerate client config, existing config left unchanged.${NC}"
 		FAILED=$((FAILED + 1))
 	fi
