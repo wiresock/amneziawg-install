@@ -1577,9 +1577,17 @@ function regenerateClients() {
 		fi
 
 		# Write the new client config file with current server parameters
-		local TMP_CONF="${CLIENT_CONF}.tmp.$$"
+		local OUTPUT_CONF="${CLIENT_CONF_OUTPUT:-$CLIENT_CONF}"
+		local TMP_CONF="${OUTPUT_CONF}.tmp.$$"
 
-		if cat <<EOF >"${TMP_CONF}" && chmod 600 "${TMP_CONF}" && mv "${TMP_CONF}" "${CLIENT_CONF}"; then
+		# Ensure parent directory for the output config exists
+		if ! mkdir -p "$(dirname "${OUTPUT_CONF}")"; then
+			echo -e "${RED}  ${CLIENT_NAME}: failed to create directory for client config (${OUTPUT_CONF})${NC}"
+			FAILED=$((FAILED + 1))
+			continue
+		fi
+
+		if cat <<EOF >"${TMP_CONF}" && chmod 600 "${TMP_CONF}" && mv "${TMP_CONF}" "${OUTPUT_CONF}"; then
 [Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
 Address = ${CLIENT_ADDRESS}
