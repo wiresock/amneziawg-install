@@ -78,20 +78,30 @@ create_mock "ip6tables" 'exit 0'
 create_mock "qrencode" 'exit 0'
 create_mock "firewall-cmd" 'exit 1'
 
-# Mock systemctl
+# Mock systemctl (unit-aware: only awg-quick@* is reported as active after start;
+# firewalld stays inactive to ensure the iptables code path is exercised)
 create_mock "systemctl" '
 case "$1" in
 	is-active)
 		if [[ "${2:-}" == "--quiet" ]]; then
-			if [[ -f /tmp/awg-mock-started ]]; then
-				exit 0
+			UNIT="${3:-}"
+			if [[ "$UNIT" == awg-quick@* ]]; then
+				if [[ -f /tmp/awg-mock-started ]]; then
+					exit 0
+				else
+					exit 1
+				fi
 			fi
+			# All other units (firewalld, etc.) are always inactive
 			exit 1
 		fi
 		exit 1
 		;;
 	start)
-		touch /tmp/awg-mock-started
+		UNIT="${2:-}"
+		if [[ "$UNIT" == awg-quick@* ]]; then
+			touch /tmp/awg-mock-started
+		fi
 		exit 0
 		;;
 	enable|daemon-reload|disable|stop)

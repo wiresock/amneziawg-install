@@ -18,11 +18,9 @@ else
 	export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 fi
 
-# Restrict file creation to owner-only by default. This protects private keys and
-# config files from being briefly world-readable before chmod runs.
-# System files that need wider access (apt sources, systemd overrides, sysctl, etc.)
-# are explicitly chmod'd after creation.
-umask 077
+# For sensitive files (private keys, params, configs), a restrictive umask (077)
+# is applied locally around their creation to avoid them being briefly world-readable.
+# This avoids affecting subprocesses (apt/dnf, dkms, etc.) that expect the default umask.
 
 # Safely quote a value for inclusion in a sourced params file
 # Escapes single quotes and wraps in single quotes to prevent shell injection
@@ -56,6 +54,11 @@ function serializeParams() {
 		echo "ERROR: serializeParams() requires an output file path" >&2
 		return 1
 	fi
+	# Apply a restrictive umask only while writing the params file to disk,
+	# so that subprocesses (apt/dnf, dkms, etc.) are not affected.
+	local OLD_UMASK
+	OLD_UMASK="$(umask)"
+	umask 077
 	cat >"${OUTPUT_FILE}" <<EOF
 SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
 SERVER_PUB_NIC=$(safeQuoteParam "${SERVER_PUB_NIC}")
@@ -80,6 +83,7 @@ SERVER_AWG_H2=$(safeQuoteParam "${SERVER_AWG_H2}")
 SERVER_AWG_H3=$(safeQuoteParam "${SERVER_AWG_H3}")
 SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")
 EOF
+	umask "${OLD_UMASK}"
 }
 
 # Validate an IPv6 address string
@@ -1162,11 +1166,17 @@ function installAmneziaWG() {
 
 	# Ensure configuration directory exists
 	mkdir -p "${AMNEZIAWG_DIR}"
+	chmod 700 "${AMNEZIAWG_DIR}"
 
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
 	SERVER_PRIV_KEY=$(awg genkey)
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | awg pubkey)
+
+	# Restrict umask for sensitive file creation (private keys, server config)
+	local OLD_UMASK
+	OLD_UMASK="$(umask)"
+	umask 077
 
 	# Save WireGuard settings atomically: write to temp file then move into place
 	PARAMS_TMP_FILE="$(mktemp "${AMNEZIAWG_DIR}/params.XXXXXX")" || { echo -e "${RED}ERROR: Failed to create temporary params file.${NC}"; exit 1; }
@@ -1195,6 +1205,9 @@ H2 = ${SERVER_AWG_H2}
 H3 = ${SERVER_AWG_H3}
 H4 = ${SERVER_AWG_H4}" >"${SERVER_AWG_CONF}"
 	chmod 600 "${SERVER_AWG_CONF}"
+
+	# Restore default umask before creating system files and running services
+	umask "${OLD_UMASK}"
 
 	if systemctl is-active --quiet firewalld 2>/dev/null; then
 		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_AWG_IPV4}" | cut -d"." -f1-3)".0"
@@ -1459,6 +1472,11 @@ function newClient() {
 		CLIENT_DNS="${CLIENT_DNS_1},${CLIENT_DNS_2}"
 	fi
 
+	# Restrict umask for client config file creation (contains private key)
+	local OLD_UMASK
+	OLD_UMASK="$(umask)"
+	umask 077
+
 	# Create client file and add the server as a peer
 	echo "[Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
@@ -1481,6 +1499,10 @@ PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
 AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+
+	# Restore default umask
+	umask "${OLD_UMASK}"
+
 	local client_conf owner_group
 	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 	if ! chmod 600 "${client_conf}"; then
