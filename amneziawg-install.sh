@@ -266,8 +266,8 @@ function checkOS() {
 		fi
 		local RELEASE_YEAR
 		RELEASE_YEAR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
-		if ! [[ ${RELEASE_YEAR} =~ ^[0-9]+$ ]] || [[ ${RELEASE_YEAR} -lt 20 ]]; then
-			echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 20.04 or later"
+		if ! [[ ${RELEASE_YEAR} =~ ^[0-9]+$ ]] || [[ ${RELEASE_YEAR} -lt 22 ]]; then
+			echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 22.04 or later"
 			exit 1
 		fi
 	elif [[ ${OS} == "fedora" ]]; then
