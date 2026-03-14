@@ -1186,6 +1186,8 @@ PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >
 	fi
 
 	# Enable routing on the server
+	mkdir -p /etc/sysctl.d
+	chmod 755 /etc/sysctl.d
 	echo "net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/awg.conf
 	chmod 644 /etc/sysctl.d/awg.conf
