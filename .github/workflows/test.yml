@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run unit tests
+        run: bash tests/test-functions.sh
+
+  integration-tests:
+    name: Integration (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - debian:11
+          - debian:12
+          - fedora:40
+          - almalinux:9
+          - rockylinux:9
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n amneziawg-install.sh
+
+      - name: Run integration test in Docker
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace:ro" \
+            -w /workspace \
+            ${{ matrix.distro }} \
+            bash tests/test-install-mock.sh

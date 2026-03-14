@@ -41,6 +41,35 @@ It will install AmneziaWG (kernel module and tools) on the server, configure it,
 
 Run the script again to add or remove clients!
 
+## Non-Interactive Installation
+
+For automated deployments, set `AUTO_INSTALL=y` to skip all prompts and use sensible defaults:
+
+```bash
+AUTO_INSTALL=y ./amneziawg-install.sh
+```
+
+You can override individual defaults via environment variables:
+
+| Variable | Default |
+|----------|---------|
+| `SERVER_PUB_IP` | Auto-detected |
+| `SERVER_PUB_NIC` | Auto-detected |
+| `SERVER_AWG_NIC` | `awg0` |
+| `SERVER_AWG_IPV4` | `10.66.66.1` |
+| `SERVER_AWG_IPV6` | `fd42:42:42::1` |
+| `SERVER_PORT` | Random (49152-65535) |
+| `CLIENT_DNS_1` | `1.1.1.1` |
+| `CLIENT_DNS_2` | `1.0.0.1` |
+| `ALLOWED_IPS` | `0.0.0.0/0,::/0` |
+
+Example with custom port and DNS:
+```bash
+AUTO_INSTALL=y SERVER_PORT=51820 CLIENT_DNS_1=8.8.8.8 ./amneziawg-install.sh
+```
+
+A default client named `client` is created automatically. Obfuscation parameters (Jc, Jmin/Jmax, S1-S4, H1-H4) are randomly generated.
+
 ## AmneziaWG 2.0 Features
 
 This installer supports AmneziaWG 2.0 parameters:

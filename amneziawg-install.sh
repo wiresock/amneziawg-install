@@ -715,6 +715,64 @@ function convertHToRangeIfNeeded() {
 }
 
 function installQuestions() {
+	# Non-interactive mode: use environment variable overrides or sensible defaults
+	# Set AUTO_INSTALL=y to skip all prompts
+	if [[ "${AUTO_INSTALL,,}" == "y" ]]; then
+		SERVER_PUB_IP=${SERVER_PUB_IP:-$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)}
+		if [[ -z "${SERVER_PUB_IP}" ]]; then
+			SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+		fi
+		if [[ -z "${SERVER_PUB_IP}" ]]; then
+			echo -e "${RED}ERROR: Could not detect public IP address. Set SERVER_PUB_IP and rerun.${NC}"
+			exit 1
+		fi
+
+		SERVER_PUB_NIC=${SERVER_PUB_NIC:-$(ip -4 route ls | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev" && i<NF) {print $(i+1); exit}}' | head -1)}
+		if [[ -z "${SERVER_PUB_NIC}" ]]; then
+			SERVER_PUB_NIC=$(ip -6 route ls | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev" && i<NF) {print $(i+1); exit}}' | head -1)
+		fi
+		if [[ -z "${SERVER_PUB_NIC}" ]]; then
+			echo -e "${RED}ERROR: Could not detect public interface. Set SERVER_PUB_NIC and rerun.${NC}"
+			exit 1
+		fi
+
+		SERVER_AWG_NIC=${SERVER_AWG_NIC:-awg0}
+		SERVER_AWG_IPV4=${SERVER_AWG_IPV4:-10.66.66.1}
+		SERVER_AWG_IPV6=${SERVER_AWG_IPV6:-fd42:42:42::1}
+		SERVER_PORT=${SERVER_PORT:-$(shuf -i49152-65535 -n1)}
+		CLIENT_DNS_1=${CLIENT_DNS_1:-1.1.1.1}
+		CLIENT_DNS_2=${CLIENT_DNS_2:-1.0.0.1}
+		ALLOWED_IPS=${ALLOWED_IPS:-0.0.0.0/0,::/0}
+
+		SERVER_AWG_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
+
+		SERVER_AWG_JC=$(shuf -i3-10 -n1)
+		SERVER_AWG_JMIN=50
+		SERVER_AWG_JMAX=1000
+
+		generateS1AndS2
+		while (( RANDOM_AWG_S1 + 56 == RANDOM_AWG_S2 )) || (( RANDOM_AWG_S2 + 56 == RANDOM_AWG_S1 )); do
+			generateS1AndS2
+		done
+		SERVER_AWG_S1=${RANDOM_AWG_S1}
+		SERVER_AWG_S2=${RANDOM_AWG_S2}
+
+		generateS3AndS4
+		while (( RANDOM_AWG_S3 + 56 == RANDOM_AWG_S4 )) || (( RANDOM_AWG_S4 + 56 == RANDOM_AWG_S3 )); do
+			generateS3AndS4
+		done
+		SERVER_AWG_S3=${RANDOM_AWG_S3}
+		SERVER_AWG_S4=${RANDOM_AWG_S4}
+
+		generateH1AndH2AndH3AndH4Ranges
+		SERVER_AWG_H1="${RANDOM_AWG_H1_MIN}-${RANDOM_AWG_H1_MAX}"
+		SERVER_AWG_H2="${RANDOM_AWG_H2_MIN}-${RANDOM_AWG_H2_MAX}"
+		SERVER_AWG_H3="${RANDOM_AWG_H3_MIN}-${RANDOM_AWG_H3_MAX}"
+		SERVER_AWG_H4="${RANDOM_AWG_H4_MIN}-${RANDOM_AWG_H4_MAX}"
+
+		return
+	fi
+
 	# Reset all interactive variables to prevent pre-set environment variables
 	# from bypassing prompt validation loops
 	SERVER_PUB_IP=""
@@ -1242,22 +1300,6 @@ function newClient() {
 	fi
 	ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
 
-	echo ""
-	echo "Client configuration"
-	echo ""
-	echo "The client name must consist of alphanumeric character(s). It may also include underscores or dashes and can't exceed 15 chars."
-
-	until [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ && ${CLIENT_EXISTS} == '0' && ${#CLIENT_NAME} -lt 16 ]]; do
-		read -rp "Client name: " -e CLIENT_NAME
-		CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "${SERVER_AWG_CONF}")
-
-		if [[ ${CLIENT_EXISTS} != 0 ]]; then
-			echo ""
-			echo -e "${ORANGE}A client with the specified name was already created, please choose another name.${NC}"
-			echo ""
-		fi
-	done
-
 	BASE_IP=$(echo "$SERVER_AWG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
 
 	local FREE_DOT_IP_FOUND=0
@@ -1275,62 +1317,95 @@ function newClient() {
 		exit 1
 	fi
 
-	until [[ ${IPV4_EXISTS} == '0' ]]; do
-		read -rp "Client AmneziaWG IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
-
-		# Validate host number is between 2 and 254
-		if ! [[ ${DOT_IP} =~ ^[0-9]+$ ]] || (( DOT_IP < 2 )) || (( DOT_IP > 254 )); then
-			echo ""
-			echo -e "${ORANGE}Invalid host number. Must be between 2 and 254.${NC}"
-			echo ""
-			IPV4_EXISTS='1'
-			continue
-		fi
+	if [[ "${AUTO_INSTALL,,}" == "y" ]]; then
+		# Auto mode: use default client name and first available IPs
+		CLIENT_NAME="client"
+		local CLIENT_NUM=2
+		while [[ $(grep -c -E "^### Client ${CLIENT_NAME}$" "${SERVER_AWG_CONF}") != 0 ]]; do
+			CLIENT_NAME="client${CLIENT_NUM}"
+			CLIENT_NUM=$((CLIENT_NUM + 1))
+		done
 
 		CLIENT_AWG_IPV4="${BASE_IP}.${DOT_IP}"
-		IPV4_EXISTS=$(grep -cF "$CLIENT_AWG_IPV4/32" "${SERVER_AWG_CONF}")
 
-		if [[ ${IPV4_EXISTS} != 0 ]]; then
-			echo ""
-			echo -e "${ORANGE}A client with the specified IPv4 was already created, please choose another IPv4.${NC}"
-			echo ""
-		fi
-	done
-
-	# Normalize server IPv6 and extract /64 prefix (first 4 groups)
-	local NORMALIZED_SERVER_IPV6
-	NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
-	BASE_IP=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
-
-	until [[ ${IPV6_EXISTS} == '0' ]]; do
-		read -rp "Client AmneziaWG IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
-
-		# Validate IPv6 host part is a valid hex segment (1-4 hex characters)
-		if ! [[ ${DOT_IP} =~ ^[a-fA-F0-9]{1,4}$ ]]; then
-			echo ""
-			echo -e "${ORANGE}Invalid IPv6 host part. Must be 1-4 hexadecimal characters.${NC}"
-			echo ""
-			IPV6_EXISTS='1'
-			continue
-		fi
-
+		local NORMALIZED_SERVER_IPV6
+		NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
+		BASE_IP=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
 		CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IP}::${DOT_IP}")
-		# Semantic duplicate check: normalize all existing IPv6 in config for comparison
-		IPV6_EXISTS=0
-		local EXISTING_IPV6_RAW
-		while IFS= read -r EXISTING_IPV6_RAW; do
-			if [[ "$(normalizeIPv6 "${EXISTING_IPV6_RAW%/128}")" == "${CLIENT_AWG_IPV6}" ]]; then
-				IPV6_EXISTS=1
-				break
-			fi
-		done < <(grep -oE '[a-fA-F0-9:]+/128' "${SERVER_AWG_CONF}")
+	else
+		echo ""
+		echo "Client configuration"
+		echo ""
+		echo "The client name must consist of alphanumeric character(s). It may also include underscores or dashes and can't exceed 15 chars."
 
-		if [[ ${IPV6_EXISTS} != 0 ]]; then
-			echo ""
-			echo -e "${ORANGE}A client with the specified IPv6 was already created, please choose another IPv6.${NC}"
-			echo ""
-		fi
-	done
+		until [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ && ${CLIENT_EXISTS} == '0' && ${#CLIENT_NAME} -lt 16 ]]; do
+			read -rp "Client name: " -e CLIENT_NAME
+			CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "${SERVER_AWG_CONF}")
+
+			if [[ ${CLIENT_EXISTS} != 0 ]]; then
+				echo ""
+				echo -e "${ORANGE}A client with the specified name was already created, please choose another name.${NC}"
+				echo ""
+			fi
+		done
+
+		until [[ ${IPV4_EXISTS} == '0' ]]; do
+			read -rp "Client AmneziaWG IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
+
+			# Validate host number is between 2 and 254
+			if ! [[ ${DOT_IP} =~ ^[0-9]+$ ]] || (( DOT_IP < 2 )) || (( DOT_IP > 254 )); then
+				echo ""
+				echo -e "${ORANGE}Invalid host number. Must be between 2 and 254.${NC}"
+				echo ""
+				IPV4_EXISTS='1'
+				continue
+			fi
+
+			CLIENT_AWG_IPV4="${BASE_IP}.${DOT_IP}"
+			IPV4_EXISTS=$(grep -cF "$CLIENT_AWG_IPV4/32" "${SERVER_AWG_CONF}")
+
+			if [[ ${IPV4_EXISTS} != 0 ]]; then
+				echo ""
+				echo -e "${ORANGE}A client with the specified IPv4 was already created, please choose another IPv4.${NC}"
+				echo ""
+			fi
+		done
+
+		# Normalize server IPv6 and extract /64 prefix (first 4 groups)
+		local NORMALIZED_SERVER_IPV6
+		NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
+		BASE_IP=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
+
+		until [[ ${IPV6_EXISTS} == '0' ]]; do
+			read -rp "Client AmneziaWG IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
+
+			# Validate IPv6 host part is a valid hex segment (1-4 hex characters)
+			if ! [[ ${DOT_IP} =~ ^[a-fA-F0-9]{1,4}$ ]]; then
+				echo ""
+				echo -e "${ORANGE}Invalid IPv6 host part. Must be 1-4 hexadecimal characters.${NC}"
+				echo ""
+				IPV6_EXISTS='1'
+				continue
+			fi
+
+			CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IP}::${DOT_IP}")
+			# Semantic duplicate check: normalize all existing IPv6 in config for comparison
+			IPV6_EXISTS=0
+			local EXISTING_IPV6_RAW
+			while IFS= read -r EXISTING_IPV6_RAW; do
+				if [[ "$(normalizeIPv6 "${EXISTING_IPV6_RAW%/128}")" == "${CLIENT_AWG_IPV6}" ]]; then
+					IPV6_EXISTS=1
+					break
+				fi
+			done < <(grep -oE '[a-fA-F0-9:]+/128' "${SERVER_AWG_CONF}")
+
+			if [[ ${IPV6_EXISTS} != 0 ]]; then
+				echo ""
+				echo -e "${ORANGE}A client with the specified IPv6 was already created, please choose another IPv6.${NC}"
+				echo ""
+			fi
+		done
+	fi
 
 	# Generate key pair for the client
 	CLIENT_PRIV_KEY=$(awg genkey)
@@ -2107,22 +2182,26 @@ function persistMigration() {
 	echo ""
 
 	# Require explicit user confirmation before proceeding with migration
-	while true; do
-		read -rp "Do you want to proceed with migration to AmneziaWG 2.0? [y/N]: " RESP
-		case "${RESP}" in
-			[Yy])
-				break
-				;;
-			[Nn]|"")
-				echo -e "${ORANGE}Migration cancelled. The script cannot continue without migration.${NC}"
-				echo -e "${ORANGE}Your existing configuration remains unchanged.${NC}"
-				exit 0
-				;;
-			*)
-				echo "Please answer y or n."
-				;;
-		esac
-	done
+	if [[ "${AUTO_INSTALL,,}" == "y" ]]; then
+		echo -e "${GREEN}AUTO_INSTALL: Auto-confirming migration to AmneziaWG 2.0${NC}"
+	else
+		while true; do
+			read -rp "Do you want to proceed with migration to AmneziaWG 2.0? [y/N]: " RESP
+			case "${RESP}" in
+				[Yy])
+					break
+					;;
+				[Nn]|"")
+					echo -e "${ORANGE}Migration cancelled. The script cannot continue without migration.${NC}"
+					echo -e "${ORANGE}Your existing configuration remains unchanged.${NC}"
+					exit 0
+					;;
+				*)
+					echo "Please answer y or n."
+					;;
+			esac
+		done
+	fi
 
 	echo -e "${GREEN}Updating configuration with migrated values...${NC}"
 
@@ -2431,13 +2510,16 @@ function manageMenu() {
 	esac
 }
 
-# Check for root, virt, OS...
-initialCheck
+# Only run main logic when executed directly (not when sourced for testing)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	# Check for root, virt, OS...
+	initialCheck
 
-# Check if AmneziaWG is already installed and load params
-if [[ -e "${AMNEZIAWG_DIR}/params" ]]; then
-	loadParams
-	manageMenu
-else
-	installAmneziaWG
+	# Check if AmneziaWG is already installed and load params
+	if [[ -e "${AMNEZIAWG_DIR}/params" ]]; then
+		loadParams
+		manageMenu
+	else
+		installAmneziaWG
+	fi
 fi
