@@ -2091,7 +2091,10 @@ function persistMigration() {
 	fi
 
 	# Write to a temporary file first, then atomically rename to prevent partial writes
-	local PARAMS_TMP="${AMNEZIAWG_DIR}/params.tmp.$$"
+	local PARAMS_TMP
+	if ! PARAMS_TMP="$(mktemp "${AMNEZIAWG_DIR}/params.tmp.XXXXXX")"; then
+		_migrationRestoreAndExit "Failed to create temporary params file."
+	fi
 	if ! serializeParams "${PARAMS_TMP}"; then
 		rm -f "${PARAMS_TMP}"
 		_migrationRestoreAndExit "Failed to write temporary params file."
