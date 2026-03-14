@@ -1531,7 +1531,7 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 	# Restore default umask
 	umask "${OLD_UMASK}"
 
-	local client_conf owner_group home_owner sudo_home
+	local client_conf owner_group sudo_home client_chown_ok client_chown_target client_primary_group
 	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 	if ! chmod 600 "${client_conf}"; then
 		echo "Warning: failed to set permissions on ${client_conf}" >&2
@@ -1547,9 +1547,6 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 	# Try to determine the ownership of HOME_DIR, if stat is available.
 	if command -v stat >/dev/null 2>&1; then
 		owner_group="$(stat -c '%U:%G' "${HOME_DIR}" 2>/dev/null || true)"
-		if [ -n "${owner_group}" ]; then
-			home_owner="${owner_group%%:*}"
-		fi
 	fi
 
 	# 1. If CLIENT_NAME corresponds to an existing user, chown to that user.
