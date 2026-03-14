@@ -1531,7 +1531,7 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 	# Restore default umask
 	umask "${OLD_UMASK}"
 
-	local client_conf owner_group sudo_home client_chown_ok client_chown_target client_primary_group
+	local client_conf owner_group sudo_home client_chown_ok client_chown_target client_primary_group sudo_chown_target sudo_primary_group
 	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 	if ! chmod 600 "${client_conf}"; then
 		echo "Warning: failed to set permissions on ${client_conf}" >&2
