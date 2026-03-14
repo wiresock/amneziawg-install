@@ -1496,16 +1496,36 @@ function regenerateClients() {
 			continue
 		fi
 
-		# Parse IPv4 and IPv6 addresses from AllowedIPs (e.g., "10.66.66.2/32,fd42:42:42::2/128")
+		# Parse IPv4 and IPv6 addresses from AllowedIPs (e.g., "10.66.66.2/32,fd42:42:42::2/128").
+		# There may be multiple routes; select a single "client address" per family to avoid
+		# multi-line values corrupting the generated Address = ... line.
 		local CLIENT_AWG_IPV4
-		CLIENT_AWG_IPV4=$(echo "${CLIENT_ALLOWED_IPS}" | tr ',' '\n' | grep -E '^[0-9]+\.' | sed 's|/.*||')
-		local CLIENT_AWG_IPV6
-		CLIENT_AWG_IPV6=$(echo "${CLIENT_ALLOWED_IPS}" | tr ',' '\n' | grep -E ':' | sed 's|/.*||')
+		local CLIENT_AWG_IPV4_CANDIDATES
+		CLIENT_AWG_IPV4_CANDIDATES=$(echo "${CLIENT_ALLOWED_IPS}" | tr ',' '\n' | grep -E '^[0-9]+\.' | sed 's|/.*||')
 
-		if [[ -z "${CLIENT_AWG_IPV4}" ]]; then
+		local CLIENT_AWG_IPV6
+		local CLIENT_AWG_IPV6_CANDIDATES
+		CLIENT_AWG_IPV6_CANDIDATES=$(echo "${CLIENT_ALLOWED_IPS}" | tr ',' '\n' | grep -E ':' | sed 's|/.*||')
+
+		if [[ -z "${CLIENT_AWG_IPV4_CANDIDATES}" ]]; then
 			echo -e "${RED}  SKIP: ${CLIENT_NAME} - could not parse IPv4 from AllowedIPs${NC}"
 			FAILED=$((FAILED + 1))
 			continue
+		fi
+
+		# Use the first IPv4/IPv6 candidate as the client address; warn if multiple exist.
+		if [[ "$(echo "${CLIENT_AWG_IPV4_CANDIDATES}" | wc -l | tr -d ' ')" -gt 1 ]]; then
+			echo -e "${ORANGE}  WARN: ${CLIENT_NAME} - multiple IPv4 entries in AllowedIPs; using first one${NC}"
+		fi
+		CLIENT_AWG_IPV4=$(echo "${CLIENT_AWG_IPV4_CANDIDATES}" | head -n 1)
+
+		if [[ -n "${CLIENT_AWG_IPV6_CANDIDATES}" ]]; then
+			if [[ "$(echo "${CLIENT_AWG_IPV6_CANDIDATES}" | wc -l | tr -d ' ')" -gt 1 ]]; then
+				echo -e "${ORANGE}  WARN: ${CLIENT_NAME} - multiple IPv6 entries in AllowedIPs; using first one${NC}"
+			fi
+			CLIENT_AWG_IPV6=$(echo "${CLIENT_AWG_IPV6_CANDIDATES}" | head -n 1)
+		else
+			CLIENT_AWG_IPV6=""
 		fi
 
 		# Build address string, including IPv6 only if present in AllowedIPs
