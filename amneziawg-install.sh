@@ -1148,7 +1148,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStartPre=/sbin/modprobe amneziawg
+ExecStartPre=modprobe amneziawg
 EOF
 	chmod 644 "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC}.service.d/override.conf"
 	systemctl daemon-reload
