@@ -1366,7 +1366,20 @@ function newClient() {
 		# and ensure the corresponding /128 is also not already present.
 		local CLIENT_IPV6_CANDIDATE
 		CLIENT_IPV6_CANDIDATE=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
-		IPV6_EXISTS=$(grep -cF "${CLIENT_IPV6_CANDIDATE}/128" "${SERVER_AWG_CONF}")
+
+		# Perform a semantic duplicate check: normalize existing /128 IPv6 addresses
+		# before comparing, so compressed vs expanded forms are treated as equal.
+		IPV6_EXISTS=0
+		while IFS= read -r _existing_ip_cidr; do
+			# Strip the /128 suffix to get the raw IPv6 address
+			local _existing_ip="${_existing_ip_cidr%/*}"
+			local _normalized_existing
+			_normalized_existing=$(normalizeIPv6 "${_existing_ip}")
+			if [[ "${_normalized_existing}" == "${CLIENT_IPV6_CANDIDATE}" ]]; then
+				IPV6_EXISTS=1
+				break
+			fi
+		done < <(grep -oE '([0-9a-fA-F:]+)/128' "${SERVER_AWG_CONF}")
 
 		if [[ ${DOT_EXISTS} == '0' && ${IPV6_EXISTS} == '0' ]]; then
 			FREE_DOT_IP_FOUND=1
