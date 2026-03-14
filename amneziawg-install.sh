@@ -1492,6 +1492,13 @@ function newClient() {
 		done
 	fi
 
+	# Safety net: if CLIENT_AWG_IPV6 was not set (e.g., the interactive IPv6
+	# prompt was unexpectedly skipped), derive it from the server's /64 prefix
+	# and the selected host number to avoid writing a broken config.
+	if [[ -z "${CLIENT_AWG_IPV6}" ]]; then
+		CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
+	fi
+
 	# Generate key pair for the client
 	CLIENT_PRIV_KEY=$(awg genkey)
 	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | awg pubkey)
