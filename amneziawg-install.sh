@@ -325,7 +325,7 @@ function getHomeDirForClient() {
 	elif [[ "${CLIENT_NAME}" == "root" ]]; then
 		# Explicitly handle root client
 		RESULT_DIR="/root"
-	elif [[ "${SUDO_USER}" ]]; then
+	elif [[ "${SUDO_USER:-}" ]]; then
 		# if not a system user, use SUDO_USER
 		local SUDO_HOME=""
 		if [[ "${HAVE_GETENT}" == true ]]; then
