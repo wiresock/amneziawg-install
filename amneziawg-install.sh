@@ -1354,8 +1354,18 @@ function newClient() {
 
 	local FREE_DOT_IP_FOUND=0
 	for DOT_IP in {2..254}; do
+		# Check IPv4 address "${BASE_IP}.${DOT_IP}/32" is not already in use
 		DOT_EXISTS=$(grep -cF "${BASE_IP}.${DOT_IP}/32" "${SERVER_AWG_CONF}")
-		if [[ ${DOT_EXISTS} == '0' ]]; then
+
+		# Derive the would-be IPv6 client address in the same way as in AUTO_INSTALL
+		# and ensure the corresponding /128 is also not already present.
+		local NORMALIZED_SERVER_IPV6 BASE_IPV6 CLIENT_IPV6_CANDIDATE
+		NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
+		BASE_IPV6=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
+		CLIENT_IPV6_CANDIDATE=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
+		IPV6_EXISTS=$(grep -cF "${CLIENT_IPV6_CANDIDATE}/128" "${SERVER_AWG_CONF}")
+
+		if [[ ${DOT_EXISTS} == '0' && ${IPV6_EXISTS} == '0' ]]; then
 			FREE_DOT_IP_FOUND=1
 			break
 		fi
