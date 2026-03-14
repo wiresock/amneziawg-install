@@ -1059,8 +1059,14 @@ function installAmneziaWG() {
 	SERVER_PRIV_KEY=$(awg genkey)
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | awg pubkey)
 
-	# Save WireGuard settings
-	serializeParams "${AMNEZIAWG_DIR}/params" || { echo -e "${RED}ERROR: Failed to write params file.${NC}"; exit 1; }
+	# Save WireGuard settings atomically: write to temp file then move into place
+	PARAMS_TMP_FILE="${AMNEZIAWG_DIR}/params.$$"
+	serializeParams "${PARAMS_TMP_FILE}" || { echo -e "${RED}ERROR: Failed to write params file.${NC}"; rm -f "${PARAMS_TMP_FILE}"; exit 1; }
+	if ! mv -f "${PARAMS_TMP_FILE}" "${AMNEZIAWG_DIR}/params"; then
+		echo -e "${RED}ERROR: Failed to move params file into place.${NC}"
+		rm -f "${PARAMS_TMP_FILE}"
+		exit 1
+	fi
 	chmod 600 "${AMNEZIAWG_DIR}/params"
 
 	# Add server interface
