@@ -1742,11 +1742,11 @@ function validateParamsFile() {
 			else
 				echo -e "${RED}ERROR: Failed to automatically fix permissions on ${AMNEZIAWG_DIR}/params.${NC}"
 				echo -e "${ORANGE}Fix manually with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
-				exit 1
+				return 1
 			fi
 		else
 			echo -e "${ORANGE}Fix with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
-			exit 1
+			return 1
 		fi
 	fi
 
