@@ -746,10 +746,39 @@ function installQuestions() {
 		CLIENT_DNS_2=${CLIENT_DNS_2-1.0.0.1}
 		ALLOWED_IPS=${ALLOWED_IPS:-0.0.0.0/0,::/0}
 
+		# Validate all overrides with the same checks used in the interactive flow.
+		# These values end up in iptables rules, systemd unit paths, and config files,
+		# so unsafe characters (shell metacharacters, path separators, whitespace)
+		# could enable command injection or path traversal.
+		if ! [[ ${SERVER_PUB_NIC} =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+			echo -e "${RED}ERROR: SERVER_PUB_NIC contains invalid characters: ${SERVER_PUB_NIC}${NC}"
+			exit 1
+		fi
+		if ! [[ ${SERVER_AWG_NIC} =~ ^[a-zA-Z0-9_.-]+$ ]] || [[ ${#SERVER_AWG_NIC} -ge 16 ]]; then
+			echo -e "${RED}ERROR: SERVER_AWG_NIC is invalid (must be alphanumeric/._- and < 16 chars): ${SERVER_AWG_NIC}${NC}"
+			exit 1
+		fi
+		if ! [[ ${SERVER_AWG_IPV4} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; then
+			echo -e "${RED}ERROR: SERVER_AWG_IPV4 is not a valid IPv4 address: ${SERVER_AWG_IPV4}${NC}"
+			exit 1
+		fi
 		if ! isValidIPv6 "${SERVER_AWG_IPV6}"; then
 			echo -e "${RED}ERROR: Invalid IPv6 address specified in SERVER_AWG_IPV6: ${SERVER_AWG_IPV6}.${NC}"
 			exit 1
 		fi
+		if ! [[ ${SERVER_PORT} =~ ^[0-9]+$ ]] || (( SERVER_PORT < 1 )) || (( SERVER_PORT > 65535 )); then
+			echo -e "${RED}ERROR: SERVER_PORT must be a number between 1 and 65535: ${SERVER_PORT}${NC}"
+			exit 1
+		fi
+		if ! [[ ${CLIENT_DNS_1} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; then
+			echo -e "${RED}ERROR: CLIENT_DNS_1 is not a valid IPv4 address: ${CLIENT_DNS_1}${NC}"
+			exit 1
+		fi
+		if [[ -n "${CLIENT_DNS_2}" ]] && ! [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; then
+			echo -e "${RED}ERROR: CLIENT_DNS_2 is not a valid IPv4 address: ${CLIENT_DNS_2}${NC}"
+			exit 1
+		fi
+
 		SERVER_AWG_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
 
 		SERVER_AWG_JC=$(shuf -i3-10 -n1)
