@@ -1623,7 +1623,15 @@ function uninstallAmneziaWG() {
 		systemctl disable "awg-quick@${SERVER_AWG_NIC}"
 
 		# Remove systemd drop-in override created during install
-		rm -rf "/etc/systemd/system/awg-quick@${SERVER_AWG_NIC:?}.service.d"
+		DROPIN_DIR="/etc/systemd/system/awg-quick@${SERVER_AWG_NIC:?}.service.d"
+		OVERRIDE_FILE="${DROPIN_DIR}/override.conf"
+		if [[ -f "${OVERRIDE_FILE}" ]]; then
+			rm -f "${OVERRIDE_FILE}"
+		fi
+		# Remove drop-in directory only if empty to avoid deleting user-managed files
+		if [[ -d "${DROPIN_DIR}" ]] && [[ -z "$(ls -A "${DROPIN_DIR}")" ]]; then
+			rmdir "${DROPIN_DIR}"
+		fi
 		systemctl daemon-reload
 
 		# Remove module auto-load entry
