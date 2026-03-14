@@ -1608,7 +1608,7 @@ function regenerateClients() {
 
 		# Write the new client config file with current server parameters
 		local OUTPUT_CONF="${CLIENT_CONF_OUTPUT:-$CLIENT_CONF}"
-		local TMP_CONF="${OUTPUT_CONF}.tmp.$$"
+		local TMP_CONF
 
 		# Ensure parent directory for the output config exists
 		if ! mkdir -p "$(dirname "${OUTPUT_CONF}")"; then
@@ -1616,6 +1616,12 @@ function regenerateClients() {
 			FAILED=$((FAILED + 1))
 			continue
 		fi
+
+		TMP_CONF="$(mktemp "$(dirname "${OUTPUT_CONF}")/.$(basename "${OUTPUT_CONF}").tmp.XXXXXX")" || {
+			echo -e "${RED}  ${CLIENT_NAME}: failed to create temporary file for client config (${OUTPUT_CONF})${NC}"
+			FAILED=$((FAILED + 1))
+			continue
+		}
 
 		if cat <<EOF >"${TMP_CONF}" && chmod 600 "${TMP_CONF}" && mv "${TMP_CONF}" "${OUTPUT_CONF}"; then
 [Interface]
