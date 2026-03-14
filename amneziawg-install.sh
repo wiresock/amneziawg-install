@@ -238,6 +238,7 @@ function checkOS() {
 		echo "Cannot detect OS: /etc/os-release is missing or not readable"
 		exit 1
 	fi
+	# shellcheck source=/etc/os-release
 	source /etc/os-release
 	OS="${ID}"
 	if [[ -z "${OS}" ]]; then
