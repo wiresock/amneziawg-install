@@ -1455,6 +1455,12 @@ function newClient() {
 		NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
 		BASE_IP=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
 
+		# Reset IPV6_EXISTS so the until-loop below actually prompts the user.
+		# The free-IP search loop above already set it to '0' for the first
+		# available slot, which would cause the until condition to be immediately
+		# true and skip the interactive IPv6 selection entirely.
+		IPV6_EXISTS=""
+
 		until [[ ${IPV6_EXISTS} == '0' ]]; do
 			read -rp "Client AmneziaWG IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
 

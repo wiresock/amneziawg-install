@@ -288,6 +288,22 @@ if [[ -f "${SERVER_CONF}" ]]; then
 		echo "  FAIL: Default client peer 'client' not found"
 		FAILED=$((FAILED + 1))
 	fi
+
+	# Verify peer AllowedIPs contains both IPv4/32 and IPv6/128
+	PEER_ALLOWED=$(sed -n '/^### Client client$/,/^$/p' "${SERVER_CONF}" | grep "^AllowedIPs = " | sed 's/^AllowedIPs = //')
+	if echo "${PEER_ALLOWED}" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/32'; then
+		echo "  OK: Peer AllowedIPs contains IPv4/32"
+	else
+		echo "  FAIL: Peer AllowedIPs missing IPv4/32 (got '${PEER_ALLOWED}')"
+		FAILED=$((FAILED + 1))
+	fi
+	PEER_IPV6_PART=$(echo "${PEER_ALLOWED}" | tr ',' '\n' | grep '/128' | sed 's|/128||')
+	if [[ -n "${PEER_IPV6_PART}" ]]; then
+		echo "  OK: Peer AllowedIPs contains IPv6/128 (${PEER_IPV6_PART})"
+	else
+		echo "  FAIL: Peer AllowedIPs missing or empty IPv6/128 (got '${PEER_ALLOWED}')"
+		FAILED=$((FAILED + 1))
+	fi
 else
 	echo "FAIL: Server config missing"
 	FAILED=$((FAILED + 1))
@@ -308,6 +324,30 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 			FAILED=$((FAILED + 1))
 		fi
 	done
+
+	# Verify Address line contains both a valid IPv4/32 and IPv6/128 entry
+	# Regression test: the interactive path previously skipped IPv6 assignment
+	# because IPV6_EXISTS was pre-set to '0' by the free-IP search loop
+	CLIENT_ADDR=$(grep "^Address = " "${CLIENT_CONF}" | sed 's/^Address = //')
+	if echo "${CLIENT_ADDR}" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/32'; then
+		echo "  OK: Address contains IPv4/32"
+	else
+		echo "  FAIL: Address missing IPv4/32 (got '${CLIENT_ADDR}')"
+		FAILED=$((FAILED + 1))
+	fi
+	if echo "${CLIENT_ADDR}" | grep -qE '[0-9a-fA-F:]+/128'; then
+		# Further check: the IPv6 part must not be empty (i.e., not just "/128")
+		CLIENT_IPV6_PART=$(echo "${CLIENT_ADDR}" | tr ',' '\n' | grep '/128' | sed 's|/128||')
+		if [[ -n "${CLIENT_IPV6_PART}" ]]; then
+			echo "  OK: Address contains IPv6/128 (${CLIENT_IPV6_PART})"
+		else
+			echo "  FAIL: Address has /128 suffix but IPv6 address is empty (got '${CLIENT_ADDR}')"
+			FAILED=$((FAILED + 1))
+		fi
+	else
+		echo "  FAIL: Address missing IPv6/128 (got '${CLIENT_ADDR}')"
+		FAILED=$((FAILED + 1))
+	fi
 else
 	echo "FAIL: Client config not found"
 	FAILED=$((FAILED + 1))
