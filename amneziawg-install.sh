@@ -1616,9 +1616,9 @@ EOF
 		# Generate QR code if qrencode is installed
 		if command -v qrencode &>/dev/null; then
 			echo -e "${GREEN}  ${CLIENT_NAME}: regenerated (QR code below)${NC}"
-			qrencode -t ansiutf8 -l L <"${CLIENT_CONF}"
+			qrencode -t ansiutf8 -l L <"${OUTPUT_CONF}"
 		else
-			echo -e "${GREEN}  ${CLIENT_NAME}: regenerated -> ${CLIENT_CONF}${NC}"
+			echo -e "${GREEN}  ${CLIENT_NAME}: regenerated -> ${OUTPUT_CONF}${NC}"
 		fi
 
 		REGENERATED=$((REGENERATED + 1))
