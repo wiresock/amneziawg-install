@@ -68,7 +68,7 @@ Example with custom port and DNS:
 AUTO_INSTALL=y SERVER_PORT=51820 CLIENT_DNS_1=8.8.8.8 ./amneziawg-install.sh
 ```
 
-A default client named `client` is created automatically. Obfuscation parameters (Jc, Jmin/Jmax, S1-S4, H1-H4) are randomly generated.
+A default client named `client` is created automatically when the server interface is successfully brought up. If the AmneziaWG kernel module cannot be loaded (e.g., missing kernel headers), client generation is skipped and you can add clients by re-running the script after resolving the issue. Obfuscation parameters (Jc, Jmin/Jmax, S1-S4, H1-H4) are randomly generated.
 
 ## AmneziaWG 2.0 Features
 

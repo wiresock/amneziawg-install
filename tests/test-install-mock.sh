@@ -13,9 +13,14 @@ echo "=== AmneziaWG Integration Test ==="
 echo "OS: $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')"
 echo ""
 
-# Ensure running as root
+# Ensure running as root inside a container to avoid clobbering real system binaries.
+# The test writes mock binaries to /sbin; running on a non-ephemeral host would be destructive.
 if [[ "$(id -u)" -ne 0 ]]; then
 	echo "ERROR: This test must be run as root (e.g., in a Docker container)"
+	exit 1
+fi
+if [[ ! -f /.dockerenv ]] && ! grep -qE '(/docker|/lxc)' /proc/1/cgroup 2>/dev/null; then
+	echo "ERROR: This test must run inside a container (Docker/LXC). Refusing to modify /sbin on a real host."
 	exit 1
 fi
 
@@ -178,6 +183,11 @@ echo ""
 echo "=== Verifying installation (exit code: ${INSTALL_RC}) ==="
 
 FAILED=0
+
+if [[ ${INSTALL_RC} -ne 0 ]]; then
+	echo "FAIL: Installer exited with non-zero code ${INSTALL_RC}"
+	FAILED=$((FAILED + 1))
+fi
 
 # Check config directory exists
 if [[ -d /etc/amnezia/amneziawg ]]; then
