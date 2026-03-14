@@ -882,8 +882,8 @@ function installAmneziaWG() {
 				# Tag managed file with sentinel so uninstall can verify ownership
 				echo "# Managed by amneziawg-install" > /etc/apt/sources.list.d/amneziawg.sources.list
 				cat /etc/apt/sources.list >> /etc/apt/sources.list.d/amneziawg.sources.list
-				# Anchor to line-start 'deb ' with trailing space to avoid matching deb-src lines
-				sed -i 's/^deb /deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
+				# Anchor to line-start 'deb' followed by whitespace to avoid matching deb-src lines
+				sed -i 's/^deb[[:space:]]\+/deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
 				chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 			fi
 		fi
