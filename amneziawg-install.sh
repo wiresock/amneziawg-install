@@ -1368,7 +1368,23 @@ PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
 AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
-	chmod 600 "${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+	chmod 600 "${client_conf}"
+
+	# Ensure the generated client config is readable by the intended non-root user.
+	# When running under sudo, HOME_DIR may point to the sudo user's home while the
+	# file is owned by root, so chown it to SUDO_USER (or the owner of HOME_DIR).
+	if [ -n "${SUDO_USER:-}" ] && id -u "${SUDO_USER}" >/dev/null 2>&1; then
+		chown "${SUDO_USER}:${SUDO_USER}" "${client_conf}" || true
+	else
+		# Fallback: match the ownership of HOME_DIR if stat is available.
+		if command -v stat >/dev/null 2>&1; then
+			owner_group="$(stat -c '%U:%G' "${HOME_DIR}" 2>/dev/null || true)"
+			if [ -n "${owner_group}" ]; then
+				chown "${owner_group}" "${client_conf}" || true
+			fi
+		fi
+	fi
 
 	# Add the client as a peer to the server
 	echo -e "\n### Client ${CLIENT_NAME}
