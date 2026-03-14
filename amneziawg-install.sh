@@ -30,7 +30,7 @@ function safeQuoteParam() {
 	local VALUE="$1"
 	# Replace each single quote with '\'' (end quote, escaped quote, start quote)
 	local ESCAPED
-	ESCAPED="$(printf '%s' "${VALUE}" | sed "s/'/'\\\\''/g")"
+	ESCAPED="$(printf '%s' "${VALUE}" | sed "s/'/'\\''/g")"
 	printf "'%s'\n" "${ESCAPED}"
 }
 
