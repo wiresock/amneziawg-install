@@ -741,7 +741,9 @@ function installQuestions() {
 		SERVER_AWG_IPV6=${SERVER_AWG_IPV6:-fd42:42:42::1}
 		SERVER_PORT=${SERVER_PORT:-$(shuf -i49152-65535 -n1)}
 		CLIENT_DNS_1=${CLIENT_DNS_1:-1.1.1.1}
-		CLIENT_DNS_2=${CLIENT_DNS_2:-1.0.0.1}
+		# Use ${var-default} (not ${var:-default}) so an explicitly empty CLIENT_DNS_2
+		# is honored (skip second resolver), matching the interactive flow.
+		CLIENT_DNS_2=${CLIENT_DNS_2-1.0.0.1}
 		ALLOWED_IPS=${ALLOWED_IPS:-0.0.0.0/0,::/0}
 
 		if ! isValidIPv6 "${SERVER_AWG_IPV6}"; then
@@ -949,8 +951,9 @@ function installAmneziaWG() {
 				chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 			fi
 		fi
-		apt install -y software-properties-common
-		add-apt-repository -y ppa:amnezia/ppa
+		apt-get update || { echo -e "${RED}ERROR: Failed to refresh APT package index.${NC}"; exit 1; }
+		apt install -y software-properties-common || { echo -e "${RED}ERROR: Failed to install software-properties-common.${NC}"; exit 1; }
+		add-apt-repository -y ppa:amnezia/ppa || { echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
 		apt-get update || { echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		# This is critical on Raspberry Pi / ARM where the default headers package
