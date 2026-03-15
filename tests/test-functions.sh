@@ -82,7 +82,7 @@ assert_eq "::1:2:3:4:5" "$(compressIPv6 "0:0:0:1:2:3:4:5")" "compressIPv6 leadin
 assert_eq "2001:db8:1:2:3:4::" "$(compressIPv6 "2001:db8:1:2:3:4:0:0")" "compressIPv6 trailing run"
 
 echo "=== compressIPv6 (via installer helper) ==="
-run_compressIPv6_tests
+assert_rc 0 run_compressIPv6_tests
 
 echo "=== parseRange ==="
 TEMP_MIN="" ; TEMP_MAX=""
