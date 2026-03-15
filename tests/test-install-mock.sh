@@ -578,7 +578,8 @@ if echo "${AWG_SHOW_OUTPUT}" | grep -q "^interface:"; then
 	if [[ -n "${SHOWN_PUBKEY}" ]] && [[ "${SHOWN_PUBKEY}" == "${SERVER_PUB_KEY}" ]]; then
 		echo "  OK: awg show public key matches SERVER_PUB_KEY from params"
 	elif [[ -n "${SHOWN_PUBKEY}" ]]; then
-		echo "  WARN: awg show public key differs from SERVER_PUB_KEY (expected in mock environment)"
+		echo "  FAIL: awg show public key differs from SERVER_PUB_KEY"
+		FAILED=$((FAILED + 1))
 	else
 		echo "  FAIL: awg show output missing public key for interface"
 		FAILED=$((FAILED + 1))
