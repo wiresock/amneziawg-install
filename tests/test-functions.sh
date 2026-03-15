@@ -67,6 +67,36 @@ assert_eq "2001:db8:85a3:0:0:8a2e:370:7334" "$(normalizeIPv6 "2001:0db8:85a3:000
 assert_eq "fe80:0:0:0:0:0:0:1" "$(normalizeIPv6 "fe80::1")" "normalizeIPv6 fe80::1"
 assert_eq "2001:db8:0:0:0:0:0:0" "$(normalizeIPv6 "2001:db8::")" "normalizeIPv6 trailing ::"
 
+echo "=== compressIPv6 ==="
+# Addresses that should NOT compress (no run of >= 2 consecutive zero groups)
+assert_eq "2001:db8:0:1:2:3:4:5" "$(compressIPv6 "2001:db8:0:1:2:3:4:5")" "compressIPv6 single zero no compress"
+assert_eq "2001:db8:0:1:2:3:4:0" "$(compressIPv6 "2001:db8:0:1:2:3:4:0")" "compressIPv6 trailing single zero no compress"
+
+# Simple middle run (>= 2 consecutive zeros)
+assert_eq "2001:db8::1:0:0:1" "$(compressIPv6 "2001:db8:0:0:1:0:0:1")" "compressIPv6 middle run"
+
+# Leading zero run
+assert_eq "::1:2:3:4:5" "$(compressIPv6 "0:0:0:1:2:3:4:5")" "compressIPv6 leading run"
+
+# Trailing zero run
+assert_eq "2001:db8:1:2:3:4::" "$(compressIPv6 "2001:db8:1:2:3:4:0:0")" "compressIPv6 trailing run"
+
+# All zeros -> ::
+assert_eq "::" "$(compressIPv6 "0:0:0:0:0:0:0:0")" "compressIPv6 all zeros"
+
+# Longest run wins over shorter run
+assert_eq "2001::1:0:0:1" "$(compressIPv6 "2001:0:0:0:1:0:0:1")" "compressIPv6 longest run wins"
+
+# Tie: leftmost longest run wins (two runs of length 2)
+assert_eq "2001::1:0:0:1:1" "$(compressIPv6 "2001:0:0:1:0:0:1:1")" "compressIPv6 leftmost run wins on tie"
+
+# Actual use case from the PR: fd42:42:42:0:0:0:0:2 -> fd42:42:42::2
+assert_eq "fd42:42:42::2" "$(compressIPv6 "fd42:42:42:0:0:0:0:2")" "compressIPv6 fd42 address"
+
+# normalizeIPv6 + compressIPv6 round-trip
+assert_eq "fd42:42:42::1" "$(compressIPv6 "$(normalizeIPv6 "fd42:42:42::1")")" "compressIPv6 round-trip fd42::1"
+assert_eq "::1" "$(compressIPv6 "$(normalizeIPv6 "::1")")" "compressIPv6 round-trip loopback"
+
 echo "=== parseRange ==="
 TEMP_MIN="" ; TEMP_MAX=""
 assert_rc 0 parseRange "100-200" TEMP_MIN TEMP_MAX
