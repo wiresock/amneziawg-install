@@ -261,6 +261,64 @@ function compressIPv6() {
 	echo "${LEFT}::${RIGHT}"
 }
 
+# Optional self-tests for compressIPv6. These are only run when the installer
+# is executed directly with AMNEZIAWG_RUN_IPV6_TESTS=1 in the environment.
+# They are intended to guard against regressions in the RFC 5952 logic.
+function __compressIPv6_expect() {
+	local EXPECTED="$1"
+	local INPUT="$2"
+	local ACTUAL
+
+	ACTUAL="$(compressIPv6 "${INPUT}")"
+	if [[ "${ACTUAL}" != "${EXPECTED}" ]]; then
+		echo "compressIPv6 test failed: input='${INPUT}' expected='${EXPECTED}' got='${ACTUAL}'" >&2
+		return 1
+	fi
+
+	return 0
+}
+
+function run_compressIPv6_tests() {
+	local FAIL=0
+
+	# Addresses that should NOT compress (no run of >= 2 zero groups)
+	__compressIPv6_expect "2001:db8:0:1:2:3:4:5" "2001:db8:0:1:2:3:4:5" || FAIL=1
+	__compressIPv6_expect "2001:db8:0:1:2:3:4:0" "2001:db8:0:1:2:3:4:0" || FAIL=1
+
+	# Simple middle run
+	__compressIPv6_expect "2001:db8::1:0:0:1" "2001:db8:0:0:1:0:0:1" || FAIL=1
+
+	# Leading zero run
+	__compressIPv6_expect "::1:2:3:4:5" "0:0:0:1:2:3:4:5" || FAIL=1
+
+	# Trailing zero run
+	__compressIPv6_expect "2001:db8:1:2:3:4::" "2001:db8:1:2:3:4:0:0" || FAIL=1
+
+	# All zeros
+	__compressIPv6_expect "::" "0:0:0:0:0:0:0:0" || FAIL=1
+
+	# Longest run chosen over shorter one
+	__compressIPv6_expect "2001::1:0:0:1" "2001:0:0:0:1:0:0:1" || FAIL=1
+
+	# Tie case: leftmost longest run wins
+	# Two runs of length 2: positions 1–2 and 4–5
+	# Input: 2001:0:0:1:0:0:1:1 -> expected: 2001::1:0:0:1:1
+	__compressIPv6_expect "2001::1:0:0:1:1" "2001:0:0:1:0:0:1:1" || FAIL=1
+
+	if (( FAIL != 0 )); then
+		echo "compressIPv6 self-tests: FAILED" >&2
+		return 1
+	fi
+
+	echo "compressIPv6 self-tests: OK"
+	return 0
+}
+
+# Only run self-tests when this script is executed directly and explicitly requested.
+if [[ "${BASH_SOURCE[0]}" == "${0}" && "${AMNEZIAWG_RUN_IPV6_TESTS:-0}" == "1" ]]; then
+	run_compressIPv6_tests || exit 1
+fi
+
 function isRoot() {
 	if [[ "${EUID}" -ne 0 ]]; then
 		echo "You need to run this script as root"
