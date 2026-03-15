@@ -602,14 +602,22 @@ fi
 if echo "${AWG_SHOW_OUTPUT}" | grep -q "^interface:"; then
 	SHOWN_IFACE=$(echo "${AWG_SHOW_OUTPUT}" | awk '/^interface:/ {print $2}')
 	echo "OK: awg show reports interface: ${SHOWN_IFACE}"
-	if [[ "${SHOWN_IFACE}" == "${SERVER_AWG_NIC}" ]]; then
-		echo "  OK: interface name matches SERVER_AWG_NIC (${SERVER_AWG_NIC})"
+	EXPECTED_SERVER_AWG_NIC="${SERVER_AWG_NIC-}"
+	if [[ -z "${EXPECTED_SERVER_AWG_NIC}" ]]; then
+		echo "  FAIL: SERVER_AWG_NIC is not set (params file may not have been sourced)"
+		FAILED=$((FAILED + 1))
+	elif [[ "${SHOWN_IFACE}" == "${EXPECTED_SERVER_AWG_NIC}" ]]; then
+		echo "  OK: interface name matches SERVER_AWG_NIC (${EXPECTED_SERVER_AWG_NIC})"
 	else
-		echo "  FAIL: interface '${SHOWN_IFACE}' does not match SERVER_AWG_NIC '${SERVER_AWG_NIC}'"
+		echo "  FAIL: interface '${SHOWN_IFACE}' does not match SERVER_AWG_NIC '${EXPECTED_SERVER_AWG_NIC}'"
 		FAILED=$((FAILED + 1))
 	fi
 	SHOWN_PUBKEY=$(echo "${AWG_SHOW_OUTPUT}" | awk '/^  public key:/ {print $NF}')
-	if [[ -n "${SHOWN_PUBKEY}" ]] && [[ "${SHOWN_PUBKEY}" == "${SERVER_PUB_KEY}" ]]; then
+	EXPECTED_SERVER_PUB_KEY="${SERVER_PUB_KEY-}"
+	if [[ -z "${EXPECTED_SERVER_PUB_KEY}" ]]; then
+		echo "  FAIL: SERVER_PUB_KEY is not set (params file may not have been sourced)"
+		FAILED=$((FAILED + 1))
+	elif [[ -n "${SHOWN_PUBKEY}" ]] && [[ "${SHOWN_PUBKEY}" == "${EXPECTED_SERVER_PUB_KEY}" ]]; then
 		echo "  OK: awg show public key matches SERVER_PUB_KEY from params"
 	elif [[ -n "${SHOWN_PUBKEY}" ]]; then
 		echo "  FAIL: awg show public key differs from SERVER_PUB_KEY"
