@@ -252,25 +252,13 @@ function compressIPv6() {
 	fi
 
 	# Build the compressed address
-	local LEFT="" RIGHT=""
-	for (( i = 0; i < BEST_START; i++ )); do
-		[[ -n "${LEFT}" ]] && LEFT+=":"
-		LEFT+="${IPV6_PARTS[$i]}"
-	done
-	for (( i = BEST_START + BEST_LEN; i < 8; i++ )); do
-		[[ -n "${RIGHT}" ]] && RIGHT+=":"
-		RIGHT+="${IPV6_PARTS[$i]}"
-	done
+	local IFS=':'
+	local LEFT_PARTS=("${IPV6_PARTS[@]:0:$BEST_START}")
+	local RIGHT_PARTS=("${IPV6_PARTS[@]:$((BEST_START + BEST_LEN))}")
+	local LEFT="${LEFT_PARTS[*]}"
+	local RIGHT="${RIGHT_PARTS[*]}"
 
-	if [[ -z "${LEFT}" ]] && [[ -z "${RIGHT}" ]]; then
-		echo "::"
-	elif [[ -z "${LEFT}" ]]; then
-		echo "::${RIGHT}"
-	elif [[ -z "${RIGHT}" ]]; then
-		echo "${LEFT}::"
-	else
-		echo "${LEFT}::${RIGHT}"
-	fi
+	echo "${LEFT}::${RIGHT}"
 }
 
 function isRoot() {
