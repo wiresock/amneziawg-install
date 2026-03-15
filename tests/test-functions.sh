@@ -67,6 +67,23 @@ assert_eq "2001:db8:85a3:0:0:8a2e:370:7334" "$(normalizeIPv6 "2001:0db8:85a3:000
 assert_eq "fe80:0:0:0:0:0:0:1" "$(normalizeIPv6 "fe80::1")" "normalizeIPv6 fe80::1"
 assert_eq "2001:db8:0:0:0:0:0:0" "$(normalizeIPv6 "2001:db8::")" "normalizeIPv6 trailing ::"
 
+echo "=== compressIPv6 ==="
+# Addresses that should NOT compress (no run of >= 2 consecutive zero groups)
+assert_eq "2001:db8:0:1:2:3:4:5" "$(compressIPv6 "2001:db8:0:1:2:3:4:5")" "compressIPv6 single zero no compress"
+assert_eq "2001:db8:0:1:2:3:4:0" "$(compressIPv6 "2001:db8:0:1:2:3:4:0")" "compressIPv6 trailing single zero no compress"
+
+# Simple middle run (>= 2 consecutive zeros)
+assert_eq "2001:db8::1:0:0:1" "$(compressIPv6 "2001:db8:0:0:1:0:0:1")" "compressIPv6 middle run"
+
+# Leading zero run
+assert_eq "::1:2:3:4:5" "$(compressIPv6 "0:0:0:1:2:3:4:5")" "compressIPv6 leading run"
+
+# Trailing zero run
+assert_eq "2001:db8:1:2:3:4::" "$(compressIPv6 "2001:db8:1:2:3:4:0:0")" "compressIPv6 trailing run"
+
+echo "=== compressIPv6 (via installer helper) ==="
+assert_rc 0 run_compressIPv6_tests
+
 echo "=== parseRange ==="
 TEMP_MIN="" ; TEMP_MAX=""
 assert_rc 0 parseRange "100-200" TEMP_MIN TEMP_MAX
