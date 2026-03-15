@@ -56,6 +56,18 @@ case "$1" in
 	pubkey)   echo "cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A=";;
 	genpsk)   echo "cHNrMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnM=";;
 	syncconf) exit 0;;
+	show)
+		echo "interface: awg0"
+		echo "  public key: cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A="
+		echo "  private key: (hidden)"
+		echo "  listening port: 51820"
+		echo "  jc: 4"
+		echo "  jmin: 50"
+		echo "  jmax: 1000"
+		echo ""
+		echo "peer: cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A="
+		echo "  allowed ips: 10.66.66.2/32, fd42:42:42::2/128"
+		;;
 	*)        exit 0;;
 esac
 '
@@ -340,6 +352,14 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 		CLIENT_IPV6_PART=$(echo "${CLIENT_ADDR}" | tr ',' '\n' | grep '/128' | sed 's|/128||')
 		if [[ -n "${CLIENT_IPV6_PART}" ]]; then
 			echo "  OK: Address contains IPv6/128 (${CLIENT_IPV6_PART})"
+			# Verify compressed form (RFC 5952): default server IPv6 fd42:42:42::1 always
+			# produces client addresses with consecutive zero groups -> must use ::
+			if echo "${CLIENT_IPV6_PART}" | grep -q "::"; then
+				echo "  OK: IPv6 address uses compressed form (::)"
+			else
+				echo "  FAIL: IPv6 address is not in compressed form: ${CLIENT_IPV6_PART}"
+				FAILED=$((FAILED + 1))
+			fi
 		else
 			echo "  FAIL: Address has /128 suffix but IPv6 address is empty (got '${CLIENT_ADDR}')"
 			FAILED=$((FAILED + 1))
@@ -351,6 +371,148 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 else
 	echo "FAIL: Client config not found"
 	FAILED=$((FAILED + 1))
+fi
+
+# ============================================================
+# Validate client config parameter values
+# ============================================================
+if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
+	echo ""
+	echo "--- Client config parameter validation ---"
+	C_PRIVKEY=$(grep "^PrivateKey = " "${CLIENT_CONF}" | sed 's/^PrivateKey = //')
+	C_PUBKEY=$(grep "^PublicKey = " "${CLIENT_CONF}" | sed 's/^PublicKey = //')
+	C_PSK=$(grep "^PresharedKey = " "${CLIENT_CONF}" | sed 's/^PresharedKey = //')
+	C_DNS=$(grep "^DNS = " "${CLIENT_CONF}" | sed 's/^DNS = //')
+	C_JC=$(grep "^Jc = " "${CLIENT_CONF}" | sed 's/^Jc = //')
+	C_JMIN=$(grep "^Jmin = " "${CLIENT_CONF}" | sed 's/^Jmin = //')
+	C_JMAX=$(grep "^Jmax = " "${CLIENT_CONF}" | sed 's/^Jmax = //')
+	C_S1=$(grep "^S1 = " "${CLIENT_CONF}" | sed 's/^S1 = //')
+	C_S2=$(grep "^S2 = " "${CLIENT_CONF}" | sed 's/^S2 = //')
+	C_S3=$(grep "^S3 = " "${CLIENT_CONF}" | sed 's/^S3 = //')
+	C_S4=$(grep "^S4 = " "${CLIENT_CONF}" | sed 's/^S4 = //')
+	C_H1=$(grep "^H1 = " "${CLIENT_CONF}" | sed 's/^H1 = //')
+	C_H2=$(grep "^H2 = " "${CLIENT_CONF}" | sed 's/^H2 = //')
+	C_H3=$(grep "^H3 = " "${CLIENT_CONF}" | sed 's/^H3 = //')
+	C_H4=$(grep "^H4 = " "${CLIENT_CONF}" | sed 's/^H4 = //')
+	C_ENDPOINT=$(grep "^Endpoint = " "${CLIENT_CONF}" | sed 's/^Endpoint = //')
+
+	# Validate key formats: 32-byte WireGuard keys are 44-char base64 strings
+	for KEY_LABEL_VALUE in "PrivateKey:${C_PRIVKEY}" "PublicKey:${C_PUBKEY}" "PresharedKey:${C_PSK}"; do
+		K_LABEL="${KEY_LABEL_VALUE%%:*}"
+		K_VALUE="${KEY_LABEL_VALUE#*:}"
+		if [[ "${#K_VALUE}" -eq 44 ]] && [[ "${K_VALUE}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+			echo "  OK: ${K_LABEL} is a valid 44-char base64 key"
+		else
+			echo "  FAIL: ${K_LABEL} has unexpected format (len=${#K_VALUE}): '${K_VALUE}'"
+			FAILED=$((FAILED + 1))
+		fi
+	done
+
+	# Validate DNS: primary resolver must be a valid IPv4 address
+	C_DNS1=$(echo "${C_DNS}" | cut -d',' -f1 | tr -d ' ')
+	if [[ "${C_DNS1}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+		echo "  OK: DNS1=${C_DNS1} is a valid IPv4"
+	else
+		echo "  FAIL: DNS1 is not a valid IPv4: '${C_DNS1}'"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# Validate Jc [1-128]
+	if [[ "${C_JC}" =~ ^[0-9]+$ ]] && (( C_JC >= 1 && C_JC <= 128 )); then
+		echo "  OK: Jc=${C_JC} in valid range [1-128]"
+	else
+		echo "  FAIL: Jc=${C_JC} out of range [1-128]"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# Validate Jmin/Jmax [1-1280] with Jmin <= Jmax
+	if [[ "${C_JMIN}" =~ ^[0-9]+$ ]] && [[ "${C_JMAX}" =~ ^[0-9]+$ ]] && \
+	   (( C_JMIN >= 1 && C_JMIN <= 1280 && C_JMAX >= 1 && C_JMAX <= 1280 && C_JMIN <= C_JMAX )); then
+		echo "  OK: Jmin=${C_JMIN} Jmax=${C_JMAX} valid (in [1-1280] and Jmin <= Jmax)"
+	else
+		echo "  FAIL: Jmin/Jmax invalid: Jmin=${C_JMIN} Jmax=${C_JMAX} (must be [1-1280] with Jmin <= Jmax)"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# Validate S1/S2 [15-150] with AmneziaWG offset constraint (S+56 != other)
+	if [[ "${C_S1}" =~ ^[0-9]+$ ]] && [[ "${C_S2}" =~ ^[0-9]+$ ]] && \
+	   (( C_S1 >= 15 && C_S1 <= 150 && C_S2 >= 15 && C_S2 <= 150 )); then
+		echo "  OK: S1=${C_S1} S2=${C_S2} in valid range [15-150]"
+		if (( C_S1 + 56 != C_S2 && C_S2 + 56 != C_S1 )); then
+			echo "  OK: S1/S2 satisfy AmneziaWG offset constraint (x+56 != y)"
+		else
+			echo "  FAIL: S1/S2 violate offset constraint: S1=${C_S1} S2=${C_S2}"
+			FAILED=$((FAILED + 1))
+		fi
+	else
+		echo "  FAIL: S1=${C_S1} or S2=${C_S2} out of range [15-150]"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# Validate S3/S4 [15-150] with AmneziaWG offset constraint
+	if [[ "${C_S3}" =~ ^[0-9]+$ ]] && [[ "${C_S4}" =~ ^[0-9]+$ ]] && \
+	   (( C_S3 >= 15 && C_S3 <= 150 && C_S4 >= 15 && C_S4 <= 150 )); then
+		echo "  OK: S3=${C_S3} S4=${C_S4} in valid range [15-150]"
+		if (( C_S3 + 56 != C_S4 && C_S4 + 56 != C_S3 )); then
+			echo "  OK: S3/S4 satisfy AmneziaWG offset constraint"
+		else
+			echo "  FAIL: S3/S4 violate offset constraint: S3=${C_S3} S4=${C_S4}"
+			FAILED=$((FAILED + 1))
+		fi
+	else
+		echo "  FAIL: S3=${C_S3} or S4=${C_S4} out of range [15-150]"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# Validate H1-H4: must be "min-max" range format within [5-2147483647] and non-overlapping
+	H_ALL_VALID=1
+	declare -a H_RANGE_MINS H_RANGE_MAXS
+	for H_IDX in 1 2 3 4; do
+		H_VAR="C_H${H_IDX}"
+		H_VAL="${!H_VAR}"
+		if [[ "${H_VAL}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+			H_LO=$(( 10#${BASH_REMATCH[1]} ))
+			H_HI=$(( 10#${BASH_REMATCH[2]} ))
+			if (( H_LO >= 5 && H_HI <= 2147483647 && H_LO <= H_HI )); then
+				echo "  OK: H${H_IDX}=${H_VAL} valid range within [5-2147483647]"
+				H_RANGE_MINS[${H_IDX}]=${H_LO}
+				H_RANGE_MAXS[${H_IDX}]=${H_HI}
+			else
+				echo "  FAIL: H${H_IDX}=${H_VAL} out of bounds [5-2147483647]"
+				H_ALL_VALID=0
+				FAILED=$((FAILED + 1))
+			fi
+		else
+			echo "  FAIL: H${H_IDX}=${H_VAL} not in 'min-max' range format"
+			H_ALL_VALID=0
+			FAILED=$((FAILED + 1))
+		fi
+	done
+	if [[ ${H_ALL_VALID} -eq 1 ]]; then
+		H_OVERLAP=0
+		for A_IDX in 1 2 3; do
+			for B_IDX in 2 3 4; do
+				(( B_IDX <= A_IDX )) && continue
+				if (( H_RANGE_MAXS[A_IDX] >= H_RANGE_MINS[B_IDX] && \
+					  H_RANGE_MAXS[B_IDX] >= H_RANGE_MINS[A_IDX] )); then
+					echo "  FAIL: H${A_IDX} [${H_RANGE_MINS[A_IDX]}-${H_RANGE_MAXS[A_IDX]}] overlaps H${B_IDX} [${H_RANGE_MINS[B_IDX]}-${H_RANGE_MAXS[B_IDX]}]"
+					H_OVERLAP=$((H_OVERLAP + 1))
+					FAILED=$((FAILED + 1))
+				fi
+			done
+		done
+		if [[ ${H_OVERLAP} -eq 0 ]]; then
+			echo "  OK: H1-H4 ranges are non-overlapping"
+		fi
+	fi
+
+	# Validate Endpoint format: host:port (supports IPv4:port and [IPv6]:port)
+	if echo "${C_ENDPOINT}" | grep -qE '^(\[?[0-9a-fA-F:.]+\]?):[0-9]+$'; then
+		echo "  OK: Endpoint format valid: ${C_ENDPOINT}"
+	else
+		echo "  FAIL: Endpoint has unexpected format: '${C_ENDPOINT}'"
+		FAILED=$((FAILED + 1))
+	fi
 fi
 
 # Check modules-load config
@@ -384,6 +546,50 @@ if [[ -f /etc/sysctl.d/awg.conf ]]; then
 	fi
 else
 	echo "FAIL: sysctl config missing"
+	FAILED=$((FAILED + 1))
+fi
+
+# ============================================================
+# awg show: verify interface and peer status
+# ============================================================
+echo ""
+echo "--- awg show verification ---"
+AWG_SHOW_OUTPUT=$(awg show 2>&1)
+AWG_SHOW_RC=$?
+if [[ ${AWG_SHOW_RC} -eq 0 ]]; then
+	echo "OK: awg show exited successfully"
+else
+	echo "FAIL: awg show exited with non-zero code ${AWG_SHOW_RC}"
+	FAILED=$((FAILED + 1))
+fi
+if echo "${AWG_SHOW_OUTPUT}" | grep -q "^interface:"; then
+	SHOWN_IFACE=$(echo "${AWG_SHOW_OUTPUT}" | awk '/^interface:/ {print $2}')
+	echo "OK: awg show reports interface: ${SHOWN_IFACE}"
+	if [[ "${SHOWN_IFACE}" == "${SERVER_AWG_NIC}" ]]; then
+		echo "  OK: interface name matches SERVER_AWG_NIC (${SERVER_AWG_NIC})"
+	else
+		echo "  FAIL: interface '${SHOWN_IFACE}' does not match SERVER_AWG_NIC '${SERVER_AWG_NIC}'"
+		FAILED=$((FAILED + 1))
+	fi
+	SHOWN_PUBKEY=$(echo "${AWG_SHOW_OUTPUT}" | awk '/^  public key:/ {print $NF}')
+	if [[ -n "${SHOWN_PUBKEY}" ]] && [[ "${SHOWN_PUBKEY}" == "${SERVER_PUB_KEY}" ]]; then
+		echo "  OK: awg show public key matches SERVER_PUB_KEY from params"
+	elif [[ -n "${SHOWN_PUBKEY}" ]]; then
+		echo "  WARN: awg show public key differs from SERVER_PUB_KEY (expected in mock environment)"
+	else
+		echo "  FAIL: awg show output missing public key for interface"
+		FAILED=$((FAILED + 1))
+	fi
+else
+	echo "FAIL: awg show output missing 'interface:' line"
+	echo "  Output: ${AWG_SHOW_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+if echo "${AWG_SHOW_OUTPUT}" | grep -q "^peer:"; then
+	PEER_COUNT=$(echo "${AWG_SHOW_OUTPUT}" | grep -c "^peer:")
+	echo "OK: awg show reports ${PEER_COUNT} peer(s) (client(s) registered)"
+else
+	echo "FAIL: awg show output missing 'peer:' entry (expected at least 1 client)"
 	FAILED=$((FAILED + 1))
 fi
 

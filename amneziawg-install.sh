@@ -210,6 +210,69 @@ function normalizeIPv6() {
 	echo "${RESULT}"
 }
 
+# Compress a fully expanded IPv6 address to its canonical compressed form (RFC 5952)
+# Replaces the longest run of consecutive zero groups (>= 2) with ::
+# Input should be the output of normalizeIPv6() (8 lowercase groups, no leading zeros)
+# e.g., fd42:42:42:0:0:0:0:2 -> fd42:42:42::2
+function compressIPv6() {
+	local ADDR="$1"
+	local -a IPV6_PARTS
+	IFS=':' read -ra IPV6_PARTS <<< "${ADDR}"
+
+	# Find the longest consecutive run of '0' groups (leftmost if tied)
+	local BEST_START=-1
+	local BEST_LEN=0
+	local CUR_START=-1
+	local CUR_LEN=0
+	local i
+
+	for (( i = 0; i < 8; i++ )); do
+		if [[ "${IPV6_PARTS[$i]}" == "0" ]]; then
+			if (( CUR_START == -1 )); then
+				CUR_START=$i
+				CUR_LEN=1
+			else
+				(( CUR_LEN++ ))
+			fi
+			if (( CUR_LEN > BEST_LEN )); then
+				BEST_START=$CUR_START
+				BEST_LEN=$CUR_LEN
+			fi
+		else
+			CUR_START=-1
+			CUR_LEN=0
+		fi
+	done
+
+	# Per RFC 5952, only compress runs of 2 or more consecutive zero groups
+	if (( BEST_LEN < 2 )); then
+		local IFS=':'
+		echo "${IPV6_PARTS[*]}"
+		return
+	fi
+
+	# Build the compressed address
+	local LEFT="" RIGHT=""
+	for (( i = 0; i < BEST_START; i++ )); do
+		[[ -n "${LEFT}" ]] && LEFT+=":"
+		LEFT+="${IPV6_PARTS[$i]}"
+	done
+	for (( i = BEST_START + BEST_LEN; i < 8; i++ )); do
+		[[ -n "${RIGHT}" ]] && RIGHT+=":"
+		RIGHT+="${IPV6_PARTS[$i]}"
+	done
+
+	if [[ -z "${LEFT}" ]] && [[ -z "${RIGHT}" ]]; then
+		echo "::"
+	elif [[ -z "${LEFT}" ]]; then
+		echo "::${RIGHT}"
+	elif [[ -z "${RIGHT}" ]]; then
+		echo "${LEFT}::"
+	else
+		echo "${LEFT}::${RIGHT}"
+	fi
+}
+
 function isRoot() {
 	if [[ "${EUID}" -ne 0 ]]; then
 		echo "You need to run this script as root"
@@ -1513,6 +1576,10 @@ function newClient() {
 		CLIENT_DNS="${CLIENT_DNS_1},${CLIENT_DNS_2}"
 	fi
 
+	# Compress IPv6 to canonical RFC 5952 form for client config display
+	local CLIENT_AWG_IPV6_DISPLAY
+	CLIENT_AWG_IPV6_DISPLAY=$(compressIPv6 "${CLIENT_AWG_IPV6}")
+
 	# Restrict umask for client config file creation (contains private key)
 	local OLD_UMASK
 	OLD_UMASK="$(umask)"
@@ -1521,7 +1588,7 @@ function newClient() {
 	# Create client file and add the server as a peer
 	echo "[Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
-Address = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6}/128
+Address = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6_DISPLAY}/128
 DNS = ${CLIENT_DNS}
 Jc = ${SERVER_AWG_JC}
 Jmin = ${SERVER_AWG_JMIN}
@@ -1766,6 +1833,11 @@ function regenerateClients() {
 			CLIENT_AWG_IPV6=$(echo "${CLIENT_AWG_IPV6_CANDIDATES}" | head -n 1)
 		else
 			CLIENT_AWG_IPV6=""
+		fi
+
+		# Normalize then compress IPv6 for canonical display in regenerated client configs
+		if [[ -n "${CLIENT_AWG_IPV6}" ]]; then
+			CLIENT_AWG_IPV6=$(compressIPv6 "$(normalizeIPv6 "${CLIENT_AWG_IPV6}")")
 		fi
 
 		# Build address string, including IPv6 only if present in AllowedIPs
