@@ -506,8 +506,11 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 		fi
 	fi
 
-	# Validate Endpoint format: host:port (supports IPv4:port and [IPv6]:port)
-	if echo "${C_ENDPOINT}" | grep -qE '^(\[?[0-9a-fA-F:.]+\]?):[0-9]+$'; then
+	# Validate Endpoint format: host:port
+	# - IPv4:port         e.g. 203.0.113.5:51820
+	# - hostname:port     e.g. vpn.example.com:51820
+	# - [IPv6]:port       e.g. [2001:db8::1]:51820 (brackets required)
+	if echo "${C_ENDPOINT}" | grep -qE '^((([0-9]{1,3}\.){3}[0-9]{1,3})|([a-zA-Z0-9.-]+)|(\[[0-9a-fA-F:]+\])):[0-9]+$'; then
 		echo "  OK: Endpoint format valid: ${C_ENDPOINT}"
 	else
 		echo "  FAIL: Endpoint has unexpected format: '${C_ENDPOINT}'"
