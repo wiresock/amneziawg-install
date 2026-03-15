@@ -410,7 +410,7 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 
 	# Validate DNS: primary resolver must be a valid IPv4 address
 	C_DNS1=$(echo "${C_DNS}" | cut -d',' -f1 | tr -d ' ')
-	if [[ "${C_DNS1}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+	if [[ "${C_DNS1}" =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; then
 		echo "  OK: DNS1=${C_DNS1} is a valid IPv4"
 	else
 		echo "  FAIL: DNS1 is not a valid IPv4: '${C_DNS1}'"
