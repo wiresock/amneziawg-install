@@ -96,16 +96,6 @@ assert_eq "42" "${TEMP_MIN}" "parseRange single value min"
 assert_eq "42" "${TEMP_MAX}" "parseRange single value max"
 
 TEMP_MIN="" ; TEMP_MAX=""
-assert_rc 0 parseRange "100-200" TEMP_MIN TEMP_MAX
-assert_eq "100" "${TEMP_MIN}" "parseRange 100-200 min"
-assert_eq "200" "${TEMP_MAX}" "parseRange 100-200 max"
-
-TEMP_MIN="" ; TEMP_MAX=""
-assert_rc 0 parseRange "42" TEMP_MIN TEMP_MAX
-assert_eq "42" "${TEMP_MIN}" "parseRange single value min"
-assert_eq "42" "${TEMP_MAX}" "parseRange single value max"
-
-TEMP_MIN="" ; TEMP_MAX=""
 assert_rc 0 parseRange "5-5" TEMP_MIN TEMP_MAX
 assert_eq "5" "${TEMP_MIN}" "parseRange same value min"
 assert_eq "5" "${TEMP_MAX}" "parseRange same value max"
