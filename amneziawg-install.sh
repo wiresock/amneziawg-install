@@ -316,7 +316,11 @@ function run_compressIPv6_tests() {
 
 # Only run self-tests when this script is executed directly and explicitly requested.
 if [[ "${BASH_SOURCE[0]}" == "${0}" && "${AMNEZIAWG_RUN_IPV6_TESTS:-0}" == "1" ]]; then
-	run_compressIPv6_tests || exit 1
+	if run_compressIPv6_tests; then
+		exit 0
+	else
+		exit 1
+	fi
 fi
 
 function isRoot() {
