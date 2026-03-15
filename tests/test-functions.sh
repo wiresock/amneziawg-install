@@ -81,23 +81,20 @@ assert_eq "::1:2:3:4:5" "$(compressIPv6 "0:0:0:1:2:3:4:5")" "compressIPv6 leadin
 # Trailing zero run
 assert_eq "2001:db8:1:2:3:4::" "$(compressIPv6 "2001:db8:1:2:3:4:0:0")" "compressIPv6 trailing run"
 
-# All zeros -> ::
-assert_eq "::" "$(compressIPv6 "0:0:0:0:0:0:0:0")" "compressIPv6 all zeros"
-
-# Longest run wins over shorter run
-assert_eq "2001::1:0:0:1" "$(compressIPv6 "2001:0:0:0:1:0:0:1")" "compressIPv6 longest run wins"
-
-# Tie: leftmost longest run wins (two runs of length 2)
-assert_eq "2001::1:0:0:1:1" "$(compressIPv6 "2001:0:0:1:0:0:1:1")" "compressIPv6 leftmost run wins on tie"
-
-# Actual use case from the PR: fd42:42:42:0:0:0:0:2 -> fd42:42:42::2
-assert_eq "fd42:42:42::2" "$(compressIPv6 "fd42:42:42:0:0:0:0:2")" "compressIPv6 fd42 address"
-
-# normalizeIPv6 + compressIPv6 round-trip
-assert_eq "fd42:42:42::1" "$(compressIPv6 "$(normalizeIPv6 "fd42:42:42::1")")" "compressIPv6 round-trip fd42::1"
-assert_eq "::1" "$(compressIPv6 "$(normalizeIPv6 "::1")")" "compressIPv6 round-trip loopback"
+echo "=== compressIPv6 (via installer helper) ==="
+run_compressIPv6_tests
 
 echo "=== parseRange ==="
+TEMP_MIN="" ; TEMP_MAX=""
+assert_rc 0 parseRange "100-200" TEMP_MIN TEMP_MAX
+assert_eq "100" "${TEMP_MIN}" "parseRange 100-200 min"
+assert_eq "200" "${TEMP_MAX}" "parseRange 100-200 max"
+
+TEMP_MIN="" ; TEMP_MAX=""
+assert_rc 0 parseRange "42" TEMP_MIN TEMP_MAX
+assert_eq "42" "${TEMP_MIN}" "parseRange single value min"
+assert_eq "42" "${TEMP_MAX}" "parseRange single value max"
+
 TEMP_MIN="" ; TEMP_MAX=""
 assert_rc 0 parseRange "100-200" TEMP_MIN TEMP_MAX
 assert_eq "100" "${TEMP_MIN}" "parseRange 100-200 min"
