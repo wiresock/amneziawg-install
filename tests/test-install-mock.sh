@@ -518,10 +518,10 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 	EP_HOST=""
 	EP_PORT=""
 	EP_PORT_NUM=0
-	if [[ "${C_ENDPOINT}" =~ ^\[[0-9a-fA-F:]+\]:([0-9]{1,5})$ ]]; then
+	if [[ "${C_ENDPOINT}" =~ ^(\[[0-9a-fA-F:]+\]):([0-9]{1,5})$ ]]; then
 		# Bracketed IPv6: [addr]:port
-		EP_HOST="${C_ENDPOINT%%:*}"        # includes brackets
-		EP_PORT="${BASH_REMATCH[1]}"
+		EP_HOST="${BASH_REMATCH[1]}"       # includes brackets
+		EP_PORT="${BASH_REMATCH[2]}"
 		EP_PORT_NUM=$((10#${EP_PORT}))
 	elif [[ "${C_ENDPOINT}" =~ ^([^:]+):([0-9]{1,5})$ ]]; then
 		# Hostname or IPv4: host:port with a single ':' separator
