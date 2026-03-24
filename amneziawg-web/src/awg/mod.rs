@@ -8,9 +8,9 @@
 //!
 //! `awg show all dump` produces tab-separated lines with two record types:
 //!
-//! **Interface line** (6 fields):
+//! **Interface line** (5 fields):
 //! ```text
-//! <interface>  private_key  public_key  listen_port  fwmark  <ignored>
+//! <interface>  private_key  public_key  listen_port  fwmark
 //! ```
 //!
 //! **Peer line** (9 fields):
