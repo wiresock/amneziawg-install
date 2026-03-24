@@ -60,6 +60,8 @@ visibility and management.
 - Docker support
 - Companion uninstall script with safe defaults and explicit purge flags
 - Companion upgrade script for safe in-place binary replacement
+- Source-first install and upgrade (`--source-dir` builds from repo checkout)
+- Automatic Rust toolchain installation (`--install-rust`)
 
 ### Installation
 
@@ -68,7 +70,10 @@ See [docs/INSTALL.md](docs/INSTALL.md) for full instructions.
 ### Upgrading
 
 ```bash
-cargo build --release
+# Rebuild from source and upgrade
+sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+
+# Or with a pre-built binary
 sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
 ```
 

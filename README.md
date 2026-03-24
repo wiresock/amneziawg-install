@@ -7,11 +7,17 @@ second script to set up a browser-accessible management interface:
 
 ```bash
 sudo ./amneziawg-install.sh        # install AmneziaWG
-sudo ./amneziawg-web-install.sh    # install the web panel
+sudo ./amneziawg-web-install.sh    # install the web panel (builds from source)
 # open http://127.0.0.1:8080
 ```
 
-To upgrade the web panel after building a new binary:
+To upgrade the web panel (rebuild from source and replace):
+
+```bash
+sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+```
+
+To upgrade with a pre-built binary:
 
 ```bash
 sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web

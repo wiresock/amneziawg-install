@@ -64,6 +64,8 @@ step()  { printf "\n${BOLD}${CYAN}==> %s${NC}\n" "$*"; }
 
 NON_INTERACTIVE=false
 BINARY_SRC=""
+SOURCE_DIR=""
+INSTALL_RUST=false
 INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
 DATA_DIR="${DEFAULT_DATA_DIR}"
 ENV_DIR="${DEFAULT_ENV_DIR}"
@@ -90,11 +92,20 @@ amneziawg-web installer
 Usage:
   $0 [OPTIONS]
 
+Binary source (choose one):
+  --source-dir DIR          Build from source in DIR (Rust crate directory).
+                            If neither --source-dir nor --binary-src is given,
+                            the installer auto-detects the source directory
+                            from the repository layout.
+  --binary-src PATH         Path to a pre-built amneziawg-web binary.
+                            Mutually exclusive with --source-dir.
+  --install-rust            Install the Rust toolchain via rustup if cargo is
+                            not found. Without this flag, a missing toolchain
+                            is a fatal error.
+
 Options:
   -h, --help                Show this help and exit
   --non-interactive         Run without prompts; fail if required values are missing
-  --binary-src PATH         Path to the compiled amneziawg-web binary
-                            (default: ${DEFAULT_BINARY_SRC})
   --install-dir DIR         Directory to install the binary into
                             (default: ${DEFAULT_INSTALL_DIR})
   --data-dir DIR            Directory for the SQLite database
@@ -118,26 +129,25 @@ Options:
   --force                   Overwrite existing env.conf without prompting
 
 Examples:
-  # Interactive install
-  sudo $0
+  # Install from source (recommended)
+  sudo $0 --source-dir ./amneziawg-web
 
-  # Non-interactive install (localhost only, auth enabled)
+  # Source install with auto Rust setup
+  sudo $0 --source-dir ./amneziawg-web --install-rust
+
+  # Non-interactive source install
   sudo $0 \\
     --non-interactive \\
-    --binary-src /path/to/amneziawg-web \\
+    --source-dir ./amneziawg-web \\
     --username admin \\
     --password-hash '\$argon2id\$v=19\$m=65536,t=3,p=4\$...'
 
-  # Non-interactive, custom paths
+  # Pre-built binary (advanced / CI)
   sudo $0 \\
     --non-interactive \\
     --binary-src ./target/release/amneziawg-web \\
-    --data-dir /opt/amneziawg-web/data \\
-    --env-file /opt/amneziawg-web/env.conf \\
-    --host 0.0.0.0 --port 9090 \\
     --username admin \\
-    --password-hash '\$argon2id\$v=19\$...' \\
-    --no-start
+    --password-hash '\$argon2id\$v=19\$...'
 EOF
 }
 
@@ -152,6 +162,10 @@ parse_args() {
                 NON_INTERACTIVE=true; shift ;;
             --binary-src)
                 BINARY_SRC="$2"; shift 2 ;;
+            --source-dir)
+                SOURCE_DIR="$2"; shift 2 ;;
+            --install-rust)
+                INSTALL_RUST=true; shift ;;
             --install-dir)
                 INSTALL_DIR="$2"; shift 2 ;;
             --data-dir)
@@ -188,6 +202,12 @@ parse_args() {
                 exit 1 ;;
         esac
     done
+
+    # --binary-src and --source-dir are mutually exclusive
+    if [[ -n "${BINARY_SRC}" ]] && [[ -n "${SOURCE_DIR}" ]]; then
+        die "--binary-src and --source-dir are mutually exclusive.
+Use --binary-src to provide a pre-built binary, or --source-dir to build from source."
+    fi
 }
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
@@ -214,7 +234,106 @@ or specify the path with --awg-binary."
     info "AWG binary: ${AWG_BINARY}"
 }
 
+# ── Source-build support ──────────────────────────────────────────────────────
+
+# Ensure the Rust toolchain (cargo) is available.
+# If --install-rust was given and cargo is missing, installs via rustup.
+ensure_rust_toolchain() {
+    if command -v cargo &>/dev/null; then
+        info "Rust toolchain found: $(cargo --version 2>/dev/null || echo 'unknown')"
+        return 0
+    fi
+
+    # Also check common rustup location for root installs
+    if [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
+        export PATH="${HOME}/.cargo/bin:${PATH}"
+        info "Rust toolchain found: $(cargo --version 2>/dev/null || echo 'unknown')"
+        return 0
+    fi
+
+    if [[ "${INSTALL_RUST}" != "true" ]]; then
+        die "Rust toolchain (cargo) is required to build from source but was not found.
+Install Rust with:  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+Or re-run with --install-rust to install automatically."
+    fi
+
+    info "Installing Rust toolchain via rustup..."
+    if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable 2>&1; then
+        die "Failed to install Rust toolchain via rustup."
+    fi
+
+    # Source the cargo environment
+    if [[ -f "${HOME}/.cargo/env" ]]; then
+        # shellcheck source=/dev/null
+        . "${HOME}/.cargo/env"
+    fi
+    export PATH="${HOME}/.cargo/bin:${PATH}"
+
+    if ! command -v cargo &>/dev/null; then
+        die "Rust toolchain installation succeeded but cargo is still not in PATH."
+    fi
+    info "Rust toolchain installed: $(cargo --version 2>/dev/null || echo 'unknown')"
+}
+
+# Auto-detect the source directory from the repository layout.
+# Returns the resolved path in SOURCE_DIR or leaves it empty.
+detect_source_dir() {
+    # Explicit --source-dir takes precedence
+    if [[ -n "${SOURCE_DIR}" ]]; then
+        return 0
+    fi
+
+    # Try to find the Cargo.toml relative to the script location (repo layout):
+    # SCRIPT_DIR = amneziawg-web/scripts/  →  amneziawg-web/ has Cargo.toml
+    local candidate="${SCRIPT_DIR}/.."
+    if [[ -f "${candidate}/Cargo.toml" ]]; then
+        SOURCE_DIR="$(cd "${candidate}" && pwd)"
+    fi
+}
+
+# Build the web application from source using cargo build --release.
+# Sets BINARY_SRC to the built binary on success.
+build_from_source() {
+    step "Building from source"
+
+    if [[ ! -d "${SOURCE_DIR}" ]]; then
+        die "Source directory does not exist: ${SOURCE_DIR}"
+    fi
+
+    if [[ ! -f "${SOURCE_DIR}/Cargo.toml" ]]; then
+        die "No Cargo.toml found in source directory: ${SOURCE_DIR}
+Expected the amneziawg-web Rust crate directory."
+    fi
+
+    ensure_rust_toolchain
+
+    info "Building in: ${SOURCE_DIR}"
+    info "Running: cargo build --release"
+
+    if ! (cd "${SOURCE_DIR}" && cargo build --release); then
+        die "Build failed. Check the output above for errors.
+Ensure build dependencies are installed (gcc, pkg-config, libssl-dev or equivalent)."
+    fi
+
+    local built_binary="${SOURCE_DIR}/target/release/amneziawg-web"
+    if [[ ! -f "${built_binary}" ]]; then
+        die "Build completed but binary not found at: ${built_binary}"
+    fi
+
+    BINARY_SRC="${built_binary}"
+    if [[ ! -x "${BINARY_SRC}" ]]; then
+        chmod +x "${BINARY_SRC}"
+    fi
+    info "Built binary: ${BINARY_SRC}"
+}
+
 locate_app_binary() {
+    # If a source directory is set (explicit or auto-detected), build from source
+    if [[ -n "${SOURCE_DIR}" ]]; then
+        build_from_source
+        return 0
+    fi
+
     # If --binary-src was provided, use it; otherwise try the default location.
     if [[ -z "${BINARY_SRC}" ]]; then
         # Look relative to the script location first (repo layout)
@@ -228,9 +347,10 @@ locate_app_binary() {
 
     if [[ -z "${BINARY_SRC}" ]] || [[ ! -f "${BINARY_SRC}" ]]; then
         die "Application binary not found.
-Build it first with:
-  cd amneziawg-web && cargo build --release
-Then run the installer again, or specify the path with --binary-src."
+Build from source with --source-dir, or provide a pre-built binary with --binary-src.
+Example:
+  sudo $0 --source-dir ./amneziawg-web
+  sudo $0 --binary-src ./target/release/amneziawg-web"
     fi
 
     if [[ ! -x "${BINARY_SRC}" ]]; then
@@ -245,6 +365,12 @@ preflight_checks() {
     check_root
     check_systemd
     check_awg_binary
+
+    # Auto-detect source directory if no binary and no source dir were specified
+    if [[ -z "${BINARY_SRC}" ]] && [[ -z "${SOURCE_DIR}" ]]; then
+        detect_source_dir
+    fi
+
     locate_app_binary
     info "All preflight checks passed."
 }

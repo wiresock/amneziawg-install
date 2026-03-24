@@ -1747,6 +1747,399 @@ fi
 echo ""
 echo "=== Phase 5: Web upgrader tests complete ==="
 
+# ============================================================
+# Phase 6: Source-build mode integration tests
+# ============================================================
+#
+# Test assumptions / harness notes:
+# - A real Rust build is too heavy for the CI integration test harness.
+#   Instead, we mock `cargo` to simulate build success/failure.
+# - The mock cargo creates a stub binary at the expected output path
+#   (target/release/amneziawg-web) when `build --release` is called.
+# - We test both the installer and upgrader source-build paths.
+# - --binary-src / --binary and --source-dir mutual exclusivity is tested.
+# - Missing cargo (without --install-rust) is tested.
+#
+echo ""
+echo "=== Phase 6: Source-build mode ==="
+
+# Create a fake source directory with a Cargo.toml to satisfy source-dir checks
+MOCK_SOURCE_DIR="/tmp/awg-web-source-test"
+mkdir -p "${MOCK_SOURCE_DIR}"
+cat > "${MOCK_SOURCE_DIR}/Cargo.toml" <<'CARGOEOF'
+[package]
+name = "amneziawg-web"
+version = "0.1.0-test"
+edition = "2021"
+CARGOEOF
+
+# Create a mock cargo that simulates a successful build
+MOCK_CARGO="/tmp/mock-cargo"
+cat > "${MOCK_CARGO}" <<'MOCKCARGOEOF'
+#!/bin/bash
+# Mock cargo: simulate a successful build by writing a stub binary
+if [[ "$1" == "build" ]]; then
+    # Find the directory we're running in (working dir set by cd in the script)
+    BUILD_DIR="$(pwd)"
+    mkdir -p "${BUILD_DIR}/target/release"
+    cat > "${BUILD_DIR}/target/release/amneziawg-web" <<'STUBBIN'
+#!/bin/bash
+echo "amneziawg-web stub v0.1.0-source-build-test"
+STUBBIN
+    chmod +x "${BUILD_DIR}/target/release/amneziawg-web"
+    exit 0
+fi
+if [[ "$1" == "--version" ]]; then
+    echo "cargo 1.80.0-mock (test harness)"
+    exit 0
+fi
+exit 0
+MOCKCARGOEOF
+chmod +x "${MOCK_CARGO}"
+
+# Create a failing mock cargo
+MOCK_CARGO_FAIL="/tmp/mock-cargo-fail"
+cat > "${MOCK_CARGO_FAIL}" <<'MOCKFAILEOF'
+#!/bin/bash
+if [[ "$1" == "build" ]]; then
+    echo "error[E0001]: mock build failure" >&2
+    exit 1
+fi
+if [[ "$1" == "--version" ]]; then
+    echo "cargo 1.80.0-mock-fail (test harness)"
+    exit 0
+fi
+exit 0
+MOCKFAILEOF
+chmod +x "${MOCK_CARGO_FAIL}"
+
+# We need to reinstall a clean state first (Phase 4/5 may have uninstalled)
+# But first clean up artifacts from prior phases
+rm -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
+rm -f /etc/systemd/system/amneziawg-web.service
+mkdir -p "${WEB_TEST_INSTALL_DIR}" "${WEB_TEST_DATA_DIR}"
+mkdir -p "$(dirname "${WEB_TEST_ENV_FILE}")"
+
+echo ""
+echo "--- Source-build: installer --source-dir success ---"
+
+# Inject mock cargo into PATH (before real commands)
+SAVED_PATH="${PATH}"
+export PATH="$(dirname "${MOCK_CARGO}"):${PATH}"
+# Replace /tmp/mock-cargo with a symlink named 'cargo'
+ln -sf "${MOCK_CARGO}" /tmp/cargo
+export PATH="/tmp:${SAVED_PATH}"
+
+WEB_SRC_INSTALL_RC=0
+WEB_SRC_INSTALL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--source-dir "${MOCK_SOURCE_DIR}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--force \
+	--no-start --no-enable 2>&1) || WEB_SRC_INSTALL_RC=$?
+
+if [[ ${WEB_SRC_INSTALL_RC} -eq 0 ]]; then
+	echo "OK: Source-build install exited successfully (rc=0)"
+else
+	echo "FAIL: Source-build install exited with non-zero code ${WEB_SRC_INSTALL_RC}"
+	echo "  Output tail: $(echo "${WEB_SRC_INSTALL_OUTPUT}" | tail -20)"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify binary was installed
+if [[ -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
+	echo "OK: Binary installed via source-build"
+else
+	echo "FAIL: Binary not found after source-build install"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -x "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
+	echo "OK: Source-built binary is executable"
+else
+	echo "FAIL: Source-built binary is not executable"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify env file was generated
+if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
+	echo "OK: Env file generated after source-build install"
+else
+	echo "FAIL: Env file not generated after source-build install"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify the output mentions building from source
+if echo "${WEB_SRC_INSTALL_OUTPUT}" | grep -qi "building\|build\|source\|cargo"; then
+	echo "OK: Source-build install mentions build/source in output"
+else
+	echo "FAIL: Source-build install output does not mention build/source"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Source-build: installer --binary-src and --source-dir mutual exclusivity ---"
+
+WEB_SRC_EXCL_RC=0
+WEB_SRC_EXCL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--binary-src "${STUB_BINARY}" \
+	--source-dir "${MOCK_SOURCE_DIR}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable 2>&1) || WEB_SRC_EXCL_RC=$?
+
+if [[ ${WEB_SRC_EXCL_RC} -ne 0 ]]; then
+	echo "OK: Installer rejects --binary-src + --source-dir (rc=${WEB_SRC_EXCL_RC})"
+else
+	echo "FAIL: Installer should fail when both --binary-src and --source-dir are given"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${WEB_SRC_EXCL_OUTPUT}" | grep -qi "mutually exclusive\|exclusive"; then
+	echo "OK: Mutual exclusivity error message is present"
+else
+	echo "FAIL: No helpful mutual-exclusivity message in output"
+	echo "  Output: ${WEB_SRC_EXCL_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Source-build: installer missing source directory ---"
+
+WEB_SRC_NODIR_RC=0
+WEB_SRC_NODIR_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--source-dir "/tmp/nonexistent-source-dir-xyz" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable 2>&1) || WEB_SRC_NODIR_RC=$?
+
+if [[ ${WEB_SRC_NODIR_RC} -ne 0 ]]; then
+	echo "OK: Installer fails when source directory is missing (rc=${WEB_SRC_NODIR_RC})"
+else
+	echo "FAIL: Installer should fail when --source-dir does not exist"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${WEB_SRC_NODIR_OUTPUT}" | grep -qi "not exist\|not found\|source"; then
+	echo "OK: Missing source-dir error message is present"
+else
+	echo "FAIL: No helpful message about missing source dir"
+	echo "  Output: ${WEB_SRC_NODIR_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Source-build: installer missing cargo (no --install-rust) ---"
+
+# Remove mock cargo from PATH
+export PATH="${SAVED_PATH}"
+# Ensure real cargo is not available by hiding it
+HIDE_CARGO_DIR="/tmp/hide-cargo"
+mkdir -p "${HIDE_CARGO_DIR}"
+# Create a PATH that excludes common cargo locations
+CLEAN_PATH=""
+while IFS=':' read -ra DIRS; do
+	for d in "${DIRS[@]}"; do
+		case "${d}" in
+			*cargo*|*rustup*) continue ;;
+			*) CLEAN_PATH="${CLEAN_PATH:+${CLEAN_PATH}:}${d}" ;;
+		esac
+	done
+done <<< "${SAVED_PATH}"
+export PATH="${CLEAN_PATH}"
+
+WEB_SRC_NOCARGO_RC=0
+WEB_SRC_NOCARGO_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--source-dir "${MOCK_SOURCE_DIR}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--force \
+	--no-start --no-enable 2>&1) || WEB_SRC_NOCARGO_RC=$?
+
+if [[ ${WEB_SRC_NOCARGO_RC} -ne 0 ]]; then
+	echo "OK: Installer fails when cargo is missing (rc=${WEB_SRC_NOCARGO_RC})"
+else
+	echo "FAIL: Installer should fail when cargo is not available in source-build mode"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${WEB_SRC_NOCARGO_OUTPUT}" | grep -qi "cargo\|rust\|toolchain"; then
+	echo "OK: Missing cargo error message mentions cargo/rust"
+else
+	echo "FAIL: No helpful message about missing cargo in output"
+	echo "  Output: ${WEB_SRC_NOCARGO_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+# Restore PATH
+export PATH="${SAVED_PATH}"
+
+echo ""
+echo "--- Source-build: installer build failure ---"
+
+# Use the failing mock cargo
+ln -sf "${MOCK_CARGO_FAIL}" /tmp/cargo
+export PATH="/tmp:${SAVED_PATH}"
+
+WEB_SRC_BUILDFAIL_RC=0
+WEB_SRC_BUILDFAIL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--source-dir "${MOCK_SOURCE_DIR}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--force \
+	--no-start --no-enable 2>&1) || WEB_SRC_BUILDFAIL_RC=$?
+
+if [[ ${WEB_SRC_BUILDFAIL_RC} -ne 0 ]]; then
+	echo "OK: Installer fails when cargo build fails (rc=${WEB_SRC_BUILDFAIL_RC})"
+else
+	echo "FAIL: Installer should fail when cargo build returns non-zero"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${WEB_SRC_BUILDFAIL_OUTPUT}" | grep -qi "build failed\|failed"; then
+	echo "OK: Build failure error message is present"
+else
+	echo "FAIL: No helpful message about build failure"
+	echo "  Output: ${WEB_SRC_BUILDFAIL_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+# Restore good mock cargo
+ln -sf "${MOCK_CARGO}" /tmp/cargo
+export PATH="/tmp:${SAVED_PATH}"
+
+echo ""
+echo "--- Source-build: upgrade --source-dir success ---"
+
+# Ensure there's an installed binary to upgrade from
+# (Re-install using binary mode to have a known baseline)
+rm -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1
+
+# Record old binary content
+OLD_BINARY_CONTENT_SRC=$(cat "${WEB_TEST_INSTALL_DIR}/amneziawg-web")
+
+# Clear systemctl log
+rm -f /tmp/systemctl-calls.log
+# Mark service as active for auto-restart test
+touch /tmp/awg-web-mock-started
+
+# Clean any prior source build artifacts
+rm -rf "${MOCK_SOURCE_DIR}/target"
+
+WEB_SRC_UPGRADE_RC=0
+WEB_SRC_UPGRADE_OUTPUT=$(bash "${WEB_UPGRADER_IMPL}" \
+	--source-dir "${MOCK_SOURCE_DIR}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--force 2>&1) || WEB_SRC_UPGRADE_RC=$?
+
+if [[ ${WEB_SRC_UPGRADE_RC} -eq 0 ]]; then
+	echo "OK: Source-build upgrade exited successfully (rc=0)"
+else
+	echo "FAIL: Source-build upgrade exited with non-zero code ${WEB_SRC_UPGRADE_RC}"
+	echo "  Output tail: $(echo "${WEB_SRC_UPGRADE_OUTPUT}" | tail -20)"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify binary was replaced
+NEW_BINARY_CONTENT_SRC=$(cat "${WEB_TEST_INSTALL_DIR}/amneziawg-web")
+if [[ "${NEW_BINARY_CONTENT_SRC}" != "${OLD_BINARY_CONTENT_SRC}" ]]; then
+	echo "OK: Binary content changed after source-build upgrade"
+else
+	echo "FAIL: Binary content is the same — source-build upgrade did not replace it"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify env file is preserved
+if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
+	echo "OK: Env file preserved after source-build upgrade"
+else
+	echo "FAIL: Env file was removed — should be preserved during upgrade"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify data directory is preserved
+if [[ -d "${WEB_TEST_DATA_DIR}" ]]; then
+	echo "OK: Data directory preserved after source-build upgrade"
+else
+	echo "FAIL: Data directory was removed — should be preserved during upgrade"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify service was restarted (was active)
+if grep -q "restart amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "OK: systemctl restart was called after source-build upgrade"
+else
+	echo "FAIL: systemctl restart was not called after source-build upgrade (service was active)"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Source-build: upgrade --binary and --source-dir mutual exclusivity ---"
+
+WEB_UPG_EXCL_RC=0
+WEB_UPG_EXCL_OUTPUT=$(bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${UPGRADE_BINARY}" \
+	--source-dir "${MOCK_SOURCE_DIR}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--force 2>&1) || WEB_UPG_EXCL_RC=$?
+
+if [[ ${WEB_UPG_EXCL_RC} -ne 0 ]]; then
+	echo "OK: Upgrader rejects --binary + --source-dir (rc=${WEB_UPG_EXCL_RC})"
+else
+	echo "FAIL: Upgrader should fail when both --binary and --source-dir are given"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${WEB_UPG_EXCL_OUTPUT}" | grep -qi "mutually exclusive\|exclusive"; then
+	echo "OK: Upgrade mutual exclusivity error message is present"
+else
+	echo "FAIL: No helpful mutual-exclusivity message in upgrade output"
+	echo "  Output: ${WEB_UPG_EXCL_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+# Restore original PATH
+export PATH="${SAVED_PATH}"
+
+echo ""
+echo "=== Phase 6: Source-build tests complete ==="
+
 echo ""
 echo "=========================================="
 if [[ ${FAILED} -eq 0 ]]; then

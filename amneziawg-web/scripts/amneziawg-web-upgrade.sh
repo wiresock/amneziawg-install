@@ -3,13 +3,14 @@
 # Companion upgrade script for the amneziawg-web management panel.
 #
 # Usage:
+#   sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
 #   sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
-#   sudo ./amneziawg-web-upgrade.sh --binary ./amneziawg-web --force
 #   sudo ./amneziawg-web-upgrade.sh --help
 #
 # Default behavior:
+#   - builds from source (--source-dir) or uses a supplied binary (--binary)
 #   - verifies the existing installation is present and valid
-#   - replaces the installed binary with the supplied one
+#   - replaces the installed binary with the new one
 #   - restarts the service if it was active before the upgrade
 #   - PRESERVES: env/config file, data directory, service user, systemd unit
 #
@@ -17,6 +18,7 @@
 #   --restart          force-restart the service after upgrade (even if inactive)
 #   --no-restart       skip restarting the service after upgrade
 #   --refresh-unit     reinstall the systemd unit file from the repository copy
+#   --install-rust     install Rust toolchain via rustup if missing (source mode)
 #
 # Assumed install paths (same defaults as the installer):
 #   Binary:       /usr/local/bin/amneziawg-web
@@ -46,6 +48,8 @@ INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
 ENV_FILE="${DEFAULT_ENV_FILE}"
 DATA_DIR="${DEFAULT_DATA_DIR}"
 BINARY_SRC=""
+SOURCE_DIR=""
+INSTALL_RUST=false
 
 FORCE="false"
 RESTART_MODE=""          # "" = auto-detect, "yes" = always, "no" = never
@@ -65,14 +69,18 @@ die()   { red    "[ERROR] $*" >&2; exit 1; }
 
 usage() {
     cat <<EOF
-Usage: sudo $0 --binary PATH [options]
+Usage: sudo $0 [--binary PATH | --source-dir DIR] [options]
 
 Upgrade the amneziawg-web management panel binary.
 
 Preserves: env/config file, data directory, service user, systemd unit.
 
-Required:
+Binary source (choose one):
   --binary PATH        Path to the replacement binary
+  --source-dir DIR     Build from source in DIR (Rust crate directory).
+                       If neither is given, auto-detects from repo layout.
+  --install-rust       Install the Rust toolchain via rustup if cargo is
+                       not found (source-build mode only).
 
 Options:
   --install-dir DIR    Binary install directory  (default: ${DEFAULT_INSTALL_DIR})
@@ -90,11 +98,14 @@ Default restart behavior:
   If the service was inactive, it is left inactive unless --restart is given.
 
 Examples:
-  # Upgrade with new binary (restarts if service was running)
+  # Upgrade from source (recommended)
+  sudo $0 --source-dir ./amneziawg-web
+
+  # Upgrade with pre-built binary
   sudo $0 --binary ./target/release/amneziawg-web
 
   # CI/automation upgrade, always restart
-  sudo $0 --binary ./amneziawg-web --force --restart
+  sudo $0 --source-dir ./amneziawg-web --force --restart
 
   # Upgrade and refresh the systemd unit file
   sudo $0 --binary ./amneziawg-web --refresh-unit --force
@@ -107,6 +118,8 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --binary)             BINARY_SRC="$2"; shift 2 ;;
+        --source-dir)         SOURCE_DIR="$2"; shift 2 ;;
+        --install-rust)       INSTALL_RUST="true"; shift ;;
         --install-dir)        INSTALL_DIR="$2"; shift 2 ;;
         --env-file)           ENV_FILE="$2"; shift 2 ;;
         --data-dir)           DATA_DIR="$2"; shift 2 ;;
@@ -120,18 +133,120 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# --binary and --source-dir are mutually exclusive
+if [[ -n "${BINARY_SRC}" ]] && [[ -n "${SOURCE_DIR}" ]]; then
+    die "--binary and --source-dir are mutually exclusive.
+Use --binary to provide a pre-built binary, or --source-dir to build from source."
+fi
+
 # ── Root check ─────────────────────────────────────────────────────────────────
 
 if [[ "$(id -u)" -ne 0 ]]; then
     die "This script must be run as root (e.g. sudo $0)"
 fi
 
-# ── Validation ─────────────────────────────────────────────────────────────────
+# ── Source-build support ───────────────────────────────────────────────────────
 
+# Ensure the Rust toolchain (cargo) is available.
+ensure_rust_toolchain() {
+    if command -v cargo &>/dev/null; then
+        info "Rust toolchain found: $(cargo --version 2>/dev/null || echo 'unknown')"
+        return 0
+    fi
+
+    if [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
+        export PATH="${HOME}/.cargo/bin:${PATH}"
+        info "Rust toolchain found: $(cargo --version 2>/dev/null || echo 'unknown')"
+        return 0
+    fi
+
+    if [[ "${INSTALL_RUST}" != "true" ]]; then
+        die "Rust toolchain (cargo) is required to build from source but was not found.
+Install Rust with:  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+Or re-run with --install-rust to install automatically."
+    fi
+
+    info "Installing Rust toolchain via rustup..."
+    if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable 2>&1; then
+        die "Failed to install Rust toolchain via rustup."
+    fi
+
+    if [[ -f "${HOME}/.cargo/env" ]]; then
+        # shellcheck source=/dev/null
+        . "${HOME}/.cargo/env"
+    fi
+    export PATH="${HOME}/.cargo/bin:${PATH}"
+
+    if ! command -v cargo &>/dev/null; then
+        die "Rust toolchain installation succeeded but cargo is still not in PATH."
+    fi
+    info "Rust toolchain installed: $(cargo --version 2>/dev/null || echo 'unknown')"
+}
+
+# Auto-detect source directory from repo layout.
+detect_source_dir() {
+    if [[ -n "${SOURCE_DIR}" ]]; then
+        return 0
+    fi
+    local candidate="${SCRIPT_DIR}/.."
+    if [[ -f "${candidate}/Cargo.toml" ]]; then
+        SOURCE_DIR="$(cd "${candidate}" && pwd)"
+    fi
+}
+
+# Build from source. Sets BINARY_SRC on success.
+build_from_source() {
+    info "Building from source..."
+
+    if [[ ! -d "${SOURCE_DIR}" ]]; then
+        die "Source directory does not exist: ${SOURCE_DIR}"
+    fi
+
+    if [[ ! -f "${SOURCE_DIR}/Cargo.toml" ]]; then
+        die "No Cargo.toml found in source directory: ${SOURCE_DIR}
+Expected the amneziawg-web Rust crate directory."
+    fi
+
+    ensure_rust_toolchain
+
+    info "Building in: ${SOURCE_DIR}"
+    info "Running: cargo build --release"
+
+    if ! (cd "${SOURCE_DIR}" && cargo build --release); then
+        die "Build failed. Check the output above for errors."
+    fi
+
+    local built_binary="${SOURCE_DIR}/target/release/amneziawg-web"
+    if [[ ! -f "${built_binary}" ]]; then
+        die "Build completed but binary not found at: ${built_binary}"
+    fi
+
+    BINARY_SRC="${built_binary}"
+    if [[ ! -x "${BINARY_SRC}" ]]; then
+        chmod +x "${BINARY_SRC}"
+    fi
+    info "Built binary: ${BINARY_SRC}"
+}
+
+# ── Resolve binary source ─────────────────────────────────────────────────────
+
+# If --source-dir was given or auto-detected, build from source.
+# Otherwise, require --binary.
 if [[ -z "${BINARY_SRC}" ]]; then
-    die "Missing required flag: --binary PATH
-Usage: sudo $0 --binary ./target/release/amneziawg-web"
+    if [[ -z "${SOURCE_DIR}" ]]; then
+        detect_source_dir
+    fi
+
+    if [[ -n "${SOURCE_DIR}" ]]; then
+        build_from_source
+    else
+        die "Missing required flag: --binary PATH or --source-dir DIR
+Usage: sudo $0 --source-dir ./amneziawg-web
+       sudo $0 --binary ./target/release/amneziawg-web"
+    fi
 fi
+
+# ── Validation ─────────────────────────────────────────────────────────────────
 
 if [[ ! -f "${BINARY_SRC}" ]]; then
     die "Source binary not found: ${BINARY_SRC}"

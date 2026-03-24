@@ -97,22 +97,47 @@ All state is in one SQLite file. No Redis, no Postgres, no container required.
 
 ### Using the installer (recommended for production)
 
-The installer lives at the repository root, next to `amneziawg-install.sh`:
+The installer lives at the repository root, next to `amneziawg-install.sh`.
+It builds from source by default — just point it at the source directory:
 
 ```bash
 # 1. Install AmneziaWG (if not already done)
 sudo ./amneziawg-install.sh
 
-# 2. Build the web panel binary
-cd amneziawg-web && cargo build --release && cd ..
+# 2. Install the web panel (builds from source automatically)
+sudo ./amneziawg-web-install.sh --source-dir ./amneziawg-web
 
-# 3. Install the web panel
-sudo ./amneziawg-web-install.sh
+# Or install Rust automatically if not present:
+sudo ./amneziawg-web-install.sh --source-dir ./amneziawg-web --install-rust
+```
+
+If you already have a pre-built binary:
+
+```bash
+sudo ./amneziawg-web-install.sh --binary-src ./target/release/amneziawg-web
 ```
 
 The installer handles user creation, directory setup, environment file generation,
 password hashing, and systemd service installation interactively.
 For non-interactive / automated installs, see [docs/INSTALL.md](docs/INSTALL.md).
+
+### Upgrading
+
+To upgrade by rebuilding from source:
+
+```bash
+sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+```
+
+To upgrade with a pre-built binary:
+
+```bash
+sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+```
+
+The upgrade script replaces the binary and restarts the service if it was running.
+Configuration, data, and the systemd unit are preserved by default.
+See [docs/INSTALL.md](docs/INSTALL.md) for full details.
 
 ### Uninstalling
 
@@ -129,19 +154,6 @@ sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force
 By default the uninstaller is safe: it stops the service and removes the binary
 but keeps your configuration and database intact. See [docs/INSTALL.md](docs/INSTALL.md)
 for full details.
-
-### Upgrading
-
-To upgrade after building a new binary:
-
-```bash
-cd amneziawg-web && cargo build --release && cd ..
-sudo ./amneziawg-web-upgrade.sh --binary ./amneziawg-web/target/release/amneziawg-web
-```
-
-The upgrade script replaces the binary and restarts the service if it was running.
-Configuration, data, and the systemd unit are preserved by default.
-See [docs/INSTALL.md](docs/INSTALL.md) for full details.
 
 ### Manual / development
 

@@ -9,20 +9,27 @@ For production hardening details, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Quick install (recommended)
 
-After building the binary, use the companion installer script for a guided setup.
-The installer lives at the repository root next to `amneziawg-install.sh`:
+The installer builds from source by default — just point it at the source directory.
+It lives at the repository root next to `amneziawg-install.sh`:
 
 ```bash
 # 1. Install AmneziaWG (if not already done)
 sudo ./amneziawg-install.sh
 
-# 2. Build the web panel binary
-cd amneziawg-web
-cargo build --release
-cd ..
+# 2. Install the web panel (builds from source)
+sudo ./amneziawg-web-install.sh --source-dir ./amneziawg-web
+```
 
-# 3. Install the web panel (interactive)
-sudo ./amneziawg-web-install.sh
+If Rust is not installed, add `--install-rust` to automatically install the toolchain:
+
+```bash
+sudo ./amneziawg-web-install.sh --source-dir ./amneziawg-web --install-rust
+```
+
+If you have a pre-built binary, use `--binary-src` instead:
+
+```bash
+sudo ./amneziawg-web-install.sh --binary-src ./target/release/amneziawg-web
 ```
 
 The root-level `amneziawg-web-install.sh` is a thin entrypoint that delegates to
@@ -41,16 +48,23 @@ for all options.
 | Requirement | Minimum version | Notes |
 |---|---|---|
 | Linux | Any modern kernel | x86_64 or aarch64 |
-| Rust toolchain | 1.75+ | Install via [rustup](https://rustup.rs/) |
+| Rust toolchain | 1.75+ | Install via [rustup](https://rustup.rs/) or use `--install-rust` |
 | AmneziaWG | Any release | `awg` binary must be at `/usr/bin/awg` |
 | SQLite | 3.x | No separate install needed — embedded in binary via sqlx |
 | Reverse proxy | nginx ≥ 1.18 or Caddy 2 | Required for TLS in production |
 
 `amneziawg-web` does **not** require a separate database server, Redis, or container runtime.
 
+> **Note:** If you use `--source-dir` to build from source, Rust must be installed.
+> The installer can install Rust for you with `--install-rust`. If you use `--binary-src`
+> to provide a pre-built binary, Rust is not required on the target host.
+
 ---
 
 ## 1. Build from source
+
+The installer can build from source automatically (see [Quick install](#quick-install-recommended)).
+To build manually:
 
 ```bash
 # Clone the repo (or download a release tarball)
@@ -320,9 +334,16 @@ You will be prompted for all important settings; press Enter to accept the defau
 ### Non-interactive mode
 
 ```bash
-# Generate a password hash first
+# Source-build (recommended)
 HASH="$(python3 -c "import argon2; print(argon2.PasswordHasher().hash('yourpassword'))")"
 
+sudo ./amneziawg-web-install.sh \
+  --non-interactive \
+  --source-dir ./amneziawg-web \
+  --username admin \
+  --password-hash "${HASH}"
+
+# Pre-built binary (advanced / CI)
 sudo ./amneziawg-web-install.sh \
   --non-interactive \
   --binary-src ./target/release/amneziawg-web \
@@ -334,7 +355,9 @@ sudo ./amneziawg-web-install.sh \
 
 | Option | Default | Description |
 |---|---|---|
-| `--binary-src PATH` | `./target/release/amneziawg-web` | Path to compiled binary |
+| `--source-dir DIR` | *(auto-detected)* | Build from source in this directory |
+| `--binary-src PATH` | `./target/release/amneziawg-web` | Path to a pre-built binary |
+| `--install-rust` | *(off)* | Install Rust via rustup if cargo is missing |
 | `--install-dir DIR` | `/usr/local/bin` | Binary installation directory |
 | `--data-dir DIR` | `/var/lib/amneziawg-web` | SQLite database directory |
 | `--env-file FILE` | `/etc/amneziawg-web/env.conf` | Generated environment file path |
@@ -351,13 +374,17 @@ sudo ./amneziawg-web-install.sh \
 | `--force` | — | Overwrite existing env.conf without prompting |
 | `--non-interactive` | — | Run without prompts |
 
+> `--source-dir` and `--binary-src` are mutually exclusive. Use `--source-dir` to
+> build from source, or `--binary-src` to install a pre-built binary.
+
 ### What the installer does
 
-1. **Preflight checks** – verifies root, systemd, AWG binary, and application binary
-2. **User + directories** – creates `awg-web` system user, data dir (`0750`), env dir (`0700`)
-3. **Binary install** – copies binary to `--install-dir`
-4. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
-5. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
+1. **Preflight checks** – verifies root, systemd, AWG binary, and application binary (or source)
+2. **Build** – *(source mode only)* verifies Rust toolchain and runs `cargo build --release`
+3. **User + directories** – creates `awg-web` system user, data dir (`0750`), env dir (`0700`)
+4. **Binary install** – copies binary to `--install-dir`
+5. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
+6. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
 
 ### Re-running / upgrading
 
@@ -366,11 +393,13 @@ The installer is idempotent:
 - Existing env file is preserved unless `--force` is given
 - Existing service unit is preserved unless `--force` is given
 
-To upgrade, use the dedicated upgrade script (see [Upgrade reference](#upgrade-reference))
-or re-run the installer:
+To upgrade, use the dedicated upgrade script (see [Upgrade reference](#upgrade-reference)):
 
 ```bash
-cargo build --release
+# Rebuild from source and upgrade
+sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+
+# Or upgrade with a pre-built binary
 sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
 ```
 
@@ -381,6 +410,10 @@ sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
 A companion upgrade script is provided at the repository root:
 
 ```bash
+# Rebuild from source and upgrade (recommended)
+sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+
+# Or upgrade with a pre-built binary
 sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
 ```
 
@@ -393,6 +426,7 @@ The upgrade script replaces the installed binary while preserving everything els
 
 | Action | What happens |
 |---|---|
+| **Built** | *(source mode)* compiled from source via `cargo build --release` |
 | **Replaced** | installed binary (`/usr/local/bin/amneziawg-web`) |
 | **Restarted** | service (only if it was active before upgrade) |
 | **Preserved** | env/config directory (`/etc/amneziawg-web/`) |
@@ -412,7 +446,7 @@ to skip restarting entirely.
 ### Interactive mode
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
 ```
 
 The script prints a plan showing what will be replaced and what will be preserved,
@@ -421,15 +455,19 @@ then asks for confirmation.
 ### Non-interactive mode
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web --force
+sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web --force
 # or equivalently:
-sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web --non-interactive
+sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web --non-interactive
 ```
 
 ### CI/automation example
 
 ```bash
-cargo build --release
+sudo ./amneziawg-web-upgrade.sh \
+  --source-dir ./amneziawg-web \
+  --force --restart
+
+# Or with a pre-built binary:
 sudo ./amneziawg-web-upgrade.sh \
   --binary ./target/release/amneziawg-web \
   --force --restart
@@ -441,7 +479,7 @@ If the service unit file has changed in the repository, use `--refresh-unit`:
 
 ```bash
 sudo ./amneziawg-web-upgrade.sh \
-  --binary ./target/release/amneziawg-web \
+  --source-dir ./amneziawg-web \
   --refresh-unit --force
 ```
 
@@ -452,7 +490,9 @@ The `EnvironmentFile` directive is automatically updated to match your `--env-fi
 
 | Option | Default | Description |
 |---|---|---|
-| `--binary PATH` | *(required)* | Path to the replacement binary |
+| `--source-dir DIR` | *(auto-detected)* | Build from source in this directory |
+| `--binary PATH` | — | Path to a pre-built replacement binary |
+| `--install-rust` | *(off)* | Install Rust via rustup if cargo is missing |
 | `--install-dir DIR` | `/usr/local/bin` | Binary install directory |
 | `--env-file FILE` | `/etc/amneziawg-web/env.conf` | Env/config file path |
 | `--data-dir DIR` | `/var/lib/amneziawg-web` | Data directory |
@@ -463,6 +503,9 @@ The `EnvironmentFile` directive is automatically updated to match your `--env-fi
 | `--non-interactive` | *(off)* | Alias for `--force`; suitable for CI/automation |
 | `--help` | — | Show usage |
 
+> `--source-dir` and `--binary` are mutually exclusive. If neither is given,
+> the script auto-detects the source directory from the repository layout.
+
 ### Path assumptions
 
 The upgrade script assumes the same default paths as the installer. If you used
@@ -471,7 +514,7 @@ pass the same values to the upgrade script:
 
 ```bash
 sudo ./amneziawg-web-upgrade.sh \
-  --binary ./target/release/amneziawg-web \
+  --source-dir ./amneziawg-web \
   --install-dir /opt/awg/bin \
   --env-file /opt/awg/env.conf \
   --data-dir /opt/awg/data \
@@ -480,13 +523,14 @@ sudo ./amneziawg-web-upgrade.sh \
 
 ### What the upgrade script does
 
-1. **Validate** – verifies the existing installation and source binary
-2. **Plan** – prints what will be replaced and what will be preserved
-3. **Confirm** – asks for confirmation (skipped with `--force`)
-4. **Stop** – stops the service if it was active
-5. **Replace binary** – copies source to temp file, then atomically moves it
-6. **Refresh unit** – *(only with `--refresh-unit`)* reinstalls the unit file, reloads daemon
-7. **Restart** – restarts the service based on restart policy
+1. **Resolve binary** – builds from source (`--source-dir`) or uses provided binary (`--binary`)
+2. **Validate** – verifies the existing installation and source binary
+3. **Plan** – prints what will be replaced and what will be preserved
+4. **Confirm** – asks for confirmation (skipped with `--force`)
+5. **Stop** – stops the service if it was active
+6. **Replace binary** – copies source to temp file, then atomically moves it
+7. **Refresh unit** – *(only with `--refresh-unit`)* reinstalls the unit file, reloads daemon
+8. **Restart** – restarts the service based on restart policy
 
 ---
 
