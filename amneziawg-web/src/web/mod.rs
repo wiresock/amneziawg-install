@@ -362,14 +362,17 @@ fn status_badge(status: &PeerStatus) -> &'static str {
 }
 
 fn fmt_bytes(b: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * KIB;
+    const GIB: f64 = MIB * KIB;
     if b < 1024 {
         format!("{b} B")
     } else if b < 1024 * 1024 {
-        format!("{:.1} KiB", b as f64 / 1024.0)
+        format!("{:.1} KiB", b as f64 / KIB)
     } else if b < 1024 * 1024 * 1024 {
-        format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0))
+        format!("{:.1} MiB", b as f64 / MIB)
     } else {
-        format!("{:.2} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+        format!("{:.2} GiB", b as f64 / GIB)
     }
 }
 
@@ -859,7 +862,8 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.contains("Charlie"));
-        // Private key must not appear in the page
+        // The peer LIST shows names, not raw public keys.  Verify the public key
+        // is not exposed in the list HTML (it only appears on the detail page).
         assert!(!html.contains("HTMLKEY1234567890ABCDEF=="));
     }
 
