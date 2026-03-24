@@ -42,6 +42,8 @@ pub const EVT_LOGIN_SUCCESS: &str = "login_success";
 pub const EVT_LOGIN_FAILED: &str = "login_failed";
 /// Audit event for `POST /logout`.
 pub const EVT_LOGOUT: &str = "logout";
+/// Audit event for enabling or disabling a peer.
+pub const EVT_PEER_DISABLED: &str = "peer_disabled";
 
 /// Maximum number of events that can be returned in a single [`list_events`] call.
 pub const MAX_EVENTS_LIMIT: i64 = 200;

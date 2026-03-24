@@ -143,6 +143,28 @@ pub async fn update_peer_metadata(
     find_by_id(pool, id).await
 }
 
+/// Update the `disabled` flag for a single peer.
+///
+/// Returns the updated `PeerRow`, or `None` if no peer with the given `id`
+/// exists.
+pub async fn update_peer_disabled(
+    pool: &SqlitePool,
+    id: i64,
+    disabled: bool,
+) -> Result<Option<PeerRow>, sqlx::Error> {
+    sqlx::query(
+        "UPDATE peers
+         SET    disabled = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE  id = ?",
+    )
+    .bind(disabled as i64)
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    find_by_id(pool, id).await
+}
+
 ///
 /// Call this at the start of every config-mapping step so that peers whose
 /// config files have been removed are correctly unmarked.  The subsequent
@@ -481,6 +503,41 @@ mod tests {
         let db = test_db().await;
         // No peers inserted – ID 9999 must not exist.
         let result = update_peer_metadata(&db.pool, 9999, Some("Ghost"), None)
+            .await
+            .expect("no db error");
+        assert!(result.is_none());
+    }
+
+    // ── update_peer_disabled ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_peer_disabled_sets_flag() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_DIS=", None).await;
+
+        // Initially disabled = 0.
+        let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(row.disabled, 0);
+
+        // Disable.
+        let row = update_peer_disabled(&db.pool, id, true)
+            .await
+            .expect("update")
+            .expect("row");
+        assert_eq!(row.disabled, 1);
+
+        // Re-enable.
+        let row = update_peer_disabled(&db.pool, id, false)
+            .await
+            .expect("update")
+            .expect("row");
+        assert_eq!(row.disabled, 0);
+    }
+
+    #[tokio::test]
+    async fn update_peer_disabled_invalid_id_returns_none() {
+        let db = test_db().await;
+        let result = update_peer_disabled(&db.pool, 9999, true)
             .await
             .expect("no db error");
         assert!(result.is_none());

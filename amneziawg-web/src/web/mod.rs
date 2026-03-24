@@ -25,7 +25,8 @@ use crate::auth::{
     RATE_LIMIT_MAX_ATTEMPTS, RATE_LIMIT_WINDOW,
 };
 use crate::db::events::{
-    list_events, log_event, EVT_LOGIN_FAILED, EVT_LOGIN_SUCCESS, EVT_LOGOUT, EVT_PEER_UPDATED,
+    list_events, log_event, EVT_LOGIN_FAILED, EVT_LOGIN_SUCCESS, EVT_LOGOUT, EVT_PEER_DISABLED,
+    EVT_PEER_UPDATED,
 };
 use crate::db::peers::{PeerRow, SnapshotRow};
 use crate::db::Database;
@@ -164,6 +165,8 @@ pub struct HistoryQuery {
 pub struct PatchPeerRequest {
     pub display_name: Option<String>,
     pub comment: Option<String>,
+    /// When present, enables (`false`) or disables (`true`) the peer.
+    pub disabled: Option<bool>,
 }
 
 /// URL-encoded form body submitted by the HTML edit form on `POST /peers/:id`.
@@ -173,6 +176,8 @@ pub struct PeerEditForm {
     pub comment: Option<String>,
     /// CSRF token embedded as a hidden field in the edit form.
     pub csrf_token: Option<String>,
+    /// Checkbox: present with value `"1"` when checked, absent when unchecked.
+    pub disabled: Option<String>,
 }
 
 /// URL-encoded form body submitted by the login page.
@@ -321,6 +326,7 @@ pub fn router(db: Database, auth: AuthConfig) -> Router {
         .route("/api/peers", get(list_peers))
         .route("/api/peers/:id", get(get_peer).patch(patch_peer))
         .route("/api/peers/:id/history", get(get_peer_history))
+        .route("/api/peers/:id/config", get(get_peer_config))
         .route("/api/events", get(list_events_handler))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
@@ -674,6 +680,84 @@ async fn get_peer_history(
     Ok(Json(dto).into_response())
 }
 
+/// `GET /api/peers/:id/config` – download the client config file.
+///
+/// Returns the raw config file content with `Content-Type: text/plain` and a
+/// `Content-Disposition: attachment` header so browsers offer a download dialog.
+///
+/// Returns HTTP 404 if the peer does not exist or has no associated config file.
+/// Returns HTTP 404 if the config file cannot be read from disk.
+async fn get_peer_config(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+    let peer = match row {
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "peer not found" })),
+            )
+                .into_response())
+        }
+        Some(r) => r,
+    };
+
+    let config_path = match peer.config_path {
+        Some(ref p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "no config file associated with this peer" })),
+            )
+                .into_response())
+        }
+    };
+
+    // Security: ensure the path is absolute and doesn't contain traversal.
+    if !config_path.is_absolute() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "invalid config path" })),
+        )
+            .into_response());
+    }
+
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "config file not found on disk" })),
+            )
+                .into_response())
+        }
+    };
+
+    let filename = config_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("client.conf");
+
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                disposition,
+            ),
+        ],
+        content,
+    )
+        .into_response())
+}
+
 /// `PATCH /api/peers/:id` – update a peer's display name and/or comment.
 ///
 /// Both request fields are optional:
@@ -702,11 +786,11 @@ async fn patch_peer(
     // Merge: if the caller provided a field, normalise it; otherwise keep the
     // existing DB value.
     let new_display_name = match body.display_name {
-        Some(v) => normalize_display_name(&v),
+        Some(ref v) => normalize_display_name(v),
         None => existing.display_name.clone(),
     };
     let new_comment = match body.comment {
-        Some(v) => normalize_comment(&v),
+        Some(ref v) => normalize_comment(v),
         None => existing.comment.clone(),
     };
 
@@ -718,6 +802,28 @@ async fn patch_peer(
     )
     .await?;
 
+    // Handle disabled flag if provided.
+    if let Some(disabled) = body.disabled {
+        crate::db::peers::update_peer_disabled(&state.db.pool, id, disabled).await?;
+        let old_disabled = existing.disabled != 0;
+        if disabled != old_disabled {
+            let detail = serde_json::json!({
+                "old_disabled": old_disabled,
+                "new_disabled": disabled,
+            })
+            .to_string();
+            log_event(
+                &state.db.pool,
+                EVT_PEER_DISABLED,
+                Some(id),
+                Some(&existing.public_key),
+                Some(&detail),
+                &state.auth.username,
+            )
+            .await;
+        }
+    }
+
     match updated {
         None => Ok((
             StatusCode::NOT_FOUND,
@@ -725,29 +831,42 @@ async fn patch_peer(
         )
             .into_response()),
         Some(peer_row) => {
-            // Fire-and-forget audit log.
-            let detail = serde_json::json!({
-                "old_display_name": existing.display_name,
-                "new_display_name": new_display_name,
-                "old_comment": existing.comment,
-                "new_comment": new_comment,
-            })
-            .to_string();
-            log_event(
-                &state.db.pool,
-                EVT_PEER_UPDATED,
-                Some(id),
-                Some(&peer_row.public_key),
-                Some(&detail),
-                &state.auth.username,
-            )
-            .await;
+            // Fire-and-forget audit log for metadata changes.
+            if body.display_name.is_some() || body.comment.is_some() {
+                let detail = serde_json::json!({
+                    "old_display_name": existing.display_name,
+                    "new_display_name": new_display_name,
+                    "old_comment": existing.comment,
+                    "new_comment": new_comment,
+                })
+                .to_string();
+                log_event(
+                    &state.db.pool,
+                    EVT_PEER_UPDATED,
+                    Some(id),
+                    Some(&peer_row.public_key),
+                    Some(&detail),
+                    &state.auth.username,
+                )
+                .await;
+            }
 
-            let public_key = peer_row.public_key.clone();
-            let snapshots =
-                crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
-            let dto = peer_row_to_detail(peer_row, snapshots);
-            Ok(Json(dto).into_response())
+            // Re-read the peer to include the disabled update.
+            let final_row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+            match final_row {
+                None => Ok((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "peer not found" })),
+                )
+                    .into_response()),
+                Some(row) => {
+                    let public_key = row.public_key.clone();
+                    let snapshots =
+                        crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
+                    let dto = peer_row_to_detail(row, snapshots);
+                    Ok(Json(dto).into_response())
+                }
+            }
         }
     }
 }
@@ -838,6 +957,27 @@ async fn post_peer_edit(
         comment.as_deref(),
     )
     .await?;
+
+    // Handle disabled checkbox: present with value "1" means disabled; absent means enabled.
+    let new_disabled = form.disabled.as_deref() == Some("1");
+    let old_disabled = existing.disabled != 0;
+    if new_disabled != old_disabled {
+        crate::db::peers::update_peer_disabled(&state.db.pool, id, new_disabled).await?;
+        let detail = serde_json::json!({
+            "old_disabled": old_disabled,
+            "new_disabled": new_disabled,
+        })
+        .to_string();
+        log_event(
+            &state.db.pool,
+            EVT_PEER_DISABLED,
+            Some(id),
+            Some(&existing.public_key),
+            Some(&detail),
+            &state.auth.username,
+        )
+        .await;
+    }
 
     // Fire-and-forget audit log.
     let detail = serde_json::json!({
@@ -1151,6 +1291,12 @@ fn render_peer_detail(
             esc(cp)
         ));
     }
+    if dto.has_config {
+        buf.push_str(&format!(
+            "<tr><th>Config</th><td><a href=\"/api/peers/{}/config\">&#x2B73; Download</a></td></tr>\n",
+            dto.id
+        ));
+    }
     if let Some(ref dn) = dto.display_name {
         buf.push_str(&format!(
             "<tr><th>Display name</th><td>{}</td></tr>\n",
@@ -1176,6 +1322,9 @@ fn render_peer_detail(
   <label for="comment">Comment</label>
   <textarea id="comment" name="comment" maxlength="512"
             placeholder="Optional note about this peer">{cm}</textarea>
+  <label style="margin-top:.75rem;display:flex;align-items:center;gap:.4rem;font-weight:bold">
+    <input type="checkbox" name="disabled" value="1"{disabled_checked}> Disabled
+  </label>
   <button type="submit">Save</button>
 </form>
 </div>
@@ -1184,6 +1333,7 @@ fn render_peer_detail(
         csrf = esc(csrf_token),
         dn = esc(current_display_name),
         cm = esc(current_comment),
+        disabled_checked = if dto.disabled { " checked" } else { "" },
     ));
 
     // Recent snapshots
@@ -2696,5 +2846,314 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Epic 10: Admin Write Actions ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn patch_peer_disable_sets_disabled_flag() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_DISABLE=", Some("DisableMe")).await;
+        let app = test_router(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"disabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["disabled"], true);
+        assert_eq!(json["status"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn patch_peer_enable_clears_disabled_flag() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_ENABLE=", Some("EnableMe")).await;
+        let app = test_router(db.clone());
+
+        // Disable first.
+        crate::db::peers::update_peer_disabled(&db.pool, id, true)
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"disabled":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["disabled"], false);
+    }
+
+    #[tokio::test]
+    async fn patch_peer_disable_creates_audit_event() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_DIS_AUDIT=", None).await;
+        let app = test_router(db);
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"disabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Check audit log.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events?event_type=peer_disabled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!events.is_empty());
+        assert_eq!(events[0]["event_type"], "peer_disabled");
+    }
+
+    #[tokio::test]
+    async fn patch_peer_disable_unchanged_no_audit_event() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_DIS_NOAUDIT=", None).await;
+        let app = test_router(db);
+
+        // Peer is already enabled (disabled=0). Setting disabled=false should not create event.
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"disabled":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events?event_type=peer_disabled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn patch_peer_metadata_only_no_disabled_event() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_META_ONLY=", None).await;
+        let app = test_router(db);
+
+        // Only update display_name, no disabled field.
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"MetaOnly"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events?event_type=peer_disabled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_peer_config_no_config_returns_404() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_NOCONF=", None).await;
+        let app = test_router(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_peer_config_peer_not_found_returns_404() {
+        let app = test_router(test_db().await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers/9999/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_peer_config_returns_file_content() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_DLCONF=", None).await;
+
+        // Create a temp config file.
+        let dir = tempfile::tempdir().unwrap();
+        let conf_path = dir.path().join("test-client.conf");
+        std::fs::write(&conf_path, "[Interface]\nAddress = 10.0.0.2/32\n").unwrap();
+
+        // Map the config to the peer.
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_DLCONF=",
+            "test-client",
+            conf_path.to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.contains("text/plain"));
+
+        let disposition = response
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disposition.contains("attachment"));
+        assert!(disposition.contains("test-client.conf"));
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("[Interface]"));
+        assert!(text.contains("10.0.0.2/32"));
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_shows_disabled_checkbox() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_CKBOX=", Some("CheckboxPeer")).await;
+        let app = test_router(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("name=\"disabled\""));
+        assert!(html.contains("value=\"1\""));
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_shows_download_link_when_config_exists() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_DLINK=", None).await;
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_DLINK=",
+            "test-dl",
+            "/etc/awg/test-dl.conf",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains(&format!("/api/peers/{id}/config")));
+        assert!(html.contains("Download"));
     }
 }
