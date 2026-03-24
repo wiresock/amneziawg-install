@@ -84,7 +84,29 @@ openssl rand -hex 32
 
 ---
 
-## 5. Install the systemd service
+## 5. Configure AWG access (sudoers)
+
+The service runs as `awg-web` (non-root) but needs to read AWG interface
+state.  Install a tightly-scoped sudoers rule:
+
+```bash
+echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump' \
+  | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
+sudo chmod 0440 /etc/sudoers.d/amneziawg-web
+```
+
+Verify:
+
+```bash
+sudo -u awg-web sudo -n /usr/bin/awg show all dump
+```
+
+> The installer does this automatically.  Manual setup is only needed for
+> deployments that bypass the installer.
+
+---
+
+## 6. Install the systemd service
 
 ```bash
 sudo cp packaging/amneziawg-web.service /etc/systemd/system/
@@ -98,7 +120,7 @@ sudo systemctl status amneziawg-web
 
 ---
 
-## 6. Reverse proxy (nginx)
+## 7. Reverse proxy (nginx)
 
 The panel listens on `127.0.0.1:8080` by default.  Terminate TLS with
 nginx and proxy to the local socket.
@@ -143,7 +165,7 @@ awg.example.com {
 
 ---
 
-## 7. HTTPS and secure cookies
+## 8. HTTPS and secure cookies
 
 Set `AUTH_SECURE_COOKIE=true` whenever the panel is served over HTTPS.
 This adds the `Secure` flag to the session cookie, preventing it from
@@ -151,7 +173,7 @@ being sent over plain HTTP.
 
 ---
 
-## 8. Security notes
+## 9. Security notes
 
 ### CSRF protection
 
@@ -191,7 +213,48 @@ internet exposure.
 
 ---
 
-## 9. Remaining limitations before broader production use
+## 10. Troubleshooting
+
+### Peer polling fails with "Operation not permitted"
+
+If the service logs show:
+
+```
+awg show all dump failed
+Unable to access interface awg0: Operation not permitted
+```
+
+This means the sudoers rule is missing or incorrect.  Fix it:
+
+```bash
+# Verify the file exists
+cat /etc/sudoers.d/amneziawg-web
+
+# Expected content:
+# awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump
+
+# Test it manually
+sudo -u awg-web sudo -n /usr/bin/awg show all dump
+
+# If missing, recreate:
+echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump' \
+  | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
+sudo chmod 0440 /etc/sudoers.d/amneziawg-web
+sudo systemctl restart amneziawg-web
+```
+
+### Service fails to start after upgrade
+
+If the systemd unit still has `NoNewPrivileges=yes`, sudo will not work.
+Refresh the unit file:
+
+```bash
+sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web --refresh-unit --force
+```
+
+---
+
+## 11. Remaining limitations before broader production use
 
 | Area | Status | Recommended action |
 |------|--------|--------------------|

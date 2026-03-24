@@ -61,6 +61,7 @@ visibility and management.
 - Companion upgrade script for safe in-place binary replacement
 - Source-first install and upgrade (`--source-dir` builds from repo checkout)
 - Automatic Rust toolchain installation (`--install-rust`)
+- Sudoers-based privilege model for non-root AWG access (`/etc/sudoers.d/amneziawg-web`)
 
 ### Installation
 

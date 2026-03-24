@@ -107,14 +107,55 @@ sudo chmod 0700 /etc/amneziawg-web
 
 ---
 
-## 4. AWG binary and config directory
+## 4. AWG binary and privilege setup
 
-`amneziawg-web` calls `/usr/bin/awg show all dump` to read tunnel state.
+`amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state.
+The service runs as a dedicated non-root user (`awg-web`) and uses a
+tightly-scoped sudoers rule for exactly this one read-only command.
 
-- The `awg` binary must exist at `/usr/bin/awg` (or you can symlink it there).
-- The service user (`awg-web`) must be able to execute it.  On most systems this
-  requires adding `awg-web` to the group that owns the AWG socket, or setting
-  `CAP_NET_ADMIN` — follow your distribution's AWG installation guide.
+### Automated setup (installer)
+
+The installer (`amneziawg-web-install.sh`) handles all of this automatically:
+
+- Installs a sudoers drop-in at `/etc/sudoers.d/amneziawg-web`
+- Validates the file with `visudo -cf` (if available)
+- Sets permissions to `0440` (required by sudoers)
+
+### Manual setup
+
+If installing manually, create the sudoers rule:
+
+```bash
+echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump' \
+  | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
+sudo chmod 0440 /etc/sudoers.d/amneziawg-web
+```
+
+Verify it works:
+
+```bash
+sudo -u awg-web sudo -n /usr/bin/awg show all dump
+```
+
+### Why sudoers?
+
+Reading AWG interface state requires `CAP_NET_ADMIN`, which is only
+available to root.  Rather than running the whole web service as root,
+we grant the service user passwordless sudo for exactly one read-only
+command.  This follows the principle of least privilege.
+
+**Important:** The systemd unit does **not** set `NoNewPrivileges=yes`
+because that would block the `sudo` escalation.  All other hardening
+directives (`ProtectSystem=strict`, `ProtectHome=yes`, etc.) remain
+active.
+
+### Installed files
+
+| File | Purpose | Permissions |
+|---|---|---|
+| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump` as root | `0440 root:root` |
+
+The uninstaller removes this file.  The upgrader creates it if missing.
 
 Client config files are expected in `AWG_CONFIG_DIR` (default:
 `/etc/amneziawg/clients`).  Each file should be a standard WireGuard/AmneziaWG
@@ -389,8 +430,9 @@ sudo ./amneziawg-web-install.sh \
 2. **Build** – *(source mode only)* verifies Rust toolchain and runs `cargo build --release`
 3. **User + directories** – creates `awg-web` system user, data dir (`0750`), env dir (`0700`)
 4. **Binary install** – copies binary to `--install-dir`
-5. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
-6. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
+5. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440`) granting `awg-web` passwordless sudo for `awg show all dump` only
+6. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
+7. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
 
 ### Re-running / upgrading
 
@@ -560,6 +602,7 @@ while preserving all configuration and data:
 |---|---|
 | **Removed** | systemd service (stopped + disabled) |
 | **Removed** | systemd unit file (`/etc/systemd/system/amneziawg-web.service`) |
+| **Removed** | sudoers drop-in (`/etc/sudoers.d/amneziawg-web`) |
 | **Removed** | installed binary (`/usr/local/bin/amneziawg-web`) |
 | **Reloaded** | systemd daemon |
 | **Preserved** | env/config directory (`/etc/amneziawg-web/`) |
@@ -632,7 +675,8 @@ sudo ./amneziawg-web-uninstall.sh \
 2. **Confirm** – asks for confirmation (skipped with `--force`)
 3. **Stop + disable** – gracefully stops and disables the systemd service
 4. **Remove unit** – deletes the systemd unit file, reloads daemon
-5. **Remove binary** – deletes the installed binary
-6. **Purge config** – *(only with `--purge-config`)* removes the env/config directory
-7. **Purge data** – *(only with `--purge-data`)* removes the data directory
-8. **Remove user** – *(only with `--remove-user`)* removes the service user
+5. **Remove sudoers** – deletes `/etc/sudoers.d/amneziawg-web`
+6. **Remove binary** – deletes the installed binary
+7. **Purge config** – *(only with `--purge-config`)* removes the env/config directory
+8. **Purge data** – *(only with `--purge-data`)* removes the data directory
+9. **Remove user** – *(only with `--remove-user`)* removes the service user

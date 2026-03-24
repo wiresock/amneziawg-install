@@ -67,12 +67,12 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 │                     Host OS                        │
 │                                                    │
 │  ┌──────────┐    ┌──────────────────────────────┐  │
-│  │ AWG kern │◄───│     awg show all dump        │  │
+│  │ AWG kern │◄───│  sudo awg show all dump      │  │
 │  │  module  │    └──────────┬───────────────────┘  │
 │  └──────────┘               │                      │
 │                             ▼                      │
 │  ┌──────────────────────────────────────────────┐  │
-│  │           amneziawg-web (this binary)        │  │
+│  │      amneziawg-web (runs as awg-web user)    │  │
 │  │                                              │  │
 │  │  ┌──────────┐  ┌──────────┐  ┌────────────┐ │  │
 │  │  │  Poller  │  │ SQLite   │  │ axum HTTP  │ │  │
@@ -80,6 +80,7 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 │  │  └──────────┘  └──────────┘  └────────────┘ │  │
 │  └──────────────────────────────────────────────┘  │
 │                                                    │
+│  /etc/sudoers.d/amneziawg-web  (read-only AWG)     │
 │  /etc/amneziawg/clients/*.conf                     │
 └────────────────────────────────────────────────────┘
          ▲
@@ -230,6 +231,31 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | Rate limiting | 5 login attempts per 5-minute window per IP; `429` on excess |
 | Audit log | Every peer write, login, and logout recorded |
 | No shell injection | AWG binary called via `Command::new()` with explicit args |
+| AWG access | Narrowly-scoped sudoers rule (read-only `awg show all dump`) |
+
+### AWG privilege model
+
+The service runs as a dedicated non-root user (`awg-web`).  Reading AWG
+interface state (`awg show all dump`) requires root-level `CAP_NET_ADMIN`.
+Rather than running the entire service as root, the installer configures
+a tightly-scoped sudoers drop-in at `/etc/sudoers.d/amneziawg-web`:
+
+```
+awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump
+```
+
+This grants the minimum privilege needed for **read-only** AWG inspection.
+No other commands are permitted.  The Rust application invokes
+`sudo -n /usr/bin/awg show all dump` via `Command::new()` with explicit
+argument arrays — no shell interpolation.
+
+**Troubleshooting:** If peer polling fails with "Operation not permitted",
+verify the sudoers file exists and is correct:
+
+```bash
+cat /etc/sudoers.d/amneziawg-web
+sudo -u awg-web sudo -n /usr/bin/awg show all dump
+```
 
 ### Known limitations for v0.1.0
 
