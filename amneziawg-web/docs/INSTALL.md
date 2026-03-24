@@ -7,6 +7,25 @@ For production hardening details, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ---
 
+## Quick install (recommended)
+
+After building the binary, use the companion installer script for a guided setup:
+
+```bash
+# Build
+cd amneziawg-web
+cargo build --release
+
+# Install (interactive)
+sudo scripts/amneziawg-web-install.sh
+```
+
+The installer handles user creation, directory setup, environment file generation,
+and systemd service installation. See [Installer reference](#installer-reference)
+for all options.
+
+---
+
 ## Prerequisites
 
 | Requirement | Minimum version | Notes |
@@ -272,3 +291,78 @@ docker run -d \
 3. `sudo systemctl restart amneziawg-web`.
 
 Database migrations run automatically on startup.
+
+---
+
+## Installer reference
+
+The companion installer script `scripts/amneziawg-web-install.sh` automates
+the full installation process.
+
+### Interactive mode
+
+```bash
+sudo scripts/amneziawg-web-install.sh
+```
+
+You will be prompted for all important settings; press Enter to accept the defaults.
+
+### Non-interactive mode
+
+```bash
+# Generate a password hash first
+HASH="$(python3 -c "import argon2; print(argon2.PasswordHasher().hash('yourpassword'))")"
+
+sudo scripts/amneziawg-web-install.sh \
+  --non-interactive \
+  --binary-src ./target/release/amneziawg-web \
+  --username admin \
+  --password-hash "${HASH}"
+```
+
+### All options
+
+| Option | Default | Description |
+|---|---|---|
+| `--binary-src PATH` | `./target/release/amneziawg-web` | Path to compiled binary |
+| `--install-dir DIR` | `/usr/local/bin` | Binary installation directory |
+| `--data-dir DIR` | `/var/lib/amneziawg-web` | SQLite database directory |
+| `--env-file FILE` | `/etc/amneziawg-web/env.conf` | Generated environment file path |
+| `--awg-binary PATH` | `/usr/bin/awg` | Path to the `awg` binary |
+| `--config-dir DIR` | `/etc/amneziawg/clients` | AWG client config directory |
+| `--host HOST` | `127.0.0.1` | Bind host |
+| `--port PORT` | `8080` | Bind port |
+| `--username NAME` | `admin` | Admin username |
+| `--password-hash HASH` | *(required in non-interactive)* | Argon2id PHC hash |
+| `--poll-interval SECS` | `30` | Polling interval |
+| `--session-ttl SECS` | `86400` | Session lifetime |
+| `--no-enable` | — | Skip enabling service at boot |
+| `--no-start` | — | Skip starting service immediately |
+| `--force` | — | Overwrite existing env.conf without prompting |
+| `--non-interactive` | — | Run without prompts |
+
+### What the installer does
+
+1. **Preflight checks** – verifies root, systemd, AWG binary, and application binary
+2. **User + directories** – creates `awg-web` system user, data dir (`0750`), env dir (`0700`)
+3. **Binary install** – copies binary to `--install-dir`
+4. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
+5. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
+
+### Re-running / upgrading
+
+The installer is idempotent:
+- System user is not recreated if it exists
+- Existing env file is preserved unless `--force` is given
+- Existing service unit is preserved unless `--force` is given
+
+To upgrade:
+
+```bash
+cargo build --release
+sudo scripts/amneziawg-web-install.sh \
+  --non-interactive \
+  --binary-src ./target/release/amneziawg-web \
+  --force
+sudo systemctl restart amneziawg-web
+```

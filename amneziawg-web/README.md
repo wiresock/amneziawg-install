@@ -95,6 +95,20 @@ All state is in one SQLite file. No Redis, no Postgres, no container required.
 
 ## Quick start
 
+### Using the installer (recommended for production)
+
+```bash
+cd amneziawg-web
+cargo build --release
+sudo scripts/amneziawg-web-install.sh
+```
+
+The installer handles user creation, directory setup, environment file generation,
+password hashing, and systemd service installation interactively.
+For non-interactive / automated installs, see [docs/INSTALL.md](docs/INSTALL.md).
+
+### Manual / development
+
 ```bash
 cd amneziawg-web
 cargo build --release

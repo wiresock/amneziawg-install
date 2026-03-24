@@ -48,3 +48,15 @@ jobs:
         with:
           workspaces: amneziawg-web
       - run: cargo test
+
+  shell-lint:
+    name: Shell lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax check
+        run: bash -n scripts/amneziawg-web-install.sh
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: ShellCheck
+        run: shellcheck --severity=warning scripts/amneziawg-web-install.sh
