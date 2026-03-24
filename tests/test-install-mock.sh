@@ -1381,6 +1381,372 @@ fi
 echo ""
 echo "=== Phase 4: Web uninstaller tests complete ==="
 
+# ============================================================
+# Phase 5: Web panel upgrade integration test
+# ============================================================
+#
+# Test assumptions / harness notes:
+# - systemctl is mocked with state tracking and call logging
+#   (/tmp/systemctl-calls.log records every invocation)
+# - The amneziawg-web service state is tracked via flag files:
+#   /tmp/awg-web-mock-started (is-active) and /tmp/awg-web-mock-enabled (is-enabled)
+# - No real service is running; we validate binary replacement and state only
+# - HTTP endpoints are NOT tested here (no runtime)
+# - Tests run in force/non-interactive mode; no user prompts
+#
+echo ""
+echo "=== Phase 5: Web panel upgrader ==="
+
+WEB_UPGRADER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-upgrade.sh"
+WEB_UPGRADER="${PROJECT_ROOT}/amneziawg-web-upgrade.sh"
+
+# Verify both entrypoints are present
+if [[ -f "${WEB_UPGRADER}" ]]; then
+	echo "OK: Root-level upgrade entrypoint exists: ${WEB_UPGRADER}"
+else
+	echo "FAIL: Root-level upgrade entrypoint missing: ${WEB_UPGRADER}"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_UPGRADER_IMPL}" ]]; then
+	echo "OK: Implementation script exists: ${WEB_UPGRADER_IMPL}"
+else
+	echo "FAIL: Implementation script missing: ${WEB_UPGRADER_IMPL}"
+	FAILED=$((FAILED + 1))
+fi
+
+# Re-install to restore a clean state for upgrade tests
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1
+
+echo ""
+echo "--- Web upgrader: missing --binary error behavior ---"
+
+WEB_UPGRADE_NOBIN_RC=0
+WEB_UPGRADE_NOBIN_OUTPUT=$(bash "${WEB_UPGRADER_IMPL}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--force 2>&1) || WEB_UPGRADE_NOBIN_RC=$?
+
+if [[ ${WEB_UPGRADE_NOBIN_RC} -ne 0 ]]; then
+	echo "OK: Upgrader exits non-zero when --binary is missing (rc=${WEB_UPGRADE_NOBIN_RC})"
+else
+	echo "FAIL: Upgrader should fail when --binary is not supplied"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${WEB_UPGRADE_NOBIN_OUTPUT}" | grep -qi "missing\|--binary\|required"; then
+	echo "OK: Missing-binary error message is present"
+else
+	echo "FAIL: No helpful message about missing --binary in output"
+	echo "  Output: ${WEB_UPGRADE_NOBIN_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web upgrader: missing source binary error behavior ---"
+
+WEB_UPGRADE_NOSRC_RC=0
+WEB_UPGRADE_NOSRC_OUTPUT=$(bash "${WEB_UPGRADER_IMPL}" \
+	--binary "/tmp/nonexistent-upgrade-binary-xyz" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--force 2>&1) || WEB_UPGRADE_NOSRC_RC=$?
+
+if [[ ${WEB_UPGRADE_NOSRC_RC} -ne 0 ]]; then
+	echo "OK: Upgrader exits non-zero when source binary is missing (rc=${WEB_UPGRADE_NOSRC_RC})"
+else
+	echo "FAIL: Upgrader should fail when source binary does not exist"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${WEB_UPGRADE_NOSRC_OUTPUT}" | grep -qi "not found"; then
+	echo "OK: Source-not-found error message is present"
+else
+	echo "FAIL: No helpful message about missing source binary in output"
+	echo "  Output: ${WEB_UPGRADE_NOSRC_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web upgrader: successful upgrade (service active) ---"
+
+# Create a new stub binary with different content to verify replacement
+UPGRADE_BINARY="/tmp/amneziawg-web-upgrade-v2"
+cat > "${UPGRADE_BINARY}" <<'STUBEOF'
+#!/bin/bash
+echo "amneziawg-web stub v0.0.2-upgrade-test"
+STUBEOF
+chmod +x "${UPGRADE_BINARY}"
+
+# Record the content of the old installed binary for comparison
+OLD_BINARY_CONTENT=$(cat "${WEB_TEST_INSTALL_DIR}/amneziawg-web")
+
+# Simulate the service being active before upgrade
+touch /tmp/awg-web-mock-started
+touch /tmp/awg-web-mock-enabled
+
+# Create a data file to ensure data directory is preserved
+mkdir -p "${WEB_TEST_DATA_DIR}"
+touch "${WEB_TEST_DATA_DIR}/test-db.sqlite"
+
+# Clear systemctl call log before upgrade
+rm -f /tmp/systemctl-calls.log
+
+WEB_UPGRADE_RC=0
+WEB_UPGRADE_OUTPUT=$(bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${UPGRADE_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--force 2>&1) || WEB_UPGRADE_RC=$?
+
+if [[ ${WEB_UPGRADE_RC} -eq 0 ]]; then
+	echo "OK: Upgrader exited successfully (rc=0)"
+else
+	echo "FAIL: Upgrader exited with non-zero code ${WEB_UPGRADE_RC}"
+	echo "  Output tail: $(echo "${WEB_UPGRADE_OUTPUT}" | tail -20)"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify binary was replaced (content changed)
+NEW_BINARY_CONTENT=$(cat "${WEB_TEST_INSTALL_DIR}/amneziawg-web")
+if [[ "${NEW_BINARY_CONTENT}" != "${OLD_BINARY_CONTENT}" ]]; then
+	echo "OK: Binary content changed after upgrade"
+else
+	echo "FAIL: Binary content is the same — upgrade did not replace it"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify the new binary matches the upgrade source
+if [[ "${NEW_BINARY_CONTENT}" == "$(cat "${UPGRADE_BINARY}")" ]]; then
+	echo "OK: Installed binary matches upgrade source"
+else
+	echo "FAIL: Installed binary does not match upgrade source"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify binary is still executable
+if [[ -x "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
+	echo "OK: Upgraded binary is executable"
+else
+	echo "FAIL: Upgraded binary is not executable"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify env file is preserved
+if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
+	echo "OK: Env file preserved after upgrade"
+else
+	echo "FAIL: Env file was removed — should be preserved during upgrade"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify data directory is preserved
+if [[ -d "${WEB_TEST_DATA_DIR}" ]]; then
+	echo "OK: Data directory preserved after upgrade"
+else
+	echo "FAIL: Data directory was removed — should be preserved during upgrade"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify data file inside data directory is preserved
+if [[ -f "${WEB_TEST_DATA_DIR}/test-db.sqlite" ]]; then
+	echo "OK: Data file preserved after upgrade"
+else
+	echo "FAIL: Data file inside data directory was removed"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify systemd unit is preserved
+if [[ -f /etc/systemd/system/amneziawg-web.service ]]; then
+	echo "OK: systemd unit preserved after upgrade"
+else
+	echo "FAIL: systemd unit was removed — should be preserved during upgrade"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify service was stopped before upgrade (since it was active)
+if grep -q "stop amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "OK: systemctl stop amneziawg-web was called during upgrade"
+else
+	echo "FAIL: systemctl stop was not called (service was active)"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify service was restarted after upgrade (since it was active)
+if grep -q "restart amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "OK: systemctl restart amneziawg-web was called after upgrade"
+else
+	echo "FAIL: systemctl restart was not called (service was active, should auto-restart)"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify upgrade output mentions preserved items
+if echo "${WEB_UPGRADE_OUTPUT}" | grep -qi "preserved\|Config.*preserved\|Data.*preserved"; then
+	echo "OK: Upgrader mentions preserved items in output"
+else
+	echo "FAIL: Upgrader output does not mention preserved items"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web upgrader: inactive service (no auto-restart) ---"
+
+# Mark service as inactive
+rm -f /tmp/awg-web-mock-started
+
+# Clear systemctl log
+rm -f /tmp/systemctl-calls.log
+
+WEB_UPGRADE_INACTIVE_RC=0
+bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${UPGRADE_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--force >/dev/null 2>&1 || WEB_UPGRADE_INACTIVE_RC=$?
+
+if [[ ${WEB_UPGRADE_INACTIVE_RC} -eq 0 ]]; then
+	echo "OK: Upgrader succeeds when service is inactive"
+else
+	echo "FAIL: Upgrader failed when service is inactive (rc=${WEB_UPGRADE_INACTIVE_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify restart was NOT called (service was inactive and no --restart flag)
+if grep -q "restart amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "FAIL: systemctl restart was called but service was inactive (should not auto-restart)"
+	FAILED=$((FAILED + 1))
+else
+	echo "OK: Service was not restarted (was inactive, correct default)"
+fi
+
+# Verify stop was NOT called (service was inactive)
+if grep -q "stop amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "FAIL: systemctl stop was called but service was not active"
+	FAILED=$((FAILED + 1))
+else
+	echo "OK: Service was not stopped (was already inactive)"
+fi
+
+echo ""
+echo "--- Web upgrader: --restart flag forces restart ---"
+
+# Service is inactive but --restart is given
+rm -f /tmp/awg-web-mock-started
+rm -f /tmp/systemctl-calls.log
+
+WEB_UPGRADE_FORCE_RESTART_RC=0
+bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${UPGRADE_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--restart \
+	--force >/dev/null 2>&1 || WEB_UPGRADE_FORCE_RESTART_RC=$?
+
+if [[ ${WEB_UPGRADE_FORCE_RESTART_RC} -eq 0 ]]; then
+	echo "OK: Upgrader with --restart exited successfully"
+else
+	echo "FAIL: Upgrader with --restart exited non-zero (rc=${WEB_UPGRADE_FORCE_RESTART_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify restart WAS called (even though service was inactive, --restart was given)
+if grep -q "restart amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "OK: systemctl restart was called with --restart flag"
+else
+	echo "FAIL: systemctl restart was not called despite --restart flag"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web upgrader: --refresh-unit ---"
+
+# Simulate active service
+touch /tmp/awg-web-mock-started
+rm -f /tmp/systemctl-calls.log
+
+WEB_UPGRADE_REFRESH_RC=0
+bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${UPGRADE_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--refresh-unit \
+	--force >/dev/null 2>&1 || WEB_UPGRADE_REFRESH_RC=$?
+
+if [[ ${WEB_UPGRADE_REFRESH_RC} -eq 0 ]]; then
+	echo "OK: Upgrader with --refresh-unit exited successfully"
+else
+	echo "FAIL: Upgrader with --refresh-unit exited non-zero (rc=${WEB_UPGRADE_REFRESH_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify daemon-reload was called (for refresh-unit)
+if grep -q "daemon-reload" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "OK: systemctl daemon-reload was called after --refresh-unit"
+else
+	echo "FAIL: systemctl daemon-reload was not called after --refresh-unit"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify the unit file still exists
+if [[ -f /etc/systemd/system/amneziawg-web.service ]]; then
+	echo "OK: systemd unit file present after --refresh-unit"
+else
+	echo "FAIL: systemd unit file missing after --refresh-unit"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web upgrader: idempotency (re-run upgrade) ---"
+
+WEB_UPGRADE_RERUN_RC=0
+bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${UPGRADE_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--force >/dev/null 2>&1 || WEB_UPGRADE_RERUN_RC=$?
+
+if [[ ${WEB_UPGRADE_RERUN_RC} -eq 0 ]]; then
+	echo "OK: Upgrader is idempotent (re-run succeeded)"
+else
+	echo "FAIL: Upgrader re-run exited non-zero (rc=${WEB_UPGRADE_RERUN_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web upgrader: --non-interactive alias ---"
+
+WEB_UPGRADE_NI_RC=0
+bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${UPGRADE_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--non-interactive >/dev/null 2>&1 || WEB_UPGRADE_NI_RC=$?
+
+if [[ ${WEB_UPGRADE_NI_RC} -eq 0 ]]; then
+	echo "OK: Upgrader works with --non-interactive"
+else
+	echo "FAIL: Upgrader failed with --non-interactive (rc=${WEB_UPGRADE_NI_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "=== Phase 5: Web upgrader tests complete ==="
+
 echo ""
 echo "=========================================="
 if [[ ${FAILED} -eq 0 ]]; then

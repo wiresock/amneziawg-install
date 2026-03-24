@@ -59,10 +59,20 @@ visibility and management.
 - Systemd service unit and deployment guide
 - Docker support
 - Companion uninstall script with safe defaults and explicit purge flags
+- Companion upgrade script for safe in-place binary replacement
 
 ### Installation
 
 See [docs/INSTALL.md](docs/INSTALL.md) for full instructions.
+
+### Upgrading
+
+```bash
+cargo build --release
+sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+```
+
+See the "Upgrade reference" section in [docs/INSTALL.md](docs/INSTALL.md).
 
 ### Uninstalling
 

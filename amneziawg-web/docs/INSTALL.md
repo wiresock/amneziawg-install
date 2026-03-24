@@ -366,16 +366,127 @@ The installer is idempotent:
 - Existing env file is preserved unless `--force` is given
 - Existing service unit is preserved unless `--force` is given
 
-To upgrade:
+To upgrade, use the dedicated upgrade script (see [Upgrade reference](#upgrade-reference))
+or re-run the installer:
 
 ```bash
 cargo build --release
-sudo ./amneziawg-web-install.sh \
-  --non-interactive \
-  --binary-src ./target/release/amneziawg-web \
-  --force
-sudo systemctl restart amneziawg-web
+sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
 ```
+
+---
+
+## Upgrade reference
+
+A companion upgrade script is provided at the repository root:
+
+```bash
+sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+```
+
+Like the installer, the root-level `amneziawg-web-upgrade.sh` is a thin entrypoint
+that delegates to `amneziawg-web/scripts/amneziawg-web-upgrade.sh`.
+
+### Default behavior
+
+The upgrade script replaces the installed binary while preserving everything else:
+
+| Action | What happens |
+|---|---|
+| **Replaced** | installed binary (`/usr/local/bin/amneziawg-web`) |
+| **Restarted** | service (only if it was active before upgrade) |
+| **Preserved** | env/config directory (`/etc/amneziawg-web/`) |
+| **Preserved** | data directory (`/var/lib/amneziawg-web/`) |
+| **Preserved** | systemd unit file (unless `--refresh-unit` is given) |
+| **Preserved** | service user (`awg-web`) |
+
+### Restart behavior
+
+By default, the upgrade script detects whether the service was running:
+- If **active**: the service is stopped, the binary is replaced, and the service is restarted
+- If **inactive**: the binary is replaced; the service is left inactive
+
+Use `--restart` to force a restart even if the service was inactive, or `--no-restart`
+to skip restarting entirely.
+
+### Interactive mode
+
+```bash
+sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+```
+
+The script prints a plan showing what will be replaced and what will be preserved,
+then asks for confirmation.
+
+### Non-interactive mode
+
+```bash
+sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web --force
+# or equivalently:
+sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web --non-interactive
+```
+
+### CI/automation example
+
+```bash
+cargo build --release
+sudo ./amneziawg-web-upgrade.sh \
+  --binary ./target/release/amneziawg-web \
+  --force --restart
+```
+
+### Refreshing the systemd unit
+
+If the service unit file has changed in the repository, use `--refresh-unit`:
+
+```bash
+sudo ./amneziawg-web-upgrade.sh \
+  --binary ./target/release/amneziawg-web \
+  --refresh-unit --force
+```
+
+This reinstalls the unit file from the repository copy and reloads the systemd daemon.
+The `EnvironmentFile` directive is automatically updated to match your `--env-file` path.
+
+### All options
+
+| Option | Default | Description |
+|---|---|---|
+| `--binary PATH` | *(required)* | Path to the replacement binary |
+| `--install-dir DIR` | `/usr/local/bin` | Binary install directory |
+| `--env-file FILE` | `/etc/amneziawg-web/env.conf` | Env/config file path |
+| `--data-dir DIR` | `/var/lib/amneziawg-web` | Data directory |
+| `--restart` | *(off)* | Always restart service after upgrade |
+| `--no-restart` | *(off)* | Never restart service after upgrade |
+| `--refresh-unit` | *(off)* | Reinstall systemd unit from repository copy |
+| `--force` | *(off)* | Skip confirmation prompts |
+| `--non-interactive` | *(off)* | Alias for `--force`; suitable for CI/automation |
+| `--help` | — | Show usage |
+
+### Path assumptions
+
+The upgrade script assumes the same default paths as the installer. If you used
+custom `--install-dir`, `--data-dir`, or `--env-file` during installation,
+pass the same values to the upgrade script:
+
+```bash
+sudo ./amneziawg-web-upgrade.sh \
+  --binary ./target/release/amneziawg-web \
+  --install-dir /opt/awg/bin \
+  --env-file /opt/awg/env.conf \
+  --data-dir /opt/awg/data \
+  --force
+```
+
+### What the upgrade script does
+
+1. **Validate** – verifies the existing installation and source binary
+2. **Plan** – prints what will be replaced and what will be preserved
+3. **Confirm** – asks for confirmation (skipped with `--force`)
+4. **Stop** – stops the service if it was active
+5. **Replace binary** – copies source to temp file, then atomically moves it
+6. **Refresh unit** – *(only with `--refresh-unit`)* reinstalls the unit file, reloads daemon
+7. **Restart** – restarts the service based on restart policy
 
 ---
 

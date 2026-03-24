@@ -11,6 +11,12 @@ sudo ./amneziawg-web-install.sh    # install the web panel
 # open http://127.0.0.1:8080
 ```
 
+To upgrade the web panel after building a new binary:
+
+```bash
+sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+```
+
 To uninstall the web panel later:
 
 ```bash

@@ -130,6 +130,19 @@ By default the uninstaller is safe: it stops the service and removes the binary
 but keeps your configuration and database intact. See [docs/INSTALL.md](docs/INSTALL.md)
 for full details.
 
+### Upgrading
+
+To upgrade after building a new binary:
+
+```bash
+cd amneziawg-web && cargo build --release && cd ..
+sudo ./amneziawg-web-upgrade.sh --binary ./amneziawg-web/target/release/amneziawg-web
+```
+
+The upgrade script replaces the binary and restarts the service if it was running.
+Configuration, data, and the systemd unit are preserved by default.
+See [docs/INSTALL.md](docs/INSTALL.md) for full details.
+
 ### Manual / development
 
 ```bash
