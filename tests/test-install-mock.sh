@@ -2252,9 +2252,10 @@ fi
 
 # Create/touch the database file (simulates SQLx create_if_missing)
 DB_PATH="${AWG_WEB_DB}"
-# Strip sqlite: prefix if present (the Rust app does this internally)
+# Strip sqlite: URL prefix if present (the Rust app handles this internally).
+# Handles both sqlite:///var/lib/foo.db and sqlite:foo.db formats.
+DB_PATH="${DB_PATH#sqlite://}"
 DB_PATH="${DB_PATH#sqlite:}"
-DB_PATH="${DB_PATH#//}"
 
 mkdir -p "$(dirname "${DB_PATH}")" 2>/dev/null || true
 if ! touch "${DB_PATH}"; then

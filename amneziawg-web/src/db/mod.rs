@@ -71,7 +71,7 @@ impl Database {
 /// Parse a database path or URL into [`SqliteConnectOptions`].
 ///
 /// Rules:
-/// - `sqlite::memory:` → in-memory database (no `create_if_missing`)
+/// - `sqlite::memory:` or `:memory:` → in-memory database (no `create_if_missing`)
 /// - `sqlite:…` → parsed as a SQLite URL with `create_if_missing(true)`
 /// - anything else → treated as a filesystem path with `create_if_missing(true)`
 fn parse_db_options(input: &str) -> anyhow::Result<SqliteConnectOptions> {
