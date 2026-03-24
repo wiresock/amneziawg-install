@@ -98,10 +98,14 @@
 
 ---
 
-## Epic 10 – Admin Write Actions 🔲 planned
+## Epic 10 – Admin Write Actions ✅ complete
 
-- [ ] Enable / disable peer (`PATCH /api/peers/:id` with `"disabled": true/false`)
-- [ ] Download client config (`GET /api/peers/:id/config`)
+- [x] Enable / disable peer (`PATCH /api/peers/:id` with `"disabled": true/false`)
+- [x] Download client config (`GET /api/peers/:id/config`)
+- [x] HTML form disabled checkbox on peer detail page
+- [x] Audit event `peer_disabled` logged on state change
+- [x] Admin module helper `execute_set_peer_enabled`
+- [x] 12 new Epic 10 tests (167 total)
 
 ---
 
