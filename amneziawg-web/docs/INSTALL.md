@@ -376,3 +376,102 @@ sudo ./amneziawg-web-install.sh \
   --force
 sudo systemctl restart amneziawg-web
 ```
+
+---
+
+## Uninstaller reference
+
+A companion uninstall script is provided at the repository root:
+
+```bash
+sudo ./amneziawg-web-uninstall.sh
+```
+
+Like the installer, the root-level `amneziawg-web-uninstall.sh` is a thin entrypoint
+that delegates to `amneziawg-web/scripts/amneziawg-web-uninstall.sh`.
+
+### Default behavior (safe)
+
+By default, the uninstaller removes the service integration and installed binary
+while preserving all configuration and data:
+
+| Action | What happens |
+|---|---|
+| **Removed** | systemd service (stopped + disabled) |
+| **Removed** | systemd unit file (`/etc/systemd/system/amneziawg-web.service`) |
+| **Removed** | installed binary (`/usr/local/bin/amneziawg-web`) |
+| **Reloaded** | systemd daemon |
+| **Preserved** | env/config directory (`/etc/amneziawg-web/`) |
+| **Preserved** | data directory (`/var/lib/amneziawg-web/`) |
+| **Preserved** | service user (`awg-web`) |
+
+This makes uninstall reversible — re-install with `./amneziawg-web-install.sh --force`
+and your configuration and database are still in place.
+
+### Interactive mode
+
+```bash
+sudo ./amneziawg-web-uninstall.sh
+```
+
+The script prints a plan showing what will be removed and what will be preserved,
+then asks for confirmation before proceeding.
+
+### Non-interactive mode
+
+```bash
+sudo ./amneziawg-web-uninstall.sh --force
+# or equivalently:
+sudo ./amneziawg-web-uninstall.sh --non-interactive
+```
+
+### Purge flags
+
+To remove configuration or data, you must explicitly request it:
+
+```bash
+# Remove config + data, no prompts
+sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force
+
+# Full cleanup including service user
+sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --remove-user --force
+```
+
+### All options
+
+| Option | Default | Description |
+|---|---|---|
+| `--install-dir DIR` | `/usr/local/bin` | Binary install directory |
+| `--data-dir DIR` | `/var/lib/amneziawg-web` | Data directory |
+| `--env-file FILE` | `/etc/amneziawg-web/env.conf` | Env/config file path |
+| `--purge-config` | *(off)* | Also remove env/config directory |
+| `--purge-data` | *(off)* | Also remove data directory and all data |
+| `--remove-user` | *(off)* | Also remove the service user (`awg-web`) |
+| `--force` | *(off)* | Skip confirmation prompts |
+| `--non-interactive` | *(off)* | Alias for `--force`; suitable for CI/automation |
+| `--help` | — | Show usage |
+
+### Path assumptions
+
+The uninstaller assumes the same default paths as the installer. If you used
+custom `--install-dir`, `--data-dir`, or `--env-file` during installation,
+pass the same values to the uninstaller:
+
+```bash
+sudo ./amneziawg-web-uninstall.sh \
+  --install-dir /opt/awg/bin \
+  --data-dir /opt/awg/data \
+  --env-file /opt/awg/env.conf \
+  --force
+```
+
+### What the uninstaller does
+
+1. **Plan** – prints what will be removed and what will be preserved
+2. **Confirm** – asks for confirmation (skipped with `--force`)
+3. **Stop + disable** – gracefully stops and disables the systemd service
+4. **Remove unit** – deletes the systemd unit file, reloads daemon
+5. **Remove binary** – deletes the installed binary
+6. **Purge config** – *(only with `--purge-config`)* removes the env/config directory
+7. **Purge data** – *(only with `--purge-data`)* removes the data directory
+8. **Remove user** – *(only with `--remove-user`)* removes the service user

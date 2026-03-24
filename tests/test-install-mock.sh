@@ -94,6 +94,9 @@ create_mock "firewall-cmd" 'exit 1'
 # Mock systemctl (unit-aware: only awg-quick@* is reported as active after start;
 # firewalld stays inactive to ensure the iptables code path is exercised)
 create_mock "systemctl" '
+# Log every systemctl call for later verification.
+echo "$@" >> /tmp/systemctl-calls.log
+
 case "$1" in
 	is-active)
 		if [[ "${2:-}" == "--quiet" ]]; then
@@ -105,7 +108,28 @@ case "$1" in
 					exit 1
 				fi
 			fi
+			if [[ "$UNIT" == "amneziawg-web" ]]; then
+				if [[ -f /tmp/awg-web-mock-started ]]; then
+					exit 0
+				else
+					exit 1
+				fi
+			fi
 			# All other units (firewalld, etc.) are always inactive
+			exit 1
+		fi
+		exit 1
+		;;
+	is-enabled)
+		if [[ "${2:-}" == "--quiet" ]]; then
+			UNIT="${3:-}"
+			if [[ "$UNIT" == "amneziawg-web" ]]; then
+				if [[ -f /tmp/awg-web-mock-enabled ]]; then
+					exit 0
+				else
+					exit 1
+				fi
+			fi
 			exit 1
 		fi
 		exit 1
@@ -115,9 +139,33 @@ case "$1" in
 		if [[ "$UNIT" == awg-quick@* ]]; then
 			touch /tmp/awg-mock-started
 		fi
+		if [[ "$UNIT" == "amneziawg-web" ]]; then
+			touch /tmp/awg-web-mock-started
+		fi
 		exit 0
 		;;
-	enable|daemon-reload|disable|stop)
+	stop)
+		UNIT="${2:-}"
+		if [[ "$UNIT" == "amneziawg-web" ]]; then
+			rm -f /tmp/awg-web-mock-started
+		fi
+		exit 0
+		;;
+	enable)
+		UNIT="${2:-}"
+		if [[ "$UNIT" == "amneziawg-web" ]]; then
+			touch /tmp/awg-web-mock-enabled
+		fi
+		exit 0
+		;;
+	disable)
+		UNIT="${2:-}"
+		if [[ "$UNIT" == "amneziawg-web" ]]; then
+			rm -f /tmp/awg-web-mock-enabled
+		fi
+		exit 0
+		;;
+	daemon-reload)
 		exit 0
 		;;
 	*)
@@ -821,10 +869,14 @@ chmod +x "${STUB_BINARY}"
 # It is safe for testing only — never used in production.
 TEST_PASSWORD_HASH='$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHRzYWx0c2FsdA$yk42pFBQW/E8b4WUBKF4cEY7sZtTZcFZCByIi1X8E+4'
 
-# Define test-local paths to avoid touching system directories
+# Define test paths for the web panel installer and uninstaller.
+# The binary install dir can live under /tmp (the uninstaller allows it).
+# The data dir and env file must live under /var/ and /etc/ respectively so that
+# the uninstaller's safe_rm_dir prefix checks are satisfied during purge tests.
+# We are running inside Docker, so writing to /var and /etc is safe.
 WEB_TEST_INSTALL_DIR="/tmp/awg-web-test/bin"
-WEB_TEST_DATA_DIR="/tmp/awg-web-test/data"
-WEB_TEST_ENV_FILE="/tmp/awg-web-test/env.conf"
+WEB_TEST_DATA_DIR="/var/lib/awg-web-test"
+WEB_TEST_ENV_FILE="/etc/awg-web-test/env.conf"
 WEB_TEST_AWG_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
 
 # Create the AWG client config directory (populated by Phase 1 install)
@@ -1029,9 +1081,10 @@ echo "=== Phase 3: Web installer tests complete ==="
 # ============================================================
 #
 # Test assumptions / harness notes:
-# - systemctl is mocked (stop, disable, daemon-reload return exit 0)
-# - systemctl is-active and is-enabled return non-zero (service never truly started)
-#   so the uninstall gracefully skips stop/disable
+# - systemctl is mocked with state tracking and call logging
+#   (/tmp/systemctl-calls.log records every invocation)
+# - The amneziawg-web service state is tracked via flag files:
+#   /tmp/awg-web-mock-started (is-active) and /tmp/awg-web-mock-enabled (is-enabled)
 # - No real service is running; we validate install artifact removal only
 # - HTTP endpoints are NOT tested here (no runtime)
 # - Tests run in force/non-interactive mode; no user prompts
@@ -1074,6 +1127,14 @@ else
 	echo "FAIL: Pre-condition: env file missing before uninstall test"
 	FAILED=$((FAILED + 1))
 fi
+
+# Simulate the service being active+enabled so the uninstaller exercises
+# stop and disable paths through the mock systemctl.
+touch /tmp/awg-web-mock-started
+touch /tmp/awg-web-mock-enabled
+
+# Clear systemctl call log before uninstall so we can verify calls
+rm -f /tmp/systemctl-calls.log
 
 WEB_UNINSTALL_RC=0
 WEB_UNINSTALL_OUTPUT=$(bash "${WEB_UNINSTALLER_IMPL}" \
@@ -1130,6 +1191,30 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+# Verify systemctl stop was called for amneziawg-web
+if grep -q "stop amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "OK: systemctl stop amneziawg-web was called"
+else
+	echo "FAIL: systemctl stop amneziawg-web was not called"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify systemctl disable was called for amneziawg-web
+if grep -q "disable amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "OK: systemctl disable amneziawg-web was called"
+else
+	echo "FAIL: systemctl disable amneziawg-web was not called"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify daemon-reload was called
+if grep -q "daemon-reload" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "OK: systemctl daemon-reload was called"
+else
+	echo "FAIL: systemctl daemon-reload was not called"
+	FAILED=$((FAILED + 1))
+fi
+
 echo ""
 echo "--- Web uninstaller: idempotency (re-run after uninstall) ---"
 
@@ -1144,6 +1229,44 @@ if [[ ${WEB_RERUN_UNINSTALL_RC} -eq 0 ]]; then
 	echo "OK: Uninstaller is idempotent (re-run after absent artifacts succeeded)"
 else
 	echo "FAIL: Uninstaller re-run exited non-zero (rc=${WEB_RERUN_UNINSTALL_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web uninstaller: --non-interactive alias ---"
+
+# Re-install to restore artifacts
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1
+
+WEB_NI_RC=0
+bash "${WEB_UNINSTALLER_IMPL}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--non-interactive >/dev/null 2>&1 || WEB_NI_RC=$?
+
+if [[ ${WEB_NI_RC} -eq 0 ]]; then
+	echo "OK: Uninstaller works with --non-interactive (alias for --force)"
+else
+	echo "FAIL: Uninstaller failed with --non-interactive (rc=${WEB_NI_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ ! -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
+	echo "OK: Binary removed after --non-interactive uninstall"
+else
+	echo "FAIL: Binary still present after --non-interactive uninstall"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1197,6 +1320,61 @@ if [[ ! -d "${WEB_TEST_DATA_DIR}" ]]; then
 	echo "OK: Data directory removed with --purge-data"
 else
 	echo "FAIL: Data directory still exists after --purge-data"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web uninstaller: --remove-user ---"
+
+# Re-install to restore artifacts and create the service user
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1
+
+# Verify the service user exists before removal
+if id awg-web &>/dev/null; then
+	echo "OK: Pre-condition: service user 'awg-web' exists before --remove-user"
+else
+	echo "WARN: Service user 'awg-web' not present (may already have been created by a prior run)"
+fi
+
+WEB_RMUSER_RC=0
+bash "${WEB_UNINSTALLER_IMPL}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--remove-user \
+	--force >/dev/null 2>&1 || WEB_RMUSER_RC=$?
+
+if [[ ${WEB_RMUSER_RC} -eq 0 ]]; then
+	echo "OK: Uninstaller with --remove-user exited successfully"
+else
+	echo "FAIL: Uninstaller with --remove-user exited non-zero (rc=${WEB_RMUSER_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify the service user was removed
+if ! id awg-web &>/dev/null; then
+	echo "OK: Service user 'awg-web' removed with --remove-user"
+else
+	echo "FAIL: Service user 'awg-web' still exists after --remove-user"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify env file is PRESERVED (--remove-user does not purge config)
+if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
+	echo "OK: Env file preserved (--remove-user does not imply --purge-config)"
+else
+	echo "FAIL: Env file was removed — --remove-user should not remove config"
 	FAILED=$((FAILED + 1))
 fi
 

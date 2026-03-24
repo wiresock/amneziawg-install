@@ -15,7 +15,7 @@ This document tracks the steps to publish a new release of `amneziawg-web`.
 - [x] `Cargo.toml` version is `0.1.0`
 - [x] `LICENSE` file present (MIT)
 - [x] `README.md` is polished and GitHub-ready
-- [x] `docs/INSTALL.md` covers full install flow
+- [x] `docs/INSTALL.md` covers full install and uninstall flow
 - [x] `docs/DEPLOYMENT.md` covers production hardening
 - [x] `.env.example` covers all runtime variables
 - [x] `packaging/amneziawg-web.service` is up-to-date
@@ -58,10 +58,15 @@ visibility and management.
 - `/api/events` endpoint with filters
 - Systemd service unit and deployment guide
 - Docker support
+- Companion uninstall script with safe defaults and explicit purge flags
 
 ### Installation
 
 See [docs/INSTALL.md](docs/INSTALL.md) for full instructions.
+
+### Uninstalling
+
+See the "Uninstaller reference" section in [docs/INSTALL.md](docs/INSTALL.md).
 
 ### Upgrade notes
 
