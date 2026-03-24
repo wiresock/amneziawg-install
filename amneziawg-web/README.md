@@ -97,10 +97,17 @@ All state is in one SQLite file. No Redis, no Postgres, no container required.
 
 ### Using the installer (recommended for production)
 
+The installer lives at the repository root, next to `amneziawg-install.sh`:
+
 ```bash
-cd amneziawg-web
-cargo build --release
-sudo scripts/amneziawg-web-install.sh
+# 1. Install AmneziaWG (if not already done)
+sudo ./amneziawg-install.sh
+
+# 2. Build the web panel binary
+cd amneziawg-web && cargo build --release && cd ..
+
+# 3. Install the web panel
+sudo ./amneziawg-web-install.sh
 ```
 
 The installer handles user creation, directory setup, environment file generation,

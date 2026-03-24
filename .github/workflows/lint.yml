@@ -13,7 +13,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Bash syntax check
-        run: bash -n amneziawg-install.sh
+        run: |
+          bash -n amneziawg-install.sh
+          bash -n amneziawg-web-install.sh
+          bash -n amneziawg-web/scripts/amneziawg-web-install.sh
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -24,4 +27,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning amneziawg-install.sh
+        run: |
+          shellcheck --severity=warning amneziawg-install.sh
+          shellcheck --severity=warning amneziawg-web-install.sh
+          shellcheck --severity=warning amneziawg-web/scripts/amneziawg-web-install.sh

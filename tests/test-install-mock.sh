@@ -774,6 +774,256 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+# ============================================================
+# Phase 3: Web panel installer integration test
+# ============================================================
+#
+# Test assumptions / harness notes:
+# - systemctl is mocked (daemon-reload, enable, start return exit 0)
+# - The amneziawg-web binary is NOT built in this environment; we use a
+#   placeholder stub so the installer can copy a valid executable
+# - No actual service is started; we validate install artifacts only
+# - HTTP endpoints are NOT tested here (no runtime)
+# - The test exercises non-interactive mode only (no prompts)
+#
+echo ""
+echo "=== Phase 3: Web panel installer ==="
+
+WEB_INSTALLER="${PROJECT_ROOT}/amneziawg-web-install.sh"
+WEB_INSTALLER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-install.sh"
+
+# Verify both entrypoints are present
+if [[ -f "${WEB_INSTALLER}" ]]; then
+	echo "OK: Root-level entrypoint exists: ${WEB_INSTALLER}"
+else
+	echo "FAIL: Root-level entrypoint missing: ${WEB_INSTALLER}"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_INSTALLER_IMPL}" ]]; then
+	echo "OK: Implementation script exists: ${WEB_INSTALLER_IMPL}"
+else
+	echo "FAIL: Implementation script missing: ${WEB_INSTALLER_IMPL}"
+	FAILED=$((FAILED + 1))
+fi
+
+# Create a minimal stub binary so the installer has something to copy.
+# We use the mocked awg binary as a placeholder for a valid executable.
+STUB_BINARY="/tmp/amneziawg-web-stub"
+cat > "${STUB_BINARY}" <<'STUBEOF'
+#!/bin/bash
+echo "amneziawg-web stub v0.0.0-test"
+STUBEOF
+chmod +x "${STUB_BINARY}"
+
+# Pre-generate a known-good Argon2id PHC hash to avoid needing python3/argon2 at test time.
+# This is a pre-computed hash of the word "testpassword" using standard Argon2id parameters.
+# It is safe for testing only — never used in production.
+TEST_PASSWORD_HASH='$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHRzYWx0c2FsdA$yk42pFBQW/E8b4WUBKF4cEY7sZtTZcFZCByIi1X8E+4'
+
+# Define test-local paths to avoid touching system directories
+WEB_TEST_INSTALL_DIR="/tmp/awg-web-test/bin"
+WEB_TEST_DATA_DIR="/tmp/awg-web-test/data"
+WEB_TEST_ENV_FILE="/tmp/awg-web-test/env.conf"
+WEB_TEST_AWG_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
+
+# Create the AWG client config directory (populated by Phase 1 install)
+mkdir -p "${WEB_TEST_AWG_CONFIG_DIR}" "${WEB_TEST_INSTALL_DIR}" "${WEB_TEST_DATA_DIR}"
+
+echo ""
+echo "--- Web installer: missing binary error behavior ---"
+
+# Verify that the installer fails clearly when the binary is not found
+WEB_MISS_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--binary-src "/tmp/nonexistent-binary-xyz" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable 2>&1) || WEB_MISS_RC=$?
+WEB_MISS_RC="${WEB_MISS_RC:-0}"
+
+if [[ ${WEB_MISS_RC} -ne 0 ]]; then
+	echo "OK: Installer exits non-zero when binary is missing (rc=${WEB_MISS_RC})"
+else
+	echo "FAIL: Installer should fail when --binary-src does not exist"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${WEB_MISS_OUTPUT}" | grep -qi "binary not found\|not found\|missing"; then
+	echo "OK: Installer prints helpful error for missing binary"
+else
+	echo "FAIL: Missing-binary error message not found in output"
+	echo "  Output: ${WEB_MISS_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web installer: missing --password-hash error behavior ---"
+
+WEB_NOPW_RC=0
+WEB_NOPW_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--no-start --no-enable 2>&1) || WEB_NOPW_RC=$?
+
+if [[ ${WEB_NOPW_RC} -ne 0 ]]; then
+	echo "OK: Installer exits non-zero when --password-hash is missing (rc=${WEB_NOPW_RC})"
+else
+	echo "FAIL: Installer should fail when --password-hash is not supplied in non-interactive mode"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${WEB_NOPW_OUTPUT}" | grep -qi "password\|hash\|required"; then
+	echo "OK: Missing-password error message is present"
+else
+	echo "FAIL: No helpful message about missing password in output"
+	echo "  Output: ${WEB_NOPW_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web installer: successful non-interactive install ---"
+
+# Clean any previous partial run
+rm -f "${WEB_TEST_ENV_FILE}" "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
+
+WEB_INSTALL_RC=0
+WEB_INSTALL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable 2>&1) || WEB_INSTALL_RC=$?
+
+if [[ ${WEB_INSTALL_RC} -eq 0 ]]; then
+	echo "OK: Installer exited successfully (rc=0)"
+else
+	echo "FAIL: Installer exited with non-zero code ${WEB_INSTALL_RC}"
+	echo "  Output tail: $(echo "${WEB_INSTALL_OUTPUT}" | tail -20)"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify binary was installed
+if [[ -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
+	echo "OK: Binary installed at ${WEB_TEST_INSTALL_DIR}/amneziawg-web"
+else
+	echo "FAIL: Binary not found at ${WEB_TEST_INSTALL_DIR}/amneziawg-web"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -x "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
+	echo "OK: Installed binary is executable"
+else
+	echo "FAIL: Installed binary is not executable"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify env file was generated
+if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
+	echo "OK: Env file generated at ${WEB_TEST_ENV_FILE}"
+else
+	echo "FAIL: Env file not generated at ${WEB_TEST_ENV_FILE}"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify env file permissions (should be 0600 — readable only by root)
+if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
+	ENV_PERMS=$(stat -c "%a" "${WEB_TEST_ENV_FILE}")
+	if [[ "${ENV_PERMS}" == "600" ]]; then
+		echo "OK: Env file has permissions 0600"
+	else
+		echo "FAIL: Env file permissions are ${ENV_PERMS}, expected 600"
+		FAILED=$((FAILED + 1))
+	fi
+fi
+
+# Verify key variables are present in the env file
+for VAR in AUTH_ENABLED AUTH_USERNAME AUTH_PASSWORD_HASH AWG_WEB_LISTEN AWG_WEB_DB AWG_CONFIG_DIR; do
+	if grep -q "^${VAR}=" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
+		echo "OK: Env file contains ${VAR}"
+	else
+		echo "FAIL: Env file missing ${VAR}"
+		FAILED=$((FAILED + 1))
+	fi
+done
+
+# Verify username was written correctly
+if grep -q "^AUTH_USERNAME=testadmin$" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
+	echo "OK: Auth username matches --username flag"
+else
+	echo "FAIL: AUTH_USERNAME not set to 'testadmin'"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify password hash was written (not left empty or as placeholder)
+if grep -q "^AUTH_PASSWORD_HASH=\$argon2id" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
+	echo "OK: AUTH_PASSWORD_HASH is a non-empty Argon2id hash"
+else
+	echo "FAIL: AUTH_PASSWORD_HASH is missing or does not look like an Argon2id hash"
+	echo "  Value: $(grep "^AUTH_PASSWORD_HASH" "${WEB_TEST_ENV_FILE}" 2>/dev/null || echo '(not found)')"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify systemd unit file was placed
+if [[ -f /etc/systemd/system/amneziawg-web.service ]]; then
+	echo "OK: systemd unit file installed"
+else
+	echo "FAIL: systemd unit file missing at /etc/systemd/system/amneziawg-web.service"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify EnvironmentFile directive is present in the unit file
+if grep -q "^EnvironmentFile=" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
+	echo "OK: systemd unit has EnvironmentFile directive"
+else
+	echo "FAIL: systemd unit is missing EnvironmentFile directive"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web installer: idempotency (re-run with --force) ---"
+
+# Re-run with --force to verify idempotent behaviour (no hard errors)
+WEB_RERUN_RC=0
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1 || WEB_RERUN_RC=$?
+
+if [[ ${WEB_RERUN_RC} -eq 0 ]]; then
+	echo "OK: Installer is idempotent (re-run with --force succeeded)"
+else
+	echo "FAIL: Re-run with --force exited non-zero (rc=${WEB_RERUN_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "=== Phase 3: Web installer tests complete ==="
+
 echo ""
 echo "=========================================="
 if [[ ${FAILED} -eq 0 ]]; then

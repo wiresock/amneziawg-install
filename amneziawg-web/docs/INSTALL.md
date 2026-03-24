@@ -9,16 +9,26 @@ For production hardening details, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Quick install (recommended)
 
-After building the binary, use the companion installer script for a guided setup:
+After building the binary, use the companion installer script for a guided setup.
+The installer lives at the repository root next to `amneziawg-install.sh`:
 
 ```bash
-# Build
+# 1. Install AmneziaWG (if not already done)
+sudo ./amneziawg-install.sh
+
+# 2. Build the web panel binary
 cd amneziawg-web
 cargo build --release
+cd ..
 
-# Install (interactive)
-sudo scripts/amneziawg-web-install.sh
+# 3. Install the web panel (interactive)
+sudo ./amneziawg-web-install.sh
 ```
+
+The root-level `amneziawg-web-install.sh` is a thin entrypoint that delegates to
+`amneziawg-web/scripts/amneziawg-web-install.sh`. All installer logic lives in
+the sub-script; the root-level file exists purely for operator convenience so both
+installers are discoverable in the same place.
 
 The installer handles user creation, directory setup, environment file generation,
 and systemd service installation. See [Installer reference](#installer-reference)
@@ -296,13 +306,13 @@ Database migrations run automatically on startup.
 
 ## Installer reference
 
-The companion installer script `scripts/amneziawg-web-install.sh` automates
+The companion installer script `amneziawg-web-install.sh` (root-level) automates
 the full installation process.
 
 ### Interactive mode
 
 ```bash
-sudo scripts/amneziawg-web-install.sh
+sudo ./amneziawg-web-install.sh
 ```
 
 You will be prompted for all important settings; press Enter to accept the defaults.
@@ -313,7 +323,7 @@ You will be prompted for all important settings; press Enter to accept the defau
 # Generate a password hash first
 HASH="$(python3 -c "import argon2; print(argon2.PasswordHasher().hash('yourpassword'))")"
 
-sudo scripts/amneziawg-web-install.sh \
+sudo ./amneziawg-web-install.sh \
   --non-interactive \
   --binary-src ./target/release/amneziawg-web \
   --username admin \
@@ -360,7 +370,7 @@ To upgrade:
 
 ```bash
 cargo build --release
-sudo scripts/amneziawg-web-install.sh \
+sudo ./amneziawg-web-install.sh \
   --non-interactive \
   --binary-src ./target/release/amneziawg-web \
   --force
