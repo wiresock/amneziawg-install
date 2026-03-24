@@ -112,3 +112,25 @@ Choose one of:
 1. **Persistent session store** – DB-backed sessions that survive restarts.
 2. **Export / backup and restore** – SQLite dump endpoint or file download.
 3. **Release packaging** – `.deb`/`.rpm` package or Docker image with the binary + systemd unit.
+
+---
+
+## Epic 11 – Release Preparation ✅ complete
+
+- [x] README overhaul: screenshot placeholders, architecture diagram, feature comparison table, "vs status script" section
+- [x] `docs/INSTALL.md`: full installation guide (prerequisites, build, systemd, Docker, reverse proxy)
+- [x] `.env.example`: all variables documented with comments and safe defaults
+- [x] `Dockerfile` + `.dockerignore`: multi-stage build, slim Debian runtime, non-root user
+- [x] `CONTRIBUTING.md`: bug reporting, PR guidelines, security note
+- [x] `docs/RELEASE.md`: v0.1.0 release checklist and release notes template
+- [x] `docs/ROADMAP.md` updated with all complete epics
+- [x] Terminology and cross-links consistent across all docs
+
+---
+
+## Recommended next steps after v0.1.0
+
+1. **Publish v0.1.0** – tag the release, optional binary upload to GitHub Releases
+2. **Persistent session store** – DB-backed sessions that survive restarts
+3. **Peer management** – enable/disable (`PATCH /api/peers/:id` with `disabled` flag), config download
+4. **Export / backup** – SQLite dump or JSON export endpoint

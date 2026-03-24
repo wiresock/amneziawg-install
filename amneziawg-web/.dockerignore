@@ -1,0 +1,30 @@
+# Rust build artifacts
+target/
+
+# Local environment files (may contain secrets)
+.env
+*.env
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Editor / OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Git history
+.git/
+.gitignore
+
+# CI
+.github/
+
+# Development docs not needed in image
+docs/COPILOT_TASK.md

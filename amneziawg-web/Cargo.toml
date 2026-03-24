@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Self-hosted web panel for AmneziaWG (AWG) visibility and management"
 license = "MIT"
+repository = "https://github.com/wiresock/amneziawg-install"
+homepage = "https://github.com/wiresock/amneziawg-install"
+keywords = ["wireguard", "amneziawg", "vpn", "web-ui"]
+categories = ["network-programming", "web-programming"]
+rust-version = "1.75"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
