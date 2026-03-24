@@ -5,30 +5,33 @@ A self-hosted web panel that provides **visibility and basic management** for
 installations managed via the
 [amneziawg-install](https://github.com/wiresock/amneziawg-install) script.
 
-> **Status:** read-only monitoring panel with traffic history and basic HTML UI · auth not yet available
+> **Status:** read-only monitoring panel with traffic history, config discovery, and basic HTML UI · auth not yet available
 
 ---
 
 ## What is implemented
 
 - **Background poller** – calls `awg show all dump` every N seconds (default: 30),
-  stores per-peer snapshots in SQLite, and keeps the `peers` table up-to-date.
-- **`GET /`** – server-rendered HTML peer list (table with name, status, endpoint, handshake, RX, TX).
+  stores per-peer snapshots in SQLite, keeps the `peers` table up-to-date, and
+  runs a config-discovery scan after each AWG poll.
+- **Config discovery** – scans `/etc/amneziawg/clients/` for `*.conf` files,
+  extracts the `[Peer] PublicKey` and `[Interface] Address` fields, and maps
+  each config file to the corresponding live peer by public key.
+- **`GET /`** – server-rendered HTML peer list (name, status, endpoint, handshake, RX, TX).
 - **`GET /peers/:id`** – server-rendered HTML peer detail page (identity, latest stats, recent snapshots).
 - **`GET /api/health`** – liveness probe.
 - **`GET /api/peers`** – returns all known peers with resolved name, status,
-  allowed IPs, endpoint, handshake time, and RX/TX counters.
+  allowed IPs, endpoint, handshake time, RX/TX counters, and config metadata.
 - **`GET /api/peers/:id`** – returns full peer detail including 50 most-recent snapshots.
 - **`GET /api/peers/:id/history?range=24h|7d|30d`** – returns per-snapshot RX/TX history
   with deltas and summary totals. Counter resets are handled gracefully (zero delta).
 - **Status derivation** – `online` / `inactive` / `disabled` / `unlinked`
-  based on last-handshake age (configurable threshold, default 180 s).
-- **Display-name fallback** – `display_name` → config filename stem → `peer-<key-prefix>`.
+  based on last-handshake age and config presence.
+- **Display-name fallback** – `display_name` → `config_name` → `peer-<key-prefix>`.
 
 ## What is NOT yet implemented
 
 - Authentication (planned: session tokens or Basic Auth – Epic 8)
-- Config-file discovery (poller does not yet scan `/etc/amneziawg/clients/` – Epic 2)
 - Admin write actions: rename, disable, config download (Epics 7–8)
 - Traffic charts / sparklines in the HTML pages
 - Peer creation or deletion
@@ -56,6 +59,29 @@ cargo build --release
 | `AWG_CONFIG_DIR`    | `/etc/amneziawg/clients`     | Directory of client `.conf` files  |
 | `AWG_POLL_INTERVAL` | `30`                         | Polling interval in seconds        |
 | `RUST_LOG`          | `amneziawg_web=info`         | Log level filter                   |
+
+---
+
+## Config discovery
+
+After each AWG poll, the poller scans `AWG_CONFIG_DIR` for `*.conf` files.
+
+For each file:
+1. The `[Peer] PublicKey` field is extracted – this is the server endpoint's public
+   key as seen by the client config, which also appears in `awg show` output.
+2. The peer row matching that public key is updated with `has_config = 1`,
+   `config_name` (filename stem), and `config_path` (absolute path).
+
+Peers with no matching config file have `has_config = 0` and are shown as
+**unlinked** in the UI and API.
+
+The mapping is **idempotent**: all config fields are reset at the start of each
+scan and re-applied from the current set of files.  Removing a config file will
+automatically mark the peer as unlinked on the next poll cycle.
+
+Config files that cannot be read are logged as warnings and skipped; the rest of
+the scan continues.  If the config directory does not exist, the mapping step is
+skipped entirely (peers remain unlinked).
 
 ---
 
@@ -89,12 +115,12 @@ subtracting traffic from summary totals.
 
 ### Status values
 
-| Value      | Meaning                                                          |
-|------------|------------------------------------------------------------------|
-| `online`   | Last handshake within 180 s                                      |
-| `inactive` | Has a config or display name, but no recent handshake            |
-| `disabled` | Administratively disabled via the `disabled` flag in the DB      |
-| `unlinked` | Seen in `awg show` but no config file matched and no name set    |
+| Value      | Meaning                                                              |
+|------------|----------------------------------------------------------------------|
+| `online`   | Last handshake within 180 s                                          |
+| `inactive` | Has a config file but no recent handshake                            |
+| `disabled` | Administratively disabled via the `disabled` flag in the DB          |
+| `unlinked` | Seen in `awg show` but no matching config file found                 |
 
 ---
 
@@ -113,7 +139,7 @@ Private-key fields are read and immediately discarded.
 ## Development
 
 ```bash
-cargo test                        # 56 tests
+cargo test                        # 64 tests
 cargo fmt --check
 cargo clippy -- -D warnings
 ```

@@ -9,13 +9,16 @@
 
 ---
 
-## Epic 2 – Config Discovery ⏳ scaffolded, not wired
+## Epic 2 – Config Discovery ✅ complete
 
-- [x] Scan config directory for `*.conf` files (module exists)
-- [x] Extract `PublicKey` + `Address` from config files
+- [x] Scan config directory for `*.conf` files (non-recursive)
+- [x] Extract `[Peer] PublicKey` + `[Interface] Address`
 - [x] Schema columns `config_name`, `config_path` added to `peers`
-- [ ] Wire poller to scan config directory and populate `config_name`/`config_path`
-- [ ] Mark peers without a matching config as `unlinked`
+- [x] Poller runs config scan after each AWG poll cycle
+- [x] Idempotent mapping: clear-then-apply on every cycle
+- [x] Warn+skip on unreadable files; skip-on-missing-dir
+- [x] `has_config`, `config_name`, `config_path` populated for matched peers
+- [x] `unlinked` status correctly driven by `has_config`
 
 ---
 
@@ -25,6 +28,7 @@
 - [x] Migrations `0001` (schema) + `0002` (`config_name`, `config_path`)
 - [x] `PeerRow`/`SnapshotRow` + query fns + `connect_for_test` helper
 - [x] `find_snapshots_since` for history queries (ascending, time-bounded)
+- [x] `clear_all_config_mappings` + `apply_config_mapping` for idempotent mapping
 
 ---
 
@@ -32,8 +36,8 @@
 
 - [x] Background Tokio task, configurable interval
 - [x] Snapshot insertion per poll; peer upsert (including `allowed_ips`)
+- [x] Config mapping step after AWG step; logged per cycle
 - [x] Rich logging: peer count, snapshot count, elapsed time, per-peer failures
-- [ ] Counter-reset detection in poller (future: flag resets in snapshots table)
 
 ---
 
@@ -78,15 +82,14 @@
 
 ## Recommended next step
 
-**Config discovery and mapping integration into poller** (Epic 2):
-- Scan `/etc/amneziawg/clients/*.conf` on each poll cycle
-- Match config public keys to live peers
-- Populate `config_name` / `config_path` / `has_config` in the `peers` table
-- This unlocks proper `unlinked` status and named configs in the UI
-
-Alternatively, **basic rename/comment actions** (Epic 7 starter):
+**Basic rename/comment actions** (Epic 7 starter):
 - `POST /api/peers/:id` with `{ "display_name": "...", "comment": "..." }`
 - No destructive actions; just metadata writes
-- Makes the UI immediately more useful
+- Makes the UI immediately more useful for labelling peers
+
+Alternatively, **authentication layer** (Epic 8 starter):
+- Basic session cookie auth for the HTML pages
+- API key support for the JSON endpoints
+- Required before any public deployment
 
 Prefer the smallest complete useful increment.

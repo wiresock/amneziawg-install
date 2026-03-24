@@ -4,15 +4,20 @@
 //! basic metadata, and attempts to map each config to a live peer via its
 //! `PublicKey`.
 //!
-//! This module is compiled and tested but not yet wired into the main
-//! request-handling path.  It will be used by the poller in a later milestone
-//! (Epic 2 – Config Discovery).
+//! ## Discovery rules
+//!
+//! - Non-recursive: only direct children of the target directory are examined.
+//! - Only regular files with the `.conf` extension are processed.
+//! - If an individual file cannot be read or parsed, a warning is logged and
+//!   that file is skipped; the rest of the scan continues.
+//! - If the directory itself cannot be opened, an error is returned to the
+//!   caller (the poller logs it and skips the mapping step).
 
-#![allow(dead_code)]
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::domain::PublicKey;
 
@@ -23,38 +28,31 @@ pub enum ConfigStoreError {
         path: PathBuf,
         source: std::io::Error,
     },
-
-    #[error("failed to read config file {path}: {source}")]
-    ReadFile {
-        path: PathBuf,
-        source: std::io::Error,
-    },
 }
 
 /// Metadata extracted from a single client config file.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientConfig {
-    /// Filename without extension.
+    /// Filename without extension (e.g. `"ivan-iphone"`).
     pub name: String,
     /// Absolute path to the config file.
     pub path: PathBuf,
-    /// Public key extracted from the `[Peer]` section, if present.
+    /// Public key extracted from the `[Peer]` section of the config.
     ///
-    /// NOTE: This is the *server* peer public key or the client's own public
-    /// key depending on the config layout.  For AWG-style split configs the
-    /// field we care about is `PublicKey =` inside `[Peer]`.
-    ///
-    /// TODO: Confirm which `PublicKey` field maps to the peer seen in
-    ///       `awg show` and update extraction accordingly.
+    /// In a split-tunnel AWG client config the `[Peer]` section describes the
+    /// **server** endpoint.  The `PublicKey` value there matches what
+    /// `awg show` reports for this client peer.
     pub peer_public_key: Option<PublicKey>,
-    /// Allowed IPs from the `[Interface]` `Address` field.
+    /// Address(es) from the `[Interface]` `Address` field.
     pub addresses: Vec<String>,
 }
 
 /// Scan `dir` for `*.conf` files and return metadata for each.
 ///
-/// Path traversal is prevented by only reading entries directly inside `dir`
-/// (non-recursive) and rejecting entries that are not regular files.
+/// Only the top-level entries inside `dir` are examined (no recursion).
+/// Entries that are not regular files or do not have a `.conf` extension are
+/// silently ignored.  Files that cannot be read are logged as warnings and
+/// skipped; the scan continues with the remaining files.
 pub fn scan(dir: &Path) -> Result<Vec<ClientConfig>, ConfigStoreError> {
     let entries = std::fs::read_dir(dir).map_err(|e| ConfigStoreError::ReadDir {
         path: dir.to_path_buf(),
@@ -65,6 +63,7 @@ pub fn scan(dir: &Path) -> Result<Vec<ClientConfig>, ConfigStoreError> {
 
     for entry in entries.flatten() {
         let path = entry.path();
+
         if path.extension().and_then(|e| e.to_str()) != Some("conf") {
             continue;
         }
@@ -72,10 +71,13 @@ pub fn scan(dir: &Path) -> Result<Vec<ClientConfig>, ConfigStoreError> {
             continue;
         }
 
-        let content = std::fs::read_to_string(&path).map_err(|e| ConfigStoreError::ReadFile {
-            path: path.clone(),
-            source: e,
-        })?;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "failed to read config file – skipping");
+                continue;
+            }
+        };
 
         let name = path
             .file_stem()
@@ -171,6 +173,12 @@ Endpoint = vpn.example.com:51820
 AllowedIPs = 0.0.0.0/0, ::/0
 ";
 
+    const CONFIG_NO_PEER: &str = "\
+[Interface]
+PrivateKey = SOME_KEY=
+Address = 10.8.0.3/32
+";
+
     #[test]
     fn extracts_peer_public_key() {
         let key = extract_peer_public_key(SAMPLE_CONFIG);
@@ -181,6 +189,12 @@ AllowedIPs = 0.0.0.0/0, ::/0
     fn extracts_addresses() {
         let addrs = extract_addresses(SAMPLE_CONFIG);
         assert_eq!(addrs, vec!["10.8.0.2/32", "fd00::2/128"]);
+    }
+
+    #[test]
+    fn no_peer_section_returns_none_key() {
+        let key = extract_peer_public_key(CONFIG_NO_PEER);
+        assert!(key.is_none());
     }
 
     #[test]
@@ -200,5 +214,38 @@ AllowedIPs = 0.0.0.0/0, ::/0
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "client1");
         assert!(result[0].peer_public_key.is_some());
+    }
+
+    #[test]
+    fn scan_config_without_peer_section_included_with_none_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("iface-only.conf"), CONFIG_NO_PEER).unwrap();
+
+        let result = scan(dir.path()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "iface-only");
+        assert!(result[0].peer_public_key.is_none());
+    }
+
+    #[test]
+    fn scan_nonexistent_dir_returns_error() {
+        let result = scan(Path::new("/tmp/does-not-exist-amneziawg-test-xyz"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scan_multiple_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alice.conf"), SAMPLE_CONFIG).unwrap();
+        std::fs::write(dir.path().join("bob.conf"), CONFIG_NO_PEER).unwrap();
+
+        let mut result = scan(dir.path()).unwrap();
+        // Sort by name for deterministic comparison
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "alice");
+        assert_eq!(result[1].name, "bob");
+        assert!(result[0].peer_public_key.is_some());
+        assert!(result[1].peer_public_key.is_none());
     }
 }

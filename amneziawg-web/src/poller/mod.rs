@@ -1,37 +1,51 @@
 //! Background polling task.
 //!
-//! Every `interval` seconds the poller:
-//! 1. Calls `awg::show_all_dump()` (reads current AWG state).
+//! Every `interval` seconds the poller runs a full cycle:
+//!
+//! 1. Calls `awg::show_all_dump()` – reads current AWG state.
 //! 2. Writes a snapshot row per peer into `snapshots`.
-//! 3. Upserts each peer into the `peers` table (creates new rows for unknown peers).
-//! 4. Handles counter resets: if `rx_bytes` or `tx_bytes` decreased since the
-//!    last snapshot, the value is treated as a reset and stored as-is.
+//! 3. Upserts each peer into the `peers` table.
+//! 4. Scans the config directory for `*.conf` files.
+//! 5. Applies config-to-peer mapping (sets `has_config`, `config_name`,
+//!    `config_path` on matching peers).
+//!
+//! Errors within a single cycle step are logged and the cycle continues;
+//! the overall polling loop never stops due to a single-cycle failure.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
 
 use crate::awg;
+use crate::config_store;
 use crate::db::Database;
 use crate::domain::PublicKey;
 
 pub struct Poller {
     db: Database,
     interval: Duration,
+    /// Directory to scan for `*.conf` client config files.
+    config_dir: PathBuf,
 }
 
 impl Poller {
-    pub fn new(db: Database, interval_secs: u64) -> Self {
+    pub fn new(db: Database, interval_secs: u64, config_dir: PathBuf) -> Self {
         Self {
             db,
             interval: Duration::from_secs(interval_secs),
+            config_dir,
         }
     }
 
     /// Run the polling loop forever.  Errors within a single cycle are logged
     /// and the loop continues with the next scheduled tick.
     pub async fn run(&self) {
-        info!(interval_secs = self.interval.as_secs(), "poller started");
+        info!(
+            interval_secs = self.interval.as_secs(),
+            config_dir = %self.config_dir.display(),
+            "poller started"
+        );
         loop {
             if let Err(e) = self.poll_once().await {
                 error!(error = %e, "poll cycle failed");
@@ -44,6 +58,7 @@ impl Poller {
         let start = std::time::Instant::now();
         debug!("poll cycle starting");
 
+        // ── Step 1–3: AWG data ───────────────────────────────────────────────
         let interfaces = match awg::show_all_dump() {
             Ok(ifaces) => ifaces,
             Err(awg::AwgError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -90,7 +105,90 @@ impl Poller {
         info!(
             snapshots_written,
             elapsed_ms = start.elapsed().as_millis(),
+            "awg poll step complete"
+        );
+
+        // ── Step 4–5: Config mapping ─────────────────────────────────────────
+        if let Err(e) = self.apply_config_mapping_step().await {
+            error!(error = %e, "config mapping step failed – continuing");
+        }
+
+        info!(
+            elapsed_ms = start.elapsed().as_millis(),
             "poll cycle complete"
+        );
+        Ok(())
+    }
+
+    /// Scan the config directory and update `has_config`, `config_name`, and
+    /// `config_path` on every peer.
+    ///
+    /// This operation is idempotent:
+    /// 1. All config-mapping fields are first reset to NULL / 0 for every peer.
+    /// 2. Each discovered config file is then matched to a peer by `public_key`
+    ///    and the relevant fields are set.
+    ///
+    /// If the config directory cannot be read, a warning is logged and the
+    /// step returns `Ok(())` (peers remain with `has_config = 0`).
+    async fn apply_config_mapping_step(&self) -> anyhow::Result<()> {
+        let configs = match config_store::scan(&self.config_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    config_dir = %self.config_dir.display(),
+                    error = %e,
+                    "config scan failed – skipping config mapping"
+                );
+                return Ok(());
+            }
+        };
+
+        debug!(
+            total_configs = configs.len(),
+            config_dir = %self.config_dir.display(),
+            "config scan complete"
+        );
+
+        // Reset all mapping fields so that removed configs don't persist.
+        crate::db::peers::clear_all_config_mappings(&self.db.pool).await?;
+
+        let mut mapped: usize = 0;
+        for config in &configs {
+            let pk = match &config.peer_public_key {
+                Some(k) => k,
+                None => {
+                    debug!(
+                        config = %config.name,
+                        "config has no [Peer] PublicKey – skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let path_str = config.path.to_string_lossy();
+            match crate::db::peers::apply_config_mapping(
+                &self.db.pool,
+                &pk.0,
+                &config.name,
+                &path_str,
+            )
+            .await
+            {
+                Ok(()) => mapped += 1,
+                Err(e) => {
+                    warn!(
+                        config = %config.name,
+                        public_key = %pk,
+                        error = %e,
+                        "failed to apply config mapping – skipping"
+                    );
+                }
+            }
+        }
+
+        info!(
+            total_configs = configs.len(),
+            mapped, "config mapping applied"
         );
         Ok(())
     }

@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     info!("database ready");
 
     // --- Background poller --------------------------------------------------
-    let poller = Poller::new(db.clone(), config.poll_interval);
+    let poller = Poller::new(db.clone(), config.poll_interval, config.config_dir);
     tokio::spawn(async move {
         poller.run().await;
     });
