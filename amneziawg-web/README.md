@@ -184,7 +184,7 @@ All settings are read from environment variables (or a `.env`-style file via sys
 | Variable | Default | Description |
 |---|---|---|
 | `AWG_WEB_LISTEN` | `0.0.0.0:8080` | TCP bind address |
-| `AWG_WEB_DB` | `awg-web.db` | Path to SQLite database file |
+| `AWG_WEB_DB` | `awg-web.db` | Path to SQLite database file (created automatically) |
 | `AWG_CONFIG_DIR` | `/etc/amneziawg/clients` | Directory of client `.conf` files |
 | `AWG_POLL_INTERVAL` | `30` | Polling interval in seconds |
 | `RUST_LOG` | `amneziawg_web=info` | Log level (`error`/`warn`/`info`/`debug`) |

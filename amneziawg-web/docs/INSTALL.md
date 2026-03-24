@@ -173,6 +173,13 @@ sudo chmod 0600 /etc/amneziawg-web/env.conf
 sudo chown root:root /etc/amneziawg-web/env.conf
 ```
 
+**`AWG_WEB_DB` accepts:**
+- a plain filesystem path: `/var/lib/amneziawg-web/awg-web.db` (recommended)
+- a relative path: `awg-web.db` (resolved relative to `WorkingDirectory`)
+- a SQLite URL: `sqlite:///var/lib/amneziawg-web/awg-web.db`
+
+The database file is created automatically if it does not exist (the directory must be writable by the service user).
+
 To generate a bearer token for API access:
 
 ```bash

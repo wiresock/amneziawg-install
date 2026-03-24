@@ -2140,6 +2140,259 @@ export PATH="${SAVED_PATH}"
 echo ""
 echo "=== Phase 6: Source-build tests complete ==="
 
+# ============================================================
+# Phase 7: Service startup + health probe integration test
+# ============================================================
+#
+# Test assumptions / harness notes:
+# - The real Rust binary is NOT available in this test harness
+# - Instead, we use an enhanced stub that simulates the service startup chain:
+#   1. reads the installer-generated env file
+#   2. creates the SQLite database file (simulates create_if_missing)
+#   3. starts a minimal HTTP server via python3
+#   4. responds to /api/health and /login
+# - This catches the real-world regression where the service crash-loops
+#   because the database file cannot be created
+# - HTTP probing uses python3's urllib (no curl dependency)
+# - systemctl is still mocked; we start the binary directly
+#
+echo ""
+echo "=== Phase 7: Service startup + health probe ==="
+
+# Check python3 availability (needed for the HTTP stub server)
+if ! command -v python3 &>/dev/null; then
+	echo "SKIP: python3 not available — cannot run HTTP health probe"
+	echo "  (DB path writability is still validated below)"
+	HAVE_PYTHON3=false
+else
+	echo "OK: python3 available for stub HTTP server"
+	HAVE_PYTHON3=true
+fi
+
+# Re-install to a known clean state for this phase.
+# Use a dedicated test port to avoid conflicts.
+WEB_PHASE7_PORT=18742
+rm -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
+rm -f "${WEB_TEST_ENV_FILE}"
+rm -rf "${WEB_TEST_DATA_DIR}"
+mkdir -p "${WEB_TEST_DATA_DIR}" "${WEB_TEST_INSTALL_DIR}"
+
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--host 127.0.0.1 --port "${WEB_PHASE7_PORT}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1
+
+echo ""
+echo "--- Phase 7a: Env file DB path writability ---"
+
+# Source the generated env file and verify AWG_WEB_DB is set and writable
+if [[ ! -f "${WEB_TEST_ENV_FILE}" ]]; then
+	echo "FAIL: Env file not found at ${WEB_TEST_ENV_FILE} for startup test"
+	FAILED=$((FAILED + 1))
+else
+	# Read AWG_WEB_DB from the generated env file
+	PHASE7_DB_PATH=$(grep '^AWG_WEB_DB=' "${WEB_TEST_ENV_FILE}" | cut -d= -f2-)
+	if [[ -z "${PHASE7_DB_PATH}" ]]; then
+		echo "FAIL: AWG_WEB_DB not found in generated env file"
+		FAILED=$((FAILED + 1))
+	else
+		echo "OK: AWG_WEB_DB configured as: ${PHASE7_DB_PATH}"
+
+		# The DB file must NOT exist yet (simulates fresh install)
+		rm -f "${PHASE7_DB_PATH}"
+
+		# The data directory must exist (installer creates it)
+		PHASE7_DB_DIR=$(dirname "${PHASE7_DB_PATH}")
+		if [[ -d "${PHASE7_DB_DIR}" ]]; then
+			echo "OK: Data directory exists: ${PHASE7_DB_DIR}"
+		else
+			echo "FAIL: Data directory does not exist: ${PHASE7_DB_DIR}"
+			FAILED=$((FAILED + 1))
+		fi
+
+		# Simulate what the app does: create the DB file
+		if touch "${PHASE7_DB_PATH}" 2>/dev/null; then
+			echo "OK: Database file is creatable at ${PHASE7_DB_PATH}"
+			rm -f "${PHASE7_DB_PATH}"
+		else
+			echo "FAIL: Cannot create database file at ${PHASE7_DB_PATH}"
+			echo "  This is the exact regression that caused the service crash-loop"
+			FAILED=$((FAILED + 1))
+		fi
+	fi
+fi
+
+echo ""
+echo "--- Phase 7b: Service startup + HTTP health probe ---"
+
+if [[ "${HAVE_PYTHON3}" != "true" ]]; then
+	echo "SKIP: HTTP health probe skipped (python3 not available)"
+else
+	# Create an enhanced stub binary that simulates service startup
+	PHASE7_STUB="${WEB_TEST_INSTALL_DIR}/amneziawg-web"
+	cat > "${PHASE7_STUB}" <<'PHASE7STUBEOF'
+#!/bin/bash
+# Enhanced stub binary for integration testing.
+# Simulates amneziawg-web service startup: reads env, creates DB, serves HTTP.
+
+# Validate AWG_WEB_DB is set
+if [[ -z "${AWG_WEB_DB}" ]]; then
+	echo "ERROR: AWG_WEB_DB is not set" >&2
+	exit 1
+fi
+
+# Create/touch the database file (simulates SQLx create_if_missing)
+DB_PATH="${AWG_WEB_DB}"
+# Strip sqlite: prefix if present (the Rust app does this internally)
+DB_PATH="${DB_PATH#sqlite:}"
+DB_PATH="${DB_PATH#//}"
+
+mkdir -p "$(dirname "${DB_PATH}")" 2>/dev/null || true
+if ! touch "${DB_PATH}"; then
+	echo "ERROR: Cannot create database at ${DB_PATH}" >&2
+	exit 1
+fi
+
+# Extract port from AWG_WEB_LISTEN
+LISTEN="${AWG_WEB_LISTEN:-0.0.0.0:8080}"
+PORT="${LISTEN##*:}"
+
+exec python3 -c "
+import http.server, json, socketserver, sys, signal
+signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/api/health':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': 'ok'}).encode())
+        elif self.path == '/login':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'<html><body>Login</body></html>')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, *args): pass
+with socketserver.TCPServer(('127.0.0.1', ${PORT}), H) as s:
+    s.serve_forever()
+"
+PHASE7STUBEOF
+	chmod +x "${PHASE7_STUB}"
+
+	# Ensure DB file does not exist before startup
+	rm -f "${WEB_TEST_DATA_DIR}/awg-web.db"
+
+	# Start the enhanced stub with the necessary environment variables.
+	# We extract specific variables from the env file using grep+cut
+	# instead of sourcing it, because the env file contains Argon2 hashes
+	# with literal $ characters that bash would try to expand.
+	PHASE7_AWG_DB=$(grep '^AWG_WEB_DB=' "${WEB_TEST_ENV_FILE}" | cut -d= -f2-)
+	PHASE7_AWG_LISTEN=$(grep '^AWG_WEB_LISTEN=' "${WEB_TEST_ENV_FILE}" | cut -d= -f2-)
+
+	AWG_WEB_DB="${PHASE7_AWG_DB}" AWG_WEB_LISTEN="${PHASE7_AWG_LISTEN}" \
+		"${PHASE7_STUB}" &
+	PHASE7_PID=$!
+
+	# Poll for the server to come up (max 5 seconds, 100ms intervals)
+	PHASE7_UP=false
+	for _i in $(seq 1 50); do
+		if python3 -c "
+import urllib.request, sys
+try:
+    urllib.request.urlopen('http://127.0.0.1:${WEB_PHASE7_PORT}/api/health', timeout=1)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+			PHASE7_UP=true
+			break
+		fi
+		sleep 0.1
+	done
+
+	if [[ "${PHASE7_UP}" == "true" ]]; then
+		echo "OK: Stub service started and is accepting connections"
+	else
+		echo "FAIL: Stub service did not start within 5 seconds"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# Probe /api/health and verify JSON response
+	if [[ "${PHASE7_UP}" == "true" ]]; then
+		HEALTH_RESPONSE=$(python3 -c "
+import urllib.request, json, sys
+try:
+    resp = urllib.request.urlopen('http://127.0.0.1:${WEB_PHASE7_PORT}/api/health', timeout=5)
+    data = json.loads(resp.read())
+    print(data.get('status', ''))
+except Exception as e:
+    print(f'error: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null) || true
+
+		if [[ "${HEALTH_RESPONSE}" == "ok" ]]; then
+			echo "OK: /api/health returned {\"status\": \"ok\"}"
+		else
+			echo "FAIL: /api/health did not return expected response"
+			echo "  Got: ${HEALTH_RESPONSE}"
+			FAILED=$((FAILED + 1))
+		fi
+	fi
+
+	# Probe /login and verify it responds
+	if [[ "${PHASE7_UP}" == "true" ]]; then
+		LOGIN_RC=0
+		python3 -c "
+import urllib.request, sys
+try:
+    resp = urllib.request.urlopen('http://127.0.0.1:${WEB_PHASE7_PORT}/login', timeout=5)
+    if resp.status == 200:
+        sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null || LOGIN_RC=$?
+
+		if [[ ${LOGIN_RC} -eq 0 ]]; then
+			echo "OK: /login endpoint responds with 200"
+		else
+			echo "FAIL: /login endpoint did not respond"
+			FAILED=$((FAILED + 1))
+		fi
+	fi
+
+	# Verify database file was created by the stub service
+	if [[ -f "${WEB_TEST_DATA_DIR}/awg-web.db" ]]; then
+		echo "OK: Database file created by service at ${WEB_TEST_DATA_DIR}/awg-web.db"
+	else
+		echo "FAIL: Database file was not created by service startup"
+		echo "  This is the exact regression: service could not create its DB"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# Clean up: kill the stub server
+	if [[ -n "${PHASE7_PID}" ]] && kill -0 "${PHASE7_PID}" 2>/dev/null; then
+		kill "${PHASE7_PID}" 2>/dev/null || true
+		wait "${PHASE7_PID}" 2>/dev/null || true
+		echo "OK: Stub service stopped cleanly"
+	fi
+fi
+
+echo ""
+echo "=== Phase 7: Service startup tests complete ==="
+
 echo ""
 echo "=========================================="
 if [[ ${FAILED} -eq 0 ]]; then
