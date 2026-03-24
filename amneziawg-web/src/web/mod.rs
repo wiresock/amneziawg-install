@@ -737,7 +737,10 @@ async fn get_peer_config(
     let filename = config_path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("client.conf");
+        .unwrap_or("client.conf")
+        // Sanitise for use inside a quoted Content-Disposition filename.
+        .replace('\\', "_")
+        .replace('"', "_");
 
     let disposition = format!("attachment; filename=\"{}\"", filename);
 
