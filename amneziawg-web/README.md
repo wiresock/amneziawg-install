@@ -5,7 +5,7 @@ A self-hosted web panel that provides **visibility and basic management** for
 installations managed via the
 [amneziawg-install](https://github.com/wiresock/amneziawg-install) script.
 
-> **Status:** read-only peer listing implemented · auth not yet available
+> **Status:** read-only monitoring panel with traffic history and basic HTML UI · auth not yet available
 
 ---
 
@@ -13,11 +13,14 @@ installations managed via the
 
 - **Background poller** – calls `awg show all dump` every N seconds (default: 30),
   stores per-peer snapshots in SQLite, and keeps the `peers` table up-to-date.
+- **`GET /`** – server-rendered HTML peer list (table with name, status, endpoint, handshake, RX, TX).
+- **`GET /peers/:id`** – server-rendered HTML peer detail page (identity, latest stats, recent snapshots).
 - **`GET /api/health`** – liveness probe.
 - **`GET /api/peers`** – returns all known peers with resolved name, status,
   allowed IPs, endpoint, handshake time, and RX/TX counters.
-- **`GET /api/peers/:id`** – returns full peer detail including the 50 most
-  recent snapshots.
+- **`GET /api/peers/:id`** – returns full peer detail including 50 most-recent snapshots.
+- **`GET /api/peers/:id/history?range=24h|7d|30d`** – returns per-snapshot RX/TX history
+  with deltas and summary totals. Counter resets are handled gracefully (zero delta).
 - **Status derivation** – `online` / `inactive` / `disabled` / `unlinked`
   based on last-handshake age (configurable threshold, default 180 s).
 - **Display-name fallback** – `display_name` → config filename stem → `peer-<key-prefix>`.
@@ -25,44 +28,26 @@ installations managed via the
 ## What is NOT yet implemented
 
 - Authentication (planned: session tokens or Basic Auth – Epic 8)
-- HTML/web UI (planned: askama templates – Epics 5–6)
 - Config-file discovery (poller does not yet scan `/etc/amneziawg/clients/` – Epic 2)
 - Admin write actions: rename, disable, config download (Epics 7–8)
-- Traffic history aggregation and charts (Epic 5)
-
----
-
-## Non-goals
-
-`amneziawg-web` is an **overlay**, not a replacement.  It does **not**:
-
-- Replace or modify the `amneziawg-install.sh` workflow
-- Generate WireGuard keys or create new peer configs
-- Replace `awg` / `wg-quick` as the primary VPN management tool
+- Traffic charts / sparklines in the HTML pages
+- Peer creation or deletion
 
 ---
 
 ## Quick start
 
 ```bash
-# Build
 cd amneziawg-web
 cargo build --release
 
-# Run (defaults to listening on 0.0.0.0:8080)
-AWG_WEB_DB=./awg-web.db ./target/release/amneziawg-web
-
-# Or via environment file
-cp .env.example .env
-# Edit .env, then:
+# Defaults: listen 0.0.0.0:8080, DB awg-web.db
 ./target/release/amneziawg-web
 ```
 
 ---
 
 ## Configuration
-
-All options can be set via CLI flags or environment variables:
 
 | Env var             | Default                      | Description                        |
 |---------------------|------------------------------|------------------------------------|
@@ -76,28 +61,31 @@ All options can be set via CLI flags or environment variables:
 
 ## API
 
-| Method | Path              | Description                              |
-|--------|-------------------|------------------------------------------|
-| GET    | `/api/health`     | Liveness probe – `{"status":"ok"}`       |
-| GET    | `/api/peers`      | List all peers (array of summary DTOs)   |
-| GET    | `/api/peers/:id`  | Get one peer by integer ID (detail DTO)  |
+| Method | Path                          | Description                                      |
+|--------|-------------------------------|--------------------------------------------------|
+| GET    | `/`                           | HTML peer list page                              |
+| GET    | `/peers/:id`                  | HTML peer detail page                            |
+| GET    | `/api/health`                 | Liveness probe – `{"status":"ok"}`               |
+| GET    | `/api/peers`                  | List all peers (array of summary DTOs)           |
+| GET    | `/api/peers/:id`              | Get one peer by integer ID (detail DTO)          |
+| GET    | `/api/peers/:id/history`      | Traffic history (default `range=24h`)            |
 
-### Example – peer summary
+### Traffic history ranges
 
-```json
-{
-  "id": 1,
-  "name": "Ivan iPhone",
-  "public_key": "BASE64KEY==",
-  "config_name": "ivan-iphone",
-  "allowed_ips": "10.8.0.2/32",
-  "endpoint": "203.0.113.10:51820",
-  "latest_handshake_at": "2026-03-24T10:00:00Z",
-  "rx_bytes": 123456,
-  "tx_bytes": 654321,
-  "status": "online"
-}
-```
+| Parameter  | Window       |
+|------------|--------------|
+| `range=24h`| Last 24 hours |
+| `range=7d` | Last 7 days   |
+| `range=30d`| Last 30 days  |
+
+### Counter-reset handling
+
+AWG byte counters are monotonic within a kernel session.  When the AWG
+interface is restarted the counters reset to zero.  The history endpoint
+detects a reset when a snapshot's counter is *lower* than the previous
+snapshot's counter, and uses **0** as the delta for that step
+(`u64::saturating_sub`).  This prevents negative deltas and avoids
+subtracting traffic from summary totals.
 
 ### Status values
 
@@ -112,33 +100,23 @@ All options can be set via CLI flags or environment variables:
 
 ## AWG dump format assumptions
 
-`awg show all dump` output is assumed to follow the WireGuard `wg show all dump`
+`awg show all dump` output is assumed to follow the `wg show all dump`
 tab-separated format:
 
 - **Interface line** (5 fields): `interface private_key public_key listen_port fwmark`
 - **Peer line** (9 fields): `interface public_key preshared_key endpoint allowed_ips latest_handshake rx_bytes tx_bytes persistent_keepalive`
 
-Private-key fields are read and immediately discarded.  If the AWG binary uses
-a different layout, update `src/awg/mod.rs::parse_dump()`.
+Private-key fields are read and immediately discarded.
 
 ---
 
 ## Development
 
 ```bash
-cargo test            # run all tests (36 as of this milestone)
-cargo fmt             # format code
-cargo clippy -- -D warnings   # lint
+cargo test                        # 56 tests
+cargo fmt --check
+cargo clippy -- -D warnings
 ```
-
----
-
-## Documentation
-
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) – system design
-- [`docs/MVP.md`](docs/MVP.md) – MVP scope and acceptance criteria
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) – development roadmap
-- [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md) – product specification
 
 ---
 
@@ -146,7 +124,8 @@ cargo clippy -- -D warnings   # lint
 
 - Private keys are **never** logged or stored.
 - `awg` is invoked with an absolute path; no shell interpolation is used.
-- Config file paths are validated before access (non-recursive directory scan).
+- HTML output is escaped with `esc()` to prevent XSS.
+- The service must run behind a trusted reverse proxy until authentication is added.
 
 ---
 

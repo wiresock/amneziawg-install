@@ -74,7 +74,28 @@ pub async fn find_by_id(pool: &SqlitePool, id: i64) -> Result<Option<PeerRow>, s
     .await
 }
 
-/// Return the `limit` most-recent snapshots for a given peer `public_key`.
+/// Return snapshots for a peer captured on or after `since_rfc3339`, ordered
+/// by `captured_at` **ascending** (oldest first).
+///
+/// Used by the traffic-history endpoint to feed `domain::history::compute_history`.
+pub async fn find_snapshots_since(
+    pool: &SqlitePool,
+    public_key: &str,
+    since_rfc3339: &str,
+) -> Result<Vec<SnapshotRow>, sqlx::Error> {
+    sqlx::query_as::<_, SnapshotRow>(
+        "SELECT id, public_key, captured_at, endpoint, last_handshake_at, rx_bytes, tx_bytes
+         FROM   snapshots
+         WHERE  public_key = ?
+           AND  captured_at >= ?
+         ORDER  BY captured_at ASC",
+    )
+    .bind(public_key)
+    .bind(since_rfc3339)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn find_snapshots(
     pool: &SqlitePool,
     public_key: &str,
@@ -203,5 +224,49 @@ mod tests {
             .await
             .expect("snapshots");
         assert_eq!(rows.len(), 3);
+    }
+
+    // ── find_snapshots_since ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_snapshots_since_empty() {
+        let db = test_db().await;
+        let rows = find_snapshots_since(&db.pool, "NO_SUCH_KEY=", "2026-01-01T00:00:00Z")
+            .await
+            .expect("snapshots_since");
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_snapshots_since_filters_by_time() {
+        let db = test_db().await;
+        insert_snapshot(&db.pool, "KEY_SINCE=", "2026-01-01T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_SINCE=", "2026-01-05T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_SINCE=", "2026-01-10T00:00:00Z").await;
+
+        // Request snapshots on or after Jan 5 – should return Jan 5 and Jan 10
+        let rows = find_snapshots_since(&db.pool, "KEY_SINCE=", "2026-01-05T00:00:00Z")
+            .await
+            .expect("snapshots_since");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].captured_at, "2026-01-05T00:00:00Z");
+        assert_eq!(rows[1].captured_at, "2026-01-10T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn find_snapshots_since_ordered_ascending() {
+        let db = test_db().await;
+        // Insert out-of-order
+        insert_snapshot(&db.pool, "KEY_ASC=", "2026-01-10T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_ASC=", "2026-01-01T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_ASC=", "2026-01-05T00:00:00Z").await;
+
+        let rows = find_snapshots_since(&db.pool, "KEY_ASC=", "2026-01-01T00:00:00Z")
+            .await
+            .expect("snapshots_since");
+        assert_eq!(rows.len(), 3);
+        // Ascending: oldest first
+        assert!(rows[0].captured_at < rows[1].captured_at);
+        assert!(rows[1].captured_at < rows[2].captured_at);
     }
 }

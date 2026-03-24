@@ -1,5 +1,7 @@
 //! Core domain types shared across the application.
 
+pub mod history;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
