@@ -114,7 +114,35 @@ pub async fn find_snapshots(
     .await
 }
 
-/// Reset all config-mapping fields on every peer to their default (no config).
+/// Update the human-editable metadata fields (`display_name`, `comment`) for a
+/// single peer.
+///
+/// Pass `None` for a field to store `NULL` (clear the value).  The caller
+/// should normalise the values with `domain::normalize_display_name` and
+/// `domain::normalize_comment` before calling this function.
+///
+/// Returns the updated `PeerRow`, or `None` if no peer with the given `id`
+/// exists.
+pub async fn update_peer_metadata(
+    pool: &SqlitePool,
+    id: i64,
+    display_name: Option<&str>,
+    comment: Option<&str>,
+) -> Result<Option<PeerRow>, sqlx::Error> {
+    sqlx::query(
+        "UPDATE peers
+         SET    display_name = ?, comment = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE  id = ?",
+    )
+    .bind(display_name)
+    .bind(comment)
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    find_by_id(pool, id).await
+}
+
 ///
 /// Call this at the start of every config-mapping step so that peers whose
 /// config files have been removed are correctly unmarked.  The subsequent
@@ -393,5 +421,68 @@ mod tests {
         let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
         assert_eq!(row.has_config, 1);
         assert_eq!(row.config_name.as_deref(), Some("idem-config"));
+    }
+
+    // ── update_peer_metadata ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_peer_metadata_name_only() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_RENAME=", None).await;
+
+        let row = update_peer_metadata(&db.pool, id, Some("Alice"), None)
+            .await
+            .expect("update")
+            .expect("row");
+        assert_eq!(row.display_name.as_deref(), Some("Alice"));
+        assert!(row.comment.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_peer_metadata_comment_only() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_COMMENT=", Some("ExistingName")).await;
+
+        let row = update_peer_metadata(&db.pool, id, Some("ExistingName"), Some("Main phone"))
+            .await
+            .expect("update")
+            .expect("row");
+        assert_eq!(row.display_name.as_deref(), Some("ExistingName"));
+        assert_eq!(row.comment.as_deref(), Some("Main phone"));
+    }
+
+    #[tokio::test]
+    async fn update_peer_metadata_both_fields() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_BOTH=", None).await;
+
+        let row = update_peer_metadata(&db.pool, id, Some("Bob"), Some("Primary device"))
+            .await
+            .expect("update")
+            .expect("row");
+        assert_eq!(row.display_name.as_deref(), Some("Bob"));
+        assert_eq!(row.comment.as_deref(), Some("Primary device"));
+    }
+
+    #[tokio::test]
+    async fn update_peer_metadata_clears_name_with_none() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_CLEAR_NAME=", Some("ToBeCleared")).await;
+
+        let row = update_peer_metadata(&db.pool, id, None, None)
+            .await
+            .expect("update")
+            .expect("row");
+        assert!(row.display_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_peer_metadata_invalid_id_returns_none() {
+        let db = test_db().await;
+        // No peers inserted – ID 9999 must not exist.
+        let result = update_peer_metadata(&db.pool, 9999, Some("Ghost"), None)
+            .await
+            .expect("no db error");
+        assert!(result.is_none());
     }
 }

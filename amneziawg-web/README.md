@@ -5,7 +5,7 @@ A self-hosted web panel that provides **visibility and basic management** for
 installations managed via the
 [amneziawg-install](https://github.com/wiresock/amneziawg-install) script.
 
-> **Status:** read-only monitoring panel with traffic history, config discovery, and basic HTML UI · auth not yet available
+> **Status:** read-only monitoring panel with traffic history, config discovery, peer renaming, and basic HTML UI · auth not yet available
 
 ---
 
@@ -17,22 +17,24 @@ installations managed via the
 - **Config discovery** – scans `/etc/amneziawg/clients/` for `*.conf` files,
   extracts the `[Peer] PublicKey` and `[Interface] Address` fields, and maps
   each config file to the corresponding live peer by public key.
+- **Peer rename / comment** – `PATCH /api/peers/:id` accepts JSON
+  `{"display_name": "...", "comment": "..."}` and saves the values in the DB.
+  The HTML detail page also provides a plain-HTML edit form.
 - **`GET /`** – server-rendered HTML peer list (name, status, endpoint, handshake, RX, TX).
-- **`GET /peers/:id`** – server-rendered HTML peer detail page (identity, latest stats, recent snapshots).
+- **`GET /peers/:id`** – server-rendered HTML peer detail page with an edit form.
 - **`GET /api/health`** – liveness probe.
 - **`GET /api/peers`** – returns all known peers with resolved name, status,
   allowed IPs, endpoint, handshake time, RX/TX counters, and config metadata.
 - **`GET /api/peers/:id`** – returns full peer detail including 50 most-recent snapshots.
-- **`GET /api/peers/:id/history?range=24h|7d|30d`** – returns per-snapshot RX/TX history
-  with deltas and summary totals. Counter resets are handled gracefully (zero delta).
+- **`GET /api/peers/:id/history?range=24h|7d|30d`** – traffic history with deltas and summary totals.
 - **Status derivation** – `online` / `inactive` / `disabled` / `unlinked`
   based on last-handshake age and config presence.
 - **Display-name fallback** – `display_name` → `config_name` → `peer-<key-prefix>`.
 
 ## What is NOT yet implemented
 
-- Authentication (planned: session tokens or Basic Auth – Epic 8)
-- Admin write actions: rename, disable, config download (Epics 7–8)
+- Authentication (planned: session tokens or Basic Auth)
+- Admin write actions: enable/disable, config download
 - Traffic charts / sparklines in the HTML pages
 - Peer creation or deletion
 
@@ -62,13 +64,45 @@ cargo build --release
 
 ---
 
+## Peer naming
+
+Every peer is assigned a human-readable name resolved through this fallback chain:
+
+| Priority | Source         | When used                                          |
+|----------|----------------|----------------------------------------------------|
+| 1        | `display_name` | User has explicitly set a name via the edit form or API |
+| 2        | `config_name`  | A matching `*.conf` file was discovered             |
+| 3        | `peer-<8-char-prefix>` | Fallback generated from the public key prefix |
+
+### Updating a name or comment
+
+**Via the API:**
+
+```http
+PATCH /api/peers/:id
+Content-Type: application/json
+
+{ "display_name": "Ivan iPhone", "comment": "Main phone" }
+```
+
+- Both fields are optional. Absent fields are left unchanged.
+- Empty or blank strings clear the field (set to NULL).
+- `display_name` is capped at 128 characters; `comment` at 512.
+- Returns the full peer detail DTO.
+- `404` if the peer does not exist.
+
+**Via the HTML UI:**
+
+Navigate to `/peers/:id` and fill in the "Edit peer" form.
+
+---
+
 ## Config discovery
 
 After each AWG poll, the poller scans `AWG_CONFIG_DIR` for `*.conf` files.
 
 For each file:
-1. The `[Peer] PublicKey` field is extracted – this is the server endpoint's public
-   key as seen by the client config, which also appears in `awg show` output.
+1. The `[Peer] PublicKey` field is extracted.
 2. The peer row matching that public key is updated with `has_config = 1`,
    `config_name` (filename stem), and `config_path` (absolute path).
 
@@ -76,12 +110,7 @@ Peers with no matching config file have `has_config = 0` and are shown as
 **unlinked** in the UI and API.
 
 The mapping is **idempotent**: all config fields are reset at the start of each
-scan and re-applied from the current set of files.  Removing a config file will
-automatically mark the peer as unlinked on the next poll cycle.
-
-Config files that cannot be read are logged as warnings and skipped; the rest of
-the scan continues.  If the config directory does not exist, the mapping step is
-skipped entirely (peers remain unlinked).
+scan and re-applied from the current set of files.
 
 ---
 
@@ -90,28 +119,13 @@ skipped entirely (peers remain unlinked).
 | Method | Path                          | Description                                      |
 |--------|-------------------------------|--------------------------------------------------|
 | GET    | `/`                           | HTML peer list page                              |
-| GET    | `/peers/:id`                  | HTML peer detail page                            |
+| GET    | `/peers/:id`                  | HTML peer detail + edit form                     |
+| POST   | `/peers/:id`                  | HTML form submit (redirect back on success)      |
 | GET    | `/api/health`                 | Liveness probe – `{"status":"ok"}`               |
-| GET    | `/api/peers`                  | List all peers (array of summary DTOs)           |
-| GET    | `/api/peers/:id`              | Get one peer by integer ID (detail DTO)          |
-| GET    | `/api/peers/:id/history`      | Traffic history (default `range=24h`)            |
-
-### Traffic history ranges
-
-| Parameter  | Window       |
-|------------|--------------|
-| `range=24h`| Last 24 hours |
-| `range=7d` | Last 7 days   |
-| `range=30d`| Last 30 days  |
-
-### Counter-reset handling
-
-AWG byte counters are monotonic within a kernel session.  When the AWG
-interface is restarted the counters reset to zero.  The history endpoint
-detects a reset when a snapshot's counter is *lower* than the previous
-snapshot's counter, and uses **0** as the delta for that step
-(`u64::saturating_sub`).  This prevents negative deltas and avoids
-subtracting traffic from summary totals.
+| GET    | `/api/peers`                  | List all peers                                   |
+| GET    | `/api/peers/:id`              | Get one peer by integer ID                       |
+| PATCH  | `/api/peers/:id`              | Update display name and/or comment               |
+| GET    | `/api/peers/:id/history`      | Traffic history (`range=24h|7d|30d`)             |
 
 ### Status values
 
@@ -124,22 +138,10 @@ subtracting traffic from summary totals.
 
 ---
 
-## AWG dump format assumptions
-
-`awg show all dump` output is assumed to follow the `wg show all dump`
-tab-separated format:
-
-- **Interface line** (5 fields): `interface private_key public_key listen_port fwmark`
-- **Peer line** (9 fields): `interface public_key preshared_key endpoint allowed_ips latest_handshake rx_bytes tx_bytes persistent_keepalive`
-
-Private-key fields are read and immediately discarded.
-
----
-
 ## Development
 
 ```bash
-cargo test                        # 64 tests
+cargo test                        # 84 tests
 cargo fmt --check
 cargo clippy -- -D warnings
 ```

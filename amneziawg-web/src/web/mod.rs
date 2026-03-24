@@ -6,9 +6,9 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
-    Json, Router,
+    Form, Json, Router,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,10 @@ use tracing::error;
 use crate::db::peers::{PeerRow, SnapshotRow};
 use crate::db::Database;
 use crate::domain::history::{compute_history, HistoryPoint, HistorySummary, SnapshotInput};
-use crate::domain::{resolve_display_name, PeerStatus, ONLINE_THRESHOLD_SECS};
+use crate::domain::{
+    normalize_comment, normalize_display_name, resolve_display_name, PeerStatus,
+    ONLINE_THRESHOLD_SECS,
+};
 
 // ── Error helper ────────────────────────────────────────────────────────────
 
@@ -55,6 +58,8 @@ pub struct PeerSummaryDto {
     pub public_key: String,
     /// Stem of the matching `.conf` filename, if known.
     pub config_name: Option<String>,
+    /// Whether a matching client config file has been discovered.
+    pub has_config: bool,
     /// Comma-separated list of allowed CIDRs.
     pub allowed_ips: String,
     pub endpoint: Option<String>,
@@ -113,6 +118,24 @@ pub struct HistoryQuery {
     pub range: Option<String>,
 }
 
+/// Request body for `PATCH /api/peers/:id`.
+///
+/// Both fields are optional.  If a field is absent the existing value is kept.
+/// If a field is provided with an empty or blank string, the value is cleared
+/// (set to NULL).
+#[derive(Debug, Deserialize)]
+pub struct PatchPeerRequest {
+    pub display_name: Option<String>,
+    pub comment: Option<String>,
+}
+
+/// URL-encoded form body submitted by the HTML edit form on `POST /peers/:id`.
+#[derive(Debug, Deserialize)]
+pub struct PeerEditForm {
+    pub display_name: Option<String>,
+    pub comment: Option<String>,
+}
+
 // ── Conversion helpers ───────────────────────────────────────────────────────
 
 fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
@@ -134,6 +157,7 @@ fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
         name,
         public_key: row.public_key,
         config_name: row.config_name,
+        has_config,
         allowed_ips: row.allowed_ips,
         endpoint: row.endpoint,
         latest_handshake_at: last_handshake,
@@ -213,11 +237,11 @@ pub fn router(db: Database) -> Router {
     Router::new()
         // HTML pages
         .route("/", get(page_peer_list))
-        .route("/peers/:id", get(page_peer_detail))
+        .route("/peers/:id", get(page_peer_detail).post(post_peer_edit))
         // JSON API
         .route("/api/health", get(health))
         .route("/api/peers", get(list_peers))
-        .route("/api/peers/:id", get(get_peer))
+        .route("/api/peers/:id", get(get_peer).patch(patch_peer))
         .route("/api/peers/:id/history", get(get_peer_history))
         .with_state(db)
         .layer(TraceLayer::new_for_http())
@@ -311,6 +335,65 @@ async fn get_peer_history(
     Ok(Json(dto).into_response())
 }
 
+/// `PATCH /api/peers/:id` – update a peer's display name and/or comment.
+///
+/// Both request fields are optional:
+/// - If absent, the corresponding DB field is left unchanged.
+/// - If present and blank/empty after trimming, the field is cleared (NULL).
+///
+/// Returns the full peer detail DTO (same as `GET /api/peers/:id`).
+/// Returns HTTP 404 if the peer does not exist.
+async fn patch_peer(
+    State(db): State<Database>,
+    Path(id): Path<i64>,
+    Json(body): Json<PatchPeerRequest>,
+) -> Result<Response, ApiError> {
+    // Load the existing peer so we can apply partial updates.
+    let existing = match crate::db::peers::find_by_id(&db.pool, id).await? {
+        Some(r) => r,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "peer not found" })),
+            )
+                .into_response())
+        }
+    };
+
+    // Merge: if the caller provided a field, normalise it; otherwise keep the
+    // existing DB value.
+    let new_display_name = match body.display_name {
+        Some(v) => normalize_display_name(&v),
+        None => existing.display_name.clone(),
+    };
+    let new_comment = match body.comment {
+        Some(v) => normalize_comment(&v),
+        None => existing.comment.clone(),
+    };
+
+    let updated = crate::db::peers::update_peer_metadata(
+        &db.pool,
+        id,
+        new_display_name.as_deref(),
+        new_comment.as_deref(),
+    )
+    .await?;
+
+    match updated {
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "peer not found" })),
+        )
+            .into_response()),
+        Some(peer_row) => {
+            let public_key = peer_row.public_key.clone();
+            let snapshots = crate::db::peers::find_snapshots(&db.pool, &public_key, 50).await?;
+            let dto = peer_row_to_detail(peer_row, snapshots);
+            Ok(Json(dto).into_response())
+        }
+    }
+}
+
 // ── HTML Handlers ─────────────────────────────────────────────────────────────
 
 /// `GET /` – server-rendered peer list page.
@@ -339,6 +422,43 @@ async fn page_peer_detail(
             Ok(Html(render_peer_detail(&dto)).into_response())
         }
     }
+}
+
+/// `POST /peers/:id` – accept the HTML edit form, update the peer, and redirect
+/// back to the detail page.
+///
+/// HTML `<form>` elements do not support `PATCH`, so the UI uses a POST to this
+/// page-level route, while the JSON API uses `PATCH /api/peers/:id`.
+async fn post_peer_edit(
+    State(db): State<Database>,
+    Path(id): Path<i64>,
+    Form(form): Form<PeerEditForm>,
+) -> Result<Response, ApiError> {
+    // 404 if the peer does not exist.
+    if crate::db::peers::find_by_id(&db.pool, id).await?.is_none() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Html("<h1>Peer not found</h1>".to_string()),
+        )
+            .into_response());
+    }
+
+    let display_name = form
+        .display_name
+        .as_deref()
+        .and_then(normalize_display_name);
+    let comment = form.comment.as_deref().and_then(normalize_comment);
+
+    crate::db::peers::update_peer_metadata(
+        &db.pool,
+        id,
+        display_name.as_deref(),
+        comment.as_deref(),
+    )
+    .await?;
+
+    // Redirect back to the detail page (PRG pattern).
+    Ok(Redirect::to(&format!("/peers/{id}")).into_response())
 }
 
 // ── HTML rendering ────────────────────────────────────────────────────────────
@@ -395,6 +515,13 @@ fn html_head(title: &str) -> String {
   a:hover {{ text-decoration: underline; }}
   .meta {{ font-size: .85rem; color: #666; margin-bottom: 1.5rem; }}
   .back {{ margin-bottom: 1rem; display: block; }}
+  .edit-form {{ margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; max-width: 480px; }}
+  .edit-form h2 {{ margin-top: 0; font-size: 1.1rem; }}
+  .edit-form label {{ display: block; font-weight: bold; margin-bottom: .25rem; margin-top: .75rem; }}
+  .edit-form input[type=text], .edit-form textarea {{ width: 100%; padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 3px; font-family: inherit; font-size: .95rem; box-sizing: border-box; }}
+  .edit-form textarea {{ resize: vertical; min-height: 4rem; }}
+  .edit-form button[type=submit] {{ margin-top: 1rem; padding: .4rem 1.1rem; background: #0066cc; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .95rem; }}
+  .edit-form button[type=submit]:hover {{ background: #0055aa; }}
 </style>
 </head>
 <body>
@@ -496,7 +623,44 @@ fn render_peer_detail(dto: &PeerDetailDto) -> String {
             esc(cn)
         ));
     }
+    if let Some(ref cp) = dto.config_path {
+        buf.push_str(&format!(
+            "<tr><th>Config path</th><td><code>{}</code></td></tr>\n",
+            esc(cp)
+        ));
+    }
+    if let Some(ref dn) = dto.display_name {
+        buf.push_str(&format!(
+            "<tr><th>Display name</th><td>{}</td></tr>\n",
+            esc(dn)
+        ));
+    }
+    if let Some(ref cm) = dto.comment {
+        buf.push_str(&format!("<tr><th>Comment</th><td>{}</td></tr>\n", esc(cm)));
+    }
     buf.push_str("</table>\n");
+
+    // Edit form
+    let current_display_name = dto.display_name.as_deref().unwrap_or("");
+    let current_comment = dto.comment.as_deref().unwrap_or("");
+    buf.push_str(&format!(
+        r#"<div class="edit-form">
+<h2>Edit peer</h2>
+<form method="POST" action="/peers/{id}">
+  <label for="display_name">Display name</label>
+  <input type="text" id="display_name" name="display_name"
+         value="{dn}" maxlength="128" placeholder="e.g. Ivan iPhone">
+  <label for="comment">Comment</label>
+  <textarea id="comment" name="comment" maxlength="512"
+            placeholder="Optional note about this peer">{cm}</textarea>
+  <button type="submit">Save</button>
+</form>
+</div>
+"#,
+        id = dto.id,
+        dn = esc(current_display_name),
+        cm = esc(current_comment),
+    ));
 
     // Recent snapshots
     buf.push_str(&format!(
@@ -905,6 +1069,193 @@ mod tests {
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.contains("Diana"));
         assert!(html.starts_with("<!DOCTYPE html>"));
+    }
+
+    // ── PATCH /api/peers/:id ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn patch_peer_updates_name() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "PATCHKEY1234567890==", None).await;
+
+        let app = router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"Renamed Peer"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["display_name"], "Renamed Peer");
+        assert_eq!(json["name"], "Renamed Peer");
+    }
+
+    #[tokio::test]
+    async fn patch_peer_updates_comment() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "CMTKEY1234567890==", Some("Alice")).await;
+
+        let app = router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"comment":"Main device"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // display_name should be preserved (field absent in request)
+        assert_eq!(json["display_name"], "Alice");
+        assert_eq!(json["comment"], "Main device");
+    }
+
+    #[tokio::test]
+    async fn patch_peer_clears_name_with_blank_string() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "CLEARKEY1234567890==", Some("ToBeCleared")).await;
+
+        let app = router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Blank name normalises to NULL → falls back to key prefix in "name"
+        assert_eq!(json["display_name"], serde_json::Value::Null);
+        assert!(json["name"].as_str().unwrap().starts_with("peer-"));
+    }
+
+    #[tokio::test]
+    async fn patch_peer_not_found_returns_404() {
+        let app = router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/peers/9999")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"Ghost"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn patch_peer_empty_body_leaves_values_unchanged() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "EMPTYKEY1234567890==", Some("Unchanged")).await;
+
+        let app = router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["display_name"], "Unchanged");
+    }
+
+    // ── has_config in peer list ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_peers_includes_has_config_field() {
+        let db = test_db().await;
+        insert_peer(&db, "HCKEY1234567890==", None).await;
+
+        let app = router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let peer = &json.as_array().unwrap()[0];
+        // has_config should be present and false (no config file linked)
+        assert_eq!(peer["has_config"], false);
+    }
+
+    // ── HTML detail page shows edit form ───────────────────────────────────
+
+    #[tokio::test]
+    async fn peer_detail_page_contains_edit_form() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "FORMKEY1234567890==", Some("Editable")).await;
+
+        let app = router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        // Form must be present with correct action
+        assert!(html.contains(&format!("action=\"/peers/{id}\"")));
+        assert!(html.contains("name=\"display_name\""));
+        assert!(html.contains("name=\"comment\""));
+        // Existing name must be pre-filled
+        assert!(html.contains("Editable"));
     }
 
     // ── HTML helpers ───────────────────────────────────────────────────────

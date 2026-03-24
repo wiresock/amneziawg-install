@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 /// Seconds within which a peer is considered "online" based on last handshake.
 pub const ONLINE_THRESHOLD_SECS: i64 = 180;
 
+/// Maximum allowed length (in Unicode scalar values) for a peer display name.
+pub const MAX_DISPLAY_NAME_LEN: usize = 128;
+/// Maximum allowed length (in Unicode scalar values) for a peer comment.
+pub const MAX_COMMENT_LEN: usize = 512;
+
 /// Public-key fingerprint used as the canonical peer identifier.
 /// Private keys are NEVER stored or logged.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
@@ -68,6 +73,42 @@ impl PeerStatus {
             None => PeerStatus::Inactive,
         }
     }
+}
+
+/// Normalize a candidate display name.
+///
+/// Rules:
+/// - Leading/trailing whitespace is stripped.
+/// - Empty result → `None` (clears the field).
+/// - Truncated to at most `MAX_DISPLAY_NAME_LEN` Unicode scalar values.
+pub fn normalize_display_name(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(trimmed, MAX_DISPLAY_NAME_LEN))
+}
+
+/// Normalize a candidate comment string.
+///
+/// Rules:
+/// - Leading/trailing whitespace is stripped.
+/// - Empty result → `None` (clears the field).
+/// - Truncated to at most `MAX_COMMENT_LEN` Unicode scalar values.
+pub fn normalize_comment(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(trimmed, MAX_COMMENT_LEN))
+}
+
+/// Return the first `max_chars` Unicode scalar values of `s`.
+/// If `s` is shorter, returns the full string without allocation.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    truncated
 }
 
 /// Resolve the human-readable display name for a peer.
@@ -232,5 +273,66 @@ mod tests {
             resolve_display_name(None, Some(""), "abcdef1234567890"),
             "peer-abcdef12"
         );
+    }
+
+    // ── normalize_display_name ─────────────────────────────────────────────
+
+    #[test]
+    fn normalize_name_trims_whitespace() {
+        assert_eq!(
+            normalize_display_name("  Alice  "),
+            Some("Alice".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_name_empty_returns_none() {
+        assert_eq!(normalize_display_name(""), None);
+        assert_eq!(normalize_display_name("   "), None);
+    }
+
+    #[test]
+    fn normalize_name_truncates_at_max_len() {
+        let long = "a".repeat(200);
+        let result = normalize_display_name(&long).unwrap();
+        assert_eq!(result.chars().count(), MAX_DISPLAY_NAME_LEN);
+    }
+
+    #[test]
+    fn normalize_name_short_not_truncated() {
+        let s = "Ivan iPhone";
+        assert_eq!(normalize_display_name(s), Some(s.to_string()));
+    }
+
+    #[test]
+    fn normalize_name_unicode_truncated_by_chars_not_bytes() {
+        // Each '☃' is 3 bytes; truncation must count chars, not bytes.
+        let long: String = "☃".repeat(200);
+        let result = normalize_display_name(&long).unwrap();
+        assert_eq!(result.chars().count(), MAX_DISPLAY_NAME_LEN);
+        assert!(result.is_empty() == false);
+    }
+
+    // ── normalize_comment ──────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_comment_trims_and_keeps() {
+        assert_eq!(
+            normalize_comment("  My phone  "),
+            Some("My phone".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_comment_empty_returns_none() {
+        assert_eq!(normalize_comment(""), None);
+        assert_eq!(normalize_comment("\t\n  "), None);
+    }
+
+    #[test]
+    fn normalize_comment_truncates_at_max_len() {
+        let long = "b".repeat(600);
+        let result = normalize_comment(&long).unwrap();
+        assert_eq!(result.chars().count(), MAX_COMMENT_LEN);
     }
 }

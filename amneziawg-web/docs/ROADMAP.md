@@ -29,6 +29,7 @@
 - [x] `PeerRow`/`SnapshotRow` + query fns + `connect_for_test` helper
 - [x] `find_snapshots_since` for history queries (ascending, time-bounded)
 - [x] `clear_all_config_mappings` + `apply_config_mapping` for idempotent mapping
+- [x] `update_peer_metadata` for rename/comment support
 
 ---
 
@@ -37,36 +38,33 @@
 - [x] Background Tokio task, configurable interval
 - [x] Snapshot insertion per poll; peer upsert (including `allowed_ips`)
 - [x] Config mapping step after AWG step; logged per cycle
-- [x] Rich logging: peer count, snapshot count, elapsed time, per-peer failures
 
 ---
 
 ## Epic 5 – Traffic History & Basic UI ✅ complete
 
 - [x] `GET /api/peers/:id/history?range=24h|7d|30d`
-- [x] Per-snapshot deltas with counter-reset handling (`saturating_sub`)
-- [x] Summary totals (`rx_total_delta`, `tx_total_delta`)
-- [x] `GET /` – server-rendered HTML peer list (table)
-- [x] `GET /peers/:id` – server-rendered HTML peer detail (identity + snapshots)
-- [x] `esc()` helper for XSS-safe HTML generation
-- [x] Human-readable byte formatting (`fmt_bytes`)
+- [x] Per-snapshot deltas with counter-reset handling
+- [x] `GET /` – server-rendered HTML peer list
+- [x] `GET /peers/:id` – server-rendered HTML peer detail + edit form
 
 ---
 
-## Epic 6 – Peer Details Enhancements 🔲 planned
+## Epic 6 – Peer Rename & Comment ✅ complete
 
-- [ ] Traffic sparkline SVG or simple ASCII chart in peer detail page
-- [ ] Pagination / search on peer list page
-- [ ] History chart linking from peer detail page
-- [ ] "Never seen" / "first seen" timestamps
+- [x] `normalize_display_name()` / `normalize_comment()` in domain layer
+- [x] `update_peer_metadata(pool, id, name, comment)` DB function
+- [x] `PATCH /api/peers/:id` – JSON API endpoint (partial update)
+- [x] `POST /peers/:id` – HTML form endpoint (PRG redirect)
+- [x] Edit form with pre-filled values in peer detail page
+- [x] `has_config` field in `GET /api/peers` summary response
 
 ---
 
 ## Epic 7 – Admin Actions 🔲 planned
 
-- [ ] Rename / comment peer (`POST /api/peers/:id/rename`)
-- [ ] Enable / disable peer
-- [ ] Download client config
+- [ ] Enable / disable peer (`PATCH /api/peers/:id` with `"disabled": true/false`)
+- [ ] Download client config (`GET /api/peers/:id/config`)
 - [ ] Audit log viewer (`events` table)
 
 ---
@@ -76,20 +74,17 @@
 - [ ] Session-based authentication
 - [ ] Admin vs. viewer roles
 - [ ] Rate limiting
-- [ ] CSRF protection
+- [ ] CSRF protection (already partially mitigated: no state-changing GET handlers)
 
 ---
 
 ## Recommended next step
 
-**Basic rename/comment actions** (Epic 7 starter):
-- `POST /api/peers/:id` with `{ "display_name": "...", "comment": "..." }`
-- No destructive actions; just metadata writes
-- Makes the UI immediately more useful for labelling peers
-
-Alternatively, **authentication layer** (Epic 8 starter):
-- Basic session cookie auth for the HTML pages
+**Authentication layer** (Epic 8 starter):
+- Session cookie auth for the HTML pages
 - API key support for the JSON endpoints
 - Required before any public deployment
 
-Prefer the smallest complete useful increment.
+This is the most important missing safety feature.  The rename/comment feature
+(Epic 6) is already useful internally but must be protected before exposing
+the panel on the public internet.
