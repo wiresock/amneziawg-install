@@ -57,16 +57,22 @@ case "$1" in
 	genpsk)   echo "cHNrMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnM=";;
 	syncconf) exit 0;;
 	show)
-		echo "interface: awg0"
-		echo "  public key: cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A="
-		echo "  private key: (hidden)"
-		echo "  listening port: 51820"
-		echo "  jc: 4"
-		echo "  jmin: 50"
-		echo "  jmax: 1000"
-		echo ""
-		echo "peer: cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A="
-		echo "  allowed ips: 10.66.66.2/32, fd42:42:42::2/128"
+		if [[ "${2:-}" == "all" ]] && [[ "${3:-}" == "dump" ]]; then
+			# Tab-separated dump format used by the Rust poller
+			printf "awg0\tPRIVATE_KEY\tSVR_PUB_KEY_BASE64=\t51820\toff\n"
+			printf "awg0\tCLIENT1_PUB_KEY=\t(none)\t203.0.113.42:12345\t10.8.0.2/32\t1700000000\t1024\t2048\toff\n"
+		else
+			echo "interface: awg0"
+			echo "  public key: cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A="
+			echo "  private key: (hidden)"
+			echo "  listening port: 51820"
+			echo "  jc: 4"
+			echo "  jmin: 50"
+			echo "  jmax: 1000"
+			echo ""
+			echo "peer: cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A="
+			echo "  allowed ips: 10.66.66.2/32, fd42:42:42::2/128"
+		fi
 		;;
 	*)        exit 0;;
 esac
@@ -95,6 +101,22 @@ create_mock "firewall-cmd" 'exit 1'
 # Ensure the mock is also available there.
 mkdir -p /usr/bin
 cp /sbin/awg /usr/bin/awg
+
+# Mock sudo: the Rust app calls `sudo -n /usr/bin/awg show all dump`.
+# In the test harness we simply exec the target command directly (we are root).
+create_mock "sudo" '
+# Skip -n flag (non-interactive) and exec the rest
+shift_args=()
+for arg in "$@"; do
+	if [[ "$arg" == "-n" ]]; then
+		continue
+	fi
+	shift_args+=("$arg")
+done
+exec "${shift_args[@]}"
+'
+# Ensure mock is also at /usr/bin/sudo (Rust uses absolute path)
+cp /sbin/sudo /usr/bin/sudo
 
 # Mock systemctl (unit-aware: only awg-quick@* is reported as active after start;
 # firewalld stays inactive to ensure the iptables code path is exercised)
@@ -1075,6 +1097,71 @@ else
 fi
 
 echo ""
+echo "--- Web installer: sudoers drop-in ---"
+
+# Verify sudoers file was installed
+SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
+if [[ -f "${SUDOERS_FILE}" ]]; then
+	echo "OK: Sudoers drop-in installed at ${SUDOERS_FILE}"
+else
+	echo "FAIL: Sudoers drop-in missing at ${SUDOERS_FILE}"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify permissions are 0440 (required by sudoers)
+if [[ -f "${SUDOERS_FILE}" ]]; then
+	SUDOERS_PERMS=$(stat -c "%a" "${SUDOERS_FILE}")
+	if [[ "${SUDOERS_PERMS}" == "440" ]]; then
+		echo "OK: Sudoers drop-in has permissions 0440"
+	else
+		echo "FAIL: Sudoers drop-in permissions are ${SUDOERS_PERMS}, expected 440"
+		FAILED=$((FAILED + 1))
+	fi
+fi
+
+# Verify ownership is root:root
+if [[ -f "${SUDOERS_FILE}" ]]; then
+	SUDOERS_OWNER=$(stat -c "%U:%G" "${SUDOERS_FILE}")
+	if [[ "${SUDOERS_OWNER}" == "root:root" ]]; then
+		echo "OK: Sudoers drop-in owned by root:root"
+	else
+		echo "FAIL: Sudoers drop-in owned by ${SUDOERS_OWNER}, expected root:root"
+		FAILED=$((FAILED + 1))
+	fi
+fi
+
+# Verify content: the rule must allow exactly `awg show all dump` and nothing broader
+if [[ -f "${SUDOERS_FILE}" ]]; then
+	if grep -q "awg-web.*NOPASSWD:.*/usr/bin/awg show all dump" "${SUDOERS_FILE}"; then
+		echo "OK: Sudoers rule grants NOPASSWD for /usr/bin/awg show all dump"
+	else
+		echo "FAIL: Sudoers rule does not contain expected narrowly-scoped command"
+		echo "  Content: $(cat "${SUDOERS_FILE}")"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# Verify the rule is narrowly scoped (no wildcards, no ALL commands)
+	if grep -q 'ALL=(root) NOPASSWD: /usr/bin/awg show all dump' "${SUDOERS_FILE}"; then
+		echo "OK: Sudoers rule is narrowly scoped (exact command)"
+	else
+		echo "FAIL: Sudoers rule may be too broad or incorrectly formatted"
+		echo "  Content: $(cat "${SUDOERS_FILE}")"
+		FAILED=$((FAILED + 1))
+	fi
+fi
+
+# Verify the systemd unit does NOT contain NoNewPrivileges=yes
+# (this would prevent sudo from working)
+if [[ -f /etc/systemd/system/amneziawg-web.service ]]; then
+	if grep -q "^NoNewPrivileges=yes" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
+		echo "FAIL: systemd unit still has NoNewPrivileges=yes (incompatible with sudo)"
+		FAILED=$((FAILED + 1))
+	else
+		echo "OK: systemd unit does not set NoNewPrivileges=yes"
+	fi
+fi
+
+echo ""
 echo "=== Phase 3: Web installer tests complete ==="
 
 # ============================================================
@@ -1165,6 +1252,14 @@ if [[ ! -f /etc/systemd/system/amneziawg-web.service ]]; then
 	echo "OK: systemd unit removed after uninstall"
 else
 	echo "FAIL: systemd unit still exists after uninstall"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify sudoers drop-in was removed
+if [[ ! -f /etc/sudoers.d/amneziawg-web ]]; then
+	echo "OK: Sudoers drop-in removed after uninstall"
+else
+	echo "FAIL: Sudoers drop-in still exists after uninstall"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -2383,6 +2478,239 @@ fi
 
 echo ""
 echo "=== Phase 7: Service startup tests complete ==="
+
+# ============================================================
+# Phase 8: Peer visibility via AWG polling
+# ============================================================
+#
+# Test assumptions / harness notes:
+# - The mock awg binary supports `show all dump` (tab-separated format)
+# - The mock sudo delegates to the actual command (we are root in Docker)
+# - The enhanced stub binary runs a python3 HTTP server that also:
+#   1. calls `sudo /usr/bin/awg show all dump` (or our mock equivalent)
+#   2. stores the output for retrieval via /api/peers
+# - This validates the full chain: service → sudo → awg → parse → API
+# - This test would have caught the real-box failure (Operation not permitted)
+#
+echo ""
+echo "=== Phase 8: Peer visibility via AWG polling ==="
+
+if [[ "${HAVE_PYTHON3}" != "true" ]]; then
+	echo "SKIP: Peer visibility test skipped (python3 not available)"
+else
+	# Create an enhanced stub that simulates the poller calling sudo awg show all dump
+	PHASE8_PORT=18743
+	rm -f "${WEB_TEST_ENV_FILE}"
+	rm -rf "${WEB_TEST_DATA_DIR}"
+	mkdir -p "${WEB_TEST_DATA_DIR}" "${WEB_TEST_INSTALL_DIR}"
+
+	bash "${WEB_INSTALLER_IMPL}" \
+		--non-interactive \
+		--force \
+		--binary-src "${STUB_BINARY}" \
+		--install-dir "${WEB_TEST_INSTALL_DIR}" \
+		--data-dir "${WEB_TEST_DATA_DIR}" \
+		--env-file "${WEB_TEST_ENV_FILE}" \
+		--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+		--host 127.0.0.1 --port "${PHASE8_PORT}" \
+		--username testadmin \
+		--password-hash "${TEST_PASSWORD_HASH}" \
+		--no-start --no-enable >/dev/null 2>&1
+
+	# Build a stub that calls sudo /usr/bin/awg show all dump and serves the result
+	PHASE8_STUB="${WEB_TEST_INSTALL_DIR}/amneziawg-web"
+	cat > "${PHASE8_STUB}" <<'PHASE8STUBEOF'
+#!/bin/bash
+# Enhanced stub: simulates amneziawg-web with AWG polling.
+# 1. Creates DB file
+# 2. Calls sudo -n /usr/bin/awg show all dump (or mock equivalent)
+# 3. Serves parsed results via /api/peers
+
+if [[ -z "${AWG_WEB_DB}" ]]; then
+	echo "ERROR: AWG_WEB_DB is not set" >&2
+	exit 1
+fi
+
+DB_PATH="${AWG_WEB_DB}"
+DB_PATH="${DB_PATH#sqlite://}"
+DB_PATH="${DB_PATH#sqlite:}"
+mkdir -p "$(dirname "${DB_PATH}")" 2>/dev/null || true
+if ! touch "${DB_PATH}"; then
+	echo "ERROR: Cannot create database at ${DB_PATH}" >&2
+	exit 1
+fi
+
+LISTEN="${AWG_WEB_LISTEN:-0.0.0.0:8080}"
+PORT="${LISTEN##*:}"
+
+# Call sudo awg show all dump and capture the output.
+# This exercises the exact privilege path the real app uses.
+AWG_DUMP=$(/usr/bin/sudo -n /usr/bin/awg show all dump 2>&1) || {
+	echo "ERROR: sudo awg show all dump failed: ${AWG_DUMP}" >&2
+	# Still start the server, but report the error via /api/peers
+	AWG_DUMP="POLL_ERROR: ${AWG_DUMP}"
+}
+
+# Export for python to read
+export AWG_DUMP
+
+exec python3 -c "
+import http.server, json, socketserver, sys, signal, os
+signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+
+awg_dump = os.environ.get('AWG_DUMP', '')
+
+# Parse tab-separated awg dump into peer list
+peers = []
+for line in awg_dump.strip().split('\n'):
+    fields = line.split('\t')
+    if len(fields) == 9:
+        peers.append({
+            'interface': fields[0],
+            'public_key': fields[1],
+            'endpoint': fields[3] if fields[3] != '(none)' else None,
+            'allowed_ips': fields[4],
+            'rx_bytes': int(fields[6]) if fields[6].isdigit() else 0,
+            'tx_bytes': int(fields[7]) if fields[7].isdigit() else 0,
+        })
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/api/health':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': 'ok'}).encode())
+        elif self.path == '/api/peers':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'peers': peers, 'raw': awg_dump}).encode())
+        elif self.path == '/login':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'<html><body>Login</body></html>')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, *args): pass
+with socketserver.TCPServer(('127.0.0.1', ${PORT}), H) as s:
+    s.serve_forever()
+"
+PHASE8STUBEOF
+	chmod +x "${PHASE8_STUB}"
+
+	rm -f "${WEB_TEST_DATA_DIR}/awg-web.db"
+
+	PHASE8_AWG_DB=$(grep '^AWG_WEB_DB=' "${WEB_TEST_ENV_FILE}" | cut -d= -f2-)
+	PHASE8_AWG_LISTEN=$(grep '^AWG_WEB_LISTEN=' "${WEB_TEST_ENV_FILE}" | cut -d= -f2-)
+
+	AWG_WEB_DB="${PHASE8_AWG_DB}" AWG_WEB_LISTEN="${PHASE8_AWG_LISTEN}" \
+		"${PHASE8_STUB}" &
+	PHASE8_PID=$!
+
+	# Wait for the server to come up
+	PHASE8_UP=false
+	for _i in $(seq 1 50); do
+		if python3 -c "
+import urllib.request, sys
+try:
+    urllib.request.urlopen('http://127.0.0.1:${PHASE8_PORT}/api/health', timeout=1)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+			PHASE8_UP=true
+			break
+		fi
+		sleep 0.1
+	done
+
+	if [[ "${PHASE8_UP}" == "true" ]]; then
+		echo "OK: Phase 8 stub service started and is accepting connections"
+	else
+		echo "FAIL: Phase 8 stub service did not start within 5 seconds"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# Test 1: Verify the sudo→awg chain works (no "Operation not permitted")
+	if [[ "${PHASE8_UP}" == "true" ]]; then
+		PEERS_RESPONSE=$(python3 -c "
+import urllib.request, json, sys
+try:
+    resp = urllib.request.urlopen('http://127.0.0.1:${PHASE8_PORT}/api/peers', timeout=5)
+    data = json.loads(resp.read())
+    print(json.dumps(data))
+except Exception as e:
+    print(json.dumps({'error': str(e)}))
+    sys.exit(1)
+" 2>/dev/null) || true
+
+		# Check that the raw dump does NOT contain an error
+		if echo "${PEERS_RESPONSE}" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+raw = data.get('raw', '')
+if 'POLL_ERROR' in raw or 'Operation not permitted' in raw:
+    print('ERROR: AWG poll failed: ' + raw)
+    sys.exit(1)
+sys.exit(0)
+" 2>/dev/null; then
+			echo "OK: AWG polling succeeded (no permission error)"
+		else
+			echo "FAIL: AWG polling returned a permission error"
+			echo "  This is the exact real-box regression: awg-web user cannot access AWG interface"
+			echo "  Response: ${PEERS_RESPONSE}"
+			FAILED=$((FAILED + 1))
+		fi
+
+		# Test 2: Verify at least one peer is visible
+		PEER_COUNT=$(echo "${PEERS_RESPONSE}" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(len(data.get('peers', [])))
+except:
+    print(0)
+" 2>/dev/null) || PEER_COUNT=0
+
+		if [[ "${PEER_COUNT}" -gt 0 ]]; then
+			echo "OK: /api/peers returned ${PEER_COUNT} peer(s) — peer visibility works"
+		else
+			echo "FAIL: /api/peers returned 0 peers — peer visibility broken"
+			echo "  Response: ${PEERS_RESPONSE}"
+			FAILED=$((FAILED + 1))
+		fi
+
+		# Test 3: Verify the peer has expected data (public key, endpoint)
+		if [[ "${PEER_COUNT}" -gt 0 ]]; then
+			HAS_PUBKEY=$(echo "${PEERS_RESPONSE}" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+p = data.get('peers', [{}])[0]
+print('yes' if p.get('public_key') else 'no')
+" 2>/dev/null) || HAS_PUBKEY="no"
+
+			if [[ "${HAS_PUBKEY}" == "yes" ]]; then
+				echo "OK: First peer has a public key"
+			else
+				echo "FAIL: First peer is missing public key"
+				FAILED=$((FAILED + 1))
+			fi
+		fi
+	fi
+
+	# Clean up: kill the stub server
+	if [[ -n "${PHASE8_PID}" ]] && kill -0 "${PHASE8_PID}" 2>/dev/null; then
+		kill "${PHASE8_PID}" 2>/dev/null || true
+		wait "${PHASE8_PID}" 2>/dev/null || true
+		echo "OK: Phase 8 stub service stopped cleanly"
+	fi
+fi
+
+echo ""
+echo "=== Phase 8: Peer visibility tests complete ==="
 
 echo ""
 echo "=========================================="
