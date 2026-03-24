@@ -37,6 +37,7 @@ set -euo pipefail
 readonly SERVICE_NAME="amneziawg-web"
 readonly SERVICE_USER="awg-web"
 readonly SYSTEMD_UNIT_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
+readonly SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
 readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_DATA_DIR="/var/lib/amneziawg-web"
 readonly DEFAULT_ENV_DIR="/etc/amneziawg-web"
@@ -219,6 +220,7 @@ print_plan() {
     printf 'Will REMOVE:\n'
     printf '  Binary:       %s\n'  "${INSTALL_DIR}/${BINARY_NAME}"
     printf '  Systemd unit: %s\n'  "${SYSTEMD_UNIT_DEST}"
+    printf '  Sudoers:      %s\n'  "${SUDOERS_FILE}"
     printf '  Service:      stop + disable %s\n' "${SERVICE_NAME}"
     printf '\n'
     printf 'Will PRESERVE (unless purge flags are given):\n'
@@ -263,7 +265,10 @@ main() {
         info "Reloaded systemd daemon"
     fi
 
-    # 3. Remove binary
+    # 3. Remove sudoers drop-in
+    safe_rm_file "${SUDOERS_FILE}"
+
+    # 4. Remove binary
     local binary_path="${INSTALL_DIR}/${BINARY_NAME}"
     # Sanity-check the binary path before removing it
     if [[ "${binary_path}" != "${INSTALL_DIR}/${BINARY_NAME}" ]] || \
@@ -276,7 +281,7 @@ main() {
     fi
     safe_rm_file "${binary_path}"
 
-    # 4. Optional: purge config
+    # 5. Optional: purge config
     if [[ "${PURGE_CONFIG}" == "true" ]]; then
         if [[ "${FORCE}" != "true" ]]; then
             if ! confirm "PURGE config/env directory '${ENV_DIR}'? THIS IS IRREVERSIBLE." "false"; then
@@ -289,7 +294,7 @@ main() {
         fi
     fi
 
-    # 5. Optional: purge data
+    # 6. Optional: purge data
     if [[ "${PURGE_DATA}" == "true" ]]; then
         if [[ "${FORCE}" != "true" ]]; then
             if ! confirm "PURGE data directory '${DATA_DIR}'? ALL DATABASE DATA WILL BE LOST." "false"; then
@@ -302,7 +307,7 @@ main() {
         fi
     fi
 
-    # 6. Optional: remove service user
+    # 7. Optional: remove service user
     if [[ "${REMOVE_USER}" == "true" ]]; then
         if [[ "${FORCE}" != "true" ]]; then
             if ! confirm "Remove service user '${SERVICE_USER}'?" "false"; then

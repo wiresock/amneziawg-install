@@ -46,7 +46,10 @@ Environment=RUST_LOG=amneziawg_web=info
 # Adjust if configs are owned by the service user.
 ReadOnlyPaths=/etc/amneziawg
 
-NoNewPrivileges=yes
+# NoNewPrivileges is NOT set because the service invokes
+# `sudo /usr/bin/awg show all dump` via a tightly-scoped sudoers rule
+# (see /etc/sudoers.d/amneziawg-web).  The sudoers rule restricts access
+# to this single read-only command.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

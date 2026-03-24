@@ -25,6 +25,7 @@ set -euo pipefail
 readonly SERVICE_NAME="amneziawg-web"
 readonly SERVICE_USER="awg-web"
 readonly SYSTEMD_UNIT_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
+readonly SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
 
 # Default paths
 readonly DEFAULT_BINARY_SRC="./target/release/amneziawg-web"
@@ -621,6 +622,45 @@ install_binary() {
     info "Installed binary: ${dest}"
 }
 
+# ── Sudoers drop-in ───────────────────────────────────────────────────────────
+
+install_sudoers() {
+    step "Installing sudoers rule for AWG access"
+
+    # The web service runs as a non-root user but needs to read AWG interface
+    # state via `awg show all dump`.  This requires CAP_NET_ADMIN which is only
+    # available to root.  Instead of running the whole service as root, we
+    # install a tightly-scoped sudoers rule that grants the service user
+    # passwordless sudo for this single read-only command.
+    local rule="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump"
+
+    info "Sudoers rule: ${rule}"
+
+    # Write with strict permissions first, then validate.
+    printf '# Allow amneziawg-web service to read AWG interface state.\n' \
+        > "${SUDOERS_FILE}"
+    printf '# Installed by amneziawg-web-install.sh – do not edit manually.\n' \
+        >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule}" >> "${SUDOERS_FILE}"
+
+    chmod 0440 "${SUDOERS_FILE}"
+    chown root:root "${SUDOERS_FILE}"
+
+    # Validate syntax if visudo is available (best-effort).
+    if command -v visudo &>/dev/null; then
+        if visudo -cf "${SUDOERS_FILE}" &>/dev/null; then
+            info "Sudoers file validated: ${SUDOERS_FILE}"
+        else
+            warn "visudo validation failed for ${SUDOERS_FILE}."
+            warn "The file has been installed but may contain errors."
+        fi
+    else
+        info "visudo not available; skipping syntax check."
+    fi
+
+    info "Installed sudoers drop-in: ${SUDOERS_FILE}"
+}
+
 # ── Environment file generation ───────────────────────────────────────────────
 
 write_env_file() {
@@ -735,7 +775,6 @@ Group=${SERVICE_USER}
 ExecStart=${INSTALL_DIR}/amneziawg-web
 WorkingDirectory=${DATA_DIR}
 EnvironmentFile=${ENV_FILE}
-NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -796,6 +835,7 @@ print_summary() {
     printf "  Binary:           %s/amneziawg-web\n" "${INSTALL_DIR}"
     printf "  Database:         %s/awg-web.db\n" "${DATA_DIR}"
     printf "  Env file:         %s\n" "${ENV_FILE}"
+    printf "  Sudoers:          %s\n" "${SUDOERS_FILE}"
     printf "  Service:          %s\n" "${SERVICE_NAME}"
     printf "\n"
 
@@ -842,6 +882,7 @@ main() {
 
     setup_filesystem
     install_binary
+    install_sudoers
     write_env_file
     install_service_unit
     print_summary

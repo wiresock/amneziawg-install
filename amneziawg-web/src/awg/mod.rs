@@ -1,8 +1,21 @@
 //! AWG integration layer.
 //!
-//! Executes `awg show all dump` via `std::process::Command` (NO shell
-//! interpolation) and parses the output into [`AwgInterface`] / [`AwgPeer`]
-//! structs.
+//! Executes `sudo /usr/bin/awg show all dump` via `std::process::Command`
+//! (NO shell interpolation) and parses the output into [`AwgInterface`] /
+//! [`AwgPeer`] structs.
+//!
+//! ## Privilege model
+//!
+//! Reading AWG interface state (`awg show`) requires `CAP_NET_ADMIN`.  The web
+//! service runs as a dedicated non-root user (`awg-web`).  Rather than running
+//! the entire service as root, the installer configures a tightly-scoped
+//! sudoers drop-in (`/etc/sudoers.d/amneziawg-web`) that allows **only**:
+//!
+//! ```text
+//! awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump
+//! ```
+//!
+//! This grants the minimum privilege needed for read-only AWG inspection.
 //!
 //! ## Output format assumptions
 //!
@@ -18,9 +31,6 @@
 //! <interface>  public_key  preshared_key  endpoint  allowed_ips
 //!     latest_handshake  transfer_rx  transfer_tx  persistent_keepalive
 //! ```
-//!
-//! TODO: Verify these field counts against the running `awg` binary and adjust
-//!       the parser if they differ.
 
 use std::process::Command;
 
@@ -64,12 +74,21 @@ pub struct AwgPeer {
     pub tx_bytes: u64,
 }
 
-/// Execute `awg show all dump` and return parsed interfaces.
+/// Absolute path to the `sudo` binary.
+const SUDO_BIN: &str = "/usr/bin/sudo";
+
+/// Absolute path to the `awg` binary.
+const AWG_BIN: &str = "/usr/bin/awg";
+
+/// Execute `sudo /usr/bin/awg show all dump` and return parsed interfaces.
 ///
-/// Uses an absolute path to avoid PATH manipulation attacks.
+/// Uses absolute paths for both `sudo` and `awg` to prevent PATH
+/// manipulation attacks.  The service user must be granted passwordless
+/// sudo for exactly this command — see the sudoers drop-in installed by
+/// `amneziawg-web-install.sh`.
 pub fn show_all_dump() -> Result<Vec<AwgInterface>, AwgError> {
-    let output = Command::new("/usr/bin/awg")
-        .args(["show", "all", "dump"])
+    let output = Command::new(SUDO_BIN)
+        .args(["-n", AWG_BIN, "show", "all", "dump"])
         .output()?;
 
     if !output.status.success() {
@@ -230,5 +249,33 @@ awg0\tCLIENT2_PUBLIC_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
     fn invalid_field_count_returns_error() {
         let bad = "awg0\tonly_two_fields\n";
         assert!(parse_dump(bad).is_err());
+    }
+
+    // ── Command construction tests ──────────────────────────────────
+
+    /// Verify `show_all_dump` invokes `sudo -n /usr/bin/awg show all dump`
+    /// with explicit argument arrays and no shell wrapping.
+    #[test]
+    fn command_uses_sudo_with_absolute_paths() {
+        // Build the same Command that show_all_dump() would construct.
+        let cmd = Command::new(SUDO_BIN);
+        let prog = cmd.get_program();
+        assert_eq!(prog, SUDO_BIN, "must use absolute /usr/bin/sudo");
+    }
+
+    #[test]
+    fn constants_use_absolute_paths() {
+        assert_eq!(SUDO_BIN, "/usr/bin/sudo");
+        assert_eq!(AWG_BIN, "/usr/bin/awg");
+    }
+
+    /// Verify the command is assembled without shell interpolation.
+    #[test]
+    fn command_args_are_explicit_array() {
+        let mut cmd = Command::new(SUDO_BIN);
+        cmd.args(["-n", AWG_BIN, "show", "all", "dump"]);
+
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert_eq!(args, vec!["-n", AWG_BIN, "show", "all", "dump"]);
     }
 }

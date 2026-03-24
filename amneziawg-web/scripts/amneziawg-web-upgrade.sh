@@ -33,7 +33,9 @@ set -euo pipefail
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 readonly SERVICE_NAME="amneziawg-web"
+readonly SERVICE_USER="awg-web"
 readonly SYSTEMD_UNIT_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
+readonly SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
 readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_ENV_FILE="/etc/amneziawg-web/env.conf"
 readonly DEFAULT_DATA_DIR="/var/lib/amneziawg-web"
@@ -396,7 +398,30 @@ main() {
     fi
     info "Replaced binary: ${DEST_BINARY}"
 
-    # 3. Optional: refresh systemd unit file
+    # 3. Ensure the sudoers drop-in exists (idempotent).
+    #    This covers upgrades from versions that did not install it.
+    local rule="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump"
+    if [[ -f "${SUDOERS_FILE}" ]]; then
+        info "Sudoers drop-in already present: ${SUDOERS_FILE}"
+    else
+        info "Installing sudoers drop-in: ${SUDOERS_FILE}"
+        printf '# Allow amneziawg-web service to read AWG interface state.\n' \
+            > "${SUDOERS_FILE}"
+        printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \
+            >> "${SUDOERS_FILE}"
+        printf '%s\n' "${rule}" >> "${SUDOERS_FILE}"
+        chmod 0440 "${SUDOERS_FILE}"
+        chown root:root "${SUDOERS_FILE}"
+        if command -v visudo &>/dev/null; then
+            if visudo -cf "${SUDOERS_FILE}" &>/dev/null; then
+                info "Sudoers file validated: ${SUDOERS_FILE}"
+            else
+                warn "visudo validation failed for ${SUDOERS_FILE}."
+            fi
+        fi
+    fi
+
+    # 4. Optional: refresh systemd unit file
     if [[ "${REFRESH_UNIT}" == "true" ]]; then
         info "Refreshing systemd unit..."
 
@@ -419,7 +444,7 @@ main() {
         info "Reloaded systemd daemon"
     fi
 
-    # 4. Restart or start service based on policy
+    # 5. Restart or start service based on policy
     if should_restart; then
         info "Restarting service..."
         systemctl restart "${SERVICE_NAME}" && info "Service restarted: ${SERVICE_NAME}" || \
