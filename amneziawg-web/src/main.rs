@@ -107,12 +107,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // --- Database -----------------------------------------------------------
-    let db_url = if config.database_url.starts_with("sqlite:") {
-        config.database_url.clone()
-    } else {
-        format!("sqlite:{}", config.database_url)
-    };
-    let db = Database::connect(&db_url)
+    let db = Database::connect(&config.database_url)
         .await
         .context("failed to open database")?;
     db.migrate().await.context("database migration failed")?;
