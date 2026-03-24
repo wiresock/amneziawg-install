@@ -18,9 +18,11 @@ use tower_http::trace::TraceLayer;
 use tracing::error;
 
 use crate::auth::{
-    add_session, clear_session_cookie, extract_session_token, generate_session_id,
-    is_session_valid, make_session_cookie, new_session_store, remove_session, AuthConfig,
-    SessionStore,
+    add_session, check_and_record_login_attempt, clear_session_cookie, consume_login_csrf, csrf_eq,
+    extract_session_token, generate_login_csrf, generate_session_id, get_session_csrf,
+    is_session_valid, make_session_cookie, new_login_csrf_store, new_login_rate_limiter,
+    new_session_store, remove_session, AuthConfig, LoginCsrfStore, LoginRateLimiter, SessionStore,
+    RATE_LIMIT_MAX_ATTEMPTS, RATE_LIMIT_WINDOW,
 };
 use crate::db::peers::{PeerRow, SnapshotRow};
 use crate::db::Database;
@@ -38,6 +40,10 @@ pub struct AppState {
     pub db: Database,
     pub auth: AuthConfig,
     pub sessions: SessionStore,
+    /// Short-lived CSRF tokens for the pre-auth login form.
+    pub login_csrf: LoginCsrfStore,
+    /// Sliding-window login attempt counters keyed by client IP.
+    pub rate_limiter: LoginRateLimiter,
 }
 
 impl AppState {
@@ -46,6 +52,8 @@ impl AppState {
             db,
             auth,
             sessions: new_session_store(),
+            login_csrf: new_login_csrf_store(),
+            rate_limiter: new_login_rate_limiter(),
         }
     }
 }
@@ -160,6 +168,8 @@ pub struct PatchPeerRequest {
 pub struct PeerEditForm {
     pub display_name: Option<String>,
     pub comment: Option<String>,
+    /// CSRF token embedded as a hidden field in the edit form.
+    pub csrf_token: Option<String>,
 }
 
 /// URL-encoded form body submitted by the login page.
@@ -167,6 +177,15 @@ pub struct PeerEditForm {
 pub struct LoginForm {
     pub username: String,
     pub password: String,
+    /// Pre-login CSRF token embedded as a hidden field in the login form.
+    pub csrf_token: Option<String>,
+}
+
+/// URL-encoded form body submitted by the logout button.
+#[derive(Debug, Deserialize)]
+pub struct LogoutForm {
+    /// Session CSRF token embedded as a hidden field in the logout form.
+    pub csrf_token: Option<String>,
 }
 
 // ── Conversion helpers ───────────────────────────────────────────────────────
@@ -319,7 +338,7 @@ async fn require_auth(
         .unwrap_or("");
 
     if let Some(token) = extract_session_token(cookie_header) {
-        if is_session_valid(&state.sessions, &token) {
+        if is_session_valid(&state.sessions, &token, state.auth.session_ttl) {
             return next.run(req).await;
         }
     }
@@ -354,59 +373,117 @@ async fn require_auth(
 
 // ── Auth Handlers ─────────────────────────────────────────────────────────────
 
-/// `GET /login` – render the login form.
-async fn page_login() -> impl IntoResponse {
-    Html(render_login_page(false))
+/// `GET /login` – render the login form with a fresh pre-login CSRF token.
+async fn page_login(State(state): State<AppState>) -> impl IntoResponse {
+    let csrf = if state.auth.enabled {
+        generate_login_csrf(&state.login_csrf)
+    } else {
+        String::new()
+    };
+    Html(render_login_page(false, &csrf))
 }
 
-/// `POST /login` – validate credentials and set a session cookie on success.
-async fn post_login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+/// `POST /login` – validate CSRF, check rate limit, then validate credentials.
+async fn post_login(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
     // When auth is disabled, redirect straight to home.
     if !state.auth.enabled {
         return Redirect::to("/").into_response();
     }
 
-    // Validate credentials.  Never log the password.
+    // ── Pre-login CSRF check ─────────────────────────────────────────────
+    let submitted_csrf = form.csrf_token.as_deref().unwrap_or("");
+    if !consume_login_csrf(&state.login_csrf, submitted_csrf) {
+        let new_csrf = generate_login_csrf(&state.login_csrf);
+        return (
+            StatusCode::FORBIDDEN,
+            Html(render_login_page_with_msg(
+                "Request validation failed. Please try again.",
+                &new_csrf,
+            )),
+        )
+            .into_response();
+    }
+
+    // ── Rate limiting ────────────────────────────────────────────────────
+    let ip = extract_client_ip(&headers);
+    if !check_and_record_login_attempt(
+        &state.rate_limiter,
+        &ip,
+        RATE_LIMIT_MAX_ATTEMPTS,
+        RATE_LIMIT_WINDOW,
+    ) {
+        let new_csrf = generate_login_csrf(&state.login_csrf);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Html(render_login_page_with_msg(
+                "Too many login attempts. Please wait a few minutes and try again.",
+                &new_csrf,
+            )),
+        )
+            .into_response();
+    }
+
+    // ── Credential check ─────────────────────────────────────────────────
     let username_ok = form.username == state.auth.username;
     let password_ok = crate::auth::verify_password(&state.auth.password_hash, &form.password);
 
     if !username_ok || !password_ok {
-        // Generic error – do not reveal which field was wrong.
-        return Html(render_login_page(true)).into_response();
+        let new_csrf = generate_login_csrf(&state.login_csrf);
+        return Html(render_login_page(true, &new_csrf)).into_response();
     }
 
-    // Issue a new session token.
-    let token = generate_session_id();
-    add_session(&state.sessions, token.clone());
+    // Issue a new session.
+    let session_id = generate_session_id();
+    let _csrf = add_session(&state.sessions, session_id.clone());
 
-    let cookie = make_session_cookie(&token, state.auth.secure_cookie);
-    let mut headers = HeaderMap::new();
-    headers.insert(
+    let cookie = make_session_cookie(
+        &session_id,
+        state.auth.secure_cookie,
+        state.auth.session_ttl,
+    );
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
         SET_COOKIE,
         cookie.parse().expect("valid cookie header value"),
     );
-    (headers, Redirect::to("/")).into_response()
+    (resp_headers, Redirect::to("/")).into_response()
 }
 
-/// `POST /logout` – invalidate the session and clear the cookie.
-async fn post_logout(State(state): State<AppState>, req: Request<axum::body::Body>) -> Response {
-    let cookie_header = req
-        .headers()
+/// `POST /logout` – validate session CSRF, invalidate the session, clear cookie.
+async fn post_logout(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<LogoutForm>,
+) -> Response {
+    let cookie_header = headers
         .get("cookie")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+
+    // Validate CSRF before doing anything (when auth is enabled).
+    if state.auth.enabled {
+        let submitted = form.csrf_token.as_deref().unwrap_or("");
+        if !validate_form_csrf(&state, cookie_header, submitted) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+
     if let Some(token) = extract_session_token(cookie_header) {
         remove_session(&state.sessions, &token);
     }
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
         SET_COOKIE,
         clear_session_cookie()
             .parse()
             .expect("valid cookie header value"),
     );
-    (headers, Redirect::to("/login")).into_response()
+    (resp_headers, Redirect::to("/login")).into_response()
 }
 
 // ── API Handlers ─────────────────────────────────────────────────────────────
@@ -565,15 +642,20 @@ async fn patch_peer(
 // ── HTML Handlers ─────────────────────────────────────────────────────────────
 
 /// `GET /` – server-rendered peer list page.
-async fn page_peer_list(State(state): State<AppState>) -> Result<Response, ApiError> {
+async fn page_peer_list(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
     let rows = crate::db::peers::list_all(&state.db.pool).await?;
     let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
-    Ok(Html(render_peer_list(&peers)).into_response())
+    let csrf = session_csrf_from_headers(&state, &headers);
+    Ok(Html(render_peer_list(&peers, &csrf)).into_response())
 }
 
 /// `GET /peers/:id` – server-rendered peer detail page.
 async fn page_peer_detail(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
     let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
@@ -588,7 +670,8 @@ async fn page_peer_detail(
             let snapshots =
                 crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
             let dto = peer_row_to_detail(peer_row, snapshots);
-            Ok(Html(render_peer_detail(&dto)).into_response())
+            let csrf = session_csrf_from_headers(&state, &headers);
+            Ok(Html(render_peer_detail(&dto, &csrf)).into_response())
         }
     }
 }
@@ -600,9 +683,22 @@ async fn page_peer_detail(
 /// page-level route, while the JSON API uses `PATCH /api/peers/:id`.
 async fn post_peer_edit(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<PeerEditForm>,
 ) -> Result<Response, ApiError> {
+    // CSRF validation (when auth is enabled).
+    if state.auth.enabled {
+        let cookie_header = headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let submitted = form.csrf_token.as_deref().unwrap_or("");
+        if !validate_form_csrf(&state, cookie_header, submitted) {
+            return Ok(StatusCode::FORBIDDEN.into_response());
+        }
+    }
+
     // 404 if the peer does not exist.
     if crate::db::peers::find_by_id(&state.db.pool, id)
         .await?
@@ -631,6 +727,59 @@ async fn post_peer_edit(
 
     // Redirect back to the detail page (PRG pattern).
     Ok(Redirect::to(&format!("/peers/{id}")).into_response())
+}
+
+// ── CSRF / IP helpers ─────────────────────────────────────────────────────────
+
+/// Validate a CSRF token submitted in an HTML form against the session's stored
+/// token.
+///
+/// - When `auth.enabled = false`: always returns `true` (CSRF not enforced).
+/// - Otherwise: extracts the session ID from `cookie_header`, looks up the
+///   expected token, and does a constant-time comparison.
+fn validate_form_csrf(state: &AppState, cookie_header: &str, submitted: &str) -> bool {
+    if !state.auth.enabled {
+        return true;
+    }
+    let Some(session_id) = extract_session_token(cookie_header) else {
+        return false;
+    };
+    let Some(expected) = get_session_csrf(&state.sessions, &session_id, state.auth.session_ttl)
+    else {
+        return false;
+    };
+    csrf_eq(&expected, submitted)
+}
+
+/// Extract the CSRF token for the current session from the `Cookie` header.
+///
+/// Returns an empty string when auth is disabled or the session is not found.
+fn session_csrf_from_headers(state: &AppState, headers: &axum::http::HeaderMap) -> String {
+    if !state.auth.enabled {
+        return String::new();
+    }
+    let cookie_header = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    extract_session_token(cookie_header)
+        .and_then(|id| get_session_csrf(&state.sessions, &id, state.auth.session_ttl))
+        .unwrap_or_default()
+}
+
+/// Extract the client IP from `X-Forwarded-For` / `X-Real-IP` reverse-proxy
+/// headers, or return `"unknown"` if neither is present.
+///
+/// **Note for deployment:** this function trusts `X-Forwarded-For`.  Ensure
+/// the reverse proxy is configured to set this header and that direct
+/// (non-proxied) access to the panel is not possible from untrusted networks.
+fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 // ── HTML rendering ────────────────────────────────────────────────────────────
@@ -708,49 +857,66 @@ fn html_head(title: &str) -> String {
 }
 
 /// Render the top navigation bar with a logout button.
-fn nav_bar() -> String {
-    r#"<nav class="nav">
+///
+/// `csrf_token` is embedded as a hidden field in the logout form.
+fn nav_bar(csrf_token: &str) -> String {
+    format!(
+        r#"<nav class="nav">
   <span><a href="/">AmneziaWG Panel</a></span>
   <form class="nav-logout" method="POST" action="/logout">
+    <input type="hidden" name="csrf_token" value="{csrf}">
     <button type="submit">Log out</button>
   </form>
 </nav>
-"#
-    .to_string()
+"#,
+        csrf = esc(csrf_token)
+    )
 }
 
 /// Render the login page.
 ///
 /// `show_error`: when `true`, a generic "invalid credentials" message is shown.
-fn render_login_page(show_error: bool) -> String {
+/// `csrf_token`: the pre-login CSRF token to embed in the form.
+fn render_login_page(show_error: bool, csrf_token: &str) -> String {
+    let error_html = if show_error {
+        "  <p class=\"error\">Invalid username or password.</p>\n"
+    } else {
+        ""
+    };
+    render_login_page_inner(error_html, csrf_token)
+}
+
+/// Render the login page with a custom message string.
+fn render_login_page_with_msg(msg: &str, csrf_token: &str) -> String {
+    let error_html = format!("  <p class=\"error\">{}</p>\n", esc(msg));
+    render_login_page_inner(&error_html, csrf_token)
+}
+
+fn render_login_page_inner(error_html: &str, csrf_token: &str) -> String {
     let mut buf = html_head("AmneziaWG – Login");
-    buf.push_str(
+    buf.push_str(&format!(
         r#"<div class="edit-form" style="max-width:340px;margin:4rem auto">
 <h2>AmneziaWG Login</h2>
 <form method="POST" action="/login">
+  <input type="hidden" name="csrf_token" value="{csrf}">
   <label for="username">Username</label>
   <input type="text" id="username" name="username" autocomplete="username" required>
   <label for="password">Password</label>
   <input type="password" id="password" name="password" autocomplete="current-password" required>
-"#,
-    );
-    if show_error {
-        buf.push_str(r#"  <p class="error">Invalid username or password.</p>"#);
-        buf.push('\n');
-    }
-    buf.push_str(
-        r#"  <button type="submit">Log in</button>
+{error}  <button type="submit">Log in</button>
 </form>
 </div>
 </body></html>
 "#,
-    );
+        csrf = esc(csrf_token),
+        error = error_html,
+    ));
     buf
 }
 
-fn render_peer_list(peers: &[PeerSummaryDto]) -> String {
+fn render_peer_list(peers: &[PeerSummaryDto], csrf_token: &str) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
-    buf.push_str(&nav_bar());
+    buf.push_str(&nav_bar(csrf_token));
     buf.push_str("<h1>AmneziaWG Peers</h1>\n");
     buf.push_str(&format!(
         "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"/api/peers\">JSON API</a></p>\n",
@@ -795,9 +961,9 @@ fn render_peer_list(peers: &[PeerSummaryDto]) -> String {
     buf
 }
 
-fn render_peer_detail(dto: &PeerDetailDto) -> String {
+fn render_peer_detail(dto: &PeerDetailDto, csrf_token: &str) -> String {
     let mut buf = html_head(&format!("Peer – {}", dto.name));
-    buf.push_str(&nav_bar());
+    buf.push_str(&nav_bar(csrf_token));
     buf.push_str(&format!(
         "<a class=\"back\" href=\"/\">&larr; All peers</a>\n\
          <h1>{name}</h1>\n",
@@ -867,6 +1033,7 @@ fn render_peer_detail(dto: &PeerDetailDto) -> String {
         r#"<div class="edit-form">
 <h2>Edit peer</h2>
 <form method="POST" action="/peers/{id}">
+  <input type="hidden" name="csrf_token" value="{csrf}">
   <label for="display_name">Display name</label>
   <input type="text" id="display_name" name="display_name"
          value="{dn}" maxlength="128" placeholder="e.g. Ivan iPhone">
@@ -878,6 +1045,7 @@ fn render_peer_detail(dto: &PeerDetailDto) -> String {
 </div>
 "#,
         id = dto.id,
+        csrf = esc(csrf_token),
         dn = esc(current_display_name),
         cm = esc(current_comment),
     ));
@@ -925,6 +1093,7 @@ fn render_peer_detail(dto: &PeerDetailDto) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::DEFAULT_SESSION_TTL_SECS;
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -949,8 +1118,76 @@ mod tests {
             password_hash: hash,
             api_token: Some("super-secret-token".to_string()),
             secure_cookie: false,
+            session_ttl: std::time::Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
         };
         (router(db, auth), "testpassword".to_string())
+    }
+
+    // ── CSRF test helpers ───────────────────────────────────────────────────
+
+    /// Extract the CSRF token from a hidden form field in an HTML page.
+    ///
+    /// Looks for `name="csrf_token" value="TOKEN"` pattern.
+    fn extract_hidden_csrf(html: &str) -> String {
+        let marker = "name=\"csrf_token\" value=\"";
+        html.find(marker)
+            .map(|pos| {
+                let rest = &html[pos + marker.len()..];
+                rest[..rest.find('"').unwrap_or(0)].to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Call `GET /login`, extract the pre-login CSRF token, then `POST /login`
+    /// with the given credentials.  Returns the login `Response`.
+    async fn do_login(app: Router, username: &str, password: &str) -> axum::response::Response {
+        // Step 1: GET /login to obtain the CSRF token.
+        let get_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        let csrf = extract_hidden_csrf(html);
+
+        // Step 2: POST /login with the CSRF token.
+        let form_body = format!(
+            "username={}&password={}&csrf_token={}",
+            username, password, csrf,
+        );
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Extract the session cookie value from a `Set-Cookie` header.
+    fn session_cookie_value(response: &axum::response::Response) -> String {
+        response
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .trim()
+            .to_string()
     }
 
     /// Insert a minimal peer row for testing and return its rowid.
@@ -1525,17 +1762,24 @@ mod tests {
 
     #[test]
     fn login_page_renders_form() {
-        let html = render_login_page(false);
+        let html = render_login_page(false, "test_csrf_token");
         assert!(html.contains(r#"action="/login""#));
         assert!(html.contains(r#"name="username""#));
         assert!(html.contains(r#"name="password""#));
+        assert!(html.contains(r#"name="csrf_token" value="test_csrf_token""#));
         assert!(!html.contains("Invalid username"));
     }
 
     #[test]
     fn login_page_shows_error() {
-        let html = render_login_page(true);
+        let html = render_login_page(true, "tok");
         assert!(html.contains("Invalid username or password"));
+    }
+
+    #[test]
+    fn login_page_embeds_csrf_token() {
+        let html = render_login_page(false, "mytoken123");
+        assert!(html.contains("name=\"csrf_token\" value=\"mytoken123\""));
     }
 
     // ── Auth: when auth is disabled, all routes remain accessible ──────────
@@ -1635,19 +1879,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_wrong_password_shows_error_page() {
+    async fn login_page_contains_csrf_token() {
         let (app, _) = test_router_with_auth(test_db().await);
         let response = app
             .oneshot(
                 Request::builder()
-                    .method("POST")
                     .uri("/login")
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("username=admin&password=wrongpassword"))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        // The login form must have a non-empty CSRF hidden field.
+        let token = extract_hidden_csrf(html);
+        assert!(
+            !token.is_empty(),
+            "login form must contain a csrf_token field"
+        );
+        assert_eq!(token.len(), 32, "CSRF token must be 32 hex chars");
+    }
+
+    #[tokio::test]
+    async fn login_wrong_password_shows_error_page() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = do_login(app, "admin", "wrongpassword").await;
         // Should stay on login page (200), not redirect.
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1658,7 +1917,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_correct_credentials_sets_cookie_and_redirects() {
+    async fn login_missing_csrf_returns_403() {
+        // Submitting the login form without a CSRF token must be rejected.
         let (app, _) = test_router_with_auth(test_db().await);
         let response = app
             .oneshot(
@@ -1671,6 +1931,33 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn login_invalid_csrf_returns_403() {
+        // Submitting the login form with a wrong CSRF token must be rejected.
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "username=admin&password=testpassword&csrf_token=bogus",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn login_correct_credentials_sets_cookie_and_redirects() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = do_login(app, "admin", "testpassword").await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers().get("location").unwrap(), "/");
         let set_cookie = response
@@ -1692,28 +1979,9 @@ mod tests {
         let (app, _password) = test_router_with_auth(db);
 
         // 1. Login to get a session cookie.
-        let login_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/login")
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("username=admin&password=testpassword"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let login_response = do_login(app.clone(), "admin", "testpassword").await;
         assert_eq!(login_response.status(), StatusCode::SEE_OTHER);
-        let cookie = login_response
-            .headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        // Extract just the token from "awg_session=TOKEN; ..."
-        let session_value = cookie.split(';').next().unwrap().trim().to_string();
+        let session_value = session_cookie_value(&login_response);
 
         // 2. Use the session cookie to access the API.
         let api_response = app
@@ -1734,29 +2002,32 @@ mod tests {
         let db = test_db().await;
         let (app, _) = test_router_with_auth(db);
 
-        // Login.
-        let login_response = app
+        // 1. Login.
+        let login_response = do_login(app.clone(), "admin", "testpassword").await;
+        assert_eq!(login_response.status(), StatusCode::SEE_OTHER);
+        let session_value = session_cookie_value(&login_response);
+
+        // 2. Fetch the main page to get the CSRF token for the logout form.
+        let page_resp = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri("/login")
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("username=admin&password=testpassword"))
+                    .uri("/")
+                    .header("cookie", &session_value)
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        let cookie = login_response
-            .headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let session_value = cookie.split(';').next().unwrap().trim().to_string();
+        let page_body = axum::body::to_bytes(page_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page_html = std::str::from_utf8(&page_body).unwrap();
+        let csrf = extract_hidden_csrf(page_html);
+        assert!(!csrf.is_empty(), "page must contain a csrf_token");
 
-        // Logout with that session.
+        // 3. Logout with session cookie + CSRF token.
+        let logout_body = format!("csrf_token={csrf}");
         let logout_response = app
             .clone()
             .oneshot(
@@ -1764,13 +2035,13 @@ mod tests {
                     .method("POST")
                     .uri("/logout")
                     .header("cookie", &session_value)
-                    .body(Body::empty())
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(logout_body))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(logout_response.status(), StatusCode::SEE_OTHER);
-        // Cookie must be cleared (Max-Age=0).
         let clear_cookie = logout_response
             .headers()
             .get("set-cookie")
@@ -1779,7 +2050,7 @@ mod tests {
             .unwrap();
         assert!(clear_cookie.contains("Max-Age=0"));
 
-        // Subsequent request with same cookie must now be rejected.
+        // 4. Subsequent request with old cookie must be rejected.
         let after_logout = app
             .oneshot(
                 Request::builder()
@@ -1791,6 +2062,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after_logout.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_missing_csrf_returns_403() {
+        let db = test_db().await;
+        let (app, _) = test_router_with_auth(db);
+
+        let login_response = do_login(app.clone(), "admin", "testpassword").await;
+        let session_value = session_cookie_value(&login_response);
+
+        // Logout without CSRF token → 403.
+        let logout_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/logout")
+                    .header("cookie", &session_value)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout_response.status(), StatusCode::FORBIDDEN);
     }
 
     // ── Auth: bearer token ─────────────────────────────────────────────────
@@ -1871,5 +2166,158 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["display_name"], "Auth Peer");
+    }
+
+    // ── CSRF: peer edit form ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn peer_edit_form_requires_csrf() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "CSRF_PEER_TEST_KEY===", Some("Original")).await;
+        let (app, _) = test_router_with_auth(db);
+
+        // Login.
+        let login_response = do_login(app.clone(), "admin", "testpassword").await;
+        let session_value = session_cookie_value(&login_response);
+
+        // POST the edit form without a CSRF token → 403.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/peers/{id}"))
+                    .header("cookie", &session_value)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("display_name=Hacked"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn peer_edit_form_valid_csrf_succeeds() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "CSRF_PEER_VALID_KEY==", Some("Original")).await;
+        let (app, _) = test_router_with_auth(db);
+
+        // Login.
+        let login_response = do_login(app.clone(), "admin", "testpassword").await;
+        let session_value = session_cookie_value(&login_response);
+
+        // Fetch the edit page to get the CSRF token.
+        let page_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .header("cookie", &session_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let page_body = axum::body::to_bytes(page_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page_html = std::str::from_utf8(&page_body).unwrap();
+        let csrf = extract_hidden_csrf(page_html);
+        assert!(!csrf.is_empty());
+
+        // POST with valid CSRF token → redirect (PRG).
+        let form_body = format!("display_name=Updated&csrf_token={csrf}");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/peers/{id}"))
+                    .header("cookie", &session_value)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn api_patch_unaffected_by_csrf() {
+        // PATCH /api/peers/:id uses bearer token and should not be affected by
+        // CSRF protection.
+        let db = test_db().await;
+        let id = insert_peer(&db, "CSRF_API_PATCH_KEY===", None).await;
+        let (app, _) = test_router_with_auth(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("authorization", "Bearer super-secret-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"No CSRF needed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Rate limiting ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn login_rate_limited_after_many_attempts() {
+        let (app, _) = test_router_with_auth(test_db().await);
+
+        // Get one CSRF token (re-used across attempts; each will consume it,
+        // so we need a fresh one per request).  Simulate multiple failed logins
+        // by doing the full GET /login → POST /login cycle each time.
+        let mut last_status = StatusCode::OK;
+        for i in 0..10 {
+            let resp = do_login(app.clone(), "admin", &format!("wrong{i}")).await;
+            last_status = resp.status();
+            if last_status == StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+        }
+        assert_eq!(last_status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // ── Session TTL ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn expired_session_rejected() {
+        // Build a router whose session TTL is 0 – sessions expire immediately.
+        let db = test_db().await;
+        let hash = AuthConfig::hash_password_fast("pass");
+        let auth = AuthConfig {
+            enabled: true,
+            username: "admin".to_string(),
+            password_hash: hash,
+            api_token: None,
+            secure_cookie: false,
+            session_ttl: std::time::Duration::from_secs(0),
+        };
+        let app = router(db, auth);
+
+        // Login succeeds and we get a session cookie ...
+        let login_resp = do_login(app.clone(), "admin", "pass").await;
+        assert_eq!(login_resp.status(), StatusCode::SEE_OTHER);
+        let session_value = session_cookie_value(&login_resp);
+
+        // ... but the session TTL is 0, so it expires immediately.
+        let api_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .header("cookie", &session_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

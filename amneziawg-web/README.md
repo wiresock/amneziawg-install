@@ -5,7 +5,7 @@ A self-hosted web panel that provides **visibility and management** for
 installations managed via the
 [amneziawg-install](https://github.com/wiresock/amneziawg-install) script.
 
-> **Status:** MVP – background poller, traffic history, config discovery, peer rename/comment, session cookie authentication · production-ready only behind a trusted reverse proxy (see [Security](#security))
+> **Status:** MVP – background poller, traffic history, config discovery, peer rename/comment, session cookie authentication, CSRF protection, login rate limiting · production-ready only behind a trusted reverse proxy (see [Security](#security) and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md))
 
 ---
 
@@ -15,6 +15,8 @@ installations managed via the
 - **Config discovery** – scans `AWG_CONFIG_DIR` for `*.conf` files, extracts `[Peer] PublicKey`, and maps each config file to the corresponding live peer.
 - **Peer rename / comment** – `PATCH /api/peers/:id` and a plain-HTML form on `/peers/:id`.
 - **Session cookie authentication** – single-admin login via `GET /login` + `POST /login`; optional bearer-token for headless API access; configurable via environment variables.
+- **CSRF protection** – every HTML form carries a hidden `csrf_token` field; `POST /login` uses a short-lived pre-login token; write forms use per-session tokens.
+- **Login rate limiting** – 5 attempts per 5-minute window per client IP; returns `429 Too Many Requests` when exceeded.
 - **`GET /`** – server-rendered HTML peer list.
 - **`GET /peers/:id`** – server-rendered HTML peer detail + edit form.
 - **`GET /api/health`** – liveness probe (always public).
@@ -59,6 +61,7 @@ export AUTH_PASSWORD_HASH="$(\
 | `AUTH_PASSWORD_HASH`  | *(empty)*                    | Argon2id PHC string of the admin password           |
 | `AUTH_API_TOKEN`      | *(absent)*                   | Optional static bearer token for API access         |
 | `AUTH_SECURE_COOKIE`  | `false`                      | Set `Secure` flag on session cookie (enable for HTTPS) |
+| `AUTH_SESSION_TTL_SECS` | `86400`                    | Session lifetime in seconds (default 24 h)          |
 
 ---
 
@@ -153,33 +156,38 @@ Authorization: Bearer <token>
 
 - Passwords stored as Argon2id PHC strings (never plaintext).
 - Session IDs are 32 bytes from `OsRng` (cryptographically random, 64-char hex).
-- Session cookies: `HttpOnly`, `SameSite=Lax`, 24-hour expiry.
+- Session cookies: `HttpOnly`, `SameSite=Lax`, configurable lifetime.
 - HTML output is escaped via `esc()` – XSS safe.
 - Private keys are never stored or logged.
-- `SameSite=Lax` mitigates the most common CSRF vectors for this panel.
+- **CSRF protection**: every HTML form embeds a hidden `csrf_token`.  Login uses a short-lived (10-min, single-use) pre-login token.  Write forms use a per-session token.
+- **Login rate limiting**: 5 attempts per 5-minute window per client IP; 429 on excess.
 
 ### What requires additional hardening before public exposure
 
 | Risk | Recommended mitigation |
 |------|------------------------|
-| No CSRF tokens on write forms | Add CSRF tokens in a future PR; for now deploy behind a trusted reverse proxy with same-origin policy |
 | `Secure` cookie flag off by default | Set `AUTH_SECURE_COOKIE=true` when using HTTPS |
 | Sessions lost on restart (in-memory store) | Acceptable for MVP; add DB-backed session store if needed |
+| Rate limit trusts `X-Forwarded-For` | Validate at the reverse proxy layer |
 | Single admin, no RBAC | Add roles in a future PR |
 
 ### Deployment recommendation
 
-Run behind a reverse proxy (nginx, Caddy) that:
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for a full guide including
+systemd service installation, nginx configuration, and environment setup.
+
+In summary, run behind a reverse proxy (nginx, Caddy) that:
 - Terminates TLS
 - Sets `AUTH_SECURE_COOKIE=true`
-- Restricts to trusted IP ranges if possible
+- Restricts to trusted IP ranges
+- Sets `X-Forwarded-For` header for accurate rate-limit keying
 
 ---
 
 ## Development
 
 ```bash
-cargo test                        # 113 tests
+cargo test                        # 138 tests
 cargo fmt --check
 cargo clippy -- -D warnings
 ```

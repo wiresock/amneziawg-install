@@ -86,16 +86,18 @@ Every peer resolves its display name through this fallback chain:
 | Auth headers logged | ✗ Never |
 | Session IDs | 32-byte OsRng, 64-char hex |
 | Cookie flags | `HttpOnly`, `SameSite=Lax`; `Secure` opt-in via `AUTH_SECURE_COOKIE` |
+| Session TTL | Configurable via `AUTH_SESSION_TTL_SECS` (default 24 h) |
 | XSS | `esc()` on all HTML output |
-| CSRF | `SameSite=Lax` mitigates; explicit tokens planned for a future PR |
+| CSRF | Per-session and pre-login CSRF tokens on all HTML forms |
+| Login rate limiting | 5 per 5-minute window per IP; 429 on excess |
 | Constant-time password check | ✓ via argon2 crate |
+| Constant-time CSRF comparison | ✓ via folded-XOR `csrf_eq()` |
 
 ---
 
 ## What is still missing before full production hardening
 
-- **CSRF tokens** – `SameSite=Lax` mitigates the main risk but explicit tokens add depth-in-defence.
 - **HTTPS** – TLS termination must be provided by a reverse proxy; set `AUTH_SECURE_COOKIE=true`.
-- **Rate limiting** – protect `/login` against brute-force.
 - **Persistent session store** – current in-memory store resets on restart.
 - **Traffic charts** – snapshots table exists but no chart is rendered.
+- **Audit logging** – write actions (peer edits) are not logged to an audit trail.

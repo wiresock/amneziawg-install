@@ -65,6 +65,11 @@ pub struct Config {
     /// Enable when serving over HTTPS.
     #[arg(long, env = "AUTH_SECURE_COOKIE", default_value_t = false)]
     pub auth_secure_cookie: bool,
+
+    /// Session lifetime in seconds.
+    /// Default is 86400 (24 hours).
+    #[arg(long, env = "AUTH_SESSION_TTL_SECS", default_value_t = 86_400)]
+    pub auth_session_ttl_secs: u64,
 }
 
 #[tokio::main]
@@ -98,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
         password_hash: config.auth_password_hash.clone(),
         api_token: config.auth_api_token.clone(),
         secure_cookie: config.auth_secure_cookie,
+        session_ttl: std::time::Duration::from_secs(config.auth_session_ttl_secs),
     };
 
     // --- Database -----------------------------------------------------------
