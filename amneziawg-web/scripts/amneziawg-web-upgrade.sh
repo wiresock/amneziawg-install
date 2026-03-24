@@ -417,6 +417,10 @@ main() {
                 info "Sudoers file validated: ${SUDOERS_FILE}"
             else
                 warn "visudo validation failed for ${SUDOERS_FILE}."
+                warn "Removing broken sudoers file to protect system integrity."
+                rm -f "${SUDOERS_FILE}"
+                die "Sudoers file syntax check failed. This should not happen with the default rule.
+Please report this issue."
             fi
         fi
     fi

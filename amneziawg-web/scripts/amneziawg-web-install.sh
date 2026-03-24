@@ -652,7 +652,10 @@ install_sudoers() {
             info "Sudoers file validated: ${SUDOERS_FILE}"
         else
             warn "visudo validation failed for ${SUDOERS_FILE}."
-            warn "The file has been installed but may contain errors."
+            warn "Removing broken sudoers file to protect system integrity."
+            rm -f "${SUDOERS_FILE}"
+            die "Sudoers file syntax check failed. This should not happen with the default rule.
+Please report this issue."
         fi
     else
         info "visudo not available; skipping syntax check."
