@@ -5,9 +5,10 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header::SET_COOKIE, HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
     Form, Json, Router,
 };
 use chrono::{DateTime, TimeZone, Utc};
@@ -16,6 +17,11 @@ use serde_json::json;
 use tower_http::trace::TraceLayer;
 use tracing::error;
 
+use crate::auth::{
+    add_session, clear_session_cookie, extract_session_token, generate_session_id,
+    is_session_valid, make_session_cookie, new_session_store, remove_session, AuthConfig,
+    SessionStore,
+};
 use crate::db::peers::{PeerRow, SnapshotRow};
 use crate::db::Database;
 use crate::domain::history::{compute_history, HistoryPoint, HistorySummary, SnapshotInput};
@@ -23,6 +29,26 @@ use crate::domain::{
     normalize_comment, normalize_display_name, resolve_display_name, PeerStatus,
     ONLINE_THRESHOLD_SECS,
 };
+
+// ── App state ────────────────────────────────────────────────────────────────
+
+/// Shared application state passed to every handler.
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Database,
+    pub auth: AuthConfig,
+    pub sessions: SessionStore,
+}
+
+impl AppState {
+    fn new(db: Database, auth: AuthConfig) -> Self {
+        Self {
+            db,
+            auth,
+            sessions: new_session_store(),
+        }
+    }
+}
 
 // ── Error helper ────────────────────────────────────────────────────────────
 
@@ -136,6 +162,13 @@ pub struct PeerEditForm {
     pub comment: Option<String>,
 }
 
+/// URL-encoded form body submitted by the login page.
+#[derive(Debug, Deserialize)]
+pub struct LoginForm {
+    pub username: String,
+    pub password: String,
+}
+
 // ── Conversion helpers ───────────────────────────────────────────────────────
 
 fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
@@ -233,18 +266,147 @@ fn range_to_secs(range: &str) -> i64 {
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Build the application router.
-pub fn router(db: Database) -> Router {
-    Router::new()
-        // HTML pages
+pub fn router(db: Database, auth: AuthConfig) -> Router {
+    let state = AppState::new(db, auth);
+
+    // Protected routes – all require a valid session.
+    let protected = Router::new()
         .route("/", get(page_peer_list))
         .route("/peers/:id", get(page_peer_detail).post(post_peer_edit))
-        // JSON API
-        .route("/api/health", get(health))
         .route("/api/peers", get(list_peers))
         .route("/api/peers/:id", get(get_peer).patch(patch_peer))
         .route("/api/peers/:id/history", get(get_peer_history))
-        .with_state(db)
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    Router::new()
+        // Public routes (no auth required)
+        .route("/api/health", get(health))
+        .route("/login", get(page_login).post(post_login))
+        .route("/logout", post(post_logout))
+        // Protected routes
+        .merge(protected)
+        .with_state(state)
         .layer(TraceLayer::new_for_http())
+}
+
+// ── Auth middleware ───────────────────────────────────────────────────────────
+
+/// Axum middleware that enforces authentication on every route it is applied to.
+///
+/// Behaviour:
+/// - When `auth.enabled = false`: always passes through (dev/trusted-network mode).
+/// - Session cookie present and valid: passes through.
+/// - Bearer token present, matches `auth.api_token`: passes through (API only).
+/// - Otherwise:
+///   - Paths starting with `/api/` → `401 Unauthorized` JSON.
+///   - Other paths → `303 See Other` redirect to `/login`.
+async fn require_auth(
+    State(state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if !state.auth.enabled {
+        return next.run(req).await;
+    }
+
+    let is_api = req.uri().path().starts_with("/api/");
+
+    // Check session cookie.
+    let cookie_header = req
+        .headers()
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if let Some(token) = extract_session_token(cookie_header) {
+        if is_session_valid(&state.sessions, &token) {
+            return next.run(req).await;
+        }
+    }
+
+    // Check bearer token (API paths only).
+    if is_api {
+        if let Some(ref expected) = state.auth.api_token {
+            let auth_header = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if let Some(provided) = auth_header.strip_prefix("Bearer ") {
+                if provided == expected.as_str() {
+                    return next.run(req).await;
+                }
+            }
+        }
+    }
+
+    // Unauthenticated.
+    if is_api {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "authentication required" })),
+        )
+            .into_response()
+    } else {
+        Redirect::to("/login").into_response()
+    }
+}
+
+// ── Auth Handlers ─────────────────────────────────────────────────────────────
+
+/// `GET /login` – render the login form.
+async fn page_login() -> impl IntoResponse {
+    Html(render_login_page(false))
+}
+
+/// `POST /login` – validate credentials and set a session cookie on success.
+async fn post_login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+    // When auth is disabled, redirect straight to home.
+    if !state.auth.enabled {
+        return Redirect::to("/").into_response();
+    }
+
+    // Validate credentials.  Never log the password.
+    let username_ok = form.username == state.auth.username;
+    let password_ok = crate::auth::verify_password(&state.auth.password_hash, &form.password);
+
+    if !username_ok || !password_ok {
+        // Generic error – do not reveal which field was wrong.
+        return Html(render_login_page(true)).into_response();
+    }
+
+    // Issue a new session token.
+    let token = generate_session_id();
+    add_session(&state.sessions, token.clone());
+
+    let cookie = make_session_cookie(&token, state.auth.secure_cookie);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        SET_COOKIE,
+        cookie.parse().expect("valid cookie header value"),
+    );
+    (headers, Redirect::to("/")).into_response()
+}
+
+/// `POST /logout` – invalidate the session and clear the cookie.
+async fn post_logout(State(state): State<AppState>, req: Request<axum::body::Body>) -> Response {
+    let cookie_header = req
+        .headers()
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(token) = extract_session_token(cookie_header) {
+        remove_session(&state.sessions, &token);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        SET_COOKIE,
+        clear_session_cookie()
+            .parse()
+            .expect("valid cookie header value"),
+    );
+    (headers, Redirect::to("/login")).into_response()
 }
 
 // ── API Handlers ─────────────────────────────────────────────────────────────
@@ -255,8 +417,8 @@ async fn health() -> impl IntoResponse {
 }
 
 /// `GET /api/peers` – list all known peers with their current stats.
-async fn list_peers(State(db): State<Database>) -> ApiResult<Json<Vec<PeerSummaryDto>>> {
-    let rows = crate::db::peers::list_all(&db.pool).await?;
+async fn list_peers(State(state): State<AppState>) -> ApiResult<Json<Vec<PeerSummaryDto>>> {
+    let rows = crate::db::peers::list_all(&state.db.pool).await?;
     let dtos: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
     Ok(Json(dtos))
 }
@@ -265,8 +427,11 @@ async fn list_peers(State(db): State<Database>) -> ApiResult<Json<Vec<PeerSummar
 ///
 /// `:id` is the integer primary key from the `peers` table.
 /// Returns HTTP 404 if no peer with that ID exists.
-async fn get_peer(State(db): State<Database>, Path(id): Path<i64>) -> Result<Response, ApiError> {
-    let row = crate::db::peers::find_by_id(&db.pool, id).await?;
+async fn get_peer(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
     match row {
         None => Ok((
             StatusCode::NOT_FOUND,
@@ -275,7 +440,8 @@ async fn get_peer(State(db): State<Database>, Path(id): Path<i64>) -> Result<Res
             .into_response()),
         Some(peer_row) => {
             let public_key = peer_row.public_key.clone();
-            let snapshots = crate::db::peers::find_snapshots(&db.pool, &public_key, 50).await?;
+            let snapshots =
+                crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
             let dto = peer_row_to_detail(peer_row, snapshots);
             Ok(Json(dto).into_response())
         }
@@ -295,12 +461,12 @@ async fn get_peer(State(db): State<Database>, Path(id): Path<i64>) -> Result<Res
 /// Returns empty `points` and zero totals if the peer has no snapshots in the
 /// requested range.
 async fn get_peer_history(
-    State(db): State<Database>,
+    State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(params): Query<HistoryQuery>,
 ) -> Result<Response, ApiError> {
     // Verify the peer exists
-    let row = crate::db::peers::find_by_id(&db.pool, id).await?;
+    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
     let peer = match row {
         None => {
             return Ok((
@@ -318,7 +484,8 @@ async fn get_peer_history(
     let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let snapshot_rows =
-        crate::db::peers::find_snapshots_since(&db.pool, &peer.public_key, &since_str).await?;
+        crate::db::peers::find_snapshots_since(&state.db.pool, &peer.public_key, &since_str)
+            .await?;
 
     let inputs: Vec<SnapshotInput> = snapshot_rows
         .into_iter()
@@ -344,12 +511,12 @@ async fn get_peer_history(
 /// Returns the full peer detail DTO (same as `GET /api/peers/:id`).
 /// Returns HTTP 404 if the peer does not exist.
 async fn patch_peer(
-    State(db): State<Database>,
+    State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<PatchPeerRequest>,
 ) -> Result<Response, ApiError> {
     // Load the existing peer so we can apply partial updates.
-    let existing = match crate::db::peers::find_by_id(&db.pool, id).await? {
+    let existing = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
         Some(r) => r,
         None => {
             return Ok((
@@ -372,7 +539,7 @@ async fn patch_peer(
     };
 
     let updated = crate::db::peers::update_peer_metadata(
-        &db.pool,
+        &state.db.pool,
         id,
         new_display_name.as_deref(),
         new_comment.as_deref(),
@@ -387,7 +554,8 @@ async fn patch_peer(
             .into_response()),
         Some(peer_row) => {
             let public_key = peer_row.public_key.clone();
-            let snapshots = crate::db::peers::find_snapshots(&db.pool, &public_key, 50).await?;
+            let snapshots =
+                crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
             let dto = peer_row_to_detail(peer_row, snapshots);
             Ok(Json(dto).into_response())
         }
@@ -397,18 +565,18 @@ async fn patch_peer(
 // ── HTML Handlers ─────────────────────────────────────────────────────────────
 
 /// `GET /` – server-rendered peer list page.
-async fn page_peer_list(State(db): State<Database>) -> Result<Response, ApiError> {
-    let rows = crate::db::peers::list_all(&db.pool).await?;
+async fn page_peer_list(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let rows = crate::db::peers::list_all(&state.db.pool).await?;
     let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
     Ok(Html(render_peer_list(&peers)).into_response())
 }
 
 /// `GET /peers/:id` – server-rendered peer detail page.
 async fn page_peer_detail(
-    State(db): State<Database>,
+    State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    let row = crate::db::peers::find_by_id(&db.pool, id).await?;
+    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
     match row {
         None => Ok((
             StatusCode::NOT_FOUND,
@@ -417,7 +585,8 @@ async fn page_peer_detail(
             .into_response()),
         Some(peer_row) => {
             let public_key = peer_row.public_key.clone();
-            let snapshots = crate::db::peers::find_snapshots(&db.pool, &public_key, 50).await?;
+            let snapshots =
+                crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
             let dto = peer_row_to_detail(peer_row, snapshots);
             Ok(Html(render_peer_detail(&dto)).into_response())
         }
@@ -430,12 +599,15 @@ async fn page_peer_detail(
 /// HTML `<form>` elements do not support `PATCH`, so the UI uses a POST to this
 /// page-level route, while the JSON API uses `PATCH /api/peers/:id`.
 async fn post_peer_edit(
-    State(db): State<Database>,
+    State(state): State<AppState>,
     Path(id): Path<i64>,
     Form(form): Form<PeerEditForm>,
 ) -> Result<Response, ApiError> {
     // 404 if the peer does not exist.
-    if crate::db::peers::find_by_id(&db.pool, id).await?.is_none() {
+    if crate::db::peers::find_by_id(&state.db.pool, id)
+        .await?
+        .is_none()
+    {
         return Ok((
             StatusCode::NOT_FOUND,
             Html("<h1>Peer not found</h1>".to_string()),
@@ -450,7 +622,7 @@ async fn post_peer_edit(
     let comment = form.comment.as_deref().and_then(normalize_comment);
 
     crate::db::peers::update_peer_metadata(
-        &db.pool,
+        &state.db.pool,
         id,
         display_name.as_deref(),
         comment.as_deref(),
@@ -518,10 +690,15 @@ fn html_head(title: &str) -> String {
   .edit-form {{ margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; max-width: 480px; }}
   .edit-form h2 {{ margin-top: 0; font-size: 1.1rem; }}
   .edit-form label {{ display: block; font-weight: bold; margin-bottom: .25rem; margin-top: .75rem; }}
-  .edit-form input[type=text], .edit-form textarea {{ width: 100%; padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 3px; font-family: inherit; font-size: .95rem; box-sizing: border-box; }}
+  .edit-form input[type=text], .edit-form input[type=password], .edit-form textarea {{ width: 100%; padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 3px; font-family: inherit; font-size: .95rem; box-sizing: border-box; }}
   .edit-form textarea {{ resize: vertical; min-height: 4rem; }}
   .edit-form button[type=submit] {{ margin-top: 1rem; padding: .4rem 1.1rem; background: #0066cc; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .95rem; }}
   .edit-form button[type=submit]:hover {{ background: #0055aa; }}
+  .nav {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; padding-bottom: .5rem; border-bottom: 1px solid #ddd; }}
+  .nav-logout {{ display: inline-block; }}
+  .nav-logout button {{ padding: .3rem .8rem; background: #e55; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .85rem; }}
+  .nav-logout button:hover {{ background: #c33; }}
+  .error {{ color: #c00; margin-top: .5rem; font-size: .95rem; }}
 </style>
 </head>
 <body>
@@ -530,8 +707,50 @@ fn html_head(title: &str) -> String {
     )
 }
 
+/// Render the top navigation bar with a logout button.
+fn nav_bar() -> String {
+    r#"<nav class="nav">
+  <span><a href="/">AmneziaWG Panel</a></span>
+  <form class="nav-logout" method="POST" action="/logout">
+    <button type="submit">Log out</button>
+  </form>
+</nav>
+"#
+    .to_string()
+}
+
+/// Render the login page.
+///
+/// `show_error`: when `true`, a generic "invalid credentials" message is shown.
+fn render_login_page(show_error: bool) -> String {
+    let mut buf = html_head("AmneziaWG – Login");
+    buf.push_str(
+        r#"<div class="edit-form" style="max-width:340px;margin:4rem auto">
+<h2>AmneziaWG Login</h2>
+<form method="POST" action="/login">
+  <label for="username">Username</label>
+  <input type="text" id="username" name="username" autocomplete="username" required>
+  <label for="password">Password</label>
+  <input type="password" id="password" name="password" autocomplete="current-password" required>
+"#,
+    );
+    if show_error {
+        buf.push_str(r#"  <p class="error">Invalid username or password.</p>"#);
+        buf.push('\n');
+    }
+    buf.push_str(
+        r#"  <button type="submit">Log in</button>
+</form>
+</div>
+</body></html>
+"#,
+    );
+    buf
+}
+
 fn render_peer_list(peers: &[PeerSummaryDto]) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
+    buf.push_str(&nav_bar());
     buf.push_str("<h1>AmneziaWG Peers</h1>\n");
     buf.push_str(&format!(
         "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"/api/peers\">JSON API</a></p>\n",
@@ -578,6 +797,7 @@ fn render_peer_list(peers: &[PeerSummaryDto]) -> String {
 
 fn render_peer_detail(dto: &PeerDetailDto) -> String {
     let mut buf = html_head(&format!("Peer – {}", dto.name));
+    buf.push_str(&nav_bar());
     buf.push_str(&format!(
         "<a class=\"back\" href=\"/\">&larr; All peers</a>\n\
          <h1>{name}</h1>\n",
@@ -715,6 +935,24 @@ mod tests {
         Database::connect_for_test().await.expect("connect")
     }
 
+    /// Build a router with auth disabled (used for all pre-auth tests).
+    fn test_router(db: Database) -> Router {
+        router(db, AuthConfig::disabled())
+    }
+
+    /// Build a router with auth enabled and known test credentials.
+    fn test_router_with_auth(db: Database) -> (Router, String) {
+        let hash = AuthConfig::hash_password_fast("testpassword");
+        let auth = AuthConfig {
+            enabled: true,
+            username: "admin".to_string(),
+            password_hash: hash,
+            api_token: Some("super-secret-token".to_string()),
+            secure_cookie: false,
+        };
+        (router(db, auth), "testpassword".to_string())
+    }
+
     /// Insert a minimal peer row for testing and return its rowid.
     async fn insert_peer(db: &Database, public_key: &str, display_name: Option<&str>) -> i64 {
         sqlx::query("INSERT INTO peers (public_key, display_name, allowed_ips) VALUES (?, ?, ?)")
@@ -750,7 +988,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_returns_200() {
-        let app = router(test_db().await);
+        let app = test_router(test_db().await);
         let response = app
             .oneshot(
                 Request::builder()
@@ -765,7 +1003,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_peers_empty_db_returns_empty_array() {
-        let app = router(test_db().await);
+        let app = test_router(test_db().await);
         let response = app
             .oneshot(
                 Request::builder()
@@ -790,7 +1028,7 @@ mod tests {
         let db = test_db().await;
         insert_peer(&db, "TESTKEY1234567890ABCDEF==", Some("Alice")).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -816,7 +1054,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_peer_not_found_returns_404() {
-        let app = router(test_db().await);
+        let app = test_router(test_db().await);
         let response = app
             .oneshot(
                 Request::builder()
@@ -834,7 +1072,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "DETAILKEY1234567890ABCDEF==", Some("Bob")).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -862,7 +1100,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "ABCDEF1234567890==", None).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -885,7 +1123,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_peer_not_found_returns_404() {
-        let app = router(test_db().await);
+        let app = test_router(test_db().await);
         let response = app
             .oneshot(
                 Request::builder()
@@ -903,7 +1141,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "HIST_KEY_EMPTY=", Some("EmptyPeer")).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -941,7 +1179,7 @@ mod tests {
         insert_snapshot_with_bytes(&db, "HIST_KEY_DATA=", &t1, 0, 0).await;
         insert_snapshot_with_bytes(&db, "HIST_KEY_DATA=", &t2, 1000, 2000).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -969,7 +1207,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "HIST_7D_KEY=", Some("SevenDayPeer")).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -992,7 +1230,7 @@ mod tests {
 
     #[tokio::test]
     async fn root_returns_html() {
-        let app = router(test_db().await);
+        let app = test_router(test_db().await);
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1014,7 +1252,7 @@ mod tests {
         let db = test_db().await;
         insert_peer(&db, "HTMLKEY1234567890ABCDEF==", Some("Charlie")).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1033,7 +1271,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_detail_page_not_found_returns_404() {
-        let app = router(test_db().await);
+        let app = test_router(test_db().await);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1051,7 +1289,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "HTMLDETAILKEY1234567890==", Some("Diana")).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1078,7 +1316,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "PATCHKEY1234567890==", None).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1105,7 +1343,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "CMTKEY1234567890==", Some("Alice")).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1133,7 +1371,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "CLEARKEY1234567890==", Some("ToBeCleared")).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1158,7 +1396,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_peer_not_found_returns_404() {
-        let app = router(test_db().await);
+        let app = test_router(test_db().await);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1178,7 +1416,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "EMPTYKEY1234567890==", Some("Unchanged")).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1206,7 +1444,7 @@ mod tests {
         let db = test_db().await;
         insert_peer(&db, "HCKEY1234567890==", None).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1234,7 +1472,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "FORMKEY1234567890==", Some("Editable")).await;
 
-        let app = router(db);
+        let app = test_router(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1281,5 +1519,357 @@ mod tests {
         assert_eq!(range_to_secs("30d"), 2_592_000);
         assert_eq!(range_to_secs(""), 86_400); // default
         assert_eq!(range_to_secs("unknown"), 86_400); // default
+    }
+
+    // ── Login page rendering ────────────────────────────────────────────────
+
+    #[test]
+    fn login_page_renders_form() {
+        let html = render_login_page(false);
+        assert!(html.contains(r#"action="/login""#));
+        assert!(html.contains(r#"name="username""#));
+        assert!(html.contains(r#"name="password""#));
+        assert!(!html.contains("Invalid username"));
+    }
+
+    #[test]
+    fn login_page_shows_error() {
+        let html = render_login_page(true);
+        assert!(html.contains("Invalid username or password"));
+    }
+
+    // ── Auth: when auth is disabled, all routes remain accessible ──────────
+
+    #[tokio::test]
+    async fn auth_disabled_root_accessible() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_api_accessible() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Auth: when auth is enabled, unauthenticated access is blocked ──────
+
+    #[tokio::test]
+    async fn auth_enabled_html_redirects_to_login() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get("location").unwrap(), "/login");
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_api_returns_401() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "authentication required");
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_health_stays_public() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Auth: login flow ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn login_page_returns_200() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.starts_with(b"<!DOCTYPE html>"));
+    }
+
+    #[tokio::test]
+    async fn login_wrong_password_shows_error_page() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=admin&password=wrongpassword"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Should stay on login page (200), not redirect.
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Invalid username or password"));
+    }
+
+    #[tokio::test]
+    async fn login_correct_credentials_sets_cookie_and_redirects() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=admin&password=testpassword"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get("location").unwrap(), "/");
+        let set_cookie = response
+            .headers()
+            .get("set-cookie")
+            .expect("Set-Cookie header missing")
+            .to_str()
+            .unwrap();
+        assert!(set_cookie.contains("awg_session="));
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Lax"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_session_allows_api_access() {
+        let db = test_db().await;
+        insert_peer(&db, "AUTH_TEST_KEY1234==", Some("TestPeer")).await;
+
+        let (app, _password) = test_router_with_auth(db);
+
+        // 1. Login to get a session cookie.
+        let login_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=admin&password=testpassword"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_response.status(), StatusCode::SEE_OTHER);
+        let cookie = login_response
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        // Extract just the token from "awg_session=TOKEN; ..."
+        let session_value = cookie.split(';').next().unwrap().trim().to_string();
+
+        // 2. Use the session cookie to access the API.
+        let api_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .header("cookie", &session_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logout_clears_session() {
+        let db = test_db().await;
+        let (app, _) = test_router_with_auth(db);
+
+        // Login.
+        let login_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=admin&password=testpassword"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = login_response
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let session_value = cookie.split(';').next().unwrap().trim().to_string();
+
+        // Logout with that session.
+        let logout_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/logout")
+                    .header("cookie", &session_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout_response.status(), StatusCode::SEE_OTHER);
+        // Cookie must be cleared (Max-Age=0).
+        let clear_cookie = logout_response
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(clear_cookie.contains("Max-Age=0"));
+
+        // Subsequent request with same cookie must now be rejected.
+        let after_logout = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .header("cookie", &session_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_logout.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Auth: bearer token ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bearer_token_allows_api_access() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .header("authorization", "Bearer super-secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn wrong_bearer_token_returns_401() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bearer_token_does_not_unlock_html_pages() {
+        // Bearer token should only work for /api/ paths; HTML paths still
+        // redirect to /login even with a valid bearer token.
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("authorization", "Bearer super-secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    // ── Auth: authenticated PATCH /api/peers/:id ───────────────────────────
+
+    #[tokio::test]
+    async fn authenticated_patch_peer_succeeds() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "AUTHPATCH1234567890==", None).await;
+        let (app, _) = test_router_with_auth(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("authorization", "Bearer super-secret-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"Auth Peer"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["display_name"], "Auth Peer");
     }
 }

@@ -17,7 +17,6 @@
 - [x] Poller runs config scan after each AWG poll cycle
 - [x] Idempotent mapping: clear-then-apply on every cycle
 - [x] Warn+skip on unreadable files; skip-on-missing-dir
-- [x] `has_config`, `config_name`, `config_path` populated for matched peers
 - [x] `unlinked` status correctly driven by `has_config`
 
 ---
@@ -26,9 +25,6 @@
 
 - [x] SQLite via sqlx; `peers`, `snapshots`, `events`, `interfaces`, `users` tables
 - [x] Migrations `0001` (schema) + `0002` (`config_name`, `config_path`)
-- [x] `PeerRow`/`SnapshotRow` + query fns + `connect_for_test` helper
-- [x] `find_snapshots_since` for history queries (ascending, time-bounded)
-- [x] `clear_all_config_mappings` + `apply_config_mapping` for idempotent mapping
 - [x] `update_peer_metadata` for rename/comment support
 
 ---
@@ -56,35 +52,50 @@
 - [x] `update_peer_metadata(pool, id, name, comment)` DB function
 - [x] `PATCH /api/peers/:id` – JSON API endpoint (partial update)
 - [x] `POST /peers/:id` – HTML form endpoint (PRG redirect)
-- [x] Edit form with pre-filled values in peer detail page
-- [x] `has_config` field in `GET /api/peers` summary response
 
 ---
 
-## Epic 7 – Admin Actions 🔲 planned
+## Epic 7 – Authentication ✅ complete
+
+- [x] `AuthConfig` struct with `enabled`, `username`, `password_hash`, `api_token`, `secure_cookie`
+- [x] Argon2id password verification (constant-time)
+- [x] In-memory session store with lazy expiry cleanup
+- [x] 32-byte `OsRng` session IDs
+- [x] `GET /login` + `POST /login` + `POST /logout`
+- [x] Auth middleware protecting all HTML + API routes
+- [x] HTML → redirect to `/login`; API → 401 JSON
+- [x] Optional bearer token via `AUTH_API_TOKEN`
+- [x] Logout button in nav bar on all pages
+- [x] `AUTH_ENABLED`, `AUTH_USERNAME`, `AUTH_PASSWORD_HASH`, `AUTH_API_TOKEN`, `AUTH_SECURE_COOKIE` env vars
+- [x] Health endpoint stays public
+- [x] 29 new auth-specific tests
+
+---
+
+## Epic 8 – Deployment Hardening 🔲 planned
+
+- [ ] CSRF tokens on write forms (depth-in-defence beyond `SameSite=Lax`)
+- [ ] Rate limiting on `/login` (brute-force protection)
+- [ ] Persistent session store (DB-backed; survive restarts)
+- [ ] Systemd service unit file
+- [ ] Reverse-proxy config examples (nginx, Caddy)
+- [ ] `AUTH_SECURE_COOKIE=true` enforced when TLS is detected
+
+---
+
+## Epic 9 – Admin Write Actions 🔲 planned
 
 - [ ] Enable / disable peer (`PATCH /api/peers/:id` with `"disabled": true/false`)
 - [ ] Download client config (`GET /api/peers/:id/config`)
-- [ ] Audit log viewer (`events` table)
-
----
-
-## Epic 8 – Auth & Hardening 🔲 planned
-
-- [ ] Session-based authentication
-- [ ] Admin vs. viewer roles
-- [ ] Rate limiting
-- [ ] CSRF protection (already partially mitigated: no state-changing GET handlers)
+- [ ] Audit log viewer (`events` table; `peer_updated` event)
 
 ---
 
 ## Recommended next step
 
-**Authentication layer** (Epic 8 starter):
-- Session cookie auth for the HTML pages
-- API key support for the JSON endpoints
-- Required before any public deployment
+Choose one of:
 
-This is the most important missing safety feature.  The rename/comment feature
-(Epic 6) is already useful internally but must be protected before exposing
-the panel on the public internet.
+1. **Deployment hardening** (Epic 8 starter) – CSRF tokens + rate limiting + systemd unit + reverse proxy docs.  Smallest path to a production-ready deployment guide.
+2. **Audit logging** – add `peer_updated` events with old/new name and timestamp; viewer on `/admin/events`.
+
+Both are small and clean.  Deployment hardening is recommended first because authentication is now in place.

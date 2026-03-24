@@ -1,42 +1,28 @@
 # amneziawg-web
 
-A self-hosted web panel that provides **visibility and basic management** for
+A self-hosted web panel that provides **visibility and management** for
 [AmneziaWG (AWG)](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module)
 installations managed via the
 [amneziawg-install](https://github.com/wiresock/amneziawg-install) script.
 
-> **Status:** read-only monitoring panel with traffic history, config discovery, peer renaming, and basic HTML UI · auth not yet available
+> **Status:** MVP – background poller, traffic history, config discovery, peer rename/comment, session cookie authentication · production-ready only behind a trusted reverse proxy (see [Security](#security))
 
 ---
 
 ## What is implemented
 
-- **Background poller** – calls `awg show all dump` every N seconds (default: 30),
-  stores per-peer snapshots in SQLite, keeps the `peers` table up-to-date, and
-  runs a config-discovery scan after each AWG poll.
-- **Config discovery** – scans `/etc/amneziawg/clients/` for `*.conf` files,
-  extracts the `[Peer] PublicKey` and `[Interface] Address` fields, and maps
-  each config file to the corresponding live peer by public key.
-- **Peer rename / comment** – `PATCH /api/peers/:id` accepts JSON
-  `{"display_name": "...", "comment": "..."}` and saves the values in the DB.
-  The HTML detail page also provides a plain-HTML edit form.
-- **`GET /`** – server-rendered HTML peer list (name, status, endpoint, handshake, RX, TX).
-- **`GET /peers/:id`** – server-rendered HTML peer detail page with an edit form.
-- **`GET /api/health`** – liveness probe.
-- **`GET /api/peers`** – returns all known peers with resolved name, status,
-  allowed IPs, endpoint, handshake time, RX/TX counters, and config metadata.
-- **`GET /api/peers/:id`** – returns full peer detail including 50 most-recent snapshots.
-- **`GET /api/peers/:id/history?range=24h|7d|30d`** – traffic history with deltas and summary totals.
-- **Status derivation** – `online` / `inactive` / `disabled` / `unlinked`
-  based on last-handshake age and config presence.
+- **Background poller** – calls `awg show all dump` every N seconds (default: 30), stores per-peer snapshots in SQLite, keeps the `peers` table up-to-date, and runs a config-discovery scan after each AWG poll.
+- **Config discovery** – scans `AWG_CONFIG_DIR` for `*.conf` files, extracts `[Peer] PublicKey`, and maps each config file to the corresponding live peer.
+- **Peer rename / comment** – `PATCH /api/peers/:id` and a plain-HTML form on `/peers/:id`.
+- **Session cookie authentication** – single-admin login via `GET /login` + `POST /login`; optional bearer-token for headless API access; configurable via environment variables.
+- **`GET /`** – server-rendered HTML peer list.
+- **`GET /peers/:id`** – server-rendered HTML peer detail + edit form.
+- **`GET /api/health`** – liveness probe (always public).
+- **`GET /api/peers`** – peer list JSON.
+- **`GET /api/peers/:id`** – peer detail JSON (50 most-recent snapshots).
+- **`GET /api/peers/:id/history?range=24h|7d|30d`** – traffic history.
+- **Status derivation** – `online` / `inactive` / `disabled` / `unlinked`.
 - **Display-name fallback** – `display_name` → `config_name` → `peer-<key-prefix>`.
-
-## What is NOT yet implemented
-
-- Authentication (planned: session tokens or Basic Auth)
-- Admin write actions: enable/disable, config download
-- Traffic charts / sparklines in the HTML pages
-- Peer creation or deletion
 
 ---
 
@@ -46,7 +32,14 @@ installations managed via the
 cd amneziawg-web
 cargo build --release
 
-# Defaults: listen 0.0.0.0:8080, DB awg-web.db
+# Development: auth off
+./target/release/amneziawg-web
+
+# Production: auth on
+export AUTH_ENABLED=true
+export AUTH_USERNAME=admin
+export AUTH_PASSWORD_HASH="$(\
+  python3 -c "import argon2; print(argon2.PasswordHasher().hash('your-password'))")"
 ./target/release/amneziawg-web
 ```
 
@@ -54,106 +47,142 @@ cargo build --release
 
 ## Configuration
 
-| Env var             | Default                      | Description                        |
-|---------------------|------------------------------|------------------------------------|
-| `AWG_WEB_LISTEN`    | `0.0.0.0:8080`               | TCP bind address                   |
-| `AWG_WEB_DB`        | `awg-web.db`                 | Path to SQLite file                |
-| `AWG_CONFIG_DIR`    | `/etc/amneziawg/clients`     | Directory of client `.conf` files  |
-| `AWG_POLL_INTERVAL` | `30`                         | Polling interval in seconds        |
-| `RUST_LOG`          | `amneziawg_web=info`         | Log level filter                   |
+| Env var               | Default                      | Description                                         |
+|-----------------------|------------------------------|-----------------------------------------------------|
+| `AWG_WEB_LISTEN`      | `0.0.0.0:8080`               | TCP bind address                                    |
+| `AWG_WEB_DB`          | `awg-web.db`                 | Path to SQLite file                                 |
+| `AWG_CONFIG_DIR`      | `/etc/amneziawg/clients`     | Directory of client `.conf` files                   |
+| `AWG_POLL_INTERVAL`   | `30`                         | Polling interval in seconds                         |
+| `RUST_LOG`            | `amneziawg_web=info`         | Log level filter                                    |
+| `AUTH_ENABLED`        | `false`                      | Enable authentication (set `true` in production)    |
+| `AUTH_USERNAME`       | `admin`                      | Admin username                                      |
+| `AUTH_PASSWORD_HASH`  | *(empty)*                    | Argon2id PHC string of the admin password           |
+| `AUTH_API_TOKEN`      | *(absent)*                   | Optional static bearer token for API access         |
+| `AUTH_SECURE_COOKIE`  | `false`                      | Set `Secure` flag on session cookie (enable for HTTPS) |
+
+---
+
+## Authentication
+
+### Generate a password hash
+
+```bash
+python3 -c "import argon2; print(argon2.PasswordHasher().hash('yourpassword'))"
+```
+
+The resulting string looks like:  
+`$argon2id$v=19$m=65536,t=3,p=4$<salt>$<hash>`
+
+Store it in `AUTH_PASSWORD_HASH`.
+
+### Login / logout
+
+- Navigate to `http://<host>:<port>/login`.
+- Enter username and password.
+- On success, a session cookie (`awg_session`) is set (`HttpOnly`, `SameSite=Lax`).
+- The logout button on every page clears the session.
+
+### Bearer token (API)
+
+For headless automation, set `AUTH_API_TOKEN` to a long random string:
+
+```bash
+export AUTH_API_TOKEN="$(openssl rand -hex 32)"
+curl -H "Authorization: Bearer $AUTH_API_TOKEN" http://localhost:8080/api/peers
+```
+
+Bearer tokens only work for `/api/` paths.  HTML pages always require a session cookie.
+
+### AUTH_ENABLED=false
+
+When `AUTH_ENABLED=false`, all requests are accepted without credentials.  
+**Never expose this on a public network.**
 
 ---
 
 ## Peer naming
 
-Every peer is assigned a human-readable name resolved through this fallback chain:
+| Priority | Source             | When used                              |
+|----------|--------------------|----------------------------------------|
+| 1        | `display_name`     | User has explicitly set a name         |
+| 2        | `config_name`      | Matching `*.conf` file was discovered  |
+| 3        | `peer-<prefix>`    | Fallback from the public key prefix    |
 
-| Priority | Source         | When used                                          |
-|----------|----------------|----------------------------------------------------|
-| 1        | `display_name` | User has explicitly set a name via the edit form or API |
-| 2        | `config_name`  | A matching `*.conf` file was discovered             |
-| 3        | `peer-<8-char-prefix>` | Fallback generated from the public key prefix |
-
-### Updating a name or comment
+### Update a name or comment
 
 **Via the API:**
 
 ```http
 PATCH /api/peers/:id
 Content-Type: application/json
+Authorization: Bearer <token>
 
 { "display_name": "Ivan iPhone", "comment": "Main phone" }
 ```
 
 - Both fields are optional. Absent fields are left unchanged.
-- Empty or blank strings clear the field (set to NULL).
-- `display_name` is capped at 128 characters; `comment` at 512.
-- Returns the full peer detail DTO.
-- `404` if the peer does not exist.
+- Empty / blank strings clear the field (set to NULL).
+- `display_name` max 128 chars; `comment` max 512 chars.
+- Returns 404 if the peer does not exist.
 
-**Via the HTML UI:**
-
-Navigate to `/peers/:id` and fill in the "Edit peer" form.
-
----
-
-## Config discovery
-
-After each AWG poll, the poller scans `AWG_CONFIG_DIR` for `*.conf` files.
-
-For each file:
-1. The `[Peer] PublicKey` field is extracted.
-2. The peer row matching that public key is updated with `has_config = 1`,
-   `config_name` (filename stem), and `config_path` (absolute path).
-
-Peers with no matching config file have `has_config = 0` and are shown as
-**unlinked** in the UI and API.
-
-The mapping is **idempotent**: all config fields are reset at the start of each
-scan and re-applied from the current set of files.
+**Via the HTML UI:** Navigate to `/peers/:id` and fill in the "Edit peer" form.
 
 ---
 
 ## API
 
-| Method | Path                          | Description                                      |
-|--------|-------------------------------|--------------------------------------------------|
-| GET    | `/`                           | HTML peer list page                              |
-| GET    | `/peers/:id`                  | HTML peer detail + edit form                     |
-| POST   | `/peers/:id`                  | HTML form submit (redirect back on success)      |
-| GET    | `/api/health`                 | Liveness probe – `{"status":"ok"}`               |
-| GET    | `/api/peers`                  | List all peers                                   |
-| GET    | `/api/peers/:id`              | Get one peer by integer ID                       |
-| PATCH  | `/api/peers/:id`              | Update display name and/or comment               |
-| GET    | `/api/peers/:id/history`      | Traffic history (`range=24h|7d|30d`)             |
+| Method | Path                     | Auth required | Description                         |
+|--------|--------------------------|---------------|-------------------------------------|
+| GET    | `/`                      | Yes           | HTML peer list                      |
+| GET    | `/peers/:id`             | Yes           | HTML peer detail + edit form        |
+| POST   | `/peers/:id`             | Yes           | HTML form submit (PRG redirect)     |
+| GET    | `/login`                 | No            | Login form                          |
+| POST   | `/login`                 | No            | Validate credentials, set cookie    |
+| POST   | `/logout`                | No            | Clear session cookie                |
+| GET    | `/api/health`            | No            | Liveness probe                      |
+| GET    | `/api/peers`             | Yes           | List all peers                      |
+| GET    | `/api/peers/:id`         | Yes           | Get one peer by integer ID          |
+| PATCH  | `/api/peers/:id`         | Yes           | Update display name and/or comment  |
+| GET    | `/api/peers/:id/history` | Yes           | Traffic history (`range=24h|7d|30d`)|
 
-### Status values
+---
 
-| Value      | Meaning                                                              |
-|------------|----------------------------------------------------------------------|
-| `online`   | Last handshake within 180 s                                          |
-| `inactive` | Has a config file but no recent handshake                            |
-| `disabled` | Administratively disabled via the `disabled` flag in the DB          |
-| `unlinked` | Seen in `awg show` but no matching config file found                 |
+## Security
+
+### What is in place
+
+- Passwords stored as Argon2id PHC strings (never plaintext).
+- Session IDs are 32 bytes from `OsRng` (cryptographically random, 64-char hex).
+- Session cookies: `HttpOnly`, `SameSite=Lax`, 24-hour expiry.
+- HTML output is escaped via `esc()` – XSS safe.
+- Private keys are never stored or logged.
+- `SameSite=Lax` mitigates the most common CSRF vectors for this panel.
+
+### What requires additional hardening before public exposure
+
+| Risk | Recommended mitigation |
+|------|------------------------|
+| No CSRF tokens on write forms | Add CSRF tokens in a future PR; for now deploy behind a trusted reverse proxy with same-origin policy |
+| `Secure` cookie flag off by default | Set `AUTH_SECURE_COOKIE=true` when using HTTPS |
+| Sessions lost on restart (in-memory store) | Acceptable for MVP; add DB-backed session store if needed |
+| Single admin, no RBAC | Add roles in a future PR |
+
+### Deployment recommendation
+
+Run behind a reverse proxy (nginx, Caddy) that:
+- Terminates TLS
+- Sets `AUTH_SECURE_COOKIE=true`
+- Restricts to trusted IP ranges if possible
 
 ---
 
 ## Development
 
 ```bash
-cargo test                        # 84 tests
+cargo test                        # 113 tests
 cargo fmt --check
 cargo clippy -- -D warnings
 ```
-
----
-
-## Security
-
-- Private keys are **never** logged or stored.
-- `awg` is invoked with an absolute path; no shell interpolation is used.
-- HTML output is escaped with `esc()` to prevent XSS.
-- The service must run behind a trusted reverse proxy until authentication is added.
 
 ---
 
