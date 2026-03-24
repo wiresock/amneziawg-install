@@ -1,45 +1,64 @@
 # MVP Definition
 
-## Included in MVP
+## Implemented in this milestone
 
-| # | Feature                               | Notes                                     |
-|---|---------------------------------------|-------------------------------------------|
-| 1 | `awg show all dump` integration        | Read-only; no writes to AWG config        |
-| 2 | Peer list with RX/TX, handshake, endpoint | Polled every 30 s                     |
-| 3 | Peer status derivation                | online / inactive / disabled / unlinked   |
-| 4 | SQLite storage (peers + snapshots)    | Persistent across restarts                |
-| 5 | REST API `/api/health`, `/api/peers`  | JSON responses                            |
-| 6 | Display name + comment per peer       | Stored in DB, not in AWG config           |
-| 7 | Enable / disable peer                 | Admin action (stub; UI TBD)               |
-| 8 | Config file discovery                 | Scan `/etc/amneziawg/clients/*.conf`      |
-| 9 | Audit log                             | Events table in DB                        |
-|10 | Config download                       | Serve existing `.conf` file to admin      |
+| # | Feature                                   | Notes                                         |
+|---|-------------------------------------------|-----------------------------------------------|
+| 1 | `awg show all dump` integration            | Read-only; no shell interpolation             |
+| 2 | Background poller (every N seconds)       | Default 30 s; degrades gracefully if AWG absent|
+| 3 | Peer snapshots stored in SQLite           | `snapshots` table; persistent history         |
+| 4 | `peers` table kept up-to-date             | Upsert on every poll; includes `allowed_ips`  |
+| 5 | `GET /api/peers` – real peer listing      | Status, name, endpoint, handshake, RX/TX      |
+| 6 | `GET /api/peers/:id` – peer detail        | 50 recent snapshots; 404 on missing peer      |
+| 7 | Status derivation                         | `online`/`inactive`/`disabled`/`unlinked`     |
+| 8 | Display-name fallback chain               | `display_name` → config stem → `peer-<prefix>`|
+| 9 | Schema migration `0002`                   | Added `config_name`, `config_path` to `peers` |
+|10 | 36 unit + integration tests               | All passing; DB, domain, web layers covered   |
 
 ---
 
-## Excluded from MVP
+## Excluded from this milestone
 
-- Authentication / authorisation (planned: session tokens or Basic Auth)
-- HTTPS termination (assumed to be handled by a reverse proxy)
-- Real-time WebSocket updates
-- Multi-user management UI
-- AWG key generation / peer creation
-- Email notifications
-- Metrics export (Prometheus)
-- Mobile-friendly UI
+- Authentication / authorisation
+- HTML/web UI (peer-list page)
+- Config-file discovery (scanning `/etc/amneziawg/clients/`)
+- Admin write actions (rename, disable, config download)
+- Traffic history charts
 - Multi-server support
 
 ---
 
 ## Acceptance Criteria
 
-1. `cargo build --release` succeeds with no errors.
-2. `cargo test` passes all unit tests.
-3. Service starts, connects to DB, and runs migrations without errors.
-4. `GET /api/health` returns `{"status":"ok"}` with HTTP 200.
-5. Poller runs without crashing when AWG binary is absent (degrades gracefully).
-6. AWG output parser correctly handles:
-   - an interface with zero peers
-   - a peer with no handshake
-   - a peer with a reset counter (rx/tx = 0 after non-zero)
-7. Config scanner correctly identifies `.conf` files and ignores other files.
+1. `cargo build --release` succeeds without errors.
+2. `cargo test` passes all 36 tests.
+3. `GET /api/peers` returns a JSON array (not a placeholder object).
+4. `GET /api/peers/:id` returns HTTP 200 with peer detail for a valid ID.
+5. `GET /api/peers/:id` returns HTTP 404 for an unknown ID.
+6. Status is derived correctly for `online`, `inactive`, `disabled`, `unlinked`.
+7. Display name falls back to config stem, then to `peer-<first-8-chars>`.
+8. Private keys do not appear in any API response.
+9. Poller logs peer count, snapshot count, and elapsed time each cycle.
+10. Poller degrades gracefully (logs a warning) when `/usr/bin/awg` is absent.
+
+---
+
+## Remaining assumptions about AWG dump format
+
+- Field layout matches WireGuard `wg show all dump` (5 interface fields, 9 peer fields).
+- `allowed_ips` field uses comma-separated CIDRs.
+- Timestamps are Unix epoch integers; `0` means no handshake.
+- `(none)` is the sentinel for absent string values.
+
+> **TODO**: Verify on a live AWG host and update `src/awg/mod.rs` if the format differs.
+
+---
+
+## What is still missing before production use
+
+- **Authentication** – the API is completely unauthenticated; must run behind a
+  trusted reverse proxy until auth middleware is added.
+- **HTTPS** – TLS termination is assumed to be provided by a reverse proxy.
+- **Config discovery** – `config_name` / `config_path` are `NULL` for all peers
+  until the poller is extended to scan the client config directory.
+- **UI** – there is no HTML interface yet; the service is API-only.

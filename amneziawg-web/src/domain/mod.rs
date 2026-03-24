@@ -3,6 +3,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Seconds within which a peer is considered "online" based on last handshake.
+pub const ONLINE_THRESHOLD_SECS: i64 = 180;
+
 /// Public-key fingerprint used as the canonical peer identifier.
 /// Private keys are NEVER stored or logged.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
@@ -19,19 +22,32 @@ impl std::fmt::Display for PublicKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerStatus {
-    /// Handshake within the last 3 minutes.
+    /// Handshake within `online_threshold_secs` seconds.
     Online,
-    /// No recent handshake but a handshake has been seen.
+    /// No recent handshake but the peer has a known config.
     Inactive,
-    /// Administratively disabled (no private config present / flagged).
+    /// Administratively disabled.
     Disabled,
-    /// Seen in `awg show` but no matching config file found.
+    /// Seen in `awg show` but no matching config file found and no
+    /// display name has been assigned.
     Unlinked,
 }
 
 impl PeerStatus {
-    /// Derive status from the last handshake timestamp and the disabled flag.
-    pub fn derive(last_handshake: Option<DateTime<Utc>>, disabled: bool, has_config: bool) -> Self {
+    /// Derive status from the last handshake timestamp, disabled flag,
+    /// config-presence flag, and a configurable online threshold.
+    ///
+    /// Priority order:
+    /// 1. `disabled` → `Disabled` (overrides everything)
+    /// 2. `!has_config` → `Unlinked`
+    /// 3. Recent handshake → `Online`
+    /// 4. Otherwise → `Inactive`
+    pub fn derive(
+        last_handshake: Option<DateTime<Utc>>,
+        disabled: bool,
+        has_config: bool,
+        online_threshold_secs: i64,
+    ) -> Self {
         if disabled {
             return PeerStatus::Disabled;
         }
@@ -41,7 +57,7 @@ impl PeerStatus {
         match last_handshake {
             Some(ts) => {
                 let age = Utc::now() - ts;
-                if age.num_seconds() <= 180 {
+                if age.num_seconds() <= online_threshold_secs {
                     PeerStatus::Online
                 } else {
                     PeerStatus::Inactive
@@ -52,7 +68,33 @@ impl PeerStatus {
     }
 }
 
-/// Peer as known to the web panel.
+/// Resolve the human-readable display name for a peer.
+///
+/// Fallback order:
+/// 1. `display_name` – if a user has explicitly set one.
+/// 2. `config_name` – stem of the matching `.conf` file (e.g. `"ivan-iphone"`).
+/// 3. `peer-<first-8-chars-of-public_key>` – last-resort generated name.
+pub fn resolve_display_name(
+    display_name: Option<&str>,
+    config_name: Option<&str>,
+    public_key: &str,
+) -> String {
+    if let Some(name) = display_name {
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    if let Some(name) = config_name {
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    let prefix_len = public_key.len().min(8);
+    format!("peer-{}", &public_key[..prefix_len])
+}
+
+/// Peer as known to the web panel (domain model, not a DB row).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
     pub public_key: PublicKey,
@@ -67,7 +109,8 @@ pub struct Peer {
     pub comment: Option<String>,
 }
 
-/// A point-in-time snapshot of a peer's stats.
+/// A point-in-time snapshot of a peer's stats (domain model).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerSnapshot {
     pub public_key: PublicKey,
@@ -82,40 +125,110 @@ pub struct PeerSnapshot {
 mod tests {
     use super::*;
 
+    // ── PeerStatus::derive ─────────────────────────────────────────────────
+
     #[test]
-    fn online_within_3_minutes() {
+    fn online_within_threshold() {
         let ts = Utc::now() - chrono::Duration::seconds(60);
         assert_eq!(
-            PeerStatus::derive(Some(ts), false, true),
+            PeerStatus::derive(Some(ts), false, true, ONLINE_THRESHOLD_SECS),
             PeerStatus::Online
         );
     }
 
     #[test]
-    fn inactive_after_3_minutes() {
+    fn inactive_after_threshold() {
         let ts = Utc::now() - chrono::Duration::seconds(300);
         assert_eq!(
-            PeerStatus::derive(Some(ts), false, true),
+            PeerStatus::derive(Some(ts), false, true, ONLINE_THRESHOLD_SECS),
             PeerStatus::Inactive
         );
     }
 
     #[test]
-    fn disabled_overrides_handshake() {
+    fn disabled_overrides_recent_handshake() {
         let ts = Utc::now() - chrono::Duration::seconds(10);
         assert_eq!(
-            PeerStatus::derive(Some(ts), true, true),
+            PeerStatus::derive(Some(ts), true, true, ONLINE_THRESHOLD_SECS),
             PeerStatus::Disabled
         );
     }
 
     #[test]
     fn unlinked_when_no_config() {
-        assert_eq!(PeerStatus::derive(None, false, false), PeerStatus::Unlinked);
+        assert_eq!(
+            PeerStatus::derive(None, false, false, ONLINE_THRESHOLD_SECS),
+            PeerStatus::Unlinked
+        );
     }
 
     #[test]
-    fn inactive_no_handshake_but_has_config() {
-        assert_eq!(PeerStatus::derive(None, false, true), PeerStatus::Inactive);
+    fn inactive_no_handshake_with_config() {
+        assert_eq!(
+            PeerStatus::derive(None, false, true, ONLINE_THRESHOLD_SECS),
+            PeerStatus::Inactive
+        );
+    }
+
+    #[test]
+    fn custom_threshold_respected() {
+        // With a 10-second threshold, a 15-second-old handshake is inactive.
+        let ts = Utc::now() - chrono::Duration::seconds(15);
+        assert_eq!(
+            PeerStatus::derive(Some(ts), false, true, 10),
+            PeerStatus::Inactive
+        );
+        // But with a 30-second threshold it is online.
+        assert_eq!(
+            PeerStatus::derive(Some(ts), false, true, 30),
+            PeerStatus::Online
+        );
+    }
+
+    // ── resolve_display_name ───────────────────────────────────────────────
+
+    #[test]
+    fn uses_display_name_first() {
+        assert_eq!(
+            resolve_display_name(Some("Alice"), Some("client1"), "abcdef1234567890"),
+            "Alice"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_config_name() {
+        assert_eq!(
+            resolve_display_name(None, Some("ivan-iphone"), "abcdef1234567890"),
+            "ivan-iphone"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_public_key_prefix() {
+        assert_eq!(
+            resolve_display_name(None, None, "abcdef1234567890"),
+            "peer-abcdef12"
+        );
+    }
+
+    #[test]
+    fn short_public_key_uses_full_key() {
+        assert_eq!(resolve_display_name(None, None, "abc"), "peer-abc");
+    }
+
+    #[test]
+    fn empty_display_name_uses_config_name() {
+        assert_eq!(
+            resolve_display_name(Some(""), Some("ivan-iphone"), "abcdef1234567890"),
+            "ivan-iphone"
+        );
+    }
+
+    #[test]
+    fn empty_config_name_uses_key_prefix() {
+        assert_eq!(
+            resolve_display_name(None, Some(""), "abcdef1234567890"),
+            "peer-abcdef12"
+        );
     }
 }

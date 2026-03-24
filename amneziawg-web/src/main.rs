@@ -2,9 +2,6 @@
 //!
 //! Starts the HTTP server, initialises the database, and launches the background poller.
 
-// Scaffold note: domain types and admin/config modules are stubs not yet wired
-// to web handlers.  Remove this allow once all modules are integrated.
-#![allow(dead_code)]
 mod admin;
 mod awg;
 mod config_store;

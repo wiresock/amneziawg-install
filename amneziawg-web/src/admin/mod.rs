@@ -2,6 +2,7 @@
 //!
 //! TODO: Implement admin actions behind an authentication layer.
 
+#![allow(dead_code)]
 use crate::domain::PublicKey;
 
 /// Rename or set the display name of a peer.

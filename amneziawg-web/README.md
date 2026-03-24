@@ -5,19 +5,30 @@ A self-hosted web panel that provides **visibility and basic management** for
 installations managed via the
 [amneziawg-install](https://github.com/wiresock/amneziawg-install) script.
 
-> **Status:** early scaffold / MVP in progress
+> **Status:** read-only peer listing implemented · auth not yet available
 
 ---
 
-## What it does
+## What is implemented
 
-- Reads live peer state from `awg show all dump`
-- Stores time-series snapshots in a local SQLite database
-- Exposes a minimal REST API (and eventually a web UI) for:
-  - listing peers with RX/TX stats and last-handshake
-  - assigning display names and comments
-  - enabling / disabling peers
-  - downloading client configs
+- **Background poller** – calls `awg show all dump` every N seconds (default: 30),
+  stores per-peer snapshots in SQLite, and keeps the `peers` table up-to-date.
+- **`GET /api/health`** – liveness probe.
+- **`GET /api/peers`** – returns all known peers with resolved name, status,
+  allowed IPs, endpoint, handshake time, and RX/TX counters.
+- **`GET /api/peers/:id`** – returns full peer detail including the 50 most
+  recent snapshots.
+- **Status derivation** – `online` / `inactive` / `disabled` / `unlinked`
+  based on last-handshake age (configurable threshold, default 180 s).
+- **Display-name fallback** – `display_name` → config filename stem → `peer-<key-prefix>`.
+
+## What is NOT yet implemented
+
+- Authentication (planned: session tokens or Basic Auth – Epic 8)
+- HTML/web UI (planned: askama templates – Epics 5–6)
+- Config-file discovery (poller does not yet scan `/etc/amneziawg/clients/` – Epic 2)
+- Admin write actions: rename, disable, config download (Epics 7–8)
+- Traffic history aggregation and charts (Epic 5)
 
 ---
 
@@ -26,8 +37,8 @@ installations managed via the
 `amneziawg-web` is an **overlay**, not a replacement.  It does **not**:
 
 - Replace or modify the `amneziawg-install.sh` workflow
-- Manage keys, generate configs from scratch, or touch `wg-quick`
-- Replace `awg` / `wg-quick` as the primary tool
+- Generate WireGuard keys or create new peer configs
+- Replace `awg` / `wg-quick` as the primary VPN management tool
 
 ---
 
@@ -63,27 +74,61 @@ All options can be set via CLI flags or environment variables:
 
 ---
 
-## API endpoints
+## API
 
-| Method | Path            | Description                    |
-|--------|-----------------|--------------------------------|
-| GET    | `/api/health`   | Liveness probe                 |
-| GET    | `/api/peers`    | List all known peers (stub)    |
-| GET    | `/api/peers/:id`| Get peer by public key (stub)  |
+| Method | Path              | Description                              |
+|--------|-------------------|------------------------------------------|
+| GET    | `/api/health`     | Liveness probe – `{"status":"ok"}`       |
+| GET    | `/api/peers`      | List all peers (array of summary DTOs)   |
+| GET    | `/api/peers/:id`  | Get one peer by integer ID (detail DTO)  |
+
+### Example – peer summary
+
+```json
+{
+  "id": 1,
+  "name": "Ivan iPhone",
+  "public_key": "BASE64KEY==",
+  "config_name": "ivan-iphone",
+  "allowed_ips": "10.8.0.2/32",
+  "endpoint": "203.0.113.10:51820",
+  "latest_handshake_at": "2026-03-24T10:00:00Z",
+  "rx_bytes": 123456,
+  "tx_bytes": 654321,
+  "status": "online"
+}
+```
+
+### Status values
+
+| Value      | Meaning                                                          |
+|------------|------------------------------------------------------------------|
+| `online`   | Last handshake within 180 s                                      |
+| `inactive` | Has a config or display name, but no recent handshake            |
+| `disabled` | Administratively disabled via the `disabled` flag in the DB      |
+| `unlinked` | Seen in `awg show` but no config file matched and no name set    |
+
+---
+
+## AWG dump format assumptions
+
+`awg show all dump` output is assumed to follow the WireGuard `wg show all dump`
+tab-separated format:
+
+- **Interface line** (5 fields): `interface private_key public_key listen_port fwmark`
+- **Peer line** (9 fields): `interface public_key preshared_key endpoint allowed_ips latest_handshake rx_bytes tx_bytes persistent_keepalive`
+
+Private-key fields are read and immediately discarded.  If the AWG binary uses
+a different layout, update `src/awg/mod.rs::parse_dump()`.
 
 ---
 
 ## Development
 
 ```bash
-# Run tests
-cargo test
-
-# Format
-cargo fmt
-
-# Lint
-cargo clippy -- -D warnings
+cargo test            # run all tests (36 as of this milestone)
+cargo fmt             # format code
+cargo clippy -- -D warnings   # lint
 ```
 
 ---
@@ -94,7 +139,6 @@ cargo clippy -- -D warnings
 - [`docs/MVP.md`](docs/MVP.md) – MVP scope and acceptance criteria
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) – development roadmap
 - [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md) – product specification
-- [`docs/COPILOT_TASK.md`](docs/COPILOT_TASK.md) – original bootstrap task
 
 ---
 
@@ -102,8 +146,7 @@ cargo clippy -- -D warnings
 
 - Private keys are **never** logged or stored.
 - `awg` is invoked with an absolute path; no shell interpolation is used.
-- All config file paths are validated before access.
-- See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for security constraints.
+- Config file paths are validated before access (non-recursive directory scan).
 
 ---
 

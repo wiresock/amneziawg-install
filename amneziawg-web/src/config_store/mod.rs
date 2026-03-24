@@ -3,7 +3,12 @@
 //! Scans a directory for `*.conf` files (AWG client configs), extracts
 //! basic metadata, and attempts to map each config to a live peer via its
 //! `PublicKey`.
+//!
+//! This module is compiled and tested but not yet wired into the main
+//! request-handling path.  It will be used by the poller in a later milestone
+//! (Epic 2 – Config Discovery).
 
+#![allow(dead_code)]
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
