@@ -17,12 +17,14 @@ installations managed via the
 - **Session cookie authentication** – single-admin login via `GET /login` + `POST /login`; optional bearer-token for headless API access; configurable via environment variables.
 - **CSRF protection** – every HTML form carries a hidden `csrf_token` field; `POST /login` uses a short-lived pre-login token; write forms use per-session tokens.
 - **Login rate limiting** – 5 attempts per 5-minute window per client IP; returns `429 Too Many Requests` when exceeded.
+- **Audit logging** – every peer write action, login success/failure, and logout is recorded in the `events` table and exposed via `GET /api/events`.
 - **`GET /`** – server-rendered HTML peer list.
-- **`GET /peers/:id`** – server-rendered HTML peer detail + edit form.
+- **`GET /peers/:id`** – server-rendered HTML peer detail + edit form + recent activity log.
 - **`GET /api/health`** – liveness probe (always public).
 - **`GET /api/peers`** – peer list JSON.
 - **`GET /api/peers/:id`** – peer detail JSON (50 most-recent snapshots).
 - **`GET /api/peers/:id/history?range=24h|7d|30d`** – traffic history.
+- **`GET /api/events`** – audit event log (filterable by `peer_id`, `event_type`, `limit`).
 - **Status derivation** – `online` / `inactive` / `disabled` / `unlinked`.
 - **Display-name fallback** – `display_name` → `config_name` → `peer-<key-prefix>`.
 
@@ -147,6 +149,7 @@ Authorization: Bearer <token>
 | GET    | `/api/peers/:id`         | Yes           | Get one peer by integer ID          |
 | PATCH  | `/api/peers/:id`         | Yes           | Update display name and/or comment  |
 | GET    | `/api/peers/:id/history` | Yes           | Traffic history (`range=24h|7d|30d`)|
+| GET    | `/api/events`            | Yes           | Audit log (`peer_id`, `event_type`, `limit`) |
 
 ---
 
@@ -187,7 +190,7 @@ In summary, run behind a reverse proxy (nginx, Caddy) that:
 ## Development
 
 ```bash
-cargo test                        # 138 tests
+cargo test                        # 155 tests
 cargo fmt --check
 cargo clippy -- -D warnings
 ```

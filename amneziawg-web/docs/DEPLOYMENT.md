@@ -199,5 +199,4 @@ internet exposure.
 | CSRF tokens | SameSite=Lax + per-form tokens | Add SameSite=Strict option |
 | Rate limit IP | Trusts X-Forwarded-For | Validate at proxy layer |
 | TLS | Handled by reverse proxy | Use Caddy/nginx with Let's Encrypt |
-| Audit logging | Not implemented | Add write-action event log |
 | Multi-user | Not implemented | Future feature |

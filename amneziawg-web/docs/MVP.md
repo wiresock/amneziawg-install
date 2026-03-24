@@ -92,6 +92,38 @@ Every peer resolves its display name through this fallback chain:
 | Login rate limiting | 5 per 5-minute window per IP; 429 on excess |
 | Constant-time password check | ✓ via argon2 crate |
 | Constant-time CSRF comparison | ✓ via folded-XOR `csrf_eq()` |
+| Audit logging | ✓ `events` table; `peer_updated`, `login_success`, `login_failed`, `logout` |
+
+---
+
+## Audit logging
+
+All write actions and auth events are appended to the `events` table and
+never modify the same row in-place.
+
+### Events logged
+
+| Event type | When | Payload fields |
+|---|---|---|
+| `peer_updated` | `PATCH /api/peers/:id` and `POST /peers/:id` | `old_display_name`, `new_display_name`, `old_comment`, `new_comment` |
+| `login_success` | Successful `POST /login` | *(none)* |
+| `login_failed`  | Failed credential check on `POST /login` | *(none)* |
+| `logout`        | `POST /logout` | *(none)* |
+
+### Actor model
+
+For the current single-admin setup, `actor` is always the value of
+`AUTH_USERNAME` (default `"admin"`). The field is stored verbatim so it
+can be extended to multi-user attribution in the future without a schema
+migration.
+
+### Limitations
+
+- No sensitive data is included in payloads (no passwords or tokens).
+- Audit records are stored in the same SQLite database; they are lost if
+  the database file is deleted or overwritten.
+- Actor attribution is user-level only (no session or IP in the event record).
+- The `events` table is append-only but not tamper-evident (no signatures).
 
 ---
 
@@ -100,4 +132,3 @@ Every peer resolves its display name through this fallback chain:
 - **HTTPS** – TLS termination must be provided by a reverse proxy; set `AUTH_SECURE_COOKIE=true`.
 - **Persistent session store** – current in-memory store resets on restart.
 - **Traffic charts** – snapshots table exists but no chart is rendered.
-- **Audit logging** – write actions (peer edits) are not logged to an audit trail.

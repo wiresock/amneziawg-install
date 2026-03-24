@@ -24,6 +24,9 @@ use crate::auth::{
     new_session_store, remove_session, AuthConfig, LoginCsrfStore, LoginRateLimiter, SessionStore,
     RATE_LIMIT_MAX_ATTEMPTS, RATE_LIMIT_WINDOW,
 };
+use crate::db::events::{
+    list_events, log_event, EVT_LOGIN_FAILED, EVT_LOGIN_SUCCESS, EVT_LOGOUT, EVT_PEER_UPDATED,
+};
 use crate::db::peers::{PeerRow, SnapshotRow};
 use crate::db::Database;
 use crate::domain::history::{compute_history, HistoryPoint, HistorySummary, SnapshotInput};
@@ -188,6 +191,29 @@ pub struct LogoutForm {
     pub csrf_token: Option<String>,
 }
 
+/// Query parameters for `GET /api/events`.
+#[derive(Debug, Deserialize)]
+pub struct EventsQuery {
+    /// Filter by integer peer ID.
+    pub peer_id: Option<i64>,
+    /// Filter by event type string (e.g. `"peer_updated"`).
+    pub event_type: Option<String>,
+    /// Maximum number of events to return (default 50, max 200).
+    pub limit: Option<i64>,
+}
+
+/// One event entry returned by `GET /api/events`.
+#[derive(Debug, Serialize)]
+pub struct EventDto {
+    pub id: i64,
+    pub event_type: String,
+    pub peer_id: Option<i64>,
+    /// Parsed JSON payload, or `null` if no detail was recorded.
+    pub payload: Option<serde_json::Value>,
+    pub actor: String,
+    pub created_at: String,
+}
+
 // ── Conversion helpers ───────────────────────────────────────────────────────
 
 fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
@@ -295,6 +321,7 @@ pub fn router(db: Database, auth: AuthConfig) -> Router {
         .route("/api/peers", get(list_peers))
         .route("/api/peers/:id", get(get_peer).patch(patch_peer))
         .route("/api/peers/:id/history", get(get_peer_history))
+        .route("/api/events", get(list_events_handler))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -432,6 +459,16 @@ async fn post_login(
     let password_ok = crate::auth::verify_password(&state.auth.password_hash, &form.password);
 
     if !username_ok || !password_ok {
+        // Log failed login attempt (does not reveal which field was wrong).
+        log_event(
+            &state.db.pool,
+            EVT_LOGIN_FAILED,
+            None,
+            None,
+            None,
+            &state.auth.username,
+        )
+        .await;
         let new_csrf = generate_login_csrf(&state.login_csrf);
         return Html(render_login_page(true, &new_csrf)).into_response();
     }
@@ -439,6 +476,17 @@ async fn post_login(
     // Issue a new session.
     let session_id = generate_session_id();
     let _csrf = add_session(&state.sessions, session_id.clone());
+
+    // Log successful login.
+    log_event(
+        &state.db.pool,
+        EVT_LOGIN_SUCCESS,
+        None,
+        None,
+        None,
+        &state.auth.username,
+    )
+    .await;
 
     let cookie = make_session_cookie(
         &session_id,
@@ -476,6 +524,17 @@ async fn post_logout(
         remove_session(&state.sessions, &token);
     }
 
+    // Log the logout event.
+    log_event(
+        &state.db.pool,
+        EVT_LOGOUT,
+        None,
+        None,
+        None,
+        &state.auth.username,
+    )
+    .await;
+
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(
         SET_COOKIE,
@@ -491,6 +550,42 @@ async fn post_logout(
 /// `GET /api/health` – liveness probe.
 async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+/// `GET /api/events` – audit event log.
+///
+/// Accepts optional query parameters:
+/// - `peer_id`    – filter by integer peer ID
+/// - `event_type` – filter by event type string (e.g. `"peer_updated"`)
+/// - `limit`      – max rows to return (default 50, max 200)
+async fn list_events_handler(
+    State(state): State<AppState>,
+    Query(params): Query<EventsQuery>,
+) -> ApiResult<Json<Vec<EventDto>>> {
+    let limit = params.limit.unwrap_or(50);
+    let rows = list_events(
+        &state.db.pool,
+        params.peer_id,
+        params.event_type.as_deref(),
+        limit,
+    )
+    .await?;
+
+    let dtos = rows
+        .into_iter()
+        .map(|row| EventDto {
+            id: row.id,
+            event_type: row.action,
+            peer_id: row.peer_id,
+            payload: row
+                .detail
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
+            actor: row.actor,
+            created_at: row.created_at,
+        })
+        .collect();
+    Ok(Json(dtos))
 }
 
 /// `GET /api/peers` – list all known peers with their current stats.
@@ -630,6 +725,24 @@ async fn patch_peer(
         )
             .into_response()),
         Some(peer_row) => {
+            // Fire-and-forget audit log.
+            let detail = serde_json::json!({
+                "old_display_name": existing.display_name,
+                "new_display_name": new_display_name,
+                "old_comment": existing.comment,
+                "new_comment": new_comment,
+            })
+            .to_string();
+            log_event(
+                &state.db.pool,
+                EVT_PEER_UPDATED,
+                Some(id),
+                Some(&peer_row.public_key),
+                Some(&detail),
+                &state.auth.username,
+            )
+            .await;
+
             let public_key = peer_row.public_key.clone();
             let snapshots =
                 crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
@@ -669,9 +782,10 @@ async fn page_peer_detail(
             let public_key = peer_row.public_key.clone();
             let snapshots =
                 crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
+            let events = list_events(&state.db.pool, Some(id), None, 20).await?;
             let dto = peer_row_to_detail(peer_row, snapshots);
             let csrf = session_csrf_from_headers(&state, &headers);
-            Ok(Html(render_peer_detail(&dto, &csrf)).into_response())
+            Ok(Html(render_peer_detail(&dto, &csrf, &events)).into_response())
         }
     }
 }
@@ -700,16 +814,16 @@ async fn post_peer_edit(
     }
 
     // 404 if the peer does not exist.
-    if crate::db::peers::find_by_id(&state.db.pool, id)
-        .await?
-        .is_none()
-    {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Html("<h1>Peer not found</h1>".to_string()),
-        )
-            .into_response());
-    }
+    let existing = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
+        Some(r) => r,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Html("<h1>Peer not found</h1>".to_string()),
+            )
+                .into_response());
+        }
+    };
 
     let display_name = form
         .display_name
@@ -724,6 +838,24 @@ async fn post_peer_edit(
         comment.as_deref(),
     )
     .await?;
+
+    // Fire-and-forget audit log.
+    let detail = serde_json::json!({
+        "old_display_name": existing.display_name,
+        "new_display_name": display_name,
+        "old_comment": existing.comment,
+        "new_comment": comment,
+    })
+    .to_string();
+    log_event(
+        &state.db.pool,
+        EVT_PEER_UPDATED,
+        Some(id),
+        Some(&existing.public_key),
+        Some(&detail),
+        &state.auth.username,
+    )
+    .await;
 
     // Redirect back to the detail page (PRG pattern).
     Ok(Redirect::to(&format!("/peers/{id}")).into_response())
@@ -961,7 +1093,11 @@ fn render_peer_list(peers: &[PeerSummaryDto], csrf_token: &str) -> String {
     buf
 }
 
-fn render_peer_detail(dto: &PeerDetailDto, csrf_token: &str) -> String {
+fn render_peer_detail(
+    dto: &PeerDetailDto,
+    csrf_token: &str,
+    events: &[crate::db::events::EventRow],
+) -> String {
     let mut buf = html_head(&format!("Peer – {}", dto.name));
     buf.push_str(&nav_bar(csrf_token));
     buf.push_str(&format!(
@@ -1083,6 +1219,32 @@ fn render_peer_detail(dto: &PeerDetailDto, csrf_token: &str) -> String {
         "<p class=\"meta\"><a href=\"/api/peers/{id}/history\">JSON history (24h)</a></p>\n",
         id = dto.id
     ));
+
+    // Recent audit events for this peer
+    buf.push_str(&format!("<h2>Recent activity ({})</h2>\n", events.len()));
+    if events.is_empty() {
+        buf.push_str("<p>No recorded activity yet.</p>\n");
+    } else {
+        buf.push_str(
+            "<table>\n\
+             <tr><th>When</th><th>Event</th><th>Actor</th><th>Detail</th></tr>\n",
+        );
+        for ev in events {
+            let detail_cell = ev
+                .detail
+                .as_deref()
+                .map(|d| format!("<code>{}</code>", esc(d)))
+                .unwrap_or_else(|| "–".to_string());
+            buf.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                esc(&ev.created_at),
+                esc(&ev.action),
+                esc(&ev.actor),
+                detail_cell,
+            ));
+        }
+        buf.push_str("</table>\n");
+    }
 
     buf.push_str("</body></html>");
     buf
@@ -2319,5 +2481,220 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(api_resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Audit events API ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn events_api_returns_empty_list_initially() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn patch_peer_creates_audit_event() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "AUDIT_PATCH_KEY===", Some("OldName")).await;
+        let app = test_router(db);
+
+        // PATCH the peer.
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"NewName"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Check events API.
+        let events_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/events?peer_id={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(events_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let events: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = events.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["event_type"], "peer_updated");
+        assert_eq!(arr[0]["peer_id"], id);
+        // Payload must contain old and new names.
+        let payload = &arr[0]["payload"];
+        assert_eq!(payload["old_display_name"], "OldName");
+        assert_eq!(payload["new_display_name"], "NewName");
+    }
+
+    #[tokio::test]
+    async fn events_api_filter_by_event_type() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "AUDIT_FILTER_KEY==", None).await;
+        let app = test_router(db);
+
+        // Cause a peer_updated event.
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"Filtered"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Filter to only peer_updated events.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events?event_type=peer_updated")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|e| e["event_type"] == "peer_updated"));
+
+        // Filter to a non-existent event type – should return empty list.
+        let resp2 = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events?event_type=no_such_event")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let events2: Vec<serde_json::Value> = serde_json::from_slice(&body2).unwrap();
+        assert!(events2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_api_limit_parameter() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "AUDIT_LIMIT_KEY===", None).await;
+        let app = test_router(db);
+
+        // Create 5 events.
+        for i in 0..5 {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/api/peers/{id}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"display_name":"Name{i}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Limit to 2.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn patch_peer_logging_does_not_break_response() {
+        // Even with audit logging, the PATCH response must remain valid.
+        let db = test_db().await;
+        let id = insert_peer(&db, "AUDIT_NOBREAK_KEY=", Some("Before")).await;
+        let app = test_router(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"After"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["display_name"], "After");
+    }
+
+    #[tokio::test]
+    async fn events_api_requires_auth_when_enabled() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn events_api_accessible_with_bearer_token() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .header("authorization", "Bearer super-secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

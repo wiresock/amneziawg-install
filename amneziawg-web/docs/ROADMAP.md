@@ -85,11 +85,23 @@
 
 ---
 
-## Epic 9 – Admin Write Actions 🔲 planned
+## Epic 9 – Audit Logging ✅ complete
+
+- [x] `events` table (existed from initial migration); added `peer_id` INTEGER FK column via migration `0003`
+- [x] `src/db/events.rs` – `EventRow`, `EVT_*` constants, `log_event()`, `list_events()`
+- [x] `GET /api/events` – filterable by `peer_id`, `event_type`, `limit`
+- [x] `peer_updated` event logged from `PATCH /api/peers/:id` and `POST /peers/:id`
+- [x] `login_success`, `login_failed`, `logout` events logged from auth handlers
+- [x] Recent activity shown on `/peers/:id` HTML page (last 20 events)
+- [x] Logging is fire-and-forget – never breaks main operation
+- [x] 17 new audit-related tests (155 total)
+
+---
+
+## Epic 10 – Admin Write Actions 🔲 planned
 
 - [ ] Enable / disable peer (`PATCH /api/peers/:id` with `"disabled": true/false`)
 - [ ] Download client config (`GET /api/peers/:id/config`)
-- [ ] Audit log viewer (`events` table; `peer_updated` event)
 
 ---
 
@@ -97,7 +109,6 @@
 
 Choose one of:
 
-1. **Audit logging** – add `peer_updated` events with old/new name, timestamp, and actor; viewer on `/admin/events`.
-2. **Persistent session store** – DB-backed sessions that survive restarts; useful for long-running deployments.
-
-Audit logging is recommended next as it has no frontend dependencies and provides operational value immediately.
+1. **Persistent session store** – DB-backed sessions that survive restarts.
+2. **Export / backup and restore** – SQLite dump endpoint or file download.
+3. **Release packaging** – `.deb`/`.rpm` package or Docker image with the binary + systemd unit.

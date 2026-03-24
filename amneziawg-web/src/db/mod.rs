@@ -1,5 +1,6 @@
 //! Database access layer (SQLite via sqlx).
 
+pub mod events;
 pub mod peers;
 
 use anyhow::Context;
