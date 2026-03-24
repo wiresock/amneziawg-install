@@ -114,6 +114,22 @@ The installer handles user creation, directory setup, environment file generatio
 password hashing, and systemd service installation interactively.
 For non-interactive / automated installs, see [docs/INSTALL.md](docs/INSTALL.md).
 
+### Uninstalling
+
+To remove the web panel:
+
+```bash
+# Safe uninstall: removes service + binary, preserves config/data
+sudo ./amneziawg-web-uninstall.sh
+
+# Full purge: also removes config and data
+sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force
+```
+
+By default the uninstaller is safe: it stops the service and removes the binary
+but keeps your configuration and database intact. See [docs/INSTALL.md](docs/INSTALL.md)
+for full details.
+
 ### Manual / development
 
 ```bash

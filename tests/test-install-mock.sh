@@ -1024,6 +1024,185 @@ fi
 echo ""
 echo "=== Phase 3: Web installer tests complete ==="
 
+# ============================================================
+# Phase 4: Web panel uninstaller integration test
+# ============================================================
+#
+# Test assumptions / harness notes:
+# - systemctl is mocked (stop, disable, daemon-reload return exit 0)
+# - systemctl is-active and is-enabled return non-zero (service never truly started)
+#   so the uninstall gracefully skips stop/disable
+# - No real service is running; we validate install artifact removal only
+# - HTTP endpoints are NOT tested here (no runtime)
+# - Tests run in force/non-interactive mode; no user prompts
+#
+echo ""
+echo "=== Phase 4: Web panel uninstaller ==="
+
+WEB_UNINSTALLER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-uninstall.sh"
+WEB_UNINSTALLER="${PROJECT_ROOT}/amneziawg-web-uninstall.sh"
+
+# Verify both entrypoints are present
+if [[ -f "${WEB_UNINSTALLER}" ]]; then
+	echo "OK: Root-level uninstall entrypoint exists: ${WEB_UNINSTALLER}"
+else
+	echo "FAIL: Root-level uninstall entrypoint missing: ${WEB_UNINSTALLER}"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_UNINSTALLER_IMPL}" ]]; then
+	echo "OK: Implementation script exists: ${WEB_UNINSTALLER_IMPL}"
+else
+	echo "FAIL: Implementation script missing: ${WEB_UNINSTALLER_IMPL}"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web uninstaller: default (safe) uninstall ---"
+
+# Precondition: verify install artifacts exist before uninstalling
+if [[ -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
+	echo "OK: Pre-condition: binary exists before uninstall"
+else
+	echo "FAIL: Pre-condition: binary missing before uninstall test"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
+	echo "OK: Pre-condition: env file exists before uninstall"
+else
+	echo "FAIL: Pre-condition: env file missing before uninstall test"
+	FAILED=$((FAILED + 1))
+fi
+
+WEB_UNINSTALL_RC=0
+WEB_UNINSTALL_OUTPUT=$(bash "${WEB_UNINSTALLER_IMPL}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--force 2>&1) || WEB_UNINSTALL_RC=$?
+
+if [[ ${WEB_UNINSTALL_RC} -eq 0 ]]; then
+	echo "OK: Uninstaller exited successfully (rc=0)"
+else
+	echo "FAIL: Uninstaller exited with non-zero code ${WEB_UNINSTALL_RC}"
+	echo "  Output tail: $(echo "${WEB_UNINSTALL_OUTPUT}" | tail -20)"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify binary was removed
+if [[ ! -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
+	echo "OK: Binary removed after uninstall"
+else
+	echo "FAIL: Binary still exists after uninstall"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify systemd unit was removed
+if [[ ! -f /etc/systemd/system/amneziawg-web.service ]]; then
+	echo "OK: systemd unit removed after uninstall"
+else
+	echo "FAIL: systemd unit still exists after uninstall"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify env file is PRESERVED (safe default)
+if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
+	echo "OK: Env file preserved (safe default, no --purge-config)"
+else
+	echo "FAIL: Env file was removed — should be preserved by default"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify data directory is PRESERVED (safe default)
+if [[ -d "${WEB_TEST_DATA_DIR}" ]]; then
+	echo "OK: Data directory preserved (safe default, no --purge-data)"
+else
+	echo "FAIL: Data directory was removed — should be preserved by default"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify output mentions what was preserved
+if echo "${WEB_UNINSTALL_OUTPUT}" | grep -qi "preserved\|preserved\|Config.*preserved\|Data.*preserved\|env\|data"; then
+	echo "OK: Uninstaller mentions preserved items in output"
+else
+	echo "FAIL: Uninstaller output does not mention preserved items"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web uninstaller: idempotency (re-run after uninstall) ---"
+
+WEB_RERUN_UNINSTALL_RC=0
+bash "${WEB_UNINSTALLER_IMPL}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--force >/dev/null 2>&1 || WEB_RERUN_UNINSTALL_RC=$?
+
+if [[ ${WEB_RERUN_UNINSTALL_RC} -eq 0 ]]; then
+	echo "OK: Uninstaller is idempotent (re-run after absent artifacts succeeded)"
+else
+	echo "FAIL: Uninstaller re-run exited non-zero (rc=${WEB_RERUN_UNINSTALL_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web uninstaller: purge config + data ---"
+
+# Re-install first to restore artifacts
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--awg-binary "/sbin/awg" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1
+
+# Create a file in the data dir to verify it is truly removed by purge
+mkdir -p "${WEB_TEST_DATA_DIR}"
+touch "${WEB_TEST_DATA_DIR}/test-db.sqlite"
+
+WEB_PURGE_RC=0
+bash "${WEB_UNINSTALLER_IMPL}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--purge-config \
+	--purge-data \
+	--force >/dev/null 2>&1 || WEB_PURGE_RC=$?
+
+if [[ ${WEB_PURGE_RC} -eq 0 ]]; then
+	echo "OK: Purge uninstall exited successfully"
+else
+	echo "FAIL: Purge uninstall exited non-zero (rc=${WEB_PURGE_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify env directory was purged
+if [[ ! -d "$(dirname "${WEB_TEST_ENV_FILE}")" ]]; then
+	echo "OK: Env directory removed with --purge-config"
+else
+	echo "FAIL: Env directory still exists after --purge-config"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify data directory was purged
+if [[ ! -d "${WEB_TEST_DATA_DIR}" ]]; then
+	echo "OK: Data directory removed with --purge-data"
+else
+	echo "FAIL: Data directory still exists after --purge-data"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "=== Phase 4: Web uninstaller tests complete ==="
+
 echo ""
 echo "=========================================="
 if [[ ${FAILED} -eq 0 ]]; then

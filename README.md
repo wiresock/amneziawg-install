@@ -11,6 +11,13 @@ sudo ./amneziawg-web-install.sh    # install the web panel
 # open http://127.0.0.1:8080
 ```
 
+To uninstall the web panel later:
+
+```bash
+sudo ./amneziawg-web-uninstall.sh                              # safe: removes service + binary, keeps config/data
+sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force  # full purge
+```
+
 See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for details.
 
 ---
