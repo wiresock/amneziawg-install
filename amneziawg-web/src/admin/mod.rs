@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use crate::db::events::{log_event, EVT_PEER_DISABLED};
-use crate::db::peers::{find_by_id, update_peer_disabled, PeerRow};
+use crate::db::peers::{find_by_public_key, update_peer_disabled, PeerRow};
 use crate::db::Database;
 use crate::domain::PublicKey;
 
@@ -28,9 +28,7 @@ pub async fn execute_set_peer_enabled(
     actor: &str,
 ) -> Result<Option<PeerRow>, sqlx::Error> {
     // Find the peer by public key.
-    let rows = crate::db::peers::list_all(&db.pool).await?;
-    let existing = rows.into_iter().find(|r| r.public_key == cmd.public_key.0);
-    let existing = match existing {
+    let existing = match find_by_public_key(&db.pool, &cmd.public_key.0).await? {
         Some(r) => r,
         None => return Ok(None),
     };

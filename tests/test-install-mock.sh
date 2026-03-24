@@ -91,6 +91,11 @@ create_mock "ip6tables" 'exit 0'
 create_mock "qrencode" 'exit 0'
 create_mock "firewall-cmd" 'exit 1'
 
+# The installer and the Rust app both use /usr/bin/awg as the hardcoded path.
+# Ensure the mock is also available there.
+mkdir -p /usr/bin
+cp /sbin/awg /usr/bin/awg
+
 # Mock systemctl (unit-aware: only awg-quick@* is reported as active after start;
 # firewalld stays inactive to ensure the iptables code path is exercised)
 create_mock "systemctl" '
@@ -892,7 +897,6 @@ WEB_MISS_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -924,7 +928,6 @@ WEB_NOPW_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--no-start --no-enable 2>&1) || WEB_NOPW_RC=$?
@@ -957,7 +960,6 @@ WEB_INSTALL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -1060,7 +1062,6 @@ bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -1243,7 +1244,6 @@ bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -1281,7 +1281,6 @@ bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -1334,7 +1333,6 @@ bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -1423,7 +1421,6 @@ bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -1837,7 +1834,6 @@ WEB_SRC_INSTALL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -1892,7 +1888,6 @@ WEB_SRC_EXCL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
 	--binary-src "${STUB_BINARY}" \
 	--source-dir "${MOCK_SOURCE_DIR}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -1921,7 +1916,6 @@ WEB_SRC_NODIR_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
 	--non-interactive \
 	--source-dir "/tmp/nonexistent-source-dir-xyz" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -1967,7 +1961,6 @@ WEB_SRC_NOCARGO_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
 	--non-interactive \
 	--source-dir "${MOCK_SOURCE_DIR}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -2004,7 +1997,6 @@ WEB_SRC_BUILDFAIL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
 	--non-interactive \
 	--source-dir "${MOCK_SOURCE_DIR}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -2043,7 +2035,6 @@ bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
@@ -2184,7 +2175,6 @@ bash "${WEB_INSTALLER_IMPL}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
-	--awg-binary "/sbin/awg" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--host 127.0.0.1 --port "${WEB_PHASE7_PORT}" \
 	--username testadmin \

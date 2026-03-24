@@ -201,8 +201,8 @@ impl Poller {
     ) -> anyhow::Result<()> {
         let endpoint = peer.endpoint.as_deref();
         let last_handshake = peer.last_handshake.map(|ts| ts.timestamp());
-        let rx = peer.rx_bytes as i64;
-        let tx = peer.tx_bytes as i64;
+        let rx = saturating_u64_to_i64(peer.rx_bytes);
+        let tx = saturating_u64_to_i64(peer.tx_bytes);
         let captured_str = captured_at.to_rfc3339();
 
         sqlx::query(
@@ -226,8 +226,8 @@ impl Poller {
         let endpoint = peer.endpoint.as_deref();
         let allowed_ips = peer.allowed_ips.join(",");
         let last_handshake = peer.last_handshake.map(|ts| ts.timestamp());
-        let rx = peer.rx_bytes as i64;
-        let tx = peer.tx_bytes as i64;
+        let rx = saturating_u64_to_i64(peer.rx_bytes);
+        let tx = saturating_u64_to_i64(peer.tx_bytes);
 
         sqlx::query(
             "INSERT INTO peers (public_key, endpoint, allowed_ips, last_handshake_at, rx_bytes, tx_bytes) \
@@ -251,4 +251,12 @@ impl Poller {
 
         Ok(())
     }
+}
+
+/// Convert a `u64` counter to `i64`, capping at [`i64::MAX`] instead of
+/// silently wrapping.  Traffic counters from `awg show` can theoretically
+/// exceed `i64::MAX` (~9.2 EiB), but saturating avoids writing incorrect
+/// negative values into SQLite.
+fn saturating_u64_to_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
 }

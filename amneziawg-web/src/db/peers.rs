@@ -74,6 +74,23 @@ pub async fn find_by_id(pool: &SqlitePool, id: i64) -> Result<Option<PeerRow>, s
     .await
 }
 
+/// Return a single peer by its public key, or `None` if not found.
+pub async fn find_by_public_key(
+    pool: &SqlitePool,
+    public_key: &str,
+) -> Result<Option<PeerRow>, sqlx::Error> {
+    sqlx::query_as::<_, PeerRow>(
+        "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
+                last_handshake_at, rx_bytes, tx_bytes, disabled, has_config,
+                config_name, config_path, created_at, updated_at
+         FROM   peers
+         WHERE  public_key = ?",
+    )
+    .bind(public_key)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Return snapshots for a peer captured on or after `since_rfc3339`, ordered
 /// by `captured_at` **ascending** (oldest first).
 ///
@@ -274,6 +291,29 @@ mod tests {
         assert_eq!(row.id, id);
         assert_eq!(row.public_key, "KEY_FIND=");
         assert_eq!(row.display_name.as_deref(), Some("Bob"));
+    }
+
+    #[tokio::test]
+    async fn find_by_public_key_not_found() {
+        let db = test_db().await;
+        let row = find_by_public_key(&db.pool, "NO_SUCH_KEY=")
+            .await
+            .expect("find");
+        assert!(row.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_by_public_key_found() {
+        let db = test_db().await;
+        insert_peer(&db.pool, "KEY_PK=", Some("PkLookup")).await;
+
+        let row = find_by_public_key(&db.pool, "KEY_PK=")
+            .await
+            .expect("find");
+        assert!(row.is_some());
+        let row = row.unwrap();
+        assert_eq!(row.public_key, "KEY_PK=");
+        assert_eq!(row.display_name.as_deref(), Some("PkLookup"));
     }
 
     #[tokio::test]

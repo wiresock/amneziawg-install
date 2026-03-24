@@ -1,6 +1,5 @@
 # Rust build artifacts
 /target/
-Cargo.lock
 
 # Environment file (may contain secrets)
 .env

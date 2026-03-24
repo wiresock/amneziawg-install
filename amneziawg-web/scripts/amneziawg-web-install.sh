@@ -32,7 +32,6 @@ readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_DATA_DIR="/var/lib/amneziawg-web"
 readonly DEFAULT_ENV_DIR="/etc/amneziawg-web"
 readonly DEFAULT_ENV_FILE="/etc/amneziawg-web/env.conf"
-readonly DEFAULT_AWG_BINARY="/usr/bin/awg"
 readonly DEFAULT_AWG_CONFIG_DIR="/etc/amneziawg/clients"
 readonly DEFAULT_LISTEN_HOST="127.0.0.1"
 readonly DEFAULT_LISTEN_PORT="8080"
@@ -70,7 +69,6 @@ INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
 DATA_DIR="${DEFAULT_DATA_DIR}"
 ENV_DIR="${DEFAULT_ENV_DIR}"
 ENV_FILE="${DEFAULT_ENV_FILE}"
-AWG_BINARY="${DEFAULT_AWG_BINARY}"
 AWG_CONFIG_DIR="${DEFAULT_AWG_CONFIG_DIR}"
 LISTEN_HOST="${DEFAULT_LISTEN_HOST}"
 LISTEN_PORT="${DEFAULT_LISTEN_PORT}"
@@ -112,8 +110,6 @@ Options:
                             (default: ${DEFAULT_DATA_DIR})
   --env-file FILE           Path for the generated environment file
                             (default: ${DEFAULT_ENV_FILE})
-  --awg-binary PATH         Path to the awg binary
-                            (default: ${DEFAULT_AWG_BINARY})
   --config-dir DIR          AWG client config directory
                             (default: ${DEFAULT_AWG_CONFIG_DIR})
   --host HOST               Bind host (default: ${DEFAULT_LISTEN_HOST})
@@ -174,8 +170,6 @@ parse_args() {
                 ENV_FILE="$2"
                 ENV_DIR="$(dirname "${ENV_FILE}")"
                 shift 2 ;;
-            --awg-binary)
-                AWG_BINARY="$2"; shift 2 ;;
             --config-dir)
                 AWG_CONFIG_DIR="$2"; shift 2 ;;
             --host)
@@ -226,12 +220,11 @@ Only systemd-based Linux distributions are supported."
 }
 
 check_awg_binary() {
-    if [[ ! -x "${AWG_BINARY}" ]]; then
-        die "AWG binary not found or not executable at: ${AWG_BINARY}
-Install AmneziaWG first (https://github.com/wiresock/amneziawg-install) \
-or specify the path with --awg-binary."
+    if [[ ! -x "/usr/bin/awg" ]]; then
+        die "AWG binary not found or not executable at: /usr/bin/awg
+Install AmneziaWG first (https://github.com/wiresock/amneziawg-install)."
     fi
-    info "AWG binary: ${AWG_BINARY}"
+    info "AWG binary: /usr/bin/awg"
 }
 
 # ── Source-build support ──────────────────────────────────────────────────────
@@ -514,7 +507,6 @@ EOF
     prompt_default DATA_DIR    "Data directory (SQLite DB)" "${DATA_DIR}"
     prompt_default ENV_FILE    "Environment file path" "${ENV_FILE}"
     ENV_DIR="$(dirname "${ENV_FILE}")"
-    prompt_default AWG_BINARY     "Path to awg binary" "${AWG_BINARY}"
     prompt_default AWG_CONFIG_DIR "AWG client config directory" "${AWG_CONFIG_DIR}"
     prompt_default LISTEN_HOST "Bind host" "${LISTEN_HOST}"
     prompt_default LISTEN_PORT "Bind port" "${LISTEN_PORT}"
@@ -549,7 +541,6 @@ EOF
     printf "  Install dir:      %s\n" "${INSTALL_DIR}"
     printf "  Data dir:         %s\n" "${DATA_DIR}"
     printf "  Env file:         %s\n" "${ENV_FILE}"
-    printf "  AWG binary:       %s\n" "${AWG_BINARY}"
     printf "  Config dir:       %s\n" "${AWG_CONFIG_DIR}"
     printf "  Listen:           %s:%s\n" "${LISTEN_HOST}" "${LISTEN_PORT}"
     printf "  Username:         %s\n" "${USERNAME}"

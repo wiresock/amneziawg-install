@@ -104,11 +104,14 @@ pub fn normalize_comment(s: &str) -> Option<String> {
 }
 
 /// Return the first `max_chars` Unicode scalar values of `s`.
-/// If `s` is shorter, returns the full string without allocation.
+///
+/// If `s` is already within the limit, returns an owned copy without
+/// scanning beyond the required length.
 fn truncate_chars(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    truncated
+    if s.chars().count() <= max_chars {
+        return s.to_owned();
+    }
+    s.chars().take(max_chars).collect()
 }
 
 /// Resolve the human-readable display name for a peer.
