@@ -210,9 +210,9 @@ Expected the amneziawg-web Rust crate directory."
     ensure_rust_toolchain
 
     info "Building in: ${SOURCE_DIR}"
-    info "Running: cargo build --release"
+    info "Running: cargo build --release --locked"
 
-    if ! (cd "${SOURCE_DIR}" && cargo build --release); then
+    if ! (cd "${SOURCE_DIR}" && cargo build --release --locked); then
         die "Build failed. Check the output above for errors."
     fi
 

@@ -136,5 +136,4 @@ Choose one of:
 
 1. **Publish v0.1.0** – tag the release, optional binary upload to GitHub Releases
 2. **Persistent session store** – DB-backed sessions that survive restarts
-3. **Peer management** – enable/disable (`PATCH /api/peers/:id` with `disabled` flag), config download
-4. **Export / backup** – SQLite dump or JSON export endpoint
+3. **Export / backup** – SQLite dump or JSON export endpoint

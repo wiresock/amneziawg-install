@@ -368,7 +368,6 @@ sudo ./amneziawg-web-install.sh \
 | `--install-dir DIR` | `/usr/local/bin` | Binary installation directory |
 | `--data-dir DIR` | `/var/lib/amneziawg-web` | SQLite database directory |
 | `--env-file FILE` | `/etc/amneziawg-web/env.conf` | Generated environment file path |
-| `--awg-binary PATH` | `/usr/bin/awg` | Path to the `awg` binary |
 | `--config-dir DIR` | `/etc/amneziawg/clients` | AWG client config directory |
 | `--host HOST` | `127.0.0.1` | Bind host |
 | `--port PORT` | `8080` | Bind port |

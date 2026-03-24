@@ -106,12 +106,13 @@ pub fn normalize_comment(s: &str) -> Option<String> {
 /// Return the first `max_chars` Unicode scalar values of `s`.
 ///
 /// If `s` is already within the limit, returns an owned copy without
-/// scanning beyond the required length.
+/// scanning beyond the required length.  Only iterates up to
+/// `max_chars + 1` characters to decide whether truncation is needed.
 fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_owned();
+    match s.char_indices().nth(max_chars) {
+        None => s.to_owned(),           // within limit – no truncation needed
+        Some((idx, _)) => s[..idx].to_owned(), // truncate at byte boundary
     }
-    s.chars().take(max_chars).collect()
 }
 
 /// Resolve the human-readable display name for a peer.

@@ -1,6 +1,8 @@
 //! Background polling task.
 //!
-//! Every `interval` seconds the poller runs a full cycle:
+//! Uses `tokio::time::interval` so that cycles are tick-aligned: the period
+//! between the *start* of consecutive cycles is `interval` seconds, regardless
+//! of how long each cycle takes.
 //!
 //! 1. Calls `awg::show_all_dump()` – reads current AWG state.
 //! 2. Writes a snapshot row per peer into `snapshots`.
@@ -15,6 +17,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use chrono::SecondsFormat;
 use tracing::{debug, error, info, warn};
 
 use crate::awg;
@@ -38,19 +41,21 @@ impl Poller {
         }
     }
 
-    /// Run the polling loop forever.  Errors within a single cycle are logged
-    /// and the loop continues with the next scheduled tick.
+    /// Run the polling loop forever.  Uses `tokio::time::interval` so that
+    /// cycles are tick-aligned – the period between the *start* of consecutive
+    /// cycles is `interval`, regardless of how long each `poll_once` takes.
     pub async fn run(&self) {
         info!(
             interval_secs = self.interval.as_secs(),
             config_dir = %self.config_dir.display(),
             "poller started"
         );
+        let mut ticker = tokio::time::interval(self.interval);
         loop {
+            ticker.tick().await;
             if let Err(e) = self.poll_once().await {
                 error!(error = %e, "poll cycle failed");
             }
-            tokio::time::sleep(self.interval).await;
         }
     }
 
@@ -203,7 +208,7 @@ impl Poller {
         let last_handshake = peer.last_handshake.map(|ts| ts.timestamp());
         let rx = saturating_u64_to_i64(peer.rx_bytes);
         let tx = saturating_u64_to_i64(peer.tx_bytes);
-        let captured_str = captured_at.to_rfc3339();
+        let captured_str = captured_at.to_rfc3339_opts(SecondsFormat::Secs, true);
 
         sqlx::query(
             "INSERT INTO snapshots \

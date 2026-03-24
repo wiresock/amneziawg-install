@@ -36,9 +36,14 @@ pub async fn execute_set_peer_enabled(
     let disabled = !cmd.enabled;
     let old_disabled = existing.disabled != 0;
 
+    // Short-circuit: skip the UPDATE if the value is already correct.
+    if disabled == old_disabled {
+        return Ok(Some(existing));
+    }
+
     let updated = update_peer_disabled(&db.pool, existing.id, disabled).await?;
 
-    if disabled != old_disabled {
+    {
         let detail = serde_json::json!({
             "old_disabled": old_disabled,
             "new_disabled": disabled,

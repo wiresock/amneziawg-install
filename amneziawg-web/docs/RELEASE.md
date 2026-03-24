@@ -34,7 +34,6 @@ See the "Current limitations" section of [README.md](../README.md):
 - Sessions reset on service restart (in-memory store)
 - Single admin account (no RBAC)
 - No traffic charts in UI
-- No peer enable/disable from UI
 - Not designed for direct public internet exposure
 
 ---

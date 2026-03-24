@@ -286,8 +286,6 @@ Docker is also supported — see [`Dockerfile`](Dockerfile).
 ## Current limitations
 
 - No traffic charts (data is stored; charts are a planned UI feature).
-- No peer disable/enable from the UI.
-- No client config download from the UI.
 - Sessions reset on service restart (in-memory store).
 - Single admin account (multi-user is planned).
 
