@@ -405,6 +405,7 @@ main() {
         info "Sudoers drop-in already present: ${SUDOERS_FILE}"
     else
         info "Installing sudoers drop-in: ${SUDOERS_FILE}"
+        mkdir -p "$(dirname "${SUDOERS_FILE}")"
         printf '# Allow amneziawg-web service to read AWG interface state.\n' \
             > "${SUDOERS_FILE}"
         printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \

@@ -636,6 +636,10 @@ install_sudoers() {
 
     info "Sudoers rule: ${rule}"
 
+    # Ensure the sudoers drop-in directory exists (may be absent in minimal
+    # containers or stripped images).
+    mkdir -p "$(dirname "${SUDOERS_FILE}")"
+
     # Write with strict permissions first, then validate.
     printf '# Allow amneziawg-web service to read AWG interface state.\n' \
         > "${SUDOERS_FILE}"
