@@ -58,8 +58,12 @@ case "$1" in
 	syncconf) exit 0;;
 	show)
 		if [[ "${2:-}" == "all" ]] && [[ "${3:-}" == "dump" ]]; then
-			# Tab-separated dump format used by the Rust poller
-			printf "awg0\tPRIVATE_KEY\tSVR_PUB_KEY_BASE64=\t51820\toff\n"
+			# Tab-separated dump format used by the Rust poller.
+			# AmneziaWG emits extra obfuscation params on the interface line
+			# (Jc, Jmin, Jmax, S1, S2, H1, H2, H3, H4, + padding) making it
+			# 21 fields instead of the standard WireGuard 5.  The parser must
+			# handle both.
+			printf "awg0\tPRIVATE_KEY\tSVR_PUB_KEY_BASE64=\t51820\t8\t50\t1000\t107\t105\t62\t95321941292\t774489227\t1084244185\t1837068650\t(null)\t(null)\t(null)\t(null)\t(null)\t(null)\toff\n"
 			printf "awg0\tCLIENT1_PUB_KEY=\t(none)\t203.0.113.42:12345\t10.8.0.2/32\t1700000000\t1024\t2048\toff\n"
 		else
 			echo "interface: awg0"
@@ -2564,7 +2568,7 @@ awg_dump = os.environ.get('AWG_DUMP', '')
 peers = []
 for line in awg_dump.strip().split('\n'):
     fields = line.split('\t')
-    if len(fields) == 9:
+    if len(fields) >= 9:
         peers.append({
             'interface': fields[0],
             'public_key': fields[1],

@@ -19,18 +19,24 @@
 //!
 //! ## Output format assumptions
 //!
-//! `awg show all dump` produces tab-separated lines with two record types:
+//! `awg show all dump` produces tab-separated lines with two record types.
 //!
-//! **Interface line** (5 fields):
+//! **Interface line** (≥ 5 fields):
 //! ```text
-//! <interface>  private_key  public_key  listen_port  fwmark
+//! <interface>  private_key  public_key  listen_port  [awg_params…]  fwmark
 //! ```
+//! Standard WireGuard emits exactly 5 fields.  AmneziaWG appends additional
+//! obfuscation parameters (Jc, Jmin, Jmax, S1, S2, H1–H4, …) resulting in
+//! ≥ 21 fields.  The parser uses only fields 0–3 and ignores the rest.
 //!
-//! **Peer line** (9 fields):
+//! **Peer line** (≥ 9 fields):
 //! ```text
 //! <interface>  public_key  preshared_key  endpoint  allowed_ips
-//!     latest_handshake  transfer_rx  transfer_tx  persistent_keepalive
+//!     latest_handshake  transfer_rx  transfer_tx  persistent_keepalive  …
 //! ```
+//!
+//! Lines are distinguished by whether their first field (interface name)
+//! has already been seen as an interface header.
 
 use std::process::Command;
 
@@ -106,6 +112,11 @@ pub fn show_all_dump() -> Result<Vec<AwgInterface>, AwgError> {
 
 /// Parse the textual output of `awg show all dump`.
 ///
+/// Handles both standard WireGuard (5-field interface, 9-field peer) and
+/// AmneziaWG extended format (≥ 21-field interface with extra obfuscation
+/// parameters).  Lines are classified by whether their first field matches
+/// an already-seen interface name.
+///
 /// Exposed publicly for unit testing without requiring a running AWG daemon.
 pub fn parse_dump(output: &str) -> Result<Vec<AwgInterface>, AwgError> {
     let mut interfaces: Vec<AwgInterface> = Vec::new();
@@ -117,60 +128,72 @@ pub fn parse_dump(output: &str) -> Result<Vec<AwgInterface>, AwgError> {
         }
 
         let fields: Vec<&str> = line.split('\t').collect();
+        let n = fields.len();
 
-        match fields.len() {
-            // Interface header line: interface  private_key  public_key  listen_port  fwmark
-            5 => {
-                let iface_name = fields[0].to_string();
-                // fields[1] is the private key – we intentionally discard it.
-                let public_key = PublicKey(fields[2].to_string());
-                let listen_port = fields[3].parse::<u16>().ok();
+        if n < 5 {
+            return Err(AwgError::Parse(format!(
+                "line {}: too few fields {} (minimum 5)",
+                line_no + 1,
+                n
+            )));
+        }
 
-                interfaces.push(AwgInterface {
-                    name: iface_name,
-                    public_key,
-                    listen_port,
-                    peers: Vec::new(),
-                });
-            }
-            // Peer line: interface  public_key  preshared_key  endpoint  allowed_ips
-            //            latest_handshake  transfer_rx  transfer_tx  persistent_keepalive
-            9 => {
-                let iface_name = fields[0];
-                let public_key = PublicKey(fields[1].to_string());
-                // fields[2] is preshared_key – discarded for security.
-                let endpoint = parse_optional(fields[3]);
-                let allowed_ips = parse_allowed_ips(fields[4]);
-                let last_handshake = parse_timestamp(fields[5]);
-                let rx_bytes = fields[6].parse::<u64>().unwrap_or(0);
-                let tx_bytes = fields[7].parse::<u64>().unwrap_or(0);
+        let iface_name = fields[0];
 
-                let peer = AwgPeer {
-                    public_key,
-                    endpoint,
-                    allowed_ips,
-                    last_handshake,
-                    rx_bytes,
-                    tx_bytes,
-                };
+        // If this interface name was already seen, the line is a peer record.
+        let is_peer = interfaces.iter().any(|i| i.name == iface_name);
 
-                if let Some(iface) = interfaces.iter_mut().find(|i| i.name == iface_name) {
-                    iface.peers.push(peer);
-                } else {
-                    return Err(AwgError::Parse(format!(
-                        "line {}: peer references unknown interface '{}'",
-                        line_no + 1,
-                        iface_name
-                    )));
-                }
-            }
-            n => {
+        if is_peer {
+            // Peer line: need at least 9 fields
+            // (interface, public_key, preshared_key, endpoint, allowed_ips,
+            //  latest_handshake, transfer_rx, transfer_tx, persistent_keepalive)
+            if n < 9 {
                 return Err(AwgError::Parse(format!(
-                    "line {}: unexpected field count {} (expected 5 or 9)",
+                    "line {}: peer line has {} fields (minimum 9)",
                     line_no + 1,
                     n
                 )));
             }
+
+            let public_key = PublicKey(fields[1].to_string());
+            // fields[2] is preshared_key – discarded for security.
+            let endpoint = parse_optional(fields[3]);
+            let allowed_ips = parse_allowed_ips(fields[4]);
+            let last_handshake = parse_timestamp(fields[5]);
+            let rx_bytes = fields[6].parse::<u64>().unwrap_or(0);
+            let tx_bytes = fields[7].parse::<u64>().unwrap_or(0);
+
+            let peer = AwgPeer {
+                public_key,
+                endpoint,
+                allowed_ips,
+                last_handshake,
+                rx_bytes,
+                tx_bytes,
+            };
+
+            if let Some(iface) = interfaces.iter_mut().find(|i| i.name == iface_name) {
+                iface.peers.push(peer);
+            } else {
+                return Err(AwgError::Parse(format!(
+                    "line {}: peer references unknown interface '{}'",
+                    line_no + 1,
+                    iface_name
+                )));
+            }
+        } else {
+            // Interface header line: first 4 fields are always
+            // interface, private_key, public_key, listen_port.
+            // fields[1] is the private key – we intentionally discard it.
+            let public_key = PublicKey(fields[2].to_string());
+            let listen_port = fields[3].parse::<u16>().ok();
+
+            interfaces.push(AwgInterface {
+                name: iface_name.to_string(),
+                public_key,
+                listen_port,
+                peers: Vec::new(),
+            });
         }
     }
 
@@ -249,6 +272,48 @@ awg0\tCLIENT2_PUBLIC_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
     fn invalid_field_count_returns_error() {
         let bad = "awg0\tonly_two_fields\n";
         assert!(parse_dump(bad).is_err());
+    }
+
+    // ── AmneziaWG extended-format tests ─────────────────────────────
+
+    /// Real AmneziaWG `awg show all dump` emits 21-field interface lines
+    /// with extra obfuscation parameters (Jc, Jmin, Jmax, S1, S2, H1–H4, …).
+    const AWG_EXTENDED_DUMP: &str = "\
+awg0\tPRIVATE_KEY\tSVR_PUB_KEY_BASE64=\t51820\t8\t50\t1000\t107\t105\t62\t95321941292\t774489227\t1084244185\t1837068650\t(null)\t(null)\t(null)\t(null)\t(null)\t(null)\toff\n\
+awg0\tCLIENT1_PUB_KEY=\t(none)\t203.0.113.42:12345\t10.8.0.2/32\t1700000000\t1024\t2048\toff\n\
+awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
+";
+
+    #[test]
+    fn parse_awg_extended_interface_line() {
+        let result = parse_dump(AWG_EXTENDED_DUMP).expect("parse should succeed");
+        assert_eq!(result.len(), 1);
+        let iface = &result[0];
+        assert_eq!(iface.name, "awg0");
+        assert_eq!(iface.public_key.0, "SVR_PUB_KEY_BASE64=");
+        assert_eq!(iface.listen_port, Some(51820));
+        assert_eq!(iface.peers.len(), 2);
+    }
+
+    #[test]
+    fn parse_awg_extended_peers() {
+        let result = parse_dump(AWG_EXTENDED_DUMP).unwrap();
+        let peer = &result[0].peers[0];
+        assert_eq!(peer.public_key.0, "CLIENT1_PUB_KEY=");
+        assert_eq!(peer.endpoint, Some("203.0.113.42:12345".to_string()));
+        assert_eq!(peer.rx_bytes, 1024);
+        assert_eq!(peer.tx_bytes, 2048);
+        assert!(peer.last_handshake.is_some());
+    }
+
+    #[test]
+    fn peer_shaped_line_without_prior_interface_treated_as_interface() {
+        // A 9-field line whose interface name hasn't been seen yet is treated
+        // as a new interface header (≥5 fields), not a peer.
+        let input = "awg0\tPK=\t(none)\t1.2.3.4:5678\t10.0.0.2/32\t0\t0\t0\toff\n";
+        let result = parse_dump(input);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()[0].peers.len(), 0);
     }
 
     // ── Command construction tests ──────────────────────────────────
