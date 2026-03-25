@@ -25,7 +25,80 @@ impl std::fmt::Display for PublicKey {
     }
 }
 
-/// Human-readable status for a peer.
+/// Human-readable connection/activity status for a peer.
+///
+/// This describes *what the peer is doing*, not whether it has been
+/// identified/linked to a config file.  See [`IdentityStatus`] for that.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionStatus {
+    /// Handshake within `online_threshold_secs` seconds.
+    Online,
+    /// No recent handshake (but not explicitly disabled).
+    Inactive,
+    /// Peer has never completed a handshake.
+    Never,
+    /// Administratively disabled.
+    Disabled,
+}
+
+/// Whether a peer has been matched to a client config file.
+///
+/// This describes *identity mapping*, not connection activity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityStatus {
+    /// Peer matched to a config file via public-key or AllowedIPs.
+    Linked,
+    /// No config match found.
+    Unlinked,
+}
+
+impl ConnectionStatus {
+    /// Derive the connection status from the peer's runtime state.
+    ///
+    /// Priority:
+    /// 1. `disabled` → `Disabled`
+    /// 2. `last_handshake.is_none()` → `Never`
+    /// 3. Recent handshake → `Online`
+    /// 4. Otherwise → `Inactive`
+    pub fn derive(
+        last_handshake: Option<DateTime<Utc>>,
+        disabled: bool,
+        online_threshold_secs: i64,
+    ) -> Self {
+        if disabled {
+            return ConnectionStatus::Disabled;
+        }
+        match last_handshake {
+            Some(ts) => {
+                let age = Utc::now() - ts;
+                if age.num_seconds() <= online_threshold_secs {
+                    ConnectionStatus::Online
+                } else {
+                    ConnectionStatus::Inactive
+                }
+            }
+            None => ConnectionStatus::Never,
+        }
+    }
+}
+
+impl IdentityStatus {
+    /// Derive the identity status from config-presence flag.
+    pub fn derive(has_config: bool) -> Self {
+        if has_config {
+            IdentityStatus::Linked
+        } else {
+            IdentityStatus::Unlinked
+        }
+    }
+}
+
+/// Legacy `PeerStatus` enum, kept for backward-compatible serialization.
+///
+/// This is derived from both connection and identity status.
+/// Used in the API `status` field for backward compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerStatus {
@@ -71,6 +144,17 @@ impl PeerStatus {
                 }
             }
             None => PeerStatus::Inactive,
+        }
+    }
+
+    /// Build a legacy `PeerStatus` from the new split statuses.
+    #[allow(dead_code)]
+    pub fn from_split(conn: &ConnectionStatus, identity: &IdentityStatus) -> Self {
+        match conn {
+            ConnectionStatus::Disabled => PeerStatus::Disabled,
+            _ if *identity == IdentityStatus::Unlinked => PeerStatus::Unlinked,
+            ConnectionStatus::Online => PeerStatus::Online,
+            ConnectionStatus::Inactive | ConnectionStatus::Never => PeerStatus::Inactive,
         }
     }
 }
@@ -119,14 +203,22 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 ///
 /// Fallback order:
 /// 1. `display_name` – if a user has explicitly set one.
-/// 2. `config_name` – stem of the matching `.conf` file (e.g. `"ivan-iphone"`).
-/// 3. `peer-<first-8-chars-of-public_key>` – last-resort generated name.
+/// 2. `friendly_name` – derived from config filename (e.g. `"gramm"` from
+///    `"awg0-client-gramm.conf"`).
+/// 3. `config_name` – stem of the matching `.conf` file (e.g. `"awg0-client-gramm"`).
+/// 4. `peer-<first-8-chars-of-public_key>` – last-resort generated name.
 pub fn resolve_display_name(
     display_name: Option<&str>,
+    friendly_name: Option<&str>,
     config_name: Option<&str>,
     public_key: &str,
 ) -> String {
     if let Some(name) = display_name {
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    if let Some(name) = friendly_name {
         if !name.is_empty() {
             return name.to_string();
         }
@@ -152,6 +244,8 @@ pub struct Peer {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub status: PeerStatus,
+    pub connection_status: ConnectionStatus,
+    pub identity_status: IdentityStatus,
     pub disabled: bool,
     pub comment: Option<String>,
 }
@@ -172,7 +266,7 @@ pub struct PeerSnapshot {
 mod tests {
     use super::*;
 
-    // ── PeerStatus::derive ─────────────────────────────────────────────────
+    // ── PeerStatus::derive (legacy compat) ──────────────────────────────────
 
     #[test]
     fn online_within_threshold() {
@@ -232,20 +326,111 @@ mod tests {
         );
     }
 
-    // ── resolve_display_name ───────────────────────────────────────────────
+    // ── ConnectionStatus::derive ────────────────────────────────────────────
+
+    #[test]
+    fn connection_online() {
+        let ts = Utc::now() - chrono::Duration::seconds(60);
+        assert_eq!(
+            ConnectionStatus::derive(Some(ts), false, ONLINE_THRESHOLD_SECS),
+            ConnectionStatus::Online
+        );
+    }
+
+    #[test]
+    fn connection_inactive() {
+        let ts = Utc::now() - chrono::Duration::seconds(300);
+        assert_eq!(
+            ConnectionStatus::derive(Some(ts), false, ONLINE_THRESHOLD_SECS),
+            ConnectionStatus::Inactive
+        );
+    }
+
+    #[test]
+    fn connection_never() {
+        assert_eq!(
+            ConnectionStatus::derive(None, false, ONLINE_THRESHOLD_SECS),
+            ConnectionStatus::Never
+        );
+    }
+
+    #[test]
+    fn connection_disabled() {
+        let ts = Utc::now() - chrono::Duration::seconds(10);
+        assert_eq!(
+            ConnectionStatus::derive(Some(ts), true, ONLINE_THRESHOLD_SECS),
+            ConnectionStatus::Disabled
+        );
+    }
+
+    // ── IdentityStatus::derive ──────────────────────────────────────────────
+
+    #[test]
+    fn identity_linked() {
+        assert_eq!(IdentityStatus::derive(true), IdentityStatus::Linked);
+    }
+
+    #[test]
+    fn identity_unlinked() {
+        assert_eq!(IdentityStatus::derive(false), IdentityStatus::Unlinked);
+    }
+
+    // ── PeerStatus::from_split ──────────────────────────────────────────────
+
+    #[test]
+    fn from_split_disabled() {
+        assert_eq!(
+            PeerStatus::from_split(&ConnectionStatus::Disabled, &IdentityStatus::Linked),
+            PeerStatus::Disabled
+        );
+    }
+
+    #[test]
+    fn from_split_unlinked_overrides_online() {
+        assert_eq!(
+            PeerStatus::from_split(&ConnectionStatus::Online, &IdentityStatus::Unlinked),
+            PeerStatus::Unlinked
+        );
+    }
+
+    #[test]
+    fn from_split_online_linked() {
+        assert_eq!(
+            PeerStatus::from_split(&ConnectionStatus::Online, &IdentityStatus::Linked),
+            PeerStatus::Online
+        );
+    }
+
+    #[test]
+    fn from_split_never_linked() {
+        assert_eq!(
+            PeerStatus::from_split(&ConnectionStatus::Never, &IdentityStatus::Linked),
+            PeerStatus::Inactive
+        );
+    }
+
+    // ── resolve_display_name ────────────────────────────────────────────────
 
     #[test]
     fn uses_display_name_first() {
         assert_eq!(
-            resolve_display_name(Some("Alice"), Some("client1"), "abcdef1234567890"),
+            resolve_display_name(Some("Alice"), Some("gramm"), Some("awg0-client-gramm"), "abcdef1234567890"),
             "Alice"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_friendly_name() {
+        assert_eq!(
+            resolve_display_name(None, Some("gramm"), Some("awg0-client-gramm"), "abcdef1234567890"),
+            "gramm"
         );
     }
 
     #[test]
     fn falls_back_to_config_name() {
         assert_eq!(
-            resolve_display_name(None, Some("ivan-iphone"), "abcdef1234567890"),
+            resolve_display_name(None, None, Some("ivan-iphone"), "abcdef1234567890"),
             "ivan-iphone"
         );
     }
@@ -253,20 +438,28 @@ mod tests {
     #[test]
     fn falls_back_to_public_key_prefix() {
         assert_eq!(
-            resolve_display_name(None, None, "abcdef1234567890"),
+            resolve_display_name(None, None, None, "abcdef1234567890"),
             "peer-abcdef12"
         );
     }
 
     #[test]
     fn short_public_key_uses_full_key() {
-        assert_eq!(resolve_display_name(None, None, "abc"), "peer-abc");
+        assert_eq!(resolve_display_name(None, None, None, "abc"), "peer-abc");
     }
 
     #[test]
-    fn empty_display_name_uses_config_name() {
+    fn empty_display_name_uses_friendly_name() {
         assert_eq!(
-            resolve_display_name(Some(""), Some("ivan-iphone"), "abcdef1234567890"),
+            resolve_display_name(Some(""), Some("gramm"), Some("awg0-client-gramm"), "abcdef1234567890"),
+            "gramm"
+        );
+    }
+
+    #[test]
+    fn empty_friendly_name_uses_config_name() {
+        assert_eq!(
+            resolve_display_name(None, Some(""), Some("ivan-iphone"), "abcdef1234567890"),
             "ivan-iphone"
         );
     }
@@ -274,12 +467,12 @@ mod tests {
     #[test]
     fn empty_config_name_uses_key_prefix() {
         assert_eq!(
-            resolve_display_name(None, Some(""), "abcdef1234567890"),
+            resolve_display_name(None, None, Some(""), "abcdef1234567890"),
             "peer-abcdef12"
         );
     }
 
-    // ── normalize_display_name ─────────────────────────────────────────────
+    // ── normalize_display_name ──────────────────────────────────────────────
 
     #[test]
     fn normalize_name_trims_whitespace() {
@@ -317,7 +510,7 @@ mod tests {
         assert!(result.is_empty() == false);
     }
 
-    // ── normalize_comment ──────────────────────────────────────────────────
+    // ── normalize_comment ───────────────────────────────────────────────────
 
     #[test]
     fn normalize_comment_trims_and_keeps() {

@@ -27,6 +27,9 @@ pub struct PeerRow {
     pub config_name: Option<String>,
     /// Absolute path to the matching config file.
     pub config_path: Option<String>,
+    /// Human-readable name derived from config filename (e.g. `"gramm"`
+    /// from `"awg0-client-gramm.conf"`).
+    pub friendly_name: Option<String>,
     #[allow(dead_code)]
     pub created_at: String,
     #[allow(dead_code)]
@@ -52,7 +55,7 @@ pub async fn list_all(pool: &SqlitePool) -> Result<Vec<PeerRow>, sqlx::Error> {
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
                 last_handshake_at, rx_bytes, tx_bytes, disabled, has_config,
-                config_name, config_path, created_at, updated_at
+                config_name, config_path, friendly_name, created_at, updated_at
          FROM   peers
          ORDER  BY id",
     )
@@ -65,7 +68,7 @@ pub async fn find_by_id(pool: &SqlitePool, id: i64) -> Result<Option<PeerRow>, s
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
                 last_handshake_at, rx_bytes, tx_bytes, disabled, has_config,
-                config_name, config_path, created_at, updated_at
+                config_name, config_path, friendly_name, created_at, updated_at
          FROM   peers
          WHERE  id = ?",
     )
@@ -82,7 +85,7 @@ pub async fn find_by_public_key(
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
                 last_handshake_at, rx_bytes, tx_bytes, disabled, has_config,
-                config_name, config_path, created_at, updated_at
+                config_name, config_path, friendly_name, created_at, updated_at
          FROM   peers
          WHERE  public_key = ?",
     )
@@ -188,31 +191,35 @@ pub async fn update_peer_disabled(
 /// `apply_config_mapping` calls will re-mark only the peers that still have
 /// a matching config file.
 pub async fn clear_all_config_mappings(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE peers SET has_config = 0, config_name = NULL, config_path = NULL")
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE peers SET has_config = 0, config_name = NULL, config_path = NULL, friendly_name = NULL",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 /// Mark one peer as having a discovered config file.
 ///
-/// Sets `has_config = 1`, `config_name`, and `config_path` for the peer
-/// identified by `public_key`.  Does nothing if no peer with that public key
-/// exists (the config file may have been created before the peer is seen by
-/// `awg show`).
+/// Sets `has_config = 1`, `config_name`, `config_path`, and `friendly_name`
+/// for the peer identified by `public_key`.  Does nothing if no peer with
+/// that public key exists (the config file may have been created before the
+/// peer is seen by `awg show`).
 pub async fn apply_config_mapping(
     pool: &SqlitePool,
     public_key: &str,
     config_name: &str,
     config_path: &str,
+    friendly_name: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE peers
-         SET    has_config = 1, config_name = ?, config_path = ?
+         SET    has_config = 1, config_name = ?, config_path = ?, friendly_name = ?
          WHERE  public_key = ?",
     )
     .bind(config_name)
     .bind(config_path)
+    .bind(friendly_name)
     .bind(public_key)
     .execute(pool)
     .await?;
@@ -402,8 +409,8 @@ mod tests {
 
     async fn insert_peer_with_config(pool: &SqlitePool, public_key: &str) -> i64 {
         sqlx::query(
-            "INSERT INTO peers (public_key, allowed_ips, has_config, config_name, config_path)
-             VALUES (?, '10.0.0.2/32', 1, 'existing-config', '/etc/awg/existing.conf')",
+            "INSERT INTO peers (public_key, allowed_ips, has_config, config_name, config_path, friendly_name)
+             VALUES (?, '10.0.0.2/32', 1, 'existing-config', '/etc/awg/existing.conf', 'existing')",
         )
         .bind(public_key)
         .execute(pool)
@@ -422,6 +429,7 @@ mod tests {
         assert_eq!(row.has_config, 1);
         assert!(row.config_name.is_some());
         assert!(row.config_path.is_some());
+        assert!(row.friendly_name.is_some());
 
         // Clear all mappings
         clear_all_config_mappings(&db.pool)
@@ -433,6 +441,7 @@ mod tests {
         assert_eq!(row.has_config, 0);
         assert!(row.config_name.is_none());
         assert!(row.config_path.is_none());
+        assert!(row.friendly_name.is_none());
     }
 
     #[tokio::test]
@@ -443,27 +452,35 @@ mod tests {
         apply_config_mapping(
             &db.pool,
             "KEY_MAP=",
-            "ivan-iphone",
-            "/etc/awg/ivan-iphone.conf",
+            "awg0-client-gramm",
+            "/etc/awg/awg0-client-gramm.conf",
+            "gramm",
         )
         .await
         .expect("apply mapping");
 
         let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
         assert_eq!(row.has_config, 1);
-        assert_eq!(row.config_name.as_deref(), Some("ivan-iphone"));
+        assert_eq!(row.config_name.as_deref(), Some("awg0-client-gramm"));
         assert_eq!(
             row.config_path.as_deref(),
-            Some("/etc/awg/ivan-iphone.conf")
+            Some("/etc/awg/awg0-client-gramm.conf")
         );
+        assert_eq!(row.friendly_name.as_deref(), Some("gramm"));
     }
 
     #[tokio::test]
     async fn apply_config_mapping_unknown_peer_is_noop() {
         let db = test_db().await;
         // Applying to a non-existent public key should not error
-        let result =
-            apply_config_mapping(&db.pool, "NO_SUCH_KEY=", "ghost", "/etc/awg/ghost.conf").await;
+        let result = apply_config_mapping(
+            &db.pool,
+            "NO_SUCH_KEY=",
+            "ghost",
+            "/etc/awg/ghost.conf",
+            "ghost",
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -475,14 +492,21 @@ mod tests {
         // Apply twice, clear in between
         for _ in 0..2 {
             clear_all_config_mappings(&db.pool).await.unwrap();
-            apply_config_mapping(&db.pool, "KEY_IDEM=", "idem-config", "/etc/awg/idem.conf")
-                .await
-                .unwrap();
+            apply_config_mapping(
+                &db.pool,
+                "KEY_IDEM=",
+                "idem-config",
+                "/etc/awg/idem.conf",
+                "idem-config",
+            )
+            .await
+            .unwrap();
         }
 
         let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
         assert_eq!(row.has_config, 1);
         assert_eq!(row.config_name.as_deref(), Some("idem-config"));
+        assert_eq!(row.friendly_name.as_deref(), Some("idem-config"));
     }
 
     // ── update_peer_metadata ─────────────────────────────────────────────────

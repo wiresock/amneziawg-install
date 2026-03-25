@@ -32,8 +32,8 @@ use crate::db::peers::{PeerRow, SnapshotRow};
 use crate::db::Database;
 use crate::domain::history::{compute_history, HistoryPoint, HistorySummary, SnapshotInput};
 use crate::domain::{
-    normalize_comment, normalize_display_name, resolve_display_name, PeerStatus,
-    ONLINE_THRESHOLD_SECS,
+    normalize_comment, normalize_display_name, resolve_display_name, ConnectionStatus,
+    IdentityStatus, PeerStatus, ONLINE_THRESHOLD_SECS,
 };
 
 // ── App state ────────────────────────────────────────────────────────────────
@@ -91,11 +91,13 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 #[derive(Debug, Serialize)]
 pub struct PeerSummaryDto {
     pub id: i64,
-    /// Resolved display name (display_name → config_name → peer-<key prefix>).
+    /// Resolved display name (display_name → friendly_name → config_name → peer-<key prefix>).
     pub name: String,
     pub public_key: String,
     /// Stem of the matching `.conf` filename, if known.
     pub config_name: Option<String>,
+    /// Human-readable name from config filename (e.g. `"gramm"`).
+    pub friendly_name: Option<String>,
     /// Whether a matching client config file has been discovered.
     pub has_config: bool,
     /// Comma-separated list of allowed CIDRs.
@@ -104,7 +106,12 @@ pub struct PeerSummaryDto {
     pub latest_handshake_at: Option<DateTime<Utc>>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Legacy combined status (kept for backward compatibility).
     pub status: PeerStatus,
+    /// Connection/activity status (online, inactive, never, disabled).
+    pub connection_status: ConnectionStatus,
+    /// Identity/config mapping status (linked, unlinked).
+    pub identity_status: IdentityStatus,
 }
 
 /// Compact snapshot entry used inside `PeerDetailDto`.
@@ -127,13 +134,19 @@ pub struct PeerDetailDto {
     pub display_name: Option<String>,
     pub comment: Option<String>,
     pub config_name: Option<String>,
+    pub friendly_name: Option<String>,
     pub config_path: Option<String>,
     pub allowed_ips: String,
     pub endpoint: Option<String>,
     pub latest_handshake_at: Option<DateTime<Utc>>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Legacy combined status (kept for backward compatibility).
     pub status: PeerStatus,
+    /// Connection/activity status (online, inactive, never, disabled).
+    pub connection_status: ConnectionStatus,
+    /// Identity/config mapping status (linked, unlinked).
+    pub identity_status: IdentityStatus,
     pub disabled: bool,
     pub has_config: bool,
     /// The 50 most-recent snapshots, newest first.
@@ -230,8 +243,12 @@ fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
     let disabled = row.disabled != 0;
     let has_config = row.has_config != 0;
     let status = PeerStatus::derive(last_handshake, disabled, has_config, ONLINE_THRESHOLD_SECS);
+    let connection_status =
+        ConnectionStatus::derive(last_handshake, disabled, ONLINE_THRESHOLD_SECS);
+    let identity_status = IdentityStatus::derive(has_config);
     let name = resolve_display_name(
         row.display_name.as_deref(),
+        row.friendly_name.as_deref(),
         row.config_name.as_deref(),
         &row.public_key,
     );
@@ -240,6 +257,7 @@ fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
         name,
         public_key: row.public_key,
         config_name: row.config_name,
+        friendly_name: row.friendly_name,
         has_config,
         allowed_ips: row.allowed_ips,
         endpoint: row.endpoint,
@@ -247,6 +265,8 @@ fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
         rx_bytes: row.rx_bytes as u64,
         tx_bytes: row.tx_bytes as u64,
         status,
+        connection_status,
+        identity_status,
     }
 }
 
@@ -274,8 +294,12 @@ fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDt
     let disabled = row.disabled != 0;
     let has_config = row.has_config != 0;
     let status = PeerStatus::derive(last_handshake, disabled, has_config, ONLINE_THRESHOLD_SECS);
+    let connection_status =
+        ConnectionStatus::derive(last_handshake, disabled, ONLINE_THRESHOLD_SECS);
+    let identity_status = IdentityStatus::derive(has_config);
     let name = resolve_display_name(
         row.display_name.as_deref(),
+        row.friendly_name.as_deref(),
         row.config_name.as_deref(),
         &row.public_key,
     );
@@ -286,6 +310,7 @@ fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDt
         display_name: row.display_name,
         comment: row.comment,
         config_name: row.config_name,
+        friendly_name: row.friendly_name,
         config_path: row.config_path,
         allowed_ips: row.allowed_ips,
         endpoint: row.endpoint,
@@ -293,6 +318,8 @@ fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDt
         rx_bytes: row.rx_bytes as u64,
         tx_bytes: row.tx_bytes as u64,
         status,
+        connection_status,
+        identity_status,
         disabled,
         has_config,
         recent_snapshots: snapshots.into_iter().map(snapshot_row_to_dto).collect(),
@@ -1068,12 +1095,30 @@ fn esc(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
+/// Render legacy combined status badge (used by tests).
+#[allow(dead_code)]
 fn status_badge(status: &PeerStatus) -> &'static str {
     match status {
         PeerStatus::Online => r#"<span style="color:green">&#x25CF; online</span>"#,
         PeerStatus::Inactive => r#"<span style="color:gray">&#x25CF; inactive</span>"#,
         PeerStatus::Disabled => r#"<span style="color:red">&#x25CF; disabled</span>"#,
         PeerStatus::Unlinked => r#"<span style="color:orange">&#x25CF; unlinked</span>"#,
+    }
+}
+
+fn connection_badge(status: &ConnectionStatus) -> &'static str {
+    match status {
+        ConnectionStatus::Online => r#"<span style="color:green">&#x25CF; online</span>"#,
+        ConnectionStatus::Inactive => r#"<span style="color:gray">&#x25CF; inactive</span>"#,
+        ConnectionStatus::Never => r#"<span style="color:gray">&#x25CB; never connected</span>"#,
+        ConnectionStatus::Disabled => r#"<span style="color:red">&#x25CF; disabled</span>"#,
+    }
+}
+
+fn identity_badge(status: &IdentityStatus) -> &'static str {
+    match status {
+        IdentityStatus::Linked => r#"<span style="color:#0a0" title="Peer matched to a config file">&#x1F517; linked</span>"#,
+        IdentityStatus::Unlinked => r#"<span style="color:orange" title="No matching config file found">&#x26A0; unlinked</span>"#,
     }
 }
 
@@ -1203,7 +1248,7 @@ fn render_peer_list(peers: &[PeerSummaryDto], csrf_token: &str) -> String {
     } else {
         buf.push_str(
             "<table>\n\
-             <tr><th>Name</th><th>Status</th><th>Endpoint</th>\
+             <tr><th>Name</th><th>Connection</th><th>Identity</th><th>Endpoint</th>\
              <th>Last handshake</th><th>RX</th><th>TX</th></tr>\n",
         );
         for p in peers {
@@ -1222,9 +1267,10 @@ fn render_peer_list(peers: &[PeerSummaryDto], csrf_token: &str) -> String {
                 .map(|ts| esc(&ts.format("%Y-%m-%d %H:%M:%S UTC").to_string()))
                 .unwrap_or_else(|| "never".to_string());
             buf.push_str(&format!(
-                "<tr><td>{name_link}</td><td>{status}</td><td>{endpoint}</td>\
+                "<tr><td>{name_link}</td><td>{conn}</td><td>{ident}</td><td>{endpoint}</td>\
                  <td>{handshake}</td><td>{rx}</td><td>{tx}</td></tr>\n",
-                status = status_badge(&p.status),
+                conn = connection_badge(&p.connection_status),
+                ident = identity_badge(&p.identity_status),
                 rx = fmt_bytes(p.rx_bytes),
                 tx = fmt_bytes(p.tx_bytes),
             ));
@@ -1256,8 +1302,12 @@ fn render_peer_detail(
         esc(&dto.public_key)
     ));
     buf.push_str(&format!(
-        "<tr><th>Status</th><td>{}</td></tr>\n",
-        status_badge(&dto.status)
+        "<tr><th>Connection</th><td>{}</td></tr>\n",
+        connection_badge(&dto.connection_status)
+    ));
+    buf.push_str(&format!(
+        "<tr><th>Identity</th><td>{}</td></tr>\n",
+        identity_badge(&dto.identity_status)
     ));
     if let Some(ref ep) = dto.endpoint {
         buf.push_str(&format!("<tr><th>Endpoint</th><td>{}</td></tr>\n", esc(ep)));
@@ -3065,6 +3115,7 @@ mod tests {
             "KEY_DLCONF=",
             "test-client",
             conf_path.to_str().unwrap(),
+            "test-client",
         )
         .await
         .unwrap();
@@ -3138,6 +3189,7 @@ mod tests {
             "KEY_DLINK=",
             "test-dl",
             "/etc/awg/test-dl.conf",
+            "test-dl",
         )
         .await
         .unwrap();

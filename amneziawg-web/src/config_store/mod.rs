@@ -33,8 +33,14 @@ pub enum ConfigStoreError {
 /// Metadata extracted from a single client config file.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientConfig {
-    /// Filename without extension (e.g. `"ivan-iphone"`).
+    /// Filename without extension (e.g. `"awg0-client-gramm"`).
     pub name: String,
+    /// Human-readable name derived from the filename.
+    ///
+    /// For files matching the pattern `*-client-<suffix>.conf`, the suffix is
+    /// used (e.g. `"awg0-client-gramm.conf"` → `"gramm"`).  Otherwise falls
+    /// back to the full filename stem (without `.conf`).
+    pub friendly_name: String,
     /// Absolute path to the config file.
     pub path: PathBuf,
     /// Public key extracted from the `[Peer]` section of the config.
@@ -45,6 +51,27 @@ pub struct ClientConfig {
     pub peer_public_key: Option<PublicKey>,
     /// Address(es) from the `[Interface]` `Address` field.
     pub addresses: Vec<String>,
+}
+
+/// Derive a human-readable "friendly" name from a config filename stem.
+///
+/// The AmneziaWG installer creates client configs with names like
+/// `awg0-client-gramm.conf`.  This function strips the common
+/// `*-client-` prefix pattern to yield `"gramm"`.
+///
+/// If the filename does not match the pattern, the full stem is returned
+/// (e.g. `"custom-name.conf"` → `"custom-name"`).
+///
+/// The input should be the filename **stem** (without the `.conf` extension).
+pub fn friendly_name_from_filename(stem: &str) -> String {
+    // Look for the last occurrence of "-client-" and take the suffix.
+    if let Some(pos) = stem.rfind("-client-") {
+        let suffix = &stem[pos + "-client-".len()..];
+        if !suffix.is_empty() {
+            return suffix.to_string();
+        }
+    }
+    stem.to_string()
 }
 
 /// Scan `dir` for `*.conf` files and return metadata for each.
@@ -85,11 +112,13 @@ pub fn scan(dir: &Path) -> Result<Vec<ClientConfig>, ConfigStoreError> {
             .unwrap_or("unknown")
             .to_string();
 
+        let friendly_name = friendly_name_from_filename(&name);
         let peer_public_key = extract_peer_public_key(&content);
         let addresses = extract_addresses(&content);
 
         configs.push(ClientConfig {
             name,
+            friendly_name,
             path,
             peer_public_key,
             addresses,
@@ -247,5 +276,74 @@ Address = 10.8.0.3/32
         assert_eq!(result[1].name, "bob");
         assert!(result[0].peer_public_key.is_some());
         assert!(result[1].peer_public_key.is_none());
+    }
+
+    // ── friendly_name_from_filename ─────────────────────────────────────────
+
+    #[test]
+    fn friendly_name_awg0_client_gramm() {
+        assert_eq!(friendly_name_from_filename("awg0-client-gramm"), "gramm");
+    }
+
+    #[test]
+    fn friendly_name_awg0_client_iphone() {
+        assert_eq!(friendly_name_from_filename("awg0-client-iphone"), "iphone");
+    }
+
+    #[test]
+    fn friendly_name_wg0_client_alice() {
+        assert_eq!(friendly_name_from_filename("wg0-client-alice"), "alice");
+    }
+
+    #[test]
+    fn friendly_name_generic_filename() {
+        assert_eq!(friendly_name_from_filename("custom-name"), "custom-name");
+    }
+
+    #[test]
+    fn friendly_name_bare_name() {
+        assert_eq!(friendly_name_from_filename("mydevice"), "mydevice");
+    }
+
+    #[test]
+    fn friendly_name_empty_suffix_uses_full_stem() {
+        // Edge case: "-client-" at the end with no suffix
+        assert_eq!(friendly_name_from_filename("awg0-client-"), "awg0-client-");
+    }
+
+    #[test]
+    fn friendly_name_multiple_client_uses_last() {
+        // If "-client-" appears multiple times, use the last suffix
+        assert_eq!(
+            friendly_name_from_filename("awg0-client-nested-client-final"),
+            "final"
+        );
+    }
+
+    #[test]
+    fn friendly_name_in_scan_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("awg0-client-gramm.conf"),
+            SAMPLE_CONFIG,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("awg0-client-iphone.conf"),
+            CONFIG_NO_PEER,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("custom-peer.conf"), SAMPLE_CONFIG).unwrap();
+
+        let mut result = scan(dir.path()).unwrap();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].name, "awg0-client-gramm");
+        assert_eq!(result[0].friendly_name, "gramm");
+        assert_eq!(result[1].name, "awg0-client-iphone");
+        assert_eq!(result[1].friendly_name, "iphone");
+        assert_eq!(result[2].name, "custom-peer");
+        assert_eq!(result[2].friendly_name, "custom-peer");
     }
 }

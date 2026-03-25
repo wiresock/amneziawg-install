@@ -125,13 +125,14 @@ impl Poller {
         Ok(())
     }
 
-    /// Scan the config directory and update `has_config`, `config_name`, and
-    /// `config_path` on every peer.
+    /// Scan the config directory and update `has_config`, `config_name`,
+    /// `config_path`, and `friendly_name` on every peer.
     ///
     /// This operation is idempotent:
     /// 1. All config-mapping fields are first reset to NULL / 0 for every peer.
-    /// 2. Each discovered config file is then matched to a peer by `public_key`
-    ///    and the relevant fields are set.
+    /// 2. Each discovered config file is matched to a peer by `public_key`
+    ///    first; if no key match is found, a fallback match via AllowedIPs
+    ///    is attempted.
     ///
     /// If the config directory cannot be read, a warning is logged and the
     /// step returns `Ok(())` (peers remain with `has_config = 0`).
@@ -157,43 +158,116 @@ impl Poller {
         // Reset all mapping fields so that removed configs don't persist.
         crate::db::peers::clear_all_config_mappings(&self.db.pool).await?;
 
-        let mut mapped: usize = 0;
-        for config in &configs {
-            let pk = match &config.peer_public_key {
-                Some(k) => k,
-                None => {
-                    debug!(
-                        config = %config.name,
-                        "config has no [Peer] PublicKey – skipping"
-                    );
-                    continue;
-                }
-            };
+        // Load all peers from the DB for AllowedIPs fallback matching.
+        let all_peers = crate::db::peers::list_all(&self.db.pool).await?;
 
+        let mut mapped: usize = 0;
+        let mut mapped_by_ip: usize = 0;
+        for config in &configs {
             let path_str = config.path.to_string_lossy();
-            match crate::db::peers::apply_config_mapping(
-                &self.db.pool,
-                &pk.0,
-                &config.name,
-                &path_str,
-            )
-            .await
-            {
-                Ok(()) => mapped += 1,
-                Err(e) => {
+
+            // ── Strategy 1: exact public-key match ──────────────────
+            if let Some(pk) = &config.peer_public_key {
+                match crate::db::peers::apply_config_mapping(
+                    &self.db.pool,
+                    &pk.0,
+                    &config.name,
+                    &path_str,
+                    &config.friendly_name,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        mapped += 1;
+                        debug!(
+                            config = %config.name,
+                            friendly_name = %config.friendly_name,
+                            public_key = %pk,
+                            "config linked by public key"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            config = %config.name,
+                            public_key = %pk,
+                            error = %e,
+                            "failed to apply config mapping – skipping"
+                        );
+                    }
+                }
+                continue;
+            }
+
+            // ── Strategy 2: AllowedIPs fallback ─────────────────────
+            // Attempt to match by comparing the config's Address field
+            // with peer AllowedIPs.  Only match if unambiguous (exactly one).
+            if !config.addresses.is_empty() {
+                let candidates: Vec<_> = all_peers
+                    .iter()
+                    .filter(|p| {
+                        config.addresses.iter().any(|addr| {
+                            let addr_base = addr.split('/').next().unwrap_or(addr);
+                            p.allowed_ips.split(',').any(|a| {
+                                let peer_base = a.trim().split('/').next().unwrap_or(a.trim());
+                                addr_base == peer_base
+                            })
+                        })
+                    })
+                    .collect();
+
+                if candidates.len() == 1 {
+                    let peer = candidates[0];
+                    match crate::db::peers::apply_config_mapping(
+                        &self.db.pool,
+                        &peer.public_key,
+                        &config.name,
+                        &path_str,
+                        &config.friendly_name,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            mapped_by_ip += 1;
+                            info!(
+                                config = %config.name,
+                                friendly_name = %config.friendly_name,
+                                public_key = %peer.public_key,
+                                "config linked by AllowedIPs fallback"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                config = %config.name,
+                                error = %e,
+                                "failed to apply AllowedIPs config mapping – skipping"
+                            );
+                        }
+                    }
+                } else if candidates.len() > 1 {
                     warn!(
                         config = %config.name,
-                        public_key = %pk,
-                        error = %e,
-                        "failed to apply config mapping – skipping"
+                        candidate_count = candidates.len(),
+                        "ambiguous AllowedIPs match – skipping config mapping"
+                    );
+                } else {
+                    debug!(
+                        config = %config.name,
+                        "no [Peer] PublicKey and no AllowedIPs match – skipping"
                     );
                 }
+            } else {
+                debug!(
+                    config = %config.name,
+                    "config has no [Peer] PublicKey and no addresses – skipping"
+                );
             }
         }
 
         info!(
             total_configs = configs.len(),
-            mapped, "config mapping applied"
+            mapped_by_key = mapped,
+            mapped_by_ip = mapped_by_ip,
+            "config mapping applied"
         );
         Ok(())
     }
