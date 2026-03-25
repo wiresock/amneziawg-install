@@ -184,8 +184,11 @@ pub fn sync_interface(interface: &str) -> Result<(), AwgError> {
         .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        // Ignore write errors – the process may have exited early.
-        let _ = stdin.write_all(stripped);
+        if let Err(e) = stdin.write_all(stripped) {
+            // The child may have exited early (e.g. bad interface name).
+            // Log at debug level; the real error comes from wait_with_output.
+            tracing::debug!(error = %e, "stdin write to awg syncconf failed – checking exit status");
+        }
     }
 
     let output = child.wait_with_output()?;
