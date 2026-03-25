@@ -668,11 +668,13 @@ install_sudoers() {
     # The web service runs as a non-root user but needs to:
     # 1. Read AWG interface state via `awg show all dump` (CAP_NET_ADMIN).
     # 2. Remove disabled peers via `awg set <iface> peer <key> remove`.
+    # 3. Sync interface config via `awg syncconf` + `awg-quick strip` to
+    #    restore re-enabled peers to the running interface.
     #
     # Instead of running the whole service as root, we install a tightly-scoped
     # sudoers rule that grants the service user passwordless sudo for only
-    # these two commands.
-    local rule="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove"
+    # these commands.
+    local rule="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
 
     info "Sudoers rule: ${rule}"
 
@@ -681,7 +683,7 @@ install_sudoers() {
     mkdir -p "$(dirname "${SUDOERS_FILE}")"
 
     # Write with strict permissions first, then validate.
-    printf '# Allow amneziawg-web service to read AWG state and remove disabled peers.\n' \
+    printf '# Allow amneziawg-web service to manage AWG state and peers.\n' \
         > "${SUDOERS_FILE}"
     printf '# Installed by amneziawg-web-install.sh – do not edit manually.\n' \
         >> "${SUDOERS_FILE}"
