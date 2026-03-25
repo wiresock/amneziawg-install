@@ -167,6 +167,12 @@ impl Poller {
             let path_str = config.path.to_string_lossy();
 
             // ── Strategy 1: exact public-key match ──────────────────
+            //
+            // The `[Peer] PublicKey` in a client config refers to the
+            // *server's* key, so it will only match a peer whose public
+            // key happens to equal that value (i.e. if the config dir
+            // also contains server-side configs).  If no peer matches,
+            // we fall through to Strategy 2 instead of giving up.
             if let Some(pk) = &config.peer_public_key {
                 match crate::db::peers::apply_config_mapping(
                     &self.db.pool,
@@ -177,13 +183,24 @@ impl Poller {
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(true) => {
                         mapped += 1;
                         debug!(
                             config = %config.name,
                             friendly_name = %config.friendly_name,
                             public_key = %pk,
                             "config linked by public key"
+                        );
+                        continue;
+                    }
+                    Ok(false) => {
+                        // No peer matched this public key (common: the key
+                        // in a client config is normally the server's key).
+                        // Fall through to AllowedIPs matching.
+                        debug!(
+                            config = %config.name,
+                            public_key = %pk,
+                            "no peer matched [Peer] PublicKey – trying AllowedIPs fallback"
                         );
                     }
                     Err(e) => {
@@ -193,9 +210,9 @@ impl Poller {
                             error = %e,
                             "failed to apply config mapping – skipping"
                         );
+                        continue;
                     }
                 }
-                continue;
             }
 
             // ── Strategy 2: AllowedIPs fallback ─────────────────────
@@ -225,13 +242,20 @@ impl Poller {
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(true) => {
                             mapped_by_ip += 1;
                             info!(
                                 config = %config.name,
                                 friendly_name = %config.friendly_name,
                                 public_key = %peer.public_key,
                                 "config linked by AllowedIPs fallback"
+                            );
+                        }
+                        Ok(false) => {
+                            warn!(
+                                config = %config.name,
+                                public_key = %peer.public_key,
+                                "AllowedIPs candidate peer vanished between query and update"
                             );
                         }
                         Err(e) => {

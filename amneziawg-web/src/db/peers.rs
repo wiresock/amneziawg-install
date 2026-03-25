@@ -202,17 +202,18 @@ pub async fn clear_all_config_mappings(pool: &SqlitePool) -> Result<(), sqlx::Er
 /// Mark one peer as having a discovered config file.
 ///
 /// Sets `has_config = 1`, `config_name`, `config_path`, and `friendly_name`
-/// for the peer identified by `public_key`.  Does nothing if no peer with
-/// that public key exists (the config file may have been created before the
-/// peer is seen by `awg show`).
+/// for the peer identified by `public_key`.  Returns `true` if a matching
+/// peer was found and updated, `false` if no peer with that public key
+/// exists (the config file may reference a key that does not correspond to
+/// any known peer — for example the server's own public key).
 pub async fn apply_config_mapping(
     pool: &SqlitePool,
     public_key: &str,
     config_name: &str,
     config_path: &str,
     friendly_name: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
         "UPDATE peers
          SET    has_config = 1, config_name = ?, config_path = ?, friendly_name = ?
          WHERE  public_key = ?",
@@ -223,7 +224,7 @@ pub async fn apply_config_mapping(
     .bind(public_key)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 #[cfg(test)]
@@ -449,7 +450,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db.pool, "KEY_MAP=", None).await;
 
-        apply_config_mapping(
+        let matched = apply_config_mapping(
             &db.pool,
             "KEY_MAP=",
             "awg0-client-gramm",
@@ -458,6 +459,7 @@ mod tests {
         )
         .await
         .expect("apply mapping");
+        assert!(matched, "should match existing peer");
 
         let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
         assert_eq!(row.has_config, 1);
@@ -472,16 +474,17 @@ mod tests {
     #[tokio::test]
     async fn apply_config_mapping_unknown_peer_is_noop() {
         let db = test_db().await;
-        // Applying to a non-existent public key should not error
-        let result = apply_config_mapping(
+        // Applying to a non-existent public key should not error but return false
+        let matched = apply_config_mapping(
             &db.pool,
             "NO_SUCH_KEY=",
             "ghost",
             "/etc/awg/ghost.conf",
             "ghost",
         )
-        .await;
-        assert!(result.is_ok());
+        .await
+        .expect("should not error");
+        assert!(!matched, "should not match any peer");
     }
 
     #[tokio::test]
@@ -492,7 +495,7 @@ mod tests {
         // Apply twice, clear in between
         for _ in 0..2 {
             clear_all_config_mappings(&db.pool).await.unwrap();
-            apply_config_mapping(
+            let matched = apply_config_mapping(
                 &db.pool,
                 "KEY_IDEM=",
                 "idem-config",
@@ -501,6 +504,7 @@ mod tests {
             )
             .await
             .unwrap();
+            assert!(matched);
         }
 
         let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
