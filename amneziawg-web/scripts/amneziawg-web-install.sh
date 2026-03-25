@@ -611,22 +611,38 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
         fi
 
         # For directories under /home, the parent home directory is typically
-        # mode 700/750.  Ensure group-read and traverse permission so the
-        # service user can reach the config files.
+        # mode 700/750.  Ensure the service user can traverse into it so that
+        # the service can reach the config files.
         case "${AWG_CONFIG_DIR}" in
             /home/*)
+                # Extract the top-level home directory (/home/<user>).
+                # Linux home directories are always at depth 3.
                 local home_dir
-                home_dir="$(echo "${AWG_CONFIG_DIR}" | cut -d/ -f1-3)"  # e.g. /home/vadim
+                home_dir="$(echo "${AWG_CONFIG_DIR}" | cut -d/ -f1-3)"
                 if [[ -d "${home_dir}" ]]; then
+                    # Check whether the awg-web user can traverse into the
+                    # home directory (needs at least the execute bit for
+                    # "other" or "group" if the user is in the owning group).
                     local home_perms
                     home_perms="$(stat -c '%a' "${home_dir}")"
-                    # If no 'other' or 'group' execute bit, add o+x so awg-web can traverse
-                    if [[ $((8#${home_perms} & 8#001)) -eq 0 ]] && \
-                       [[ $((8#${home_perms} & 8#010)) -eq 0 ]]; then
-                        chmod o+x "${home_dir}" 2>/dev/null \
-                            && info "Added traverse permission (o+x) on ${home_dir} for service access." \
-                            || warn "Could not set o+x on ${home_dir}. The service may not be \
+                    local other_x=$(( 8#${home_perms} & 8#001 ))
+                    local group_x=$(( 8#${home_perms} & 8#010 ))
+                    if [[ ${other_x} -eq 0 ]] && [[ ${group_x} -eq 0 ]]; then
+                        # Prefer setfacl (POSIX ACL) for a targeted per-user
+                        # grant that avoids opening the directory to everyone.
+                        if command -v setfacl >/dev/null 2>&1; then
+                            setfacl -m "u:${SERVICE_USER}:x" "${home_dir}" 2>/dev/null \
+                                && info "Granted traverse ACL for ${SERVICE_USER} on ${home_dir}." \
+                                || warn "setfacl failed on ${home_dir}. You may need to \
+grant traverse access manually: sudo setfacl -m u:${SERVICE_USER}:x ${home_dir}"
+                        else
+                            chmod o+x "${home_dir}" 2>/dev/null \
+                                && info "Added traverse permission (o+x) on ${home_dir} for service access." \
+                                || warn "Could not set o+x on ${home_dir}. The service may not be \
 able to read configs.  Run: sudo chmod o+x ${home_dir}"
+                            warn "Consider installing ACL tools (apt install acl) for a more \
+targeted permission grant."
+                        fi
                     fi
                 fi
                 ;;
@@ -782,10 +798,14 @@ adjust_unit_hardening() {
 
     [[ -f "${unit_file}" ]] || return 0
 
+    # Normalize: strip trailing slashes for consistent comparison
+    config_dir="${config_dir%/}"
+
     # 1. Update ReadOnlyPaths to include the actual config directory
     if grep -q '^ReadOnlyPaths=' "${unit_file}" 2>/dev/null; then
         local current_ro
         current_ro="$(grep '^ReadOnlyPaths=' "${unit_file}" | head -1 | cut -d= -f2-)"
+        current_ro="${current_ro%/}"
         # If the configured directory is already covered, nothing to do
         if [[ "${config_dir}" != "${current_ro}" ]] \
                 && [[ "${config_dir}" != "${current_ro}/"* ]]; then

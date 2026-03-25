@@ -75,10 +75,14 @@ adjust_unit_hardening() {
 
     [[ -f "${unit_file}" ]] || return 0
 
+    # Normalize: strip trailing slashes for consistent comparison
+    config_dir="${config_dir%/}"
+
     # 1. Update ReadOnlyPaths to include the actual config directory
     if grep -q '^ReadOnlyPaths=' "${unit_file}" 2>/dev/null; then
         local current_ro
         current_ro="$(grep '^ReadOnlyPaths=' "${unit_file}" | head -1 | cut -d= -f2-)"
+        current_ro="${current_ro%/}"
         if [[ "${config_dir}" != "${current_ro}" ]] \
                 && [[ "${config_dir}" != "${current_ro}/"* ]]; then
             sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${config_dir}|" "${unit_file}"
@@ -480,6 +484,11 @@ Please report this issue."
         local awg_config_dir=""
         if [[ -f "${ENV_FILE}" ]]; then
             awg_config_dir="$(grep '^AWG_CONFIG_DIR=' "${ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
+            # Strip surrounding quotes (single or double) in case the value was quoted
+            awg_config_dir="${awg_config_dir#\"}"
+            awg_config_dir="${awg_config_dir%\"}"
+            awg_config_dir="${awg_config_dir#\'}"
+            awg_config_dir="${awg_config_dir%\'}"
         fi
         if [[ -n "${awg_config_dir}" ]]; then
             adjust_unit_hardening "${SYSTEMD_UNIT_DEST}" "${awg_config_dir}"
