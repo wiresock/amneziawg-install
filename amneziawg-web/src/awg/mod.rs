@@ -216,9 +216,7 @@ pub fn sync_interface(
 /// WireGuard INI-style config containing `[Interface]` and `[Peer]` sections.
 /// Sections are delimited by `[…]` headers; each `[Peer]` section may contain
 /// a `PublicKey = <base64>` line.
-///
-/// Exposed publicly for unit testing.
-pub fn filter_disabled_peers(
+fn filter_disabled_peers(
     config: &str,
     disabled_keys: &std::collections::HashSet<String>,
 ) -> String {
