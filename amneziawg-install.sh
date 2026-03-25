@@ -2846,7 +2846,7 @@ function nonInteractiveAddClient() {
 
 	# Auto-assign the first available IP pair (same logic as AUTO_INSTALL)
 	local BASE_IP DOT_IP DOT_EXISTS IPV6_EXISTS CLIENT_AWG_IPV4 CLIENT_AWG_IPV6
-	BASE_IP=$(echo "$SERVER_AWG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
+	BASE_IP="${SERVER_AWG_IPV4%.*}"
 
 	local NORMALIZED_SERVER_IPV6 BASE_IPV6
 	NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
@@ -2972,6 +2972,8 @@ function nonInteractiveRemoveClient() {
 	fi
 
 	# Remove [Peer] block
+	# Note: CLIENT_NAME is validated to [a-zA-Z0-9_-]+ so it cannot contain
+	# sed metacharacters — safe to interpolate directly.
 	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "${SERVER_AWG_CONF}"
 
 	# Remove client config file

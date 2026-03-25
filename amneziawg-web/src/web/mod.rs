@@ -1414,13 +1414,16 @@ fn esc(s: &str) -> String {
 ///
 /// Handles both JS-level escaping (backslash, quote) and HTML-level escaping
 /// so the value is safe in `onclick="confirm('...')"` contexts.
+///
+/// **Important:** `&` must be replaced first to avoid double-escaping
+/// entities produced by later replacements (e.g. `&lt;` → `&amp;lt;`).
 fn esc_js(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('"', "&quot;")
+    s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
 }
 
 /// Render legacy combined status badge (used by tests).
