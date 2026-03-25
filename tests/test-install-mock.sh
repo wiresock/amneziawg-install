@@ -1250,7 +1250,7 @@ if [[ -f "${SUDOERS_FILE}" ]]; then
 	fi
 
 	# Verify the rule is narrowly scoped (only the expected commands)
-	if grep -q 'ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set \* peer \* remove, /usr/bin/awg syncconf \* /dev/stdin, /usr/bin/awg-quick strip \*' "${SUDOERS_FILE}"; then
+	if grep -Eq '^awg-web ALL=\(root\) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set \* peer \* remove, /usr/bin/awg syncconf \* /dev/stdin, /usr/bin/awg-quick strip \*$' "${SUDOERS_FILE}"; then
 		echo "OK: Sudoers rule is narrowly scoped (exact commands)"
 	else
 		echo "FAIL: Sudoers rule may be too broad or incorrectly formatted"

@@ -1045,7 +1045,7 @@ async fn post_peer_edit(
                 }
                 Err(error) => {
                     tracing::warn!(
-                        error = ?error,
+                        error = %error,
                         "could not load disabled keys – skipping interface sync to avoid re-adding disabled peers"
                     );
                 }
