@@ -1212,7 +1212,8 @@ if [[ -f "${SUDOERS_FILE}" ]]; then
 	fi
 fi
 
-# Verify content: the rule must allow `awg show all dump` and `awg set * peer * remove`
+# Verify content: the rule must allow `awg show all dump`, `awg set * peer * remove`,
+# `awg syncconf * /dev/stdin`, and `awg-quick strip *`
 if [[ -f "${SUDOERS_FILE}" ]]; then
 	if grep -q "awg-web.*NOPASSWD:.*/usr/bin/awg show all dump" "${SUDOERS_FILE}"; then
 		echo "OK: Sudoers rule grants NOPASSWD for /usr/bin/awg show all dump"

@@ -141,10 +141,16 @@ sudo -u awg-web sudo -n /usr/bin/awg show all dump
 
 ### Why sudoers?
 
-Reading AWG interface state requires `CAP_NET_ADMIN`, which is only
+Managing AWG interfaces requires `CAP_NET_ADMIN`, which is only
 available to root.  Rather than running the whole web service as root,
-we grant the service user passwordless sudo for exactly one read-only
-command.  This follows the principle of least privilege.
+we grant the service user passwordless sudo for a small, fixed set of
+commands:
+
+- `awg show all dump` – read tunnel state (read-only)
+- `awg set … peer … remove` – disable a peer by removing it from the running interface
+- `awg syncconf` + `awg-quick strip` – re-enable a peer by syncing a sanitized on-disk config
+
+This follows the principle of least privilege.
 
 **Important:** The systemd unit does **not** set `NoNewPrivileges=yes`
 because that would block the `sudo` escalation.  All other hardening
