@@ -144,21 +144,23 @@ pub fn remove_peer(interface: &str, public_key: &str) -> Result<(), AwgError> {
     Ok(())
 }
 
-/// Synchronise a running AWG interface with its on-disk config.
+/// Synchronise a running AWG interface with its on-disk config, excluding
+/// disabled peers.
 ///
 /// 1. Calls `sudo -n /usr/bin/awg-quick strip <interface>` to obtain the
 ///    config with non-WG directives (Address, DNS, etc.) removed.
-/// 2. Pipes the stripped config into
+/// 2. Filters out any `[Peer]` sections whose `PublicKey` appears in
+///    `disabled_keys`, so disabled peers are **never** piped into `syncconf`
+///    and cannot be temporarily reactivated.
+/// 3. Pipes the filtered config into
 ///    `sudo -n /usr/bin/awg syncconf <interface> /dev/stdin` which adds any
 ///    peers present in the config but missing from the running interface and
 ///    updates peers whose settings have changed.  Peers already active on the
 ///    interface but absent from the config file are left untouched.
-///
-/// **Note:** `syncconf` may re-add peers that were previously removed
-/// (e.g. disabled peers).  Callers that manage a disabled-peer list must
-/// run [`remove_peer`] (or the poller's enforcement step) *after* calling
-/// this function.
-pub fn sync_interface(interface: &str) -> Result<(), AwgError> {
+pub fn sync_interface(
+    interface: &str,
+    disabled_keys: &std::collections::HashSet<String>,
+) -> Result<(), AwgError> {
     // Step 1: obtain the stripped config via awg-quick.
     let strip_output = Command::new(SUDO_BIN)
         .args(["-n", AWG_QUICK_BIN, "strip", interface])
@@ -173,9 +175,11 @@ pub fn sync_interface(interface: &str) -> Result<(), AwgError> {
         });
     }
 
-    let stripped = &strip_output.stdout;
+    // Step 2: filter out disabled peers so they are never re-added.
+    let stripped_text = String::from_utf8_lossy(&strip_output.stdout);
+    let filtered = filter_disabled_peers(&stripped_text, disabled_keys);
 
-    // Step 2: pipe the stripped config into `awg syncconf`.
+    // Step 3: pipe the filtered config into `awg syncconf`.
     let mut child = Command::new(SUDO_BIN)
         .args(["-n", AWG_BIN, "syncconf", interface, "/dev/stdin"])
         .stdin(Stdio::piped())
@@ -184,7 +188,7 @@ pub fn sync_interface(interface: &str) -> Result<(), AwgError> {
         .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(stripped) {
+        if let Err(e) = stdin.write_all(filtered.as_bytes()) {
             // The child may have exited early (e.g. bad interface name).
             // Log at debug level; the real error comes from wait_with_output.
             tracing::debug!(error = %e, "stdin write to awg syncconf failed – checking exit status");
@@ -203,6 +207,82 @@ pub fn sync_interface(interface: &str) -> Result<(), AwgError> {
     }
 
     Ok(())
+}
+
+/// Remove `[Peer]` sections from a WireGuard stripped config whose
+/// `PublicKey` appears in `disabled_keys`.
+///
+/// The input is the output of `awg-quick strip <iface>`, which is a standard
+/// WireGuard INI-style config containing `[Interface]` and `[Peer]` sections.
+/// Sections are delimited by `[…]` headers; each `[Peer]` section may contain
+/// a `PublicKey = <base64>` line.
+///
+/// Exposed publicly for unit testing.
+pub fn filter_disabled_peers(
+    config: &str,
+    disabled_keys: &std::collections::HashSet<String>,
+) -> String {
+    if disabled_keys.is_empty() {
+        return config.to_string();
+    }
+
+    let mut output = String::with_capacity(config.len());
+    let mut current_section = Vec::<&str>::new();
+    let mut is_peer_section = false;
+
+    for line in config.lines() {
+        let trimmed = line.trim();
+
+        // Detect section headers.
+        if trimmed.starts_with('[') {
+            // Flush the previous section.
+            if !current_section.is_empty() {
+                if !is_peer_section || !section_has_disabled_key(&current_section, disabled_keys) {
+                    for s in &current_section {
+                        output.push_str(s);
+                        output.push('\n');
+                    }
+                }
+                current_section.clear();
+            }
+
+            is_peer_section = trimmed.eq_ignore_ascii_case("[peer]");
+        }
+
+        current_section.push(line);
+    }
+
+    // Flush the final section.
+    if !current_section.is_empty()
+        && (!is_peer_section || !section_has_disabled_key(&current_section, disabled_keys))
+    {
+        for s in &current_section {
+            output.push_str(s);
+            output.push('\n');
+        }
+    }
+
+    output
+}
+
+/// Check whether a `[Peer]` section's `PublicKey` value is in `disabled_keys`.
+fn section_has_disabled_key(
+    lines: &[&str],
+    disabled_keys: &std::collections::HashSet<String>,
+) -> bool {
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("PublicKey") {
+            let rest = rest.trim_start();
+            if let Some(value) = rest.strip_prefix('=') {
+                let key = value.trim();
+                if disabled_keys.contains(key) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Parse the textual output of `awg show all dump`.
@@ -479,5 +559,119 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
             args,
             vec!["-n", AWG_BIN, "syncconf", "awg0", "/dev/stdin"]
         );
+    }
+
+    // ── filter_disabled_peers tests ─────────────────────────────────
+
+    #[test]
+    fn filter_no_disabled_keys_returns_unchanged() {
+        let config = "[Interface]\nListenPort = 51820\nPrivateKey = KEY=\n\n[Peer]\nPublicKey = PEER1=\nAllowedIPs = 10.0.0.2/32\n";
+        let disabled = std::collections::HashSet::new();
+        let result = filter_disabled_peers(config, &disabled);
+        assert_eq!(result, config);
+    }
+
+    #[test]
+    fn filter_removes_disabled_peer_section() {
+        let config = "\
+[Interface]
+ListenPort = 51820
+PrivateKey = KEY=
+
+[Peer]
+PublicKey = ENABLED_PEER=
+AllowedIPs = 10.0.0.2/32
+
+[Peer]
+PublicKey = DISABLED_PEER=
+AllowedIPs = 10.0.0.3/32
+";
+        let disabled: std::collections::HashSet<String> =
+            ["DISABLED_PEER=".to_string()].into_iter().collect();
+        let result = filter_disabled_peers(config, &disabled);
+        assert!(result.contains("ENABLED_PEER="));
+        assert!(!result.contains("DISABLED_PEER="));
+        assert!(result.contains("[Interface]"));
+    }
+
+    #[test]
+    fn filter_keeps_all_when_no_match() {
+        let config = "\
+[Interface]
+ListenPort = 51820
+
+[Peer]
+PublicKey = PEER_A=
+AllowedIPs = 10.0.0.2/32
+
+[Peer]
+PublicKey = PEER_B=
+AllowedIPs = 10.0.0.3/32
+";
+        let disabled: std::collections::HashSet<String> =
+            ["NONEXISTENT=".to_string()].into_iter().collect();
+        let result = filter_disabled_peers(config, &disabled);
+        assert!(result.contains("PEER_A="));
+        assert!(result.contains("PEER_B="));
+    }
+
+    #[test]
+    fn filter_removes_all_disabled_peers() {
+        let config = "\
+[Interface]
+ListenPort = 51820
+
+[Peer]
+PublicKey = PEER_A=
+AllowedIPs = 10.0.0.2/32
+
+[Peer]
+PublicKey = PEER_B=
+AllowedIPs = 10.0.0.3/32
+";
+        let disabled: std::collections::HashSet<String> =
+            ["PEER_A=".to_string(), "PEER_B=".to_string()]
+                .into_iter()
+                .collect();
+        let result = filter_disabled_peers(config, &disabled);
+        assert!(!result.contains("PEER_A="));
+        assert!(!result.contains("PEER_B="));
+        assert!(result.contains("[Interface]"));
+    }
+
+    #[test]
+    fn filter_handles_whitespace_around_public_key() {
+        let config = "\
+[Interface]
+ListenPort = 51820
+
+[Peer]
+PublicKey  =  DISABLED_KEY=
+AllowedIPs = 10.0.0.2/32
+";
+        let disabled: std::collections::HashSet<String> =
+            ["DISABLED_KEY=".to_string()].into_iter().collect();
+        let result = filter_disabled_peers(config, &disabled);
+        assert!(!result.contains("DISABLED_KEY="));
+    }
+
+    #[test]
+    fn filter_preserves_interface_section_only_when_all_peers_disabled() {
+        let config = "\
+[Interface]
+ListenPort = 51820
+PrivateKey = SVR_KEY=
+
+[Peer]
+PublicKey = ONLY_PEER=
+AllowedIPs = 10.0.0.2/32
+";
+        let disabled: std::collections::HashSet<String> =
+            ["ONLY_PEER=".to_string()].into_iter().collect();
+        let result = filter_disabled_peers(config, &disabled);
+        assert!(result.contains("[Interface]"));
+        assert!(result.contains("ListenPort = 51820"));
+        assert!(!result.contains("[Peer]"));
+        assert!(!result.contains("ONLY_PEER="));
     }
 }
