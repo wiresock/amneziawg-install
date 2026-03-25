@@ -1119,17 +1119,21 @@ async fn restore_peer_best_effort(pool: &sqlx::SqlitePool) {
     }
 }
 
-/// Best-effort immediate restoration of peers to the running AWG interface.
+/// Best-effort immediate reconciliation of the running AWG interface with the
+/// on-disk config.
 ///
 /// Spawns blocking AWG commands on a dedicated thread:
 /// 1. `awg show all dump` to discover active interfaces.
 /// 2. For each interface, `awg-quick strip <iface>` → filter out disabled
-///    peers → `awg syncconf <iface>` to re-add only enabled peers that are
-///    in the on-disk config but missing from the running interface.
+///    peers → `awg syncconf <iface>` to fully reconcile the running
+///    interface with the (filtered) on-disk config.
 ///
-/// Because disabled peers are filtered from the config *before* it reaches
-/// `syncconf`, they are never re-added to the interface — no temporary
-/// reactivation window exists.
+/// **Important:** `syncconf` performs a full reconciliation — it adds peers
+/// present in the config but missing from the interface, removes peers
+/// present on the interface but absent from the config (including any
+/// runtime-only peers), and updates changed settings.  Disabled peers are
+/// filtered from the config *before* it reaches `syncconf`, so they are
+/// effectively removed from the running interface as well.
 ///
 /// Like [`remove_peer_from_interface`], this is fire-and-forget: errors are
 /// logged but never propagated.  If this best-effort restore fails, the peer
