@@ -858,8 +858,9 @@ async fn patch_peer(
                 remove_peer_from_interface(&existing.public_key);
             } else {
                 // Re-add the peer to the running AWG interface by syncing
-                // the on-disk config.  syncconf may also re-add other
-                // disabled peers, so enforce_disabled_peers runs afterwards.
+                // the on-disk config. Note: syncconf may also re-add other
+                // disabled peers; their removal is enforced eventually by
+                // the background poller rather than immediately here.
                 restore_peer_to_interface();
             }
         }
@@ -1025,8 +1026,9 @@ async fn post_peer_edit(
             remove_peer_from_interface(&existing.public_key);
         } else {
             // Re-add the peer to the running AWG interface by syncing
-            // the on-disk config.  syncconf may also re-add other
-            // disabled peers, so enforce_disabled_peers runs afterwards.
+            // the on-disk config. Note that syncconf may also temporarily
+            // re-add other disabled peers; enforcement of disabled peers
+            // is handled by the separate poller rather than this handler.
             restore_peer_to_interface();
         }
     }
@@ -1107,9 +1109,9 @@ fn remove_peer_from_interface(public_key: &str) {
 /// 1. `awg show all dump` to discover active interfaces.
 /// 2. For each interface, `awg-quick strip <iface>` + `awg syncconf <iface>`
 ///    to re-add any peers that are in the on-disk config but missing from the
-///    running interface (e.g. a peer that was just re-enabled).
-/// 3. Re-runs disabled-peer enforcement because `syncconf` may also re-add
-///    peers that are still flagged as disabled.
+///    running interface (e.g. a peer that was just re-enabled). This may also
+///    temporarily re-add peers that are still flagged as disabled; the periodic
+///    poller is responsible for enforcing disabled-peer state.
 ///
 /// Like [`remove_peer_from_interface`], this is fire-and-forget: errors are
 /// logged but never propagated.  The database is already updated, and the
