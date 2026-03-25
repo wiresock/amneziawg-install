@@ -94,6 +94,19 @@ pub async fn find_by_public_key(
     .await
 }
 
+/// Return the set of public keys for all administratively disabled peers.
+///
+/// Used by the poller to remove disabled peers from the running AWG
+/// interface.
+pub async fn list_disabled_public_keys(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT public_key FROM peers WHERE disabled = 1")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(pk,)| pk).collect())
+}
+
 /// Return snapshots for a peer captured on or after `since_rfc3339`, ordered
 /// by `captured_at` **ascending** (oldest first).
 ///
@@ -607,5 +620,38 @@ mod tests {
             .await
             .expect("no db error");
         assert!(result.is_none());
+    }
+
+    // ── list_disabled_public_keys ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_disabled_public_keys_empty_db() {
+        let db = test_db().await;
+        let keys = list_disabled_public_keys(&db.pool).await.expect("query");
+        assert!(keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_disabled_public_keys_returns_only_disabled() {
+        let db = test_db().await;
+        insert_peer(&db.pool, "KEY_ENABLED=", None).await;
+        let id_b = insert_peer(&db.pool, "KEY_DISABLED_1=", None).await;
+        let id_c = insert_peer(&db.pool, "KEY_DISABLED_2=", None).await;
+
+        // Disable peers B and C
+        update_peer_disabled(&db.pool, id_b, true).await.unwrap();
+        update_peer_disabled(&db.pool, id_c, true).await.unwrap();
+
+        let keys = list_disabled_public_keys(&db.pool).await.expect("query");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains("KEY_DISABLED_1="));
+        assert!(keys.contains("KEY_DISABLED_2="));
+        assert!(!keys.contains("KEY_ENABLED="));
+
+        // Re-enable B — should now only contain C
+        update_peer_disabled(&db.pool, id_b, false).await.unwrap();
+        let keys = list_disabled_public_keys(&db.pool).await.expect("query");
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains("KEY_DISABLED_2="));
     }
 }

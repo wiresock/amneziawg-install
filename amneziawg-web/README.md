@@ -86,7 +86,7 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 │  │  └──────────┘  └──────────┘  └────────────┘ │  │
 │  └──────────────────────────────────────────────┘  │
 │                                                    │
-│  /etc/sudoers.d/amneziawg-web  (read-only AWG)     │
+│  /etc/sudoers.d/amneziawg-web  (AWG read + peer remove + install script) │
 │  /etc/amneziawg/clients/*.conf                     │
 └────────────────────────────────────────────────────┘
          ▲
@@ -241,21 +241,22 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | Rate limiting | 5 login attempts per 5-minute window per IP; `429` on excess |
 | Audit log | Every peer write, login, and logout recorded |
 | No shell injection | AWG binary called via `Command::new()` with explicit args |
-| AWG access | Narrowly-scoped sudoers rules (read-only `awg show all dump`, install script lifecycle) |
+| AWG access | Narrowly-scoped sudoers rules (AWG read/peer-remove, install script lifecycle) |
 
 ### AWG privilege model
 
-The service runs as a dedicated non-root user (`awg-web`).  Reading AWG
-interface state (`awg show all dump`) requires root-level `CAP_NET_ADMIN`.
+The service runs as a dedicated non-root user (`awg-web`).  Managing AWG
+interface state requires root-level `CAP_NET_ADMIN`.
 Rather than running the entire service as root, the installer configures
 a tightly-scoped sudoers drop-in at `/etc/sudoers.d/amneziawg-web`:
 
 ```
-awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump
+awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove
 awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients
 ```
 
-The first rule grants the minimum privilege needed for **read-only** AWG inspection.
+The first rule grants the minimum privilege needed for AWG inspection and
+for removing disabled peers from the running interface.
 The second rule allows the web panel to manage clients via the install script's
 non-interactive `--add-client` / `--remove-client` / `--list-clients` flags.
 All invocations use `Command::new()` with explicit argument arrays — no shell

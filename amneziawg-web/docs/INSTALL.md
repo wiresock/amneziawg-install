@@ -109,9 +109,10 @@ sudo chmod 0700 /etc/amneziawg-web
 
 ## 4. AWG binary and privilege setup
 
-`amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state.
-It also invokes `sudo /usr/local/bin/amneziawg-install.sh` for user lifecycle
-actions (add/remove clients).
+`amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state,
+`sudo /usr/bin/awg set <iface> peer <key> remove` to enforce disabled peers,
+and `sudo /usr/local/bin/amneziawg-install.sh` for user lifecycle actions
+(add/remove clients).
 The service runs as a dedicated non-root user (`awg-web`) and uses
 tightly-scoped sudoers rules for these specific commands.
 
@@ -129,7 +130,7 @@ If installing manually, create the sudoers rules:
 
 ```bash
 cat <<'EOF' | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
-awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump
+awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove
 awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients
 EOF
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
@@ -157,9 +158,9 @@ active.
 
 | File | Purpose | Permissions |
 |---|---|---|
-| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump` and manage clients via install script | `0440 root:root` |
+| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump`, `awg set … peer … remove`, and manage clients via install script | `0440 root:root` |
 
-The uninstaller removes this file.  The upgrader creates it if missing.
+The uninstaller removes this file.  The upgrader always rewrites it to keep rules current.
 
 Client config files are expected in `AWG_CONFIG_DIR` (default:
 `/etc/amneziawg/clients`).  Each file should be a standard WireGuard/AmneziaWG
@@ -435,7 +436,7 @@ sudo ./amneziawg-web-install.sh \
 2. **Build** – *(source mode only)* verifies Rust toolchain and runs `cargo build --release`
 3. **User + directories** – creates `awg-web` system user, data dir (`0750`), env dir (`0700`)
 4. **Binary install** – copies binary to `--install-dir`
-5. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440`) granting `awg-web` passwordless sudo for `awg show all dump` only
+5. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440`) granting `awg-web` passwordless sudo for AWG commands and install-script lifecycle actions
 6. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
 7. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
 

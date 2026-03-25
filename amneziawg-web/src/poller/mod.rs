@@ -7,6 +7,9 @@
 //! 1. Calls `awg::show_all_dump()` – reads current AWG state.
 //! 2. Writes a snapshot row per peer into `snapshots`.
 //! 3. Upserts each peer into the `peers` table.
+//! 3b. Removes disabled peers from the running AWG interface
+//!     (`awg set <iface> peer <key> remove`).  This is a self-healing
+//!     safety net; immediate removal also happens at toggle time.
 //! 4. Scans the config directory for `*.conf` files.
 //! 5. Applies config-to-peer mapping (sets `has_config`, `config_name`,
 //!    `config_path` on matching peers).
@@ -113,6 +116,16 @@ impl Poller {
             "awg poll step complete"
         );
 
+        // ── Step 3b: Enforce disabled peers ──────────────────────────────────
+        // Remove peers that are flagged as disabled in the DB but still present
+        // on the running AWG interface.  This is a self-healing safety net:
+        // immediate removal also happens at toggle time (web/admin handlers),
+        // but the poller ensures eventual consistency (e.g. after an AWG
+        // restart that re-reads the on-disk config).
+        if let Err(e) = self.enforce_disabled_peers(&interfaces).await {
+            error!(error = %e, "enforce-disabled step failed – continuing");
+        }
+
         // ── Step 4–5: Config mapping ─────────────────────────────────────────
         if let Err(e) = self.apply_config_mapping_step().await {
             error!(error = %e, "config mapping step failed – continuing");
@@ -122,6 +135,85 @@ impl Poller {
             elapsed_ms = start.elapsed().as_millis(),
             "poll cycle complete"
         );
+        Ok(())
+    }
+
+    /// Remove peers that are disabled in the database but still present on the
+    /// running AWG interface.
+    ///
+    /// Iterates over every peer reported by `awg show all dump`.  If a peer's
+    /// public key is marked `disabled = 1` in the DB, it is removed from the
+    /// interface via `awg set <iface> peer <pubkey> remove`.
+    ///
+    /// The actual removal commands are blocking (`std::process::Command`) and
+    /// are offloaded to `tokio::task::spawn_blocking` so the poller task stays
+    /// responsive.
+    ///
+    /// Errors on individual peer removals are logged but do not abort the
+    /// remaining removals.
+    async fn enforce_disabled_peers(&self, interfaces: &[awg::AwgInterface]) -> anyhow::Result<()> {
+        let disabled_keys = crate::db::peers::list_disabled_public_keys(&self.db.pool).await?;
+
+        if disabled_keys.is_empty() {
+            return Ok(());
+        }
+
+        // Collect (interface_name, public_key) pairs that need removal.
+        let to_remove: Vec<(String, String)> = interfaces
+            .iter()
+            .flat_map(|iface| {
+                iface
+                    .peers
+                    .iter()
+                    .filter(|p| disabled_keys.contains(&p.public_key.0))
+                    .map(|p| (iface.name.clone(), p.public_key.0.clone()))
+            })
+            .collect();
+
+        if to_remove.is_empty() {
+            return Ok(());
+        }
+
+        // Offload the blocking awg commands to a dedicated thread.
+        let result = tokio::task::spawn_blocking(move || {
+            let mut removed: usize = 0;
+            for (iface_name, public_key) in &to_remove {
+                info!(
+                    interface = %iface_name,
+                    public_key = %public_key,
+                    "removing disabled peer from interface"
+                );
+                match awg::remove_peer(iface_name, public_key) {
+                    Ok(()) => removed += 1,
+                    Err(e) => {
+                        error!(
+                            interface = %iface_name,
+                            public_key = %public_key,
+                            error = %e,
+                            "failed to remove disabled peer – continuing"
+                        );
+                    }
+                }
+            }
+            removed
+        })
+        .await;
+
+        match result {
+            Ok(removed) if removed > 0 => {
+                info!(removed, "disabled peers removed from interface");
+            }
+            Err(e) if e.is_panic() => {
+                error!(error = %e, "spawn_blocking for peer removal panicked");
+            }
+            Err(e) if e.is_cancelled() => {
+                warn!(error = %e, "spawn_blocking for peer removal was cancelled");
+            }
+            Err(e) => {
+                error!(error = %e, "spawn_blocking for peer removal failed");
+            }
+            _ => {}
+        }
         Ok(())
     }
 

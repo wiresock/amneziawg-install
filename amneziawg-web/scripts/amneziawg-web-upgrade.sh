@@ -432,44 +432,33 @@ main() {
     fi
     info "Replaced binary: ${DEST_BINARY}"
 
-    # 3. Ensure the sudoers drop-in exists and is up to date.
-    #    This covers upgrades from versions that did not install it,
-    #    and also adds the install-script rule if missing.
-    local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump"
+    # 3. Ensure the sudoers drop-in is up-to-date.
+    #    Always rewrite so that upgrades from older versions pick up the
+    #    additional `awg set … peer … remove` and install-script rules.
+    local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove"
     local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients"
-    local needs_rewrite=false
-    if [[ ! -f "${SUDOERS_FILE}" ]]; then
-        needs_rewrite=true
-    elif ! grep -qF -- "--add-client" "${SUDOERS_FILE}"; then
-        needs_rewrite=true
-        info "Sudoers drop-in missing install-script rules; rewriting."
-    fi
-    if [[ "${needs_rewrite}" == "true" ]]; then
-        info "Writing sudoers drop-in: ${SUDOERS_FILE}"
-        mkdir -p "$(dirname "${SUDOERS_FILE}")"
-        printf '# Allow amneziawg-web service to read AWG interface state.\n' \
-            > "${SUDOERS_FILE}"
-        printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \
-            >> "${SUDOERS_FILE}"
-        printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
-        printf '# Allow amneziawg-web to manage clients via the install script.\n' \
-            >> "${SUDOERS_FILE}"
-        printf '%s\n' "${rule_install}" >> "${SUDOERS_FILE}"
-        chmod 0440 "${SUDOERS_FILE}"
-        chown root:root "${SUDOERS_FILE}"
-        if command -v visudo &>/dev/null; then
-            if visudo -cf "${SUDOERS_FILE}" &>/dev/null; then
-                info "Sudoers file validated: ${SUDOERS_FILE}"
-            else
-                warn "visudo validation failed for ${SUDOERS_FILE}."
-                warn "Removing broken sudoers file to protect system integrity."
-                rm -f "${SUDOERS_FILE}"
-                die "Sudoers file syntax check failed. This should not happen with the default rule.
+    info "Installing/updating sudoers drop-in: ${SUDOERS_FILE}"
+    mkdir -p "$(dirname "${SUDOERS_FILE}")"
+    printf '# Allow amneziawg-web service to read AWG state and remove disabled peers.\n' \
+        > "${SUDOERS_FILE}"
+    printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \
+        >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
+    printf '# Allow amneziawg-web to manage clients via the install script.\n' \
+        >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule_install}" >> "${SUDOERS_FILE}"
+    chmod 0440 "${SUDOERS_FILE}"
+    chown root:root "${SUDOERS_FILE}"
+    if command -v visudo &>/dev/null; then
+        if visudo -cf "${SUDOERS_FILE}" &>/dev/null; then
+            info "Sudoers file validated: ${SUDOERS_FILE}"
+        else
+            warn "visudo validation failed for ${SUDOERS_FILE}."
+            warn "Removing broken sudoers file to protect system integrity."
+            rm -f "${SUDOERS_FILE}"
+            die "Sudoers file syntax check failed. This should not happen with the default rule.
 Please report this issue."
-            fi
         fi
-    else
-        info "Sudoers drop-in already present and up to date: ${SUDOERS_FILE}"
     fi
 
     # 4. Optional: refresh systemd unit file
