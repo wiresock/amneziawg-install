@@ -69,7 +69,7 @@ fn is_valid_name_char(c: char) -> bool {
 /// Rules:
 /// - Non-empty
 /// - Only ASCII alphanumeric, underscore, or hyphen
-/// - Fewer than 16 characters
+/// - At most 15 characters
 /// - No path separators, dots, or shell metacharacters
 pub fn validate_client_name(name: &str) -> Result<(), ScriptError> {
     if name.is_empty() {

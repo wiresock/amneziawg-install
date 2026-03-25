@@ -1350,6 +1350,19 @@ fn esc(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
+/// Escape a string for safe use inside a JavaScript string literal in an HTML attribute.
+///
+/// Handles both JS-level escaping (backslash, quote) and HTML-level escaping
+/// so the value is safe in `onclick="confirm('...')"` contexts.
+fn esc_js(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('&', "&amp;")
+}
+
 /// Render legacy combined status badge (used by tests).
 #[allow(dead_code)]
 fn status_badge(status: &PeerStatus) -> &'static str {
@@ -1565,6 +1578,7 @@ fn render_peer_list_inner(
   <input type="text" id="add_user_name" name="name" required
          pattern="[a-zA-Z0-9_-]+" maxlength="15"
          placeholder="e.g. iphone" title="Alphanumeric, underscore, or hyphen (max 15 chars)">
+  <p class="meta" style="margin-top:.25rem">Letters, digits, underscore, or hyphen. Max 15 characters.</p>
   <button type="submit">Add user</button>
 </form>
 </div>
@@ -1704,7 +1718,7 @@ Historical data (snapshots, events) will be preserved.</p>
                 id = dto.id,
                 csrf = esc(csrf_token),
                 name = esc(fn_name),
-                name_js = esc(fn_name),
+                name_js = esc_js(fn_name),
             ));
         }
     }

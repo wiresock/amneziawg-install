@@ -2830,8 +2830,8 @@ function nonInteractiveAddClient() {
 		echo "ERROR: client name must be alphanumeric (plus underscores/dashes)" >&2
 		exit 1
 	fi
-	if [[ ${#CLIENT_NAME} -ge 16 ]]; then
-		echo "ERROR: client name must be fewer than 16 characters" >&2
+	if [[ ${#CLIENT_NAME} -gt 15 ]]; then
+		echo "ERROR: client name must be at most 15 characters" >&2
 		exit 1
 	fi
 
