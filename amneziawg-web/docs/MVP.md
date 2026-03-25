@@ -12,19 +12,19 @@
 | 6 | `GET /api/peers/:id` – peer detail        | 50 recent snapshots; 404 on missing peer                                 |
 | 7 | `GET /api/peers/:id/history` – history    | `range=24h\|7d\|30d`; counter-reset safe                                 |
 | 8 | `PATCH /api/peers/:id` – rename/comment   | Partial update; normalisation; 404 on missing peer                       |
-| 9 | Status derivation                         | `online`/`inactive`/`disabled`/`unlinked`                                |
-|10 | Display-name fallback chain               | `display_name` → config stem → `peer-<prefix>`                           |
-|11 | Schema migrations `0001` + `0002`         | `config_name`, `config_path` on `peers`                                  |
+| 9 | Status derivation (split model)           | Connection: `online`/`inactive`/`never`/`disabled`; Identity: `linked`/`unlinked` |
+|10 | Display-name fallback chain               | `display_name` → `friendly_name` → config stem → `peer-<prefix>`         |
+|11 | Schema migrations `0001`–`0004`           | `config_name`, `config_path`, `friendly_name` on `peers`                 |
 |12 | `GET /` – HTML peer list page             | Server-rendered; no JS framework; nav bar with logout                    |
 |13 | `GET /peers/:id` – HTML peer detail page  | Identity block + edit form + recent snapshots; nav bar with logout       |
 |14 | `POST /peers/:id` – HTML form submit      | PRG redirect; same normalisation as PATCH API                            |
-|15 | Config discovery (`config_store`)         | Scans `*.conf`, extracts `[Peer] PublicKey` + `Address`                  |
-|16 | Config-to-peer mapping in poller          | Sets `has_config`, `config_name`, `config_path`; idempotent              |
-|17 | `unlinked` status driven by `has_config`  | Correct once config mapping runs                                         |
+|15 | Config discovery (`config_store`)         | Scans `*.conf`, extracts `[Peer] PublicKey` + `Address`; derives friendly name |
+|16 | Config-to-peer mapping in poller          | Key match first, then AllowedIPs fallback; sets `has_config`, `config_name`, `friendly_name` |
+|17 | Identity status driven by `has_config`    | `linked` / `unlinked` – separate from connection status                  |
 |18 | Session cookie authentication             | `GET /login`, `POST /login`, `POST /logout`; Argon2id, `SameSite=Lax`   |
 |19 | Auth middleware on all protected routes   | HTML → redirect `/login`; API → 401 JSON; health always public           |
 |20 | Optional bearer token for API             | `Authorization: Bearer <token>` via `AUTH_API_TOKEN`                     |
-|21 | 113 unit + integration tests              | Auth, domain, DB, config, history, web handler layers covered            |
+|21 | 204 unit + integration tests              | Auth, domain, DB, config, history, web handler layers covered            |
 
 ---
 
@@ -65,8 +65,14 @@ python3 -c "import argon2; print(argon2.PasswordHasher().hash('yourpassword'))"
 Every peer resolves its display name through this fallback chain:
 
 1. **`display_name`** – explicitly set via `PATCH /api/peers/:id` or the HTML edit form.
-2. **`config_name`** – stem of the matching `.conf` filename (e.g. `"ivan-iphone"`).
-3. **`peer-<8-char-prefix>`** – generated from the first 8 characters of the public key.
+2. **`friendly_name`** – derived from the config filename by stripping the
+   `*-client-` prefix (e.g. `"awg0-client-gramm.conf"` → `"gramm"`).
+3. **`config_name`** – stem of the matching `.conf` filename (e.g. `"awg0-client-gramm"`).
+4. **`peer-<8-char-prefix>`** – generated from the first 8 characters of the public key.
+
+The `friendly_name` extraction uses the pattern `*-client-<suffix>` which is
+the format created by the AmneziaWG install workflow.  If the filename does
+not match this pattern, the full stem is used as the friendly name.
 
 ### Normalisation rules
 
@@ -74,6 +80,50 @@ Every peer resolves its display name through this fallback chain:
 |----------------|-----------|------|----------------|
 | `display_name` | 128 chars  | Yes  | `NULL` (clear) |
 | `comment`      | 512 chars  | Yes  | `NULL` (clear) |
+
+---
+
+## Peer status model
+
+Peer status is split into two independent dimensions:
+
+### Connection status (`connection_status`)
+
+Describes the peer's network activity:
+
+| Value      | Meaning |
+|------------|---------|
+| `online`   | Handshake within the last 3 minutes |
+| `inactive` | Stale handshake (older than threshold) |
+| `never`    | No handshake has ever been observed |
+| `disabled` | Administratively disabled |
+
+### Identity status (`identity_status`)
+
+Describes whether the peer has been matched to a config file:
+
+| Value      | Meaning |
+|------------|---------|
+| `linked`   | Peer matched to a `.conf` file (by public key or AllowedIPs) |
+| `unlinked` | No matching config file found |
+
+The legacy `status` field is still present in the API for backward
+compatibility.  It combines both dimensions: `disabled` > `unlinked` >
+`online` / `inactive`.
+
+### Config matching strategy
+
+The poller uses a layered matching strategy:
+
+1. **Exact public-key match** – the `[Peer] PublicKey` in the client config
+   is matched against the peer's public key from `awg show all dump`.
+2. **AllowedIPs fallback** – if no key match is found, the config's
+   `[Interface] Address` field is compared with the peer's `allowed_ips`.
+   Only used when the match is unambiguous (exactly one candidate).
+3. **No match** – the peer remains `unlinked` and uses a fallback name.
+
+Diagnostic logging reports key matches, IP matches, ambiguous matches, and
+unmatched configs at each polling cycle.
 
 ---
 

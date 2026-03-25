@@ -276,8 +276,23 @@ Names are resolved in priority order:
 | Priority | Source | When used |
 |---|---|---|
 | 1 | `display_name` | Explicitly set by admin |
-| 2 | `config_name` | Stem of matching `*.conf` file |
-| 3 | `peer-<prefix>` | First 8 chars of public key |
+| 2 | `friendly_name` | Derived from config filename (e.g. `awg0-client-gramm.conf` → `gramm`) |
+| 3 | `config_name` | Stem of matching `*.conf` file (e.g. `awg0-client-gramm`) |
+| 4 | `peer-<prefix>` | First 8 chars of public key |
+
+The `friendly_name` is automatically extracted from the config filename when
+it matches the `*-client-<suffix>` pattern used by the AmneziaWG installer.
+
+## Peer status model
+
+Peer status is split into two independent dimensions:
+
+| Dimension | Values | Meaning |
+|---|---|---|
+| **Connection** (`connection_status`) | `online`, `inactive`, `never`, `disabled` | Network activity state |
+| **Identity** (`identity_status`) | `linked`, `unlinked` | Config file mapping state |
+
+The legacy `status` field is still present in the API for backward compatibility.
 
 ---
 
@@ -285,7 +300,7 @@ Names are resolved in priority order:
 
 ```bash
 # Run tests
-cargo test           # 155 tests
+cargo test           # 204 tests
 
 # Check formatting
 cargo fmt --check
