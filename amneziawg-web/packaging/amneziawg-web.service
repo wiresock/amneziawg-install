@@ -1,0 +1,65 @@
+[Unit]
+Description=AmneziaWG Web Management Panel
+After=network.target
+Documentation=https://github.com/wiresock/amneziawg-install
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5s
+
+# --- Run as a dedicated non-root user ----------------------------------------
+# Create before enabling the service:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin awg-web
+User=awg-web
+Group=awg-web
+
+# --- Binary and working directory --------------------------------------------
+ExecStart=/usr/local/bin/amneziawg-web
+
+# The database file is created relative to WorkingDirectory unless AWG_WEB_DB
+# is set to an absolute path.
+WorkingDirectory=/var/lib/amneziawg-web
+
+# --- Environment variables ---------------------------------------------------
+# Copy /etc/amneziawg-web/env.conf.example to /etc/amneziawg-web/env.conf
+# and fill in your values, then uncomment the line below.
+#EnvironmentFile=/etc/amneziawg-web/env.conf
+
+# These can also be set inline (prefer EnvironmentFile for secrets):
+Environment=AWG_WEB_LISTEN=127.0.0.1:8080
+Environment=AWG_WEB_DB=/var/lib/amneziawg-web/awg-web.db
+Environment=AWG_CONFIG_DIR=/etc/amneziawg/clients
+Environment=AWG_POLL_INTERVAL=30
+Environment=RUST_LOG=amneziawg_web=info
+
+# Authentication — set these in EnvironmentFile, not inline in production:
+# Environment=AUTH_ENABLED=true
+# Environment=AUTH_USERNAME=admin
+# Environment=AUTH_PASSWORD_HASH=$argon2id$v=19$m=65536,t=3,p=4$...
+# Environment=AUTH_SESSION_TTL_SECS=86400
+# Environment=AUTH_SECURE_COOKIE=true
+# Environment=AUTH_API_TOKEN=<random-32-byte-hex>
+
+# --- Hardening ---------------------------------------------------------------
+# Allow the process to read AWG config files (typically owned by root).
+# Adjust if configs are owned by the service user.
+ReadOnlyPaths=/etc/amneziawg
+
+# NoNewPrivileges is NOT set because the service invokes
+# `sudo /usr/bin/awg show all dump` via a tightly-scoped sudoers rule
+# (see /etc/sudoers.d/amneziawg-web).  The sudoers rule restricts access
+# to this single read-only command.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# Allow writing to the database directory only.
+ReadWritePaths=/var/lib/amneziawg-web
+
+[Install]
+WantedBy=multi-user.target

@@ -2,6 +2,38 @@
 
 **This project is a bash script that aims to setup a [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) VPN on a Linux server, as easily as possible!**
 
+A companion web panel is also available. Once AmneziaWG is installed, run the
+second script to set up a browser-accessible management interface:
+
+```bash
+sudo ./amneziawg-install.sh        # install AmneziaWG
+sudo ./amneziawg-web-install.sh    # install the web panel (builds from source)
+# open http://127.0.0.1:8080
+```
+
+To upgrade the web panel (rebuild from source and replace):
+
+```bash
+sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+```
+
+To upgrade with a pre-built binary:
+
+```bash
+sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+```
+
+To uninstall the web panel later:
+
+```bash
+sudo ./amneziawg-web-uninstall.sh                              # safe: removes service + binary, keeps config/data
+sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force  # full purge
+```
+
+See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for details.
+
+---
+
 ## Requirements
 
 Supported distributions:
