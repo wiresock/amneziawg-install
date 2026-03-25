@@ -44,6 +44,18 @@ pub const EVT_LOGIN_FAILED: &str = "login_failed";
 pub const EVT_LOGOUT: &str = "logout";
 /// Audit event for enabling or disabling a peer.
 pub const EVT_PEER_DISABLED: &str = "peer_disabled";
+/// Audit event when a user creation is requested.
+pub const EVT_USER_CREATE_REQUESTED: &str = "user_create_requested";
+/// Audit event when a user creation succeeds.
+pub const EVT_USER_CREATED: &str = "user_created";
+/// Audit event when a user creation fails.
+pub const EVT_USER_CREATE_FAILED: &str = "user_create_failed";
+/// Audit event when a user removal is requested.
+pub const EVT_USER_REMOVE_REQUESTED: &str = "user_remove_requested";
+/// Audit event when a user removal succeeds.
+pub const EVT_USER_REMOVED: &str = "user_removed";
+/// Audit event when a user removal fails.
+pub const EVT_USER_REMOVE_FAILED: &str = "user_remove_failed";
 
 /// Maximum number of events that can be returned in a single [`list_events`] call.
 pub const MAX_EVENTS_LIMIT: i64 = 200;

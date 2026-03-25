@@ -2805,8 +2805,245 @@ function manageMenu() {
 	esac
 }
 
+# ── Non-interactive client management ─────────────────────────────────────────
+#
+# These functions support the --add-client and --remove-client flags,
+# enabling fully non-interactive client lifecycle management from the
+# amneziawg-web panel or other automation tooling.
+#
+# Contract:
+#   --add-client NAME     → validates name, creates client config, exits 0 on success
+#   --remove-client NAME  → validates name, removes client config, exits 0 on success
+#   --list-clients        → lists all client names (one per line), exits 0
+#
+# On error, prints a message to stderr and exits with a non-zero code.
+
+function nonInteractiveAddClient() {
+	local CLIENT_NAME="$1"
+
+	# Validate the name format (same rules as interactive mode)
+	if [[ -z "${CLIENT_NAME}" ]]; then
+		echo "ERROR: client name must not be empty" >&2
+		exit 1
+	fi
+	if ! [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+		echo "ERROR: client name must be alphanumeric (plus underscores/dashes)" >&2
+		exit 1
+	fi
+	if [[ ${#CLIENT_NAME} -ge 16 ]]; then
+		echo "ERROR: client name must be fewer than 16 characters" >&2
+		exit 1
+	fi
+
+	# Ensure params are loaded and config path is set
+	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+
+	# Check for duplicate name
+	if [[ $(grep -c -xF "### Client ${CLIENT_NAME}" "${SERVER_AWG_CONF}") != 0 ]]; then
+		echo "ERROR: a client named '${CLIENT_NAME}' already exists" >&2
+		exit 1
+	fi
+
+	# Auto-assign the first available IP pair (same logic as AUTO_INSTALL)
+	local BASE_IP DOT_IP DOT_EXISTS IPV6_EXISTS CLIENT_AWG_IPV4 CLIENT_AWG_IPV6
+	BASE_IP=$(echo "$SERVER_AWG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
+
+	local NORMALIZED_SERVER_IPV6 BASE_IPV6
+	NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
+	BASE_IPV6=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
+
+	local FREE_FOUND=0
+	for DOT_IP in {2..254}; do
+		DOT_EXISTS=$(grep -cF "${BASE_IP}.${DOT_IP}/32" "${SERVER_AWG_CONF}")
+		local CLIENT_IPV6_CANDIDATE
+		CLIENT_IPV6_CANDIDATE=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
+		IPV6_EXISTS=0
+		while IFS= read -r _existing_ip_cidr; do
+			local _existing_ip="${_existing_ip_cidr%/*}"
+			local _normalized_existing
+			_normalized_existing=$(normalizeIPv6 "${_existing_ip}")
+			if [[ "${_normalized_existing}" == "${CLIENT_IPV6_CANDIDATE}" ]]; then
+				IPV6_EXISTS=1
+				break
+			fi
+		done < <(grep -oE '([0-9a-fA-F:]+)/128' "${SERVER_AWG_CONF}")
+		if [[ ${DOT_EXISTS} == '0' && ${IPV6_EXISTS} == '0' ]]; then
+			FREE_FOUND=1
+			break
+		fi
+	done
+
+	if [[ ${FREE_FOUND} -eq 0 ]]; then
+		echo "ERROR: no free IP addresses available (max 253 clients)" >&2
+		exit 1
+	fi
+
+	CLIENT_AWG_IPV4="${BASE_IP}.${DOT_IP}"
+	CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
+
+	# Generate key pair
+	local CLIENT_PRIV_KEY CLIENT_PUB_KEY CLIENT_PRE_SHARED_KEY
+	CLIENT_PRIV_KEY=$(awg genkey)
+	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | awg pubkey)
+	CLIENT_PRE_SHARED_KEY=$(awg genpsk)
+
+	local HOME_DIR
+	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
+
+	local CLIENT_DNS="${CLIENT_DNS_1}"
+	if [[ -n "${CLIENT_DNS_2}" ]]; then
+		CLIENT_DNS="${CLIENT_DNS_1},${CLIENT_DNS_2}"
+	fi
+
+	local CLIENT_AWG_IPV6_DISPLAY
+	CLIENT_AWG_IPV6_DISPLAY=$(compressIPv6 "${CLIENT_AWG_IPV6}")
+
+	# If SERVER_PUB_IP is IPv6, normalize brackets
+	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
+		SERVER_PUB_IP="${SERVER_PUB_IP#\[}"
+		SERVER_PUB_IP="${SERVER_PUB_IP%\]}"
+		SERVER_PUB_IP="[${SERVER_PUB_IP}]"
+	fi
+	local ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
+
+	local OLD_UMASK
+	OLD_UMASK="$(umask)"
+	umask 077
+
+	echo "[Interface]
+PrivateKey = ${CLIENT_PRIV_KEY}
+Address = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6_DISPLAY}/128
+DNS = ${CLIENT_DNS}
+Jc = ${SERVER_AWG_JC}
+Jmin = ${SERVER_AWG_JMIN}
+Jmax = ${SERVER_AWG_JMAX}
+S1 = ${SERVER_AWG_S1}
+S2 = ${SERVER_AWG_S2}
+S3 = ${SERVER_AWG_S3}
+S4 = ${SERVER_AWG_S4}
+H1 = ${SERVER_AWG_H1}
+H2 = ${SERVER_AWG_H2}
+H3 = ${SERVER_AWG_H3}
+H4 = ${SERVER_AWG_H4}
+
+[Peer]
+PublicKey = ${SERVER_PUB_KEY}
+PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+Endpoint = ${ENDPOINT}
+AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+
+	umask "${OLD_UMASK}"
+
+	local client_conf
+	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+	chmod 600 "${client_conf}" 2>/dev/null || true
+
+	# Add peer to server config
+	echo -e "\n### Client ${CLIENT_NAME}
+[Peer]
+PublicKey = ${CLIENT_PUB_KEY}
+PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+AllowedIPs = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6}/128" >>"${SERVER_AWG_CONF}"
+
+	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+
+	# Print the config path to stdout for the caller
+	echo "${client_conf}"
+}
+
+function nonInteractiveRemoveClient() {
+	local CLIENT_NAME="$1"
+
+	if [[ -z "${CLIENT_NAME}" ]]; then
+		echo "ERROR: client name must not be empty" >&2
+		exit 1
+	fi
+	if ! [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+		echo "ERROR: client name contains unsafe characters" >&2
+		exit 1
+	fi
+
+	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+
+	# Check the client exists
+	if [[ $(grep -c -xF "### Client ${CLIENT_NAME}" "${SERVER_AWG_CONF}") == 0 ]]; then
+		echo "ERROR: no client named '${CLIENT_NAME}' found" >&2
+		exit 1
+	fi
+
+	# Remove [Peer] block
+	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "${SERVER_AWG_CONF}"
+
+	# Remove client config file
+	local HOME_DIR
+	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
+	rm -f "${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+
+	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+
+	echo "OK"
+}
+
+function nonInteractiveListClients() {
+	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+	grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3
+}
+
 # Only run main logic when executed directly (not when sourced for testing)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	# ── Non-interactive flags ─────────────────────────────────────────────
+	#
+	# These flags allow automation tooling (e.g. amneziawg-web) to invoke
+	# client lifecycle operations without interactive prompts.
+	#
+	# Usage:
+	#   amneziawg-install.sh --add-client <NAME>
+	#   amneziawg-install.sh --remove-client <NAME>
+	#   amneziawg-install.sh --list-clients
+	#
+	# Requires AmneziaWG to be already installed (params file must exist).
+	case "${1:-}" in
+		--add-client)
+			if [[ -z "${2:-}" ]]; then
+				echo "ERROR: --add-client requires a client name argument" >&2
+				exit 1
+			fi
+			initialCheck
+			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
+				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
+				exit 1
+			fi
+			loadParams
+			nonInteractiveAddClient "$2"
+			exit $?
+			;;
+		--remove-client)
+			if [[ -z "${2:-}" ]]; then
+				echo "ERROR: --remove-client requires a client name argument" >&2
+				exit 1
+			fi
+			initialCheck
+			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
+				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
+				exit 1
+			fi
+			loadParams
+			nonInteractiveRemoveClient "$2"
+			exit $?
+			;;
+		--list-clients)
+			initialCheck
+			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
+				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
+				exit 1
+			fi
+			loadParams
+			nonInteractiveListClients
+			exit $?
+			;;
+	esac
+
+	# ── Default interactive flow ──────────────────────────────────────────
 	# Check for root, virt, OS...
 	initialCheck
 

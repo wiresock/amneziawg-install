@@ -17,6 +17,7 @@ use serde_json::json;
 use tower_http::trace::TraceLayer;
 use tracing::error;
 
+use crate::admin::script_bridge::ScriptBridge;
 use crate::auth::{
     add_session, check_and_record_login_attempt, clear_session_cookie, consume_login_csrf, csrf_eq,
     extract_session_token, generate_login_csrf, generate_session_id, get_session_csrf,
@@ -48,16 +49,27 @@ pub struct AppState {
     pub login_csrf: LoginCsrfStore,
     /// Sliding-window login attempt counters keyed by client IP.
     pub rate_limiter: LoginRateLimiter,
+    /// Directory where AWG client configs are stored (for rescan).
+    pub config_dir: std::path::PathBuf,
+    /// Bridge to the install script for user lifecycle actions.
+    pub script_bridge: std::sync::Arc<ScriptBridge>,
 }
 
 impl AppState {
-    fn new(db: Database, auth: AuthConfig) -> Self {
+    fn new(
+        db: Database,
+        auth: AuthConfig,
+        config_dir: std::path::PathBuf,
+        install_script: std::path::PathBuf,
+    ) -> Self {
         Self {
             db,
             auth,
             sessions: new_session_store(),
             login_csrf: new_login_csrf_store(),
             rate_limiter: new_login_rate_limiter(),
+            config_dir,
+            script_bridge: std::sync::Arc::new(ScriptBridge::new(install_script)),
         }
     }
 }
@@ -232,6 +244,37 @@ pub struct EventDto {
     pub created_at: String,
 }
 
+// ── User lifecycle DTOs ──────────────────────────────────────────────────────
+
+/// JSON request body for `POST /api/admin/users`.
+#[derive(Debug, Deserialize)]
+pub struct CreateUserRequest {
+    pub name: String,
+}
+
+/// JSON response from `POST /api/admin/users` on success.
+#[derive(Debug, Serialize)]
+#[allow(dead_code)]
+pub struct CreateUserResponse {
+    pub name: String,
+    pub config_path: String,
+}
+
+/// HTML form body for `POST /admin/users/add`.
+#[derive(Debug, Deserialize)]
+pub struct AddUserForm {
+    pub name: String,
+    pub csrf_token: Option<String>,
+}
+
+/// HTML form body for `POST /admin/users/:id/remove`.
+#[derive(Debug, Deserialize)]
+pub struct RemoveUserForm {
+    pub csrf_token: Option<String>,
+    /// Confirmation field – must be "yes" to proceed.
+    pub confirm: Option<String>,
+}
+
 // ── Conversion helpers ───────────────────────────────────────────────────────
 
 fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
@@ -343,8 +386,13 @@ fn range_to_secs(range: &str) -> i64 {
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Build the application router.
-pub fn router(db: Database, auth: AuthConfig) -> Router {
-    let state = AppState::new(db, auth);
+pub fn router(
+    db: Database,
+    auth: AuthConfig,
+    config_dir: std::path::PathBuf,
+    install_script: std::path::PathBuf,
+) -> Router {
+    let state = AppState::new(db, auth, config_dir, install_script);
 
     // Protected routes – all require a valid session.
     let protected = Router::new()
@@ -355,6 +403,11 @@ pub fn router(db: Database, auth: AuthConfig) -> Router {
         .route("/api/peers/:id/history", get(get_peer_history))
         .route("/api/peers/:id/config", get(get_peer_config))
         .route("/api/events", get(list_events_handler))
+        // ── User lifecycle routes ────────────────────────────────
+        .route("/api/admin/users", post(api_create_user))
+        .route("/api/admin/users/:id/remove", post(api_remove_user))
+        .route("/admin/users/add", post(post_add_user_form))
+        .route("/admin/users/:id/remove", post(post_remove_user_form))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -1031,6 +1084,215 @@ async fn post_peer_edit(
     Ok(Redirect::to(&format!("/peers/{id}")).into_response())
 }
 
+// ── User lifecycle handlers ──────────────────────────────────────────────────
+
+/// `POST /api/admin/users` – JSON API to create a new user/client.
+async fn api_create_user(
+    State(state): State<AppState>,
+    Json(body): Json<CreateUserRequest>,
+) -> Result<Response, ApiError> {
+    let name = body.name.trim().to_string();
+    match crate::admin::execute_create_user(
+        &state.db,
+        &state.script_bridge,
+        &name,
+        &state.auth.username,
+    )
+    .await
+    {
+        Ok(result) => {
+            // Trigger config rescan so new peer appears immediately.
+            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
+                tracing::warn!(error = %e, "post-create config rescan failed");
+            }
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({
+                    "name": result.client_name,
+                    "config_path": result.config_path,
+                })),
+            )
+                .into_response())
+        }
+        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": msg })),
+        )
+            .into_response()),
+        Err(e) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response()),
+    }
+}
+
+/// `POST /api/admin/users/:id/remove` – JSON API to remove an existing user/client.
+async fn api_remove_user(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let peer = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
+        Some(p) => p,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "peer not found" })),
+            )
+                .into_response());
+        }
+    };
+
+    // Determine the script-side client name from the peer's friendly_name
+    // (which is extracted from the config filename's `-client-<suffix>` pattern).
+    let client_name = match peer.friendly_name.as_deref() {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "peer has no associated client name (no config linked)" })),
+            )
+                .into_response());
+        }
+    };
+
+    match crate::admin::execute_remove_user(
+        &state.db,
+        &state.script_bridge,
+        id,
+        &client_name,
+        &state.auth.username,
+    )
+    .await
+    {
+        Ok(()) => {
+            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
+                tracing::warn!(error = %e, "post-remove config rescan failed");
+            }
+            Ok(Json(json!({ "ok": true })).into_response())
+        }
+        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": msg })),
+        )
+            .into_response()),
+        Err(e) => Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response()),
+    }
+}
+
+/// `POST /admin/users/add` – HTML form to add a new user (PRG pattern).
+async fn post_add_user_form(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<AddUserForm>,
+) -> Result<Response, ApiError> {
+    if state.auth.enabled {
+        let cookie_header = headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let submitted = form.csrf_token.as_deref().unwrap_or("");
+        if !validate_form_csrf(&state, cookie_header, submitted) {
+            return Ok(StatusCode::FORBIDDEN.into_response());
+        }
+    }
+
+    let name = form.name.trim().to_string();
+    match crate::admin::execute_create_user(
+        &state.db,
+        &state.script_bridge,
+        &name,
+        &state.auth.username,
+    )
+    .await
+    {
+        Ok(_result) => {
+            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
+                tracing::warn!(error = %e, "post-create config rescan failed");
+            }
+            // Redirect back to the peer list.
+            Ok(Redirect::to("/").into_response())
+        }
+        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
+            // Show the peer list page with an error message.
+            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+            let csrf = session_csrf_from_headers(&state, &headers);
+            Ok(Html(render_peer_list_with_error(&peers, &csrf, &msg)).into_response())
+        }
+        Err(e) => {
+            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+            let csrf = session_csrf_from_headers(&state, &headers);
+            Ok(Html(render_peer_list_with_error(&peers, &csrf, &e.to_string())).into_response())
+        }
+    }
+}
+
+/// `POST /admin/users/:id/remove` – HTML form to remove a user (PRG pattern).
+async fn post_remove_user_form(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<RemoveUserForm>,
+) -> Result<Response, ApiError> {
+    if state.auth.enabled {
+        let cookie_header = headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let submitted = form.csrf_token.as_deref().unwrap_or("");
+        if !validate_form_csrf(&state, cookie_header, submitted) {
+            return Ok(StatusCode::FORBIDDEN.into_response());
+        }
+    }
+
+    // Require explicit confirmation.
+    if form.confirm.as_deref() != Some("yes") {
+        return Ok(Redirect::to(&format!("/peers/{id}")).into_response());
+    }
+
+    let peer = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
+        Some(p) => p,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Html("<h1>Peer not found</h1>".to_string()),
+            )
+                .into_response());
+        }
+    };
+
+    let client_name = match peer.friendly_name.as_deref() {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => {
+            return Ok(Redirect::to(&format!("/peers/{id}")).into_response());
+        }
+    };
+
+    match crate::admin::execute_remove_user(
+        &state.db,
+        &state.script_bridge,
+        id,
+        &client_name,
+        &state.auth.username,
+    )
+    .await
+    {
+        Ok(()) => {
+            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
+                tracing::warn!(error = %e, "post-remove config rescan failed");
+            }
+            Ok(Redirect::to("/").into_response())
+        }
+        Err(_e) => Ok(Redirect::to(&format!("/peers/{id}")).into_response()),
+    }
+}
+
 // ── CSRF / IP helpers ─────────────────────────────────────────────────────────
 
 /// Validate a CSRF token submitted in an HTML form against the session's stored
@@ -1235,6 +1497,18 @@ fn render_login_page_inner(error_html: &str, csrf_token: &str) -> String {
 }
 
 fn render_peer_list(peers: &[PeerSummaryDto], csrf_token: &str) -> String {
+    render_peer_list_inner(peers, csrf_token, None)
+}
+
+fn render_peer_list_with_error(peers: &[PeerSummaryDto], csrf_token: &str, error: &str) -> String {
+    render_peer_list_inner(peers, csrf_token, Some(error))
+}
+
+fn render_peer_list_inner(
+    peers: &[PeerSummaryDto],
+    csrf_token: &str,
+    error: Option<&str>,
+) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
     buf.push_str(&nav_bar(csrf_token));
     buf.push_str("<h1>AmneziaWG Peers</h1>\n");
@@ -1277,6 +1551,29 @@ fn render_peer_list(peers: &[PeerSummaryDto], csrf_token: &str) -> String {
         }
         buf.push_str("</table>\n");
     }
+
+    // Add user form
+    if let Some(err) = error {
+        buf.push_str(&format!(
+            "<p class=\"error\">Add user failed: {}</p>\n",
+            esc(err)
+        ));
+    }
+    buf.push_str(&format!(
+        r#"<div class="edit-form">
+<h2>Add user</h2>
+<form method="POST" action="/admin/users/add">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <label for="add_user_name">Client name</label>
+  <input type="text" id="add_user_name" name="name" required
+         pattern="[a-zA-Z0-9_-]+" maxlength="15"
+         placeholder="e.g. iphone" title="Alphanumeric, underscore, or hyphen (max 15 chars)">
+  <button type="submit">Add user</button>
+</form>
+</div>
+"#,
+        csrf = esc(csrf_token)
+    ));
 
     buf.push_str("</body></html>");
     buf
@@ -1389,6 +1686,32 @@ fn render_peer_detail(
         disabled_checked = if dto.disabled { " checked" } else { "" },
     ));
 
+    // Remove user form (only shown when the peer has a linked config)
+    if dto.has_config {
+        if let Some(ref fn_name) = dto.friendly_name {
+            buf.push_str(&format!(
+                r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
+<h2 style="color:#c00">Remove user</h2>
+<p>This will permanently revoke the client <strong>{name}</strong> and delete its config file.
+Historical data (snapshots, events) will be preserved.</p>
+<form method="POST" action="/admin/users/{id}/remove">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <input type="hidden" name="confirm" value="yes">
+  <button type="submit" style="background:#c00;margin-top:.5rem"
+          onclick="return confirm('Are you sure you want to remove user {name_js}? This cannot be undone.')">
+    Remove user
+  </button>
+</form>
+</div>
+"#,
+                id = dto.id,
+                csrf = esc(csrf_token),
+                name = esc(fn_name),
+                name_js = esc(fn_name),
+            ));
+        }
+    }
+
     // Recent snapshots
     buf.push_str(&format!(
         "<h2>Recent snapshots ({})</h2>\n",
@@ -1471,7 +1794,12 @@ mod tests {
 
     /// Build a router with auth disabled (used for all pre-auth tests).
     fn test_router(db: Database) -> Router {
-        router(db, AuthConfig::disabled())
+        router(
+            db,
+            AuthConfig::disabled(),
+            std::path::PathBuf::from("/tmp/test-configs"),
+            std::path::PathBuf::from("/tmp/test-install.sh"),
+        )
     }
 
     /// Build a router with auth enabled and known test credentials.
@@ -1485,7 +1813,15 @@ mod tests {
             secure_cookie: false,
             session_ttl: std::time::Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
         };
-        (router(db, auth), "testpassword".to_string())
+        (
+            router(
+                db,
+                auth,
+                std::path::PathBuf::from("/tmp/test-configs"),
+                std::path::PathBuf::from("/tmp/test-install.sh"),
+            ),
+            "testpassword".to_string(),
+        )
     }
 
     // ── CSRF test helpers ───────────────────────────────────────────────────
@@ -2665,7 +3001,12 @@ mod tests {
             secure_cookie: false,
             session_ttl: std::time::Duration::from_secs(0),
         };
-        let app = router(db, auth);
+        let app = router(
+            db,
+            auth,
+            std::path::PathBuf::from("/tmp/test-configs"),
+            std::path::PathBuf::from("/tmp/test-install.sh"),
+        );
 
         // Login succeeds and we get a session cookie ...
         let login_resp = do_login(app.clone(), "admin", "pass").await;

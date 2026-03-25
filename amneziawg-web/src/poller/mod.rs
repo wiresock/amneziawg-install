@@ -367,3 +367,78 @@ fn saturating_u64_to_i64(v: u64) -> i64 {
 fn base_ip(cidr: &str) -> &str {
     cidr.split('/').next().unwrap_or(cidr)
 }
+
+/// Perform a one-shot config-directory rescan and update peer mappings.
+///
+/// This is the same logic the poller runs every cycle, exposed for on-demand
+/// use after lifecycle actions (user create/remove).
+pub async fn rescan_configs(
+    db: &crate::db::Database,
+    config_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let configs = match config_store::scan(config_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                config_dir = %config_dir.display(),
+                error = %e,
+                "config scan failed during rescan"
+            );
+            return Ok(());
+        }
+    };
+
+    crate::db::peers::clear_all_config_mappings(&db.pool).await?;
+    let all_peers = crate::db::peers::list_all(&db.pool).await?;
+
+    for config in &configs {
+        let path_str = config.path.to_string_lossy();
+
+        // Strategy 1: exact public-key match
+        if let Some(pk) = &config.peer_public_key {
+            match crate::db::peers::apply_config_mapping(
+                &db.pool,
+                &pk.0,
+                &config.name,
+                &path_str,
+                &config.friendly_name,
+            )
+            .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => continue,
+            }
+        }
+
+        // Strategy 2: AllowedIPs fallback
+        if !config.addresses.is_empty() {
+            let candidates: Vec<_> = all_peers
+                .iter()
+                .filter(|p| {
+                    config.addresses.iter().any(|addr| {
+                        let addr_base = base_ip(addr);
+                        p.allowed_ips
+                            .split(',')
+                            .any(|a| base_ip(a.trim()) == addr_base)
+                    })
+                })
+                .collect();
+
+            if candidates.len() == 1 {
+                let peer = candidates[0];
+                let _ = crate::db::peers::apply_config_mapping(
+                    &db.pool,
+                    &peer.public_key,
+                    &config.name,
+                    &path_str,
+                    &config.friendly_name,
+                )
+                .await;
+            }
+        }
+    }
+
+    info!("on-demand config rescan complete");
+    Ok(())
+}

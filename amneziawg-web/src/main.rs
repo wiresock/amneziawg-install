@@ -70,6 +70,14 @@ pub struct Config {
     /// Default is 86400 (24 hours).
     #[arg(long, env = "AUTH_SESSION_TTL_SECS", default_value_t = 86_400)]
     pub auth_session_ttl_secs: u64,
+
+    /// Path to the amneziawg-install.sh script used for user lifecycle actions.
+    #[arg(
+        long,
+        env = "AWG_INSTALL_SCRIPT",
+        default_value = "/usr/local/bin/amneziawg-install.sh"
+    )]
+    pub install_script: std::path::PathBuf,
 }
 
 #[tokio::main]
@@ -114,13 +122,14 @@ async fn main() -> anyhow::Result<()> {
     info!("database ready");
 
     // --- Background poller --------------------------------------------------
+    let config_dir = config.config_dir.clone();
     let poller = Poller::new(db.clone(), config.poll_interval, config.config_dir);
     tokio::spawn(async move {
         poller.run().await;
     });
 
     // --- HTTP server --------------------------------------------------------
-    let app = router(db, auth);
+    let app = router(db, auth, config_dir, config.install_script);
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .context("failed to bind TCP listener")?;
