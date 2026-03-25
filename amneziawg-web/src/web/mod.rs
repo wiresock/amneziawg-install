@@ -851,6 +851,12 @@ async fn patch_peer(
                 &state.auth.username,
             )
             .await;
+
+            // Immediately remove the peer from the running AWG interface so
+            // the client cannot connect until re-enabled.
+            if disabled {
+                remove_peer_from_interface(&existing.public_key);
+            }
         }
     }
 
@@ -1007,6 +1013,12 @@ async fn post_peer_edit(
             &state.auth.username,
         )
         .await;
+
+        // Immediately remove the peer from the running AWG interface so
+        // the client cannot connect until re-enabled.
+        if new_disabled {
+            remove_peer_from_interface(&existing.public_key);
+        }
     }
 
     // Fire-and-forget audit log.
@@ -1029,6 +1041,54 @@ async fn post_peer_edit(
 
     // Redirect back to the detail page (PRG pattern).
     Ok(Redirect::to(&format!("/peers/{id}")).into_response())
+}
+
+// ── AWG enforcement helpers ───────────────────────────────────────────────────
+
+/// Best-effort immediate removal of a peer from the running AWG interface.
+///
+/// Spawns the blocking AWG commands (`show all dump` + `set … peer … remove`)
+/// on a dedicated blocking thread via `tokio::task::spawn_blocking` so the
+/// calling async handler stays non-blocking.  The task is fire-and-forget:
+/// errors are logged but never propagated – the database is already updated,
+/// and the poller will retry removal on the next cycle.
+fn remove_peer_from_interface(public_key: &str) {
+    let pk = public_key.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let interfaces = match crate::awg::show_all_dump() {
+            Ok(ifaces) => ifaces,
+            Err(e) => {
+                tracing::warn!(
+                    public_key = %pk,
+                    error = %e,
+                    "could not read AWG state for immediate peer removal – poller will retry"
+                );
+                return;
+            }
+        };
+
+        for iface in &interfaces {
+            if iface.peers.iter().any(|p| p.public_key.0 == pk) {
+                match crate::awg::remove_peer(&iface.name, &pk) {
+                    Ok(()) => {
+                        tracing::info!(
+                            interface = %iface.name,
+                            public_key = %pk,
+                            "disabled peer removed from interface"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            interface = %iface.name,
+                            public_key = %pk,
+                            error = %e,
+                            "failed to remove disabled peer – poller will retry"
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ── CSRF / IP helpers ─────────────────────────────────────────────────────────
