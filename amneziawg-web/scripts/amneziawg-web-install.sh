@@ -609,6 +609,28 @@ setup_filesystem() {
                 || warn "Could not add ${SERVICE_USER} to group ${awg_group}. \
 You may need to grant read access to ${AWG_CONFIG_DIR} manually."
         fi
+
+        # For directories under /home, the parent home directory is typically
+        # mode 700/750.  Ensure group-read and traverse permission so the
+        # service user can reach the config files.
+        case "${AWG_CONFIG_DIR}" in
+            /home/*)
+                local home_dir
+                home_dir="$(echo "${AWG_CONFIG_DIR}" | cut -d/ -f1-3)"  # e.g. /home/vadim
+                if [[ -d "${home_dir}" ]]; then
+                    local home_perms
+                    home_perms="$(stat -c '%a' "${home_dir}")"
+                    # If no 'other' or 'group' execute bit, add o+x so awg-web can traverse
+                    if [[ $((8#${home_perms} & 8#001)) -eq 0 ]] && \
+                       [[ $((8#${home_perms} & 8#010)) -eq 0 ]]; then
+                        chmod o+x "${home_dir}" 2>/dev/null \
+                            && info "Added traverse permission (o+x) on ${home_dir} for service access." \
+                            || warn "Could not set o+x on ${home_dir}. The service may not be \
+able to read configs.  Run: sudo chmod o+x ${home_dir}"
+                    fi
+                fi
+                ;;
+        esac
     fi
 }
 
@@ -748,6 +770,43 @@ find_unit_template() {
     return 1
 }
 
+# Adjust ReadOnlyPaths and ProtectHome in the installed service unit to match
+# the user's configured AWG_CONFIG_DIR.  The packaged template hard-codes
+# ReadOnlyPaths=/etc/amneziawg and ProtectHome=yes which is correct for the
+# default config directory.  When a custom directory is chosen — especially
+# one under /home — we need to relax the sandboxing so the service can read
+# the config files.
+adjust_unit_hardening() {
+    local unit_file="$1"
+    local config_dir="$2"
+
+    [[ -f "${unit_file}" ]] || return 0
+
+    # 1. Update ReadOnlyPaths to include the actual config directory
+    if grep -q '^ReadOnlyPaths=' "${unit_file}" 2>/dev/null; then
+        local current_ro
+        current_ro="$(grep '^ReadOnlyPaths=' "${unit_file}" | head -1 | cut -d= -f2-)"
+        # If the configured directory is already covered, nothing to do
+        if [[ "${config_dir}" != "${current_ro}" ]] \
+                && [[ "${config_dir}" != "${current_ro}/"* ]]; then
+            sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${config_dir}|" "${unit_file}"
+            info "Updated ReadOnlyPaths to ${config_dir}"
+        fi
+    fi
+
+    # 2. If the config directory lives under /home, relax ProtectHome so the
+    #    service can traverse into it.  ProtectHome=read-only still prevents
+    #    writes while allowing reads.
+    case "${config_dir}" in
+        /home|/home/*)
+            if grep -q '^ProtectHome=yes' "${unit_file}" 2>/dev/null; then
+                sed -i 's|^ProtectHome=yes|ProtectHome=read-only|' "${unit_file}"
+                info "Changed ProtectHome to read-only (config dir is under /home)."
+            fi
+            ;;
+    esac
+}
+
 install_service_unit() {
     step "Installing systemd service"
 
@@ -785,7 +844,7 @@ EnvironmentFile=${ENV_FILE}
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadOnlyPaths=/etc/amneziawg
+ReadOnlyPaths=${AWG_CONFIG_DIR}
 ReadWritePaths=${DATA_DIR}
 
 [Install]
@@ -805,6 +864,9 @@ UNITEOF
         sed -i "/^ExecStart=/a EnvironmentFile=${ENV_FILE}" "${SYSTEMD_UNIT_DEST}"
         info "Added EnvironmentFile directive to service unit."
     fi
+
+    # Adjust ReadOnlyPaths / ProtectHome for the configured AWG config directory
+    adjust_unit_hardening "${SYSTEMD_UNIT_DEST}" "${AWG_CONFIG_DIR}"
 
     systemctl daemon-reload
     info "systemd daemon reloaded."

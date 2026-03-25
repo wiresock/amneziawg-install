@@ -67,6 +67,36 @@ info()  { printf '[INFO]  %s\n' "$*"; }
 warn()  { yellow "[WARN]  $*" >&2; }
 die()   { red    "[ERROR] $*" >&2; exit 1; }
 
+# Adjust ReadOnlyPaths and ProtectHome in the installed service unit to match
+# the configured AWG_CONFIG_DIR (mirrors the same function in the installer).
+adjust_unit_hardening() {
+    local unit_file="$1"
+    local config_dir="$2"
+
+    [[ -f "${unit_file}" ]] || return 0
+
+    # 1. Update ReadOnlyPaths to include the actual config directory
+    if grep -q '^ReadOnlyPaths=' "${unit_file}" 2>/dev/null; then
+        local current_ro
+        current_ro="$(grep '^ReadOnlyPaths=' "${unit_file}" | head -1 | cut -d= -f2-)"
+        if [[ "${config_dir}" != "${current_ro}" ]] \
+                && [[ "${config_dir}" != "${current_ro}/"* ]]; then
+            sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${config_dir}|" "${unit_file}"
+            info "Updated ReadOnlyPaths to ${config_dir}"
+        fi
+    fi
+
+    # 2. If the config directory lives under /home, relax ProtectHome
+    case "${config_dir}" in
+        /home|/home/*)
+            if grep -q '^ProtectHome=yes' "${unit_file}" 2>/dev/null; then
+                sed -i 's|^ProtectHome=yes|ProtectHome=read-only|' "${unit_file}"
+                info "Changed ProtectHome to read-only (config dir is under /home)."
+            fi
+            ;;
+    esac
+}
+
 # ── Usage ──────────────────────────────────────────────────────────────────────
 
 usage() {
@@ -444,6 +474,16 @@ Please report this issue."
 
         mv -f -- "${tmp_unit}" "${SYSTEMD_UNIT_DEST}"
         info "Refreshed unit file: ${SYSTEMD_UNIT_DEST}"
+
+        # Adjust ReadOnlyPaths / ProtectHome for the configured config directory.
+        # Read AWG_CONFIG_DIR from the env file if it exists.
+        local awg_config_dir=""
+        if [[ -f "${ENV_FILE}" ]]; then
+            awg_config_dir="$(grep '^AWG_CONFIG_DIR=' "${ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
+        fi
+        if [[ -n "${awg_config_dir}" ]]; then
+            adjust_unit_hardening "${SYSTEMD_UNIT_DEST}" "${awg_config_dir}"
+        fi
 
         systemctl daemon-reload
         info "Reloaded systemd daemon"

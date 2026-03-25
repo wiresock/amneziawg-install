@@ -1076,6 +1076,24 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+# Verify ReadOnlyPaths matches the configured config directory
+if grep -q "^ReadOnlyPaths=${WEB_TEST_AWG_CONFIG_DIR}" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
+	echo "OK: systemd unit ReadOnlyPaths matches config dir"
+else
+	echo "FAIL: systemd unit ReadOnlyPaths does not match config dir ${WEB_TEST_AWG_CONFIG_DIR}"
+	echo "  Got: $(grep 'ReadOnlyPaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify ProtectHome=yes is preserved for non-/home config directories
+if grep -q "^ProtectHome=yes" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
+	echo "OK: systemd unit has ProtectHome=yes for non-home config dir"
+else
+	echo "FAIL: systemd unit should have ProtectHome=yes when config dir is not under /home"
+	echo "  Got: $(grep 'ProtectHome=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	FAILED=$((FAILED + 1))
+fi
+
 echo ""
 echo "--- Web installer: idempotency (re-run with --force) ---"
 
@@ -1099,6 +1117,66 @@ else
 	echo "FAIL: Re-run with --force exited non-zero (rc=${WEB_RERUN_RC})"
 	FAILED=$((FAILED + 1))
 fi
+
+echo ""
+echo "--- Web installer: ProtectHome relaxed for /home config dir ---"
+
+# When config-dir is under /home, the installer must relax ProtectHome
+# to read-only so the service can access the config files.
+HOME_CONFIG_DIR="/home/testuser-configs"
+mkdir -p "${HOME_CONFIG_DIR}"
+
+WEB_HOME_RC=0
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${HOME_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1 || WEB_HOME_RC=$?
+
+if [[ ${WEB_HOME_RC} -eq 0 ]]; then
+	echo "OK: Installer with /home config dir succeeded"
+else
+	echo "FAIL: Installer with /home config dir exited non-zero (rc=${WEB_HOME_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify ProtectHome was changed to read-only
+if grep -q "^ProtectHome=read-only" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
+	echo "OK: ProtectHome=read-only when config dir is under /home"
+else
+	echo "FAIL: ProtectHome should be read-only when config dir is under /home"
+	echo "  Got: $(grep 'ProtectHome=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify ReadOnlyPaths was updated to the /home config dir
+if grep -q "^ReadOnlyPaths=${HOME_CONFIG_DIR}" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
+	echo "OK: ReadOnlyPaths updated to ${HOME_CONFIG_DIR}"
+else
+	echo "FAIL: ReadOnlyPaths should point to ${HOME_CONFIG_DIR}"
+	echo "  Got: $(grep 'ReadOnlyPaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	FAILED=$((FAILED + 1))
+fi
+
+# Restore the original config dir for subsequent tests
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1 || true
+rm -rf "${HOME_CONFIG_DIR}"
 
 echo ""
 echo "--- Web installer: sudoers drop-in ---"
