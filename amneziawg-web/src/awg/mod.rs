@@ -272,7 +272,16 @@ fn section_has_disabled_key(
 ) -> bool {
     for line in lines {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("PublicKey") {
+        // Case-insensitive match for "PublicKey" (WireGuard/INI keys are
+        // typically treated case-insensitively).
+        let rest_opt = if trimmed.len() >= 9
+            && trimmed[..9].eq_ignore_ascii_case("PublicKey")
+        {
+            Some(&trimmed[9..])
+        } else {
+            None
+        };
+        if let Some(rest) = rest_opt {
             let rest = rest.trim_start();
             if let Some(value) = rest.strip_prefix('=') {
                 let key = value.trim();
@@ -673,5 +682,26 @@ AllowedIPs = 10.0.0.2/32
         assert!(result.contains("ListenPort = 51820"));
         assert!(!result.contains("[Peer]"));
         assert!(!result.contains("ONLY_PEER="));
+    }
+
+    #[test]
+    fn filter_matches_publickey_case_insensitively() {
+        let config = "\
+[Interface]
+ListenPort = 51820
+
+[Peer]
+publickey = DISABLED_PEER=
+AllowedIPs = 10.0.0.2/32
+
+[Peer]
+PUBLICKEY = ENABLED_PEER=
+AllowedIPs = 10.0.0.3/32
+";
+        let disabled: std::collections::HashSet<String> =
+            ["DISABLED_PEER=".to_string()].into_iter().collect();
+        let result = filter_disabled_peers(config, &disabled);
+        assert!(!result.contains("DISABLED_PEER="), "lowercase publickey should be matched");
+        assert!(result.contains("ENABLED_PEER="), "non-disabled peer should be kept");
     }
 }

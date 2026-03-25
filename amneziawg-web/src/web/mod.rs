@@ -1039,14 +1039,16 @@ async fn post_peer_edit(
             // Re-add the peer to the running AWG interface by syncing
             // the on-disk config (with disabled peers pre-filtered so
             // syncconf never reactivates them).
-            if let Ok(disabled_keys) =
-                crate::db::peers::list_disabled_public_keys(&state.db.pool).await
-            {
-                restore_peer_to_interface(disabled_keys);
-            } else {
-                tracing::warn!(
-                    "could not load disabled keys – skipping interface sync to avoid re-adding disabled peers"
-                );
+            match crate::db::peers::list_disabled_public_keys(&state.db.pool).await {
+                Ok(disabled_keys) => {
+                    restore_peer_to_interface(disabled_keys);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = ?error,
+                        "could not load disabled keys – skipping interface sync to avoid re-adding disabled peers"
+                    );
+                }
             }
         }
     }
@@ -1134,8 +1136,8 @@ fn remove_peer_from_interface(public_key: &str) {
 /// reactivation window exists.
 ///
 /// Like [`remove_peer_from_interface`], this is fire-and-forget: errors are
-/// logged but never propagated.  The database is already updated, and the
-/// poller will eventually converge.
+/// logged but never propagated.  If this best-effort restore fails, the peer
+/// will not be auto-synced; it will become active on the next AWG restart.
 fn restore_peer_to_interface(disabled_keys: std::collections::HashSet<String>) {
     tokio::task::spawn_blocking(move || {
         let interfaces = match crate::awg::show_all_dump() {
@@ -1143,7 +1145,7 @@ fn restore_peer_to_interface(disabled_keys: std::collections::HashSet<String>) {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "could not read AWG state for peer restoration – poller will converge"
+                    "could not read AWG state for peer restoration – skipping best-effort restore; peer will not be auto-synced"
                 );
                 return;
             }
