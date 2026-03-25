@@ -12,8 +12,7 @@
 //! drop-in (`/etc/sudoers.d/amneziawg-web`) that allows **only**:
 //!
 //! ```text
-//! awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, \
-//!     /usr/bin/awg set * peer * remove
+//! awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove
 //! ```
 //!
 //! This grants the minimum privilege needed for AWG inspection and for

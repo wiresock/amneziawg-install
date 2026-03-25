@@ -145,6 +145,10 @@ impl Poller {
     /// public key is marked `disabled = 1` in the DB, it is removed from the
     /// interface via `awg set <iface> peer <pubkey> remove`.
     ///
+    /// The actual removal commands are blocking (`std::process::Command`) and
+    /// are offloaded to `tokio::task::spawn_blocking` so the poller task stays
+    /// responsive.
+    ///
     /// Errors on individual peer removals are logged but do not abort the
     /// remaining removals.
     async fn enforce_disabled_peers(
@@ -158,32 +162,55 @@ impl Poller {
             return Ok(());
         }
 
-        let mut removed: usize = 0;
-        for iface in interfaces {
-            for peer in &iface.peers {
-                if disabled_keys.contains(&peer.public_key.0) {
-                    info!(
-                        interface = %iface.name,
-                        public_key = %peer.public_key,
-                        "removing disabled peer from interface"
-                    );
-                    match awg::remove_peer(&iface.name, &peer.public_key.0) {
-                        Ok(()) => removed += 1,
-                        Err(e) => {
-                            error!(
-                                interface = %iface.name,
-                                public_key = %peer.public_key,
-                                error = %e,
-                                "failed to remove disabled peer – continuing"
-                            );
-                        }
+        // Collect (interface_name, public_key) pairs that need removal.
+        let to_remove: Vec<(String, String)> = interfaces
+            .iter()
+            .flat_map(|iface| {
+                iface
+                    .peers
+                    .iter()
+                    .filter(|p| disabled_keys.contains(&p.public_key.0))
+                    .map(|p| (iface.name.clone(), p.public_key.0.clone()))
+            })
+            .collect();
+
+        if to_remove.is_empty() {
+            return Ok(());
+        }
+
+        // Offload the blocking awg commands to a dedicated thread.
+        let result = tokio::task::spawn_blocking(move || {
+            let mut removed: usize = 0;
+            for (iface_name, public_key) in &to_remove {
+                info!(
+                    interface = %iface_name,
+                    public_key = %public_key,
+                    "removing disabled peer from interface"
+                );
+                match awg::remove_peer(iface_name, public_key) {
+                    Ok(()) => removed += 1,
+                    Err(e) => {
+                        error!(
+                            interface = %iface_name,
+                            public_key = %public_key,
+                            error = %e,
+                            "failed to remove disabled peer – continuing"
+                        );
                     }
                 }
             }
-        }
+            removed
+        })
+        .await;
 
-        if removed > 0 {
-            info!(removed, "disabled peers removed from interface");
+        match result {
+            Ok(removed) if removed > 0 => {
+                info!(removed, "disabled peers removed from interface");
+            }
+            Err(e) => {
+                error!(error = %e, "spawn_blocking for peer removal panicked");
+            }
+            _ => {}
         }
         Ok(())
     }
