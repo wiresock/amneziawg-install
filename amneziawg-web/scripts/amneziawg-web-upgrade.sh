@@ -432,31 +432,28 @@ main() {
     fi
     info "Replaced binary: ${DEST_BINARY}"
 
-    # 3. Ensure the sudoers drop-in exists (idempotent).
-    #    This covers upgrades from versions that did not install it.
-    local rule="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump"
-    if [[ -f "${SUDOERS_FILE}" ]]; then
-        info "Sudoers drop-in already present: ${SUDOERS_FILE}"
-    else
-        info "Installing sudoers drop-in: ${SUDOERS_FILE}"
-        mkdir -p "$(dirname "${SUDOERS_FILE}")"
-        printf '# Allow amneziawg-web service to read AWG interface state.\n' \
-            > "${SUDOERS_FILE}"
-        printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \
-            >> "${SUDOERS_FILE}"
-        printf '%s\n' "${rule}" >> "${SUDOERS_FILE}"
-        chmod 0440 "${SUDOERS_FILE}"
-        chown root:root "${SUDOERS_FILE}"
-        if command -v visudo &>/dev/null; then
-            if visudo -cf "${SUDOERS_FILE}" &>/dev/null; then
-                info "Sudoers file validated: ${SUDOERS_FILE}"
-            else
-                warn "visudo validation failed for ${SUDOERS_FILE}."
-                warn "Removing broken sudoers file to protect system integrity."
-                rm -f "${SUDOERS_FILE}"
-                die "Sudoers file syntax check failed. This should not happen with the default rule.
+    # 3. Ensure the sudoers drop-in is up-to-date.
+    #    Always rewrite so that upgrades from older versions pick up the
+    #    additional `awg set … peer … remove` rule.
+    local rule="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove"
+    info "Installing/updating sudoers drop-in: ${SUDOERS_FILE}"
+    mkdir -p "$(dirname "${SUDOERS_FILE}")"
+    printf '# Allow amneziawg-web service to read AWG state and remove disabled peers.\n' \
+        > "${SUDOERS_FILE}"
+    printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \
+        >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule}" >> "${SUDOERS_FILE}"
+    chmod 0440 "${SUDOERS_FILE}"
+    chown root:root "${SUDOERS_FILE}"
+    if command -v visudo &>/dev/null; then
+        if visudo -cf "${SUDOERS_FILE}" &>/dev/null; then
+            info "Sudoers file validated: ${SUDOERS_FILE}"
+        else
+            warn "visudo validation failed for ${SUDOERS_FILE}."
+            warn "Removing broken sudoers file to protect system integrity."
+            rm -f "${SUDOERS_FILE}"
+            die "Sudoers file syntax check failed. This should not happen with the default rule.
 Please report this issue."
-            fi
         fi
     fi
 

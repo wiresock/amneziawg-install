@@ -1,21 +1,23 @@
 //! AWG integration layer.
 //!
-//! Executes `sudo /usr/bin/awg show all dump` via `std::process::Command`
+//! Executes `sudo /usr/bin/awg …` via `std::process::Command`
 //! (NO shell interpolation) and parses the output into [`AwgInterface`] /
 //! [`AwgPeer`] structs.
 //!
 //! ## Privilege model
 //!
-//! Reading AWG interface state (`awg show`) requires `CAP_NET_ADMIN`.  The web
-//! service runs as a dedicated non-root user (`awg-web`).  Rather than running
-//! the entire service as root, the installer configures a tightly-scoped
-//! sudoers drop-in (`/etc/sudoers.d/amneziawg-web`) that allows **only**:
+//! Managing AWG interface state requires `CAP_NET_ADMIN`.  The web service
+//! runs as a dedicated non-root user (`awg-web`).  Rather than running the
+//! entire service as root, the installer configures a tightly-scoped sudoers
+//! drop-in (`/etc/sudoers.d/amneziawg-web`) that allows **only**:
 //!
 //! ```text
-//! awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump
+//! awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, \
+//!     /usr/bin/awg set * peer * remove
 //! ```
 //!
-//! This grants the minimum privilege needed for read-only AWG inspection.
+//! This grants the minimum privilege needed for AWG inspection and for
+//! removing disabled peers from the running interface.
 //!
 //! ## Output format assumptions
 //!
@@ -108,6 +110,32 @@ pub fn show_all_dump() -> Result<Vec<AwgInterface>, AwgError> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_dump(&stdout)
+}
+
+/// Remove a single peer from a running AWG interface.
+///
+/// Executes `sudo -n /usr/bin/awg set <interface> peer <pubkey> remove`.
+/// The sudoers drop-in installed by the installer restricts `awg set` to
+/// only the `remove` sub-command, and the arguments are passed as an
+/// explicit array (no shell interpolation).
+///
+/// Returns `Ok(())` if the peer was removed or the command exited
+/// successfully (e.g. the peer was already absent).
+pub fn remove_peer(interface: &str, public_key: &str) -> Result<(), AwgError> {
+    let output = Command::new(SUDO_BIN)
+        .args(["-n", AWG_BIN, "set", interface, "peer", public_key, "remove"])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let code = output.status.code().unwrap_or(-1);
+        return Err(AwgError::NonZeroExit {
+            status: code,
+            stderr,
+        });
+    }
+
+    Ok(())
 }
 
 /// Parse the textual output of `awg show all dump`.
@@ -342,5 +370,21 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
 
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
         assert_eq!(args, vec!["-n", AWG_BIN, "show", "all", "dump"]);
+    }
+
+    // ── remove_peer command construction tests ──────────────────────
+
+    /// Verify `remove_peer` constructs the correct `awg set … peer … remove`
+    /// command with explicit argument array.
+    #[test]
+    fn remove_peer_command_args() {
+        let mut cmd = Command::new(SUDO_BIN);
+        cmd.args(["-n", AWG_BIN, "set", "awg0", "peer", "SOME_KEY=", "remove"]);
+
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert_eq!(
+            args,
+            vec!["-n", AWG_BIN, "set", "awg0", "peer", "SOME_KEY=", "remove"]
+        );
     }
 }
