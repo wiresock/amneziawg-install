@@ -274,10 +274,14 @@ fn section_has_disabled_key(
         let trimmed = line.trim();
         // Case-insensitive match for "PublicKey" (WireGuard/INI keys are
         // typically treated case-insensitively).
-        let rest_opt = if trimmed.len() >= 9
-            && trimmed[..9].eq_ignore_ascii_case("PublicKey")
-        {
-            Some(&trimmed[9..])
+        let rest_opt = if trimmed.len() >= 9 {
+            match trimmed.get(..9) {
+                Some(prefix) if prefix.eq_ignore_ascii_case("PublicKey") => {
+                    // Safe because `get(..9)` succeeded, so index 9 is a char boundary.
+                    Some(&trimmed[9..])
+                }
+                _ => None,
+            }
         } else {
             None
         };

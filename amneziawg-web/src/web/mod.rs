@@ -860,19 +860,7 @@ async fn patch_peer(
                 // Re-add the peer to the running AWG interface by syncing
                 // the on-disk config (with disabled peers pre-filtered so
                 // syncconf never reactivates them).
-                match crate::db::peers::list_disabled_public_keys(&state.db.pool).await {
-                    Ok(disabled_keys) => {
-                        restore_peer_to_interface(disabled_keys);
-                    }
-                    Err(e) => {
-                        // Fail closed: if we cannot determine which peers are disabled,
-                        // skip the interface sync to avoid re-enabling disabled peers.
-                        tracing::warn!(
-                            error = %e,
-                            "could not load disabled keys – skipping interface sync to avoid re-adding disabled peers"
-                        );
-                    }
-                }
+                restore_peer_best_effort(&state.db.pool).await;
             }
         }
     }
@@ -1039,17 +1027,7 @@ async fn post_peer_edit(
             // Re-add the peer to the running AWG interface by syncing
             // the on-disk config (with disabled peers pre-filtered so
             // syncconf never reactivates them).
-            match crate::db::peers::list_disabled_public_keys(&state.db.pool).await {
-                Ok(disabled_keys) => {
-                    restore_peer_to_interface(disabled_keys);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "could not load disabled keys – skipping interface sync to avoid re-adding disabled peers"
-                    );
-                }
-            }
+            restore_peer_best_effort(&state.db.pool).await;
         }
     }
 
@@ -1123,6 +1101,24 @@ fn remove_peer_from_interface(public_key: &str) {
     });
 }
 
+/// Load disabled keys from the DB and attempt a best-effort interface sync.
+///
+/// Fails closed: if the disabled keys cannot be loaded, the sync is skipped
+/// entirely so that disabled peers are never accidentally reactivated.
+async fn restore_peer_best_effort(pool: &sqlx::SqlitePool) {
+    match crate::db::peers::list_disabled_public_keys(pool).await {
+        Ok(disabled_keys) => {
+            restore_peer_to_interface(disabled_keys);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not load disabled keys – skipping interface sync to avoid re-adding disabled peers"
+            );
+        }
+    }
+}
+
 /// Best-effort immediate restoration of peers to the running AWG interface.
 ///
 /// Spawns blocking AWG commands on a dedicated thread:
@@ -1156,7 +1152,7 @@ fn restore_peer_to_interface(disabled_keys: std::collections::HashSet<String>) {
                 Ok(()) => {
                     tracing::info!(
                         interface = %iface.name,
-                        "interface synced – re-enabled peer should now be active"
+                        "interface synced from disk after attempting peer restore"
                     );
                 }
                 Err(e) => {
