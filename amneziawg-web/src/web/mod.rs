@@ -858,10 +858,20 @@ async fn patch_peer(
                 remove_peer_from_interface(&existing.public_key);
             } else {
                 // Re-add the peer to the running AWG interface by syncing
-                // the on-disk config. Note: syncconf may also re-add other
-                // disabled peers; their removal is enforced eventually by
-                // the background poller rather than immediately here.
-                restore_peer_to_interface();
+                // the on-disk config.  After syncing, any other disabled
+                // peers that syncconf may have re-added are immediately
+                // removed again.
+                let disabled_keys = match crate::db::peers::list_disabled_public_keys(&state.db.pool).await {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "could not load disabled keys – syncconf may temporarily re-add disabled peers"
+                        );
+                        std::collections::HashSet::new()
+                    }
+                };
+                restore_peer_to_interface(disabled_keys);
             }
         }
     }
@@ -1026,10 +1036,20 @@ async fn post_peer_edit(
             remove_peer_from_interface(&existing.public_key);
         } else {
             // Re-add the peer to the running AWG interface by syncing
-            // the on-disk config. Note that syncconf may also temporarily
-            // re-add other disabled peers; enforcement of disabled peers
-            // is handled by the separate poller rather than this handler.
-            restore_peer_to_interface();
+            // the on-disk config.  After syncing, any other disabled
+            // peers that syncconf may have re-added are immediately
+            // removed again.
+            let disabled_keys = match crate::db::peers::list_disabled_public_keys(&state.db.pool).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "could not load disabled keys – syncconf may temporarily re-add disabled peers"
+                    );
+                    std::collections::HashSet::new()
+                }
+            };
+            restore_peer_to_interface(disabled_keys);
         }
     }
 
@@ -1109,14 +1129,14 @@ fn remove_peer_from_interface(public_key: &str) {
 /// 1. `awg show all dump` to discover active interfaces.
 /// 2. For each interface, `awg-quick strip <iface>` + `awg syncconf <iface>`
 ///    to re-add any peers that are in the on-disk config but missing from the
-///    running interface (e.g. a peer that was just re-enabled). This may also
-///    temporarily re-add peers that are still flagged as disabled; the periodic
-///    poller is responsible for enforcing disabled-peer state.
+///    running interface (e.g. a peer that was just re-enabled).
+/// 3. Immediately removes any peers in `disabled_keys` from each synced
+///    interface so that `syncconf` does not accidentally reactivate them.
 ///
 /// Like [`remove_peer_from_interface`], this is fire-and-forget: errors are
 /// logged but never propagated.  The database is already updated, and the
 /// poller will eventually converge.
-fn restore_peer_to_interface() {
+fn restore_peer_to_interface(disabled_keys: std::collections::HashSet<String>) {
     tokio::task::spawn_blocking(move || {
         let interfaces = match crate::awg::show_all_dump() {
             Ok(ifaces) => ifaces,
@@ -1142,6 +1162,20 @@ fn restore_peer_to_interface() {
                         interface = %iface.name,
                         error = %e,
                         "failed to sync interface – peer will be restored on next AWG restart"
+                    );
+                    continue;
+                }
+            }
+
+            // syncconf may have re-added peers that are still disabled in
+            // the DB.  Remove them immediately so they cannot connect.
+            for pk in &disabled_keys {
+                if let Err(e) = crate::awg::remove_peer(&iface.name, pk) {
+                    tracing::warn!(
+                        interface = %iface.name,
+                        public_key = %pk,
+                        error = %e,
+                        "failed to re-remove disabled peer after sync – poller will retry"
                     );
                 }
             }
