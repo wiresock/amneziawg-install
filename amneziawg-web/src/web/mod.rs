@@ -856,6 +856,11 @@ async fn patch_peer(
             // the client cannot connect until re-enabled.
             if disabled {
                 remove_peer_from_interface(&existing.public_key);
+            } else {
+                // Re-add the peer to the running AWG interface by syncing
+                // the on-disk config.  syncconf may also re-add other
+                // disabled peers, so enforce_disabled_peers runs afterwards.
+                restore_peer_to_interface();
             }
         }
     }
@@ -1018,6 +1023,11 @@ async fn post_peer_edit(
         // the client cannot connect until re-enabled.
         if new_disabled {
             remove_peer_from_interface(&existing.public_key);
+        } else {
+            // Re-add the peer to the running AWG interface by syncing
+            // the on-disk config.  syncconf may also re-add other
+            // disabled peers, so enforce_disabled_peers runs afterwards.
+            restore_peer_to_interface();
         }
     }
 
@@ -1085,6 +1095,52 @@ fn remove_peer_from_interface(public_key: &str) {
                             "failed to remove disabled peer – poller will retry"
                         );
                     }
+                }
+            }
+        }
+    });
+}
+
+/// Best-effort immediate restoration of peers to the running AWG interface.
+///
+/// Spawns blocking AWG commands on a dedicated thread:
+/// 1. `awg show all dump` to discover active interfaces.
+/// 2. For each interface, `awg-quick strip <iface>` + `awg syncconf <iface>`
+///    to re-add any peers that are in the on-disk config but missing from the
+///    running interface (e.g. a peer that was just re-enabled).
+/// 3. Re-runs disabled-peer enforcement because `syncconf` may also re-add
+///    peers that are still flagged as disabled.
+///
+/// Like [`remove_peer_from_interface`], this is fire-and-forget: errors are
+/// logged but never propagated.  The database is already updated, and the
+/// poller will eventually converge.
+fn restore_peer_to_interface() {
+    tokio::task::spawn_blocking(move || {
+        let interfaces = match crate::awg::show_all_dump() {
+            Ok(ifaces) => ifaces,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not read AWG state for peer restoration – poller will converge"
+                );
+                return;
+            }
+        };
+
+        for iface in &interfaces {
+            match crate::awg::sync_interface(&iface.name) {
+                Ok(()) => {
+                    tracing::info!(
+                        interface = %iface.name,
+                        "interface synced – re-enabled peer should now be active"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        interface = %iface.name,
+                        error = %e,
+                        "failed to sync interface – peer will be restored on next AWG restart"
+                    );
                 }
             }
         }

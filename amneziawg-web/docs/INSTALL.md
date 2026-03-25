@@ -109,9 +109,11 @@ sudo chmod 0700 /etc/amneziawg-web
 
 ## 4. AWG binary and privilege setup
 
-`amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state.
-The service runs as a dedicated non-root user (`awg-web`) and uses a
-tightly-scoped sudoers rule for exactly this one read-only command.
+`amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state,
+`sudo /usr/bin/awg set … peer … remove` to disable peers, and
+`sudo /usr/bin/awg syncconf` + `sudo /usr/bin/awg-quick strip` to re-enable
+peers.  The service runs as a dedicated non-root user (`awg-web`) and uses
+tightly-scoped sudoers rules for only these commands.
 
 ### Automated setup (installer)
 
@@ -126,7 +128,7 @@ The installer (`amneziawg-web-install.sh`) handles all of this automatically:
 If installing manually, create the sudoers rule:
 
 ```bash
-echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump' \
+echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *' \
   | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
 ```
@@ -153,7 +155,7 @@ active.
 
 | File | Purpose | Permissions |
 |---|---|---|
-| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump` as root | `0440 root:root` |
+| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump`, `awg set … peer … remove`, `awg syncconf`, and `awg-quick strip` as root | `0440 root:root` |
 
 The uninstaller removes this file.  The upgrader creates it if missing.
 
@@ -430,7 +432,7 @@ sudo ./amneziawg-web-install.sh \
 2. **Build** – *(source mode only)* verifies Rust toolchain and runs `cargo build --release`
 3. **User + directories** – creates `awg-web` system user, data dir (`0750`), env dir (`0700`)
 4. **Binary install** – copies binary to `--install-dir`
-5. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440`) granting `awg-web` passwordless sudo for `awg show all dump` only
+5. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440`) granting `awg-web` passwordless sudo for AWG inspection, peer removal, and config sync
 6. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
 7. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
 

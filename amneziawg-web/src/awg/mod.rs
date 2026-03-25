@@ -12,11 +12,14 @@
 //! drop-in (`/etc/sudoers.d/amneziawg-web`) that allows **only**:
 //!
 //! ```text
-//! awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove
+//! awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, \
+//!     /usr/bin/awg set * peer * remove, \
+//!     /usr/bin/awg syncconf * /dev/stdin, \
+//!     /usr/bin/awg-quick strip *
 //! ```
 //!
-//! This grants the minimum privilege needed for AWG inspection and for
-//! removing disabled peers from the running interface.
+//! This grants the minimum privilege needed for AWG inspection, removing
+//! disabled peers, and re-adding enabled peers to the running interface.
 //!
 //! ## Output format assumptions
 //!
@@ -39,7 +42,8 @@
 //! Lines are distinguished by whether their first field (interface name)
 //! has already been seen as an interface header.
 
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Serialize;
@@ -87,6 +91,9 @@ const SUDO_BIN: &str = "/usr/bin/sudo";
 /// Absolute path to the `awg` binary.
 const AWG_BIN: &str = "/usr/bin/awg";
 
+/// Absolute path to the `awg-quick` binary.
+const AWG_QUICK_BIN: &str = "/usr/bin/awg-quick";
+
 /// Execute `sudo /usr/bin/awg show all dump` and return parsed interfaces.
 ///
 /// Uses absolute paths for both `sudo` and `awg` to prevent PATH
@@ -124,6 +131,64 @@ pub fn remove_peer(interface: &str, public_key: &str) -> Result<(), AwgError> {
     let output = Command::new(SUDO_BIN)
         .args(["-n", AWG_BIN, "set", interface, "peer", public_key, "remove"])
         .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let code = output.status.code().unwrap_or(-1);
+        return Err(AwgError::NonZeroExit {
+            status: code,
+            stderr,
+        });
+    }
+
+    Ok(())
+}
+
+/// Synchronise a running AWG interface with its on-disk config.
+///
+/// 1. Calls `sudo -n /usr/bin/awg-quick strip <interface>` to obtain the
+///    config with non-WG directives (Address, DNS, etc.) removed.
+/// 2. Pipes the stripped config into
+///    `sudo -n /usr/bin/awg syncconf <interface> /dev/stdin` which adds any
+///    peers present in the config but missing from the running interface and
+///    updates peers whose settings have changed.  Peers already active on the
+///    interface but absent from the config file are left untouched.
+///
+/// **Note:** `syncconf` may re-add peers that were previously removed
+/// (e.g. disabled peers).  Callers that manage a disabled-peer list must
+/// run [`remove_peer`] (or the poller's enforcement step) *after* calling
+/// this function.
+pub fn sync_interface(interface: &str) -> Result<(), AwgError> {
+    // Step 1: obtain the stripped config via awg-quick.
+    let strip_output = Command::new(SUDO_BIN)
+        .args(["-n", AWG_QUICK_BIN, "strip", interface])
+        .output()?;
+
+    if !strip_output.status.success() {
+        let stderr = String::from_utf8_lossy(&strip_output.stderr).into_owned();
+        let code = strip_output.status.code().unwrap_or(-1);
+        return Err(AwgError::NonZeroExit {
+            status: code,
+            stderr,
+        });
+    }
+
+    let stripped = &strip_output.stdout;
+
+    // Step 2: pipe the stripped config into `awg syncconf`.
+    let mut child = Command::new(SUDO_BIN)
+        .args(["-n", AWG_BIN, "syncconf", interface, "/dev/stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        // Ignore write errors – the process may have exited early.
+        let _ = stdin.write_all(stripped);
+    }
+
+    let output = child.wait_with_output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -359,6 +424,7 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
     fn constants_use_absolute_paths() {
         assert_eq!(SUDO_BIN, "/usr/bin/sudo");
         assert_eq!(AWG_BIN, "/usr/bin/awg");
+        assert_eq!(AWG_QUICK_BIN, "/usr/bin/awg-quick");
     }
 
     /// Verify the command is assembled without shell interpolation.
@@ -384,6 +450,31 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
         assert_eq!(
             args,
             vec!["-n", AWG_BIN, "set", "awg0", "peer", "SOME_KEY=", "remove"]
+        );
+    }
+
+    // ── sync_interface command construction tests ───────────────────
+
+    /// Verify `awg-quick strip` command is constructed with absolute paths.
+    #[test]
+    fn awg_quick_strip_command_args() {
+        let mut cmd = Command::new(SUDO_BIN);
+        cmd.args(["-n", AWG_QUICK_BIN, "strip", "awg0"]);
+
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert_eq!(args, vec!["-n", AWG_QUICK_BIN, "strip", "awg0"]);
+    }
+
+    /// Verify `awg syncconf` command uses `/dev/stdin` for piped input.
+    #[test]
+    fn syncconf_command_args() {
+        let mut cmd = Command::new(SUDO_BIN);
+        cmd.args(["-n", AWG_BIN, "syncconf", "awg0", "/dev/stdin"]);
+
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert_eq!(
+            args,
+            vec!["-n", AWG_BIN, "syncconf", "awg0", "/dev/stdin"]
         );
     }
 }

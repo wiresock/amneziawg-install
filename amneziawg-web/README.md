@@ -231,22 +231,25 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | Rate limiting | 5 login attempts per 5-minute window per IP; `429` on excess |
 | Audit log | Every peer write, login, and logout recorded |
 | No shell injection | AWG binary called via `Command::new()` with explicit args |
-| AWG access | Narrowly-scoped sudoers rule (read-only `awg show all dump`) |
+| AWG access | Narrowly-scoped sudoers rule (`awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`) |
 
 ### AWG privilege model
 
-The service runs as a dedicated non-root user (`awg-web`).  Reading AWG
-interface state (`awg show all dump`) requires root-level `CAP_NET_ADMIN`.
-Rather than running the entire service as root, the installer configures
-a tightly-scoped sudoers drop-in at `/etc/sudoers.d/amneziawg-web`:
+The service runs as a dedicated non-root user (`awg-web`).  Managing AWG
+interface state requires root-level `CAP_NET_ADMIN`.  Rather than running
+the entire service as root, the installer configures a tightly-scoped
+sudoers drop-in at `/etc/sudoers.d/amneziawg-web`:
 
 ```
-awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump
+awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, \
+    /usr/bin/awg set * peer * remove, \
+    /usr/bin/awg syncconf * /dev/stdin, \
+    /usr/bin/awg-quick strip *
 ```
 
-This grants the minimum privilege needed for **read-only** AWG inspection.
-No other commands are permitted.  The Rust application invokes
-`sudo -n /usr/bin/awg show all dump` via `Command::new()` with explicit
+This grants the minimum privilege needed for AWG inspection, disabling
+peers (removal), and re-enabling peers (config sync).  The Rust
+application invokes these commands via `Command::new()` with explicit
 argument arrays — no shell interpolation.
 
 **Troubleshooting:** If peer polling fails with "Operation not permitted",
