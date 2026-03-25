@@ -207,8 +207,14 @@ impl Poller {
             Ok(removed) if removed > 0 => {
                 info!(removed, "disabled peers removed from interface");
             }
-            Err(e) => {
+            Err(e) if e.is_panic() => {
                 error!(error = %e, "spawn_blocking for peer removal panicked");
+            }
+            Err(e) if e.is_cancelled() => {
+                warn!(error = %e, "spawn_blocking for peer removal was cancelled");
+            }
+            Err(e) => {
+                error!(error = %e, "spawn_blocking for peer removal failed");
             }
             _ => {}
         }
