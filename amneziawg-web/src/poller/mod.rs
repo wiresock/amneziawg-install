@@ -206,11 +206,10 @@ impl Poller {
                     .iter()
                     .filter(|p| {
                         config.addresses.iter().any(|addr| {
-                            let addr_base = addr.split('/').next().unwrap_or(addr);
-                            p.allowed_ips.split(',').any(|a| {
-                                let peer_base = a.trim().split('/').next().unwrap_or(a.trim());
-                                addr_base == peer_base
-                            })
+                            let addr_base = base_ip(addr);
+                            p.allowed_ips
+                                .split(',')
+                                .any(|a| base_ip(a.trim()) == addr_base)
                         })
                     })
                     .collect();
@@ -338,4 +337,9 @@ impl Poller {
 /// negative values into SQLite.
 fn saturating_u64_to_i64(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// Extract the base IP address from a CIDR string (e.g. `"10.8.0.2/32"` → `"10.8.0.2"`).
+fn base_ip(cidr: &str) -> &str {
+    cidr.split('/').next().unwrap_or(cidr)
 }
