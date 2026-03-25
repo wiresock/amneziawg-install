@@ -379,4 +379,120 @@ mod tests {
         assert_eq!(rows[0].peer_id, Some(pid));
         assert_eq!(rows[0].action, EVT_PEER_UPDATED);
     }
+
+    // ── User lifecycle event constants ────────────────────────────────────
+
+    #[tokio::test]
+    async fn user_create_events_logged_correctly() {
+        let db = test_db().await;
+
+        log_event(
+            &db.pool,
+            EVT_USER_CREATE_REQUESTED,
+            None,
+            None,
+            Some(r#"{"name":"alice"}"#),
+            "admin",
+        )
+        .await;
+
+        log_event(
+            &db.pool,
+            EVT_USER_CREATED,
+            None,
+            None,
+            Some(r#"{"name":"alice","config_path":"/root/awg0-client-alice.conf"}"#),
+            "admin",
+        )
+        .await;
+
+        let rows = list_events(&db.pool, None, Some(EVT_USER_CREATED), 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, EVT_USER_CREATED);
+        assert!(rows[0].detail.as_deref().unwrap().contains("alice"));
+
+        let rows = list_events(&db.pool, None, Some(EVT_USER_CREATE_REQUESTED), 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn user_remove_events_logged_correctly() {
+        let db = test_db().await;
+        let pid = insert_peer(&db.pool, "REMOVE_KEY==").await;
+
+        log_event(
+            &db.pool,
+            EVT_USER_REMOVE_REQUESTED,
+            Some(pid),
+            None,
+            Some(r#"{"peer_id":1,"name":"bob"}"#),
+            "admin",
+        )
+        .await;
+
+        log_event(
+            &db.pool,
+            EVT_USER_REMOVED,
+            Some(pid),
+            None,
+            Some(r#"{"peer_id":1,"name":"bob"}"#),
+            "admin",
+        )
+        .await;
+
+        let rows = list_events(&db.pool, Some(pid), None, 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 2);
+
+        let rows = list_events(&db.pool, None, Some(EVT_USER_REMOVED), 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, EVT_USER_REMOVED);
+    }
+
+    #[tokio::test]
+    async fn user_create_failed_event_logged() {
+        let db = test_db().await;
+        log_event(
+            &db.pool,
+            EVT_USER_CREATE_FAILED,
+            None,
+            None,
+            Some(r#"{"name":"bad","error":"script failed"}"#),
+            "admin",
+        )
+        .await;
+
+        let rows = list_events(&db.pool, None, Some(EVT_USER_CREATE_FAILED), 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].detail.as_deref().unwrap().contains("script failed"));
+    }
+
+    #[tokio::test]
+    async fn user_remove_failed_event_logged() {
+        let db = test_db().await;
+        log_event(
+            &db.pool,
+            EVT_USER_REMOVE_FAILED,
+            None,
+            None,
+            Some(r#"{"name":"missing","error":"not found"}"#),
+            "admin",
+        )
+        .await;
+
+        let rows = list_events(&db.pool, None, Some(EVT_USER_REMOVE_FAILED), 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].detail.as_deref().unwrap().contains("not found"));
+    }
 }

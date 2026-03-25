@@ -10,8 +10,7 @@ pub mod script_bridge;
 
 use crate::db::events::{
     log_event, EVT_PEER_DISABLED, EVT_USER_CREATED, EVT_USER_CREATE_FAILED,
-    EVT_USER_CREATE_REQUESTED, EVT_USER_REMOVED, EVT_USER_REMOVE_FAILED,
-    EVT_USER_REMOVE_REQUESTED,
+    EVT_USER_CREATE_REQUESTED, EVT_USER_REMOVED, EVT_USER_REMOVE_FAILED, EVT_USER_REMOVE_REQUESTED,
 };
 use crate::db::peers::{find_by_public_key, update_peer_disabled, PeerRow};
 use crate::db::Database;
@@ -116,15 +115,7 @@ pub async fn execute_create_user(
                 "config_path": config_path,
             })
             .to_string();
-            log_event(
-                &db.pool,
-                EVT_USER_CREATED,
-                None,
-                None,
-                Some(&detail),
-                actor,
-            )
-            .await;
+            log_event(&db.pool, EVT_USER_CREATED, None, None, Some(&detail), actor).await;
             Ok(CreateUserResult {
                 config_path,
                 client_name: name.to_string(),

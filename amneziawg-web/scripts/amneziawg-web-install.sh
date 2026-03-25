@@ -670,9 +670,14 @@ install_sudoers() {
     # available to root.  Instead of running the whole service as root, we
     # install a tightly-scoped sudoers rule that grants the service user
     # passwordless sudo for this single read-only command.
-    local rule="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump"
+    #
+    # Additionally, the service user needs to run the install script for
+    # user lifecycle actions (add/remove clients).
+    local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump"
+    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients"
 
-    info "Sudoers rule: ${rule}"
+    info "Sudoers rule (AWG): ${rule_awg}"
+    info "Sudoers rule (install): ${rule_install}"
 
     # Ensure the sudoers drop-in directory exists (may be absent in minimal
     # containers or stripped images).
@@ -683,7 +688,10 @@ install_sudoers() {
         > "${SUDOERS_FILE}"
     printf '# Installed by amneziawg-web-install.sh – do not edit manually.\n' \
         >> "${SUDOERS_FILE}"
-    printf '%s\n' "${rule}" >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
+    printf '# Allow amneziawg-web to manage clients via the install script.\n' \
+        >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule_install}" >> "${SUDOERS_FILE}"
 
     chmod 0440 "${SUDOERS_FILE}"
     chown root:root "${SUDOERS_FILE}"

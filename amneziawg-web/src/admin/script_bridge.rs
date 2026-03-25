@@ -148,11 +148,7 @@ impl ScriptBridge {
     }
 
     /// Run the script with the given arguments, capturing stdout/stderr.
-    async fn run(
-        &self,
-        flag: &str,
-        client_name: Option<&str>,
-    ) -> Result<String, ScriptError> {
+    async fn run(&self, flag: &str, client_name: Option<&str>) -> Result<String, ScriptError> {
         let args = self.build_args(flag, client_name);
 
         debug!(
@@ -319,12 +315,7 @@ mod tests {
         let args = bridge.build_args("--add-client", Some("alice"));
         assert_eq!(
             args,
-            vec![
-                "-n",
-                "/opt/amneziawg-install.sh",
-                "--add-client",
-                "alice"
-            ]
+            vec!["-n", "/opt/amneziawg-install.sh", "--add-client", "alice"]
         );
     }
 
@@ -334,12 +325,7 @@ mod tests {
         let args = bridge.build_args("--remove-client", Some("bob"));
         assert_eq!(
             args,
-            vec![
-                "-n",
-                "/opt/amneziawg-install.sh",
-                "--remove-client",
-                "bob"
-            ]
+            vec!["-n", "/opt/amneziawg-install.sh", "--remove-client", "bob"]
         );
     }
 
@@ -347,7 +333,10 @@ mod tests {
     fn build_args_list_clients() {
         let bridge = ScriptBridge::new("/opt/amneziawg-install.sh");
         let args = bridge.build_args("--list-clients", None);
-        assert_eq!(args, vec!["-n", "/opt/amneziawg-install.sh", "--list-clients"]);
+        assert_eq!(
+            args,
+            vec!["-n", "/opt/amneziawg-install.sh", "--list-clients"]
+        );
     }
 
     #[test]

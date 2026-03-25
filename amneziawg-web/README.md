@@ -53,9 +53,15 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 - **CSRF protection** – per-session tokens on all write forms;
   short-lived single-use pre-login token on the login form.
 - **Login rate limiting** – 5 attempts per 5-minute window per client IP.
-- **Audit logging** – `peer_updated`, `login_success`, `login_failed`, `logout`
+- **Audit logging** – `peer_updated`, `login_success`, `login_failed`, `logout`,
+  `user_create_requested`, `user_created`, `user_create_failed`,
+  `user_remove_requested`, `user_removed`, `user_remove_failed`
   written to the `events` table; queryable via `GET /api/events`.
-- **Server-rendered HTML** – peer list, peer detail, edit form, recent activity — no JavaScript framework.
+- **User lifecycle** – add and remove AmneziaWG clients directly from the panel.
+  Reuses the `amneziawg-install.sh` script via a subprocess bridge layer
+  (`admin/script_bridge.rs`), with no shell interpolation and strict name validation.
+- **Server-rendered HTML** – peer list, peer detail, edit form, add/remove user,
+  recent activity — no JavaScript framework.
 - **Zero external dependencies** – single binary + one SQLite file.
 
 ---
@@ -204,9 +210,11 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/` | Yes | HTML peer list |
-| `GET` | `/peers/:id` | Yes | HTML peer detail + edit form + activity |
+| `GET` | `/` | Yes | HTML peer list + add user form |
+| `GET` | `/peers/:id` | Yes | HTML peer detail + edit form + remove user + activity |
 | `POST` | `/peers/:id` | Yes | HTML form update (PRG redirect) |
+| `POST` | `/admin/users/add` | Yes | HTML form: add new user (PRG redirect) |
+| `POST` | `/admin/users/:id/remove` | Yes | HTML form: remove user (PRG redirect) |
 | `GET` | `/login` | No | Login form |
 | `POST` | `/login` | No | Validate credentials, set cookie |
 | `POST` | `/logout` | No | Clear session cookie |
@@ -216,6 +224,8 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `PATCH` | `/api/peers/:id` | Yes | Update `display_name` and/or `comment` |
 | `GET` | `/api/peers/:id/history` | Yes | Traffic history (`?range=24h\|7d\|30d`) |
 | `GET` | `/api/events` | Yes | Audit log (`?peer_id=`, `?event_type=`, `?limit=`) |
+| `POST` | `/api/admin/users` | Yes | JSON API: create user `{"name":"..."}` |
+| `POST` | `/api/admin/users/:id/remove` | Yes | JSON API: remove user |
 
 ---
 
@@ -231,7 +241,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | Rate limiting | 5 login attempts per 5-minute window per IP; `429` on excess |
 | Audit log | Every peer write, login, and logout recorded |
 | No shell injection | AWG binary called via `Command::new()` with explicit args |
-| AWG access | Narrowly-scoped sudoers rule (read-only `awg show all dump`) |
+| AWG access | Narrowly-scoped sudoers rules (read-only `awg show all dump`, install script lifecycle) |
 
 ### AWG privilege model
 
@@ -242,12 +252,14 @@ a tightly-scoped sudoers drop-in at `/etc/sudoers.d/amneziawg-web`:
 
 ```
 awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump
+awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients
 ```
 
-This grants the minimum privilege needed for **read-only** AWG inspection.
-No other commands are permitted.  The Rust application invokes
-`sudo -n /usr/bin/awg show all dump` via `Command::new()` with explicit
-argument arrays — no shell interpolation.
+The first rule grants the minimum privilege needed for **read-only** AWG inspection.
+The second rule allows the web panel to manage clients via the install script's
+non-interactive `--add-client` / `--remove-client` / `--list-clients` flags.
+All invocations use `Command::new()` with explicit argument arrays — no shell
+interpolation.
 
 **Troubleshooting:** If peer polling fails with "Operation not permitted",
 verify the sudoers file exists and is correct:

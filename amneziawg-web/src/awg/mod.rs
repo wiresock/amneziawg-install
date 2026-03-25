@@ -340,7 +340,10 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
         let mut cmd = Command::new(SUDO_BIN);
         cmd.args(["-n", AWG_BIN, "show", "all", "dump"]);
 
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
         assert_eq!(args, vec!["-n", AWG_BIN, "show", "all", "dump"]);
     }
 }

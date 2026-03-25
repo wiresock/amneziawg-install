@@ -102,6 +102,23 @@ AUTO_INSTALL=y SERVER_PORT=51820 CLIENT_DNS_1=8.8.8.8 ./amneziawg-install.sh
 
 A default client named `client` is created automatically when the server interface is successfully brought up. If the AmneziaWG kernel module cannot be loaded (e.g., missing kernel headers), client generation is skipped and you can add clients by re-running the script after resolving the issue, or (for existing installations, especially after migration) by using the interactive menu to regenerate all client configurations. Obfuscation parameters (Jc, Jmin/Jmax, S1-S4, H1-H4) are randomly generated.
 
+## Non-Interactive Client Management
+
+The install script also supports non-interactive flags for automation and integration with the web panel:
+
+```bash
+# Add a new client
+sudo ./amneziawg-install.sh --add-client alice
+
+# Remove a client
+sudo ./amneziawg-install.sh --remove-client alice
+
+# List all clients
+sudo ./amneziawg-install.sh --list-clients
+```
+
+These flags are used by the `amneziawg-web` panel to manage clients directly from the browser UI.
+
 ## AmneziaWG 2.0 Features
 
 This installer supports AmneziaWG 2.0 parameters:

@@ -315,9 +315,7 @@ mod tests {
         let db = test_db().await;
         insert_peer(&db.pool, "KEY_PK=", Some("PkLookup")).await;
 
-        let row = find_by_public_key(&db.pool, "KEY_PK=")
-            .await
-            .expect("find");
+        let row = find_by_public_key(&db.pool, "KEY_PK=").await.expect("find");
         assert!(row.is_some());
         let row = row.unwrap();
         assert_eq!(row.public_key, "KEY_PK=");

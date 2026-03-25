@@ -110,8 +110,10 @@ sudo chmod 0700 /etc/amneziawg-web
 ## 4. AWG binary and privilege setup
 
 `amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state.
-The service runs as a dedicated non-root user (`awg-web`) and uses a
-tightly-scoped sudoers rule for exactly this one read-only command.
+It also invokes `sudo /usr/local/bin/amneziawg-install.sh` for user lifecycle
+actions (add/remove clients).
+The service runs as a dedicated non-root user (`awg-web`) and uses
+tightly-scoped sudoers rules for these specific commands.
 
 ### Automated setup (installer)
 
@@ -123,11 +125,13 @@ The installer (`amneziawg-web-install.sh`) handles all of this automatically:
 
 ### Manual setup
 
-If installing manually, create the sudoers rule:
+If installing manually, create the sudoers rules:
 
 ```bash
-echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump' \
-  | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
+cat <<'EOF' | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
+awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump
+awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients
+EOF
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
 ```
 
@@ -141,8 +145,8 @@ sudo -u awg-web sudo -n /usr/bin/awg show all dump
 
 Reading AWG interface state requires `CAP_NET_ADMIN`, which is only
 available to root.  Rather than running the whole web service as root,
-we grant the service user passwordless sudo for exactly one read-only
-command.  This follows the principle of least privilege.
+we grant the service user passwordless sudo for exactly the required
+commands.  This follows the principle of least privilege.
 
 **Important:** The systemd unit does **not** set `NoNewPrivileges=yes`
 because that would block the `sudo` escalation.  All other hardening
@@ -153,7 +157,7 @@ active.
 
 | File | Purpose | Permissions |
 |---|---|---|
-| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump` as root | `0440 root:root` |
+| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump` and manage clients via install script | `0440 root:root` |
 
 The uninstaller removes this file.  The upgrader creates it if missing.
 
@@ -207,6 +211,7 @@ AWG_WEB_LISTEN=127.0.0.1:8080
 AWG_WEB_DB=/var/lib/amneziawg-web/awg-web.db
 AWG_CONFIG_DIR=/etc/amneziawg/clients
 AWG_POLL_INTERVAL=30
+AWG_INSTALL_SCRIPT=/usr/local/bin/amneziawg-install.sh
 RUST_LOG=amneziawg_web=info
 EOF
 

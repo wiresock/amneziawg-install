@@ -831,10 +831,7 @@ async fn get_peer_config(
                 axum::http::header::CONTENT_TYPE,
                 "text/plain; charset=utf-8".to_string(),
             ),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                disposition,
-            ),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
         ],
         content,
     )
@@ -1114,11 +1111,9 @@ async fn api_create_user(
             )
                 .into_response())
         }
-        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => Ok((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": msg })),
-        )
-            .into_response()),
+        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
+            Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
+        }
         Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -1171,11 +1166,9 @@ async fn api_remove_user(
             }
             Ok(Json(json!({ "ok": true })).into_response())
         }
-        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => Ok((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": msg })),
-        )
-            .into_response()),
+        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
+            Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
+        }
         Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -1379,8 +1372,12 @@ fn connection_badge(status: &ConnectionStatus) -> &'static str {
 
 fn identity_badge(status: &IdentityStatus) -> &'static str {
     match status {
-        IdentityStatus::Linked => r#"<span style="color:#0a0" title="Peer matched to a config file">&#x1F517; linked</span>"#,
-        IdentityStatus::Unlinked => r#"<span style="color:orange" title="No matching config file found">&#x26A0; unlinked</span>"#,
+        IdentityStatus::Linked => {
+            r#"<span style="color:#0a0" title="Peer matched to a config file">&#x1F517; linked</span>"#
+        }
+        IdentityStatus::Unlinked => {
+            r#"<span style="color:orange" title="No matching config file found">&#x26A0; unlinked</span>"#
+        }
     }
 }
 
@@ -3551,5 +3548,190 @@ mod tests {
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.contains(&format!("/api/peers/{id}/config")));
         assert!(html.contains("Download"));
+    }
+
+    // ── User lifecycle UI tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn peer_list_page_contains_add_user_form() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("Add user"),
+            "peer list page should contain 'Add user' form"
+        );
+        assert!(
+            html.contains("/admin/users/add"),
+            "peer list page should contain add user form action"
+        );
+        assert!(
+            html.contains("name=\"name\""),
+            "peer list page should contain name input field"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_shows_remove_button_when_config_linked() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "REMOVE_TEST_KEY==", Some("myuser")).await;
+
+        // Set config metadata so has_config=1 and friendly_name is set
+        sqlx::query(
+            "UPDATE peers SET has_config = 1, friendly_name = 'myuser', \
+             config_name = 'awg0-client-myuser' WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("Remove user"),
+            "detail page should contain 'Remove user' when config is linked"
+        );
+        assert!(
+            html.contains(&format!("/admin/users/{id}/remove")),
+            "detail page should contain remove form action"
+        );
+        assert!(
+            html.contains("confirm"),
+            "detail page should have confirmation mechanism"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_no_remove_when_unlinked() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "NOREMOVE_KEY==", Some("noconf")).await;
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !html.contains("Remove user"),
+            "detail page should NOT show 'Remove user' when config is not linked"
+        );
+    }
+
+    // ── API user lifecycle tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn api_create_user_rejects_empty_name() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_create_user_rejects_invalid_chars() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"../etc/passwd"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_create_user_rejects_too_long_name() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"1234567890123456"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_remove_user_not_found_returns_404() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users/9999/remove")
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_remove_user_no_config_returns_400() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "NOCONF_REMOVE_KEY==", Some("noconf")).await;
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/admin/users/{id}/remove"))
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
