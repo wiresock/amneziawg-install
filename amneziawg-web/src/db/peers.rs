@@ -637,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn list_disabled_public_keys_returns_only_disabled() {
         let db = test_db().await;
-        let id_a = insert_peer(&db.pool, "KEY_ENABLED=", None).await;
+        insert_peer(&db.pool, "KEY_ENABLED=", None).await;
         let id_b = insert_peer(&db.pool, "KEY_DISABLED_1=", None).await;
         let id_c = insert_peer(&db.pool, "KEY_DISABLED_2=", None).await;
 
@@ -656,6 +656,5 @@ mod tests {
         let keys = list_disabled_public_keys(&db.pool).await.expect("query");
         assert_eq!(keys.len(), 1);
         assert!(keys.contains("KEY_DISABLED_2="));
-        let _ = id_a; // suppress unused warning
     }
 }
