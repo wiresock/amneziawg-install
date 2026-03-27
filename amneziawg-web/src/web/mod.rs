@@ -1112,7 +1112,7 @@ async fn api_create_user(
     .await
     {
         Ok(result) => {
-            // Trigger config rescan so new peer appears immediately.
+            // Trigger a config rescan so config-to-peer mappings are updated after creation.
             if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
                 tracing::warn!(error = %e, "post-create config rescan failed");
             }
@@ -1140,9 +1140,13 @@ async fn api_create_user(
 }
 
 /// `POST /api/admin/users/:id/remove` – JSON API to remove an existing user/client.
+///
+/// Requires a JSON body (even if empty) so that browsers cannot submit this
+/// request via a cross-site `<form>` POST (CSRF mitigation).
 async fn api_remove_user(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Json(_body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let peer = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
         Some(p) => p,
@@ -3937,7 +3941,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/admin/users/9999/remove")
                     .header("content-type", "application/json")
-                    .body(Body::empty())
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -3957,7 +3961,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/admin/users/{id}/remove"))
                     .header("content-type", "application/json")
-                    .body(Body::empty())
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await

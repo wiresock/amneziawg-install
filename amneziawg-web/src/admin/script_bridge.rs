@@ -38,6 +38,14 @@ pub const MAX_CLIENT_NAME_LEN: usize = 15;
 /// Maximum number of chars to keep when logging stderr output.
 const STDERR_LOG_LIMIT: usize = 512;
 
+/// Maximum number of bytes to capture from stdout/stderr pipes.
+///
+/// Prevents unbounded memory usage if the script produces excessive output.
+/// The value is generous enough for all expected output while still bounding
+/// memory consumption (and the size of strings stored in error variants /
+/// audit-event records).
+const PIPE_CAPTURE_LIMIT: usize = 64 * 1024; // 64 KiB
+
 /// Truncate stderr to [`STDERR_LOG_LIMIT`] chars for safe logging.
 fn truncate_for_log(s: &str) -> String {
     s.chars().take(STDERR_LOG_LIMIT).collect()
@@ -178,10 +186,11 @@ impl ScriptBridge {
 
         // Read stdout/stderr concurrently with waiting on the child process
         // to avoid deadlocks on full OS pipe buffers.
+        // Reads are capped at PIPE_CAPTURE_LIMIT bytes to bound memory usage.
         let stdout_fut = async move {
             let mut buf = Vec::new();
             if let Some(mut h) = stdout_handle {
-                if let Err(e) = h.read_to_end(&mut buf).await {
+                if let Err(e) = (&mut h).take(PIPE_CAPTURE_LIMIT as u64).read_to_end(&mut buf).await {
                     warn!(error = %e, "failed to read child stdout");
                 }
             }
@@ -191,7 +200,7 @@ impl ScriptBridge {
         let stderr_fut = async move {
             let mut buf = Vec::new();
             if let Some(mut h) = stderr_handle {
-                if let Err(e) = h.read_to_end(&mut buf).await {
+                if let Err(e) = (&mut h).take(PIPE_CAPTURE_LIMIT as u64).read_to_end(&mut buf).await {
                     warn!(error = %e, "failed to read child stderr");
                 }
             }
@@ -223,13 +232,13 @@ impl ScriptBridge {
                         error!(flag, code, stderr = %truncate_for_log(&stderr), "install script failed");
                         Err(ScriptError::NonZeroExit {
                             code,
-                            stderr: stderr.trim().to_string(),
+                            stderr: truncate_for_log(stderr.trim()),
                         })
                     }
                     None => {
                         error!(flag, stderr = %truncate_for_log(&stderr), "install script killed by signal");
                         Err(ScriptError::Signal {
-                            stderr: stderr.trim().to_string(),
+                            stderr: truncate_for_log(stderr.trim()),
                         })
                     }
                 }
