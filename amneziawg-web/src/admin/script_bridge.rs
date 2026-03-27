@@ -200,10 +200,11 @@ impl ScriptBridge {
                 let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
 
                 if !stderr.is_empty() {
-                    // Log stderr at debug level, redacting anything that might
-                    // contain private keys.  The stderr from the install script
-                    // is short diagnostic text (no secrets).
-                    debug!(stderr = %stderr, "script stderr");
+                    // Log stderr at debug level.  The install script is
+                    // expected to emit only short diagnostic text (no secrets).
+                    // Truncate to 512 chars as a safety measure.
+                    let truncated: String = stderr.chars().take(512).collect();
+                    debug!(stderr = %truncated, "script stderr");
                 }
 
                 match status.code() {
@@ -212,14 +213,16 @@ impl ScriptBridge {
                         Ok(stdout.trim().to_string())
                     }
                     Some(code) => {
-                        error!(flag, code, stderr = %stderr, "install script failed");
+                        let truncated: String = stderr.chars().take(512).collect();
+                        error!(flag, code, stderr = %truncated, "install script failed");
                         Err(ScriptError::NonZeroExit {
                             code,
                             stderr: stderr.trim().to_string(),
                         })
                     }
                     None => {
-                        error!(flag, stderr = %stderr, "install script killed by signal");
+                        let truncated: String = stderr.chars().take(512).collect();
+                        error!(flag, stderr = %truncated, "install script killed by signal");
                         Err(ScriptError::Signal {
                             stderr: stderr.trim().to_string(),
                         })

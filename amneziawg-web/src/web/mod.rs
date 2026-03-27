@@ -1885,9 +1885,11 @@ fn render_peer_detail(
 Historical data (snapshots, events) will be preserved.</p>
 <form method="POST" action="/admin/users/{id}/remove">
   <input type="hidden" name="csrf_token" value="{csrf}">
-  <input type="hidden" name="confirm" value="yes">
-  <button type="submit" style="background:#c00;margin-top:.5rem"
-          onclick="return confirm('Are you sure you want to remove user {name_js}? This cannot be undone.')">
+  <label style="display:flex;align-items:center;gap:.4rem;margin-top:.5rem">
+    <input type="checkbox" id="confirm_remove" name="confirm" value="yes" required>
+    I understand this action will permanently remove this user and cannot be undone.
+  </label>
+  <button type="submit" style="background:#c00;margin-top:.5rem">
     Remove user
   </button>
 </form>
@@ -1896,7 +1898,6 @@ Historical data (snapshots, events) will be preserved.</p>
                     id = dto.id,
                     csrf = esc(csrf_token),
                     name = esc(fn_name),
-                    name_js = esc_js(fn_name),
                 ));
             }
         }

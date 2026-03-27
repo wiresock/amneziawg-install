@@ -98,12 +98,13 @@ pub async fn execute_create_user(
     // Pre-validate name (the script validates too, but fail fast for the UI).
     script_bridge::validate_client_name(name)?;
 
+    let detail = serde_json::json!({ "name": name }).to_string();
     log_event(
         &db.pool,
         EVT_USER_CREATE_REQUESTED,
         None,
         None,
-        Some(&serde_json::json!({ "name": name }).to_string()),
+        Some(&detail),
         actor,
     )
     .await;
