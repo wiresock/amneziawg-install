@@ -38,6 +38,11 @@ impl SessionTable {
     ///
     /// Returns `(socket, is_new)` where `is_new` is `true` when a fresh session
     /// was just created (so the caller can spawn a relay task for it).
+    ///
+    /// Session creation is single-flight per client address: we pre-create the
+    /// socket outside the lock, then use `DashMap::entry` to atomically insert
+    /// only if the key is still vacant. This prevents two concurrent calls for
+    /// the same `client_addr` from both inserting separate sessions.
     pub async fn get_or_create(
         &self,
         client_addr: SocketAddr,
@@ -70,15 +75,26 @@ impl SessionTable {
         sock.connect(self.backend_addr).await?;
         let sock = Arc::new(sock);
 
-        let session = Session {
-            backend_sock: Arc::clone(&sock),
-            last_active: Instant::now(),
-            client_addr,
-        };
-
-        self.sessions.insert(client_addr, session);
-        debug!(%client_addr, "new session created");
-        Ok((sock, true))
+        // Use entry API so concurrent calls for the same client_addr
+        // don't create duplicate sessions / orphaned sockets.
+        let entry = self.sessions.entry(client_addr);
+        match entry {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                // Another task raced us — reuse the existing session.
+                occ.get_mut().last_active = Instant::now();
+                Ok((Arc::clone(&occ.get().backend_sock), false))
+            }
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                let session = Session {
+                    backend_sock: Arc::clone(&sock),
+                    last_active: Instant::now(),
+                    client_addr,
+                };
+                vac.insert(session);
+                debug!(%client_addr, "new session created");
+                Ok((sock, true))
+            }
+        }
     }
 
     /// Touch a session (update last_active).

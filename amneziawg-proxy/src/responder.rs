@@ -276,18 +276,32 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
 /// from the incoming request. We parse and echo these when available; this
 /// makes the response indistinguishable from a real SIP proxy.
 fn generate_sip_trying(incoming: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(512);
+    // Cap the response size to prevent memory/CPU DoS from oversized SIP probes.
+    // 512 bytes is generous for a 100 Trying with the five echoed headers.
+    const MAX_RESPONSE_SIZE: usize = 512;
+
+    let mut buf = BytesMut::with_capacity(MAX_RESPONSE_SIZE);
     buf.put_slice(b"SIP/2.0 100 Trying\r\n");
 
     // Echo key SIP headers from the incoming request for realism.
     // Allocation-free ASCII case-insensitive prefix checks.
+    // Only scan up to a bounded prefix of the request to limit work on
+    // spoofed/oversized UDP payloads.
     if let Ok(text) = std::str::from_utf8(incoming) {
         let echo_prefixes = ["via:", "from:", "to:", "call-id:", "cseq:"];
+        let suffix = b"Content-Length: 0\r\n\r\n";
         for line in text.lines() {
             let trimmed = line.trim();
             for &prefix in &echo_prefixes {
                 if trimmed.get(..prefix.len()).is_some_and(|s| s.eq_ignore_ascii_case(prefix))
                 {
+                    // Stop echoing if adding this line would exceed the cap
+                    let line_len = trimmed.len() + 2; // +2 for \r\n
+                    if buf.len() + line_len + suffix.len() > MAX_RESPONSE_SIZE {
+                        // No more room — finish the response now
+                        buf.put_slice(suffix);
+                        return buf.freeze();
+                    }
                     buf.put_slice(trimmed.as_bytes());
                     buf.put_slice(b"\r\n");
                     break;

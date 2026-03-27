@@ -247,6 +247,12 @@ impl Proxy {
             relay_handles.remove(&client_addr);
         });
 
+        // Abort any previously running relay task for this client before
+        // inserting the new handle, so we don't leak orphaned tasks and the
+        // old task can't later remove the *new* entry from the map.
+        if let Some((_, old_handle)) = self.relay_handles.remove(&client_addr) {
+            old_handle.abort();
+        }
         self.relay_handles.insert(client_addr, handle);
 
         // If the task has already completed (e.g., due to an immediate recv error)
@@ -350,7 +356,7 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let shutdown = proxy.shutdown_handle();
 
-        tokio::spawn(async move {
+        let proxy_handle = tokio::spawn(async move {
             proxy.run().await.unwrap();
         });
 
@@ -392,5 +398,10 @@ mod tests {
         assert_eq!(&backend_buf[..n], &quic_pkt);
 
         shutdown.notify_one();
+        // Await the proxy task to prevent leaked tasks / flaky CI.
+        tokio::time::timeout(Duration::from_secs(5), proxy_handle)
+            .await
+            .expect("proxy should shut down within 5s")
+            .unwrap();
     }
 }
