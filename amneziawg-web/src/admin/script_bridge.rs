@@ -162,27 +162,36 @@ impl ScriptBridge {
 
         // Take ownership of stdout/stderr handles before the select! so we
         // can still kill the child on timeout.
-        let mut stdout_handle = child.stdout.take();
-        let mut stderr_handle = child.stderr.take();
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        // Read stdout/stderr concurrently with waiting on the child process
+        // to avoid deadlocks on full OS pipe buffers.
+        let stdout_fut = async move {
+            let mut buf = Vec::new();
+            if let Some(mut h) = stdout_handle {
+                if let Err(e) = h.read_to_end(&mut buf).await {
+                    warn!(error = %e, "failed to read child stdout");
+                }
+            }
+            buf
+        };
+
+        let stderr_fut = async move {
+            let mut buf = Vec::new();
+            if let Some(mut h) = stderr_handle {
+                if let Err(e) = h.read_to_end(&mut buf).await {
+                    warn!(error = %e, "failed to read child stderr");
+                }
+            }
+            buf
+        };
 
         let timeout = self.timeout;
         tokio::select! {
-            status_result = child.wait() => {
+            joined = async { tokio::join!(child.wait(), stdout_fut, stderr_fut) } => {
+                let (status_result, stdout_buf, stderr_buf) = joined;
                 let status = status_result.map_err(ScriptError::Wait)?;
-
-                // Read captured output from the handles.
-                let mut stdout_buf = Vec::new();
-                let mut stderr_buf = Vec::new();
-                if let Some(ref mut h) = stdout_handle {
-                    if let Err(e) = h.read_to_end(&mut stdout_buf).await {
-                        warn!(error = %e, "failed to read child stdout");
-                    }
-                }
-                if let Some(ref mut h) = stderr_handle {
-                    if let Err(e) = h.read_to_end(&mut stderr_buf).await {
-                        warn!(error = %e, "failed to read child stderr");
-                    }
-                }
 
                 let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
                 let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
@@ -216,8 +225,9 @@ impl ScriptBridge {
             }
             _ = tokio::time::sleep(timeout) => {
                 warn!(timeout = ?timeout, "install script timed out – killing child process");
-                // Best-effort kill; ignore errors (process may have already exited).
+                // Best-effort kill and reap; ignore errors (process may have already exited).
                 let _ = child.kill().await;
+                let _ = child.wait().await;
                 Err(ScriptError::Timeout(timeout))
             }
         }

@@ -21,12 +21,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::SecondsFormat;
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::awg;
 use crate::config_store;
 use crate::db::Database;
 use crate::domain::PublicKey;
+
+/// Serializes access to the clear-all + re-map sequence so that concurrent
+/// calls from the poller and on-demand `rescan_configs` cannot interleave.
+static CONFIG_MAPPING_LOCK: Mutex<()> = Mutex::const_new(());
 
 pub struct Poller {
     db: Database,
@@ -329,10 +334,17 @@ fn base_ip(cidr: &str) -> &str {
 /// Shared config-to-peer mapping logic used by both the poller cycle and
 /// on-demand rescan.  Resets all mappings, then applies Strategy 1 (public-key)
 /// and Strategy 2 (AllowedIPs fallback) for each config.
+///
+/// The clear-all + re-map sequence is serialized via [`CONFIG_MAPPING_LOCK`]
+/// so that concurrent calls from the poller and on-demand `rescan_configs`
+/// cannot interleave and leave stale/missing mappings.
 async fn apply_config_mappings(
     db: &crate::db::Database,
     configs: &[config_store::ClientConfig],
 ) -> anyhow::Result<()> {
+    // Acquire the lock so the clear + re-apply is atomic w.r.t. other callers.
+    let _guard = CONFIG_MAPPING_LOCK.lock().await;
+
     // Reset all mapping fields so that removed configs don't persist.
     crate::db::peers::clear_all_config_mappings(&db.pool).await?;
 
