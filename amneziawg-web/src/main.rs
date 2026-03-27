@@ -117,7 +117,8 @@ async fn main() -> anyhow::Result<()> {
         if !p.is_file() {
             warn!(
                 path = %p.display(),
-                "AWG_INSTALL_SCRIPT not found; user lifecycle features will fail until the script is installed"
+                "AWG_INSTALL_SCRIPT not found; client creation/deletion will fail \
+                 until the script is installed at the configured path"
             );
         } else {
             // Best-effort executable check on Unix.
