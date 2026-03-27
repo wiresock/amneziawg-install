@@ -702,7 +702,7 @@ install_sudoers() {
         die "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: ${install_script_path}"
     fi
     if [[ ! -x "${install_script_path}" ]]; then
-        die "Install script not found or not executable: ${install_script_path}"
+        warn "Install script not found or not executable (will be checked at service startup): ${install_script_path}"
     fi
 
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
