@@ -78,9 +78,24 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
         return None;
     }
 
-    // QUIC Initial: long header form bit (0x80) + fixed bit (0x40) set
-    if data[0] & 0xC0 == 0xC0 {
-        return Some(Protocol::Quic);
+    // QUIC long header: form bit (0x80) + fixed bit (0x40) must both be set,
+    // plus additional invariants to avoid false positives on AWG packets
+    // whose random H-range headers happen to have those bits set.
+    //   - Minimum 7 bytes (1 header + 4 version + 1 DCID len + 1 SCID len)
+    //   - DCID length ≤ 20 (RFC 9000 §17.2)
+    //   - Packet contains SCID length field
+    //   - SCID length ≤ 20
+    if data.len() >= 7 && data[0] & 0xC0 == 0xC0 {
+        let dcid_len = data[5] as usize;
+        if dcid_len <= 20 {
+            let scid_len_offset = 6 + dcid_len;
+            if data.len() > scid_len_offset {
+                let scid_len = data[scid_len_offset] as usize;
+                if scid_len <= 20 {
+                    return Some(Protocol::Quic);
+                }
+            }
+        }
     }
 
     // DNS query: >= 12 bytes, QR=0, standard opcode, QDCOUNT >= 1
@@ -323,6 +338,44 @@ mod tests {
     #[test]
     fn detect_empty() {
         assert_eq!(detect_protocol(&[]), None);
+    }
+
+    #[test]
+    fn detect_quic_rejects_short_packet() {
+        // Too short for valid QUIC long header (< 7 bytes)
+        let pkt = [0xC3, 0x00, 0x00, 0x00, 0x01, 0x04];
+        assert_eq!(detect_protocol(&pkt), None);
+    }
+
+    #[test]
+    fn detect_quic_rejects_oversized_dcid() {
+        // DCID length > 20 is invalid per RFC 9000 §17.2
+        // Use version bytes that avoid accidentally matching DNS detection
+        let mut pkt = vec![0xC3u8, 0x00, 0x80, 0x00, 0x01];
+        pkt.push(21); // DCID len > 20
+        pkt.extend(std::iter::repeat(0xAA).take(21)); // DCID
+        pkt.push(0); // SCID len
+        assert_eq!(detect_protocol(&pkt), None);
+    }
+
+    #[test]
+    fn detect_quic_rejects_oversized_scid() {
+        // SCID length > 20 is invalid per RFC 9000 §17.2
+        let mut pkt = vec![0xC3u8, 0x00, 0x80, 0x00, 0x01];
+        pkt.push(4); // DCID len
+        pkt.extend_from_slice(&[1, 2, 3, 4]); // DCID
+        pkt.push(21); // SCID len > 20
+        pkt.extend(std::iter::repeat(0xBB).take(21)); // SCID
+        assert_eq!(detect_protocol(&pkt), None);
+    }
+
+    #[test]
+    fn detect_quic_rejects_truncated_before_scid_len() {
+        // Packet has DCID but no SCID length byte
+        let mut pkt = vec![0xC3u8, 0x00, 0x00, 0x00, 0x01];
+        pkt.push(4); // DCID len
+        pkt.extend_from_slice(&[1, 2, 3, 4]); // DCID (but no SCID len byte)
+        assert_eq!(detect_protocol(&pkt), None);
     }
 
     #[test]

@@ -111,19 +111,7 @@ buffer_size = 4096
     let has_version_neg = responses.iter().any(|r| !r.is_empty() && r[0] == 0xC3);
     assert!(has_version_neg, "should have a QUIC version negotiation response");
 
-    // 6. Test DNS probe
-    let mut dns_query = vec![0x00u8; 12];
-    dns_query[0] = 0xAB; // TX ID
-    dns_query[1] = 0xCD;
-    dns_query[2] = 0x01; // Flags: RD=1
-    dns_query[3] = 0x00;
-    dns_query[4] = 0x00; // QDCOUNT = 1
-    dns_query[5] = 0x01;
-
-    // Reconfigure with DNS protocol — for this test we'll just verify the
-    // QUIC probe was correct. DNS detection works at the unit-test level.
-
-    // 7. Shutdown
+    // 6. Shutdown
     shutdown.notify_one();
     tokio::time::sleep(Duration::from_millis(100)).await;
     backend_handle.abort();

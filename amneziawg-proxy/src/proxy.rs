@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
@@ -22,6 +23,10 @@ pub struct Proxy {
     protocol: Protocol,
     awg_params: Option<Arc<AwgParams>>,
     shutdown: Arc<Notify>,
+    /// Per-session relay task handles, keyed by client address.
+    /// Each task awaits data from the session's backend socket and relays it
+    /// back to the client — fully event-driven, no polling.
+    relay_handles: Arc<DashMap<SocketAddr, tokio::task::JoinHandle<()>>>,
 }
 
 impl Proxy {
@@ -62,6 +67,7 @@ impl Proxy {
             protocol,
             awg_params: awg_params.map(Arc::new),
             shutdown: Arc::new(Notify::new()),
+            relay_handles: Arc::new(DashMap::new()),
         })
     }
 
@@ -82,6 +88,7 @@ impl Proxy {
             protocol,
             awg_params: awg_params.map(Arc::new),
             shutdown: Arc::new(Notify::new()),
+            relay_handles: Arc::new(DashMap::new()),
         }
     }
 
@@ -98,7 +105,6 @@ impl Proxy {
     /// Run the proxy until shutdown is signaled.
     pub async fn run(&self) -> anyhow::Result<()> {
         let cleanup_handle = self.spawn_cleanup_task();
-        let relay_handle = self.spawn_relay_tasks();
 
         info!("proxy running");
 
@@ -125,7 +131,11 @@ impl Proxy {
         }
 
         cleanup_handle.abort();
-        relay_handle.abort();
+        // Abort all per-session relay tasks
+        self.relay_handles.iter().for_each(|entry| {
+            entry.value().abort();
+        });
+        self.relay_handles.clear();
         info!("proxy stopped");
         Ok(())
     }
@@ -156,9 +166,12 @@ impl Proxy {
             }
         }
 
-        // Forward to backend
+        // Forward to backend (and spawn relay task for new sessions)
         match self.sessions.get_or_create(client_addr).await {
-            Ok(backend_sock) => {
+            Ok((backend_sock, is_new)) => {
+                if is_new {
+                    self.spawn_session_relay(client_addr, Arc::clone(&backend_sock));
+                }
                 if let Err(e) = backend::forward_to_backend(&backend_sock, data).await {
                     warn!(%client_addr, error = %e, "failed to forward to backend");
                 }
@@ -169,10 +182,67 @@ impl Proxy {
         }
     }
 
+    /// Spawn an event-driven relay task for a single session.
+    ///
+    /// The task awaits data from the backend socket and relays responses back to
+    /// the client via the frontend socket. This is fully event-driven — no
+    /// polling or per-tick allocation.
+    fn spawn_session_relay(&self, client_addr: SocketAddr, backend_sock: Arc<UdpSocket>) {
+        let frontend = Arc::clone(&self.frontend);
+        let metrics = Arc::clone(&self.metrics);
+        let sessions = Arc::clone(&self.sessions);
+        let protocol = self.protocol;
+        let awg_params = self.awg_params.clone();
+        let buffer_size = self.config.buffer_size;
+        let relay_handles = Arc::clone(&self.relay_handles);
+
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; buffer_size];
+            loop {
+                match backend_sock.recv(&mut buf).await {
+                    Ok(n) => {
+                        // Apply padding transformation to outgoing packets.
+                        // When AWG params are available, use per-type S-value
+                        // padding based on H-range classification.
+                        if let Some(ref params) = awg_params {
+                            transform::apply_awg_transform(
+                                &mut buf[..n],
+                                params,
+                                protocol,
+                            );
+                        }
+
+                        if let Some(m) = metrics.get_or_create(client_addr) {
+                            m.record_out();
+                            drop(m);
+                        }
+
+                        sessions.touch(&client_addr);
+
+                        if let Err(e) =
+                            backend::send_to_client(&frontend, client_addr, &buf[..n]).await
+                        {
+                            warn!(%client_addr, error = %e, "failed to relay to client");
+                        }
+                    }
+                    Err(e) => {
+                        debug!(%client_addr, error = %e, "relay recv error, ending session relay");
+                        break;
+                    }
+                }
+            }
+            // Clean up relay handle entry when task ends naturally
+            relay_handles.remove(&client_addr);
+        });
+
+        self.relay_handles.insert(client_addr, handle);
+    }
+
     /// Spawn a task that periodically cleans up expired sessions.
     fn spawn_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
         let sessions = Arc::clone(&self.sessions);
         let metrics = Arc::clone(&self.metrics);
+        let relay_handles = Arc::clone(&self.relay_handles);
         let interval = Duration::from_secs(self.config.cleanup_interval_secs);
 
         tokio::spawn(async move {
@@ -183,73 +253,13 @@ impl Proxy {
                 let expired = sessions.cleanup_expired();
                 for addr in &expired {
                     metrics.remove(addr);
+                    // Abort the relay task for the expired session
+                    if let Some((_, handle)) = relay_handles.remove(addr) {
+                        handle.abort();
+                    }
                 }
                 if !expired.is_empty() {
                     info!(count = expired.len(), "cleaned up expired sessions");
-                }
-            }
-        })
-    }
-
-    /// Spawn tasks that relay responses from backend sockets back to clients.
-    fn spawn_relay_tasks(&self) -> tokio::task::JoinHandle<()> {
-        let sessions = Arc::clone(&self.sessions);
-        let frontend = Arc::clone(&self.frontend);
-        let metrics = Arc::clone(&self.metrics);
-        let protocol = self.protocol;
-        let awg_params = self.awg_params.clone();
-        let buffer_size = self.config.buffer_size;
-        let _shutdown = Arc::clone(&self.shutdown);
-
-        tokio::spawn(async move {
-            // Poll all backend sockets for responses
-            let mut interval = tokio::time::interval(Duration::from_millis(1));
-            let mut buf = vec![0u8; buffer_size];
-
-            loop {
-                interval.tick().await;
-
-                let sockets = sessions.all_backend_sockets();
-                for (client_addr, backend_sock) in sockets {
-                    match backend::try_recv_from_backend(
-                        &backend_sock,
-                        &mut buf,
-                        Duration::from_millis(1),
-                    )
-                    .await
-                    {
-                        Ok(Some(n)) => {
-                            // Apply padding transformation to outgoing packets.
-                            // When AWG params are available, use per-type S-value
-                            // padding based on H-range classification. Otherwise,
-                            // fall back to treating the entire packet as payload
-                            // (no padding region to transform).
-                            if let Some(ref params) = awg_params {
-                                transform::apply_awg_transform(
-                                    &mut buf[..n],
-                                    params,
-                                    protocol,
-                                );
-                            }
-
-                            if let Some(m) = metrics.get_or_create(client_addr) {
-                                m.record_out();
-                                drop(m);
-                            }
-
-                            sessions.touch(&client_addr);
-
-                            if let Err(e) =
-                                backend::send_to_client(&frontend, client_addr, &buf[..n]).await
-                            {
-                                warn!(%client_addr, error = %e, "failed to relay to client");
-                            }
-                        }
-                        Ok(None) => {} // no data
-                        Err(e) => {
-                            debug!(%client_addr, error = %e, "backend recv error in relay");
-                        }
-                    }
                 }
             }
         })

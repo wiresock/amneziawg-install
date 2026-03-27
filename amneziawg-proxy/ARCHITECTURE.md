@@ -37,8 +37,9 @@ It performs two complementary functions:
                                   │     │    └──────┬──────────┘  │
                                   │     │           │             │
                                   │     │    ┌──────▼──────────┐  │
-                                  │     │    │   relay task     │  │
-                                  │     │    │  (poll backends, │  │
+                                  │     │    │   relay tasks    │  │
+                                  │     │    │  (per-session    │  │
+                                  │     │    │   async recv,    │  │
                                   │     │    │   apply padding  │  │
                                   │     │    │   transform)     │  │
                                   │     │    └──────┬──────────┘  │
@@ -80,7 +81,7 @@ passes through the proxy, which adds the imitation layer.
 |----------------|----------------|
 | `main.rs`      | CLI entry point: loads TOML config, optionally loads AWG config, sets up logging and signal handling, runs the proxy. |
 | `config.rs`    | Parses `proxy.toml` (TOML) and AWG INI-style config files. Validates addresses, protocol names, H-range non-overlap, Jmin≤Jmax. |
-| `proxy.rs`     | Core runtime: binds frontend socket, runs the main `recv_from` loop, spawns cleanup and relay tasks, orchestrates all other modules. |
+| `proxy.rs`     | Core runtime: binds frontend socket, runs the main `recv_from` loop, spawns per-session relay tasks and cleanup task, orchestrates all other modules. |
 | `responder.rs` | Probe detection (`detect_protocol`) and response generation (`generate_response`). Also contains AWG packet classification (`classify_awg_packet`). |
 | `transform.rs` | Padding transformation: overwrites the S1–S4 padding region with protocol-conformant filler (QUIC PRNG, DNS header, SIP text). |
 | `session.rs`   | Per-client session table backed by `DashMap`. Each session owns a dedicated ephemeral UDP socket connected to the backend. TTL-based expiry. |
@@ -114,7 +115,7 @@ Client                      Proxy                           Backend (AWG)
 
 **Step 5–6 detail (padding transform):**
 
-The relay task reads the first 4 bytes of the backend response as a
+The per-session relay task reads the first 4 bytes of the backend response as a
 little-endian `u32` header value. It checks which H range the value falls
 into, determining the AWG packet type (Handshake Init / Response / Cookie
 Reply / Transport Data). The corresponding S-value tells it how many trailing
@@ -160,11 +161,17 @@ backend.
 
 **Probe detection** (`detect_protocol`):
 ```
-First byte: (byte & 0xC0) == 0xC0
+1. Packet length ≥ 7
+2. First byte: (byte & 0xC0) == 0xC0
+3. DCID length (byte 5) ≤ 20
+4. Packet long enough to contain SCID length byte
+5. SCID length ≤ 20
 ```
 This matches QUIC long-header packets (RFC 9000 §17.2), including Initial,
 0-RTT, Handshake, and Retry packets. The two high bits being `11` indicate
-the long header form bit (0x80) and the fixed bit (0x40).
+the long header form bit (0x80) and the fixed bit (0x40). The additional
+connection ID length checks (≤ 20, per RFC 9000 §17.2) reduce false positives
+from AWG packets whose random H-range headers happen to have those bits set.
 
 **Probe response** (`generate_quic_version_negotiation`):
 A valid QUIC Version Negotiation packet (RFC 9000 §17.2.1):
@@ -364,7 +371,8 @@ Byte  Value   Meaning
 ```
 
 **Proxy processing:**
-1. `detect_protocol()` → `data[0] & 0xC0 = 0xC0` → `Protocol::Quic`
+1. `detect_protocol()` → `len ≥ 7`, `data[0] & 0xC0 = 0xC0`, `DCID_len = 4 ≤ 20`,
+   `SCID_len = 0 ≤ 20` → `Protocol::Quic`
 2. `try_acquire_probe()` → `true` (rate limiter has tokens)
 3. `generate_response(Quic, &data)` → Version Negotiation packet
 4. Packet is also forwarded to backend (AWG ignores it)
@@ -537,8 +545,9 @@ ephemeral UDP socket `connect()`ed to the backend. This provides:
 - **NAT-like isolation** — each client's traffic uses a distinct source port
   to the backend, so the backend (and any intermediate NAT) can distinguish
   clients.
-- **Efficient relay** — the relay task polls all backend sockets every 1 ms
-  using `try_recv_from_backend` with a zero timeout (non-blocking).
+- **Efficient relay** — each session gets a dedicated async recv task that
+  awaits data from the backend socket event-driven (no polling or per-tick
+  allocation), keeping CPU usage proportional to actual traffic.
 - **Automatic cleanup** — a periodic task (default: every 60 s) reaps
   sessions idle longer than `session_ttl_secs` (default: 300 s) and removes
   associated metrics.

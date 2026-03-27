@@ -35,14 +35,17 @@ impl SessionTable {
     }
 
     /// Get the backend socket for a client, creating a new session if needed.
+    ///
+    /// Returns `(socket, is_new)` where `is_new` is `true` when a fresh session
+    /// was just created (so the caller can spawn a relay task for it).
     pub async fn get_or_create(
         &self,
         client_addr: SocketAddr,
-    ) -> anyhow::Result<Arc<UdpSocket>> {
+    ) -> anyhow::Result<(Arc<UdpSocket>, bool)> {
         // Fast path: session exists
         if let Some(mut entry) = self.sessions.get_mut(&client_addr) {
             entry.last_active = Instant::now();
-            return Ok(Arc::clone(&entry.backend_sock));
+            return Ok((Arc::clone(&entry.backend_sock), false));
         }
 
         // Check session limit before creating a new one
@@ -55,8 +58,15 @@ impl SessionTable {
             );
         }
 
-        // Slow path: create a new session
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        // Slow path: create a new session.
+        // Bind to the correct address family so connect() works for both
+        // IPv4 and IPv6 backend addresses.
+        let bind_addr = if self.backend_addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let sock = UdpSocket::bind(bind_addr).await?;
         sock.connect(self.backend_addr).await?;
         let sock = Arc::new(sock);
 
@@ -68,7 +78,7 @@ impl SessionTable {
 
         self.sessions.insert(client_addr, session);
         debug!(%client_addr, "new session created");
-        Ok(sock)
+        Ok((sock, true))
     }
 
     /// Touch a session (update last_active).
@@ -143,8 +153,11 @@ mod tests {
         let table = SessionTable::new(backend, Duration::from_secs(60), 1000);
         let client: SocketAddr = "10.0.0.1:5555".parse().unwrap();
 
-        let sock1 = table.get_or_create(client).await.unwrap();
-        let sock2 = table.get_or_create(client).await.unwrap();
+        let (sock1, is_new1) = table.get_or_create(client).await.unwrap();
+        assert!(is_new1, "first call should create a new session");
+
+        let (sock2, is_new2) = table.get_or_create(client).await.unwrap();
+        assert!(!is_new2, "second call should return existing session");
 
         // Should return the same socket
         assert_eq!(
