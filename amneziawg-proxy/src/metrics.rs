@@ -113,21 +113,18 @@ impl MetricsStore {
         }
         // We've reserved a slot — insert if still absent, or undo if another
         // call already inserted the same addr concurrently.
-        let inserted = {
+        {
             let entry = self.clients.entry(addr);
             match entry {
                 dashmap::mapref::entry::Entry::Occupied(_) => {
                     // Another task beat us to it; undo the counter bump.
                     self.client_count.fetch_sub(1, Ordering::AcqRel);
-                    false
                 }
                 dashmap::mapref::entry::Entry::Vacant(v) => {
                     v.insert(ClientMetrics::new(self.rate_limit_per_sec));
-                    true
                 }
             }
-        };
-        let _ = inserted;
+        }
         self.clients.get(&addr)
     }
 
