@@ -121,7 +121,7 @@ impl SessionTable {
         None
     }
 
-    /// Get all backend sockets (for polling responses).
+    /// Get all backend sockets for the currently active sessions.
     pub fn all_backend_sockets(&self) -> Vec<(SocketAddr, Arc<UdpSocket>)> {
         self.sessions
             .iter()

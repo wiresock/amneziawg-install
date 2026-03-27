@@ -108,7 +108,13 @@ impl Proxy {
 
         info!("proxy running");
 
-        // Main receive loop
+        // Main receive loop.
+        // Packets are processed inline to preserve ordering guarantees for
+        // per-client session state. For the expected workload (single
+        // backend on localhost), session creation and backend send are fast
+        // enough that pipelining provides no measurable benefit while adding
+        // complexity. If throughput becomes a concern under extreme load,
+        // this can be changed to spawn per-packet tasks.
         let mut buf = vec![0u8; self.config.buffer_size];
 
         loop {
@@ -147,21 +153,25 @@ impl Proxy {
             drop(metrics);
         }
 
-        // Check if this is a probe packet and respond if rate allows
+        // Check if this is a probe packet and respond if rate allows.
+        // Only respond to probes that match the configured protocol so the
+        // proxy does not appear to host multiple services on the same port.
         if let Some(proto) = responder::detect_protocol(data) {
-            if let Some(metrics) = self.metrics.get_or_create(client_addr) {
-                if metrics.try_acquire_probe() {
-                    metrics.record_probe();
-                    drop(metrics);
+            if proto == self.protocol {
+                if let Some(metrics) = self.metrics.get_or_create(client_addr) {
+                    if metrics.try_acquire_probe() {
+                        metrics.record_probe();
+                        drop(metrics);
 
-                    let response = responder::generate_response(proto, data);
-                    if let Err(e) = self.frontend.send_to(&response, client_addr).await {
-                        warn!(%client_addr, error = %e, "failed to send probe response");
+                        let response = responder::generate_response(proto, data);
+                        if let Err(e) = self.frontend.send_to(&response, client_addr).await {
+                            warn!(%client_addr, error = %e, "failed to send probe response");
+                        }
+                        debug!(%client_addr, protocol = ?proto, "probe response sent");
+                    } else {
+                        debug!(%client_addr, "probe rate limited");
+                        drop(metrics);
                     }
-                    debug!(%client_addr, protocol = ?proto, "probe response sent");
-                } else {
-                    debug!(%client_addr, "probe rate limited");
-                    drop(metrics);
                 }
             }
         }

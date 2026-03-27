@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -72,6 +72,9 @@ pub struct MetricsStore {
     clients: DashMap<SocketAddr, ClientMetrics>,
     rate_limit_per_sec: u32,
     max_clients: usize,
+    /// Atomic counter for the number of tracked clients, kept in sync with
+    /// `clients.len()` so the capacity check in `get_or_create` is race-free.
+    client_count: AtomicUsize,
 }
 
 impl MetricsStore {
@@ -80,6 +83,7 @@ impl MetricsStore {
             clients: DashMap::new(),
             rate_limit_per_sec,
             max_clients: 10000,
+            client_count: AtomicUsize::new(0),
         }
     }
 
@@ -90,19 +94,48 @@ impl MetricsStore {
         if let Some(r) = self.clients.get(&addr) {
             return Some(r);
         }
-        // Check limit before inserting
-        if self.clients.len() >= self.max_clients {
-            return None;
+        // Atomically reserve a slot before inserting. If the counter is at or
+        // above the limit, reject the new client without inserting.
+        loop {
+            let current = self.client_count.load(Ordering::Acquire);
+            if current >= self.max_clients {
+                return None;
+            }
+            // Try to increment; if another thread won the race, retry.
+            if self.client_count.compare_exchange(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ).is_ok() {
+                break;
+            }
         }
-        self.clients
-            .entry(addr)
-            .or_insert_with(|| ClientMetrics::new(self.rate_limit_per_sec));
+        // We've reserved a slot — insert if still absent, or undo if another
+        // call already inserted the same addr concurrently.
+        let inserted = {
+            let entry = self.clients.entry(addr);
+            match entry {
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    // Another task beat us to it; undo the counter bump.
+                    self.client_count.fetch_sub(1, Ordering::AcqRel);
+                    false
+                }
+                dashmap::mapref::entry::Entry::Vacant(v) => {
+                    v.insert(ClientMetrics::new(self.rate_limit_per_sec));
+                    true
+                }
+            }
+        };
+        let _ = inserted;
         self.clients.get(&addr)
     }
 
     /// Remove metrics for a client (called on session expiry).
     pub fn remove(&self, addr: &SocketAddr) {
-        self.clients.remove(addr);
+        if self.clients.remove(addr).is_some() {
+            self.client_count.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Number of tracked clients.
@@ -112,6 +145,12 @@ impl MetricsStore {
 
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
+    }
+
+    /// Override the maximum client count (for testing).
+    #[cfg(test)]
+    pub fn set_max_clients(&mut self, max: usize) {
+        self.max_clients = max;
     }
 }
 
@@ -186,7 +225,7 @@ mod tests {
     #[test]
     fn metrics_store_max_clients() {
         let mut store = MetricsStore::new(5);
-        store.max_clients = 2;
+        store.set_max_clients(2);
 
         let a1: SocketAddr = "127.0.0.1:1001".parse().unwrap();
         let a2: SocketAddr = "127.0.0.1:1002".parse().unwrap();

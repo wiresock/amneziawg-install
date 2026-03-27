@@ -128,7 +128,7 @@ fn apply_quic_padding(data: &mut [u8], payload_len: usize) {
 /// Creates a plausible DNS response structure:
 /// - Transaction ID derived from the packet payload
 /// - Standard response flags (QR=1, RD=1, RA=1, RCODE=NOERROR)
-/// - Remaining bytes are zero-filled (EDNS OPT padding option, RFC 7830)
+/// - Remaining bytes are zero-filled for generic padding
 fn apply_dns_padding(data: &mut [u8], payload_len: usize) {
     let (payload, padding) = data.split_at_mut(payload_len);
     if padding.is_empty() {
@@ -152,7 +152,7 @@ fn apply_dns_padding(data: &mut [u8], payload_len: usize) {
     let copy_len = std::cmp::min(padding.len(), header.len());
     padding[..copy_len].copy_from_slice(&header[..copy_len]);
 
-    // Rest: zero-fill (EDNS OPT padding option content is zeros per RFC 7830)
+    // Rest: zero-fill (generic padding content)
     for byte in padding[copy_len..].iter_mut() {
         *byte = 0x00;
     }

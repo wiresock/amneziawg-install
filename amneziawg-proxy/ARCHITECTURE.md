@@ -648,10 +648,11 @@ cargo test
 
 The test suite includes:
 
-- **81 unit tests** covering config parsing/validation, protocol detection,
-  response generation, padding transformation, AWG classification, session
-  management, backend I/O, metrics/rate limiting, and error types.
-- **2 integration tests** that spin up a mock echo backend, start the proxy,
+- A comprehensive suite of unit tests covering config parsing/validation,
+  protocol detection, response generation, padding transformation, AWG
+  classification, session management, backend I/O, metrics/rate limiting,
+  and error types.
+- Integration tests that spin up a mock echo backend, start the proxy,
   send real UDP packets, and verify end-to-end behavior including probe
   detection, version negotiation responses, and multi-client session
   isolation.
