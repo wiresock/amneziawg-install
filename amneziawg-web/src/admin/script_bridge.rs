@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -179,12 +180,14 @@ impl ScriptBridge {
                 let mut stdout_buf = Vec::new();
                 let mut stderr_buf = Vec::new();
                 if let Some(ref mut h) = stdout_handle {
-                    use tokio::io::AsyncReadExt;
-                    let _ = h.read_to_end(&mut stdout_buf).await;
+                    if let Err(e) = h.read_to_end(&mut stdout_buf).await {
+                        warn!(error = %e, "failed to read child stdout");
+                    }
                 }
                 if let Some(ref mut h) = stderr_handle {
-                    use tokio::io::AsyncReadExt;
-                    let _ = h.read_to_end(&mut stderr_buf).await;
+                    if let Err(e) = h.read_to_end(&mut stderr_buf).await {
+                        warn!(error = %e, "failed to read child stderr");
+                    }
                 }
 
                 let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
