@@ -389,7 +389,8 @@ mod tests {
 
         let mut buf = [0u8; 4096];
         let mut got_probe_response = false;
-        for i in 0..10u32 {
+        const MAX_RETRIES: u32 = 10;
+        for attempt in 0..MAX_RETRIES {
             let _ = client.send_to(&quic_pkt, proxy_addr).await;
             match tokio::time::timeout(
                 Duration::from_millis(200),
@@ -403,8 +404,8 @@ mod tests {
                     break;
                 }
                 _ => {
-                    if i + 1 == 10 {
-                        panic!("proxy did not become ready after 10 retries");
+                    if attempt + 1 == MAX_RETRIES {
+                        panic!("proxy did not become ready after {MAX_RETRIES} retries");
                     }
                 }
             }
