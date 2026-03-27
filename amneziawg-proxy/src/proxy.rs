@@ -193,11 +193,13 @@ impl Proxy {
         let sessions = Arc::clone(&self.sessions);
         let protocol = self.protocol;
         let awg_params = self.awg_params.clone();
-        let buffer_size = self.config.buffer_size;
+        // Cap per-session relay buffer to 1500 (typical MTU) to avoid
+        // O(sessions × buffer_size) memory pressure with large buffer_size.
+        let relay_buf_size = std::cmp::min(self.config.buffer_size, 1500);
         let relay_handles = Arc::clone(&self.relay_handles);
 
         let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; buffer_size];
+            let mut buf = vec![0u8; relay_buf_size];
             loop {
                 match backend_sock.recv(&mut buf).await {
                     Ok(n) => {
@@ -236,6 +238,15 @@ impl Proxy {
         });
 
         self.relay_handles.insert(client_addr, handle);
+
+        // If the task has already completed (e.g., due to an immediate recv error)
+        // by the time we insert its handle, remove the stale entry to avoid
+        // leaving a finished JoinHandle in the map.
+        if let Some(handle_ref) = self.relay_handles.get(&client_addr) {
+            if handle_ref.is_finished() {
+                self.relay_handles.remove(&client_addr);
+            }
+        }
     }
 
     /// Spawn a task that periodically cleans up expired sessions.

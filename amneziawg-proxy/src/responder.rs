@@ -107,16 +107,16 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
         }
     }
 
-    // SIP: starts with known SIP method or version prefix
+    // SIP: starts with known SIP method or version prefix.
+    // Allocation-free ASCII case-insensitive prefix checks.
     if data.len() >= 4 {
         let prefix = &data[..std::cmp::min(data.len(), 10)];
         if let Ok(text) = std::str::from_utf8(prefix) {
-            let upper = text.to_uppercase();
-            if upper.starts_with("SIP/")
-                || upper.starts_with("REGISTER ")
-                || upper.starts_with("INVITE ")
-                || upper.starts_with("OPTIONS ")
-            {
+            let is_sip = (text.len() >= 4 && text[..4].eq_ignore_ascii_case("SIP/"))
+                || (text.len() >= 9 && text[..9].eq_ignore_ascii_case("REGISTER "))
+                || (text.len() >= 7 && text[..7].eq_ignore_ascii_case("INVITE "))
+                || (text.len() >= 8 && text[..8].eq_ignore_ascii_case("OPTIONS "));
+            if is_sip {
                 return Some(Protocol::Sip);
             }
         }
@@ -228,8 +228,10 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
 
     // Flags: QR=1, Opcode=0, AA=0, TC=0, RD=1, RA=1, RCODE=2 (SERVFAIL)
     buf.put_u16(0x8182);
-    // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
-    buf.put_u16(1);
+    // QDCOUNT (placeholder — will be patched to 1 if we echo the question),
+    // ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+    let qdcount_offset = buf.len();
+    buf.put_u16(0); // QDCOUNT placeholder
     buf.put_u16(0);
     buf.put_u16(0);
     buf.put_u16(0);
@@ -237,22 +239,38 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
     // Echo the question section from the incoming query if available.
     // The question section starts at byte 12 in a DNS message and consists
     // of: QNAME (sequence of labels ending with 0) + QTYPE (2) + QCLASS (2).
+    // We intentionally do not support compression pointers here; if we
+    // encounter them, we refrain from echoing the question.
     if incoming.len() > 12 {
         let mut pos = 12;
+        let mut valid_question = true;
         // Walk QNAME labels until root label (0) or end of packet
         while pos < incoming.len() {
             let label_len = incoming[pos] as usize;
+            // Compression pointer (two high bits set) is not supported here.
+            if label_len & 0xC0 == 0xC0 {
+                valid_question = false;
+                break;
+            }
             if label_len == 0 {
-                // Include root label (0) + QTYPE (2) + QCLASS (2) = 5 bytes
-                let end = std::cmp::min(pos + 5, incoming.len());
-                buf.put_slice(&incoming[12..end]);
+                // Ensure we have root label (0) + QTYPE (2) + QCLASS (2) = 5 bytes
+                if pos + 5 <= incoming.len() {
+                    buf.put_slice(&incoming[12..pos + 5]);
+                    // Patch QDCOUNT to 1 since we successfully echoed the question
+                    buf[qdcount_offset] = 0x00;
+                    buf[qdcount_offset + 1] = 0x01;
+                } else {
+                    valid_question = false;
+                }
                 break;
             }
             pos += 1 + label_len;
             if pos > incoming.len() {
+                valid_question = false;
                 break;
             }
         }
+        let _ = valid_question; // consumed above via early breaks
     }
 
     buf.freeze()
@@ -268,13 +286,15 @@ fn generate_sip_trying(incoming: &[u8]) -> Bytes {
     buf.put_slice(b"SIP/2.0 100 Trying\r\n");
 
     // Echo key SIP headers from the incoming request for realism.
+    // Allocation-free ASCII case-insensitive prefix checks.
     if let Ok(text) = std::str::from_utf8(incoming) {
         let echo_prefixes = ["via:", "from:", "to:", "call-id:", "cseq:"];
         for line in text.lines() {
             let trimmed = line.trim();
-            let lower = trimmed.to_lowercase();
             for &prefix in &echo_prefixes {
-                if lower.starts_with(prefix) {
+                if trimmed.len() >= prefix.len()
+                    && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+                {
                     buf.put_slice(trimmed.as_bytes());
                     buf.put_slice(b"\r\n");
                     break;
@@ -471,6 +491,48 @@ mod tests {
         assert!(resp.len() > 12, "DNS response should include question section");
         // QNAME echoed: starts at byte 12 with label length 7 ("example")
         assert_eq!(resp[12], 7);
+        // QDCOUNT should be 1 since the question was echoed
+        assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 1);
+    }
+
+    #[test]
+    fn generate_dns_response_truncated_question_qdcount_zero() {
+        // DNS query with truncated question section (missing QTYPE/QCLASS)
+        let mut query = vec![0x00u8; 12];
+        query[0] = 0x12; // TX ID
+        query[1] = 0x34;
+        query[4] = 0x00; query[5] = 0x01; // QDCOUNT=1
+        // QNAME: 3foo0 but missing QTYPE/QCLASS
+        query.push(3);
+        query.extend_from_slice(b"foo");
+        query.push(0); // root label — but no QTYPE/QCLASS follows
+
+        let resp = generate_response(Protocol::Dns, &query);
+        // TX ID echoed
+        assert_eq!(resp[0], 0x12);
+        assert_eq!(resp[1], 0x34);
+        // QDCOUNT should be 0 since question section is incomplete
+        assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 0);
+        // Response should be header only (12 bytes)
+        assert_eq!(resp.len(), 12);
+    }
+
+    #[test]
+    fn generate_dns_response_compression_pointer_qdcount_zero() {
+        // DNS query with a compression pointer in QNAME — we don't support these
+        let mut query = vec![0x00u8; 12];
+        query[0] = 0x56; // TX ID
+        query[1] = 0x78;
+        query[4] = 0x00; query[5] = 0x01; // QDCOUNT=1
+        // QNAME starting with a compression pointer (0xC0 0x00)
+        query.push(0xC0);
+        query.push(0x00);
+
+        let resp = generate_response(Protocol::Dns, &query);
+        // QDCOUNT should be 0 since we refused to parse compression pointer
+        assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 0);
+        // Response should be header only (12 bytes)
+        assert_eq!(resp.len(), 12);
     }
 
     // -- AWG packet classification tests --
