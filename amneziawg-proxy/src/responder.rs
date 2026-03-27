@@ -191,9 +191,13 @@ fn generate_quic_version_negotiation(incoming: &[u8]) -> Bytes {
 }
 
 /// DNS SERVFAIL response (RFC 1035 §4.1):
-/// Echoes the transaction ID, sets QR=1, RCODE=2 (SERVFAIL).
+/// Echoes the transaction ID and question section, sets QR=1, RCODE=2
+/// (SERVFAIL).
+///
+/// Echoing the question section back is required by RFC 1035 §4.1.1 and makes
+/// the response indistinguishable from a real recursive resolver failure.
 fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(12);
+    let mut buf = BytesMut::with_capacity(512);
 
     // Transaction ID (echo from query)
     if incoming.len() >= 2 {
@@ -210,12 +214,57 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
     buf.put_u16(0);
     buf.put_u16(0);
 
+    // Echo the question section from the incoming query if available.
+    // The question section starts at byte 12 in a DNS message and consists
+    // of: QNAME (sequence of labels ending with 0) + QTYPE (2) + QCLASS (2).
+    if incoming.len() > 12 {
+        let mut pos = 12;
+        // Walk QNAME labels until root label (0) or end of packet
+        while pos < incoming.len() {
+            let label_len = incoming[pos] as usize;
+            if label_len == 0 {
+                // Include root label (0) + QTYPE (2) + QCLASS (2) = 5 bytes
+                let end = std::cmp::min(pos + 5, incoming.len());
+                buf.put_slice(&incoming[12..end]);
+                break;
+            }
+            pos += 1 + label_len;
+            if pos > incoming.len() {
+                break;
+            }
+        }
+    }
+
     buf.freeze()
 }
 
-/// SIP 100 Trying response.
-fn generate_sip_trying(_incoming: &[u8]) -> Bytes {
-    Bytes::from_static(b"SIP/2.0 100 Trying\r\nContent-Length: 0\r\n\r\n")
+/// SIP 100 Trying response (RFC 3261 §8.2.6).
+///
+/// A proper 100 Trying MUST echo the Via, From, To, Call-ID, and CSeq headers
+/// from the incoming request. We parse and echo these when available; this
+/// makes the response indistinguishable from a real SIP proxy.
+fn generate_sip_trying(incoming: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(512);
+    buf.put_slice(b"SIP/2.0 100 Trying\r\n");
+
+    // Echo key SIP headers from the incoming request for realism.
+    if let Ok(text) = std::str::from_utf8(incoming) {
+        let echo_prefixes = ["via:", "from:", "to:", "call-id:", "cseq:"];
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let lower = trimmed.to_lowercase();
+            for &prefix in &echo_prefixes {
+                if lower.starts_with(prefix) {
+                    buf.put_slice(trimmed.as_bytes());
+                    buf.put_slice(b"\r\n");
+                    break;
+                }
+            }
+        }
+    }
+
+    buf.put_slice(b"Content-Length: 0\r\n\r\n");
+    buf.freeze()
 }
 
 #[cfg(test)]
@@ -305,6 +354,50 @@ mod tests {
         let resp = generate_response(Protocol::Sip, b"INVITE sip:user@example.com SIP/2.0\r\n");
         let text = std::str::from_utf8(&resp).unwrap();
         assert!(text.starts_with("SIP/2.0 100 Trying"));
+    }
+
+    #[test]
+    fn generate_sip_response_echoes_headers() {
+        let incoming = b"INVITE sip:user@example.com SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK776\r\nFrom: <sip:caller@example.com>;tag=1234\r\nTo: <sip:user@example.com>\r\nCall-ID: a84b4c76e66710@pc33.example.com\r\nCSeq: 314159 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let resp = generate_response(Protocol::Sip, incoming);
+        let text = std::str::from_utf8(&resp).unwrap();
+        assert!(text.starts_with("SIP/2.0 100 Trying"));
+        assert!(text.contains("Via:"));
+        assert!(text.contains("From:"));
+        assert!(text.contains("To:"));
+        assert!(text.contains("Call-ID:"));
+        assert!(text.contains("CSeq:"));
+    }
+
+    #[test]
+    fn generate_dns_response_echoes_question() {
+        // Build a DNS query for "example.com" A record
+        let mut query = Vec::new();
+        query.extend_from_slice(&[0xAB, 0xCD]); // TX ID
+        query.extend_from_slice(&[0x01, 0x00]); // Flags: RD=1
+        query.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+        query.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
+        query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
+        query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
+        // QNAME: 7example3com0
+        query.push(7);
+        query.extend_from_slice(b"example");
+        query.push(3);
+        query.extend_from_slice(b"com");
+        query.push(0); // root label
+        query.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+        query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+
+        let resp = generate_response(Protocol::Dns, &query);
+        // TX ID echoed
+        assert_eq!(resp[0], 0xAB);
+        assert_eq!(resp[1], 0xCD);
+        // QR=1
+        assert!(resp[2] & 0x80 != 0);
+        // Response should include the question section
+        assert!(resp.len() > 12, "DNS response should include question section");
+        // QNAME echoed: starts at byte 12 with label length 7 ("example")
+        assert_eq!(resp[12], 7);
     }
 
     // -- AWG packet classification tests --
