@@ -40,6 +40,7 @@ impl Proxy {
         let sessions = Arc::new(SessionTable::new(
             backend_addr,
             Duration::from_secs(config.session_ttl_secs),
+            config.max_sessions,
         ));
         let metrics = Arc::new(MetricsStore::new(config.rate_limit_per_sec));
 
@@ -126,25 +127,27 @@ impl Proxy {
 
     /// Handle a packet received from a client.
     async fn handle_client_packet(&self, data: &[u8], client_addr: SocketAddr) {
-        let metrics = self.metrics.get_or_create(client_addr);
-        metrics.record_in();
-        drop(metrics);
+        if let Some(metrics) = self.metrics.get_or_create(client_addr) {
+            metrics.record_in();
+            drop(metrics);
+        }
 
         // Check if this is a probe packet and respond if rate allows
         if let Some(proto) = responder::detect_protocol(data) {
-            let metrics = self.metrics.get_or_create(client_addr);
-            if metrics.try_acquire_probe() {
-                metrics.record_probe();
-                drop(metrics);
+            if let Some(metrics) = self.metrics.get_or_create(client_addr) {
+                if metrics.try_acquire_probe() {
+                    metrics.record_probe();
+                    drop(metrics);
 
-                let response = responder::generate_response(proto, data);
-                if let Err(e) = self.frontend.send_to(&response, client_addr).await {
-                    warn!(%client_addr, error = %e, "failed to send probe response");
+                    let response = responder::generate_response(proto, data);
+                    if let Err(e) = self.frontend.send_to(&response, client_addr).await {
+                        warn!(%client_addr, error = %e, "failed to send probe response");
+                    }
+                    debug!(%client_addr, protocol = ?proto, "probe response sent");
+                } else {
+                    debug!(%client_addr, "probe rate limited");
+                    drop(metrics);
                 }
-                debug!(%client_addr, protocol = ?proto, "probe response sent");
-            } else {
-                debug!(%client_addr, "probe rate limited");
-                drop(metrics);
             }
         }
 
@@ -195,13 +198,13 @@ impl Proxy {
         tokio::spawn(async move {
             // Poll all backend sockets for responses
             let mut interval = tokio::time::interval(Duration::from_millis(1));
+            let mut buf = vec![0u8; buffer_size];
 
             loop {
                 interval.tick().await;
 
                 let sockets = sessions.all_backend_sockets();
                 for (client_addr, backend_sock) in sockets {
-                    let mut buf = vec![0u8; buffer_size];
                     match backend::try_recv_from_backend(
                         &backend_sock,
                         &mut buf,
@@ -215,9 +218,10 @@ impl Proxy {
                             // and apply the transform in-place
                             transform::apply_s4_padding(&mut buf[..n], n, protocol);
 
-                            let m = metrics.get_or_create(client_addr);
-                            m.record_out();
-                            drop(m);
+                            if let Some(m) = metrics.get_or_create(client_addr) {
+                                m.record_out();
+                                drop(m);
+                            }
 
                             sessions.touch(&client_addr);
 
@@ -252,6 +256,7 @@ mod tests {
             rate_limit_per_sec: 5,
             imitate_protocol: "quic".into(),
             buffer_size: 4096,
+            max_sessions: 1000,
         };
 
         let proxy = Proxy::bind(config).await.unwrap();
@@ -291,6 +296,7 @@ mod tests {
             rate_limit_per_sec: 10,
             imitate_protocol: "quic".into(),
             buffer_size: 4096,
+            max_sessions: 1000,
         };
 
         let proxy = Proxy::bind(config).await.unwrap();

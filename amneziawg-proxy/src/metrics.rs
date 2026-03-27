@@ -71,6 +71,7 @@ impl ClientMetrics {
 pub struct MetricsStore {
     clients: DashMap<SocketAddr, ClientMetrics>,
     rate_limit_per_sec: u32,
+    max_clients: usize,
 }
 
 impl MetricsStore {
@@ -78,17 +79,25 @@ impl MetricsStore {
         Self {
             clients: DashMap::new(),
             rate_limit_per_sec,
+            max_clients: 10000,
         }
     }
 
     /// Get or create metrics for a client.
-    pub fn get_or_create(&self, addr: SocketAddr) -> dashmap::mapref::one::Ref<'_, SocketAddr, ClientMetrics> {
-        if !self.clients.contains_key(&addr) {
-            self.clients
-                .entry(addr)
-                .or_insert_with(|| ClientMetrics::new(self.rate_limit_per_sec));
+    /// Returns `None` if the client limit has been reached and this is a new client.
+    pub fn get_or_create(&self, addr: SocketAddr) -> Option<dashmap::mapref::one::Ref<'_, SocketAddr, ClientMetrics>> {
+        // Fast path: already exists
+        if let Some(r) = self.clients.get(&addr) {
+            return Some(r);
         }
-        self.clients.get(&addr).unwrap()
+        // Check limit before inserting
+        if self.clients.len() >= self.max_clients {
+            return None;
+        }
+        self.clients
+            .entry(addr)
+            .or_insert_with(|| ClientMetrics::new(self.rate_limit_per_sec));
+        self.clients.get(&addr)
     }
 
     /// Remove metrics for a client (called on session expiry).
@@ -155,12 +164,12 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         assert!(store.is_empty());
 
-        let m = store.get_or_create(addr);
+        let m = store.get_or_create(addr).unwrap();
         m.record_in();
         drop(m);
 
         assert_eq!(store.len(), 1);
-        let m = store.get_or_create(addr);
+        let m = store.get_or_create(addr).unwrap();
         assert_eq!(m.packets_in.load(Ordering::Relaxed), 1);
     }
 
@@ -172,5 +181,21 @@ mod tests {
         assert_eq!(store.len(), 1);
         store.remove(&addr);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn metrics_store_max_clients() {
+        let mut store = MetricsStore::new(5);
+        store.max_clients = 2;
+
+        let a1: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let a2: SocketAddr = "127.0.0.1:1002".parse().unwrap();
+        let a3: SocketAddr = "127.0.0.1:1003".parse().unwrap();
+
+        assert!(store.get_or_create(a1).is_some());
+        assert!(store.get_or_create(a2).is_some());
+        // Third client should be rejected
+        assert!(store.get_or_create(a3).is_none());
+        assert_eq!(store.len(), 2);
     }
 }

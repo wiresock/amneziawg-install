@@ -31,6 +31,10 @@ pub struct ProxyConfig {
     /// Buffer size for UDP recv in bytes.
     #[serde(default = "default_buffer_size")]
     pub buffer_size: usize,
+
+    /// Maximum number of concurrent sessions (prevents resource exhaustion).
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
 }
 
 fn default_session_ttl() -> u64 {
@@ -48,6 +52,9 @@ fn default_imitate_protocol() -> String {
 fn default_buffer_size() -> usize {
     65535
 }
+fn default_max_sessions() -> usize {
+    10000
+}
 
 impl Default for ProxyConfig {
     fn default() -> Self {
@@ -59,6 +66,7 @@ impl Default for ProxyConfig {
             rate_limit_per_sec: default_rate_limit(),
             imitate_protocol: default_imitate_protocol(),
             buffer_size: default_buffer_size(),
+            max_sessions: default_max_sessions(),
         }
     }
 }

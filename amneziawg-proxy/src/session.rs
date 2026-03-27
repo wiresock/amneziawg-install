@@ -21,14 +21,16 @@ pub struct SessionTable {
     sessions: DashMap<SocketAddr, Session>,
     backend_addr: SocketAddr,
     ttl: Duration,
+    max_sessions: usize,
 }
 
 impl SessionTable {
-    pub fn new(backend_addr: SocketAddr, ttl: Duration) -> Self {
+    pub fn new(backend_addr: SocketAddr, ttl: Duration, max_sessions: usize) -> Self {
         Self {
             sessions: DashMap::new(),
             backend_addr,
             ttl,
+            max_sessions,
         }
     }
 
@@ -41,6 +43,16 @@ impl SessionTable {
         if let Some(mut entry) = self.sessions.get_mut(&client_addr) {
             entry.last_active = Instant::now();
             return Ok(Arc::clone(&entry.backend_sock));
+        }
+
+        // Check session limit before creating a new one
+        if self.sessions.len() >= self.max_sessions {
+            anyhow::bail!(
+                "session limit reached ({}/{}), rejecting {}",
+                self.sessions.len(),
+                self.max_sessions,
+                client_addr,
+            );
         }
 
         // Slow path: create a new session
@@ -128,7 +140,7 @@ mod tests {
     #[tokio::test]
     async fn create_and_retrieve_session() {
         let backend: SocketAddr = "127.0.0.1:19999".parse().unwrap();
-        let table = SessionTable::new(backend, Duration::from_secs(60));
+        let table = SessionTable::new(backend, Duration::from_secs(60), 1000);
         let client: SocketAddr = "10.0.0.1:5555".parse().unwrap();
 
         let sock1 = table.get_or_create(client).await.unwrap();
@@ -146,7 +158,7 @@ mod tests {
     async fn cleanup_expired_sessions() {
         let backend: SocketAddr = "127.0.0.1:19999".parse().unwrap();
         // TTL of 0 means everything expires immediately
-        let table = SessionTable::new(backend, Duration::from_millis(0));
+        let table = SessionTable::new(backend, Duration::from_millis(0), 1000);
         let client: SocketAddr = "10.0.0.1:5555".parse().unwrap();
 
         table.get_or_create(client).await.unwrap();
@@ -163,7 +175,7 @@ mod tests {
     #[tokio::test]
     async fn touch_refreshes_session() {
         let backend: SocketAddr = "127.0.0.1:19999".parse().unwrap();
-        let table = SessionTable::new(backend, Duration::from_secs(60));
+        let table = SessionTable::new(backend, Duration::from_secs(60), 1000);
         let client: SocketAddr = "10.0.0.1:5555".parse().unwrap();
 
         table.get_or_create(client).await.unwrap();
@@ -175,7 +187,7 @@ mod tests {
     #[tokio::test]
     async fn remove_session() {
         let backend: SocketAddr = "127.0.0.1:19999".parse().unwrap();
-        let table = SessionTable::new(backend, Duration::from_secs(60));
+        let table = SessionTable::new(backend, Duration::from_secs(60), 1000);
         let client: SocketAddr = "10.0.0.1:5555".parse().unwrap();
 
         table.get_or_create(client).await.unwrap();
@@ -186,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn all_backend_sockets_returns_entries() {
         let backend: SocketAddr = "127.0.0.1:19999".parse().unwrap();
-        let table = SessionTable::new(backend, Duration::from_secs(60));
+        let table = SessionTable::new(backend, Duration::from_secs(60), 1000);
         let c1: SocketAddr = "10.0.0.1:1111".parse().unwrap();
         let c2: SocketAddr = "10.0.0.2:2222".parse().unwrap();
 
@@ -195,5 +207,21 @@ mod tests {
 
         let socks = table.all_backend_sockets();
         assert_eq!(socks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn session_limit_enforced() {
+        let backend: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+        let table = SessionTable::new(backend, Duration::from_secs(60), 2);
+
+        let c1: SocketAddr = "10.0.0.1:1111".parse().unwrap();
+        let c2: SocketAddr = "10.0.0.2:2222".parse().unwrap();
+        let c3: SocketAddr = "10.0.0.3:3333".parse().unwrap();
+
+        assert!(table.get_or_create(c1).await.is_ok());
+        assert!(table.get_or_create(c2).await.is_ok());
+        // Third session should be rejected
+        assert!(table.get_or_create(c3).await.is_err());
+        assert_eq!(table.len(), 2);
     }
 }
