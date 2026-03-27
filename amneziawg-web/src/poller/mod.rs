@@ -232,7 +232,8 @@ impl Poller {
     ///    is attempted.
     ///
     /// If the config directory cannot be read, a warning is logged and the
-    /// step returns `Ok(())` (peers remain with `has_config = 0`).
+    /// step returns `Ok(())` — existing config-mapping fields are **not**
+    /// cleared (they retain whatever values they had from the previous cycle).
     async fn apply_config_mapping_step(&self) -> anyhow::Result<()> {
         let config_dir = self.config_dir.clone();
         let configs = match tokio::task::spawn_blocking(move || config_store::scan(&config_dir))

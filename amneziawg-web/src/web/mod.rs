@@ -1113,6 +1113,10 @@ async fn api_create_user(
     {
         Ok(result) => {
             // Trigger a config rescan so config-to-peer mappings are updated after creation.
+            // Note: the client config file itself is written by the install script (often
+            // outside config_dir, e.g. under /root or /home/<user>).  The rescan picks up
+            // the new [Peer] block from the server config, not the client config file.
+            // The client config path is returned in the API response for direct access.
             if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
                 tracing::warn!(error = %e, "post-create config rescan failed");
             }

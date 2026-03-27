@@ -13,7 +13,7 @@ mod web;
 
 use anyhow::Context;
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::AuthConfig;
 use crate::db::Database;
@@ -96,7 +96,9 @@ async fn main() -> anyhow::Result<()> {
     // --- Validate install-script path early --------------------------------
     // The script path is security-critical: it is invoked via sudo and must
     // be an absolute path, free of whitespace/commas (sudoers can't handle
-    // those), and must exist + be executable.
+    // those).  If the file doesn't exist yet (e.g. mid-install or
+    // deployments that don't use user lifecycle), we warn instead of failing
+    // so the rest of the service can still start.
     {
         let p = &config.install_script;
         if !p.is_absolute() {
@@ -113,22 +115,23 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         if !p.is_file() {
-            anyhow::bail!(
-                "AWG_INSTALL_SCRIPT not found: {}",
-                p.display()
+            warn!(
+                path = %p.display(),
+                "AWG_INSTALL_SCRIPT not found; user lifecycle features will fail until the script is installed"
             );
-        }
-        // Best-effort executable check on Unix.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let meta = std::fs::metadata(p)
-                .with_context(|| format!("cannot stat AWG_INSTALL_SCRIPT: {}", p.display()))?;
-            if meta.permissions().mode() & 0o111 == 0 {
-                anyhow::bail!(
-                    "AWG_INSTALL_SCRIPT is not executable: {}",
-                    p.display()
-                );
+        } else {
+            // Best-effort executable check on Unix.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::metadata(p)
+                    .with_context(|| format!("cannot stat AWG_INSTALL_SCRIPT: {}", p.display()))?;
+                if meta.permissions().mode() & 0o111 == 0 {
+                    anyhow::bail!(
+                        "AWG_INSTALL_SCRIPT is not executable: {}",
+                        p.display()
+                    );
+                }
             }
         }
         info!(path = %p.display(), "install script validated");

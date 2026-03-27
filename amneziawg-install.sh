@@ -2951,6 +2951,15 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 	chmod 600 "${client_conf}" 2>/dev/null || true
 
+	# When invoked via sudo from a service user (e.g. awg-web), ensure the
+	# generated config is readable by that user so the web service can serve
+	# config downloads and config-directory rescans can discover the file.
+	if [[ -n "${AWG_WEB_USER:-}" ]]; then
+		chown "${AWG_WEB_USER}":"${AWG_WEB_USER}" "${client_conf}" 2>/dev/null || true
+	elif [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+		chown "${SUDO_USER}":"${SUDO_USER}" "${client_conf}" 2>/dev/null || true
+	fi
+
 	# Add peer to server config
 	echo -e "\n### Client ${CLIENT_NAME}
 [Peer]
