@@ -51,6 +51,24 @@ fn truncate_for_log(s: &str) -> String {
     s.chars().take(STDERR_LOG_LIMIT).collect()
 }
 
+/// Drain a pipe fully so the child process never gets a broken-pipe error.
+///
+/// Only the first [`PIPE_CAPTURE_LIMIT`] bytes are stored in `buf`; any excess
+/// is read and discarded so the child can finish writing without blocking.
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    // Phase 1: read up to the capture limit into buf.
+    let mut limited = reader.take(PIPE_CAPTURE_LIMIT as u64);
+    limited.read_to_end(buf).await?;
+
+    // Phase 2: discard any remaining output so the pipe stays open.
+    let inner = limited.into_inner();
+    tokio::io::copy(inner, &mut tokio::io::sink()).await?;
+    Ok(())
+}
+
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -187,11 +205,13 @@ impl ScriptBridge {
 
         // Read stdout/stderr concurrently with waiting on the child process
         // to avoid deadlocks on full OS pipe buffers.
-        // Reads are capped at PIPE_CAPTURE_LIMIT bytes to bound memory usage.
+        //
+        // We drain the pipes fully so the child process never gets a broken
+        // pipe error, but only *store* up to PIPE_CAPTURE_LIMIT bytes.
         let stdout_fut = async move {
             let mut buf = Vec::new();
             if let Some(mut h) = stdout_handle {
-                if let Err(e) = (&mut h).take(PIPE_CAPTURE_LIMIT as u64).read_to_end(&mut buf).await {
+                if let Err(e) = drain_pipe(&mut h, &mut buf).await {
                     warn!(error = %e, "failed to read child stdout");
                 }
             }
@@ -201,7 +221,7 @@ impl ScriptBridge {
         let stderr_fut = async move {
             let mut buf = Vec::new();
             if let Some(mut h) = stderr_handle {
-                if let Err(e) = (&mut h).take(PIPE_CAPTURE_LIMIT as u64).read_to_end(&mut buf).await {
+                if let Err(e) = drain_pipe(&mut h, &mut buf).await {
                     warn!(error = %e, "failed to read child stderr");
                 }
             }

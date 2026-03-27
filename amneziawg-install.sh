@@ -3017,7 +3017,7 @@ function nonInteractiveRemoveClient() {
 
 function nonInteractiveListClients() {
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
-	grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3
+	grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3 || true
 }
 
 # Only run main logic when executed directly (not when sourced for testing)
