@@ -1168,6 +1168,18 @@ async fn api_remove_user(
         }
     };
 
+    // Only peers whose friendly_name passes installer validation can be removed
+    // via the script.  Configs not matching the `*-client-<name>.conf` pattern
+    // (or with names that exceed the character/length constraints) are not
+    // managed by the installer and would always fail.
+    if let Err(e) = crate::admin::script_bridge::validate_client_name(&client_name) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("peer is not managed by installer: {e}") })),
+        )
+            .into_response());
+    }
+
     match crate::admin::execute_remove_user(
         &state.db,
         &state.script_bridge,
@@ -1238,10 +1250,12 @@ async fn post_add_user_form(
             Ok(Html(render_peer_list_with_error(&peers, &csrf, &msg)).into_response())
         }
         Err(e) => {
+            tracing::error!(error = %e, "failed to create user via HTML form");
             let rows = crate::db::peers::list_all(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
-            Ok(Html(render_peer_list_with_error(&peers, &csrf, &e.to_string())).into_response())
+            let message = "Failed to create user. Please try again later or contact the administrator.";
+            Ok(Html(render_peer_list_with_error(&peers, &csrf, message)).into_response())
         }
     }
 }
@@ -1858,11 +1872,14 @@ fn render_peer_detail(
         disabled_checked = if dto.disabled { " checked" } else { "" },
     ));
 
-    // Remove user form (only shown when the peer has a linked config)
+    // Remove user form (only shown when the peer has a linked config and the
+    // friendly name passes installer-managed name validation, i.e. it matches
+    // the `-client-<name>` pattern and `[a-zA-Z0-9_-]{1,15}`).
     if dto.has_config {
         if let Some(ref fn_name) = dto.friendly_name {
-            buf.push_str(&format!(
-                r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
+            if crate::admin::script_bridge::validate_client_name(fn_name).is_ok() {
+                buf.push_str(&format!(
+                    r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
 <h2 style="color:#c00">Remove user</h2>
 <p>This will permanently revoke the client <strong>{name}</strong> and delete its config file.
 Historical data (snapshots, events) will be preserved.</p>
@@ -1876,11 +1893,12 @@ Historical data (snapshots, events) will be preserved.</p>
 </form>
 </div>
 "#,
-                id = dto.id,
-                csrf = esc(csrf_token),
-                name = esc(fn_name),
-                name_js = esc_js(fn_name),
-            ));
+                    id = dto.id,
+                    csrf = esc(csrf_token),
+                    name = esc(fn_name),
+                    name_js = esc_js(fn_name),
+                ));
+            }
         }
     }
 
@@ -3817,6 +3835,41 @@ mod tests {
         assert!(
             !html.contains("Remove user"),
             "detail page should NOT show 'Remove user' when config is not linked"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_no_remove_when_name_not_installer_managed() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "DOTNAME_KEY==", Some("custom.name")).await;
+
+        // Config is linked but the friendly_name contains a dot (not installer-managed).
+        sqlx::query(
+            "UPDATE peers SET has_config = 1, friendly_name = 'custom.name', \
+             config_name = 'custom.name' WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !html.contains("Remove user"),
+            "detail page should NOT show 'Remove user' when friendly_name fails installer validation"
         );
     }
 

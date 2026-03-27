@@ -90,12 +90,6 @@ pub fn validate_client_name(name: &str) -> Result<(), ScriptError> {
                 .into(),
         ));
     }
-    // Additional safety: reject reserved names that could cause confusion
-    if name == "." || name == ".." {
-        return Err(ScriptError::InvalidName(
-            "client name must not be '.' or '..'".into(),
-        ));
-    }
     Ok(())
 }
 

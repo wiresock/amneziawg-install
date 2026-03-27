@@ -435,8 +435,20 @@ main() {
     # 3. Ensure the sudoers drop-in is up-to-date.
     #    Always rewrite so that upgrades from older versions pick up the
     #    additional `awg syncconf` / `awg-quick strip` and install-script rules.
+
+    # Determine the install script path for sudoers: default, overridable via env.
+    local install_script_path="/usr/local/bin/amneziawg-install.sh"
+    if [[ -f "${ENV_FILE}" ]]; then
+        # shellcheck disable=SC1090
+        local env_script_path
+        env_script_path="$(. "${ENV_FILE}" && echo "${AWG_INSTALL_SCRIPT:-}")"
+        if [[ -n "${env_script_path}" ]]; then
+            install_script_path="${env_script_path}"
+        fi
+    fi
+
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
-    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients"
+    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --add-client *, ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
     info "Installing/updating sudoers drop-in: ${SUDOERS_FILE}"
     mkdir -p "$(dirname "${SUDOERS_FILE}")"
     printf '# Allow amneziawg-web service to manage AWG state and peers.\n' \

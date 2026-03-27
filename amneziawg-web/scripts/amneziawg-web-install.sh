@@ -675,8 +675,24 @@ install_sudoers() {
     # Instead of running the whole service as root, we install tightly-scoped
     # sudoers rules that grant the service user passwordless sudo for only
     # these specific commands.
+
+    # Resolve the install-script path consistently with the service config.
+    # Preference order:
+    #   1. AWG_INSTALL_SCRIPT from the current environment (if set)
+    #   2. AWG_INSTALL_SCRIPT from the env file (if present)
+    #   3. Default to /usr/local/bin/amneziawg-install.sh
+    local install_script_path
+    if [[ -n "${AWG_INSTALL_SCRIPT:-}" ]]; then
+        install_script_path="${AWG_INSTALL_SCRIPT}"
+    elif [[ -f "${ENV_FILE}" ]]; then
+        # shellcheck disable=SC1090
+        install_script_path="$(. "${ENV_FILE}" && echo "${AWG_INSTALL_SCRIPT:-/usr/local/bin/amneziawg-install.sh}")"
+    else
+        install_script_path="/usr/local/bin/amneziawg-install.sh"
+    fi
+
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
-    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients"
+    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --add-client *, ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
 
     info "Sudoers rule (AWG): ${rule_awg}"
     info "Sudoers rule (install): ${rule_install}"

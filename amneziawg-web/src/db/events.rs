@@ -424,12 +424,14 @@ mod tests {
         let db = test_db().await;
         let pid = insert_peer(&db.pool, "REMOVE_KEY==").await;
 
+        let detail = format!(r#"{{"peer_id":{},"name":"bob"}}"#, pid);
+
         log_event(
             &db.pool,
             EVT_USER_REMOVE_REQUESTED,
             Some(pid),
             None,
-            Some(r#"{"peer_id":1,"name":"bob"}"#),
+            Some(&detail),
             "admin",
         )
         .await;
@@ -439,7 +441,7 @@ mod tests {
             EVT_USER_REMOVED,
             Some(pid),
             None,
-            Some(r#"{"peer_id":1,"name":"bob"}"#),
+            Some(&detail),
             "admin",
         )
         .await;
