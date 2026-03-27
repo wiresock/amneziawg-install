@@ -134,8 +134,8 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+            info!(path = %p.display(), "install script validated");
         }
-        info!(path = %p.display(), "install script validated");
     }
 
     if config.auth_enabled {
