@@ -349,8 +349,9 @@ mod tests {
 
     #[test]
     fn detect_quic_rejects_oversized_dcid() {
-        // DCID length > 20 is invalid per RFC 9000 §17.2
-        // Use version bytes that avoid accidentally matching DNS detection
+        // DCID length > 20 is invalid per RFC 9000 §17.2.
+        // Byte 2 is set to 0x80 so that the DNS detection heuristic
+        // (flags & 0xF800 == 0x0000) fails, preventing a false DNS match.
         let mut pkt = vec![0xC3u8, 0x00, 0x80, 0x00, 0x01];
         pkt.push(21); // DCID len > 20
         pkt.extend(std::iter::repeat(0xAA).take(21)); // DCID
@@ -360,7 +361,8 @@ mod tests {
 
     #[test]
     fn detect_quic_rejects_oversized_scid() {
-        // SCID length > 20 is invalid per RFC 9000 §17.2
+        // SCID length > 20 is invalid per RFC 9000 §17.2.
+        // Same byte-2 trick as above to avoid DNS false positive.
         let mut pkt = vec![0xC3u8, 0x00, 0x80, 0x00, 0x01];
         pkt.push(4); // DCID len
         pkt.extend_from_slice(&[1, 2, 3, 4]); // DCID
