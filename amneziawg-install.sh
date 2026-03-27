@@ -386,6 +386,19 @@ function checkOS() {
 			echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 22.04 or later"
 			exit 1
 		fi
+	elif [[ ${OS} == "linuxmint" ]]; then
+		if [[ -z "${VERSION_ID}" ]]; then
+			echo "Cannot detect Linux Mint version: VERSION_ID is missing from /etc/os-release"
+			exit 1
+		fi
+		# Linux Mint 21.x is based on Ubuntu 22.04; require major version >= 21
+		local MINT_MAJOR
+		MINT_MAJOR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
+		if ! [[ ${MINT_MAJOR} =~ ^[0-9]+$ ]] || [[ ${MINT_MAJOR} -lt 21 ]]; then
+			echo "Your version of Linux Mint (${VERSION_ID}) is not supported. Please use Linux Mint 21 or later"
+			exit 1
+		fi
+		OS=ubuntu # treat Linux Mint as Ubuntu for package management
 	elif [[ ${OS} == "fedora" ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
 			echo "Cannot detect Fedora version: VERSION_ID is missing from /etc/os-release"
@@ -408,7 +421,7 @@ function checkOS() {
 			exit 1
 		fi
 	else
-		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Fedora, CentOS, AlmaLinux or Rocky Linux system"
+		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Linux Mint, Fedora, CentOS, AlmaLinux or Rocky Linux system"
 		exit 1
 	fi
 }
