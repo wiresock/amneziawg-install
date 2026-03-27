@@ -2975,6 +2975,10 @@ function nonInteractiveRemoveClient() {
 		echo "ERROR: client name contains unsafe characters" >&2
 		exit 1
 	fi
+	if [[ ${#CLIENT_NAME} -gt 15 ]]; then
+		echo "ERROR: client name must be at most 15 characters" >&2
+		exit 1
+	fi
 
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 

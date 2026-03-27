@@ -157,7 +157,7 @@ impl ScriptBridge {
             "spawning install script"
         );
 
-        let child = tokio::process::Command::new(&self.sudo_path)
+        let mut child = tokio::process::Command::new(&self.sudo_path)
             .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -165,17 +165,30 @@ impl ScriptBridge {
             .spawn()
             .map_err(ScriptError::Spawn)?;
 
-        let result = tokio::time::timeout(self.timeout, child.wait_with_output()).await;
+        // Take ownership of stdout/stderr handles before the select! so we
+        // can still kill the child on timeout.
+        let mut stdout_handle = child.stdout.take();
+        let mut stderr_handle = child.stderr.take();
 
-        match result {
-            Err(_elapsed) => {
-                warn!(timeout = ?self.timeout, "install script timed out");
-                Err(ScriptError::Timeout(self.timeout))
-            }
-            Ok(Err(e)) => Err(ScriptError::Wait(e)),
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let timeout = self.timeout;
+        tokio::select! {
+            status_result = child.wait() => {
+                let status = status_result.map_err(ScriptError::Wait)?;
+
+                // Read captured output from the handles.
+                let mut stdout_buf = Vec::new();
+                let mut stderr_buf = Vec::new();
+                if let Some(ref mut h) = stdout_handle {
+                    use tokio::io::AsyncReadExt;
+                    let _ = h.read_to_end(&mut stdout_buf).await;
+                }
+                if let Some(ref mut h) = stderr_handle {
+                    use tokio::io::AsyncReadExt;
+                    let _ = h.read_to_end(&mut stderr_buf).await;
+                }
+
+                let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+                let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
 
                 if !stderr.is_empty() {
                     // Log stderr at debug level, redacting anything that might
@@ -184,7 +197,7 @@ impl ScriptBridge {
                     debug!(stderr = %stderr, "script stderr");
                 }
 
-                match output.status.code() {
+                match status.code() {
                     Some(0) => {
                         info!(flag, "install script completed successfully");
                         Ok(stdout.trim().to_string())
@@ -203,6 +216,12 @@ impl ScriptBridge {
                         })
                     }
                 }
+            }
+            _ = tokio::time::sleep(timeout) => {
+                warn!(timeout = ?timeout, "install script timed out – killing child process");
+                // Best-effort kill; ignore errors (process may have already exited).
+                let _ = child.kill().await;
+                Err(ScriptError::Timeout(timeout))
             }
         }
     }

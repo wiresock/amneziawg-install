@@ -252,14 +252,6 @@ pub struct CreateUserRequest {
     pub name: String,
 }
 
-/// JSON response from `POST /api/admin/users` on success.
-#[derive(Debug, Serialize)]
-#[allow(dead_code)]
-pub struct CreateUserResponse {
-    pub name: String,
-    pub config_path: String,
-}
-
 /// HTML form body for `POST /admin/users/add`.
 #[derive(Debug, Deserialize)]
 pub struct AddUserForm {
@@ -1136,11 +1128,14 @@ async fn api_create_user(
         Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
             Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
         }
-        Err(e) => Ok((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response()),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to create user via script");
+            Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal server error" })),
+            )
+                .into_response())
+        }
     }
 }
 
@@ -1191,11 +1186,14 @@ async fn api_remove_user(
         Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
             Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
         }
-        Err(e) => Ok((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response()),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to remove user via script");
+            Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal server error" })),
+            )
+                .into_response())
+        }
     }
 }
 
@@ -1498,12 +1496,32 @@ fn esc(s: &str) -> String {
 /// **Important:** `&` must be replaced first to avoid double-escaping
 /// entities produced by later replacements (e.g. `&lt;` → `&amp;lt;`).
 fn esc_js(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
+    // Build the escaped string in a single pass to avoid double-escaping.
+    let mut out = String::with_capacity(s.len());
+
+    for ch in s.chars() {
+        match ch {
+            // HTML escaping
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+
+            // JS string escaping
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+
+            // JS line terminators / control characters that would break the string
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+
+            _ => out.push(ch),
+        }
+    }
+
+    out
 }
 
 /// Render legacy combined status badge (used by tests).
@@ -3890,5 +3908,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn esc_js_escapes_html_and_js_specials() {
+        assert_eq!(
+            super::esc_js("a&b<c>d\"e'f\\g"),
+            "a&amp;b&lt;c&gt;d&quot;e\\'f\\\\g"
+        );
+    }
+
+    #[test]
+    fn esc_js_escapes_line_terminators() {
+        assert_eq!(super::esc_js("a\nb\rc"), "a\\nb\\rc");
+        assert_eq!(super::esc_js("x\u{2028}y\u{2029}z"), "x\\u2028y\\u2029z");
     }
 }

@@ -110,7 +110,6 @@ sudo chmod 0700 /etc/amneziawg-web
 ## 4. AWG binary and privilege setup
 
 `amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state,
-`amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state,
 `sudo /usr/bin/awg set … peer … remove` to disable peers,
 `sudo /usr/bin/awg syncconf` + `sudo /usr/bin/awg-quick strip` to re-enable
 peers, and `sudo /usr/local/bin/amneziawg-install.sh` for user lifecycle actions
