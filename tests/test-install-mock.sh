@@ -28,7 +28,7 @@ fi
 source /etc/os-release
 OS_FAMILY=""
 case "${ID}" in
-	ubuntu|debian) OS_FAMILY="debian" ;;
+	ubuntu|debian|linuxmint) OS_FAMILY="debian" ;;
 	fedora|centos|almalinux|rocky) OS_FAMILY="rhel" ;;
 	*) echo "Unsupported OS: ${ID}"; exit 1 ;;
 esac

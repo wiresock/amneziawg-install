@@ -290,6 +290,121 @@ fi
 }
 rm -f "${SERIALIZE_TMP}"
 
+# ============================================================
+# checkOS tests (Linux Mint support)
+# ============================================================
+echo "=== checkOS ==="
+
+# Helper: run checkOS with a fake /etc/os-release in a subshell.
+# The source builtin is overridden so checkOS reads our fake file
+# instead of the real /etc/os-release.
+FAKE_OS_DIR=$(mktemp -d)
+trap 'rm -rf "${FAKE_OS_DIR}"' EXIT
+
+run_checkOS_with() {
+	local FAKE_CONTENT="$1"
+	echo "${FAKE_CONTENT}" > "${FAKE_OS_DIR}/os-release"
+	(
+		# The install script does not use set -u, so disable it in the
+		# subshell to match production behaviour (VERSION_ID may be unset).
+		set +u
+		# Override source builtin to redirect /etc/os-release reads
+		source() {
+			if [[ "$1" == "/etc/os-release" ]]; then
+				builtin source "${FAKE_OS_DIR}/os-release"
+			else
+				builtin source "$@"
+			fi
+		}
+		checkOS
+		# On success, print the normalised OS value so the caller can verify it
+		echo "OS=${OS}"
+	) 2>&1
+}
+
+# Linux Mint 21.1 (Vera) — should succeed and normalise to ubuntu
+OUTPUT=$(run_checkOS_with 'ID="linuxmint"
+VERSION_ID="21.1"')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && echo "${OUTPUT}" | grep -q "OS=ubuntu"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: checkOS Mint 21.1 should succeed and set OS=ubuntu (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Linux Mint 21 — should succeed
+OUTPUT=$(run_checkOS_with 'ID="linuxmint"
+VERSION_ID="21"')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && echo "${OUTPUT}" | grep -q "OS=ubuntu"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: checkOS Mint 21 should succeed and set OS=ubuntu (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Linux Mint 22 — should succeed (future version)
+OUTPUT=$(run_checkOS_with 'ID="linuxmint"
+VERSION_ID="22"')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && echo "${OUTPUT}" | grep -q "OS=ubuntu"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: checkOS Mint 22 should succeed (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Linux Mint 20.3 — too old, should fail
+OUTPUT=$(run_checkOS_with 'ID="linuxmint"
+VERSION_ID="20.3"')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -ne 0 ]] && echo "${OUTPUT}" | grep -q "not supported"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: checkOS Mint 20.3 should fail (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Linux Mint with missing VERSION_ID — should fail
+OUTPUT=$(run_checkOS_with 'ID="linuxmint"')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -ne 0 ]] && echo "${OUTPUT}" | grep -q "VERSION_ID is missing"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: checkOS Mint with missing VERSION_ID should fail (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Ubuntu 24.04 — should still work
+OUTPUT=$(run_checkOS_with 'ID="ubuntu"
+VERSION_ID="24.04"')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && echo "${OUTPUT}" | grep -q "OS=ubuntu"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: checkOS Ubuntu 24.04 should succeed (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Unsupported distro — should fail
+OUTPUT=$(run_checkOS_with 'ID="archlinux"
+VERSION_ID="2024.01"')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -ne 0 ]] && echo "${OUTPUT}" | grep -q "aren't running"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: checkOS unsupported distro should fail (rc=${RC}, output: ${OUTPUT})"
+fi
+
 echo ""
 echo "=========================================="
 echo "Results: ${TESTS_PASSED}/${TESTS_RUN} passed, ${TESTS_FAILED} failed"
