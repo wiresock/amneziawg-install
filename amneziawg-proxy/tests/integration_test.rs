@@ -58,7 +58,7 @@ buffer_size = 4096
     let cfg: amneziawg_proxy::config::ProxyConfig =
         toml::from_str(&config_toml).unwrap();
 
-    let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg).await.unwrap();
+    let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg, None).await.unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
     let shutdown = proxy.shutdown_handle();
 
@@ -154,7 +154,7 @@ buffer_size = 4096
     let cfg: amneziawg_proxy::config::ProxyConfig =
         toml::from_str(&config_toml).unwrap();
 
-    let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg).await.unwrap();
+    let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg, None).await.unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
     let shutdown = proxy.shutdown_handle();
 

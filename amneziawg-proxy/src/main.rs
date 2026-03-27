@@ -34,7 +34,36 @@ async fn main() -> anyhow::Result<()> {
         "configuration loaded"
     );
 
-    let proxy = proxy::Proxy::bind(cfg).await?;
+    // Load AWG config if specified
+    let awg_params = if let Some(ref awg_path) = cfg.awg_config {
+        let path = PathBuf::from(awg_path);
+        info!(path = %path.display(), "loading AmneziaWG configuration");
+        let params = config::load_awg_config(&path)?;
+        info!(
+            jc = params.jc,
+            jmin = params.jmin,
+            jmax = params.jmax,
+            s1 = params.s1,
+            s2 = params.s2,
+            s3 = params.s3,
+            s4 = params.s4,
+            h1_min = params.h1.min,
+            h1_max = params.h1.max,
+            h2_min = params.h2.min,
+            h2_max = params.h2.max,
+            h3_min = params.h3.min,
+            h3_max = params.h3.max,
+            h4_min = params.h4.min,
+            h4_max = params.h4.max,
+            "AWG parameters loaded"
+        );
+        Some(params)
+    } else {
+        info!("no AWG config specified, running without packet classification");
+        None
+    };
+
+    let proxy = proxy::Proxy::bind(cfg, awg_params).await?;
     let shutdown = proxy.shutdown_handle();
 
     // Set up graceful shutdown on SIGINT / SIGTERM

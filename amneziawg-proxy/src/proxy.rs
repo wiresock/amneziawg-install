@@ -7,7 +7,7 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use crate::backend;
-use crate::config::ProxyConfig;
+use crate::config::{AwgParams, ProxyConfig};
 use crate::metrics::MetricsStore;
 use crate::responder::{self, Protocol};
 use crate::session::SessionTable;
@@ -20,12 +20,13 @@ pub struct Proxy {
     sessions: Arc<SessionTable>,
     metrics: Arc<MetricsStore>,
     protocol: Protocol,
+    awg_params: Option<Arc<AwgParams>>,
     shutdown: Arc<Notify>,
 }
 
 impl Proxy {
     /// Create and bind a new proxy instance.
-    pub async fn bind(config: ProxyConfig) -> anyhow::Result<Self> {
+    pub async fn bind(config: ProxyConfig, awg_params: Option<AwgParams>) -> anyhow::Result<Self> {
         let listen_addr: SocketAddr = config.listen.parse()?;
         let backend_addr: SocketAddr = config.backend.parse()?;
         let frontend = Arc::new(UdpSocket::bind(listen_addr).await?);
@@ -49,6 +50,7 @@ impl Proxy {
             backend = %backend_addr,
             protocol = %config.imitate_protocol,
             session_ttl = config.session_ttl_secs,
+            awg_params = awg_params.is_some(),
             "proxy initialized"
         );
 
@@ -58,6 +60,7 @@ impl Proxy {
             sessions,
             metrics,
             protocol,
+            awg_params: awg_params.map(Arc::new),
             shutdown: Arc::new(Notify::new()),
         })
     }
@@ -69,6 +72,7 @@ impl Proxy {
         sessions: Arc<SessionTable>,
         metrics: Arc<MetricsStore>,
         protocol: Protocol,
+        awg_params: Option<AwgParams>,
     ) -> Self {
         Self {
             config,
@@ -76,6 +80,7 @@ impl Proxy {
             sessions,
             metrics,
             protocol,
+            awg_params: awg_params.map(Arc::new),
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -192,6 +197,7 @@ impl Proxy {
         let frontend = Arc::clone(&self.frontend);
         let metrics = Arc::clone(&self.metrics);
         let protocol = self.protocol;
+        let awg_params = self.awg_params.clone();
         let buffer_size = self.config.buffer_size;
         let _shutdown = Arc::clone(&self.shutdown);
 
@@ -213,10 +219,18 @@ impl Proxy {
                     .await
                     {
                         Ok(Some(n)) => {
-                            // Apply S4 padding transformation
-                            // For simplicity, we treat the entire packet as payload
-                            // and apply the transform in-place
-                            transform::apply_s4_padding(&mut buf[..n], n, protocol);
+                            // Apply padding transformation to outgoing packets.
+                            // When AWG params are available, use per-type S-value
+                            // padding based on H-range classification. Otherwise,
+                            // fall back to treating the entire packet as payload
+                            // (no padding region to transform).
+                            if let Some(ref params) = awg_params {
+                                transform::apply_awg_transform(
+                                    &mut buf[..n],
+                                    params,
+                                    protocol,
+                                );
+                            }
 
                             if let Some(m) = metrics.get_or_create(client_addr) {
                                 m.record_out();
@@ -257,9 +271,10 @@ mod tests {
             imitate_protocol: "quic".into(),
             buffer_size: 4096,
             max_sessions: 1000,
+            awg_config: None,
         };
 
-        let proxy = Proxy::bind(config).await.unwrap();
+        let proxy = Proxy::bind(config, None).await.unwrap();
         let addr = proxy.local_addr().unwrap();
         assert_ne!(addr.port(), 0);
 
@@ -297,9 +312,10 @@ mod tests {
             imitate_protocol: "quic".into(),
             buffer_size: 4096,
             max_sessions: 1000,
+            awg_config: None,
         };
 
-        let proxy = Proxy::bind(config).await.unwrap();
+        let proxy = Proxy::bind(config, None).await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         let shutdown = proxy.shutdown_handle();
 
