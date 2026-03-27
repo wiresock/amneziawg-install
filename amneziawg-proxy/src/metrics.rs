@@ -62,7 +62,12 @@ impl ClientMetrics {
     /// This is entirely lock-free: we CAS-loop on the packed atomic state
     /// so no `Mutex` is held across `.await` boundaries.
     pub fn try_acquire_probe(&self) -> bool {
-        let now = coarse_now_secs();
+        self.try_acquire_at(coarse_now_secs())
+    }
+
+    /// Core token-bucket CAS loop parameterised by `now` so that tests
+    /// can simulate elapsed time without real sleeps.
+    fn try_acquire_at(&self, now: u32) -> bool {
         loop {
             let old = self.rate_state.load(Ordering::Acquire);
             let (old_mt, old_ts) = unpack(old);
@@ -219,12 +224,13 @@ mod tests {
             assert!(m.try_acquire_probe());
         }
         assert!(!m.try_acquire_probe());
-        // Wait for at least 1 second so the lock-free bucket refills.
-        // The bucket operates at whole-second granularity, so we need
-        // slightly more than 1s to guarantee a refill.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        // Now should have refilled
-        assert!(m.try_acquire_probe());
+
+        // Simulate 2 seconds passing by calling try_acquire_at() with a
+        // synthetic timestamp instead of sleeping for real wall-clock time.
+        // This exercises the same CAS refill logic without the 1+ second
+        // wall-clock delay.
+        let future = coarse_now_secs() + 2;
+        assert!(m.try_acquire_at(future));
     }
 
     #[test]

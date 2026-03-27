@@ -252,7 +252,13 @@ impl Proxy {
                         }
                     }
                     Err(e) => {
-                        debug!(%client_addr, error = %e, "relay recv error, ending session relay");
+                        warn!(%client_addr, error = %e, "relay recv error, removing session");
+                        // Remove the session so the next client packet recreates it
+                        // (and spawns a fresh relay).  Without this the session stays
+                        // in the table (is_new=false), no new relay is spawned, and
+                        // backend responses are silently black-holed until TTL cleanup.
+                        sessions.remove(&client_addr);
+                        metrics.remove(&client_addr);
                         break;
                     }
                 }
