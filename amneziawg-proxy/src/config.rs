@@ -339,6 +339,16 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
     if config.buffer_size == 0 {
         return Err(ProxyError::Config("buffer_size must be > 0".into()));
     }
+    if config.cleanup_interval_secs == 0 {
+        return Err(ProxyError::Config(
+            "cleanup_interval_secs must be > 0".into(),
+        ));
+    }
+    if config.session_ttl_secs == 0 {
+        return Err(ProxyError::Config(
+            "session_ttl_secs must be > 0".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -416,6 +426,28 @@ buffer_size = 0
 "#;
         let err = parse_config(toml).unwrap_err();
         assert!(err.to_string().contains("buffer_size must be > 0"));
+    }
+
+    #[test]
+    fn reject_zero_cleanup_interval() {
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+cleanup_interval_secs = 0
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err.to_string().contains("cleanup_interval_secs must be > 0"));
+    }
+
+    #[test]
+    fn reject_zero_session_ttl() {
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+session_ttl_secs = 0
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err.to_string().contains("session_ttl_secs must be > 0"));
     }
 
     #[test]

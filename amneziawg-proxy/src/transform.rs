@@ -143,10 +143,10 @@ fn apply_dns_padding(data: &mut [u8], payload_len: usize) {
     let header: [u8; 12] = [
         tx_hi, tx_lo,   // Transaction ID
         0x81, 0x80,     // Flags: QR=1, RD=1, RA=1, RCODE=NOERROR
-        0x00, 0x01,     // QDCOUNT = 1
+        0x00, 0x00,     // QDCOUNT = 0 (no question section emitted)
         0x00, 0x00,     // ANCOUNT = 0
         0x00, 0x00,     // NSCOUNT = 0
-        0x00, 0x01,     // ARCOUNT = 1 (OPT pseudo-RR for EDNS)
+        0x00, 0x00,     // ARCOUNT = 0 (no additional records emitted)
     ];
 
     let copy_len = std::cmp::min(padding.len(), header.len());
@@ -252,9 +252,9 @@ mod tests {
         assert_eq!(data[6] & 0x80, 0x80, "DNS QR bit should be set");
         assert_eq!(data[6], 0x81); // RD=1
         assert_eq!(data[7], 0x80); // RA=1
-        // QDCOUNT = 1
+        // QDCOUNT = 0
         assert_eq!(data[8], 0x00);
-        assert_eq!(data[9], 0x01);
+        assert_eq!(data[9], 0x00);
         // After header (12 bytes), rest should be zeros (EDNS padding)
         assert!(data[16..].iter().all(|&b| b == 0x00));
     }

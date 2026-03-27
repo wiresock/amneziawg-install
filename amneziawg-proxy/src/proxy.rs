@@ -214,7 +214,7 @@ impl Proxy {
                     match backend::try_recv_from_backend(
                         &backend_sock,
                         &mut buf,
-                        Duration::from_millis(0),
+                        Duration::from_millis(1),
                     )
                     .await
                     {
@@ -346,8 +346,8 @@ mod tests {
         assert!(result.is_ok(), "should receive probe response");
         let (_n, from) = result.unwrap().unwrap();
         assert_eq!(from, proxy_addr);
-        // Version negotiation starts with 0x80
-        assert_eq!(buf[0], 0x80);
+        // Version negotiation starts with 0xC3 (preserving incoming type bits)
+        assert_eq!(buf[0], 0xC3);
 
         // Backend should also have received the forwarded packet
         let mut backend_buf = [0u8; 4096];

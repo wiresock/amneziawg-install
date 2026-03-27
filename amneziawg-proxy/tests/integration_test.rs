@@ -50,10 +50,6 @@ buffer_size = 4096
         backend_addr
     );
 
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("proxy.toml");
-    std::fs::write(&config_path, &config_toml).unwrap();
-
     // Parse config to get a ProxyConfig
     let cfg: amneziawg_proxy::config::ProxyConfig =
         toml::from_str(&config_toml).unwrap();
@@ -111,8 +107,8 @@ buffer_size = 4096
         "should receive at least the probe response"
     );
 
-    // Check that we got a QUIC version negotiation (starts with 0x80)
-    let has_version_neg = responses.iter().any(|r| !r.is_empty() && r[0] == 0x80);
+    // Check that we got a QUIC version negotiation (starts with 0xC3, preserving incoming type bits)
+    let has_version_neg = responses.iter().any(|r| !r.is_empty() && r[0] == 0xC3);
     assert!(has_version_neg, "should have a QUIC version negotiation response");
 
     // 6. Test DNS probe

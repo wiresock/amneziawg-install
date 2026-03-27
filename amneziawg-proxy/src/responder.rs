@@ -147,8 +147,13 @@ pub fn generate_response(proto: Protocol, incoming: &[u8]) -> Bytes {
 fn generate_quic_version_negotiation(incoming: &[u8]) -> Bytes {
     let mut buf = BytesMut::with_capacity(64);
 
-    // First byte: long header indicator
-    buf.put_u8(0x80);
+    // First byte: long header indicator + fixed bit, preserving incoming type bits
+    let first_byte = if let Some(&b0) = incoming.first() {
+        b0 | 0xC0
+    } else {
+        0xC0
+    };
+    buf.put_u8(first_byte);
     // Version = 0 (version negotiation)
     buf.put_u32(0);
 
@@ -329,8 +334,8 @@ mod tests {
         pkt.extend_from_slice(&[0x11, 0x22]); // SCID
 
         let resp = generate_response(Protocol::Quic, &pkt);
-        // Should start with 0x80 (version negotiation)
-        assert_eq!(resp[0], 0x80);
+        // Should start with 0xC3 (version negotiation, preserving incoming type bits)
+        assert_eq!(resp[0], 0xC3);
         // Version = 0
         assert_eq!(&resp[1..5], &[0, 0, 0, 0]);
     }

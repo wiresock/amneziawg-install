@@ -171,7 +171,7 @@ A valid QUIC Version Negotiation packet (RFC 9000 §17.2.1):
 ```
 Byte  Field
 ────  ─────
- 0    0x80                    Long header form bit
+ 0    0xC3                    Long header form + fixed bit (incoming type bits preserved)
  1-4  0x00000000              Version = 0 (version negotiation)
  5    SCID_len                Response DCID = incoming SCID (swapped)
  6+   incoming_SCID bytes     (the swap makes it RFC-compliant)
@@ -241,7 +241,7 @@ failure.
 **Padding fill** (`apply_dns_padding`):
 - Bytes 0-1: Transaction ID derived from payload bytes 0-1
 - Bytes 2-3: `0x81 0x80` (QR=1, RD=1, RA=1, RCODE=NOERROR)
-- Bytes 4-11: Section counts (QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=1)
+- Bytes 4-11: Section counts (QDCOUNT=0, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0)
 - Bytes 12+: Zero-filled (EDNS OPT padding per RFC 7830)
 
 ```
@@ -373,7 +373,7 @@ Byte  Value   Meaning
 ```
 Byte  Value       Meaning
 ────  ─────       ───────
-  0   0x80        Long header form bit
+  0   0xC3        Long header form + fixed bit (incoming type bits preserved)
   1   0x00 00     ┐
   3   0x00 00     ┘ Version = 0 (version negotiation marker)
   5   0x00        Response DCID len = 0 (incoming SCID was empty)
