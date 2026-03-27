@@ -203,9 +203,9 @@ impl Proxy {
         let sessions = Arc::clone(&self.sessions);
         let protocol = self.protocol;
         let awg_params = self.awg_params.clone();
-        // Cap per-session relay buffer to 1500 (typical MTU) to avoid
-        // O(sessions × buffer_size) memory pressure with large buffer_size.
-        let relay_buf_size = std::cmp::min(self.config.buffer_size, 1500);
+        // Use per-session relay buffer up to configured buffer_size, but do not
+        // exceed a safe upper bound to avoid unbounded memory usage per session.
+        let relay_buf_size = std::cmp::min(self.config.buffer_size, 65_535);
         let relay_handles = Arc::clone(&self.relay_handles);
 
         let handle = tokio::spawn(async move {

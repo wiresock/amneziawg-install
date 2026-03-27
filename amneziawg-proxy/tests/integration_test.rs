@@ -27,8 +27,7 @@ async fn spawn_echo_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
-/// Helper: write a minimal TOML config and start the proxy binary as a subprocess.
-/// For integration testing we use the library directly instead.
+/// Build a minimal in-memory TOML config and exercise the proxy via the library (no subprocess).
 #[tokio::test]
 async fn full_round_trip_with_echo_backend() {
     // 1. Start the echo backend
