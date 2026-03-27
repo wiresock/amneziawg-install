@@ -241,22 +241,27 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | Rate limiting | 5 login attempts per 5-minute window per IP; `429` on excess |
 | Audit log | Every peer write, login, and logout recorded |
 | No shell injection | AWG binary called via `Command::new()` with explicit args |
-| AWG access | Narrowly-scoped sudoers rules (AWG read/peer-remove, install script lifecycle) |
+| AWG access | Narrowly-scoped sudoers rules (`awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`, install script lifecycle) |
 
 ### AWG privilege model
 
 The service runs as a dedicated non-root user (`awg-web`).  Managing AWG
-interface state requires root-level `CAP_NET_ADMIN`.
-Rather than running the entire service as root, the installer configures
-a tightly-scoped sudoers drop-in at `/etc/sudoers.d/amneziawg-web`:
+interface state requires root-level `CAP_NET_ADMIN`.  Rather than running
+the entire service as root, the installer configures a tightly-scoped
+sudoers drop-in at `/etc/sudoers.d/amneziawg-web`:
 
 ```
-awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove
-awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients
+awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, \
+    /usr/bin/awg set * peer * remove, \
+    /usr/bin/awg syncconf * /dev/stdin, \
+    /usr/bin/awg-quick strip *
+awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, \
+    /usr/local/bin/amneziawg-install.sh --remove-client *, \
+    /usr/local/bin/amneziawg-install.sh --list-clients
 ```
 
-The first rule grants the minimum privilege needed for AWG inspection and
-for removing disabled peers from the running interface.
+The first rule grants the minimum privilege needed for AWG inspection,
+disabling peers (removal), and re-enabling peers (config sync).
 The second rule allows the web panel to manage clients via the install script's
 non-interactive `--add-client` / `--remove-client` / `--list-clients` flags.
 All invocations use `Command::new()` with explicit argument arrays — no shell

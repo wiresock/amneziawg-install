@@ -86,11 +86,11 @@ openssl rand -hex 32
 
 ## 5. Configure AWG access (sudoers)
 
-The service runs as `awg-web` (non-root) but needs to read AWG interface
+The service runs as `awg-web` (non-root) but needs to manage AWG interface
 state.  Install a tightly-scoped sudoers rule:
 
 ```bash
-echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump' \
+echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *' \
   | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
 ```
@@ -231,13 +231,13 @@ This means the sudoers rule is missing or incorrect.  Fix it:
 cat /etc/sudoers.d/amneziawg-web
 
 # Expected content:
-# awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump
+# awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *
 
 # Test it manually
 sudo -u awg-web sudo -n /usr/bin/awg show all dump
 
 # If missing, recreate:
-echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump' \
+echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *' \
   | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
 sudo systemctl restart amneziawg-web

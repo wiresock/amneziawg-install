@@ -906,6 +906,11 @@ async fn patch_peer(
             // the client cannot connect until re-enabled.
             if disabled {
                 remove_peer_from_interface(&existing.public_key);
+            } else {
+                // Re-add the peer to the running AWG interface by syncing
+                // the on-disk config (with disabled peers pre-filtered so
+                // syncconf never reactivates them).
+                restore_peer_best_effort(&state.db.pool).await;
             }
         }
     }
@@ -1068,6 +1073,11 @@ async fn post_peer_edit(
         // the client cannot connect until re-enabled.
         if new_disabled {
             remove_peer_from_interface(&existing.public_key);
+        } else {
+            // Re-add the peer to the running AWG interface by syncing
+            // the on-disk config (with disabled peers pre-filtered so
+            // syncconf never reactivates them).
+            restore_peer_best_effort(&state.db.pool).await;
         }
     }
 
@@ -1340,6 +1350,76 @@ fn remove_peer_from_interface(public_key: &str) {
                             "failed to remove disabled peer – poller will retry"
                         );
                     }
+                }
+            }
+        }
+    });
+}
+
+/// Load disabled keys from the DB and attempt a best-effort interface sync.
+///
+/// Fails closed: if the disabled keys cannot be loaded, the sync is skipped
+/// entirely so that disabled peers are never accidentally reactivated.
+async fn restore_peer_best_effort(pool: &sqlx::SqlitePool) {
+    match crate::db::peers::list_disabled_public_keys(pool).await {
+        Ok(disabled_keys) => {
+            restore_peer_to_interface(disabled_keys);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not load disabled keys – skipping interface sync to avoid re-adding disabled peers"
+            );
+        }
+    }
+}
+
+/// Best-effort immediate reconciliation of the running AWG interface with the
+/// on-disk config.
+///
+/// Spawns blocking AWG commands on a dedicated thread:
+/// 1. `awg show all dump` to discover active interfaces.
+/// 2. For each interface, `awg-quick strip <iface>` → filter out disabled
+///    peers → `awg syncconf <iface>` to fully reconcile the running
+///    interface with the (filtered) on-disk config.
+///
+/// **Important:** `syncconf` performs a full reconciliation — it adds peers
+/// present in the config but missing from the interface, removes peers
+/// present on the interface but absent from the config (including any
+/// runtime-only peers), and updates changed settings.  Disabled peers are
+/// filtered from the config *before* it reaches `syncconf`, so they are
+/// effectively removed from the running interface as well.
+///
+/// Like [`remove_peer_from_interface`], this is fire-and-forget: errors are
+/// logged but never propagated.  If this best-effort restore fails, the peer
+/// will not be auto-synced; it will become active on the next AWG restart.
+fn restore_peer_to_interface(disabled_keys: std::collections::HashSet<String>) {
+    tokio::task::spawn_blocking(move || {
+        let interfaces = match crate::awg::show_all_dump() {
+            Ok(ifaces) => ifaces,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not read AWG state for peer restoration – skipping best-effort restore; peer will not be auto-synced"
+                );
+                return;
+            }
+        };
+
+        for iface in &interfaces {
+            match crate::awg::sync_interface(&iface.name, &disabled_keys) {
+                Ok(()) => {
+                    tracing::info!(
+                        interface = %iface.name,
+                        "interface synced from disk after attempting peer restore"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        interface = %iface.name,
+                        error = %e,
+                        "failed to sync interface – peer will be restored on next AWG restart"
+                    );
                 }
             }
         }
