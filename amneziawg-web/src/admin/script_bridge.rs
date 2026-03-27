@@ -280,6 +280,7 @@ impl ScriptBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     // ── validate_client_name ─────────────────────────────────────────────
 
@@ -348,7 +349,6 @@ mod tests {
 
     #[test]
     fn build_args_add_client() {
-        use std::ffi::OsString;
         let bridge = ScriptBridge::new("/opt/amneziawg-install.sh");
         let args = bridge.build_args("--add-client", Some("alice"));
         let expected: Vec<OsString> = vec![
@@ -362,7 +362,6 @@ mod tests {
 
     #[test]
     fn build_args_remove_client() {
-        use std::ffi::OsString;
         let bridge = ScriptBridge::new("/opt/amneziawg-install.sh");
         let args = bridge.build_args("--remove-client", Some("bob"));
         let expected: Vec<OsString> = vec![
@@ -376,7 +375,6 @@ mod tests {
 
     #[test]
     fn build_args_list_clients() {
-        use std::ffi::OsString;
         let bridge = ScriptBridge::new("/opt/amneziawg-install.sh");
         let args = bridge.build_args("--list-clients", None);
         let expected: Vec<OsString> = vec![
@@ -389,7 +387,6 @@ mod tests {
 
     #[test]
     fn build_args_no_shell_interpolation() {
-        use std::ffi::OsString;
         // Even a malicious name is passed as a single argument element,
         // never expanded by the shell.
         let bridge = ScriptBridge::new("/opt/amneziawg-install.sh");
