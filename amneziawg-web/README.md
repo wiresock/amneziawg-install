@@ -87,7 +87,7 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 │  └──────────────────────────────────────────────┘  │
 │                                                    │
 │  /etc/sudoers.d/amneziawg-web  (AWG read + peer remove + install script) │
-│  /etc/amneziawg/clients/*.conf                     │
+│  /etc/amnezia/amneziawg/clients/*.conf                     │
 └────────────────────────────────────────────────────┘
          ▲
   reverse proxy (nginx / Caddy)
@@ -192,7 +192,7 @@ All settings are read from environment variables (or a `.env`-style file via sys
 |---|---|---|
 | `AWG_WEB_LISTEN` | `0.0.0.0:8080` | TCP bind address |
 | `AWG_WEB_DB` | `awg-web.db` | Path to SQLite database file (created automatically) |
-| `AWG_CONFIG_DIR` | `/etc/amneziawg/clients` | Directory of client `.conf` files |
+| `AWG_CONFIG_DIR` | `/etc/amnezia/amneziawg/clients` | Directory of client `.conf` files |
 | `AWG_POLL_INTERVAL` | `30` | Polling interval in seconds |
 | `RUST_LOG` | `amneziawg_web=info` | Log level (`error`/`warn`/`info`/`debug`) |
 | `AUTH_ENABLED` | `false` | Enable authentication (set `true` in production) |

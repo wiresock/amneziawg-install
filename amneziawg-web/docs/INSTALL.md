@@ -171,7 +171,7 @@ active.
 The uninstaller removes this file.  The upgrader always rewrites it to keep rules current.
 
 Client config files are expected in `AWG_CONFIG_DIR` (default:
-`/etc/amneziawg/clients`).  Each file should be a standard WireGuard/AmneziaWG
+`/etc/amnezia/amneziawg/clients`).  Each file should be a standard WireGuard/AmneziaWG
 `*.conf` with a `[Peer] PublicKey` entry matching a live tunnel peer.
 
 The service user needs **read** access to the config directory:
@@ -181,7 +181,7 @@ The service user needs **read** access to the config directory:
 sudo usermod -aG amneziawg awg-web
 
 # Option B: grant read permission explicitly
-sudo chmod o+rx /etc/amneziawg/clients
+sudo chmod o+rx /etc/amnezia/amneziawg/clients
 ```
 
 ---
@@ -218,7 +218,7 @@ AUTH_SECURE_COOKIE=true
 # Server
 AWG_WEB_LISTEN=127.0.0.1:8080
 AWG_WEB_DB=/var/lib/amneziawg-web/awg-web.db
-AWG_CONFIG_DIR=/etc/amneziawg/clients
+AWG_CONFIG_DIR=/etc/amnezia/amneziawg/clients
 AWG_POLL_INTERVAL=30
 AWG_INSTALL_SCRIPT=/usr/local/bin/amneziawg-install.sh
 RUST_LOG=amneziawg_web=info
@@ -337,7 +337,7 @@ docker run -d \
   --name amneziawg-web \
   -p 127.0.0.1:8080:8080 \
   -v /var/lib/amneziawg-web:/data \
-  -v /etc/amneziawg/clients:/etc/amneziawg/clients:ro \
+  -v /etc/amnezia/amneziawg/clients:/etc/amnezia/amneziawg/clients:ro \
   -e AUTH_ENABLED=true \
   -e AUTH_USERNAME=admin \
   -e AUTH_PASSWORD_HASH='$argon2id$...' \
@@ -358,7 +358,7 @@ docker run -d \
 |---|---|---|
 | `AWG_WEB_LISTEN` | `0.0.0.0:8080` | TCP bind address |
 | `AWG_WEB_DB` | `awg-web.db` | SQLite database path |
-| `AWG_CONFIG_DIR` | `/etc/amneziawg/clients` | Client `.conf` directory |
+| `AWG_CONFIG_DIR` | `/etc/amnezia/amneziawg/clients` | Client `.conf` directory |
 | `AWG_POLL_INTERVAL` | `30` | Poll interval in seconds |
 | `RUST_LOG` | `amneziawg_web=info` | Log verbosity |
 | `AUTH_ENABLED` | `false` | Enable auth; set `true` in production |
@@ -423,7 +423,7 @@ sudo ./amneziawg-web-install.sh \
 | `--install-dir DIR` | `/usr/local/bin` | Binary installation directory |
 | `--data-dir DIR` | `/var/lib/amneziawg-web` | SQLite database directory |
 | `--env-file FILE` | `/etc/amneziawg-web/env.conf` | Generated environment file path |
-| `--config-dir DIR` | `/etc/amneziawg/clients` | AWG client config directory |
+| `--config-dir DIR` | `/etc/amnezia/amneziawg/clients` | AWG client config directory |
 | `--host HOST` | `127.0.0.1` | Bind host |
 | `--port PORT` | `8080` | Bind port |
 | `--username NAME` | `admin` | Admin username |

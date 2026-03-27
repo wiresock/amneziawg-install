@@ -33,7 +33,7 @@ pub struct Config {
     pub database_url: String,
 
     /// Directory where AWG client configs are stored.
-    #[arg(long, env = "AWG_CONFIG_DIR", default_value = "/etc/amneziawg/clients")]
+    #[arg(long, env = "AWG_CONFIG_DIR", default_value = "/etc/amnezia/amneziawg/clients")]
     pub config_dir: std::path::PathBuf,
 
     /// Polling interval in seconds.

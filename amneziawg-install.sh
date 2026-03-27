@@ -2900,8 +2900,12 @@ function nonInteractiveAddClient() {
 	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | awg pubkey)
 	CLIENT_PRE_SHARED_KEY=$(awg genpsk)
 
-	local HOME_DIR
-	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
+	# Non-interactive mode writes client configs to a dedicated, traversable
+	# directory under AMNEZIAWG_DIR.  This avoids writing into home directories
+	# that may not be traversable by the web service (e.g. /root).
+	local HOME_DIR="${AMNEZIAWG_DIR}/clients"
+	mkdir -p "${HOME_DIR}"
+	chmod 755 "${HOME_DIR}"
 
 	local CLIENT_DNS="${CLIENT_DNS_1}"
 	if [[ -n "${CLIENT_DNS_2}" ]]; then
@@ -2951,9 +2955,8 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 	chmod 600 "${client_conf}" 2>/dev/null || true
 
-	# When invoked via sudo from a service user (e.g. awg-web), ensure the
-	# generated config is readable by that user so the web service can serve
-	# config downloads and config-directory rescans can discover the file.
+	# When invoked via sudo, ensure the generated config is readable by the
+	# calling service user so the web service can serve config downloads.
 	if [[ -n "${AWG_WEB_USER:-}" ]]; then
 		chown "${AWG_WEB_USER}":"${AWG_WEB_USER}" "${client_conf}" 2>/dev/null || true
 	elif [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
@@ -3002,10 +3005,10 @@ function nonInteractiveRemoveClient() {
 	# sed metacharacters — safe to interpolate directly.
 	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "${SERVER_AWG_CONF}"
 
-	# Remove client config file
-	local HOME_DIR
-	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
-	rm -f "${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+	# Remove client config file (non-interactive configs are stored under
+	# ${AMNEZIAWG_DIR}/clients to keep them in a traversable directory).
+	local CLIENT_DIR="${AMNEZIAWG_DIR}/clients"
+	rm -f "${CLIENT_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
 

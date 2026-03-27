@@ -67,7 +67,7 @@ AUTH_API_TOKEN=
 
 AWG_WEB_LISTEN=127.0.0.1:8080
 AWG_WEB_DB=/var/lib/amneziawg-web/awg-web.db
-AWG_CONFIG_DIR=/etc/amneziawg/clients
+AWG_CONFIG_DIR=/etc/amnezia/amneziawg/clients
 AWG_POLL_INTERVAL=30
 RUST_LOG=amneziawg_web=info
 EOF
