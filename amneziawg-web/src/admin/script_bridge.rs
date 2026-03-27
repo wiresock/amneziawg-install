@@ -348,42 +348,54 @@ mod tests {
 
     #[test]
     fn build_args_add_client() {
+        use std::ffi::OsString;
         let bridge = ScriptBridge::new("/opt/amneziawg-install.sh");
         let args = bridge.build_args("--add-client", Some("alice"));
-        assert_eq!(
-            args,
-            vec!["-n", "/opt/amneziawg-install.sh", "--add-client", "alice"]
-        );
+        let expected: Vec<OsString> = vec![
+            "-n".into(),
+            "/opt/amneziawg-install.sh".into(),
+            "--add-client".into(),
+            "alice".into(),
+        ];
+        assert_eq!(args, expected);
     }
 
     #[test]
     fn build_args_remove_client() {
+        use std::ffi::OsString;
         let bridge = ScriptBridge::new("/opt/amneziawg-install.sh");
         let args = bridge.build_args("--remove-client", Some("bob"));
-        assert_eq!(
-            args,
-            vec!["-n", "/opt/amneziawg-install.sh", "--remove-client", "bob"]
-        );
+        let expected: Vec<OsString> = vec![
+            "-n".into(),
+            "/opt/amneziawg-install.sh".into(),
+            "--remove-client".into(),
+            "bob".into(),
+        ];
+        assert_eq!(args, expected);
     }
 
     #[test]
     fn build_args_list_clients() {
+        use std::ffi::OsString;
         let bridge = ScriptBridge::new("/opt/amneziawg-install.sh");
         let args = bridge.build_args("--list-clients", None);
-        assert_eq!(
-            args,
-            vec!["-n", "/opt/amneziawg-install.sh", "--list-clients"]
-        );
+        let expected: Vec<OsString> = vec![
+            "-n".into(),
+            "/opt/amneziawg-install.sh".into(),
+            "--list-clients".into(),
+        ];
+        assert_eq!(args, expected);
     }
 
     #[test]
     fn build_args_no_shell_interpolation() {
+        use std::ffi::OsString;
         // Even a malicious name is passed as a single argument element,
         // never expanded by the shell.
         let bridge = ScriptBridge::new("/opt/amneziawg-install.sh");
         let args = bridge.build_args("--add-client", Some("$(rm -rf /)"));
         assert_eq!(args.len(), 4);
-        assert_eq!(args[3], "$(rm -rf /)");
+        assert_eq!(args[3], OsString::from("$(rm -rf /)"));
     }
 
     // ── ScriptBridge construction ────────────────────────────────────────
