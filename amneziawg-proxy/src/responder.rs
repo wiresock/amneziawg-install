@@ -112,10 +112,10 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
     if data.len() >= 4 {
         let prefix = &data[..std::cmp::min(data.len(), 10)];
         if let Ok(text) = std::str::from_utf8(prefix) {
-            let is_sip = (text.len() >= 4 && text[..4].eq_ignore_ascii_case("SIP/"))
-                || (text.len() >= 9 && text[..9].eq_ignore_ascii_case("REGISTER "))
-                || (text.len() >= 7 && text[..7].eq_ignore_ascii_case("INVITE "))
-                || (text.len() >= 8 && text[..8].eq_ignore_ascii_case("OPTIONS "));
+            let is_sip = text.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("SIP/"))
+                || text.get(..9).is_some_and(|s| s.eq_ignore_ascii_case("REGISTER "))
+                || text.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("INVITE "))
+                || text.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("OPTIONS "));
             if is_sip {
                 return Some(Protocol::Sip);
             }
@@ -243,13 +243,11 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
     // encounter them, we refrain from echoing the question.
     if incoming.len() > 12 {
         let mut pos = 12;
-        let mut valid_question = true;
         // Walk QNAME labels until root label (0) or end of packet
         while pos < incoming.len() {
             let label_len = incoming[pos] as usize;
             // Compression pointer (two high bits set) is not supported here.
             if label_len & 0xC0 == 0xC0 {
-                valid_question = false;
                 break;
             }
             if label_len == 0 {
@@ -259,18 +257,14 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
                     // Patch QDCOUNT to 1 since we successfully echoed the question
                     buf[qdcount_offset] = 0x00;
                     buf[qdcount_offset + 1] = 0x01;
-                } else {
-                    valid_question = false;
                 }
                 break;
             }
             pos += 1 + label_len;
             if pos > incoming.len() {
-                valid_question = false;
                 break;
             }
         }
-        let _ = valid_question; // consumed above via early breaks
     }
 
     buf.freeze()
@@ -292,8 +286,7 @@ fn generate_sip_trying(incoming: &[u8]) -> Bytes {
         for line in text.lines() {
             let trimmed = line.trim();
             for &prefix in &echo_prefixes {
-                if trimmed.len() >= prefix.len()
-                    && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+                if trimmed.get(..prefix.len()).is_some_and(|s| s.eq_ignore_ascii_case(prefix))
                 {
                     buf.put_slice(trimmed.as_bytes());
                     buf.put_slice(b"\r\n");
