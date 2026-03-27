@@ -113,7 +113,7 @@ pub async fn execute_create_user(
         Ok(config_path) => {
             let detail = serde_json::json!({
                 "name": name,
-                "config_path": config_path,
+                "config_path": &config_path,
             })
             .to_string();
             log_event(&db.pool, EVT_USER_CREATED, None, None, Some(&detail), actor).await;
