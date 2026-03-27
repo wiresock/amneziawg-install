@@ -75,7 +75,7 @@ pub struct Config {
     #[arg(
         long,
         env = "AWG_INSTALL_SCRIPT",
-        default_value = "/usr/local/bin/amneziawg-install.sh"
+        default_value = crate::admin::script_bridge::DEFAULT_SCRIPT_PATH
     )]
     pub install_script: std::path::PathBuf,
 }

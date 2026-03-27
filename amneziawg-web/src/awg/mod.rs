@@ -86,7 +86,10 @@ pub struct AwgPeer {
 }
 
 /// Absolute path to the `sudo` binary.
-const SUDO_BIN: &str = "/usr/bin/sudo";
+///
+/// Shared across the AWG command layer and the install-script bridge so
+/// that both use the same, validated path to `sudo`.
+pub const SUDO_BIN: &str = "/usr/bin/sudo";
 
 /// Absolute path to the `awg` binary.
 const AWG_BIN: &str = "/usr/bin/awg";

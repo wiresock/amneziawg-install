@@ -26,7 +26,7 @@ use tokio::io::AsyncReadExt;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-/// Default path to the install script (relative to repo root on a standard install).
+/// Default absolute path to the install script on a standard system-wide install.
 pub const DEFAULT_SCRIPT_PATH: &str = "/usr/local/bin/amneziawg-install.sh";
 
 /// Maximum time to wait for the script to complete.
@@ -116,7 +116,7 @@ impl ScriptBridge {
     pub fn new(script_path: impl Into<PathBuf>) -> Self {
         Self {
             script_path: script_path.into(),
-            sudo_path: PathBuf::from("/usr/bin/sudo"),
+            sudo_path: PathBuf::from(crate::awg::SUDO_BIN),
             timeout: SCRIPT_TIMEOUT,
         }
     }

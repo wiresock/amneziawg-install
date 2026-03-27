@@ -1509,6 +1509,7 @@ fn esc(s: &str) -> String {
 ///
 /// **Important:** `&` must be replaced first to avoid double-escaping
 /// entities produced by later replacements (e.g. `&lt;` → `&amp;lt;`).
+#[cfg(test)]
 fn esc_js(s: &str) -> String {
     // Build the escaped string in a single pass to avoid double-escaping.
     let mut out = String::with_capacity(s.len());
