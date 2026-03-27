@@ -112,8 +112,14 @@ fn apply_quic_padding(data: &mut [u8], payload_len: usize) {
         state = state.wrapping_mul(0x0100_0193);
     }
 
-    // Byte 0: QUIC short-header form byte (header form=0, fixed bit=1)
-    padding[0] = 0x40 | ((state & 0x3F) as u8);
+    // Byte 0: QUIC short-header form byte (header form=0, fixed bit=1).
+    // Randomize only allowed bits: spin (0x20), key phase (0x04), PN length (0x03),
+    // while keeping reserved bits (0x18) cleared as per RFC 9000.
+    let header_random = state as u8;
+    let spin_bit = header_random & 0x20;
+    let key_phase_bit = header_random & 0x04;
+    let pn_len_bits = header_random & 0x03;
+    padding[0] = 0x40 | spin_bit | key_phase_bit | pn_len_bits;
     state = lcg_step(state);
 
     // Remaining bytes: pseudo-random, simulating encrypted QUIC 1-RTT payload
@@ -216,6 +222,12 @@ mod tests {
             data[10] & 0x40,
             0x40,
             "QUIC padding first byte should have fixed bit set"
+        );
+        // Reserved bits (0x18) must be cleared per RFC 9000
+        assert_eq!(
+            data[10] & 0x18,
+            0x00,
+            "QUIC padding first byte must have reserved bits cleared"
         );
         // Padding should contain non-zero bytes (high entropy, not all-zero)
         assert!(
@@ -336,6 +348,8 @@ mod tests {
         assert_eq!(&result[..3], &[0x01, 0x02, 0x03]);
         // First padding byte has QUIC fixed bit
         assert_eq!(result[3] & 0x40, 0x40);
+        // Reserved bits must be cleared
+        assert_eq!(result[3] & 0x18, 0x00);
     }
 
     #[test]
@@ -410,6 +424,8 @@ mod tests {
         assert!(pkt[4..34].iter().all(|&b| b == 0xAA));
         // Padding (last 10 bytes): first byte has QUIC fixed bit
         assert_eq!(pkt[34] & 0x40, 0x40);
+        // Reserved bits must be cleared
+        assert_eq!(pkt[34] & 0x18, 0x00);
         // Should have non-zero bytes (pseudo-random, not all-zero)
         assert!(pkt[35..].iter().any(|&b| b != 0x00));
     }

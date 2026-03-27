@@ -17,7 +17,7 @@ pub struct ClientMetrics {
     pub probes_sent: AtomicU64,
     /// Packed token bucket state: high 32 bits = tokens × 1000 (fixed-point
     /// millitoken representation), low 32 bits = last-refill timestamp as
-    /// seconds since an unspecified epoch obtained from `coarse_now()`.
+    /// seconds since an unspecified epoch obtained from `coarse_now_secs()`.
     rate_state: AtomicU64,
     max_tokens: u32,
     refill_rate: u32,

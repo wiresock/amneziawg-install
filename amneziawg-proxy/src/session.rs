@@ -7,6 +7,38 @@ use dashmap::DashMap;
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
+/// RAII guard that decrements `session_count` on drop unless committed.
+///
+/// This ensures that if the future holding the guard is cancelled between
+/// the counter reservation and the final insert/rollback, the slot is always
+/// released — preventing permanent capacity loss.
+struct SlotReservation<'a> {
+    counter: &'a AtomicUsize,
+    committed: bool,
+}
+
+impl<'a> SlotReservation<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        Self {
+            counter,
+            committed: false,
+        }
+    }
+
+    /// Mark the reservation as consumed so `Drop` won't release the slot.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SlotReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 /// A single client session: maps a client address to a dedicated backend socket.
 pub struct Session {
     /// Dedicated UDP socket bound to an ephemeral port for talking to the backend.
@@ -81,6 +113,11 @@ impl SessionTable {
             }
         }
 
+        // RAII guard: if the future is cancelled between the reservation
+        // above and the final insert/rollback below, this automatically
+        // decrements session_count so the slot is never leaked.
+        let reservation = SlotReservation::new(&self.session_count);
+
         // Slow path: create a new session.
         // Bind to the correct address family so connect() works for both
         // IPv4 and IPv6 backend addresses.
@@ -89,17 +126,8 @@ impl SessionTable {
         } else {
             "[::]:0"
         };
-        let sock = match UdpSocket::bind(bind_addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                self.session_count.fetch_sub(1, Ordering::AcqRel);
-                return Err(e.into());
-            }
-        };
-        if let Err(e) = sock.connect(self.backend_addr).await {
-            self.session_count.fetch_sub(1, Ordering::AcqRel);
-            return Err(e.into());
-        }
+        let sock = UdpSocket::bind(bind_addr).await?;
+        sock.connect(self.backend_addr).await?;
         let sock = Arc::new(sock);
 
         // Use entry API so concurrent calls for the same client_addr
@@ -107,9 +135,8 @@ impl SessionTable {
         let entry = self.sessions.entry(client_addr);
         match entry {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                // Another task raced us — reuse the existing session and
-                // undo the counter bump.
-                self.session_count.fetch_sub(1, Ordering::AcqRel);
+                // Another task raced us — reuse the existing session.
+                // Drop reservation (which decrements the counter).
                 occ.get_mut().last_active = Instant::now();
                 Ok((Arc::clone(&occ.get().backend_sock), false))
             }
@@ -120,6 +147,8 @@ impl SessionTable {
                     client_addr,
                 };
                 vac.insert(session);
+                // Commit the reservation so Drop doesn't decrement.
+                reservation.commit();
                 debug!(%client_addr, "new session created");
                 Ok((sock, true))
             }
