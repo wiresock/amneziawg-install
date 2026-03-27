@@ -172,18 +172,22 @@ fn generate_quic_version_negotiation(incoming: &[u8]) -> Bytes {
     // Version = 0 (version negotiation)
     buf.put_u32(0);
 
-    // Parse incoming DCID and SCID
+    // Parse incoming DCID and SCID.
+    // Enforce RFC 9000 §17.2 length limits (≤ 20) even though detect_protocol()
+    // already validates these — this function is a public library API and may be
+    // called with arbitrary inputs.
+    const MAX_CID: usize = 20;
     if incoming.len() >= 6 {
         let dcid_len = incoming[5] as usize;
         let dcid_end = 6 + dcid_len;
 
-        if incoming.len() > dcid_end {
+        if dcid_len <= MAX_CID && incoming.len() > dcid_end {
             let scid_len = incoming[dcid_end] as usize;
             let scid_end = dcid_end + 1 + scid_len;
 
             // In version negotiation, swap DCID and SCID from the incoming packet
             // Response DCID = incoming SCID, Response SCID = incoming DCID
-            if incoming.len() >= scid_end {
+            if scid_len <= MAX_CID && incoming.len() >= scid_end {
                 let incoming_dcid = &incoming[6..dcid_end];
                 let incoming_scid = &incoming[dcid_end + 1..scid_end];
 
@@ -278,8 +282,9 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
                 break;
             }
             qname_len += 1 + label_len;
-            // Validate total QNAME length (RFC 1035 §2.3.4: ≤ 255 octets)
-            if qname_len > MAX_QNAME {
+            // Validate total QNAME length (RFC 1035 §2.3.4: ≤ 255 octets,
+            // including the terminating root label which adds 1 octet)
+            if qname_len + 1 > MAX_QNAME {
                 break;
             }
             pos += 1 + label_len;
@@ -459,6 +464,36 @@ mod tests {
     }
 
     #[test]
+    fn generate_quic_response_rejects_oversized_dcid() {
+        // DCID len = 21, exceeds RFC 9000 §17.2 max of 20
+        let mut pkt = vec![0xC3u8, 0x00, 0x00, 0x00, 0x01];
+        pkt.push(21); // DCID len
+        pkt.extend_from_slice(&[0xAA; 21]); // DCID body
+        pkt.push(2); // SCID len
+        pkt.extend_from_slice(&[0x11, 0x22]);
+
+        let resp = generate_response(Protocol::Quic, &pkt);
+        // Should fall back to zero-length CIDs
+        assert_eq!(resp[5], 0); // DCID len = 0
+        assert_eq!(resp[6], 0); // SCID len = 0
+    }
+
+    #[test]
+    fn generate_quic_response_rejects_oversized_scid() {
+        // DCID len = 4 (valid), SCID len = 21 (exceeds max)
+        let mut pkt = vec![0xC3u8, 0x00, 0x00, 0x00, 0x01];
+        pkt.push(4);
+        pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        pkt.push(21); // SCID len
+        pkt.extend_from_slice(&[0x11; 21]);
+
+        let resp = generate_response(Protocol::Quic, &pkt);
+        // Should fall back to zero-length CIDs
+        assert_eq!(resp[5], 0);
+        assert_eq!(resp[6], 0);
+    }
+
+    #[test]
     fn generate_dns_response() {
         let mut query = vec![0x00u8; 12];
         query[0] = 0xAB;
@@ -606,6 +641,33 @@ mod tests {
         // QDCOUNT should be 0 since QNAME exceeds 255-octet limit
         assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 0);
         assert_eq!(resp.len(), 12);
+    }
+
+    #[test]
+    fn generate_dns_response_qname_boundary_255_accepted() {
+        // Build a QNAME whose total encoded length is exactly 255 octets
+        // (including root label). This is the maximum allowed by RFC 1035.
+        // 3 labels of 63 bytes = 3*(1+63) = 192 octets
+        // + 1 label of 61 bytes = 1+61 = 62 octets → subtotal = 254
+        // + root label (1 octet) = 255 total → valid
+        let mut query = vec![0x00u8; 12];
+        query[0] = 0xEE;
+        query[1] = 0xFF;
+        query[4] = 0x00; query[5] = 0x01; // QDCOUNT=1
+        for _ in 0..3 {
+            query.push(63);
+            query.extend_from_slice(&[b'b'; 63]);
+        }
+        query.push(61);
+        query.extend_from_slice(&[b'c'; 61]);
+        query.push(0); // root label
+        query.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+        query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+
+        let resp = generate_response(Protocol::Dns, &query);
+        // QDCOUNT should be 1 — the name is exactly at the boundary
+        assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 1);
+        assert!(resp.len() > 12, "response should include the echoed question");
     }
 
     // -- AWG packet classification tests --

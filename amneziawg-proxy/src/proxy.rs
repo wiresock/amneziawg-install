@@ -339,9 +339,9 @@ mod tests {
             proxy.run().await.unwrap();
         });
 
-        // Give it a moment to start
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
+        // Notify::notify_one() stores the permit, so the proxy will pick it
+        // up on its first select! iteration even if the recv loop hasn't
+        // started yet. No readiness probe needed for a pure bind+shutdown test.
         // Signal shutdown
         shutdown.notify_one();
 
@@ -378,33 +378,42 @@ mod tests {
             proxy.run().await.unwrap();
         });
 
-        // Give proxy time to start
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Send a QUIC-like probe packet
+        // Wait for proxy to become ready by using the actual QUIC probe as the
+        // readiness signal — the proxy responds to QUIC probes directly, so we
+        // retry until we get a version-negotiation response.
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut quic_pkt = vec![0xC3u8, 0x00, 0x00, 0x00, 0x01];
         quic_pkt.push(4);
         quic_pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
         quic_pkt.push(0);
 
-        client.send_to(&quic_pkt, proxy_addr).await.unwrap();
-
-        // Should get a probe response (QUIC version negotiation)
         let mut buf = [0u8; 4096];
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            client.recv_from(&mut buf),
-        )
-        .await;
-
-        assert!(result.is_ok(), "should receive probe response");
-        let (_n, from) = result.unwrap().unwrap();
-        assert_eq!(from, proxy_addr);
-        // Version negotiation starts with 0xC3 (preserving incoming type bits)
-        assert_eq!(buf[0], 0xC3);
+        let mut got_probe_response = false;
+        for i in 0..10u32 {
+            let _ = client.send_to(&quic_pkt, proxy_addr).await;
+            match tokio::time::timeout(
+                Duration::from_millis(200),
+                client.recv_from(&mut buf),
+            ).await {
+                Ok(Ok((_n, from))) => {
+                    assert_eq!(from, proxy_addr);
+                    // Version negotiation starts with 0xC3 (preserving incoming type bits)
+                    assert_eq!(buf[0], 0xC3);
+                    got_probe_response = true;
+                    break;
+                }
+                _ => {
+                    if i + 1 == 10 {
+                        panic!("proxy did not become ready after 10 retries");
+                    }
+                }
+            }
+        }
+        assert!(got_probe_response, "should receive probe response");
 
         // Backend should also have received the forwarded packet
+        // (may have received multiple copies from readiness retries — drain the
+        // first one which matches our probe).
         let mut backend_buf = [0u8; 4096];
         let result = tokio::time::timeout(
             Duration::from_secs(2),
