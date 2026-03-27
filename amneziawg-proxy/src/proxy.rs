@@ -258,7 +258,9 @@ impl Proxy {
             }
             // Only remove our own entry — if a newer relay was spawned for
             // the same client, its generation will differ and we must not
-            // remove it.
+            // remove it.  This handles the case where this task exits after
+            // a replacement relay has already been inserted: `remove_if`'s
+            // predicate fails for the newer generation, preserving it.
             relay_handles.remove_if(&client_addr, |_, entry| entry.generation == generation);
         });
 
