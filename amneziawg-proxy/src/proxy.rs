@@ -127,7 +127,8 @@ impl Proxy {
         // enough that pipelining provides no measurable benefit while adding
         // complexity. If throughput becomes a concern under extreme load,
         // this can be changed to spawn per-packet tasks.
-        let mut buf = vec![0u8; self.config.buffer_size];
+        let buffer_size = self.config.buffer_size.min(65_535);
+        let mut buf = vec![0u8; buffer_size];
 
         loop {
             tokio::select! {

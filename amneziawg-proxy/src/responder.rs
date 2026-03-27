@@ -217,7 +217,12 @@ fn generate_quic_version_negotiation(incoming: &[u8]) -> Bytes {
 /// Echoing the question section back is required by RFC 1035 §4.1.1 and makes
 /// the response indistinguishable from a real recursive resolver failure.
 fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(512);
+    // Hard cap: standard DNS message size (RFC 1035 §2.3.4).
+    const MAX_RESPONSE: usize = 512;
+    const MAX_LABEL: usize = 63;
+    const MAX_QNAME: usize = 255;
+
+    let mut buf = BytesMut::with_capacity(MAX_RESPONSE);
 
     // Transaction ID (echo from query)
     if incoming.len() >= 2 {
@@ -241,8 +246,13 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
     // of: QNAME (sequence of labels ending with 0) + QTYPE (2) + QCLASS (2).
     // We intentionally do not support compression pointers here; if we
     // encounter them, we refrain from echoing the question.
+    //
+    // We validate RFC 1035 §2.3.4 label/QNAME limits (label ≤ 63, total
+    // name ≤ 255) and enforce a hard 512-byte response cap. Invalid or
+    // oversized names are silently dropped (header-only response).
     if incoming.len() > 12 {
         let mut pos = 12;
+        let mut qname_len: usize = 0;
         // Walk QNAME labels until root label (0) or end of packet
         while pos < incoming.len() {
             let label_len = incoming[pos] as usize;
@@ -252,12 +262,24 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
             }
             if label_len == 0 {
                 // Ensure we have root label (0) + QTYPE (2) + QCLASS (2) = 5 bytes
-                if pos + 5 <= incoming.len() {
-                    buf.put_slice(&incoming[12..pos + 5]);
+                let question_end = pos + 5;
+                if question_end <= incoming.len()
+                    && buf.len() + (question_end - 12) <= MAX_RESPONSE
+                {
+                    buf.put_slice(&incoming[12..question_end]);
                     // Patch QDCOUNT to 1 since we successfully echoed the question
                     buf[qdcount_offset] = 0x00;
                     buf[qdcount_offset + 1] = 0x01;
                 }
+                break;
+            }
+            // Validate label length (RFC 1035 §2.3.4: label ≤ 63 octets)
+            if label_len > MAX_LABEL {
+                break;
+            }
+            qname_len += 1 + label_len;
+            // Validate total QNAME length (RFC 1035 §2.3.4: ≤ 255 octets)
+            if qname_len > MAX_QNAME {
                 break;
             }
             pos += 1 + label_len;
@@ -540,6 +562,49 @@ mod tests {
         // QDCOUNT should be 0 since we refused to parse compression pointer
         assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 0);
         // Response should be header only (12 bytes)
+        assert_eq!(resp.len(), 12);
+    }
+
+    #[test]
+    fn generate_dns_response_label_too_long_qdcount_zero() {
+        // DNS query with a label > 63 octets — violates RFC 1035 §2.3.4
+        let mut query = vec![0x00u8; 12];
+        query[0] = 0xAA;
+        query[1] = 0xBB;
+        query[4] = 0x00; query[5] = 0x01; // QDCOUNT=1
+        // Label length = 64 (exceeds the 63-octet limit)
+        query.push(64);
+        query.extend_from_slice(&[b'x'; 64]);
+        query.push(0); // root label
+        query.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+        query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+
+        let resp = generate_response(Protocol::Dns, &query);
+        // QDCOUNT should be 0 since label length exceeds RFC 1035 limit
+        assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 0);
+        assert_eq!(resp.len(), 12);
+    }
+
+    #[test]
+    fn generate_dns_response_qname_too_long_qdcount_zero() {
+        // DNS query with total QNAME > 255 octets — violates RFC 1035 §2.3.4
+        let mut query = vec![0x00u8; 12];
+        query[0] = 0xCC;
+        query[1] = 0xDD;
+        query[4] = 0x00; query[5] = 0x01; // QDCOUNT=1
+        // Build a QNAME with many 63-byte labels to exceed 255 total
+        // 4 labels of 63 bytes = 4*(1+63) = 256 > 255
+        for _ in 0..4 {
+            query.push(63);
+            query.extend_from_slice(&[b'a'; 63]);
+        }
+        query.push(0); // root label
+        query.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+        query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+
+        let resp = generate_response(Protocol::Dns, &query);
+        // QDCOUNT should be 0 since QNAME exceeds 255-octet limit
+        assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 0);
         assert_eq!(resp.len(), 12);
     }
 
