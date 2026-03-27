@@ -285,10 +285,11 @@ fn generate_sip_trying(incoming: &[u8]) -> Bytes {
 
     // Echo key SIP headers from the incoming request for realism.
     // Allocation-free ASCII case-insensitive prefix checks.
-    // Only scan up to a bounded prefix of the request to limit work on
-    // spoofed/oversized UDP payloads.
+    // Only scan up to a bounded prefix (2 KiB) of the request to limit CPU
+    // work on spoofed/oversized UDP payloads.
     let suffix = b"Content-Length: 0\r\n\r\n";
-    if let Ok(text) = std::str::from_utf8(incoming) {
+    let scan_limit = std::cmp::min(incoming.len(), 2048);
+    if let Ok(text) = std::str::from_utf8(&incoming[..scan_limit]) {
         let echo_prefixes = ["via:", "from:", "to:", "call-id:", "cseq:"];
         for line in text.lines() {
             let trimmed = line.trim();

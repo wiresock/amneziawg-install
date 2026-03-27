@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,9 @@ pub struct SessionTable {
     backend_addr: SocketAddr,
     ttl: Duration,
     max_sessions: usize,
+    /// Atomic counter kept in sync with `sessions.len()` so the capacity
+    /// check + insert are race-free (same pattern as MetricsStore).
+    session_count: AtomicUsize,
 }
 
 impl SessionTable {
@@ -31,6 +35,7 @@ impl SessionTable {
             backend_addr,
             ttl,
             max_sessions,
+            session_count: AtomicUsize::new(0),
         }
     }
 
@@ -53,14 +58,27 @@ impl SessionTable {
             return Ok((Arc::clone(&entry.backend_sock), false));
         }
 
-        // Check session limit before creating a new one
-        if self.sessions.len() >= self.max_sessions {
-            anyhow::bail!(
-                "session limit reached ({}/{}), rejecting {}",
-                self.sessions.len(),
-                self.max_sessions,
-                client_addr,
-            );
+        // Atomically reserve a slot before creating the session.
+        // This prevents concurrent callers from all observing len() < max
+        // and exceeding the limit.
+        loop {
+            let current = self.session_count.load(Ordering::Acquire);
+            if current >= self.max_sessions {
+                anyhow::bail!(
+                    "session limit reached ({}/{}), rejecting {}",
+                    current,
+                    self.max_sessions,
+                    client_addr,
+                );
+            }
+            if self.session_count.compare_exchange(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ).is_ok() {
+                break;
+            }
         }
 
         // Slow path: create a new session.
@@ -71,8 +89,17 @@ impl SessionTable {
         } else {
             "[::]:0"
         };
-        let sock = UdpSocket::bind(bind_addr).await?;
-        sock.connect(self.backend_addr).await?;
+        let sock = match UdpSocket::bind(bind_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.session_count.fetch_sub(1, Ordering::AcqRel);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = sock.connect(self.backend_addr).await {
+            self.session_count.fetch_sub(1, Ordering::AcqRel);
+            return Err(e.into());
+        }
         let sock = Arc::new(sock);
 
         // Use entry API so concurrent calls for the same client_addr
@@ -80,7 +107,9 @@ impl SessionTable {
         let entry = self.sessions.entry(client_addr);
         match entry {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                // Another task raced us — reuse the existing session.
+                // Another task raced us — reuse the existing session and
+                // undo the counter bump.
+                self.session_count.fetch_sub(1, Ordering::AcqRel);
                 occ.get_mut().last_active = Instant::now();
                 Ok((Arc::clone(&occ.get().backend_sock), false))
             }
@@ -113,6 +142,7 @@ impl SessionTable {
             if now.duration_since(session.last_active) > self.ttl {
                 info!(%addr, "session expired");
                 expired.push(*addr);
+                self.session_count.fetch_sub(1, Ordering::AcqRel);
                 false
             } else {
                 true
@@ -155,7 +185,9 @@ impl SessionTable {
 
     /// Remove a specific session.
     pub fn remove(&self, addr: &SocketAddr) {
-        self.sessions.remove(addr);
+        if self.sessions.remove(addr).is_some() {
+            self.session_count.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 

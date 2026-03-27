@@ -1,10 +1,13 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
 
 use dashmap::DashMap;
 
 /// Per-client metrics: packet counts and rate-limit state.
+///
+/// The token bucket uses lock-free atomics so it never blocks a Tokio
+/// worker thread. Tokens and the last-refill timestamp are packed into a
+/// single `AtomicU64` and updated via `compare_exchange`.
 pub struct ClientMetrics {
     /// Total packets received from this client.
     pub packets_in: AtomicU64,
@@ -12,45 +15,88 @@ pub struct ClientMetrics {
     pub packets_out: AtomicU64,
     /// Total probe responses sent to this client.
     pub probes_sent: AtomicU64,
-    /// Rate-limit token bucket state.
-    rate_tokens: std::sync::Mutex<RateBucket>,
+    /// Packed token bucket state: high 32 bits = tokens × 1000 (fixed-point
+    /// millitoken representation), low 32 bits = last-refill timestamp as
+    /// seconds since an unspecified epoch obtained from `coarse_now()`.
+    rate_state: AtomicU64,
+    max_tokens: u32,
+    refill_rate: u32,
 }
 
-struct RateBucket {
-    tokens: f64,
-    last_refill: Instant,
-    max_tokens: f64,
-    refill_rate: f64, // tokens per second
+/// Cheap monotonic seconds counter.  Uses `Instant` under the hood but only
+/// returns whole seconds, which is sufficient for the token-bucket granularity.
+fn coarse_now_secs() -> u32 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_secs() as u32
+}
+
+/// Pack millitoken count and timestamp into a single u64.
+fn pack(millitokens: u32, ts: u32) -> u64 {
+    ((millitokens as u64) << 32) | (ts as u64)
+}
+
+/// Unpack millitoken count and timestamp from a u64.
+fn unpack(v: u64) -> (u32, u32) {
+    ((v >> 32) as u32, v as u32)
 }
 
 impl ClientMetrics {
     pub fn new(rate_limit_per_sec: u32) -> Self {
-        let max = rate_limit_per_sec as f64;
+        let now = coarse_now_secs();
+        let millitokens = rate_limit_per_sec.saturating_mul(1000);
         Self {
             packets_in: AtomicU64::new(0),
             packets_out: AtomicU64::new(0),
             probes_sent: AtomicU64::new(0),
-            rate_tokens: std::sync::Mutex::new(RateBucket {
-                tokens: max,
-                last_refill: Instant::now(),
-                max_tokens: max,
-                refill_rate: max,
-            }),
+            rate_state: AtomicU64::new(pack(millitokens, now)),
+            max_tokens: rate_limit_per_sec,
+            refill_rate: rate_limit_per_sec,
         }
     }
 
     /// Try to consume one rate-limit token. Returns `true` if allowed.
+    ///
+    /// This is entirely lock-free: we CAS-loop on the packed atomic state
+    /// so no `Mutex` is held across `.await` boundaries.
     pub fn try_acquire_probe(&self) -> bool {
-        let mut bucket = self.rate_tokens.lock().unwrap();
-        let now = Instant::now();
-        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * bucket.refill_rate).min(bucket.max_tokens);
-        bucket.last_refill = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
+        let now = coarse_now_secs();
+        loop {
+            let old = self.rate_state.load(Ordering::Acquire);
+            let (old_mt, old_ts) = unpack(old);
+
+            // Refill: elapsed seconds × refill_rate × 1000 (millitoken)
+            let elapsed = now.saturating_sub(old_ts);
+            let refill = (elapsed as u64)
+                .saturating_mul(self.refill_rate as u64)
+                .saturating_mul(1000);
+            let max_mt = self.max_tokens.saturating_mul(1000);
+            let current_mt = std::cmp::min(
+                (old_mt as u64).saturating_add(refill),
+                max_mt as u64,
+            ) as u32;
+
+            if current_mt < 1000 {
+                // Not enough for one full token — store refilled state and reject.
+                let new = pack(current_mt, now);
+                // Best-effort update; if another thread won the race we'll
+                // recalculate on the next call.
+                let _ = self.rate_state.compare_exchange(
+                    old, new, Ordering::AcqRel, Ordering::Acquire,
+                );
+                return false;
+            }
+
+            let new_mt = current_mt - 1000;
+            let new = pack(new_mt, now);
+            if self.rate_state.compare_exchange(
+                old, new, Ordering::AcqRel, Ordering::Acquire,
+            ).is_ok() {
+                return true;
+            }
+            // CAS failed — another thread modified state, retry.
         }
     }
 
@@ -173,11 +219,10 @@ mod tests {
             assert!(m.try_acquire_probe());
         }
         assert!(!m.try_acquire_probe());
-        // Manually adjust the bucket time to simulate 1 second passing
-        {
-            let mut bucket = m.rate_tokens.lock().unwrap();
-            bucket.last_refill = Instant::now() - std::time::Duration::from_secs(1);
-        }
+        // Wait for at least 1 second so the lock-free bucket refills.
+        // The bucket operates at whole-second granularity, so we need
+        // slightly more than 1s to guarantee a refill.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         // Now should have refilled
         assert!(m.try_acquire_probe());
     }

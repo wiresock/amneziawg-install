@@ -27,6 +27,28 @@ async fn spawn_echo_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
+/// Send a single byte probe and wait for any response to confirm the proxy
+/// is ready.  Retries up to `max_retries` times with `interval` between
+/// attempts, which is more robust under CI load than a fixed sleep.
+async fn wait_for_proxy_ready(proxy_addr: SocketAddr, max_retries: u32, interval: Duration) {
+    let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for i in 0..max_retries {
+        // Send a benign non-protocol payload — the proxy will forward it to
+        // the echo backend, and we'll get an echo back once the recv loop is
+        // live.
+        let _ = probe.send_to(b"\x00", proxy_addr).await;
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(interval, probe.recv_from(&mut buf)).await {
+            Ok(Ok(_)) => return,
+            _ => {
+                if i + 1 == max_retries {
+                    panic!("proxy did not become ready after {max_retries} retries");
+                }
+            }
+        }
+    }
+}
+
 /// Build a minimal in-memory TOML config and exercise the proxy via the library (no subprocess).
 #[tokio::test]
 async fn full_round_trip_with_echo_backend() {
@@ -60,8 +82,8 @@ buffer_size = 4096
         proxy.run().await.unwrap();
     });
 
-    // Give the proxy a moment to start
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for the proxy to become ready (retry-based, no fixed sleep)
+    wait_for_proxy_ready(proxy_addr, 20, Duration::from_millis(100)).await;
 
     // 3. Create a "client" and send a packet
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -147,7 +169,8 @@ buffer_size = 4096
         proxy.run().await.unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for the proxy to become ready (retry-based, no fixed sleep)
+    wait_for_proxy_ready(proxy_addr, 20, Duration::from_millis(100)).await;
 
     // Two independent clients
     let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -159,28 +182,45 @@ buffer_size = 4096
     let mut buf_a = [0u8; 4096];
     let mut buf_b = [0u8; 4096];
 
-    // Collect responses (order may vary)
-    let mut payloads = Vec::new();
-
     // Receive from both clients in parallel using separate buffers
     let (res_a, res_b) = tokio::join!(
         tokio::time::timeout(Duration::from_secs(3), client_a.recv_from(&mut buf_a)),
         tokio::time::timeout(Duration::from_secs(3), client_b.recv_from(&mut buf_b)),
     );
 
-    if let Ok(Ok((n, _))) = res_a {
-        if n >= 2 {
-            payloads.push(("a".to_string(), buf_a[2..n].to_vec()));
-        }
-    }
-    if let Ok(Ok((n, _))) = res_b {
-        if n >= 2 {
-            payloads.push(("b".to_string(), buf_b[2..n].to_vec()));
-        }
-    }
+    // Validate client A response
+    let (n_a, src_a) = res_a
+        .expect("client A timed out")
+        .expect("client A recv error");
+    assert_eq!(src_a, proxy_addr, "client A response must come from proxy");
+    assert!(n_a >= 2, "client A response too short: {} bytes", n_a);
+    assert_eq!(
+        &buf_a[..2],
+        &[0xEC, 0x00],
+        "client A response missing [0xEC, 0x00] prefix"
+    );
+    assert_eq!(
+        &buf_a[2..n_a],
+        b"msg-from-a",
+        "client A payload mismatch"
+    );
 
-    // Each client should get its own echo back
-    assert_eq!(payloads.len(), 2, "both clients should get responses");
+    // Validate client B response
+    let (n_b, src_b) = res_b
+        .expect("client B timed out")
+        .expect("client B recv error");
+    assert_eq!(src_b, proxy_addr, "client B response must come from proxy");
+    assert!(n_b >= 2, "client B response too short: {} bytes", n_b);
+    assert_eq!(
+        &buf_b[..2],
+        &[0xEC, 0x00],
+        "client B response missing [0xEC, 0x00] prefix"
+    );
+    assert_eq!(
+        &buf_b[2..n_b],
+        b"msg-from-b",
+        "client B payload mismatch"
+    );
 
     shutdown.notify_one();
     tokio::time::timeout(Duration::from_secs(2), proxy_handle)

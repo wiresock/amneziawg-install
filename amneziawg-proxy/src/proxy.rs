@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,13 @@ use crate::responder::{self, Protocol};
 use crate::session::SessionTable;
 use crate::transform;
 
+/// A relay task handle paired with its generation, so stale tasks can't
+/// accidentally remove a newer handle from the map.
+struct RelayEntry {
+    handle: tokio::task::JoinHandle<()>,
+    generation: u64,
+}
+
 /// The main proxy runtime state.
 pub struct Proxy {
     config: ProxyConfig,
@@ -26,7 +34,9 @@ pub struct Proxy {
     /// Per-session relay task handles, keyed by client address.
     /// Each task awaits data from the session's backend socket and relays it
     /// back to the client — fully event-driven, no polling.
-    relay_handles: Arc<DashMap<SocketAddr, tokio::task::JoinHandle<()>>>,
+    relay_handles: Arc<DashMap<SocketAddr, RelayEntry>>,
+    /// Monotonically increasing generation counter for relay tasks.
+    relay_generation: AtomicU64,
 }
 
 impl Proxy {
@@ -68,6 +78,7 @@ impl Proxy {
             awg_params: awg_params.map(Arc::new),
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
+            relay_generation: AtomicU64::new(0),
         })
     }
 
@@ -89,6 +100,7 @@ impl Proxy {
             awg_params: awg_params.map(Arc::new),
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
+            relay_generation: AtomicU64::new(0),
         }
     }
 
@@ -139,7 +151,7 @@ impl Proxy {
         cleanup_handle.abort();
         // Abort all per-session relay tasks
         self.relay_handles.iter().for_each(|entry| {
-            entry.value().abort();
+            entry.value().handle.abort();
         });
         self.relay_handles.clear();
         info!("proxy stopped");
@@ -207,6 +219,7 @@ impl Proxy {
         // exceed a safe upper bound to avoid unbounded memory usage per session.
         let relay_buf_size = std::cmp::min(self.config.buffer_size, 65_535);
         let relay_handles = Arc::clone(&self.relay_handles);
+        let generation = self.relay_generation.fetch_add(1, Ordering::Relaxed);
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; relay_buf_size];
@@ -243,24 +256,26 @@ impl Proxy {
                     }
                 }
             }
-            // Clean up relay handle entry when task ends naturally
-            relay_handles.remove(&client_addr);
+            // Only remove our own entry — if a newer relay was spawned for
+            // the same client, its generation will differ and we must not
+            // remove it.
+            relay_handles.remove_if(&client_addr, |_, entry| entry.generation == generation);
         });
 
         // Abort any previously running relay task for this client before
-        // inserting the new handle, so we don't leak orphaned tasks and the
-        // old task can't later remove the *new* entry from the map.
-        if let Some((_, old_handle)) = self.relay_handles.remove(&client_addr) {
-            old_handle.abort();
+        // inserting the new handle, so we don't leak orphaned tasks.
+        if let Some((_, old_entry)) = self.relay_handles.remove(&client_addr) {
+            old_entry.handle.abort();
         }
-        self.relay_handles.insert(client_addr, handle);
+        self.relay_handles.insert(client_addr, RelayEntry { handle, generation });
 
         // If the task has already completed (e.g., due to an immediate recv error)
         // by the time we insert its handle, remove the stale entry to avoid
         // leaving a finished JoinHandle in the map.
-        if let Some(handle_ref) = self.relay_handles.get(&client_addr) {
-            if handle_ref.is_finished() {
-                self.relay_handles.remove(&client_addr);
+        if let Some(entry_ref) = self.relay_handles.get(&client_addr) {
+            if entry_ref.handle.is_finished() {
+                drop(entry_ref);
+                self.relay_handles.remove_if(&client_addr, |_, entry| entry.generation == generation);
             }
         }
     }
@@ -281,8 +296,8 @@ impl Proxy {
                 for addr in &expired {
                     metrics.remove(addr);
                     // Abort the relay task for the expired session
-                    if let Some((_, handle)) = relay_handles.remove(addr) {
-                        handle.abort();
+                    if let Some((_, entry)) = relay_handles.remove(addr) {
+                        entry.handle.abort();
                     }
                 }
                 if !expired.is_empty() {
