@@ -677,18 +677,21 @@ install_sudoers() {
     # these specific commands.
 
     # Resolve the install-script path consistently with the service config.
+    # We use grep instead of sourcing the env file to avoid triggering
+    # `set -u` errors from other variables (e.g. $argon2id in password hashes).
     # Preference order:
     #   1. AWG_INSTALL_SCRIPT from the current environment (if set)
     #   2. AWG_INSTALL_SCRIPT from the env file (if present)
     #   3. Default to /usr/local/bin/amneziawg-install.sh
-    local install_script_path
+    local install_script_path="/usr/local/bin/amneziawg-install.sh"
     if [[ -n "${AWG_INSTALL_SCRIPT:-}" ]]; then
         install_script_path="${AWG_INSTALL_SCRIPT}"
     elif [[ -f "${ENV_FILE}" ]]; then
-        # shellcheck disable=SC1090
-        install_script_path="$(. "${ENV_FILE}" && echo "${AWG_INSTALL_SCRIPT:-/usr/local/bin/amneziawg-install.sh}")"
-    else
-        install_script_path="/usr/local/bin/amneziawg-install.sh"
+        local env_script_path
+        env_script_path="$(grep -E '^AWG_INSTALL_SCRIPT=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2-)"
+        if [[ -n "${env_script_path}" ]]; then
+            install_script_path="${env_script_path}"
+        fi
     fi
 
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"

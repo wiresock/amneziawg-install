@@ -437,11 +437,12 @@ main() {
     #    additional `awg syncconf` / `awg-quick strip` and install-script rules.
 
     # Determine the install script path for sudoers: default, overridable via env.
+    # We use grep instead of sourcing the env file to avoid triggering
+    # `set -u` errors from other variables (e.g. $argon2id in password hashes).
     local install_script_path="/usr/local/bin/amneziawg-install.sh"
     if [[ -f "${ENV_FILE}" ]]; then
-        # shellcheck disable=SC1090
         local env_script_path
-        env_script_path="$(. "${ENV_FILE}" && echo "${AWG_INSTALL_SCRIPT:-}")"
+        env_script_path="$(grep -E '^AWG_INSTALL_SCRIPT=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2-)"
         if [[ -n "${env_script_path}" ]]; then
             install_script_path="${env_script_path}"
         fi
