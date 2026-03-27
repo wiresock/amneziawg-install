@@ -442,7 +442,7 @@ main() {
     local install_script_path="/usr/local/bin/amneziawg-install.sh"
     if [[ -f "${ENV_FILE}" ]]; then
         local env_script_path
-        env_script_path="$(grep -E '^AWG_INSTALL_SCRIPT=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+        env_script_path="$(grep -E '^AWG_INSTALL_SCRIPT=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true)"
         if [[ -n "${env_script_path}" ]]; then
             install_script_path="${env_script_path}"
         fi
