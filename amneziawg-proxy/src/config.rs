@@ -349,6 +349,11 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
             "session_ttl_secs must be > 0".into(),
         ));
     }
+    if config.max_sessions == 0 {
+        return Err(ProxyError::Config(
+            "max_sessions must be > 0".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -448,6 +453,17 @@ session_ttl_secs = 0
 "#;
         let err = parse_config(toml).unwrap_err();
         assert!(err.to_string().contains("session_ttl_secs must be > 0"));
+    }
+
+    #[test]
+    fn reject_zero_max_sessions() {
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+max_sessions = 0
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err.to_string().contains("max_sessions must be > 0"));
     }
 
     #[test]

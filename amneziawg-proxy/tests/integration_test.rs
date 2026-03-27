@@ -50,15 +50,14 @@ buffer_size = 4096
         backend_addr
     );
 
-    // Parse config to get a ProxyConfig
-    let cfg: amneziawg_proxy::config::ProxyConfig =
-        toml::from_str(&config_toml).unwrap();
+    // Parse config to get a ProxyConfig using the same validation as production
+    let cfg = amneziawg_proxy::config::parse_config(&config_toml).unwrap();
 
     let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg, None).await.unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
     let shutdown = proxy.shutdown_handle();
 
-    tokio::spawn(async move {
+    let proxy_handle = tokio::spawn(async move {
         proxy.run().await.unwrap();
     });
 
@@ -113,7 +112,10 @@ buffer_size = 4096
 
     // 6. Shutdown
     shutdown.notify_one();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(2), proxy_handle)
+        .await
+        .expect("proxy did not shut down in time")
+        .unwrap();
     backend_handle.abort();
 }
 
@@ -135,14 +137,14 @@ buffer_size = 4096
         backend_addr
     );
 
-    let cfg: amneziawg_proxy::config::ProxyConfig =
-        toml::from_str(&config_toml).unwrap();
+    // Parse config using the same validation as production
+    let cfg = amneziawg_proxy::config::parse_config(&config_toml).unwrap();
 
     let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg, None).await.unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
     let shutdown = proxy.shutdown_handle();
 
-    tokio::spawn(async move {
+    let proxy_handle = tokio::spawn(async move {
         proxy.run().await.unwrap();
     });
 
@@ -182,6 +184,9 @@ buffer_size = 4096
     assert_eq!(payloads.len(), 2, "both clients should get responses");
 
     shutdown.notify_one();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(2), proxy_handle)
+        .await
+        .expect("proxy did not shut down in time")
+        .unwrap();
     backend_handle.abort();
 }

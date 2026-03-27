@@ -91,7 +91,7 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
             let scid_len_offset = 6 + dcid_len;
             if data.len() > scid_len_offset {
                 let scid_len = data[scid_len_offset] as usize;
-                if scid_len <= 20 {
+                if scid_len <= 20 && data.len() >= scid_len_offset + 1 + scid_len {
                     return Some(Protocol::Quic);
                 }
             }
@@ -377,6 +377,19 @@ mod tests {
         let mut pkt = vec![0xC3u8, 0x00, 0x00, 0x00, 0x01];
         pkt.push(4); // DCID len
         pkt.extend_from_slice(&[1, 2, 3, 4]); // DCID (but no SCID len byte)
+        assert_eq!(detect_protocol(&pkt), None);
+    }
+
+    #[test]
+    fn detect_quic_rejects_truncated_scid_body() {
+        // Packet has SCID length but not enough SCID bytes.
+        // Byte 2 is set to 0x80 so that the DNS detection heuristic
+        // (flags & 0xF800 == 0x0000) fails, preventing a false DNS match.
+        let mut pkt = vec![0xC3u8, 0x00, 0x80, 0x00, 0x01];
+        pkt.push(4); // DCID len
+        pkt.extend_from_slice(&[1, 2, 3, 4]); // DCID
+        pkt.push(8); // SCID len = 8
+        pkt.extend_from_slice(&[0xAA, 0xBB]); // only 2 bytes of SCID (truncated)
         assert_eq!(detect_protocol(&pkt), None);
     }
 

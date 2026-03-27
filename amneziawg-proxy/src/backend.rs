@@ -14,7 +14,7 @@ pub async fn forward_to_backend(
 }
 
 /// Receive a response from the backend on the session's dedicated socket.
-/// Returns `None` if the socket would block (no data available).
+/// Awaits until data is available and returns the number of bytes read.
 pub async fn recv_from_backend(
     backend_sock: &UdpSocket,
     buf: &mut [u8],
