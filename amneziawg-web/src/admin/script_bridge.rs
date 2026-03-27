@@ -35,6 +35,14 @@ const SCRIPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum client name length (must match install script's validation).
 pub const MAX_CLIENT_NAME_LEN: usize = 15;
 
+/// Maximum number of chars to keep when logging stderr output.
+const STDERR_LOG_LIMIT: usize = 512;
+
+/// Truncate stderr to [`STDERR_LOG_LIMIT`] chars for safe logging.
+fn truncate_for_log(s: &str) -> String {
+    s.chars().take(STDERR_LOG_LIMIT).collect()
+}
+
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -202,9 +210,8 @@ impl ScriptBridge {
                 if !stderr.is_empty() {
                     // Log stderr at debug level.  The install script is
                     // expected to emit only short diagnostic text (no secrets).
-                    // Truncate to 512 chars as a safety measure.
-                    let truncated: String = stderr.chars().take(512).collect();
-                    debug!(stderr = %truncated, "script stderr");
+                    // Truncate as a safety measure.
+                    debug!(stderr = %truncate_for_log(&stderr), "script stderr");
                 }
 
                 match status.code() {
@@ -213,16 +220,14 @@ impl ScriptBridge {
                         Ok(stdout.trim().to_string())
                     }
                     Some(code) => {
-                        let truncated: String = stderr.chars().take(512).collect();
-                        error!(flag, code, stderr = %truncated, "install script failed");
+                        error!(flag, code, stderr = %truncate_for_log(&stderr), "install script failed");
                         Err(ScriptError::NonZeroExit {
                             code,
                             stderr: stderr.trim().to_string(),
                         })
                     }
                     None => {
-                        let truncated: String = stderr.chars().take(512).collect();
-                        error!(flag, stderr = %truncated, "install script killed by signal");
+                        error!(flag, stderr = %truncate_for_log(&stderr), "install script killed by signal");
                         Err(ScriptError::Signal {
                             stderr: stderr.trim().to_string(),
                         })

@@ -1885,7 +1885,7 @@ fn render_peer_detail(
 Historical data (snapshots, events) will be preserved.</p>
 <form method="POST" action="/admin/users/{id}/remove">
   <input type="hidden" name="csrf_token" value="{csrf}">
-  <label style="display:flex;align-items:center;gap:.4rem;margin-top:.5rem">
+  <label for="confirm_remove" style="display:flex;align-items:center;gap:.4rem;margin-top:.5rem">
     <input type="checkbox" id="confirm_remove" name="confirm" value="yes" required>
     I understand this action will permanently remove this user and cannot be undone.
   </label>
