@@ -1,0 +1,24 @@
+[package]
+name = "amneziawg-proxy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Async UDP proxy for AmneziaWG with protocol imitation and S4 padding"
+license = "MIT"
+keywords = ["wireguard", "amneziawg", "vpn", "proxy", "udp"]
+categories = ["network-programming"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+dashmap = "6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
