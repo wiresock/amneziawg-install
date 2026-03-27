@@ -93,6 +93,47 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::parse();
     info!(listen = %config.listen, db = %config.database_url, "starting amneziawg-web");
 
+    // --- Validate install-script path early --------------------------------
+    // The script path is security-critical: it is invoked via sudo and must
+    // be an absolute path, free of whitespace/commas (sudoers can't handle
+    // those), and must exist + be executable.
+    {
+        let p = &config.install_script;
+        if !p.is_absolute() {
+            anyhow::bail!(
+                "AWG_INSTALL_SCRIPT must be an absolute path, got: {}",
+                p.display()
+            );
+        }
+        let s = p.to_string_lossy();
+        if s.contains(char::is_whitespace) || s.contains(',') {
+            anyhow::bail!(
+                "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: {}",
+                p.display()
+            );
+        }
+        if !p.is_file() {
+            anyhow::bail!(
+                "AWG_INSTALL_SCRIPT not found: {}",
+                p.display()
+            );
+        }
+        // Best-effort executable check on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(p)
+                .with_context(|| format!("cannot stat AWG_INSTALL_SCRIPT: {}", p.display()))?;
+            if meta.permissions().mode() & 0o111 == 0 {
+                anyhow::bail!(
+                    "AWG_INSTALL_SCRIPT is not executable: {}",
+                    p.display()
+                );
+            }
+        }
+        info!(path = %p.display(), "install script validated");
+    }
+
     if config.auth_enabled {
         if config.auth_password_hash.is_empty() {
             anyhow::bail!(

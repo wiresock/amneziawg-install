@@ -130,14 +130,17 @@ impl ScriptBridge {
     /// Build the argument array for a given flag + optional client name.
     ///
     /// The returned vector is the full `argv` for `Command::new(sudo)`.
-    fn build_args(&self, flag: &str, client_name: Option<&str>) -> Vec<String> {
-        let mut args = vec![
-            "-n".to_string(), // non-interactive sudo
-            self.script_path.to_string_lossy().into_owned(),
-            flag.to_string(),
+    /// Uses `OsString` to preserve the exact script path bytes (no lossy
+    /// UTF-8 conversion), which also ensures sudoers matching works for
+    /// non-ASCII paths.
+    fn build_args(&self, flag: &str, client_name: Option<&str>) -> Vec<std::ffi::OsString> {
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "-n".into(), // non-interactive sudo
+            self.script_path.as_os_str().to_owned(),
+            flag.into(),
         ];
         if let Some(name) = client_name {
-            args.push(name.to_string());
+            args.push(name.into());
         }
         args
     }

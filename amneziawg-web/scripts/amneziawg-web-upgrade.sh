@@ -436,16 +436,33 @@ main() {
     #    Always rewrite so that upgrades from older versions pick up the
     #    additional `awg syncconf` / `awg-quick strip` and install-script rules.
 
-    # Determine the install script path for sudoers: default, overridable via env.
+    # Determine the install script path for sudoers.
     # We use grep instead of sourcing the env file to avoid triggering
     # `set -u` errors from other variables (e.g. $argon2id in password hashes).
+    # Precedence:
+    #   1. AWG_INSTALL_SCRIPT environment variable (if set)
+    #   2. AWG_INSTALL_SCRIPT from the env file (if present)
+    #   3. Default to /usr/local/bin/amneziawg-install.sh
     local install_script_path="/usr/local/bin/amneziawg-install.sh"
-    if [[ -f "${ENV_FILE}" ]]; then
+    if [[ -n "${AWG_INSTALL_SCRIPT:-}" ]]; then
+        install_script_path="${AWG_INSTALL_SCRIPT}"
+    elif [[ -f "${ENV_FILE}" ]]; then
         local env_script_path
         env_script_path="$(grep -E '^AWG_INSTALL_SCRIPT=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true)"
         if [[ -n "${env_script_path}" ]]; then
             install_script_path="${env_script_path}"
         fi
+    fi
+
+    # Validate install_script_path before embedding it into sudoers.
+    if [[ "${install_script_path}" != /* ]]; then
+        die "AWG_INSTALL_SCRIPT must be an absolute path, got: ${install_script_path}"
+    fi
+    if [[ "${install_script_path}" =~ [[:space:],] ]]; then
+        die "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: ${install_script_path}"
+    fi
+    if [[ ! -x "${install_script_path}" ]]; then
+        die "Install script not found or not executable: ${install_script_path}"
     fi
 
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"

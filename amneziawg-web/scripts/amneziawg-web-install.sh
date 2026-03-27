@@ -694,6 +694,17 @@ install_sudoers() {
         fi
     fi
 
+    # Validate install_script_path before embedding it into sudoers.
+    if [[ "${install_script_path}" != /* ]]; then
+        die "AWG_INSTALL_SCRIPT must be an absolute path, got: ${install_script_path}"
+    fi
+    if [[ "${install_script_path}" =~ [[:space:],] ]]; then
+        die "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: ${install_script_path}"
+    fi
+    if [[ ! -x "${install_script_path}" ]]; then
+        die "Install script not found or not executable: ${install_script_path}"
+    fi
+
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
     local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --add-client *, ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
 
