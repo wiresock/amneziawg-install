@@ -3995,7 +3995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_create_user_spawn_failure_returns_diagnostic_error() {
+    async fn api_create_user_internal_failure_returns_diagnostic_error() {
         let app = test_router(test_db().await);
         let response = app
             .oneshot(
@@ -4025,7 +4025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_add_user_form_spawn_failure_renders_diagnostic_error() {
+    async fn post_add_user_form_create_user_failure_renders_diagnostic_error() {
         let app = test_router(test_db().await);
         let response = app
             .oneshot(
@@ -4052,7 +4052,8 @@ mod tests {
             html.contains("script exit code")
                 || html.contains("unable to start install script")
                 || html.contains("script terminated by signal")
-                || html.contains("script timed out"),
+                || html.contains("script timed out")
+                || html.contains("failed while waiting for install script"),
             "HTML should include concrete diagnostic reason"
         );
     }
