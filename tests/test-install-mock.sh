@@ -1319,6 +1319,13 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+if [[ -f /usr/local/bin/amneziawg-install.sh ]]; then
+	echo "OK: Pre-condition: AWG lifecycle script exists before uninstall"
+else
+	echo "FAIL: Pre-condition: AWG lifecycle script missing before uninstall test"
+	FAILED=$((FAILED + 1))
+fi
+
 if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
 	echo "OK: Pre-condition: env file exists before uninstall"
 else
@@ -1354,6 +1361,14 @@ if [[ ! -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
 	echo "OK: Binary removed after uninstall"
 else
 	echo "FAIL: Binary still exists after uninstall"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify installed AWG lifecycle script was removed
+if [[ ! -f /usr/local/bin/amneziawg-install.sh ]]; then
+	echo "OK: Installed AWG lifecycle script removed after uninstall"
+else
+	echo "FAIL: Installed AWG lifecycle script still exists after uninstall"
 	FAILED=$((FAILED + 1))
 fi
 

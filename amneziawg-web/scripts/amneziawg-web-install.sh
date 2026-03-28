@@ -26,6 +26,7 @@ readonly SERVICE_NAME="amneziawg-web"
 readonly SERVICE_USER="awg-web"
 readonly SYSTEMD_UNIT_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
+readonly AWG_INSTALL_SCRIPT_DEST="/usr/local/bin/amneziawg-install.sh"
 
 # Default paths
 readonly DEFAULT_BINARY_SRC="./target/release/amneziawg-web"
@@ -660,6 +661,19 @@ install_binary() {
     info "Installed binary: ${dest}"
 }
 
+install_awg_install_script() {
+    step "Installing AmneziaWG lifecycle script"
+
+    local source_path="${SCRIPT_DIR}/../../amneziawg-install.sh"
+    if [[ ! -f "${source_path}" ]]; then
+        die "Required script not found: ${source_path}
+The web panel requires amneziawg-install.sh for add/remove/list client operations."
+    fi
+
+    install -m 0755 "${source_path}" "${AWG_INSTALL_SCRIPT_DEST}"
+    info "Installed AWG lifecycle script: ${AWG_INSTALL_SCRIPT_DEST}"
+}
+
 # ── Sudoers drop-in ───────────────────────────────────────────────────────────
 
 install_sudoers() {
@@ -1011,6 +1025,7 @@ main() {
 
     setup_filesystem
     install_binary
+    install_awg_install_script
     install_sudoers
     write_env_file
     install_service_unit
