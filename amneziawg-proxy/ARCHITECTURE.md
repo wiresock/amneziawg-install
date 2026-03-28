@@ -12,8 +12,9 @@ It performs two complementary functions:
    Initial or a DNS query), the proxy generates a valid protocol response so
    the port appears to host the imitated service.
 2. **Padding transformation** — outgoing AmneziaWG packets have their S1–S4
-   padding regions overwritten with protocol-conformant filler bytes, so the
-   statistical byte distribution matches the imitated protocol.
+   padding prefix (the random bytes prepended before the obfuscated header)
+   overwritten with protocol-conformant filler bytes, so the statistical byte
+   distribution matches the imitated protocol.
 
 ```
                                   ┌──────────────────────────────┐
@@ -83,7 +84,7 @@ passes through the proxy, which adds the imitation layer.
 | `config.rs`    | Parses `proxy.toml` (TOML) and AWG INI-style config files. Validates addresses, protocol names, H-range non-overlap, Jmin≤Jmax. |
 | `proxy.rs`     | Core runtime: binds frontend socket, runs the main `recv_from` loop, spawns per-session relay tasks and cleanup task, orchestrates all other modules. |
 | `responder.rs` | Probe detection (`detect_protocol`) and response generation (`generate_response`). Also contains AWG packet classification (`classify_awg_packet`). |
-| `transform.rs` | Padding transformation: overwrites the S1–S4 padding region with protocol-conformant filler (QUIC PRNG, DNS header, SIP text). |
+| `transform.rs` | Padding transformation: overwrites the S1–S4 padding prefix with protocol-conformant filler (QUIC PRNG, DNS header, SIP text). |
 | `session.rs`   | Per-client session table backed by `DashMap`. Each session owns a dedicated ephemeral UDP socket connected to the backend. TTL-based expiry. |
 | `backend.rs`   | Low-level backend I/O: `forward_to_backend`, `recv_from_backend`, `send_to_client`, `try_recv_from_backend` (with timeout). |
 | `metrics.rs`   | Per-client counters (packets in/out, probes) and token-bucket rate limiter for probe responses. |
@@ -115,11 +116,12 @@ Client                      Proxy                           Backend (AWG)
 
 **Step 5–6 detail (padding transform):**
 
-The per-session relay task reads the first 4 bytes of the backend response as a
-little-endian `u32` header value. It checks which H range the value falls
-into, determining the AWG packet type (Handshake Init / Response / Cookie
-Reply / Transport Data). The corresponding S-value tells it how many trailing
-bytes are the padding region. Those bytes are then overwritten with
+The per-session relay task classifies the backend response by trying each
+(S-offset, H-range) pair: it reads the 4 bytes at offset S as a
+little-endian `u32` and checks whether the value falls into the
+corresponding H range. This determines the AWG packet type (Handshake Init /
+Response / Cookie Reply / Transport Data). The S-value tells it how many
+leading bytes are the padding prefix. Those bytes are then overwritten with
 protocol-conformant filler (see "Padding Strategies" below).
 
 ---
@@ -195,24 +197,24 @@ Destination Connection ID field."
   reserved bits (0x18) cleared and spin/key-phase/PN-length bits derived
   from the PRNG
 - Remaining bytes: pseudo-random from an FNV-1a-seeded LCG PRNG
-- Seed is derived from the first 64 bytes of the WG payload, so each packet
-  produces different padding
+- Seed is derived from the first 64 bytes of the WG payload (which follows
+  the padding prefix), so each packet produces different padding
 - Result: high-entropy byte distribution matching encrypted QUIC 1-RTT data
 
 ```
 AWG packet (backend → client):
-┌──────────┬──────────────────────┬────────────────────────┐
-│ H header │   WG payload         │   S padding (random)   │
-│ (4 bytes)│   (variable)         │   (S1-S4 bytes)        │
-└──────────┴──────────────────────┴────────────────────────┘
-                                   ▲
-                                   │ overwritten with:
-                                   ▼
-                               ┌────────────────────────┐
-                               │ 0x4X │ PRNG bytes ...  │
-                               │ short│ (high entropy)  │
-                               │ hdr  │                 │
-                               └────────────────────────┘
+┌────────────────────────┬──────────┬──────────────────────┐
+│   S padding (random)   │ H header │   WG payload         │
+│   (S1-S4 bytes)        │ (4 bytes)│   (variable)         │
+└────────────────────────┴──────────┴──────────────────────┘
+ ▲
+ │ overwritten with:
+ ▼
+┌────────────────────────┐
+│ 0x4X │ PRNG bytes ...  │
+│ short│ (high entropy)  │
+│ hdr  │                 │
+└────────────────────────┘
 ```
 
 ### DNS Imitation
@@ -251,27 +253,28 @@ response is returned header-only with QDCOUNT = 0.  The total echoed
 response is capped at 512 bytes per RFC 1035 §2.3.4.
 
 **Padding fill** (`apply_dns_padding`):
-- Bytes 0-1: Transaction ID derived from payload bytes 0-1
+- Bytes 0-1: Transaction ID derived from the first two payload bytes
+  (H header bytes) that follow the padding prefix
 - Bytes 2-3: `0x81 0x80` (QR=1, RD=1, RA=1, RCODE=NOERROR)
 - Bytes 4-11: Section counts (QDCOUNT=0, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0)
 - Bytes 12+: Zero-filled (EDNS OPT padding per RFC 7830)
 
 ```
 AWG packet (backend → client):
-┌──────────┬──────────────────────┬──────────────────────────┐
-│ H header │   WG payload         │   S padding (random)     │
-│ (4 bytes)│   (variable)         │   (S1-S4 bytes)          │
-└──────────┴──────────────────────┴──────────────────────────┘
-                                   ▲
-                                   │ overwritten with:
-                                   ▼
-                               ┌──────────────────────────┐
-                               │ TX_ID │ flags │ counts   │
-                               │ (2B)  │ (2B)  │ (8B)     │
-                               │ 0x81 0x80     │          │
-                               ├──────────────────────────┤
-                               │ 0x00 ... (EDNS padding)  │
-                               └──────────────────────────┘
+┌──────────────────────────┬──────────┬──────────────────────┐
+│   S padding (random)     │ H header │   WG payload         │
+│   (S1-S4 bytes)          │ (4 bytes)│   (variable)         │
+└──────────────────────────┴──────────┴──────────────────────┘
+ ▲
+ │ overwritten with:
+ ▼
+┌──────────────────────────┐
+│ TX_ID │ flags │ counts   │
+│ (2B)  │ (2B)  │ (8B)     │
+│ 0x81 0x80     │          │
+├──────────────────────────┤
+│ 0x00 ... (EDNS padding)  │
+└──────────────────────────┘
 ```
 
 ### SIP Imitation
@@ -303,23 +306,23 @@ indistinguishable from a real SIP proxy.
 
 **Padding fill** (`apply_sip_padding`):
 - Filled by cycling through: `Via: SIP/2.0/UDP proxy\r\nContent-Length: 0\r\n`
-- The last 2 bytes are always overwritten with `\r\n`
+- The last 2 bytes of the padding prefix are always overwritten with `\r\n`
 - This makes the padding look like legitimate SIP header continuation
 
 ```
 AWG packet (backend → client):
-┌──────────┬──────────────────────┬──────────────────────────────┐
-│ H header │   WG payload         │   S padding (random)         │
-│ (4 bytes)│   (variable)         │   (S1-S4 bytes)              │
-└──────────┴──────────────────────┴──────────────────────────────┘
-                                   ▲
-                                   │ overwritten with:
-                                   ▼
-                               ┌──────────────────────────────┐
-                               │ Via: SIP/2.0/UDP proxy\r\n   │
-                               │ Content-Length: 0\r\n         │
-                               │ Via: SIP/2.0/UDP pr...\r\n   │
-                               └──────────────────────────────┘
+┌──────────────────────────────┬──────────┬──────────────────────┐
+│   S padding (random)         │ H header │   WG payload         │
+│   (S1-S4 bytes)              │ (4 bytes)│   (variable)         │
+└──────────────────────────────┴──────────┴──────────────────────┘
+ ▲
+ │ overwritten with:
+ ▼
+┌──────────────────────────────┐
+│ Via: SIP/2.0/UDP proxy\r\n   │
+│ Content-Length: 0\r\n         │
+│ Via: SIP/2.0/UDP pr...\r\n   │
+└──────────────────────────────┘
 ```
 
 ---
@@ -327,28 +330,29 @@ AWG packet (backend → client):
 ## AWG Packet Classification
 
 AmneziaWG modifies standard WireGuard by replacing the 4-byte message type
-header with a random value from a per-type range and appending random padding.
+header with a random value from a per-type range and prepending random
+padding before the obfuscated header.
 
-| WireGuard Type        | AWG Header Range | Padding Size |
-|-----------------------|------------------|-------------|
-| Handshake Initiation  | H1 (min–max)     | S1 bytes    |
-| Handshake Response    | H2 (min–max)     | S2 bytes    |
-| Cookie Reply          | H3 (min–max)     | S3 bytes    |
-| Transport Data        | H4 (min–max)     | S4 bytes    |
+| WireGuard Type        | AWG Header Range | Padding Prefix |
+|-----------------------|------------------|----------------|
+| Handshake Initiation  | H1 (min–max)     | S1 bytes       |
+| Handshake Response    | H2 (min–max)     | S2 bytes       |
+| Cookie Reply          | H3 (min–max)     | S3 bytes       |
+| Transport Data        | H4 (min–max)     | S4 bytes       |
 
 Classification algorithm (`classify_awg_packet`):
 ```
-header = u32::from_le_bytes(data[0..4])
+for each (S, H-range, packet_type) in [(S1,H1), (S2,H2), (S3,H3), (S4,H4)]:
+    if data.len() >= S + 4:
+        header = u32::from_le_bytes(data[S..S+4])
+        if H.min ≤ header ≤ H.max → return packet_type
 
-if H1.min ≤ header ≤ H1.max → HandshakeInit   → padding = S1
-if H2.min ≤ header ≤ H2.max → HandshakeResponse → padding = S2
-if H3.min ≤ header ≤ H3.max → CookieReply      → padding = S3
-if H4.min ≤ header ≤ H4.max → TransportData    → padding = S4
-otherwise                    → unclassified (no transform applied)
+otherwise → unclassified (no transform applied)
 ```
 
-The H ranges are validated to be non-overlapping during config parsing so
-classification is unambiguous.
+The S-padding precedes the H header, so the classifier tries each S offset
+to find the header.  The H ranges are validated to be non-overlapping during
+config parsing so classification is unambiguous.
 
 ---
 
@@ -512,33 +516,32 @@ Backend sends a Transport Data packet back to the client. AWG config has
 
 **Backend response** (124 bytes):
 ```
-┌──────────────────┬─────────────────────────┬──────────────────┐
-│ Header: 750 (LE) │  WG encrypted payload   │  Random padding  │
-│ [0xEE,0x02,0,0]  │  (100 bytes)            │  (20 bytes)      │
-└──────────────────┴─────────────────────────┴──────────────────┘
- bytes 0-3           bytes 4-103               bytes 104-123
+┌──────────────────┬──────────────────┬─────────────────────────┐
+│  Random padding  │ Header: 750 (LE) │  WG encrypted payload   │
+│  (20 bytes)      │ [0xEE,0x02,0,0]  │  (100 bytes)            │
+└──────────────────┴──────────────────┴─────────────────────────┘
+ bytes 0-19          bytes 20-23        bytes 24-123
 ```
 
 **Relay task processing:**
-1. `classify_awg_packet()` → header `750` is in H4 range `[700,800]`
-   → `TransportData`
+1. `classify_awg_packet()` → tries S4 offset (20), reads header `750` at
+   bytes 20-23, matches H4 range `[700,800]` → `TransportData`
 2. `padding_size()` → `S4 = 20`
-3. `payload_end = 124 - 20 = 104`
-4. `apply_quic_padding(data, 104)`:
-   - FNV-1a hash of `data[0..64]` → seed
-   - `data[104]` = QUIC short-header byte with fixed bit set, reserved bits
+3. `apply_quic_padding(data, 20)`:
+   - FNV-1a hash of `data[20..84]` (payload after padding) → seed
+   - `data[0]` = QUIC short-header byte with fixed bit set, reserved bits
      (0x18) cleared, and spin/key-phase/PN-length bits derived from seed
-   - `data[105..124]` = LCG PRNG pseudo-random bytes
+   - `data[1..20]` = LCG PRNG pseudo-random bytes
 
 **Transformed packet** (124 bytes, same length):
 ```
-┌──────────────────┬─────────────────────────┬──────────────────┐
-│ Header: 750 (LE) │  WG encrypted payload   │ QUIC-like padding│
-│ [0xEE,0x02,0,0]  │  (100 bytes, untouched) │ [0x4X, PRN...]   │
-└──────────────────┴─────────────────────────┴──────────────────┘
+┌──────────────────┬──────────────────┬─────────────────────────┐
+│ QUIC-like padding│ Header: 750 (LE) │  WG encrypted payload   │
+│ [0x4X, PRN...]   │ [0xEE,0x02,0,0]  │  (100 bytes, untouched) │
+└──────────────────┴──────────────────┴─────────────────────────┘
 ```
 
-To DPI, the trailing bytes now look like encrypted QUIC 1-RTT data rather
+To DPI, the leading bytes now look like encrypted QUIC 1-RTT data rather
 than random padding.
 
 ---
