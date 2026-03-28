@@ -2223,12 +2223,24 @@ function validateParamsFile() {
 				echo -e "${GREEN}Permissions on ${AMNEZIAWG_DIR}/params updated to 600. Continuing.${NC}"
 			else
 				# chmod failed (e.g. read-only filesystem or immutable file attribute).
-				# The file is still readable, so params loading can continue.
-				# Warn the operator but do not abort – aborting would prevent all
-				# client management on systems where the filesystem cannot be modified.
+				# Warn the operator, but only continue if the file has no group/other
+				# write bits set; sourcing a writable-by-others file as root is a
+				# local privilege-escalation risk.
 				echo -e "${ORANGE}WARNING: Could not fix permissions on ${AMNEZIAWG_DIR}/params (current: ${PARAMS_PERMS}): ${chmod_err}${NC}"
 				echo -e "${ORANGE}The filesystem may be read-only or the file may have the immutable attribute set.${NC}"
 				echo -e "${ORANGE}Fix when possible: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
+				local current_mode
+				if ! current_mode=$(stat -c '%a' "${AMNEZIAWG_DIR}/params" 2>/dev/null); then
+					echo -e "${RED}ERROR: Could not re-read permissions on ${AMNEZIAWG_DIR}/params after chmod failure; refusing to source an unverified file as root.${NC}"
+					return 1
+				fi
+				# Abort if any group/other write bit remains set (mode & 022 != 0).
+				# 022 is octal, matching the standard umask write-bit mask.
+				if (( (8#${current_mode} & 022) != 0 )); then
+					echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params remains writable by group/other (mode: ${current_mode}). Refusing to source for security reasons.${NC}"
+					echo -e "${ORANGE}Fix manually: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
+					return 1
+				fi
 			fi
 		else
 			echo -e "${ORANGE}Fix with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
