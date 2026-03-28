@@ -1088,7 +1088,7 @@ PARAMS_EOF
 ) || FAILED=$((FAILED + 1))
 
 echo ""
-echo "--- validateParamsFile: chmod failure on mode 604 (group-readable only) is non-fatal ---"
+echo "--- validateParamsFile: chmod failure on mode 604 (other-readable only) is non-fatal ---"
 
 (
 	VPFTEST_604_DIR=$(mktemp -d)
@@ -1119,7 +1119,7 @@ SERVER_AWG_H3='200000012-300000016'
 SERVER_AWG_H4='300000018-400000022'
 PARAMS_EOF
 
-	# Mode 604: group-readable only, no write bits.
+	# Mode 604: other-readable only (owner rw-, group ---, other r--), no write bits for group/other.
 	command chmod 604 "${VPFTEST_604_DIR}/params"
 
 	touch "${VPFTEST_604_DIR}/awg0.conf"
@@ -1152,7 +1152,7 @@ PARAMS_EOF
 ) || FAILED=$((FAILED + 1))
 
 echo ""
-echo "--- validateParamsFile: chmod failure on mode 646 (group-writable) is fatal ---"
+echo "--- validateParamsFile: chmod failure on mode 646 (other-writable) is fatal ---"
 
 (
 	VPFTEST_646_DIR=$(mktemp -d)
@@ -1183,7 +1183,7 @@ SERVER_AWG_H3='200000012-300000016'
 SERVER_AWG_H4='300000018-400000022'
 PARAMS_EOF
 
-	# Mode 646: group-writable — must be fatal.
+	# Mode 646: other-writable (owner rw-, group r--, other rw-) — must be fatal.
 	command chmod 646 "${VPFTEST_646_DIR}/params"
 
 	touch "${VPFTEST_646_DIR}/awg0.conf"
@@ -1200,9 +1200,9 @@ PARAMS_EOF
 	OUTPUT=$(validateParamsFile 2>&1)
 	RC=$?
 	if [[ ${RC} -ne 0 ]]; then
-		echo "OK: validateParamsFile correctly rejected group-writable params (mode 646) when chmod failed"
+		echo "OK: validateParamsFile correctly rejected other-writable params (mode 646) when chmod failed"
 	else
-		echo "FAIL: validateParamsFile should have rejected group-writable params (mode 646) when chmod failed"
+		echo "FAIL: validateParamsFile should have rejected other-writable params (mode 646) when chmod failed"
 		echo "  output: ${OUTPUT}"
 		exit 1
 	fi
