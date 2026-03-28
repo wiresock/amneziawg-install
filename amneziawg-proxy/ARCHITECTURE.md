@@ -233,18 +233,22 @@ A valid DNS SERVFAIL response (RFC 1035 §4.1):
 Byte  Field
 ────  ─────
  0-1  Transaction ID      Echoed from incoming query
- 2-3  0x8182              Flags: QR=1, RD=1, RA=1, RCODE=2 (SERVFAIL)
- 4-5  0x0001              QDCOUNT = 1
+ 2-3  Flags               QR=1, RA=1, RCODE=2 (SERVFAIL); RD copied from query
+ 4-5  QDCOUNT             1 when question echoed, 0 otherwise
  6-7  0x0000              ANCOUNT = 0
  8-9  0x0000              NSCOUNT = 0
 10-11 0x0000              ARCOUNT = 0
-12+   Question section    Echoed from incoming query (QNAME + QTYPE + QCLASS)
+12+   Question section    Echoed when fully parsed (optional)
 ```
-The question section is parsed by walking the QNAME labels (each prefixed
-with a length byte, terminated by a zero root label) then appending 4 bytes
-for QTYPE and QCLASS. Echoing the question section is required by RFC 1035
-and makes the response indistinguishable from a real recursive resolver
-failure.
+The RD (Recursion Desired) bit is copied from the incoming query per
+RFC 1035 §4.1.1 rather than being hard-coded.  The question section is
+parsed by walking the QNAME labels (each prefixed with a length byte,
+terminated by a zero root label; individual labels ≤ 63, total QNAME
+≤ 255 including root) then appending 4 bytes for QTYPE and QCLASS.
+If the question section cannot be fully parsed (truncated query,
+compression pointers, or RFC 1035 label/name length violations), the
+response is returned header-only with QDCOUNT = 0.  The total echoed
+response is capped at 512 bytes per RFC 1035 §2.3.4.
 
 **Padding fill** (`apply_dns_padding`):
 - Bytes 0-1: Transaction ID derived from payload bytes 0-1

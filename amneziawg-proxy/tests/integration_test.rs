@@ -111,8 +111,8 @@ buffer_size = 4096
 
     client.send_to(&quic_pkt, proxy_addr).await.unwrap();
 
-    // We should get TWO responses: probe response + backend echo
-    // Collect responses
+    // We should get TWO responses: a probe response (QUIC Version
+    // Negotiation) and a backend echo (prefixed with [0xEC, 0x00]).
     let mut responses = Vec::new();
     for _ in 0..2 {
         match tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf)).await {
@@ -121,15 +121,22 @@ buffer_size = 4096
         }
     }
 
-    // At least the probe response should be present
-    assert!(
-        !responses.is_empty(),
-        "should receive at least the probe response"
+    assert_eq!(
+        responses.len(),
+        2,
+        "expected both probe response and backend echo, got {}",
+        responses.len()
     );
 
-    // Check that we got a QUIC version negotiation (starts with 0xC3, preserving incoming type bits)
+    // One response must be the QUIC Version Negotiation (first byte 0xC3).
     let has_version_neg = responses.iter().any(|r| !r.is_empty() && r[0] == 0xC3);
     assert!(has_version_neg, "should have a QUIC version negotiation response");
+
+    // The other must be the backend echo (prefixed with [0xEC, 0x00]).
+    let has_backend_echo = responses
+        .iter()
+        .any(|r| r.len() >= 2 && r[0] == 0xEC && r[1] == 0x00);
+    assert!(has_backend_echo, "should have a backend echo response");
 
     // 6. Shutdown
     shutdown.notify_one();
