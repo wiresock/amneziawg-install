@@ -116,6 +116,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "${ENV_FILE}" != /* ]]; then
+    die "Env file path must be absolute: ${ENV_FILE}"
+fi
+if [[ "${ENV_DIR}" != /* ]]; then
+    die "Env directory path must be absolute: ${ENV_DIR}"
+fi
+
 # ── Root check ─────────────────────────────────────────────────────────────────
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -259,7 +266,25 @@ print_plan() {
 
 is_safe_awg_script_path() {
     local path="$1"
-    [[ "${path}" == /* ]] && [[ ! "${path}" =~ [[:space:],] ]]
+    if [[ "${path}" != /* ]] || [[ "${path}" =~ [[:space:],] ]]; then
+        return 1
+    fi
+
+    local filename="${path##*/}"
+    if [[ "${filename}" != "amneziawg-install.sh" ]]; then
+        return 1
+    fi
+
+    case "${path}" in
+        /usr/local/bin/amneziawg-install.sh|\
+        /usr/bin/amneziawg-install.sh|\
+        /opt/amneziawg-web/bin/amneziawg-install.sh)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 remove_managed_awg_install_script() {

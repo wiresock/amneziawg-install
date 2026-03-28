@@ -683,6 +683,40 @@ resolve_awg_install_script_path() {
     printf '%s' "${resolved_path}"
 }
 
+is_script_safe_for_sudoers() {
+    local script_path="$1"
+
+    if [[ ! -f "${script_path}" ]] || [[ -L "${script_path}" ]]; then
+        return 1
+    fi
+    if [[ ! -x "${script_path}" ]]; then
+        return 1
+    fi
+
+    local owner_uid owner_gid mode
+    owner_uid="$(stat -c '%u' "${script_path}" 2>/dev/null || echo "")"
+    owner_gid="$(stat -c '%g' "${script_path}" 2>/dev/null || echo "")"
+    mode="$(stat -c '%a' "${script_path}" 2>/dev/null || echo "")"
+    if [[ -z "${owner_uid}" ]] || [[ -z "${owner_gid}" ]] || [[ -z "${mode}" ]]; then
+        return 1
+    fi
+    if [[ ! "${mode}" =~ ^[0-7]{3,4}$ ]]; then
+        return 1
+    fi
+
+    # Require root ownership and no group/other write bits.
+    if [[ "${owner_uid}" != "0" ]] || [[ "${owner_gid}" != "0" ]]; then
+        return 1
+    fi
+    local mode_octal
+    mode_octal=$((8#${mode}))
+    if (( (mode_octal & 8#022) != 0 )); then
+        return 1
+    fi
+
+    return 0
+}
+
 install_awg_install_script() {
     step "Installing AmneziaWG lifecycle script"
 
@@ -719,6 +753,9 @@ install_awg_install_script() {
        [[ "${marker_target}" != "${install_script_path}" ]] && \
        [[ "${FORCE}" != "true" ]]; then
         warn "Existing AWG lifecycle script appears unmanaged: ${install_script_path}"
+        if ! is_script_safe_for_sudoers "${install_script_path}"; then
+            die "Refusing to grant sudoers access to unsafe unmanaged script '${install_script_path}'. Ensure it is a regular executable file owned by root:root and not group or world-writable, or re-run with --force to replace it."
+        fi
         warn "Preserving existing script. Re-run with --force to replace and mark it as installer-managed."
         return 0
     fi
