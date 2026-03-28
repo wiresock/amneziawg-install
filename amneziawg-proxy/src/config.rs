@@ -24,8 +24,8 @@ impl HRange {
 /// AmneziaWG obfuscation parameters parsed from an AWG config file.
 ///
 /// AmneziaWG extends WireGuard by replacing the standard 4-byte message type
-/// header with a random value drawn from a per-type H range and appending
-/// S bytes of random padding after the packet payload.
+/// header with a random value drawn from a per-type H range and prepending
+/// S bytes of random padding before the obfuscated header.
 ///
 /// | Packet type          | Header range | Padding |
 /// |----------------------|-------------|---------|
@@ -41,13 +41,13 @@ pub struct AwgParams {
     pub jmin: u32,
     /// Maximum junk packet size in bytes.
     pub jmax: u32,
-    /// Padding bytes appended to Handshake Initiation packets.
+    /// Padding bytes prepended to Handshake Initiation packets.
     pub s1: u32,
-    /// Padding bytes appended to Handshake Response packets.
+    /// Padding bytes prepended to Handshake Response packets.
     pub s2: u32,
-    /// Padding bytes appended to Cookie Reply packets.
+    /// Padding bytes prepended to Cookie Reply packets.
     pub s3: u32,
-    /// Padding bytes appended to Transport Data packets.
+    /// Padding bytes prepended to Transport Data packets.
     pub s4: u32,
     /// Header value range for Handshake Initiation.
     pub h1: HRange,

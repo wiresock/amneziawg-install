@@ -36,29 +36,38 @@ impl AwgPacketType {
     }
 }
 
-/// Classify an AmneziaWG packet by reading the first 4 bytes as a little-endian
-/// u32 and checking which H range it falls into.
+/// Classify an AmneziaWG packet by checking the H-range header that follows
+/// the S-padding prefix.
 ///
-/// Returns `None` if the packet is too short or the header value doesn't match
-/// any configured H range (e.g. junk packet or non-AWG traffic).
+/// AmneziaWG prepends S1–S4 random bytes before the obfuscated header, so the
+/// header starts at byte offset S for each packet type.  This function tries
+/// each (S-offset, H-range) pair and returns the first match.
+///
+/// Returns `None` if the packet is too short for any candidate offset or the
+/// header value at no offset matches a configured H range (e.g. junk packet or
+/// non-AWG traffic).
 pub fn classify_awg_packet(data: &[u8], params: &AwgParams) -> Option<AwgPacketType> {
-    if data.len() < 4 {
-        return None;
-    }
+    let candidates = [
+        (params.s1 as usize, params.h1, AwgPacketType::HandshakeInit),
+        (params.s2 as usize, params.h2, AwgPacketType::HandshakeResponse),
+        (params.s3 as usize, params.h3, AwgPacketType::CookieReply),
+        (params.s4 as usize, params.h4, AwgPacketType::TransportData),
+    ];
 
-    let header = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-
-    if params.h1.contains(header) {
-        Some(AwgPacketType::HandshakeInit)
-    } else if params.h2.contains(header) {
-        Some(AwgPacketType::HandshakeResponse)
-    } else if params.h3.contains(header) {
-        Some(AwgPacketType::CookieReply)
-    } else if params.h4.contains(header) {
-        Some(AwgPacketType::TransportData)
-    } else {
-        None
+    for (offset, range, pkt_type) in candidates {
+        if data.len() >= offset + 4 {
+            let header = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            if range.contains(header) {
+                return Some(pkt_type);
+            }
+        }
     }
+    None
 }
 
 /// Detect whether an incoming packet looks like a QUIC, DNS, or SIP initiation.
@@ -727,9 +736,10 @@ mod tests {
     #[test]
     fn classify_handshake_init() {
         let params = test_awg_params();
-        let header = 150u32.to_le_bytes();
-        let mut pkt = Vec::from(header);
-        pkt.extend_from_slice(&[0u8; 200]); // body
+        // S1(42) prefix padding + H1-range header at offset 42 + body
+        let mut pkt = vec![0x00; 42];
+        pkt.extend_from_slice(&150u32.to_le_bytes());
+        pkt.extend_from_slice(&[0u8; 200]);
         assert_eq!(
             classify_awg_packet(&pkt, &params),
             Some(AwgPacketType::HandshakeInit)
@@ -739,8 +749,9 @@ mod tests {
     #[test]
     fn classify_handshake_response() {
         let params = test_awg_params();
-        let header = 350u32.to_le_bytes();
-        let mut pkt = Vec::from(header);
+        // S2(88) prefix padding + H2-range header at offset 88 + body
+        let mut pkt = vec![0x00; 88];
+        pkt.extend_from_slice(&350u32.to_le_bytes());
         pkt.extend_from_slice(&[0u8; 100]);
         assert_eq!(
             classify_awg_packet(&pkt, &params),
@@ -751,8 +762,9 @@ mod tests {
     #[test]
     fn classify_cookie_reply() {
         let params = test_awg_params();
-        let header = 550u32.to_le_bytes();
-        let mut pkt = Vec::from(header);
+        // S3(33) prefix padding + H3-range header at offset 33 + body
+        let mut pkt = vec![0x00; 33];
+        pkt.extend_from_slice(&550u32.to_le_bytes());
         pkt.extend_from_slice(&[0u8; 70]);
         assert_eq!(
             classify_awg_packet(&pkt, &params),
@@ -763,8 +775,9 @@ mod tests {
     #[test]
     fn classify_transport_data() {
         let params = test_awg_params();
-        let header = 750u32.to_le_bytes();
-        let mut pkt = Vec::from(header);
+        // S4(120) prefix padding + H4-range header at offset 120 + body
+        let mut pkt = vec![0x00; 120];
+        pkt.extend_from_slice(&750u32.to_le_bytes());
         pkt.extend_from_slice(&[0u8; 500]);
         assert_eq!(
             classify_awg_packet(&pkt, &params),
@@ -775,35 +788,38 @@ mod tests {
     #[test]
     fn classify_unknown_header() {
         let params = test_awg_params();
-        // Header value 50 is below H1 range (100-200)
-        let header = 50u32.to_le_bytes();
-        let pkt = Vec::from(header);
+        // Packet with all zeros → header=0 at every S offset, no H range match
+        let pkt = vec![0x00; 200];
         assert_eq!(classify_awg_packet(&pkt, &params), None);
     }
 
     #[test]
     fn classify_too_short() {
         let params = test_awg_params();
+        // Packet too short for any S offset + 4 header bytes
         assert_eq!(classify_awg_packet(&[0x01, 0x02], &params), None);
     }
 
     #[test]
     fn classify_boundary_values() {
         let params = test_awg_params();
-        // H1 min boundary
-        let pkt = Vec::from(100u32.to_le_bytes());
+        // H1 min boundary at offset S1(42)
+        let mut pkt = vec![0x00; 250];
+        pkt[42..46].copy_from_slice(&100u32.to_le_bytes());
         assert_eq!(
             classify_awg_packet(&pkt, &params),
             Some(AwgPacketType::HandshakeInit)
         );
-        // H1 max boundary
-        let pkt = Vec::from(200u32.to_le_bytes());
+        // H1 max boundary at offset S1(42)
+        let mut pkt = vec![0x00; 250];
+        pkt[42..46].copy_from_slice(&200u32.to_le_bytes());
         assert_eq!(
             classify_awg_packet(&pkt, &params),
             Some(AwgPacketType::HandshakeInit)
         );
-        // Just outside H1
-        let pkt = Vec::from(201u32.to_le_bytes());
+        // Just outside H1 at offset S1(42)
+        let mut pkt = vec![0x00; 250];
+        pkt[42..46].copy_from_slice(&201u32.to_le_bytes());
         assert_eq!(classify_awg_packet(&pkt, &params), None);
     }
 
