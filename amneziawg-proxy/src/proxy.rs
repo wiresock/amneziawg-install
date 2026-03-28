@@ -228,9 +228,14 @@ impl Proxy {
         let sessions = Arc::clone(&self.sessions);
         let protocol = self.protocol;
         let awg_params = self.awg_params.clone();
-        // Use per-session relay buffer up to configured buffer_size, but do not
-        // exceed a safe upper bound to avoid unbounded memory usage per session.
-        let relay_buf_size = std::cmp::min(self.config.buffer_size, 65_535);
+        // Per-session relay buffer uses a tighter cap than the frontend recv
+        // buffer.  WireGuard packets are at most MTU-sized (~1500 B typical);
+        // using a small per-relay buffer keeps total memory bounded even when
+        // max_sessions is high (e.g. 10 000 × 4 KiB ≈ 40 MiB vs 640 MiB at
+        // 64 KiB each).  The configured `buffer_size` is still honoured but
+        // is clamped to a safe relay-specific ceiling.
+        const RELAY_BUF_CAP: usize = 4_096;
+        let relay_buf_size = std::cmp::min(self.config.buffer_size, RELAY_BUF_CAP);
         let relay_handles = Arc::clone(&self.relay_handles);
         let generation = self.relay_generation.fetch_add(1, Ordering::Relaxed);
 
