@@ -997,9 +997,9 @@ PARAMS_EOF
 	OUTPUT=$(validateParamsFile 2>&1)
 	RC=$?
 	if [[ ${RC} -ne 0 ]]; then
-		echo "OK: validateParamsFile correctly rejected group/other-readable/writable params when chmod failed (security)"
+		echo "OK: validateParamsFile correctly rejected group/other-writable params when chmod failed (security)"
 	else
-		echo "FAIL: validateParamsFile should have rejected group/other-readable/writable params when chmod failed"
+		echo "FAIL: validateParamsFile should have rejected group/other-writable params when chmod failed"
 		echo "  output: ${OUTPUT}"
 		exit 1
 	fi
