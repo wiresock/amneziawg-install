@@ -11,8 +11,9 @@
 #   1. Runs preflight checks (root, systemd, AWG binary, application binary)
 #   2. Creates the service user and required directories
 #   3. Installs the binary to /usr/local/bin
-#   4. Writes /etc/amneziawg-web/env.conf
-#   5. Installs and optionally enables the systemd service
+#   4. Installs amneziawg-install.sh to /usr/local/bin/amneziawg-install.sh
+#   5. Writes /etc/amneziawg-web/env.conf
+#   6. Installs and optionally enables the systemd service
 #
 # Dependencies: bash 4+, openssl, systemd, python3 (for Argon2 hash) or argon2 CLI
 #
@@ -668,6 +669,12 @@ install_awg_install_script() {
     if [[ ! -f "${source_path}" ]]; then
         die "Required script not found: ${source_path}. The web panel requires amneziawg-install.sh for add/remove/list client operations."
     fi
+
+    # Ensure destination directory exists so installation does not fail on
+    # minimal systems where /usr/local/bin is absent.
+    local dest_dir
+    dest_dir="$(dirname "${AWG_INSTALL_SCRIPT_DEST}")"
+    mkdir -p "${dest_dir}"
 
     install -m 0755 "${source_path}" "${AWG_INSTALL_SCRIPT_DEST}"
     info "Installed AWG lifecycle script: ${AWG_INSTALL_SCRIPT_DEST}"

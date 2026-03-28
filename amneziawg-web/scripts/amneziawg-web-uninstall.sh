@@ -22,6 +22,7 @@
 #
 # Assumed install paths (same defaults as the installer):
 #   Binary:       /usr/local/bin/amneziawg-web
+#   AWG script:   /usr/local/bin/amneziawg-install.sh
 #   Env file:     /etc/amneziawg-web/env.conf
 #   Env dir:      /etc/amneziawg-web/
 #   Data dir:     /var/lib/amneziawg-web/
