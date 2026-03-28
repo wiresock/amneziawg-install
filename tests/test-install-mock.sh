@@ -861,7 +861,8 @@ fi
 # error.  When the params file has non-standard permissions (e.g. a legacy
 # install) and chmod fails:
 #   - If the file has no group/other read or write bits after chmod (e.g. mock fixes to 600): warn and continue.
-#   - If the file is group/other-readable or writable (e.g. 644, 666): abort for security.
+#   - If the file is group/other-readable only (e.g. 644): warn and continue (info-disclosure only).
+#   - If the file is group/other-writable (e.g. 666): abort for security (privilege-escalation risk).
 #
 echo ""
 echo "--- validateParamsFile: chmod failure on insecure perms with safe post-chmod mode is non-fatal ---"
@@ -996,16 +997,219 @@ PARAMS_EOF
 	OUTPUT=$(validateParamsFile 2>&1)
 	RC=$?
 	if [[ ${RC} -ne 0 ]]; then
-		echo "OK: validateParamsFile correctly rejected group/other-readable/writable params when chmod failed (security)"
+		echo "OK: validateParamsFile correctly rejected group/other-writable params when chmod failed (security)"
 	else
-		echo "FAIL: validateParamsFile should have rejected group/other-readable/writable params when chmod failed"
+		echo "FAIL: validateParamsFile should have rejected group/other-writable params when chmod failed"
 		echo "  output: ${OUTPUT}"
 		exit 1
 	fi
-	if echo "${OUTPUT}" | grep -qi "readable or writable\|refusing to source\|security"; then
-		echo "OK: validateParamsFile emitted a security error for readable/writable params"
+	if echo "${OUTPUT}" | grep -qi "writable by group/other\|refusing to source\|security"; then
+		echo "OK: validateParamsFile emitted a security error for writable params"
 	else
 		echo "FAIL: validateParamsFile did not emit an expected security error"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
+echo "--- validateParamsFile: chmod failure on read-only perms (644) is non-fatal (info-disclosure only) ---"
+
+(
+	VPFTEST_644_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_644_DIR}"' EXIT
+
+	# Write a minimal-but-valid params file.
+	cat > "${VPFTEST_644_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Set mode 644 (read-only by group/other, no write bits — the exact case from the issue).
+	command chmod 644 "${VPFTEST_644_DIR}/params"
+
+	# Create the fake server config that validateParamsFile checks for.
+	touch "${VPFTEST_644_DIR}/awg0.conf"
+
+	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file fails
+	# without changing permissions — simulating a read-only filesystem.
+	AMNEZIAWG_DIR="${VPFTEST_644_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_644_DIR}/params"* ]]; then
+			echo "chmod: changing permissions of '${VPFTEST_644_DIR}/params': Read-only file system" >&2
+			return 1  # Simulate read-only filesystem
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -eq 0 ]]; then
+		echo "OK: validateParamsFile returned 0 for mode 644 when chmod failed (non-fatal, info-disclosure only)"
+	else
+		echo "FAIL: validateParamsFile hard-failed (rc=${RC}) for mode 644 — should have warned and continued"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "readable by group/other\|private key may be exposed"; then
+		echo "OK: validateParamsFile emitted a warning about readable params"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected readability warning"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -q "Read-only file system"; then
+		echo "OK: validateParamsFile included the chmod error message in the warning"
+	else
+		echo "FAIL: validateParamsFile did not include chmod error message in warning"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
+echo "--- validateParamsFile: chmod failure on mode 604 (other-readable only) is non-fatal ---"
+
+(
+	VPFTEST_604_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_604_DIR}"' EXIT
+
+	cat > "${VPFTEST_604_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Mode 604: other-readable only (owner rw-, group ---, other r--), no write bits for group/other.
+	command chmod 604 "${VPFTEST_604_DIR}/params"
+
+	touch "${VPFTEST_604_DIR}/awg0.conf"
+
+	AMNEZIAWG_DIR="${VPFTEST_604_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_604_DIR}/params"* ]]; then
+			echo "chmod: changing permissions of '${VPFTEST_604_DIR}/params': Read-only file system" >&2
+			return 1
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -eq 0 ]]; then
+		echo "OK: validateParamsFile returned 0 for mode 604 when chmod failed (non-fatal, info-disclosure only)"
+	else
+		echo "FAIL: validateParamsFile hard-failed (rc=${RC}) for mode 604 — should have warned and continued"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "readable by group/other\|private key may be exposed"; then
+		echo "OK: validateParamsFile emitted a warning about readable params (mode 604)"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected readability warning for mode 604"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
+echo "--- validateParamsFile: chmod failure on mode 646 (other-writable) is fatal ---"
+
+(
+	VPFTEST_646_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_646_DIR}"' EXIT
+
+	cat > "${VPFTEST_646_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Mode 646: other-writable (owner rw-, group r--, other rw-) — must be fatal.
+	command chmod 646 "${VPFTEST_646_DIR}/params"
+
+	touch "${VPFTEST_646_DIR}/awg0.conf"
+
+	AMNEZIAWG_DIR="${VPFTEST_646_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_646_DIR}/params"* ]]; then
+			echo "chmod: changing permissions of '${VPFTEST_646_DIR}/params': Read-only file system" >&2
+			return 1
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -ne 0 ]]; then
+		echo "OK: validateParamsFile correctly rejected other-writable params (mode 646) when chmod failed"
+	else
+		echo "FAIL: validateParamsFile should have rejected other-writable params (mode 646) when chmod failed"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "writable by group/other\|refusing to source\|security"; then
+		echo "OK: validateParamsFile emitted a security error for writable params (mode 646)"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected security error for mode 646"
 		echo "  output: ${OUTPUT}"
 		exit 1
 	fi
