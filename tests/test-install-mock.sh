@@ -1124,6 +1124,7 @@ fi
 echo ""
 echo "--- Web installer: preserve unmanaged AWG script unless --force ---"
 
+mkdir -p "$(dirname "${WEB_AWG_SCRIPT_PATH}")"
 cat > "${WEB_AWG_SCRIPT_PATH}" <<'EOF'
 #!/usr/bin/env bash
 echo operator-managed-awg-script
@@ -1399,7 +1400,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if [[ -f /usr/local/bin/amneziawg-install.sh ]]; then
+if [[ -f "${WEB_AWG_SCRIPT_PATH}" ]]; then
 	echo "OK: Pre-condition: AWG lifecycle script exists before uninstall"
 else
 	echo "FAIL: Pre-condition: AWG lifecycle script missing before uninstall test"
@@ -1452,7 +1453,7 @@ else
 fi
 
 # Verify installed AWG lifecycle script was removed
-if [[ ! -f /usr/local/bin/amneziawg-install.sh ]]; then
+if [[ ! -f "${WEB_AWG_SCRIPT_PATH}" ]]; then
 	echo "OK: Installed AWG lifecycle script removed after uninstall"
 else
 	echo "FAIL: Installed AWG lifecycle script still exists after uninstall"

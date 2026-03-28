@@ -218,12 +218,22 @@ systemctl_if_enabled() {
 # ── Summary / plan ─────────────────────────────────────────────────────────────
 
 print_plan() {
+    local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
+    local awg_script_plan_path="${AWG_INSTALL_SCRIPT_DEST}"
+    if [[ -f "${marker_path}" ]]; then
+        local marker_target
+        marker_target="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
+        if is_safe_awg_script_path "${marker_target}"; then
+            awg_script_plan_path="${marker_target}"
+        fi
+    fi
+
     printf '\n'
     printf '=== amneziawg-web uninstall plan ===\n'
     printf '\n'
     printf 'Will REMOVE:\n'
     printf '  Binary:       %s\n'  "${INSTALL_DIR}/${BINARY_NAME}"
-    printf '  AWG script:   %s (if installed by amneziawg-web)\n'  "${AWG_INSTALL_SCRIPT_DEST}"
+    printf '  AWG script:   %s (if installed by amneziawg-web)\n'  "${awg_script_plan_path}"
     printf '  Systemd unit: %s\n'  "${SYSTEMD_UNIT_DEST}"
     printf '  Sudoers:      %s\n'  "${SUDOERS_FILE}"
     printf '  Service:      stop + disable %s\n' "${SERVICE_NAME}"
@@ -247,6 +257,11 @@ print_plan() {
     printf '\n'
 }
 
+is_safe_awg_script_path() {
+    local path="$1"
+    [[ "${path}" == /* ]] && [[ ! "${path}" =~ [[:space:],] ]]
+}
+
 remove_managed_awg_install_script() {
     local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
 
@@ -257,12 +272,12 @@ remove_managed_awg_install_script() {
 
     local marker_target
     marker_target="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
-    if [[ "${marker_target}" != "${AWG_INSTALL_SCRIPT_DEST}" ]]; then
-        warn "AWG lifecycle script marker points to unexpected path '${marker_target}', preserving ${AWG_INSTALL_SCRIPT_DEST}"
+    if ! is_safe_awg_script_path "${marker_target}"; then
+        warn "AWG lifecycle script marker contains unsafe path '${marker_target}', preserving AWG script"
         return 0
     fi
 
-    safe_rm_file "${AWG_INSTALL_SCRIPT_DEST}"
+    safe_rm_file "${marker_target}"
     safe_rm_file "${marker_path}"
 }
 
