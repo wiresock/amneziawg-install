@@ -2224,9 +2224,9 @@ function validateParamsFile() {
 			else
 				# chmod failed (e.g. read-only filesystem or immutable file attribute).
 				# Re-stat first so the warning shows the actual post-failure mode, not
-				# the stale pre-chmod value.  Only continue if no group/other write bits
-				# remain; sourcing a writable-by-others file as root is a privilege-
-				# escalation risk.
+				# the stale pre-chmod value.  Only continue if no group/other read or
+				# write bits remain; a readable-by-others file exposes SERVER_PRIV_KEY,
+				# and a writable-by-others file is a privilege-escalation risk.
 				local current_mode
 				if ! current_mode=$(stat -c '%a' "${AMNEZIAWG_DIR}/params" 2>/dev/null); then
 					echo -e "${RED}ERROR: Could not re-read permissions on ${AMNEZIAWG_DIR}/params after chmod failure; refusing to source an unverified file as root.${NC}"
@@ -2235,10 +2235,10 @@ function validateParamsFile() {
 				echo -e "${ORANGE}WARNING: Could not fix permissions on ${AMNEZIAWG_DIR}/params (current: ${current_mode}): ${chmod_err}${NC}"
 				echo -e "${ORANGE}The filesystem may be read-only or the file may have the immutable attribute set.${NC}"
 				echo -e "${ORANGE}Fix when possible: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
-				# Abort if any group/other write bit remains set (mode & 022 != 0).
-				# 022 is octal, matching the standard umask write-bit mask.
-				if (( (8#${current_mode} & 022) != 0 )); then
-					echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params remains writable by group/other (mode: ${current_mode}). Refusing to source for security reasons.${NC}"
+				# Abort if any group/other read or write bit remains set (mode & 066 != 0).
+				# 066 is octal, covering group/other read (044) and write (022) bits.
+				if (( (8#${current_mode} & 066) != 0 )); then
+					echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params remains readable or writable by group/other (mode: ${current_mode}). Refusing to source for security reasons.${NC}"
 					echo -e "${ORANGE}Fix manually: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
 					return 1
 				fi

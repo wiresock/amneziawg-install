@@ -854,17 +854,17 @@ else
 fi
 
 # ============================================================
-# Phase 2b: validateParamsFile – chmod failure handling
+# Phase 2d: validateParamsFile – chmod failure handling
 # ============================================================
 #
 # Regression tests for the "add user failed: chmod: ... Read-only file system"
 # error.  When the params file has non-standard permissions (e.g. a legacy
 # install) and chmod fails:
-#   - If the file is only read-permissive (e.g. 644): warn and continue.
-#   - If the file is group/other-writable (e.g. 666): abort for security.
+#   - If the file has no group/other read or write bits (e.g. 400): warn and continue.
+#   - If the file is group/other-readable or writable (e.g. 644, 666): abort for security.
 #
 echo ""
-echo "--- validateParamsFile: chmod failure on read-only insecure perms is non-fatal ---"
+echo "--- validateParamsFile: chmod failure on owner-only perms is non-fatal ---"
 
 (
 	VPFTEST_DIR=$(mktemp -d)
@@ -896,8 +896,8 @@ SERVER_AWG_H3='200000012-300000016'
 SERVER_AWG_H4='300000018-400000022'
 PARAMS_EOF
 
-	# Set read-only insecure permissions (644 – no group/other write bits).
-	command chmod 644 "${VPFTEST_DIR}/params"
+	# Set owner-only read permissions (400 – no group/other read or write bits).
+	command chmod 400 "${VPFTEST_DIR}/params"
 
 	# Create the fake server config that validateParamsFile checks for.
 	touch "${VPFTEST_DIR}/awg0.conf"
@@ -916,7 +916,7 @@ PARAMS_EOF
 	OUTPUT=$(validateParamsFile 2>&1)
 	RC=$?
 	if [[ ${RC} -eq 0 ]]; then
-		echo "OK: validateParamsFile returned 0 when chmod failed on read-only insecure perms (non-fatal)"
+		echo "OK: validateParamsFile returned 0 when chmod failed on owner-only perms (non-fatal)"
 	else
 		echo "FAIL: validateParamsFile hard-failed (rc=${RC}) when chmod failed on params"
 		echo "  output: ${OUTPUT}"
@@ -991,14 +991,14 @@ PARAMS_EOF
 	OUTPUT=$(validateParamsFile 2>&1)
 	RC=$?
 	if [[ ${RC} -ne 0 ]]; then
-		echo "OK: validateParamsFile correctly rejected group/other-writable params when chmod failed (security)"
+		echo "OK: validateParamsFile correctly rejected group/other-readable/writable params when chmod failed (security)"
 	else
-		echo "FAIL: validateParamsFile should have rejected group/other-writable params when chmod failed"
+		echo "FAIL: validateParamsFile should have rejected group/other-readable/writable params when chmod failed"
 		echo "  output: ${OUTPUT}"
 		exit 1
 	fi
-	if echo "${OUTPUT}" | grep -qi "writable by group\|refusing to source\|security"; then
-		echo "OK: validateParamsFile emitted a security error for writable params"
+	if echo "${OUTPUT}" | grep -qi "readable or writable\|refusing to source\|security"; then
+		echo "OK: validateParamsFile emitted a security error for readable/writable params"
 	else
 		echo "FAIL: validateParamsFile did not emit an expected security error"
 		echo "  output: ${OUTPUT}"
