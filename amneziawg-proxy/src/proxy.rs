@@ -210,6 +210,9 @@ impl Proxy {
             }
             Err(e) => {
                 error!(%client_addr, error = %e, "failed to create session");
+                // Remove orphaned metrics entry — without a session, the
+                // cleanup task will never expire this client's metrics.
+                self.metrics.remove(&client_addr);
             }
         }
     }

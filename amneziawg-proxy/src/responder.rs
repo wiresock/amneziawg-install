@@ -235,8 +235,16 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
         buf.put_u16(0);
     }
 
-    // Flags: QR=1, Opcode=0, AA=0, TC=0, RD=1, RA=1, RCODE=2 (SERVFAIL)
-    buf.put_u16(0x8182);
+    // Flags: QR=1, Opcode=0, AA=0, TC=0, RA=1, RCODE=2 (SERVFAIL).
+    // Per RFC 1035, the RD bit must be copied from the query.
+    let mut flags: u16 = 0x8082; // QR=1, RA=1, RCODE=2 (RD cleared)
+    if incoming.len() >= 4 {
+        let query_flags = u16::from_be_bytes([incoming[2], incoming[3]]);
+        if (query_flags & 0x0100) != 0 {
+            flags |= 0x0100; // copy RD from query
+        }
+    }
+    buf.put_u16(flags);
     // QDCOUNT (placeholder — will be patched to 1 if we echo the question),
     // ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
     let qdcount_offset = buf.len();
@@ -552,12 +560,40 @@ mod tests {
         assert_eq!(resp[1], 0xCD);
         // QR=1
         assert!(resp[2] & 0x80 != 0);
+        // RD=1 should be copied from the query
+        assert!(resp[2] & 0x01 != 0, "RD bit should be copied from query");
         // Response should include the question section
         assert!(resp.len() > 12, "DNS response should include question section");
         // QNAME echoed: starts at byte 12 with label length 7 ("example")
         assert_eq!(resp[12], 7);
         // QDCOUNT should be 1 since the question was echoed
         assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 1);
+    }
+
+    #[test]
+    fn generate_dns_response_rd_zero_query_rd_zero_response() {
+        // DNS query with RD=0 — response must also have RD=0 (RFC 1035).
+        let mut query = Vec::new();
+        query.extend_from_slice(&[0x11, 0x22]); // TX ID
+        query.extend_from_slice(&[0x00, 0x00]); // Flags: RD=0
+        query.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+        query.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
+        query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
+        query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
+        // QNAME: 3foo0
+        query.push(3);
+        query.extend_from_slice(b"foo");
+        query.push(0); // root label
+        query.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+        query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+
+        let resp = generate_response(Protocol::Dns, &query);
+        // QR=1
+        assert!(resp[2] & 0x80 != 0);
+        // RD=0 should be preserved from query
+        assert_eq!(resp[2] & 0x01, 0, "RD bit should be 0 when query has RD=0");
+        // RA=1 and RCODE=2 (SERVFAIL) should still be set
+        assert_eq!(resp[3], 0x82);
     }
 
     #[test]
