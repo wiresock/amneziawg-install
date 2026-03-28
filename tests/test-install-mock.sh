@@ -854,6 +854,81 @@ else
 fi
 
 # ============================================================
+# Phase 2b: validateParamsFile – chmod failure is non-fatal
+# ============================================================
+#
+# Regression test for the "add user failed: chmod: ... Read-only file system"
+# error.  When the params file has non-standard permissions (e.g. a legacy
+# install) and chmod fails (e.g. read-only filesystem / immutable flag),
+# validateParamsFile must warn and continue instead of hard-failing.
+#
+echo ""
+echo "--- validateParamsFile: chmod failure on insecure perms is non-fatal ---"
+
+(
+	VPFTEST_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_DIR}"' EXIT
+
+	# Write a minimal-but-valid params file.
+	cat > "${VPFTEST_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Set "insecure" permissions to trigger the auto-remediation path.
+	command chmod 644 "${VPFTEST_DIR}/params"
+
+	# Create the fake server config that validateParamsFile checks for.
+	touch "${VPFTEST_DIR}/awg0.conf"
+
+	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file fails.
+	AMNEZIAWG_DIR="${VPFTEST_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_DIR}/params"* ]]; then
+			return 1  # Simulate read-only filesystem
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -eq 0 ]]; then
+		echo "OK: validateParamsFile returned 0 when chmod failed (non-fatal)"
+	else
+		echo "FAIL: validateParamsFile hard-failed (rc=${RC}) when chmod failed on params"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "warning\|could not fix\|fix when possible"; then
+		echo "OK: validateParamsFile emitted a warning about chmod failure"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected warning"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+# ============================================================
 # Phase 3: Web panel installer integration test
 # ============================================================
 #

@@ -2218,12 +2218,17 @@ function validateParamsFile() {
 		# when running as root and the file is owned by root, to avoid locking out management actions.
 		if [[ "${EUID}" -eq 0 ]] && [[ "${PARAMS_OWNER}" == "0" ]]; then
 			echo -e "${ORANGE}Attempting to fix permissions by setting mode 600 on ${AMNEZIAWG_DIR}/params...${NC}"
-			if chmod 600 "${AMNEZIAWG_DIR}/params"; then
+			local chmod_err
+			if chmod_err=$(chmod 600 "${AMNEZIAWG_DIR}/params" 2>&1); then
 				echo -e "${GREEN}Permissions on ${AMNEZIAWG_DIR}/params updated to 600. Continuing.${NC}"
 			else
-				echo -e "${RED}ERROR: Failed to automatically fix permissions on ${AMNEZIAWG_DIR}/params.${NC}"
-				echo -e "${ORANGE}Fix manually with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
-				return 1
+				# chmod failed (e.g. read-only filesystem or immutable file attribute).
+				# The file is still readable, so params loading can continue.
+				# Warn the operator but do not abort – aborting would prevent all
+				# client management on systems where the filesystem cannot be modified.
+				echo -e "${ORANGE}WARNING: Could not fix permissions on ${AMNEZIAWG_DIR}/params (current: ${PARAMS_PERMS}): ${chmod_err}${NC}"
+				echo -e "${ORANGE}The filesystem may be read-only or the file may have the immutable attribute set.${NC}"
+				echo -e "${ORANGE}Fix when possible: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
 			fi
 		else
 			echo -e "${ORANGE}Fix with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
