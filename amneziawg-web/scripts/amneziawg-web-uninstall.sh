@@ -116,11 +116,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if ! command -v realpath >/dev/null 2>&1; then
+    die "realpath is required but not available on this system"
+fi
+ENV_FILE="$(realpath -m -- "${ENV_FILE}")"
+ENV_DIR="$(realpath -m -- "${ENV_DIR}")"
+
 if [[ "${ENV_FILE}" != /* ]]; then
-    die "Env file path must be absolute: ${ENV_FILE}"
+    die "Env file path must be absolute after normalization: ${ENV_FILE}"
 fi
 if [[ "${ENV_DIR}" != /* ]]; then
-    die "Env directory path must be absolute: ${ENV_DIR}"
+    die "Env directory path must be absolute after normalization: ${ENV_DIR}"
+fi
+if [[ "${ENV_DIR}" == "/etc" ]]; then
+    die "Env directory must not be /etc itself: ${ENV_DIR}"
+fi
+if [[ "${ENV_DIR}" != /etc/* ]]; then
+    die "Env directory must reside under /etc: ${ENV_DIR}"
 fi
 
 # ── Root check ─────────────────────────────────────────────────────────────────
@@ -291,7 +303,7 @@ remove_managed_awg_install_script() {
     local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
 
     if [[ ! -f "${marker_path}" ]]; then
-        info "Preserving AWG lifecycle script (not marked as installer-managed): ${AWG_INSTALL_SCRIPT_DEST}"
+        info "Preserving AWG lifecycle script because it is not marked as installer-managed (no marker file found)"
         return 0
     fi
 

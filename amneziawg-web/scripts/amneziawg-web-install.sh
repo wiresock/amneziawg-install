@@ -717,6 +717,54 @@ is_script_safe_for_sudoers() {
     return 0
 }
 
+validate_awg_install_script_target_path_policy() {
+    local script_path="$1"
+    local script_name script_dir
+    script_name="$(basename "${script_path}")"
+    script_dir="$(dirname "${script_path}")"
+
+    if [[ "${script_name}" != "amneziawg-install.sh" ]]; then
+        die "AWG_INSTALL_SCRIPT must point to amneziawg-install.sh, got: ${script_path}"
+    fi
+
+    case "${script_dir}" in
+        /usr/local/bin|/usr/bin|/opt/amneziawg-web/bin)
+            ;;
+        *)
+            die "AWG_INSTALL_SCRIPT must be in a trusted root-controlled directory (/usr/local/bin, /usr/bin, /opt/amneziawg-web/bin), got: ${script_dir}"
+            ;;
+    esac
+}
+
+validate_awg_install_script_target_path() {
+    local script_path="$1"
+    local script_dir
+    script_dir="$(dirname "${script_path}")"
+
+    validate_awg_install_script_target_path_policy "${script_path}"
+
+    if [[ -d "${script_dir}" ]]; then
+        local dir_uid dir_gid dir_mode dir_mode_octal
+        dir_uid="$(stat -c '%u' "${script_dir}" 2>/dev/null || echo "")"
+        dir_gid="$(stat -c '%g' "${script_dir}" 2>/dev/null || echo "")"
+        dir_mode="$(stat -c '%a' "${script_dir}" 2>/dev/null || echo "")"
+        if [[ -z "${dir_uid}" ]] || [[ -z "${dir_gid}" ]] || [[ -z "${dir_mode}" ]]; then
+            die "Could not validate ownership/permissions for AWG_INSTALL_SCRIPT directory: ${script_dir}"
+        fi
+        if [[ ! "${dir_mode}" =~ ^[0-7]{3,4}$ ]]; then
+            die "Invalid permissions format for AWG_INSTALL_SCRIPT directory '${script_dir}': ${dir_mode}"
+        fi
+
+        if [[ "${dir_uid}" != "0" ]] || [[ "${dir_gid}" != "0" ]]; then
+            die "AWG_INSTALL_SCRIPT directory must be owned by root:root: ${script_dir}"
+        fi
+        dir_mode_octal=$((8#${dir_mode}))
+        if (( (dir_mode_octal & 8#022) != 0 )); then
+            die "AWG_INSTALL_SCRIPT directory must not be group or world-writable: ${script_dir}"
+        fi
+    fi
+}
+
 install_awg_install_script() {
     step "Installing AmneziaWG lifecycle script"
 
@@ -737,9 +785,14 @@ install_awg_install_script() {
         die "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: ${install_script_path}"
     fi
 
+    validate_awg_install_script_target_path_policy "${install_script_path}"
+
     local dest_dir
     dest_dir="$(dirname "${install_script_path}")"
-    mkdir -p "${dest_dir}"
+    if [[ ! -d "${dest_dir}" ]]; then
+        install -d -m 0755 -o root -g root "${dest_dir}"
+    fi
+    validate_awg_install_script_target_path "${install_script_path}"
 
     local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
     local marker_target=""
@@ -799,6 +852,7 @@ install_sudoers() {
     if [[ "${install_script_path}" =~ [[:space:],] ]]; then
         die "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: ${install_script_path}"
     fi
+    validate_awg_install_script_target_path "${install_script_path}"
     if [[ ! -x "${install_script_path}" ]]; then
         warn "Install script not found or not executable (will be checked at service startup): ${install_script_path}"
     fi
