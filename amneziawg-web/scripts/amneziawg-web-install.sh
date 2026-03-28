@@ -663,6 +663,25 @@ install_binary() {
     info "Installed binary: ${dest}"
 }
 
+resolve_awg_install_script_path() {
+    # Resolve the install-script path consistently with service/sudoers config.
+    # Preference order:
+    #   1. AWG_INSTALL_SCRIPT from the current environment (if set)
+    #   2. AWG_INSTALL_SCRIPT from the env file (if present)
+    #   3. Default to /usr/local/bin/amneziawg-install.sh
+    local resolved_path="${AWG_INSTALL_SCRIPT_DEST}"
+    if [[ -n "${AWG_INSTALL_SCRIPT:-}" ]]; then
+        resolved_path="${AWG_INSTALL_SCRIPT}"
+    elif [[ -f "${ENV_FILE}" ]]; then
+        local env_script_path
+        env_script_path="$(grep -E '^AWG_INSTALL_SCRIPT=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true)"
+        if [[ -n "${env_script_path}" ]]; then
+            resolved_path="${env_script_path}"
+        fi
+    fi
+    printf '%s' "${resolved_path}"
+}
+
 install_awg_install_script() {
     step "Installing AmneziaWG lifecycle script"
 
@@ -673,8 +692,18 @@ install_awg_install_script() {
 
     # Ensure destination directory exists so installation does not fail on
     # minimal systems where /usr/local/bin is absent.
+    local install_script_path
+    install_script_path="$(resolve_awg_install_script_path)"
+
+    if [[ "${install_script_path}" != /* ]]; then
+        die "AWG_INSTALL_SCRIPT must be an absolute path, got: ${install_script_path}"
+    fi
+    if [[ "${install_script_path}" =~ [[:space:],] ]]; then
+        die "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: ${install_script_path}"
+    fi
+
     local dest_dir
-    dest_dir="$(dirname "${AWG_INSTALL_SCRIPT_DEST}")"
+    dest_dir="$(dirname "${install_script_path}")"
     mkdir -p "${dest_dir}"
 
     local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
@@ -685,19 +714,19 @@ install_awg_install_script() {
         marker_target="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
     fi
 
-    if [[ -e "${AWG_INSTALL_SCRIPT_DEST}" ]] && \
-       [[ "${marker_target}" != "${AWG_INSTALL_SCRIPT_DEST}" ]] && \
+    if [[ -e "${install_script_path}" ]] && \
+       [[ "${marker_target}" != "${install_script_path}" ]] && \
        [[ "${FORCE}" != "true" ]]; then
-        warn "Existing AWG lifecycle script appears unmanaged: ${AWG_INSTALL_SCRIPT_DEST}"
+        warn "Existing AWG lifecycle script appears unmanaged: ${install_script_path}"
         warn "Preserving existing script. Re-run with --force to replace and mark it as installer-managed."
         return 0
     fi
 
-    install -m 0755 "${source_path}" "${AWG_INSTALL_SCRIPT_DEST}"
-    info "Installed AWG lifecycle script: ${AWG_INSTALL_SCRIPT_DEST}"
+    install -m 0755 "${source_path}" "${install_script_path}"
+    info "Installed AWG lifecycle script: ${install_script_path}"
 
-    if [[ "${marker_target}" != "${AWG_INSTALL_SCRIPT_DEST}" ]]; then
-        printf '%s\n' "${AWG_INSTALL_SCRIPT_DEST}" > "${marker_path}"
+    if [[ "${marker_target}" != "${install_script_path}" ]]; then
+        printf '%s\n' "${install_script_path}" > "${marker_path}"
         chown root:root "${marker_path}"
         chmod 0644 "${marker_path}"
         info "Recorded AWG lifecycle script ownership marker: ${marker_path}"
@@ -722,23 +751,8 @@ install_sudoers() {
     # sudoers rules that grant the service user passwordless sudo for only
     # these specific commands.
 
-    # Resolve the install-script path consistently with the service config.
-    # We use grep instead of sourcing the env file to avoid triggering
-    # `set -u` errors from other variables (e.g. $argon2id in password hashes).
-    # Preference order:
-    #   1. AWG_INSTALL_SCRIPT from the current environment (if set)
-    #   2. AWG_INSTALL_SCRIPT from the env file (if present)
-    #   3. Default to /usr/local/bin/amneziawg-install.sh
-    local install_script_path="/usr/local/bin/amneziawg-install.sh"
-    if [[ -n "${AWG_INSTALL_SCRIPT:-}" ]]; then
-        install_script_path="${AWG_INSTALL_SCRIPT}"
-    elif [[ -f "${ENV_FILE}" ]]; then
-        local env_script_path
-        env_script_path="$(grep -E '^AWG_INSTALL_SCRIPT=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true)"
-        if [[ -n "${env_script_path}" ]]; then
-            install_script_path="${env_script_path}"
-        fi
-    fi
+    local install_script_path
+    install_script_path="$(resolve_awg_install_script_path)"
 
     # Validate install_script_path before embedding it into sudoers.
     if [[ "${install_script_path}" != /* ]]; then

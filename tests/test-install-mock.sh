@@ -1550,11 +1550,12 @@ fi
 echo ""
 echo "--- Web uninstaller: preserve unmanaged AWG script ---"
 
-cat > /usr/local/bin/amneziawg-install.sh <<'EOF'
+mkdir -p "$(dirname "${WEB_AWG_SCRIPT_PATH}")"
+cat > "${WEB_AWG_SCRIPT_PATH}" <<'EOF'
 #!/usr/bin/env bash
 echo unmanaged-awg-script
 EOF
-chmod 0755 /usr/local/bin/amneziawg-install.sh
+chmod 0755 "${WEB_AWG_SCRIPT_PATH}"
 rm -f "${WEB_AWG_SCRIPT_MARKER}"
 
 WEB_PRESERVE_UNMANAGED_RC=0
@@ -1571,7 +1572,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if [[ -f /usr/local/bin/amneziawg-install.sh ]]; then
+if [[ -f "${WEB_AWG_SCRIPT_PATH}" ]]; then
 	echo "OK: Unmanaged AWG lifecycle script preserved"
 else
 	echo "FAIL: Unmanaged AWG lifecycle script was removed"
