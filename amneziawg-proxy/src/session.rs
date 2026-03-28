@@ -7,38 +7,6 @@ use dashmap::DashMap;
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
-/// RAII guard that decrements `session_count` on drop unless committed.
-///
-/// This ensures that if the future holding the guard is cancelled between
-/// the counter reservation and the final insert/rollback, the slot is always
-/// released — preventing permanent capacity loss.
-struct SlotReservation<'a> {
-    counter: &'a AtomicUsize,
-    committed: bool,
-}
-
-impl<'a> SlotReservation<'a> {
-    fn new(counter: &'a AtomicUsize) -> Self {
-        Self {
-            counter,
-            committed: false,
-        }
-    }
-
-    /// Mark the reservation as consumed so `Drop` won't release the slot.
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for SlotReservation<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.counter.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-}
-
 /// A single client session: maps a client address to a dedicated backend socket.
 pub struct Session {
     /// Dedicated UDP socket bound to an ephemeral port for talking to the backend.
@@ -77,9 +45,10 @@ impl SessionTable {
     /// was just created (so the caller can spawn a relay task for it).
     ///
     /// Session creation is single-flight per client address: we pre-create the
-    /// socket outside the lock, then use `DashMap::entry` to atomically insert
-    /// only if the key is still vacant. This prevents two concurrent calls for
-    /// the same `client_addr` from both inserting separate sessions.
+    /// socket outside the lock, then use `DashMap::entry` to atomically check
+    /// vacancy *and* enforce capacity in the same critical section. This
+    /// prevents two concurrent calls for the same `client_addr` from both
+    /// consuming a capacity slot when only one insert actually succeeds.
     pub async fn get_or_create(
         &self,
         client_addr: SocketAddr,
@@ -90,44 +59,9 @@ impl SessionTable {
             return Ok((Arc::clone(&entry.backend_sock), false));
         }
 
-        // Atomically reserve a slot before creating the session.
-        // This prevents concurrent callers from all observing len() < max
-        // and exceeding the limit.
-        loop {
-            let current = self.session_count.load(Ordering::Acquire);
-            if current >= self.max_sessions {
-                // Before rejecting, re-check whether this client already has
-                // a session — concurrent callers for the same client_addr
-                // should still succeed when the limit is reached.
-                if let Some(mut entry) = self.sessions.get_mut(&client_addr) {
-                    entry.last_active = Instant::now();
-                    return Ok((Arc::clone(&entry.backend_sock), false));
-                }
-                anyhow::bail!(
-                    "session limit reached ({}/{}), rejecting {}",
-                    current,
-                    self.max_sessions,
-                    client_addr,
-                );
-            }
-            if self.session_count.compare_exchange(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ).is_ok() {
-                break;
-            }
-        }
-
-        // RAII guard: if the future is cancelled between the reservation
-        // above and the final insert/rollback below, this automatically
-        // decrements session_count so the slot is never leaked.
-        let reservation = SlotReservation::new(&self.session_count);
-
         // Slow path: create a new session.
-        // Bind to the correct address family so connect() works for both
-        // IPv4 and IPv6 backend addresses.
+        // Pre-create the backend socket before acquiring the entry lock so
+        // no .await points are held under the DashMap shard guard.
         let bind_addr = if self.backend_addr.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -139,23 +73,50 @@ impl SessionTable {
 
         // Use entry API so concurrent calls for the same client_addr
         // don't create duplicate sessions / orphaned sockets.
+        // Capacity is checked only when the entry is truly vacant,
+        // eliminating the race where two callers for the same client
+        // both consume a slot while only one insert succeeds.
         let entry = self.sessions.entry(client_addr);
         match entry {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                 // Another task raced us — reuse the existing session.
-                // Drop reservation (which decrements the counter).
                 occ.get_mut().last_active = Instant::now();
                 Ok((Arc::clone(&occ.get().backend_sock), false))
             }
             dashmap::mapref::entry::Entry::Vacant(vac) => {
+                // Atomically reserve a slot only after confirming the key
+                // is vacant. No .await points between reservation and
+                // insert, so cancellation cannot leak the slot.
+                loop {
+                    let current = self.session_count.load(Ordering::Acquire);
+                    if current >= self.max_sessions {
+                        anyhow::bail!(
+                            "session limit reached ({}/{}), rejecting {}",
+                            current,
+                            self.max_sessions,
+                            client_addr,
+                        );
+                    }
+                    if self
+                        .session_count
+                        .compare_exchange(
+                            current,
+                            current + 1,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+
                 let session = Session {
                     backend_sock: Arc::clone(&sock),
                     last_active: Instant::now(),
                     client_addr,
                 };
                 vac.insert(session);
-                // Commit the reservation so Drop doesn't decrement.
-                reservation.commit();
                 debug!(%client_addr, "new session created");
                 Ok((sock, true))
             }

@@ -522,7 +522,8 @@ Backend sends a Transport Data packet back to the client. AWG config has
 3. `payload_end = 124 - 20 = 104`
 4. `apply_quic_padding(data, 104)`:
    - FNV-1a hash of `data[0..64]` → seed
-   - `data[104]` = `0x40 | (seed & 0x3F)` (QUIC short header)
+   - `data[104]` = QUIC short-header byte with fixed bit set, reserved bits
+     (0x18) cleared, and spin/key-phase/PN-length bits derived from seed
    - `data[105..124]` = LCG PRNG pseudo-random bytes
 
 **Transformed packet** (124 bytes, same length):
