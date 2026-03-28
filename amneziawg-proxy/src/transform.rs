@@ -71,14 +71,8 @@ pub fn apply_awg_transform(
 ///
 /// Takes the original payload and prepends `pad_len` bytes of
 /// protocol-conformant padding.  `pad_len` is silently clamped to
-/// [`MAX_PAD_LEN`] (1024) to prevent excessive allocation — AmneziaWG
+/// `MAX_PAD_LEN` (1024) to prevent excessive allocation — AmneziaWG
 /// S-values are typically well below this limit.
-///
-/// # Panics
-///
-/// Does not panic.
-///
-/// [`MAX_PAD_LEN`]: Self::MAX_PAD_LEN
 #[cfg(test)]
 const MAX_PAD_LEN: usize = 1_024;
 
