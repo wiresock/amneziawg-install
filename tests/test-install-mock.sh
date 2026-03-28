@@ -1023,7 +1023,7 @@ echo "--- validateParamsFile: errors go to stderr, not stdout ---"
 
 	AMNEZIAWG_DIR="${VPFTEST3_DIR}"
 
-	# Capture stdout and stderr separately
+	# Capture stdout only (discard stderr) to verify no errors appear on stdout
 	STDOUT_OUTPUT=$(validateParamsFile 2>/dev/null)
 	RC=$?
 
@@ -1038,6 +1038,22 @@ echo "--- validateParamsFile: errors go to stderr, not stdout ---"
 	else
 		echo "FAIL: validateParamsFile wrote error message to stdout instead of stderr"
 		echo "  stdout: ${STDOUT_OUTPUT}"
+		exit 1
+	fi
+
+	# Capture stderr only (redirect stdout away) to verify the diagnostic appears on stderr
+	STDERR_OUTPUT=$(validateParamsFile 2>&1 >/dev/null)
+	if [[ -n "${STDERR_OUTPUT}" ]]; then
+		echo "OK: validateParamsFile emitted diagnostic text on stderr"
+	else
+		echo "FAIL: validateParamsFile emitted no diagnostic text on stderr"
+		exit 1
+	fi
+	if echo "${STDERR_OUTPUT}" | grep -q "symbolic link"; then
+		echo "OK: validateParamsFile stderr contains expected 'symbolic link' message"
+	else
+		echo "FAIL: validateParamsFile stderr missing expected 'symbolic link' message"
+		echo "  stderr: ${STDERR_OUTPUT}"
 		exit 1
 	fi
 ) || FAILED=$((FAILED + 1))
