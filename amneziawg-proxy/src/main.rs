@@ -78,33 +78,52 @@ async fn main() -> anyhow::Result<()> {
                     error!(error = %e, "failed to register SIGTERM handler");
                     // Fall back to ctrl-c only.
                     match tokio::signal::ctrl_c().await {
-                        Ok(()) => info!("received SIGINT"),
-                        Err(e) => error!(error = %e, "failed to listen for SIGINT"),
+                        Ok(()) => {
+                            info!("received SIGINT");
+                            shutdown_signal.notify_one();
+                        }
+                        Err(e) => {
+                            error!(error = %e, "failed to listen for SIGINT");
+                            // Do not trigger shutdown on handler registration failure.
+                        }
                     }
-                    shutdown_signal.notify_one();
                     return;
                 }
             };
             tokio::select! {
                 result = tokio::signal::ctrl_c() => {
                     match result {
-                        Ok(()) => info!("received SIGINT"),
-                        Err(e) => error!(error = %e, "failed to listen for SIGINT"),
+                        Ok(()) => {
+                            info!("received SIGINT");
+                            shutdown_signal.notify_one();
+                        }
+                        Err(e) => {
+                            error!(error = %e, "failed to listen for SIGINT");
+                            // Do not trigger shutdown on handler registration failure.
+                            return;
+                        }
                     }
                 }
                 _ = sigterm.recv() => {
                     info!("received SIGTERM");
+                    shutdown_signal.notify_one();
                 }
             }
         }
         #[cfg(not(unix))]
         {
             match tokio::signal::ctrl_c().await {
-                Ok(()) => info!("received ctrl-c"),
-                Err(e) => error!(error = %e, "failed to listen for ctrl-c"),
+                Ok(()) => {
+                    info!("received ctrl-c");
+                    shutdown_signal.notify_one();
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to listen for ctrl-c");
+                    // Do not trigger shutdown on handler registration failure.
+                    return;
+                }
             }
         }
-        shutdown_signal.notify_one();
     });
 
     if let Err(e) = proxy.run().await {
