@@ -860,11 +860,11 @@ fi
 # Regression tests for the "add user failed: chmod: ... Read-only file system"
 # error.  When the params file has non-standard permissions (e.g. a legacy
 # install) and chmod fails:
-#   - If the file has no group/other read or write bits (e.g. 400): warn and continue.
+#   - If the file has no group/other read or write bits after chmod (e.g. mock fixes to 600): warn and continue.
 #   - If the file is group/other-readable or writable (e.g. 644, 666): abort for security.
 #
 echo ""
-echo "--- validateParamsFile: chmod failure on owner-only perms is non-fatal ---"
+echo "--- validateParamsFile: chmod failure on insecure perms with safe post-chmod mode is non-fatal ---"
 
 (
 	VPFTEST_DIR=$(mktemp -d)
@@ -896,19 +896,24 @@ SERVER_AWG_H3='200000012-300000016'
 SERVER_AWG_H4='300000018-400000022'
 PARAMS_EOF
 
-	# Set owner-only read permissions (400 – no group/other read or write bits).
-	command chmod 400 "${VPFTEST_DIR}/params"
+	# Set mode 700 (insecure: not 600/400) to trigger the chmod remediation path.
+	# The mock will actually fix it to 600 (so the re-stat passes the 066 check)
+	# while still reporting failure — simulating a filesystem that partially applies
+	# the permission change but returns an error (e.g. a FUSE driver quirk).
+	command chmod 700 "${VPFTEST_DIR}/params"
 
 	# Create the fake server config that validateParamsFile checks for.
 	touch "${VPFTEST_DIR}/awg0.conf"
 
-	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file fails
-	# with a representative error message emitted to stderr.
+	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file applies
+	# the permission change but still returns non-zero with a stderr message,
+	# exercising the chmod-failure / warning path in validateParamsFile.
 	AMNEZIAWG_DIR="${VPFTEST_DIR}"
 	chmod() {
 		if [[ "$*" == *"${VPFTEST_DIR}/params"* ]]; then
+			command chmod 600 "${VPFTEST_DIR}/params"  # actually fix to a safe mode
 			echo "chmod: changing permissions of '${VPFTEST_DIR}/params': Read-only file system" >&2
-			return 1  # Simulate read-only filesystem
+			return 1  # Simulate chmod reporting failure despite applying the change
 		fi
 		command chmod "$@"
 	}
@@ -916,7 +921,7 @@ PARAMS_EOF
 	OUTPUT=$(validateParamsFile 2>&1)
 	RC=$?
 	if [[ ${RC} -eq 0 ]]; then
-		echo "OK: validateParamsFile returned 0 when chmod failed on owner-only perms (non-fatal)"
+		echo "OK: validateParamsFile returned 0 when chmod failed but post-failure mode is safe (non-fatal)"
 	else
 		echo "FAIL: validateParamsFile hard-failed (rc=${RC}) when chmod failed on params"
 		echo "  output: ${OUTPUT}"
