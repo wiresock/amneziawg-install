@@ -1088,6 +1088,134 @@ PARAMS_EOF
 ) || FAILED=$((FAILED + 1))
 
 echo ""
+echo "--- validateParamsFile: chmod failure on mode 604 (group-readable only) is non-fatal ---"
+
+(
+	VPFTEST_604_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_604_DIR}"' EXIT
+
+	cat > "${VPFTEST_604_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Mode 604: group-readable only, no write bits.
+	command chmod 604 "${VPFTEST_604_DIR}/params"
+
+	touch "${VPFTEST_604_DIR}/awg0.conf"
+
+	AMNEZIAWG_DIR="${VPFTEST_604_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_604_DIR}/params"* ]]; then
+			echo "chmod: changing permissions of '${VPFTEST_604_DIR}/params': Read-only file system" >&2
+			return 1
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -eq 0 ]]; then
+		echo "OK: validateParamsFile returned 0 for mode 604 when chmod failed (non-fatal, info-disclosure only)"
+	else
+		echo "FAIL: validateParamsFile hard-failed (rc=${RC}) for mode 604 — should have warned and continued"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "readable by group/other\|private key may be exposed"; then
+		echo "OK: validateParamsFile emitted a warning about readable params (mode 604)"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected readability warning for mode 604"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
+echo "--- validateParamsFile: chmod failure on mode 646 (group-writable) is fatal ---"
+
+(
+	VPFTEST_646_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_646_DIR}"' EXIT
+
+	cat > "${VPFTEST_646_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Mode 646: group-writable — must be fatal.
+	command chmod 646 "${VPFTEST_646_DIR}/params"
+
+	touch "${VPFTEST_646_DIR}/awg0.conf"
+
+	AMNEZIAWG_DIR="${VPFTEST_646_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_646_DIR}/params"* ]]; then
+			echo "chmod: changing permissions of '${VPFTEST_646_DIR}/params': Read-only file system" >&2
+			return 1
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -ne 0 ]]; then
+		echo "OK: validateParamsFile correctly rejected group-writable params (mode 646) when chmod failed"
+	else
+		echo "FAIL: validateParamsFile should have rejected group-writable params (mode 646) when chmod failed"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "writable by group/other\|refusing to source\|security"; then
+		echo "OK: validateParamsFile emitted a security error for writable params (mode 646)"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected security error for mode 646"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
 echo "--- validateParamsFile: errors go to stderr, not stdout ---"
 
 (
