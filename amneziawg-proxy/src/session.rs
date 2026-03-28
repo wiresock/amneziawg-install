@@ -63,10 +63,11 @@ impl SessionTable {
         // Cheap capacity pre-check: reject new clients early when the table
         // is full, avoiding the expensive UdpSocket::bind()/connect() work
         // that would be discarded in the Vacant arm below.
-        if self.session_count.load(Ordering::Acquire) >= self.max_sessions {
+        let current = self.session_count.load(Ordering::Acquire);
+        if current >= self.max_sessions {
             anyhow::bail!(
                 "session limit reached ({}/{}), rejecting {}",
-                self.max_sessions,
+                current,
                 self.max_sessions,
                 client_addr,
             );
