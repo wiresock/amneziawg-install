@@ -1157,6 +1157,13 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+if [[ -x "${WEB_AWG_SCRIPT_PATH}" ]]; then
+	echo "OK: Preserved unmanaged AWG lifecycle script remains executable"
+else
+	echo "FAIL: Preserved unmanaged AWG lifecycle script lost executable permissions"
+	FAILED=$((FAILED + 1))
+fi
+
 if [[ ! -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
 	echo "OK: Ownership marker not written for unmanaged AWG script"
 else

@@ -680,6 +680,8 @@ install_awg_install_script() {
     local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
     local marker_target=""
     if [[ -f "${marker_path}" ]]; then
+        # Marker file is a single-path record; read only the first line to
+        # tolerate accidental trailing content.
         marker_target="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
     fi
 
@@ -694,10 +696,14 @@ install_awg_install_script() {
     install -m 0755 "${source_path}" "${AWG_INSTALL_SCRIPT_DEST}"
     info "Installed AWG lifecycle script: ${AWG_INSTALL_SCRIPT_DEST}"
 
-    printf '%s\n' "${AWG_INSTALL_SCRIPT_DEST}" > "${marker_path}"
-    chown root:root "${marker_path}"
-    chmod 0644 "${marker_path}"
-    info "Recorded AWG lifecycle script ownership marker: ${marker_path}"
+    if [[ "${marker_target}" != "${AWG_INSTALL_SCRIPT_DEST}" ]]; then
+        printf '%s\n' "${AWG_INSTALL_SCRIPT_DEST}" > "${marker_path}"
+        chown root:root "${marker_path}"
+        chmod 0644 "${marker_path}"
+        info "Recorded AWG lifecycle script ownership marker: ${marker_path}"
+    else
+        info "AWG lifecycle script ownership marker already up to date: ${marker_path}"
+    fi
 }
 
 # ── Sudoers drop-in ───────────────────────────────────────────────────────────
