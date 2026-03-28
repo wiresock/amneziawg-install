@@ -2250,7 +2250,6 @@ function validateParamsFile() {
 				# so we warn and continue.
 				if (( (8#${current_mode} & 044) != 0 )); then
 					echo -e "${ORANGE}WARNING: ${AMNEZIAWG_DIR}/params is readable by group/other (mode: ${current_mode}). The server private key may be exposed to non-root users.${NC}" >&2
-					echo -e "${ORANGE}Fix when possible: chmod 600 ${AMNEZIAWG_DIR}/params${NC}" >&2
 				fi
 			fi
 		else
