@@ -666,8 +666,7 @@ install_awg_install_script() {
 
     local source_path="${SCRIPT_DIR}/../../amneziawg-install.sh"
     if [[ ! -f "${source_path}" ]]; then
-        die "Required script not found: ${source_path}
-The web panel requires amneziawg-install.sh for add/remove/list client operations."
+        die "Required script not found: ${source_path}. The web panel requires amneziawg-install.sh for add/remove/list client operations."
     fi
 
     install -m 0755 "${source_path}" "${AWG_INSTALL_SCRIPT_DEST}"
