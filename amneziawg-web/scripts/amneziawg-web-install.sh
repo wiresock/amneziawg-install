@@ -677,10 +677,23 @@ install_awg_install_script() {
     dest_dir="$(dirname "${AWG_INSTALL_SCRIPT_DEST}")"
     mkdir -p "${dest_dir}"
 
+    local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
+    local marker_target=""
+    if [[ -f "${marker_path}" ]]; then
+        marker_target="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
+    fi
+
+    if [[ -e "${AWG_INSTALL_SCRIPT_DEST}" ]] && \
+       [[ "${marker_target}" != "${AWG_INSTALL_SCRIPT_DEST}" ]] && \
+       [[ "${FORCE}" != "true" ]]; then
+        warn "Existing AWG lifecycle script appears unmanaged: ${AWG_INSTALL_SCRIPT_DEST}"
+        warn "Preserving existing script. Re-run with --force to replace and mark it as installer-managed."
+        return 0
+    fi
+
     install -m 0755 "${source_path}" "${AWG_INSTALL_SCRIPT_DEST}"
     info "Installed AWG lifecycle script: ${AWG_INSTALL_SCRIPT_DEST}"
 
-    local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
     printf '%s\n' "${AWG_INSTALL_SCRIPT_DEST}" > "${marker_path}"
     chown root:root "${marker_path}"
     chmod 0644 "${marker_path}"

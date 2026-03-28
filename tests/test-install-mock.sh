@@ -870,6 +870,7 @@ echo "=== Phase 3: Web panel installer ==="
 
 WEB_INSTALLER="${PROJECT_ROOT}/amneziawg-web-install.sh"
 WEB_INSTALLER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-install.sh"
+WEB_AWG_SCRIPT_PATH="/usr/local/bin/amneziawg-install.sh"
 
 # Verify both entrypoints are present
 if [[ -f "${WEB_INSTALLER}" ]]; then
@@ -909,6 +910,7 @@ WEB_TEST_INSTALL_DIR="/tmp/awg-web-test/bin"
 WEB_TEST_DATA_DIR="/var/lib/awg-web-test"
 WEB_TEST_ENV_FILE="/etc/awg-web-test/env.conf"
 WEB_TEST_AWG_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
+WEB_AWG_SCRIPT_MARKER="$(dirname "${WEB_TEST_ENV_FILE}")/installed-awg-script.path"
 
 # Create the AWG client config directory (populated by Phase 1 install)
 mkdir -p "${WEB_TEST_AWG_CONFIG_DIR}" "${WEB_TEST_INSTALL_DIR}" "${WEB_TEST_DATA_DIR}"
@@ -978,6 +980,7 @@ echo "--- Web installer: successful non-interactive install ---"
 
 # Clean any previous partial run
 rm -f "${WEB_TEST_ENV_FILE}" "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
+rm -f "${WEB_AWG_SCRIPT_PATH}" "${WEB_AWG_SCRIPT_MARKER}"
 
 WEB_INSTALL_RC=0
 WEB_INSTALL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
@@ -1115,6 +1118,76 @@ if [[ ${WEB_RERUN_RC} -eq 0 ]]; then
 	echo "OK: Installer is idempotent (re-run with --force succeeded)"
 else
 	echo "FAIL: Re-run with --force exited non-zero (rc=${WEB_RERUN_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web installer: preserve unmanaged AWG script unless --force ---"
+
+cat > "${WEB_AWG_SCRIPT_PATH}" <<'EOF'
+#!/usr/bin/env bash
+echo operator-managed-awg-script
+EOF
+chmod 0755 "${WEB_AWG_SCRIPT_PATH}"
+rm -f "${WEB_AWG_SCRIPT_MARKER}"
+
+WEB_UNMANAGED_INSTALL_RC=0
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1 || WEB_UNMANAGED_INSTALL_RC=$?
+
+if [[ ${WEB_UNMANAGED_INSTALL_RC} -eq 0 ]]; then
+	echo "OK: Installer succeeds with unmanaged AWG script present"
+else
+	echo "FAIL: Installer failed when unmanaged AWG script exists (rc=${WEB_UNMANAGED_INSTALL_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+if grep -q "operator-managed-awg-script" "${WEB_AWG_SCRIPT_PATH}" 2>/dev/null; then
+	echo "OK: Unmanaged AWG lifecycle script preserved on install"
+else
+	echo "FAIL: Installer overwrote unmanaged AWG lifecycle script without --force"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ ! -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
+	echo "OK: Ownership marker not written for unmanaged AWG script"
+else
+	echo "FAIL: Ownership marker unexpectedly written for unmanaged AWG script"
+	FAILED=$((FAILED + 1))
+fi
+
+WEB_MANAGED_FORCE_RC=0
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1 || WEB_MANAGED_FORCE_RC=$?
+
+if [[ ${WEB_MANAGED_FORCE_RC} -eq 0 ]]; then
+	echo "OK: --force replaces unmanaged AWG lifecycle script"
+else
+	echo "FAIL: --force install failed while replacing unmanaged AWG script (rc=${WEB_MANAGED_FORCE_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
+	echo "OK: Ownership marker written after forced AWG script install"
+else
+	echo "FAIL: Ownership marker missing after forced AWG script install"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1292,7 +1365,6 @@ echo "=== Phase 4: Web panel uninstaller ==="
 
 WEB_UNINSTALLER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-uninstall.sh"
 WEB_UNINSTALLER="${PROJECT_ROOT}/amneziawg-web-uninstall.sh"
-WEB_AWG_SCRIPT_MARKER="$(dirname "${WEB_TEST_ENV_FILE}")/installed-awg-script.path"
 
 # Verify both entrypoints are present
 if [[ -f "${WEB_UNINSTALLER}" ]]; then
