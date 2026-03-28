@@ -11,6 +11,7 @@
 # Default behavior (safe):
 #   - stops and disables the systemd service
 #   - removes the installed binary
+#   - removes AWG lifecycle script only when it was installed by amneziawg-web
 #   - removes the systemd unit file
 #   - reloads systemd daemon
 #   - PRESERVES: env/config file, data directory, service user
@@ -40,6 +41,7 @@ readonly SERVICE_USER="awg-web"
 readonly SYSTEMD_UNIT_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
 readonly AWG_INSTALL_SCRIPT_DEST="/usr/local/bin/amneziawg-install.sh"
+readonly AWG_INSTALL_SCRIPT_MARKER_NAME="installed-awg-script.path"
 readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_DATA_DIR="/var/lib/amneziawg-web"
 readonly DEFAULT_ENV_DIR="/etc/amneziawg-web"
@@ -221,7 +223,7 @@ print_plan() {
     printf '\n'
     printf 'Will REMOVE:\n'
     printf '  Binary:       %s\n'  "${INSTALL_DIR}/${BINARY_NAME}"
-    printf '  AWG script:   %s\n'  "${AWG_INSTALL_SCRIPT_DEST}"
+    printf '  AWG script:   %s (if installed by amneziawg-web)\n'  "${AWG_INSTALL_SCRIPT_DEST}"
     printf '  Systemd unit: %s\n'  "${SYSTEMD_UNIT_DEST}"
     printf '  Sudoers:      %s\n'  "${SUDOERS_FILE}"
     printf '  Service:      stop + disable %s\n' "${SERVICE_NAME}"
@@ -243,6 +245,25 @@ print_plan() {
         printf '  Service user: %s  [WILL BE REMOVED --remove-user]\n' "${SERVICE_USER}"
     fi
     printf '\n'
+}
+
+remove_managed_awg_install_script() {
+    local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
+
+    if [[ ! -f "${marker_path}" ]]; then
+        info "Preserving AWG lifecycle script (not marked as installer-managed): ${AWG_INSTALL_SCRIPT_DEST}"
+        return 0
+    fi
+
+    local marker_target
+    marker_target="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
+    if [[ "${marker_target}" != "${AWG_INSTALL_SCRIPT_DEST}" ]]; then
+        warn "AWG lifecycle script marker points to unexpected path '${marker_target}', preserving ${AWG_INSTALL_SCRIPT_DEST}"
+        return 0
+    fi
+
+    safe_rm_file "${AWG_INSTALL_SCRIPT_DEST}"
+    safe_rm_file "${marker_path}"
 }
 
 # ── Main uninstall ─────────────────────────────────────────────────────────────
@@ -284,8 +305,8 @@ main() {
     fi
     safe_rm_file "${binary_path}"
 
-    # 5. Remove installed AWG lifecycle script
-    safe_rm_file "${AWG_INSTALL_SCRIPT_DEST}"
+    # 5. Remove installer-managed AWG lifecycle script
+    remove_managed_awg_install_script
 
     # 6. Optional: purge config
     if [[ "${PURGE_CONFIG}" == "true" ]]; then

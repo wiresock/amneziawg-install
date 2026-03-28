@@ -1292,6 +1292,7 @@ echo "=== Phase 4: Web panel uninstaller ==="
 
 WEB_UNINSTALLER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-uninstall.sh"
 WEB_UNINSTALLER="${PROJECT_ROOT}/amneziawg-web-uninstall.sh"
+WEB_AWG_SCRIPT_MARKER="$(dirname "${WEB_TEST_ENV_FILE}")/installed-awg-script.path"
 
 # Verify both entrypoints are present
 if [[ -f "${WEB_UNINSTALLER}" ]]; then
@@ -1323,6 +1324,13 @@ if [[ -f /usr/local/bin/amneziawg-install.sh ]]; then
 	echo "OK: Pre-condition: AWG lifecycle script exists before uninstall"
 else
 	echo "FAIL: Pre-condition: AWG lifecycle script missing before uninstall test"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
+	echo "OK: Pre-condition: AWG lifecycle marker exists before uninstall"
+else
+	echo "FAIL: Pre-condition: AWG lifecycle marker missing before uninstall test"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1369,6 +1377,13 @@ if [[ ! -f /usr/local/bin/amneziawg-install.sh ]]; then
 	echo "OK: Installed AWG lifecycle script removed after uninstall"
 else
 	echo "FAIL: Installed AWG lifecycle script still exists after uninstall"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ ! -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
+	echo "OK: AWG lifecycle marker removed after uninstall"
+else
+	echo "FAIL: AWG lifecycle marker still exists after uninstall"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1450,6 +1465,37 @@ if [[ ${WEB_RERUN_UNINSTALL_RC} -eq 0 ]]; then
 	echo "OK: Uninstaller is idempotent (re-run after absent artifacts succeeded)"
 else
 	echo "FAIL: Uninstaller re-run exited non-zero (rc=${WEB_RERUN_UNINSTALL_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web uninstaller: preserve unmanaged AWG script ---"
+
+cat > /usr/local/bin/amneziawg-install.sh <<'EOF'
+#!/usr/bin/env bash
+echo unmanaged-awg-script
+EOF
+chmod 0755 /usr/local/bin/amneziawg-install.sh
+rm -f "${WEB_AWG_SCRIPT_MARKER}"
+
+WEB_PRESERVE_UNMANAGED_RC=0
+bash "${WEB_UNINSTALLER_IMPL}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--force >/dev/null 2>&1 || WEB_PRESERVE_UNMANAGED_RC=$?
+
+if [[ ${WEB_PRESERVE_UNMANAGED_RC} -eq 0 ]]; then
+	echo "OK: Uninstaller succeeds when unmanaged AWG script exists"
+else
+	echo "FAIL: Uninstaller failed with unmanaged AWG script (rc=${WEB_PRESERVE_UNMANAGED_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f /usr/local/bin/amneziawg-install.sh ]]; then
+	echo "OK: Unmanaged AWG lifecycle script preserved"
+else
+	echo "FAIL: Unmanaged AWG lifecycle script was removed"
 	FAILED=$((FAILED + 1))
 fi
 

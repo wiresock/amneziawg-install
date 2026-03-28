@@ -28,6 +28,7 @@ readonly SERVICE_USER="awg-web"
 readonly SYSTEMD_UNIT_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
 readonly AWG_INSTALL_SCRIPT_DEST="/usr/local/bin/amneziawg-install.sh"
+readonly AWG_INSTALL_SCRIPT_MARKER_NAME="installed-awg-script.path"
 
 # Default paths
 readonly DEFAULT_BINARY_SRC="./target/release/amneziawg-web"
@@ -678,6 +679,12 @@ install_awg_install_script() {
 
     install -m 0755 "${source_path}" "${AWG_INSTALL_SCRIPT_DEST}"
     info "Installed AWG lifecycle script: ${AWG_INSTALL_SCRIPT_DEST}"
+
+    local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
+    printf '%s\n' "${AWG_INSTALL_SCRIPT_DEST}" > "${marker_path}"
+    chown root:root "${marker_path}"
+    chmod 0644 "${marker_path}"
+    info "Recorded AWG lifecycle script ownership marker: ${marker_path}"
 }
 
 # ── Sudoers drop-in ───────────────────────────────────────────────────────────
