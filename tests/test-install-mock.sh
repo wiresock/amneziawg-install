@@ -854,6 +854,164 @@ else
 fi
 
 # ============================================================
+# Phase 2d: validateParamsFile – chmod failure handling
+# ============================================================
+#
+# Regression tests for the "add user failed: chmod: ... Read-only file system"
+# error.  When the params file has non-standard permissions (e.g. a legacy
+# install) and chmod fails:
+#   - If the file has no group/other read or write bits after chmod (e.g. mock fixes to 600): warn and continue.
+#   - If the file is group/other-readable or writable (e.g. 644, 666): abort for security.
+#
+echo ""
+echo "--- validateParamsFile: chmod failure on insecure perms with safe post-chmod mode is non-fatal ---"
+
+(
+	VPFTEST_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_DIR}"' EXIT
+
+	# Write a minimal-but-valid params file.
+	cat > "${VPFTEST_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Set mode 700 (insecure: not 600/400) to trigger the chmod remediation path.
+	# The mock will actually fix it to 600 (so the re-stat passes the 066 check)
+	# while still reporting failure — simulating a filesystem that partially applies
+	# the permission change but returns an error (e.g. a FUSE driver quirk).
+	command chmod 700 "${VPFTEST_DIR}/params"
+
+	# Create the fake server config that validateParamsFile checks for.
+	touch "${VPFTEST_DIR}/awg0.conf"
+
+	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file applies
+	# the permission change but still returns non-zero with a stderr message,
+	# exercising the chmod-failure / warning path in validateParamsFile.
+	AMNEZIAWG_DIR="${VPFTEST_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_DIR}/params"* ]]; then
+			command chmod 600 "${VPFTEST_DIR}/params"  # actually fix to a safe mode
+			echo "chmod: changing permissions of '${VPFTEST_DIR}/params': Read-only file system" >&2
+			return 1  # Simulate chmod reporting failure despite applying the change
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -eq 0 ]]; then
+		echo "OK: validateParamsFile returned 0 when chmod failed but post-failure mode is safe (non-fatal)"
+	else
+		echo "FAIL: validateParamsFile hard-failed (rc=${RC}) when chmod failed on params"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "warning\|could not fix\|fix when possible"; then
+		echo "OK: validateParamsFile emitted a warning about chmod failure"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected warning"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	# Verify that the captured chmod error message is surfaced in the warning.
+	if echo "${OUTPUT}" | grep -q "Read-only file system"; then
+		echo "OK: validateParamsFile included the chmod error message in the warning"
+	else
+		echo "FAIL: validateParamsFile did not include chmod error message in warning"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
+echo "--- validateParamsFile: chmod failure on writable perms is fatal (security) ---"
+
+(
+	VPFTEST2_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST2_DIR}"' EXIT
+
+	# Write a minimal-but-valid params file.
+	cat > "${VPFTEST2_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Set group/other-writable permissions (666 – write bits set for group and other).
+	command chmod 666 "${VPFTEST2_DIR}/params"
+
+	# Create the fake server config that validateParamsFile checks for.
+	touch "${VPFTEST2_DIR}/awg0.conf"
+
+	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file fails.
+	AMNEZIAWG_DIR="${VPFTEST2_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST2_DIR}/params"* ]]; then
+			echo "chmod: changing permissions of '${VPFTEST2_DIR}/params': Read-only file system" >&2
+			return 1  # Simulate read-only filesystem
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -ne 0 ]]; then
+		echo "OK: validateParamsFile correctly rejected group/other-readable/writable params when chmod failed (security)"
+	else
+		echo "FAIL: validateParamsFile should have rejected group/other-readable/writable params when chmod failed"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "readable or writable\|refusing to source\|security"; then
+		echo "OK: validateParamsFile emitted a security error for readable/writable params"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected security error"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+# ============================================================
 # Phase 3: Web panel installer integration test
 # ============================================================
 #
