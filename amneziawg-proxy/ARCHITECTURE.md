@@ -191,8 +191,9 @@ from the Source Connection ID field of the packet it receives in the
 Destination Connection ID field."
 
 **Padding fill** (`apply_quic_padding`):
-- First byte: `0x40 | (prng & 0x3F)` — QUIC short-header form (fixed bit
-  set, header form = 0)
+- First byte: QUIC short-header byte with fixed bit set, header form = 0,
+  reserved bits (0x18) cleared and spin/key-phase/PN-length bits derived
+  from the PRNG
 - Remaining bytes: pseudo-random from an FNV-1a-seeded LCG PRNG
 - Seed is derived from the first 64 bytes of the WG payload, so each packet
   produces different padding
@@ -357,7 +358,7 @@ A DPI system sends a QUIC Initial to test if the port runs a QUIC server.
 ```
 Byte  Value   Meaning
 ────  ─────   ───────
-  0   0xC3    Long header: form=1, fixed=1, type=00 (Initial), reserved=11
+  0   0xC3    Long header: form=1, fixed=1, type=00 (Initial), reserved=00, pn_length=11
   1   0x00    ┐
   2   0x00    │ Version = 0x00000001 (QUIC v1)
   3   0x00    │

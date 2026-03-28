@@ -161,32 +161,41 @@ impl Proxy {
 
     /// Handle a packet received from a client.
     async fn handle_client_packet(&self, data: &[u8], client_addr: SocketAddr) {
-        if let Some(metrics) = self.metrics.get_or_create(client_addr) {
+        // Perform a single metrics lookup per client packet and reuse it for
+        // both general accounting and probe-related rate limiting, then drop
+        // before any await points.
+        let metrics_ref = self.metrics.get_or_create(client_addr);
+
+        if let Some(ref metrics) = metrics_ref {
             metrics.record_in();
-            drop(metrics);
         }
 
         // Check if this is a probe packet and respond if rate allows.
         // Only respond to probes that match the configured protocol so the
         // proxy does not appear to host multiple services on the same port.
+        let mut probe_response: Option<bytes::Bytes> = None;
         if let Some(proto) = responder::detect_protocol(data) {
             if proto == self.protocol {
-                if let Some(metrics) = self.metrics.get_or_create(client_addr) {
+                if let Some(ref metrics) = metrics_ref {
                     if metrics.try_acquire_probe() {
                         metrics.record_probe();
-                        drop(metrics);
-
-                        let response = responder::generate_response(proto, data);
-                        if let Err(e) = self.frontend.send_to(&response, client_addr).await {
-                            warn!(%client_addr, error = %e, "failed to send probe response");
-                        }
-                        debug!(%client_addr, protocol = ?proto, "probe response sent");
+                        probe_response = Some(responder::generate_response(proto, data));
                     } else {
                         debug!(%client_addr, "probe rate limited");
-                        drop(metrics);
                     }
                 }
             }
+        }
+
+        // Drop metrics reference before any await points.
+        drop(metrics_ref);
+
+        // Send probe response (if any) outside the metrics borrow.
+        if let Some(response) = probe_response {
+            if let Err(e) = self.frontend.send_to(&response, client_addr).await {
+                warn!(%client_addr, error = %e, "failed to send probe response");
+            }
+            debug!(%client_addr, "probe response sent");
         }
 
         // Forward to backend (and spawn relay task for new sessions)

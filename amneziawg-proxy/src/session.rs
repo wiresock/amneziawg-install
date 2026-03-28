@@ -96,6 +96,13 @@ impl SessionTable {
         loop {
             let current = self.session_count.load(Ordering::Acquire);
             if current >= self.max_sessions {
+                // Before rejecting, re-check whether this client already has
+                // a session — concurrent callers for the same client_addr
+                // should still succeed when the limit is reached.
+                if let Some(mut entry) = self.sessions.get_mut(&client_addr) {
+                    entry.last_active = Instant::now();
+                    return Ok((Arc::clone(&entry.backend_sock), false));
+                }
                 anyhow::bail!(
                     "session limit reached ({}/{}), rejecting {}",
                     current,
@@ -312,6 +319,22 @@ mod tests {
         assert!(table.get_or_create(c2).await.is_ok());
         // Third session should be rejected
         assert!(table.get_or_create(c3).await.is_err());
+        assert_eq!(table.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn existing_client_allowed_at_capacity() {
+        let backend: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+        let table = SessionTable::new(backend, Duration::from_secs(60), 2);
+
+        let c1: SocketAddr = "10.0.0.1:1111".parse().unwrap();
+        let c2: SocketAddr = "10.0.0.2:2222".parse().unwrap();
+
+        assert!(table.get_or_create(c1).await.is_ok());
+        assert!(table.get_or_create(c2).await.is_ok());
+        // Existing client should still succeed at capacity
+        let (_, is_new) = table.get_or_create(c1).await.unwrap();
+        assert!(!is_new, "existing client should reuse session at capacity");
         assert_eq!(table.len(), 2);
     }
 }
