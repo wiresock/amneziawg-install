@@ -63,8 +63,15 @@ impl SessionTable {
         // Cheap capacity pre-check: reject new clients early when the table
         // is full, avoiding the expensive UdpSocket::bind()/connect() work
         // that would be discarded in the Vacant arm below.
+        // Re-check the map when at capacity because a concurrent task may
+        // have inserted the session between the fast-path get_mut above and
+        // this point.
         let current = self.session_count.load(Ordering::Acquire);
         if current >= self.max_sessions {
+            if let Some(mut entry) = self.sessions.get_mut(&client_addr) {
+                entry.last_active = Instant::now();
+                return Ok((Arc::clone(&entry.backend_sock), false));
+            }
             anyhow::bail!(
                 "session limit reached ({}/{}), rejecting {}",
                 current,
