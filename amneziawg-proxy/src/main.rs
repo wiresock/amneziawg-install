@@ -69,15 +69,28 @@ async fn main() -> anyhow::Result<()> {
     // Set up graceful shutdown on SIGINT / SIGTERM
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm =
-                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(error = %e, "failed to register SIGTERM handler");
+                    // Fall back to ctrl-c only.
+                    match tokio::signal::ctrl_c().await {
+                        Ok(()) => info!("received SIGINT"),
+                        Err(e) => error!(error = %e, "failed to listen for SIGINT"),
+                    }
+                    shutdown_signal.notify_one();
+                    return;
+                }
+            };
             tokio::select! {
-                _ = ctrl_c => {
-                    info!("received SIGINT");
+                result = tokio::signal::ctrl_c() => {
+                    match result {
+                        Ok(()) => info!("received SIGINT"),
+                        Err(e) => error!(error = %e, "failed to listen for SIGINT"),
+                    }
                 }
                 _ = sigterm.recv() => {
                     info!("received SIGTERM");
@@ -86,8 +99,10 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(not(unix))]
         {
-            ctrl_c.await.expect("failed to listen for ctrl-c");
-            info!("received ctrl-c");
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => info!("received ctrl-c"),
+                Err(e) => error!(error = %e, "failed to listen for ctrl-c"),
+            }
         }
         shutdown_signal.notify_one();
     });
