@@ -1011,9 +1011,39 @@ PARAMS_EOF
 	fi
 ) || FAILED=$((FAILED + 1))
 
+echo ""
+echo "--- validateParamsFile: errors go to stderr, not stdout ---"
+
+(
+	VPFTEST3_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST3_DIR}"' EXIT
+
+	# Create a symlink instead of a regular file — this should make validateParamsFile return 1
+	ln -s /dev/null "${VPFTEST3_DIR}/params"
+
+	AMNEZIAWG_DIR="${VPFTEST3_DIR}"
+
+	# Capture stdout and stderr separately
+	STDOUT_OUTPUT=$(validateParamsFile 2>/dev/null)
+	RC=$?
+
+	if [[ ${RC} -ne 0 ]]; then
+		echo "OK: validateParamsFile returned non-zero for symlink params"
+	else
+		echo "FAIL: validateParamsFile should have failed for symlink params"
+		exit 1
+	fi
+	if [[ -z "${STDOUT_OUTPUT}" ]]; then
+		echo "OK: validateParamsFile error goes to stderr, not stdout (stdout is empty on failure)"
+	else
+		echo "FAIL: validateParamsFile wrote error message to stdout instead of stderr"
+		echo "  stdout: ${STDOUT_OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
 # ============================================================
 # Phase 3: Web panel installer integration test
-# ============================================================
 #
 # Test assumptions / harness notes:
 # - systemctl is mocked (daemon-reload, enable, start return exit 0)

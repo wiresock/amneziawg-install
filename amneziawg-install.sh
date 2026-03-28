@@ -325,7 +325,7 @@ fi
 
 function isRoot() {
 	if [[ "${EUID}" -ne 0 ]]; then
-		echo "You need to run this script as root"
+		echo "You need to run this script as root" >&2
 		exit 1
 	fi
 }
@@ -336,92 +336,92 @@ function checkVirt() {
 	fi
 
 	if [[ "$(systemd-detect-virt)" == "openvz" ]]; then
-		echo "OpenVZ is not supported"
+		echo "OpenVZ is not supported" >&2
 		exit 1
 	fi
 
 	if [[ "$(systemd-detect-virt)" == "lxc" ]]; then
-		echo "LXC is not supported (yet)."
-		echo "WireGuard can technically run in an LXC container,"
-		echo "but the kernel module has to be installed on the host,"
-		echo "the container has to be run with some specific parameters"
-		echo "and only the tools need to be installed in the container."
+		echo "LXC is not supported (yet)." >&2
+		echo "WireGuard can technically run in an LXC container," >&2
+		echo "but the kernel module has to be installed on the host," >&2
+		echo "the container has to be run with some specific parameters" >&2
+		echo "and only the tools need to be installed in the container." >&2
 		exit 1
 	fi
 }
 
 function checkOS() {
 	if [[ ! -f /etc/os-release ]] || [[ ! -r /etc/os-release ]]; then
-		echo "Cannot detect OS: /etc/os-release is missing or not readable"
+		echo "Cannot detect OS: /etc/os-release is missing or not readable" >&2
 		exit 1
 	fi
 	# shellcheck source=/etc/os-release
 	source /etc/os-release
 	OS="${ID}"
 	if [[ -z "${OS}" ]]; then
-		echo "Cannot detect OS: /etc/os-release is missing the ID field"
+		echo "Cannot detect OS: /etc/os-release is missing the ID field" >&2
 		exit 1
 	fi
 	if [[ ${OS} == "debian" || ${OS} == "raspbian" ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
-			echo "Cannot detect Debian version: VERSION_ID is missing from /etc/os-release"
+			echo "Cannot detect Debian version: VERSION_ID is missing from /etc/os-release" >&2
 			exit 1
 		fi
 		# Extract major version to handle point-release formats (e.g., "11.7")
 		local DEBIAN_MAJOR
 		DEBIAN_MAJOR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
 		if ! [[ ${DEBIAN_MAJOR} =~ ^[0-9]+$ ]] || [[ ${DEBIAN_MAJOR} -lt 11 ]]; then
-			echo "Your version of Debian (${VERSION_ID}) is not supported. Please use Debian 11 Bullseye or later"
+			echo "Your version of Debian (${VERSION_ID}) is not supported. Please use Debian 11 Bullseye or later" >&2
 			exit 1
 		fi
 		OS=debian # overwrite if raspbian
 	elif [[ ${OS} == "ubuntu" ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
-			echo "Cannot detect Ubuntu version: VERSION_ID is missing from /etc/os-release"
+			echo "Cannot detect Ubuntu version: VERSION_ID is missing from /etc/os-release" >&2
 			exit 1
 		fi
 		local RELEASE_YEAR
 		RELEASE_YEAR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
 		if ! [[ ${RELEASE_YEAR} =~ ^[0-9]+$ ]] || [[ ${RELEASE_YEAR} -lt 22 ]]; then
-			echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 22.04 or later"
+			echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 22.04 or later" >&2
 			exit 1
 		fi
 	elif [[ ${OS} == "linuxmint" ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
-			echo "Cannot detect Linux Mint version: VERSION_ID is missing from /etc/os-release"
+			echo "Cannot detect Linux Mint version: VERSION_ID is missing from /etc/os-release" >&2
 			exit 1
 		fi
 		# Linux Mint 21.x is based on Ubuntu 22.04; require major version >= 21
 		local MINT_MAJOR
 		MINT_MAJOR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
 		if ! [[ ${MINT_MAJOR} =~ ^[0-9]+$ ]] || [[ ${MINT_MAJOR} -lt 21 ]]; then
-			echo "Your version of Linux Mint (${VERSION_ID}) is not supported. Please use Linux Mint 21 or later"
+			echo "Your version of Linux Mint (${VERSION_ID}) is not supported. Please use Linux Mint 21 or later" >&2
 			exit 1
 		fi
 		OS=ubuntu # treat Linux Mint as Ubuntu for package management
 	elif [[ ${OS} == "fedora" ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
-			echo "Cannot detect Fedora version: VERSION_ID is missing from /etc/os-release"
+			echo "Cannot detect Fedora version: VERSION_ID is missing from /etc/os-release" >&2
 			exit 1
 		fi
 		# Extract major version to handle potential future format changes
 		local FEDORA_MAJOR
 		FEDORA_MAJOR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
 		if ! [[ ${FEDORA_MAJOR} =~ ^[0-9]+$ ]] || [[ ${FEDORA_MAJOR} -lt 39 ]]; then
-			echo "Your version of Fedora (${VERSION_ID}) is not supported. Please use Fedora 39 or later"
+			echo "Your version of Fedora (${VERSION_ID}) is not supported. Please use Fedora 39 or later" >&2
 			exit 1
 		fi
 	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
-			echo "Cannot detect CentOS/AlmaLinux/Rocky version: VERSION_ID is missing from /etc/os-release"
+			echo "Cannot detect CentOS/AlmaLinux/Rocky version: VERSION_ID is missing from /etc/os-release" >&2
 			exit 1
 		fi
 		if [[ ${VERSION_ID} == 7* ]] || [[ ${VERSION_ID} == 8* ]]; then
-			echo "Your version of CentOS (${VERSION_ID}) is not supported. Please use CentOS 9 or later"
+			echo "Your version of CentOS (${VERSION_ID}) is not supported. Please use CentOS 9 or later" >&2
 			exit 1
 		fi
 	else
-		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Linux Mint, Fedora, CentOS, AlmaLinux or Rocky Linux system"
+		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Linux Mint, Fedora, CentOS, AlmaLinux or Rocky Linux system" >&2
 		exit 1
 	fi
 }
@@ -2182,45 +2182,45 @@ function validateParamsFile() {
 	# This mitigates the risk of arbitrary code execution or private key exposure
 	# Reject symlinks explicitly so we don't accidentally source an unexpected file via a link.
 	if [[ -L "${AMNEZIAWG_DIR}/params" ]] || [[ -h "${AMNEZIAWG_DIR}/params" ]]; then
-		echo -e "${RED}ERROR: Params file must not be a symbolic link: ${AMNEZIAWG_DIR}/params${NC}"
-		echo -e "${ORANGE}Remove the symlink and create a regular file owned by root with mode 600 or 400.${NC}"
+		echo -e "${RED}ERROR: Params file must not be a symbolic link: ${AMNEZIAWG_DIR}/params${NC}" >&2
+		echo -e "${ORANGE}Remove the symlink and create a regular file owned by root with mode 600 or 400.${NC}" >&2
 		return 1
 	fi
 	if [[ ! -f "${AMNEZIAWG_DIR}/params" ]]; then
-		echo -e "${RED}ERROR: Params file not found or is not a regular file: ${AMNEZIAWG_DIR}/params${NC}"
-		echo -e "${ORANGE}The installer cannot continue without a valid params file.${NC}"
+		echo -e "${RED}ERROR: Params file not found or is not a regular file: ${AMNEZIAWG_DIR}/params${NC}" >&2
+		echo -e "${ORANGE}The installer cannot continue without a valid params file.${NC}" >&2
 		return 1
 	fi
 	if [[ ! -r "${AMNEZIAWG_DIR}/params" ]]; then
-		echo -e "${RED}ERROR: Params file is not readable: ${AMNEZIAWG_DIR}/params${NC}"
-		echo -e "${ORANGE}Ensure the file is readable by root and try again.${NC}"
+		echo -e "${RED}ERROR: Params file is not readable: ${AMNEZIAWG_DIR}/params${NC}" >&2
+		echo -e "${ORANGE}Ensure the file is readable by root and try again.${NC}" >&2
 		return 1
 	fi
 	local PARAMS_OWNER PARAMS_PERMS
 	PARAMS_OWNER=$(stat -c '%u' "${AMNEZIAWG_DIR}/params" 2>/dev/null)
 	PARAMS_PERMS=$(stat -c '%a' "${AMNEZIAWG_DIR}/params" 2>/dev/null)
 	if [[ -z "${PARAMS_OWNER}" ]] || [[ -z "${PARAMS_PERMS}" ]]; then
-		echo -e "${RED}ERROR: Failed to read file metadata for ${AMNEZIAWG_DIR}/params.${NC}"
-		echo -e "${ORANGE}Ensure the file exists and is accessible, then retry.${NC}"
+		echo -e "${RED}ERROR: Failed to read file metadata for ${AMNEZIAWG_DIR}/params.${NC}" >&2
+		echo -e "${ORANGE}Ensure the file exists and is accessible, then retry.${NC}" >&2
 		return 1
 	fi
 	if [[ "${PARAMS_OWNER}" != "0" ]]; then
-		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params is not owned by root (owner UID: ${PARAMS_OWNER}).${NC}"
-		echo -e "${ORANGE}This is a security risk. Fix with: chown root:root ${AMNEZIAWG_DIR}/params${NC}"
+		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params is not owned by root (owner UID: ${PARAMS_OWNER}).${NC}" >&2
+		echo -e "${ORANGE}This is a security risk. Fix with: chown root:root ${AMNEZIAWG_DIR}/params${NC}" >&2
 		return 1
 	fi
 	# Require mode 600 or 400: the file contains SERVER_PRIV_KEY and must not be
 	# readable or writable by group/other. Modes like 644 would leak the private key.
 	if [[ "${PARAMS_PERMS}" != "600" ]] && [[ "${PARAMS_PERMS}" != "400" ]]; then
-		echo -e "${RED}WARNING: ${AMNEZIAWG_DIR}/params has insecure permissions (${PARAMS_PERMS}).${NC}"
-		echo -e "${RED}This file contains the server private key and must not be accessible by non-root users.${NC}"
+		echo -e "${RED}WARNING: ${AMNEZIAWG_DIR}/params has insecure permissions (${PARAMS_PERMS}).${NC}" >&2
+		echo -e "${RED}This file contains the server private key and must not be accessible by non-root users.${NC}" >&2
 		# For legacy installs created before strict umask/chmod logic, try to auto-remediate
 		# when running as root and the file is owned by root, to avoid locking out management actions.
 		if [[ "${EUID}" -eq 0 ]] && [[ "${PARAMS_OWNER}" == "0" ]]; then
-			echo -e "${ORANGE}Attempting to fix permissions by setting mode 600 on ${AMNEZIAWG_DIR}/params...${NC}"
+			echo -e "${ORANGE}Attempting to fix permissions by setting mode 600 on ${AMNEZIAWG_DIR}/params...${NC}" >&2
 			local chmod_err
 			if chmod_err=$(chmod 600 "${AMNEZIAWG_DIR}/params" 2>&1); then
-				echo -e "${GREEN}Permissions on ${AMNEZIAWG_DIR}/params updated to 600. Continuing.${NC}"
+				echo -e "${GREEN}Permissions on ${AMNEZIAWG_DIR}/params updated to 600. Continuing.${NC}" >&2
 			else
 				# chmod failed (e.g. read-only filesystem or immutable file attribute).
 				# Re-stat first so the warning shows the actual post-failure mode, not
@@ -2229,46 +2229,46 @@ function validateParamsFile() {
 				# and a writable-by-others file is a privilege-escalation risk.
 				local current_mode
 				if ! current_mode=$(stat -c '%a' "${AMNEZIAWG_DIR}/params" 2>/dev/null); then
-					echo -e "${RED}ERROR: Could not re-read permissions on ${AMNEZIAWG_DIR}/params after chmod failure; refusing to source an unverified file as root.${NC}"
+					echo -e "${RED}ERROR: Could not re-read permissions on ${AMNEZIAWG_DIR}/params after chmod failure; refusing to source an unverified file as root.${NC}" >&2
 					return 1
 				fi
-				echo -e "${ORANGE}WARNING: Could not fix permissions on ${AMNEZIAWG_DIR}/params (current: ${current_mode}): ${chmod_err}${NC}"
-				echo -e "${ORANGE}The filesystem may be read-only or the file may have the immutable attribute set.${NC}"
-				echo -e "${ORANGE}Fix when possible: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
+				echo -e "${ORANGE}WARNING: Could not fix permissions on ${AMNEZIAWG_DIR}/params (current: ${current_mode}): ${chmod_err}${NC}" >&2
+				echo -e "${ORANGE}The filesystem may be read-only or the file may have the immutable attribute set.${NC}" >&2
+				echo -e "${ORANGE}Fix when possible: chmod 600 ${AMNEZIAWG_DIR}/params${NC}" >&2
 				# Abort if any group/other read or write bit remains set (mode & 066 != 0).
 				# 066 is octal, covering group/other read (044) and write (022) bits.
 				if (( (8#${current_mode} & 066) != 0 )); then
-					echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params remains readable or writable by group/other (mode: ${current_mode}). Refusing to source for security reasons.${NC}"
-					echo -e "${ORANGE}Fix manually: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
+					echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params remains readable or writable by group/other (mode: ${current_mode}). Refusing to source for security reasons.${NC}" >&2
+					echo -e "${ORANGE}Fix manually: chmod 600 ${AMNEZIAWG_DIR}/params${NC}" >&2
 					return 1
 				fi
 			fi
 		else
-			echo -e "${ORANGE}Fix with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
+			echo -e "${ORANGE}Fix with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}" >&2
 			return 1
 		fi
 	fi
 
 	# shellcheck source=/etc/amnezia/amneziawg/params
 	if ! source "${AMNEZIAWG_DIR}/params"; then
-		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}"
-		echo -e "${ORANGE}The file may be corrupted or contain a syntax error. Fix or regenerate it and rerun the installer.${NC}"
+		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}" >&2
+		echo -e "${ORANGE}The file may be corrupted or contain a syntax error. Fix or regenerate it and rerun the installer.${NC}" >&2
 		return 1
 	fi
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
 	# Verify server config file exists before attempting migration
 	if [[ ! -f "${SERVER_AWG_CONF}" ]]; then
-		echo -e "${RED}ERROR: Server configuration file not found: ${SERVER_AWG_CONF}${NC}"
-		echo -e "${ORANGE}The params file exists but the config file is missing.${NC}"
+		echo -e "${RED}ERROR: Server configuration file not found: ${SERVER_AWG_CONF}${NC}" >&2
+		echo -e "${ORANGE}The params file exists but the config file is missing.${NC}" >&2
 		return 1
 	fi
 
 	# Validate and normalize SERVER_AWG_IPV6 from params file
 	# Older installations may have stored non-normalized or oddly formatted IPv6
 	if ! isValidIPv6 "${SERVER_AWG_IPV6}"; then
-		echo -e "${RED}ERROR: Invalid IPv6 address in params file: ${SERVER_AWG_IPV6}${NC}"
-		echo -e "${ORANGE}Fix the SERVER_AWG_IPV6 value in ${AMNEZIAWG_DIR}/params${NC}"
+		echo -e "${RED}ERROR: Invalid IPv6 address in params file: ${SERVER_AWG_IPV6}${NC}" >&2
+		echo -e "${ORANGE}Fix the SERVER_AWG_IPV6 value in ${AMNEZIAWG_DIR}/params${NC}" >&2
 		return 1
 	fi
 	# Global used by loadParams to detect IPv6 normalization changes;
@@ -2768,7 +2768,7 @@ function quietIPv6Rewrite() {
 
 function loadParams() {
 	if ! validateParamsFile; then
-		echo -e "${RED}Failed to validate params file. Aborting parameter loading.${NC}"
+		echo -e "${RED}Failed to validate params file. Aborting parameter loading.${NC}" >&2
 		exit 1
 	fi
 
