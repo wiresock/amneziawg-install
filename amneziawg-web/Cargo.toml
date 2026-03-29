@@ -26,6 +26,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 argon2 = "0.5"
 rand = "0.8"
+libc = "0.2.183"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

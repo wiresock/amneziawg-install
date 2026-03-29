@@ -572,6 +572,66 @@ Generate with:
 
 # ── Filesystem setup ───────────────────────────────────────────────────────────
 
+validate_awg_config_dir() {
+    local dir_path_raw="$1"
+    local dir_path
+    local resolved_path
+
+    # Reject empty or non-absolute paths.
+    if [[ -z "${dir_path_raw}" ]]; then
+        warn "AWG_CONFIG_DIR is empty; skipping automatic ownership/permission changes."
+        return 1
+    fi
+    if [[ "${dir_path_raw}" != /* ]]; then
+        warn "AWG_CONFIG_DIR '${dir_path_raw}' is not an absolute path; skipping automatic ownership/permission changes."
+        return 1
+    fi
+
+    # Normalize: strip trailing slashes (but keep "/" as-is).
+    dir_path="${dir_path_raw%/}"
+    if [[ -z "${dir_path}" ]]; then
+        dir_path="/"
+    fi
+
+    # Reject paths that contain symlink components (TOCTOU defense: a symlink
+    # target could change between validation and the subsequent chown/chmod).
+    local check_path="${dir_path}"
+    while [[ "${check_path}" != "/" && "${check_path}" != "." ]]; do
+        if [[ -L "${check_path}" ]]; then
+            warn "AWG_CONFIG_DIR '${dir_path_raw}' contains a symbolic link at '${check_path}'; skipping automatic ownership/permission changes."
+            return 1
+        fi
+        check_path="$(dirname "${check_path}")"
+    done
+
+    # Try to resolve the real path to canonicalize and catch any remaining
+    # indirection (e.g. /foo/../etc).
+    resolved_path="${dir_path}"
+    if command -v realpath >/dev/null 2>&1; then
+        local resolved_tmp
+        if resolved_tmp="$(realpath -m -- "${dir_path}" 2>/dev/null)"; then
+            resolved_path="${resolved_tmp}"
+        fi
+    elif command -v readlink >/dev/null 2>&1; then
+        local resolved_tmp
+        if resolved_tmp="$(readlink -f -- "${dir_path}" 2>/dev/null)"; then
+            resolved_path="${resolved_tmp}"
+        fi
+    fi
+    dir_path="${resolved_path}"
+
+    # Reject sensitive system directories that should never have their
+    # ownership changed to the service user.
+    case "${dir_path}" in
+        "/"|"/etc"|"/etc/amnezia"|"/etc/amnezia/amneziawg"|"/var"|"/home"|"/tmp"|"/usr"|"/usr/local")
+            warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
 setup_filesystem() {
     step "Filesystem setup"
 
@@ -603,12 +663,32 @@ setup_filesystem() {
     chown root:root "${ENV_DIR}"
     chmod 0700 "${ENV_DIR}"
 
-    # Give the service user read access to the AWG config directory if it exists
+    # Give the service user read+write access to the AWG config directory.
+    # The web service creates client config files directly in this directory,
+    # so it needs write permission (not just read).
+    if validate_awg_config_dir "${AWG_CONFIG_DIR}"; then
+        if [[ -d "${AWG_CONFIG_DIR}" ]]; then
+            chown "${SERVICE_USER}:${SERVICE_USER}" "${AWG_CONFIG_DIR}" 2>/dev/null \
+                && info "Set ownership of ${AWG_CONFIG_DIR} to ${SERVICE_USER}." \
+                || warn "Could not change ownership of ${AWG_CONFIG_DIR}. The service may not be able to create client configs."
+            chmod 0700 "${AWG_CONFIG_DIR}" 2>/dev/null \
+                && info "Set permissions of ${AWG_CONFIG_DIR} to 0700." \
+                || warn "Could not change permissions of ${AWG_CONFIG_DIR}. The service may not be able to create or manage client configs."
+        else
+            # Create the directory owned by the service user so it can write configs.
+            mkdir -p "${AWG_CONFIG_DIR}"
+            chown "${SERVICE_USER}:${SERVICE_USER}" "${AWG_CONFIG_DIR}"
+            chmod 0700 "${AWG_CONFIG_DIR}"
+            info "Created config directory: ${AWG_CONFIG_DIR}"
+        fi
+    fi
+
+    # For existing client configs, ensure the service user can read them.
     if [[ -d "${AWG_CONFIG_DIR}" ]]; then
         # Best-effort: add to group owning the directory
         local awg_group
         awg_group="$(stat -c '%G' "${AWG_CONFIG_DIR}")"
-        if [[ "${awg_group}" != "root" ]] && ! id -Gn "${SERVICE_USER}" | grep -qw "${awg_group}"; then
+        if [[ "${awg_group}" != "root" ]] && [[ "${awg_group}" != "${SERVICE_USER}" ]] && ! id -Gn "${SERVICE_USER}" | grep -qw "${awg_group}"; then
             usermod -aG "${awg_group}" "${SERVICE_USER}" 2>/dev/null \
                 || warn "Could not add ${SERVICE_USER} to group ${awg_group}. \
 You may need to grant read access to ${AWG_CONFIG_DIR} manually."
@@ -836,7 +916,9 @@ install_sudoers() {
     # 2. Remove disabled peers via `awg set <iface> peer <key> remove`.
     # 3. Sync interface config via `awg syncconf` + `awg-quick strip` to
     #    restore re-enabled peers to the running interface.
-    # 4. Manage clients via the install script (add/remove/list).
+    # 4. Manage clients via the install script (remove/list).
+    # 5. Read server params and config for direct client creation.
+    # 6. Append peer blocks to the server config for direct client creation.
     #
     # Instead of running the whole service as root, we install tightly-scoped
     # sudoers rules that grant the service user passwordless sudo for only
@@ -858,10 +940,14 @@ install_sudoers() {
     fi
 
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
-    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --add-client *, ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
+    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
+    # Direct client creation: read params file and server config, append peer blocks.
+    # Scoped to specific file patterns to minimize privilege surface.
+    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf"
 
     info "Sudoers rule (AWG): ${rule_awg}"
     info "Sudoers rule (install): ${rule_install}"
+    info "Sudoers rule (direct): ${rule_direct}"
 
     # Ensure the sudoers drop-in directory exists (may be absent in minimal
     # containers or stripped images).
@@ -873,9 +959,12 @@ install_sudoers() {
     printf '# Installed by amneziawg-web-install.sh – do not edit manually.\n' \
         >> "${SUDOERS_FILE}"
     printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
-    printf '# Allow amneziawg-web to manage clients via the install script.\n' \
+    printf '# Allow amneziawg-web to manage clients via the install script (remove/list).\n' \
         >> "${SUDOERS_FILE}"
     printf '%s\n' "${rule_install}" >> "${SUDOERS_FILE}"
+    printf '# Allow amneziawg-web to create clients directly (read params, append config).\n' \
+        >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule_direct}" >> "${SUDOERS_FILE}"
 
     chmod 0440 "${SUDOERS_FILE}"
     chown root:root "${SUDOERS_FILE}"
@@ -995,12 +1084,17 @@ find_unit_template() {
     return 1
 }
 
-# Adjust ReadOnlyPaths and ProtectHome in the installed service unit to match
+# Adjust ReadWritePaths and ProtectHome in the installed service unit to match
 # the user's configured AWG_CONFIG_DIR.  The packaged template hard-codes
-# ReadOnlyPaths=/etc/amneziawg and ProtectHome=yes which is correct for the
-# default config directory.  When a custom directory is chosen — especially
-# one under /home — we need to relax the sandboxing so the service can read
-# the config files.
+# ReadWritePaths=/etc/amnezia/amneziawg and ProtectHome=yes which is correct
+# for the default config directory.  When a custom directory is chosen —
+# especially one under /home — we need to relax the sandboxing so the service
+# can access the config files.
+#
+# The function distinguishes the AWG-config ReadWritePaths entry from the
+# data-dir entry (DATA_DIR) by line number, skipping any entry whose path
+# matches DATA_DIR.  This avoids substring-based matching that could
+# accidentally target the wrong line.
 adjust_unit_hardening() {
     local unit_file="$1"
     local config_dir="$2"
@@ -1010,22 +1104,89 @@ adjust_unit_hardening() {
     # Normalize: strip trailing slashes for consistent comparison
     config_dir="${config_dir%/}"
 
-    # 1. Update ReadOnlyPaths to include the actual config directory
+    # Escape config_dir for safe use in sed replacement / append text.
+    # Backslashes and '&' are special in sed replacement strings; '/' is
+    # special in sed address patterns.  The delimiter '|' is used for s|||
+    # commands, so escape that as well.
+    local config_dir_sed
+    config_dir_sed=$(printf '%s' "${config_dir}" | sed 's|[\\&/|]|\\&|g')
+
+    # 1. Update ReadWritePaths for the AWG config directory.
+    #    Also handle legacy ReadOnlyPaths left over from older installs.
+    #    The server config root (/etc/amnezia/amneziawg) must always remain in
+    #    ReadWritePaths because direct client creation appends peer blocks to
+    #    /etc/amnezia/amneziawg/*.conf.  If AWG_CONFIG_DIR is outside that tree,
+    #    a separate ReadWritePaths entry is added to cover both paths.
+    local etc_dir="/etc/amnezia/amneziawg"
+
     if grep -q '^ReadOnlyPaths=' "${unit_file}" 2>/dev/null; then
-        local current_ro
-        current_ro="$(grep '^ReadOnlyPaths=' "${unit_file}" | head -1 | cut -d= -f2-)"
-        current_ro="${current_ro%/}"
-        # If the configured directory is already covered, nothing to do
-        if [[ "${config_dir}" != "${current_ro}" ]] \
-                && [[ "${config_dir}" != "${current_ro}/"* ]]; then
-            sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${config_dir}|" "${unit_file}"
-            info "Updated ReadOnlyPaths to ${config_dir}"
+        # Upgrade: replace ReadOnlyPaths with ReadWritePaths.
+        # Ensure both the server config root and config_dir are covered.
+        if [[ "${config_dir}" == "${etc_dir}" ]] \
+                || [[ "${config_dir}" == "${etc_dir}/"* ]]; then
+            sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}|" "${unit_file}"
+        else
+            # Replace the legacy line, then append an extra ReadWritePaths line.
+            sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}|" "${unit_file}"
+            sed -i "/^ReadWritePaths=${etc_dir//\//\\/}\$/a ReadWritePaths=${config_dir_sed}" "${unit_file}"
+        fi
+        info "Replaced ReadOnlyPaths with ReadWritePaths (${etc_dir}, ${config_dir})"
+    elif grep -q '^ReadWritePaths=' "${unit_file}" 2>/dev/null; then
+        # Scan existing non-DATA_DIR ReadWritePaths entries to determine
+        # whether the server config root and config_dir are already covered.
+        local data_base="${DATA_DIR%/}"
+        local has_etc_dir=false
+        local has_config_dir=false
+
+        while IFS=: read -r _ln line; do
+            local val="${line#ReadWritePaths=}"
+            val="${val%/}"
+            # Skip the data directory entry
+            if [[ "${val}" == "${data_base}" ]] || [[ "${val}" == "${data_base}/"* ]]; then
+                continue
+            fi
+            # Check if this entry already covers what we need
+            if [[ "${val}" == "${etc_dir}" ]] || [[ "${etc_dir}" == "${val}/"* ]]; then
+                has_etc_dir=true
+            fi
+            if [[ "${val}" == "${config_dir}" ]] || [[ "${config_dir}" == "${val}/"* ]]; then
+                has_config_dir=true
+            fi
+        done < <(grep -n '^ReadWritePaths=' "${unit_file}")
+
+        # Add missing entries before the DATA_DIR entry (or after the last
+        # ReadWritePaths line as fallback).
+        if ! ${has_etc_dir}; then
+            local data_linenum=""
+            data_linenum=$(grep -n "^ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1)
+            if [[ -n "${data_linenum}" ]]; then
+                sed -i "${data_linenum}i\\ReadWritePaths=${etc_dir}" "${unit_file}"
+            else
+                local last_rw
+                last_rw=$(grep -n '^ReadWritePaths=' "${unit_file}" | tail -1 | cut -d: -f1)
+                sed -i "${last_rw}a\\ReadWritePaths=${etc_dir}" "${unit_file}"
+            fi
+            info "Added ReadWritePaths=${etc_dir}"
+        fi
+
+        if ! ${has_config_dir}; then
+            # Re-scan to find the DATA_DIR line (line numbers may have shifted).
+            local data_linenum2=""
+            data_linenum2=$(grep -n "^ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1)
+            if [[ -n "${data_linenum2}" ]]; then
+                sed -i "${data_linenum2}i\\ReadWritePaths=${config_dir_sed}" "${unit_file}"
+            else
+                local last_rw2
+                last_rw2=$(grep -n '^ReadWritePaths=' "${unit_file}" | tail -1 | cut -d: -f1)
+                sed -i "${last_rw2}a\\ReadWritePaths=${config_dir_sed}" "${unit_file}"
+            fi
+            info "Added ReadWritePaths=${config_dir}"
         fi
     fi
 
     # 2. If the config directory lives under /home, relax ProtectHome so the
     #    service can traverse into it.  ProtectHome=read-only still prevents
-    #    writes while allowing reads.
+    #    writes to other home dirs while allowing access to the config dir.
     case "${config_dir}" in
         /home|/home/*)
             if grep -q '^ProtectHome=yes' "${unit_file}" 2>/dev/null; then
@@ -1073,7 +1234,8 @@ EnvironmentFile=${ENV_FILE}
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadOnlyPaths=${AWG_CONFIG_DIR}
+ReadWritePaths=/etc/amnezia/amneziawg
+ReadWritePaths=${AWG_CONFIG_DIR}
 ReadWritePaths=${DATA_DIR}
 
 [Install]
@@ -1094,7 +1256,7 @@ UNITEOF
         info "Added EnvironmentFile directive to service unit."
     fi
 
-    # Adjust ReadOnlyPaths / ProtectHome for the configured AWG config directory
+    # Adjust ReadWritePaths / ProtectHome for the configured AWG config directory
     adjust_unit_hardening "${SYSTEMD_UNIT_DEST}" "${AWG_CONFIG_DIR}"
 
     systemctl daemon-reload

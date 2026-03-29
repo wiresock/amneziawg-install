@@ -99,58 +99,45 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 
 /// Build a safe, user-facing diagnostic for create-user failures.
 ///
-/// This message is shown in both JSON API and HTML form responses. It keeps
-/// useful context (error kind, exit code, timeout) while sanitizing stderr and
-/// avoiding raw OS/path details from spawn/wait errors.
-fn create_user_diagnostic_message(error: &crate::admin::script_bridge::ScriptError) -> String {
-    fn sanitize_diagnostic_fragment(input: &str) -> String {
-        let mut out = String::with_capacity(input.len());
-        let mut last_was_space = false;
-        for ch in input.chars() {
-            let is_space = ch.is_whitespace() || ch.is_control();
-            if is_space {
-                if !last_was_space {
-                    out.push(' ');
-                }
-                last_was_space = true;
-            } else {
-                out.push(ch);
-                last_was_space = false;
-            }
-        }
-        out.trim().to_string()
-    }
-
+/// This message is shown in both JSON API and HTML form responses. It uses
+/// fixed, non-sensitive messages for error variants that may contain raw
+/// stderr or filesystem paths, while keeping useful context for variants
+/// that are inherently safe (e.g. duplicate name, no free IP).
+fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateClientError) -> String {
+    use crate::admin::client_manager::CreateClientError;
     match error {
-        crate::admin::script_bridge::ScriptError::NonZeroExit { code, stderr } => {
-            let stderr = sanitize_diagnostic_fragment(stderr);
-            if stderr.is_empty() {
-                format!("Failed to create user (script exit code {code}).")
-            } else {
-                format!("Failed to create user (script exit code {code}): {stderr}")
-            }
+        CreateClientError::InvalidName(msg) => format!("Failed to create user: {msg}"),
+        CreateClientError::DuplicateName(name) => {
+            format!("Failed to create user: a client named '{name}' already exists.")
         }
-        crate::admin::script_bridge::ScriptError::Signal { stderr } => {
-            let stderr = sanitize_diagnostic_fragment(stderr);
-            if stderr.is_empty() {
-                "Failed to create user (script terminated by signal).".to_string()
-            } else {
-                format!("Failed to create user (script terminated by signal): {stderr}")
-            }
+        CreateClientError::NoFreeIp => {
+            "Failed to create user: no free IP addresses available (max 253 clients).".to_string()
         }
-        crate::admin::script_bridge::ScriptError::Timeout(duration) => {
-            format!("Failed to create user (script timed out after {duration:?}).")
+        // The following variants may contain raw stderr/paths from sudo
+        // commands or OS errors; use fixed messages and log details server-side.
+        CreateClientError::ParamsRead(_) => {
+            "Failed to create user: could not read server configuration.".to_string()
         }
-        crate::admin::script_bridge::ScriptError::Spawn(e) => format!(
-            "Failed to create user (unable to start install script; OS error kind: {:?}).",
-            e.kind()
-        ),
-        crate::admin::script_bridge::ScriptError::Wait(e) => format!(
-            "Failed to create user (failed while waiting for install script; OS error kind: {:?}).",
-            e.kind()
-        ),
-        crate::admin::script_bridge::ScriptError::InvalidName(msg) => {
-            format!("Failed to create user: {msg}")
+        CreateClientError::DbRead(_) => {
+            "Failed to create user: database operation failed.".to_string()
+        }
+        CreateClientError::KeyGen(_) => {
+            "Failed to create user: key generation failed.".to_string()
+        }
+        CreateClientError::FileWrite(_) => {
+            "Failed to create user: file operation failed.".to_string()
+        }
+        CreateClientError::ConfigParse(_) => {
+            "Failed to create user: server configuration error.".to_string()
+        }
+        CreateClientError::Awg(_) => {
+            "Client was created, but interface sync failed. Please sync the VPN interface configuration or restart the service, then try again.".to_string()
+        }
+        CreateClientError::LockBusy => {
+            "Failed to create user: another add/remove operation is already in progress; please try again later.".to_string()
+        }
+        CreateClientError::Internal(_) => {
+            "Failed to create user: internal server error.".to_string()
         }
     }
 }
@@ -1163,7 +1150,7 @@ async fn api_create_user(
     let name = body.name.trim().to_string();
     match crate::admin::execute_create_user(
         &state.db,
-        &state.script_bridge,
+        &state.config_dir,
         &name,
         &state.auth.username,
     )
@@ -1171,10 +1158,6 @@ async fn api_create_user(
     {
         Ok(result) => {
             // Trigger a config rescan so config-to-peer mappings are updated after creation.
-            // rescan_configs() scans client *.conf files under config_dir, so config_dir
-            // must point to the directory where the install script writes client configs
-            // (non-interactive mode writes to ${AMNEZIAWG_DIR}/clients by default).
-            // The client config path is also returned in the API response for direct access.
             if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
                 tracing::warn!(error = %e, "post-create config rescan failed");
             }
@@ -1187,11 +1170,32 @@ async fn api_create_user(
             )
                 .into_response())
         }
-        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
+        Err(crate::admin::client_manager::CreateClientError::InvalidName(msg)) => {
             Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
         }
+        Err(crate::admin::client_manager::CreateClientError::DuplicateName(name)) => {
+            Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": format!("a client named '{name}' already exists") })),
+            )
+                .into_response())
+        }
+        Err(crate::admin::client_manager::CreateClientError::LockBusy) => {
+            Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "another add/remove operation is already in progress; please try again later" })),
+            )
+                .into_response())
+        }
+        Err(crate::admin::client_manager::CreateClientError::NoFreeIp) => {
+            Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "no free IP addresses available (max 253 clients)" })),
+            )
+                .into_response())
+        }
         Err(e) => {
-            tracing::error!(error = %e, "failed to create user via script");
+            tracing::error!(error = %e, "failed to create user");
             Ok((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": create_user_diagnostic_message(&e) })),
@@ -1249,6 +1253,7 @@ async fn api_remove_user(
     match crate::admin::execute_remove_user(
         &state.db,
         &state.script_bridge,
+        &state.config_dir,
         id,
         &client_name,
         &state.auth.username,
@@ -1263,6 +1268,13 @@ async fn api_remove_user(
         }
         Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
             Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
+        }
+        Err(crate::admin::script_bridge::ScriptError::LockBusy) => {
+            Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "another add/remove operation is already in progress; please try again later" })),
+            )
+                .into_response())
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to remove user via script");
@@ -1295,7 +1307,7 @@ async fn post_add_user_form(
     let name = form.name.trim().to_string();
     match crate::admin::execute_create_user(
         &state.db,
-        &state.script_bridge,
+        &state.config_dir,
         &name,
         &state.auth.username,
     )
@@ -1308,12 +1320,19 @@ async fn post_add_user_form(
             // Redirect back to the peer list.
             Ok(Redirect::to("/").into_response())
         }
-        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
+        Err(crate::admin::client_manager::CreateClientError::InvalidName(msg)) => {
             // Show the peer list page with an error message.
             let rows = crate::db::peers::list_all(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             Ok(Html(render_peer_list_with_error(&peers, &csrf, &msg)).into_response())
+        }
+        Err(crate::admin::client_manager::CreateClientError::LockBusy) => {
+            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+            let csrf = session_csrf_from_headers(&state, &headers);
+            let message = "Another add/remove operation is already in progress; please try again later.";
+            Ok(Html(render_peer_list_with_error(&peers, &csrf, message)).into_response())
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to create user via HTML form");
@@ -1370,6 +1389,7 @@ async fn post_remove_user_form(
     match crate::admin::execute_remove_user(
         &state.db,
         &state.script_bridge,
+        &state.config_dir,
         id,
         &client_name,
         &state.auth.username,
@@ -1382,7 +1402,31 @@ async fn post_remove_user_form(
             }
             Ok(Redirect::to("/").into_response())
         }
-        Err(_e) => Ok(Redirect::to(&format!("/peers/{id}")).into_response()),
+        Err(e) => {
+            let message: &str = match &e {
+                crate::admin::script_bridge::ScriptError::LockBusy => {
+                    "Remove failed: another add/remove operation is already in progress; please try again later."
+                }
+                _ => {
+                    tracing::error!(error = %e, "failed to remove user via HTML form");
+                    "Remove failed: internal server error."
+                }
+            };
+            // Re-fetch peer data to render the detail page with the error banner.
+            let peer_row = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
+                Some(p) => p,
+                None => {
+                    return Ok(Redirect::to("/").into_response());
+                }
+            };
+            let public_key = peer_row.public_key.clone();
+            let snapshots =
+                crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
+            let events = list_events(&state.db.pool, Some(id), None, 20).await?;
+            let dto = peer_row_to_detail(peer_row, snapshots);
+            let csrf = session_csrf_from_headers(&state, &headers);
+            Ok(Html(render_peer_detail_with_error(&dto, &csrf, &events, message)).into_response())
+        }
     }
 }
 
@@ -1837,8 +1881,32 @@ fn render_peer_detail(
     csrf_token: &str,
     events: &[crate::db::events::EventRow],
 ) -> String {
+    render_peer_detail_inner(dto, csrf_token, events, None)
+}
+
+fn render_peer_detail_with_error(
+    dto: &PeerDetailDto,
+    csrf_token: &str,
+    events: &[crate::db::events::EventRow],
+    error: &str,
+) -> String {
+    render_peer_detail_inner(dto, csrf_token, events, Some(error))
+}
+
+fn render_peer_detail_inner(
+    dto: &PeerDetailDto,
+    csrf_token: &str,
+    events: &[crate::db::events::EventRow],
+    error: Option<&str>,
+) -> String {
     let mut buf = html_head(&format!("Peer – {}", dto.name));
     buf.push_str(&nav_bar(csrf_token));
+    if let Some(err) = error {
+        buf.push_str(&format!(
+            "<p class=\"error\">{}</p>\n",
+            esc(err)
+        ));
+    }
     buf.push_str(&format!(
         "<a class=\"back\" href=\"/\">&larr; All peers</a>\n\
          <h1>{name}</h1>\n",
@@ -4018,8 +4086,8 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("error must be a string");
         assert!(
-            message.starts_with("Failed to create user ("),
-            "API should include diagnostic context in create-user failure message"
+            message.starts_with("Failed to create user"),
+            "API should include diagnostic context in create-user failure message, got: {message}"
         );
         assert_ne!(message, "internal server error");
     }
@@ -4044,18 +4112,10 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         assert!(
-            html.contains("Add user failed: Failed to create user ("),
-            "HTML should include a diagnostic add-user error message"
+            html.contains("Add user failed: Failed to create user"),
+            "HTML should include a diagnostic add-user error message, got: {html}"
         );
         assert!(!html.contains("Add user failed: internal server error"));
-        assert!(
-            html.contains("script exit code")
-                || html.contains("unable to start install script")
-                || html.contains("script terminated by signal")
-                || html.contains("script timed out")
-                || html.contains("failed while waiting for install script"),
-            "HTML should include concrete diagnostic reason"
-        );
     }
 
     #[tokio::test]

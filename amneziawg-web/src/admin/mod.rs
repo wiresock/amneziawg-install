@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+pub mod client_manager;
 pub mod script_bridge;
 
 use crate::db::events::{
@@ -15,6 +16,7 @@ use crate::db::events::{
 use crate::db::peers::{find_by_public_key, update_peer_disabled, PeerRow};
 use crate::db::Database;
 use crate::domain::PublicKey;
+use std::os::unix::fs::OpenOptionsExt;
 
 use self::script_bridge::{ScriptBridge, ScriptError};
 
@@ -81,21 +83,22 @@ pub struct CreateUserResult {
     pub client_name: String,
 }
 
-/// Create a new AmneziaWG user/client via the install script.
+/// Create a new AmneziaWG user/client directly, without the external script.
 ///
 /// 1. Validates the name.
 /// 2. Logs `user_create_requested`.
-/// 3. Invokes `--add-client` through the script bridge.
+/// 3. Reads server params, generates keys, writes configs, and syncs the
+///    interface — all natively in Rust using individual AWG commands.
 /// 4. Logs `user_created` or `user_create_failed`.
 ///
 /// The caller is responsible for triggering a config rescan after success.
 pub async fn execute_create_user(
     db: &Database,
-    bridge: &ScriptBridge,
+    config_dir: &std::path::Path,
     name: &str,
     actor: &str,
-) -> Result<CreateUserResult, ScriptError> {
-    // Pre-validate name (the script validates too, but fail fast for the UI).
+) -> Result<CreateUserResult, client_manager::CreateClientError> {
+    // Pre-validate name (fail fast for the UI).
     script_bridge::validate_client_name(name)?;
 
     let detail = serde_json::json!({ "name": name }).to_string();
@@ -109,23 +112,75 @@ pub async fn execute_create_user(
     )
     .await;
 
-    match bridge.add_client(name).await {
-        Ok(config_path) => {
+    // Fetch disabled keys so the sync step doesn't reactivate disabled peers.
+    // Fail closed: if the DB lookup fails, abort the operation so disabled
+    // peers are never accidentally reactivated.
+    let disabled_keys = match crate::db::peers::list_disabled_public_keys(&db.pool).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to load disabled peers from database");
             let detail = serde_json::json!({
                 "name": name,
-                "config_path": &config_path,
+                "error": "db_read_failed",
+            })
+            .to_string();
+            log_event(
+                &db.pool,
+                EVT_USER_CREATE_FAILED,
+                None,
+                None,
+                Some(&detail),
+                actor,
+            )
+            .await;
+            return Err(client_manager::CreateClientError::DbRead(
+                "failed to load disabled peers from database".to_string(),
+            ));
+        }
+    };
+
+    let dir = config_dir.to_path_buf();
+    let client_name = name.to_string();
+
+    // Run the blocking client-creation logic on a dedicated thread.
+    let result = tokio::task::spawn_blocking(move || {
+        client_manager::create_client(&dir, &client_name, &disabled_keys)
+    })
+    .await;
+
+    // Handle JoinError from spawn_blocking (panic or cancellation).
+    let result = match result {
+        Ok(inner) => inner,
+        Err(e) => {
+            tracing::error!(error = %e, "client creation task panicked or was cancelled");
+            Err(client_manager::CreateClientError::Internal(
+                "internal error while running client creation task".to_string(),
+            ))
+        }
+    };
+
+    match result {
+        Ok(r) => {
+            let detail = serde_json::json!({
+                "name": name,
+                "config_path": &r.config_path,
             })
             .to_string();
             log_event(&db.pool, EVT_USER_CREATED, None, None, Some(&detail), actor).await;
             Ok(CreateUserResult {
-                config_path,
-                client_name: name.to_string(),
+                config_path: r.config_path,
+                client_name: r.client_name,
             })
         }
         Err(e) => {
+            // Log full error details server-side only; the audit event
+            // visible via /api/events uses a fixed/sanitized message to
+            // avoid leaking raw stderr, OS errors, or filesystem paths.
+            tracing::error!(error = %e, name = name, "client creation failed");
+            let sanitized = client_manager::sanitized_create_error_category(&e);
             let detail = serde_json::json!({
                 "name": name,
-                "error": e.to_string(),
+                "error": sanitized,
             })
             .to_string();
             log_event(
@@ -153,6 +208,7 @@ pub async fn execute_create_user(
 pub async fn execute_remove_user(
     db: &Database,
     bridge: &ScriptBridge,
+    config_dir: &std::path::Path,
     peer_id: i64,
     client_name: &str,
     actor: &str,
@@ -173,6 +229,64 @@ pub async fn execute_remove_user(
         actor,
     )
     .await;
+
+    // Acquire the same exclusive lock used by create_client() to prevent
+    // concurrent add/remove operations from corrupting the server config
+    // (the remove path uses `sed -i` + rename which can race with `tee -a`).
+    // Non-blocking (LOCK_NB) to avoid hanging web requests; returns an error
+    // if another operation is in progress, matching create_client() behavior.
+    let lock_path = config_dir.join(".create-client.lock");
+    let lock_result: Result<std::fs::File, ScriptError> = (|| {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|err| ScriptError::LockFailed(
+                format!("failed to open lock file for client removal at {lock_path:?}: {err}"),
+            ))?;
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return match err.raw_os_error() {
+                // Another process holds the lock: surface as a dedicated variant.
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+                    Err(ScriptError::LockBusy)
+                }
+                // Any other I/O error: include the underlying OS error for diagnostics.
+                _ => Err(ScriptError::LockFailed(
+                    format!("failed to acquire lock for client removal: {err}"),
+                )),
+            };
+        }
+        Ok(f)
+    })();
+    let _lock_file = match lock_result {
+        Ok(f) => f,
+        Err(e) => {
+            let error_kind = match &e {
+                ScriptError::LockBusy => "lock_busy",
+                _ => "lock_failed",
+            };
+            let detail = serde_json::json!({
+                "peer_id": peer_id,
+                "name": client_name,
+                "error": error_kind,
+            })
+            .to_string();
+            log_event(
+                &db.pool,
+                EVT_USER_REMOVE_FAILED,
+                Some(peer_id),
+                None,
+                Some(&detail),
+                actor,
+            )
+            .await;
+            return Err(e);
+        }
+    };
 
     match bridge.remove_client(client_name).await {
         Ok(()) => {
