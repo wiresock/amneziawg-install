@@ -17,9 +17,9 @@ sudo ./amneziawg-install.sh
 **Add the web panel (optional):**
 
 ```bash
-curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web-install.sh
-chmod +x amneziawg-web-install.sh
-sudo ./amneziawg-web-install.sh
+curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web.sh
+chmod +x amneziawg-web.sh
+sudo ./amneziawg-web.sh install
 # open http://YOUR_SERVER_IP:8080
 ```
 
@@ -28,7 +28,7 @@ sudo ./amneziawg-web-install.sh
 ## 🧠 How It Works
 
 - **`amneziawg-install.sh`** — **required.** Installs the VPN server, generates obfuscation parameters, and creates client configs.
-- **`amneziawg-web-install.sh`** — **optional.** Adds a browser-accessible management panel on top of the VPN. Automatically downloads everything it needs.
+- **`amneziawg-web.sh`** — **optional.** One script to install, upgrade, uninstall, and check the status of the browser-accessible management panel.
 
 ---
 
@@ -37,7 +37,7 @@ sudo ./amneziawg-web-install.sh
 | Goal | What to run |
 |------|-------------|
 | VPN server only | `amneziawg-install.sh` |
-| VPN + web panel | `amneziawg-install.sh` then `amneziawg-web-install.sh` |
+| VPN + web panel | `amneziawg-install.sh` then `amneziawg-web.sh install` |
 | Dev / full control | Clone the repo, then run both scripts from the checkout |
 
 ---
@@ -58,9 +58,9 @@ sudo ./amneziawg-web-install.sh
 Download and run the web panel installer:
 
 ```bash
-curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web-install.sh
-chmod +x amneziawg-web-install.sh
-sudo ./amneziawg-web-install.sh
+curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web.sh
+chmod +x amneziawg-web.sh
+sudo ./amneziawg-web.sh install
 ```
 
 The installer automatically downloads required files and builds the panel.  
@@ -72,7 +72,7 @@ Add `--install-rust` if Rust is not already installed on the server.
 git clone https://github.com/wiresock/amneziawg-install.git
 cd amneziawg-install
 sudo ./amneziawg-install.sh
-sudo ./amneziawg-web-install.sh
+sudo ./amneziawg-web.sh install
 ```
 
 See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for all installer options.
@@ -89,33 +89,33 @@ See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for all insta
 
 ## 🔄 Maintenance
 
-**Step 1 — Get the scripts** (skip if you already cloned the repo):
+All web panel lifecycle actions use the same script:
+
+**Check status:**
 
 ```bash
-curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web-upgrade.sh
-curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web-uninstall.sh
-chmod +x amneziawg-web-upgrade.sh amneziawg-web-uninstall.sh
+./amneziawg-web.sh status
 ```
 
 **Upgrade the web panel:**
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh
+sudo ./amneziawg-web.sh upgrade
 ```
 
 **Uninstall the web panel (keeps config and data):**
 
 ```bash
-sudo ./amneziawg-web-uninstall.sh --force
+sudo ./amneziawg-web.sh uninstall --force
 ```
 
 **Uninstall and purge all data:**
 
 ```bash
-sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force
+sudo ./amneziawg-web.sh uninstall --purge-config --purge-data --force
 ```
 
-> Both scripts work standalone — they automatically download required files when run.
+> The script works standalone — it automatically downloads required files when run.
 
 ---
 
