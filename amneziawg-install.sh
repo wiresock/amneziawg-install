@@ -2932,7 +2932,7 @@ function nonInteractiveAddClient() {
 	# that may not be traversable by the web service (e.g. /root).
 	local HOME_DIR="${AMNEZIAWG_DIR}/clients"
 	mkdir -p "${HOME_DIR}"
-	chmod 755 "${HOME_DIR}"
+	chmod 700 "${HOME_DIR}"
 
 	local CLIENT_DNS="${CLIENT_DNS_1}"
 	if [[ -n "${CLIENT_DNS_2}" ]]; then

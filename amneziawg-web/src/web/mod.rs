@@ -1194,6 +1194,26 @@ async fn api_create_user(
             )
                 .into_response())
         }
+        Err(crate::admin::client_manager::CreateClientError::Awg(ref awg_err)) => {
+            // The client config and server config have been written, but the
+            // live interface sync failed.  Return 201 with a flag so the
+            // caller knows the peer will become active after an explicit
+            // AWG sync or service restart.
+            tracing::warn!(error = %awg_err, "client created but interface sync failed");
+            // Still trigger a rescan so config-to-peer mappings pick up the new file.
+            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
+                tracing::warn!(error = %e, "post-create config rescan failed");
+            }
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({
+                    "name": name,
+                    "sync_required": true,
+                    "warning": "client created but interface sync failed; the peer will become active after an AWG sync or service restart",
+                })),
+            )
+                .into_response())
+        }
         Err(e) => {
             tracing::error!(error = %e, "failed to create user");
             Ok((
