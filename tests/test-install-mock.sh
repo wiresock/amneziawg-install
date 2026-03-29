@@ -1253,12 +1253,14 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify ProtectHome was relaxed for /root config dir
-if grep -q "^ProtectHome=read-only" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
-	echo "OK: ProtectHome=read-only when config dir is /root"
+# Verify ProtectHome was relaxed for /root config dir and that this run changed it
+if grep -q "^ProtectHome=read-only" /etc/systemd/system/amneziawg-web.service 2>/dev/null && \
+	echo "${WEB_AUTODETECT_OUTPUT}" | grep -q "ProtectHome"; then
+	echo "OK: ProtectHome=read-only when config dir is /root and change logged by installer"
 else
-	echo "FAIL: ProtectHome should be read-only when config dir is /root"
-	echo "  Got: $(grep 'ProtectHome=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	echo "FAIL: ProtectHome should be read-only when config dir is /root and change should be logged"
+	echo "  Unit file ProtectHome line: $(grep 'ProtectHome=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	echo "  Installer output (grep ProtectHome): $(echo "${WEB_AUTODETECT_OUTPUT}" | grep -i 'ProtectHome' || echo 'no ProtectHome log found')"
 	FAILED=$((FAILED + 1))
 fi
 

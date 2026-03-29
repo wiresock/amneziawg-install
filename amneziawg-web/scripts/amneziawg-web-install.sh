@@ -702,18 +702,13 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                         ;;
                 esac
 
-                # For home directories, grant traverse-only (x) so the service can
-                # reach config files by known path without being able to list the
-                # directory contents.  For dedicated config directories, grant rx.
-                if [[ ${is_home_dir} -eq 0 ]]; then
-                    setfacl -m "u:${SERVICE_USER}:rx" "${target_dir}" 2>/dev/null \
-                        && info "Granted read+traverse ACL for ${SERVICE_USER} on ${target_dir}." \
-                        || warn "setfacl failed on ${target_dir}."
-                else
-                    setfacl -m "u:${SERVICE_USER}:x" "${target_dir}" 2>/dev/null \
-                        && info "Granted traverse-only ACL for ${SERVICE_USER} on ${target_dir}." \
-                        || warn "setfacl failed on ${target_dir}."
-                fi
+                # Grant rx on the config directory so the service can list its
+                # contents (std::fs::read_dir) and traverse into it.  This applies
+                # to both home directories and dedicated config directories — the
+                # web panel needs directory read permission to discover configs.
+                setfacl -m "u:${SERVICE_USER}:rx" "${target_dir}" 2>/dev/null \
+                    && info "Granted read+traverse ACL for ${SERVICE_USER} on ${target_dir}." \
+                    || warn "setfacl failed on ${target_dir}."
 
                 # Default ACL: new files inherit read for the service user, and
                 # new directories inherit read+execute (traverse).  Using rX grants
@@ -991,14 +986,20 @@ adjust_unit_hardening() {
         fi
     fi
 
-    # 2. If the config directory lives under /home or /root, relax ProtectHome
-    #    so the service can traverse into it.  ProtectHome=read-only still
-    #    prevents writes while allowing reads.
+    # 2. Make ProtectHome deterministic based on the current config_dir:
+    #    - For /home or /root paths: relax to read-only so the service can read configs.
+    #    - For all other paths: ensure ProtectHome=yes for maximum sandboxing.
     case "${config_dir}" in
         /root|/root/*|/home|/home/*)
             if grep -q '^ProtectHome=yes' "${unit_file}" 2>/dev/null; then
                 sed -i 's|^ProtectHome=yes|ProtectHome=read-only|' "${unit_file}"
                 info "Changed ProtectHome to read-only (config dir is under /home or /root)."
+            fi
+            ;;
+        *)
+            if grep -q '^ProtectHome=read-only' "${unit_file}" 2>/dev/null; then
+                sed -i 's|^ProtectHome=read-only|ProtectHome=yes|' "${unit_file}"
+                info "Restored ProtectHome to yes (config dir is not under /home or /root)."
             fi
             ;;
     esac
