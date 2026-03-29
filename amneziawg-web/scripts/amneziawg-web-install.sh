@@ -606,19 +606,21 @@ setup_filesystem() {
     # Give the service user read+write access to the AWG config directory.
     # The web service creates client config files directly in this directory,
     # so it needs write permission (not just read).
-    if [[ -d "${AWG_CONFIG_DIR}" ]]; then
-        chown "${SERVICE_USER}:${SERVICE_USER}" "${AWG_CONFIG_DIR}" 2>/dev/null \
-            && info "Set ownership of ${AWG_CONFIG_DIR} to ${SERVICE_USER}." \
-            || warn "Could not change ownership of ${AWG_CONFIG_DIR}. The service may not be able to create client configs."
-        chmod 0700 "${AWG_CONFIG_DIR}" 2>/dev/null \
-            && info "Set permissions of ${AWG_CONFIG_DIR} to 0700." \
-            || warn "Could not change permissions of ${AWG_CONFIG_DIR}. The service may not be able to create or manage client configs."
-    else
-        # Create the directory owned by the service user so it can write configs.
-        mkdir -p "${AWG_CONFIG_DIR}"
-        chown "${SERVICE_USER}:${SERVICE_USER}" "${AWG_CONFIG_DIR}"
-        chmod 0700 "${AWG_CONFIG_DIR}"
-        info "Created config directory: ${AWG_CONFIG_DIR}"
+    if validate_awg_config_dir "${AWG_CONFIG_DIR}"; then
+        if [[ -d "${AWG_CONFIG_DIR}" ]]; then
+            chown "${SERVICE_USER}:${SERVICE_USER}" "${AWG_CONFIG_DIR}" 2>/dev/null \
+                && info "Set ownership of ${AWG_CONFIG_DIR} to ${SERVICE_USER}." \
+                || warn "Could not change ownership of ${AWG_CONFIG_DIR}. The service may not be able to create client configs."
+            chmod 0700 "${AWG_CONFIG_DIR}" 2>/dev/null \
+                && info "Set permissions of ${AWG_CONFIG_DIR} to 0700." \
+                || warn "Could not change permissions of ${AWG_CONFIG_DIR}. The service may not be able to create or manage client configs."
+        else
+            # Create the directory owned by the service user so it can write configs.
+            mkdir -p "${AWG_CONFIG_DIR}"
+            chown "${SERVICE_USER}:${SERVICE_USER}" "${AWG_CONFIG_DIR}"
+            chmod 0700 "${AWG_CONFIG_DIR}"
+            info "Created config directory: ${AWG_CONFIG_DIR}"
+        fi
     fi
 
     # For existing client configs, ensure the service user can read them.
@@ -731,6 +733,31 @@ is_script_safe_for_sudoers() {
     if (( (mode_octal & 8#022) != 0 )); then
         return 1
     fi
+
+    return 0
+}
+
+validate_awg_config_dir() {
+    local dir_path="$1"
+
+    # Reject empty or non-absolute paths.
+    if [[ -z "${dir_path}" ]]; then
+        warn "AWG_CONFIG_DIR is empty; skipping automatic ownership/permission changes."
+        return 1
+    fi
+    if [[ "${dir_path}" != /* ]]; then
+        warn "AWG_CONFIG_DIR '${dir_path}' is not an absolute path; skipping automatic ownership/permission changes."
+        return 1
+    fi
+
+    # Reject sensitive system directories that should never have their
+    # ownership changed to the service user.
+    case "${dir_path}" in
+        "/"|"/etc"|"/etc/amnezia"|"/etc/amnezia/amneziawg"|"/var"|"/home"|"/tmp"|"/usr"|"/usr/local")
+            warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
+            return 1
+            ;;
+    esac
 
     return 0
 }

@@ -67,6 +67,31 @@ info()  { printf '[INFO]  %s\n' "$*"; }
 warn()  { yellow "[WARN]  $*" >&2; }
 die()   { red    "[ERROR] $*" >&2; exit 1; }
 
+validate_awg_config_dir() {
+    local dir_path="$1"
+
+    # Reject empty or non-absolute paths.
+    if [[ -z "${dir_path}" ]]; then
+        warn "AWG_CONFIG_DIR is empty; skipping automatic ownership/permission changes."
+        return 1
+    fi
+    if [[ "${dir_path}" != /* ]]; then
+        warn "AWG_CONFIG_DIR '${dir_path}' is not an absolute path; skipping automatic ownership/permission changes."
+        return 1
+    fi
+
+    # Reject sensitive system directories that should never have their
+    # ownership changed to the service user.
+    case "${dir_path}" in
+        "/"|"/etc"|"/etc/amnezia"|"/etc/amnezia/amneziawg"|"/var"|"/home"|"/tmp"|"/usr"|"/usr/local")
+            warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
 # Adjust ReadWritePaths and ProtectHome in the installed service unit to match
 # the configured AWG_CONFIG_DIR (mirrors the same function in the installer).
 adjust_unit_hardening() {
@@ -570,19 +595,21 @@ Please report this issue."
     # Fall back to the default clients directory used by the installer.
     awg_config_dir_upgrade="${awg_config_dir_upgrade:-/etc/amnezia/amneziawg/clients}"
 
-    if [[ -d "${awg_config_dir_upgrade}" ]]; then
-        chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}" 2>/dev/null \
-            && info "Set ownership of ${awg_config_dir_upgrade} to ${SERVICE_USER}." \
-            || warn "Could not change ownership of ${awg_config_dir_upgrade}. Direct client creation may fail."
-        chmod 0700 "${awg_config_dir_upgrade}" 2>/dev/null \
-            && info "Set permissions of ${awg_config_dir_upgrade} to 0700." \
-            || warn "Could not change permissions of ${awg_config_dir_upgrade}. Direct client creation may fail."
-    else
-        mkdir -p "${awg_config_dir_upgrade}" 2>/dev/null \
-            && chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}" \
-            && chmod 0700 "${awg_config_dir_upgrade}" \
-            && info "Created config directory: ${awg_config_dir_upgrade}" \
-            || warn "Could not create ${awg_config_dir_upgrade}. Direct client creation may fail until the directory is created with correct ownership."
+    if validate_awg_config_dir "${awg_config_dir_upgrade}"; then
+        if [[ -d "${awg_config_dir_upgrade}" ]]; then
+            chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}" 2>/dev/null \
+                && info "Set ownership of ${awg_config_dir_upgrade} to ${SERVICE_USER}." \
+                || warn "Could not change ownership of ${awg_config_dir_upgrade}. Direct client creation may fail."
+            chmod 0700 "${awg_config_dir_upgrade}" 2>/dev/null \
+                && info "Set permissions of ${awg_config_dir_upgrade} to 0700." \
+                || warn "Could not change permissions of ${awg_config_dir_upgrade}. Direct client creation may fail."
+        else
+            mkdir -p "${awg_config_dir_upgrade}" 2>/dev/null \
+                && chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}" \
+                && chmod 0700 "${awg_config_dir_upgrade}" \
+                && info "Created config directory: ${awg_config_dir_upgrade}" \
+                || warn "Could not create ${awg_config_dir_upgrade}. Direct client creation may fail until the directory is created with correct ownership."
+        fi
     fi
 
     # 4. Optional: refresh systemd unit file
