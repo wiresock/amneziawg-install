@@ -662,17 +662,19 @@ setup_filesystem() {
 You may need to grant read access to ${AWG_CONFIG_DIR} manually."
         fi
 
+        # Resolve AWG_CONFIG_DIR to an absolute, symlink-free path once, and use
+        # the resolved value consistently for ACL setup AND parent traversal.
+        local target_dir
+        if ! target_dir="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
+            target_dir="${AWG_CONFIG_DIR}"
+        fi
+        # Strip trailing slashes so /home/user/ is correctly recognized as a home dir.
+        target_dir="${target_dir%/}"
+
         # Grant the service user read access to existing *.conf files and set
         # a default ACL so that future files created by amneziawg-install.sh
         # are also readable — even when those files are created with mode 600.
         if command -v setfacl >/dev/null 2>&1; then
-            # Resolve AWG_CONFIG_DIR to an absolute, symlink-free path before applying ACLs.
-            local target_dir
-            if ! target_dir="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
-                target_dir="${AWG_CONFIG_DIR}"
-            fi
-            # Strip trailing slashes so /home/user/ is correctly recognized as a home dir.
-            target_dir="${target_dir%/}"
 
             # Refuse to modify ACLs on clearly unsafe, broad system directories.
             local unsafe_dir=0
@@ -760,7 +762,8 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
         # For directories under /home or /root, the parent directory is typically
         # mode 700/750.  Ensure the service user can traverse into it so that
         # the service can reach the config files.
-        case "${AWG_CONFIG_DIR}" in
+        # Use the resolved target_dir so symlinks are handled consistently.
+        case "${target_dir}" in
             /root/*)
                 # Config is under /root (e.g. /root/awg-configs).  /root is
                 # typically mode 0700, so the service user needs traverse (x)
@@ -769,8 +772,9 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                     local root_perms
                     root_perms="$(stat -c '%a' /root)"
                     local root_other_x=$(( 8#${root_perms} & 8#001 ))
-                    local root_group_x=$(( 8#${root_perms} & 8#010 ))
-                    if [[ ${root_other_x} -eq 0 ]] && [[ ${root_group_x} -eq 0 ]]; then
+                    # Only treat "other+x" as sufficient for traversal. The service user is
+                    # not in the root group, so "group+x" on /root does not help it.
+                    if [[ ${root_other_x} -eq 0 ]]; then
                         if command -v setfacl >/dev/null 2>&1; then
                             setfacl -m "u:${SERVICE_USER}:x" /root 2>/dev/null \
                                 && info "Granted traverse ACL for ${SERVICE_USER} on /root." \
@@ -787,7 +791,7 @@ Ensure user ${SERVICE_USER} can traverse /root (e.g., via ACL) or configs may be
                 # Extract the top-level home directory (/home/<user>).
                 # Linux home directories are always at depth 3.
                 local home_dir
-                home_dir="$(echo "${AWG_CONFIG_DIR}" | cut -d/ -f1-3)"
+                home_dir="$(echo "${target_dir}" | cut -d/ -f1-3)"
                 if [[ -d "${home_dir}" ]]; then
                     # Check whether the awg-web user can traverse into the
                     # home directory (needs at least the execute bit for

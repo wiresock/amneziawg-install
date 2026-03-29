@@ -1264,6 +1264,11 @@ fi
 
 rm -f "${AUTODETECT_CONF}"
 
+# Clean up any ACL entries on /root left by the auto-detection test
+if command -v setfacl >/dev/null 2>&1; then
+	setfacl -x "u:awg-web" /root 2>/dev/null || true
+fi
+
 # Restore the original config dir for subsequent tests
 bash "${WEB_INSTALLER_IMPL}" \
 	--non-interactive \
