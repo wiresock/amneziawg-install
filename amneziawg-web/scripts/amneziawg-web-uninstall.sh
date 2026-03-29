@@ -331,7 +331,7 @@ main() {
     printf '\n'
     if [[ "${PURGE_CONFIG}" != "true" ]]; then
         info "Config/env preserved: ${ENV_DIR}"
-        info "Re-install with:  sudo ./amneziawg-web-install.sh --force"
+        info "Re-install with:  sudo ./amneziawg-web.sh install --force"
     fi
     if [[ "${PURGE_DATA}" != "true" ]]; then
         info "Data preserved:   ${DATA_DIR}"

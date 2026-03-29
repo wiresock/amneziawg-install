@@ -71,10 +71,10 @@ See [docs/INSTALL.md](docs/INSTALL.md) for full instructions.
 
 ```bash
 # Rebuild from source and upgrade
-sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+sudo ./amneziawg-web.sh upgrade --source-dir ./amneziawg-web
 
 # Or with a pre-built binary
-sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+sudo ./amneziawg-web.sh upgrade --binary ./target/release/amneziawg-web
 ```
 
 See the "Upgrade reference" section in [docs/INSTALL.md](docs/INSTALL.md).

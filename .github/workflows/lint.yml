@@ -16,9 +16,6 @@ jobs:
         run: |
           bash -n amneziawg-install.sh
           bash -n amneziawg-web.sh
-          bash -n amneziawg-web-install.sh
-          bash -n amneziawg-web-uninstall.sh
-          bash -n amneziawg-web-upgrade.sh
           bash -n amneziawg-web/scripts/amneziawg-web-install.sh
           bash -n amneziawg-web/scripts/amneziawg-web-uninstall.sh
           bash -n amneziawg-web/scripts/amneziawg-web-upgrade.sh
@@ -35,9 +32,6 @@ jobs:
         run: |
           shellcheck --severity=warning amneziawg-install.sh
           shellcheck --severity=warning amneziawg-web.sh
-          shellcheck --severity=warning amneziawg-web-install.sh
-          shellcheck --severity=warning amneziawg-web-uninstall.sh
-          shellcheck --severity=warning amneziawg-web-upgrade.sh
           shellcheck --severity=warning amneziawg-web/scripts/amneziawg-web-install.sh
           shellcheck --severity=warning amneziawg-web/scripts/amneziawg-web-uninstall.sh
           shellcheck --severity=warning amneziawg-web/scripts/amneziawg-web-upgrade.sh
