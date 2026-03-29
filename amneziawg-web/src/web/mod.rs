@@ -1258,6 +1258,7 @@ async fn api_remove_user(
     match crate::admin::execute_remove_user(
         &state.db,
         &state.script_bridge,
+        &state.config_dir,
         id,
         &client_name,
         &state.auth.username,
@@ -1379,6 +1380,7 @@ async fn post_remove_user_form(
     match crate::admin::execute_remove_user(
         &state.db,
         &state.script_bridge,
+        &state.config_dir,
         id,
         &client_name,
         &state.auth.username,

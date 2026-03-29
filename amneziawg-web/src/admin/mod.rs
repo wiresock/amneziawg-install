@@ -16,6 +16,7 @@ use crate::db::events::{
 use crate::db::peers::{find_by_public_key, update_peer_disabled, PeerRow};
 use crate::db::Database;
 use crate::domain::PublicKey;
+use std::os::unix::fs::OpenOptionsExt;
 
 use self::script_bridge::{ScriptBridge, ScriptError};
 
@@ -207,6 +208,7 @@ pub async fn execute_create_user(
 pub async fn execute_remove_user(
     db: &Database,
     bridge: &ScriptBridge,
+    config_dir: &std::path::Path,
     peer_id: i64,
     client_name: &str,
     actor: &str,
@@ -227,6 +229,25 @@ pub async fn execute_remove_user(
         actor,
     )
     .await;
+
+    // Acquire the same exclusive lock used by create_client() to prevent
+    // concurrent add/remove operations from corrupting the server config
+    // (the remove path uses `sed -i` + rename which can race with `tee -a`).
+    let lock_path = config_dir.join(".create-client.lock");
+    let _lock_file = {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(ScriptError::Spawn)?;
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(ScriptError::Wait(std::io::Error::last_os_error()));
+        }
+        f
+    };
 
     match bridge.remove_client(client_name).await {
         Ok(()) => {

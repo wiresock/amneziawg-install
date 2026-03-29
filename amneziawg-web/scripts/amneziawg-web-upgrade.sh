@@ -78,6 +78,10 @@ adjust_unit_hardening() {
     # Normalize: strip trailing slashes for consistent comparison
     config_dir="${config_dir%/}"
 
+    # Escape config_dir for safe use in sed replacement / append text.
+    local config_dir_sed
+    config_dir_sed=$(printf '%s' "${config_dir}" | sed 's/[\\&|/]/\\&/g')
+
     # 1. Update ReadWritePaths for the AWG config directory.
     #    Also handle legacy ReadOnlyPaths left over from older installs.
     #    The server config root (/etc/amnezia/amneziawg) must always remain in
@@ -94,7 +98,7 @@ adjust_unit_hardening() {
         else
             # Replace the legacy line, then append an extra ReadWritePaths line.
             sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}|" "${unit_file}"
-            sed -i "/^ReadWritePaths=${etc_dir//\//\\/}\$/a ReadWritePaths=${config_dir}" "${unit_file}"
+            sed -i "/^ReadWritePaths=${etc_dir//\//\\/}\$/a ReadWritePaths=${config_dir_sed}" "${unit_file}"
         fi
         info "Replaced ReadOnlyPaths with ReadWritePaths (${etc_dir}, ${config_dir})"
     elif grep -q '^ReadWritePaths=' "${unit_file}" 2>/dev/null; then
@@ -134,11 +138,11 @@ adjust_unit_hardening() {
             local data_linenum2=""
             data_linenum2=$(grep -n "^ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1)
             if [[ -n "${data_linenum2}" ]]; then
-                sed -i "${data_linenum2}i\\ReadWritePaths=${config_dir}" "${unit_file}"
+                sed -i "${data_linenum2}i\\ReadWritePaths=${config_dir_sed}" "${unit_file}"
             else
                 local last_rw2
                 last_rw2=$(grep -n '^ReadWritePaths=' "${unit_file}" | tail -1 | cut -d: -f1)
-                sed -i "${last_rw2}a\\ReadWritePaths=${config_dir}" "${unit_file}"
+                sed -i "${last_rw2}a\\ReadWritePaths=${config_dir_sed}" "${unit_file}"
             fi
             info "Added ReadWritePaths=${config_dir}"
         fi

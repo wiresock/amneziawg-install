@@ -522,6 +522,14 @@ pub fn create_client(
         std::fs::create_dir_all(config_dir)
             .map_err(|e| CreateClientError::FileWrite(format!("mkdir {}: {e}", config_dir.display())))?;
     }
+    // Reject non-directory paths (e.g. regular file, symlink to file) before
+    // we attempt to set permissions or create the lock file inside it.
+    if !config_dir.is_dir() {
+        return Err(CreateClientError::FileWrite(format!(
+            "config path exists but is not a directory: {}",
+            config_dir.display()
+        )));
+    }
     // Always ensure correct permissions (fix pre-existing directories too).
     std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| CreateClientError::FileWrite(format!(
