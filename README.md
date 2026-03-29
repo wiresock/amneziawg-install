@@ -144,6 +144,10 @@ If migration fails, backups are automatically restored.
 - **Atomic File Writes**: Configuration updates use temporary files with atomic rename to prevent corruption on interruption
 - **Filesystem Boundary Protection**: Client config search uses `-xdev` to prevent crossing filesystem boundaries
 
+## Credits
+
+This project is a fork of [RomikB/amneziawg-install](https://github.com/RomikB/amneziawg-install), which is the original AmneziaWG install script this work is based on.
+
 ## License
 
 MIT License
