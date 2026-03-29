@@ -285,22 +285,26 @@ fn ipv4_base(server_ipv4: &str) -> &str {
     }
 }
 
-/// Find all host numbers (.2–.254) currently used in the server config.
+/// Find all host numbers (.2–.254) currently used in the server config
+/// based on IPv4 AllowedIPs entries.
 ///
 /// Scans AllowedIPs in `[Peer]` sections for IPv4 addresses matching the
-/// given base prefix (e.g., `10.66.66.X/32`) and IPv6 addresses matching
-/// the given prefix.  Returns a set of used host numbers.
-fn find_used_dots(
+/// given base prefix (e.g., `10.66.66.X/32`).  Returns a set of used host
+/// numbers.
+///
+/// IPv6 collision detection is handled separately via
+/// `find_existing_ipv6_normalized()` to avoid a mismatch between the hex
+/// representation of IPv6 host numbers and the decimal DOT_IP used by the
+/// allocator.
+fn find_used_ipv4_dots(
     server_config: &str,
     base_ipv4: &str,
-    ipv6_prefix_str: &str,
 ) -> HashSet<u16> {
     let mut used = HashSet::new();
     let prefix_with_dot = format!("{base_ipv4}.");
 
     for line in server_config.lines() {
         let trimmed = line.trim();
-        // Look for AllowedIPs lines in peer blocks
         if let Some(val) = parse_kv(trimmed, "AllowedIPs") {
             for cidr in val.split(',') {
                 let cidr = cidr.trim();
@@ -312,21 +316,6 @@ fn find_used_dots(
                         }
                     }
                 }
-                // Check IPv6: "<prefix>::X/128" (normalized form)
-                if cidr.ends_with("/128") {
-                    let ip = &cidr[..cidr.len() - 4];
-                    if let Ok(normalized) = normalize_ipv6(ip) {
-                        let norm_prefix = ipv6_prefix(&normalized);
-                        if norm_prefix == ipv6_prefix_str {
-                            // Extract the last segment as the host number
-                            if let Some(last_seg) = normalized.rsplit(':').next() {
-                                if let Ok(dot) = u16::from_str_radix(last_seg, 16) {
-                                    used.insert(dot);
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -334,9 +323,58 @@ fn find_used_dots(
     used
 }
 
+/// Collect all normalized `/128` IPv6 addresses present in the server config.
+///
+/// Used for candidate-based collision detection: for each DOT_IP candidate,
+/// the caller generates `normalize_ipv6("{base_ipv6}::{dot_ip}")` and checks
+/// membership in this set.  This mirrors the installer's
+/// `nonInteractiveAddClient()` logic and avoids the hex/decimal mismatch
+/// that would occur if we tried to extract DOT_IP directly from the IPv6
+/// numeric value.
+fn find_existing_ipv6_normalized(server_config: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+
+    for line in server_config.lines() {
+        let trimmed = line.trim();
+        if let Some(val) = parse_kv(trimmed, "AllowedIPs") {
+            for cidr in val.split(',') {
+                let cidr = cidr.trim();
+                if cidr.ends_with("/128") {
+                    let ip = &cidr[..cidr.len() - 4];
+                    if let Ok(normalized) = normalize_ipv6(ip) {
+                        set.insert(normalized);
+                    }
+                }
+            }
+        }
+    }
+
+    set
+}
+
 /// Find the first available host number in the .2–.254 range.
-fn find_available_dot(used: &HashSet<u16>) -> Option<u16> {
-    (2..=254).find(|dot| !used.contains(dot))
+///
+/// A DOT_IP is available when it is not in the `used_ipv4` set (from IPv4
+/// AllowedIPs) AND the candidate IPv6 address `{base_ipv6}::{dot}` does
+/// not appear in `existing_ipv6s` (the set of normalized /128 addresses
+/// already in the config).
+fn find_available_dot(
+    used_ipv4: &HashSet<u16>,
+    existing_ipv6s: &HashSet<String>,
+    base_ipv6: &str,
+) -> Option<u16> {
+    (2..=254).find(|&dot| {
+        if used_ipv4.contains(&dot) {
+            return false;
+        }
+        // Generate the candidate IPv6 and check for collisions.
+        if let Ok(candidate) = normalize_ipv6(&format!("{base_ipv6}::{dot}")) {
+            if existing_ipv6s.contains(&candidate) {
+                return false;
+            }
+        }
+        true
+    })
 }
 
 /// Simple INI key-value parser for a single line.
@@ -543,9 +581,11 @@ pub fn create_client(
     let server_ipv6_normalized = normalize_ipv6(&params.server_awg_ipv6)?;
     let base_ipv6 = ipv6_prefix(&server_ipv6_normalized);
 
-    let used_dots = find_used_dots(&server_config, base_ipv4, base_ipv6);
+    let used_ipv4 = find_used_ipv4_dots(&server_config, base_ipv4);
+    let existing_ipv6s = find_existing_ipv6_normalized(&server_config);
     let dot_ip =
-        find_available_dot(&used_dots).ok_or(CreateClientError::NoFreeIp)?;
+        find_available_dot(&used_ipv4, &existing_ipv6s, base_ipv6)
+            .ok_or(CreateClientError::NoFreeIp)?;
 
     let client_ipv4 = format!("{base_ipv4}.{dot_ip}");
     let client_ipv6_full = format!("{base_ipv6}::{dot_ip}");
@@ -918,7 +958,7 @@ SERVER_AWG_H4='11'
     }
 
     #[test]
-    fn find_used_dots_parses_server_config() {
+    fn find_used_ipv4_dots_parses_server_config() {
         let config = "\
 [Interface]
 PrivateKey = KEY=
@@ -935,10 +975,26 @@ PublicKey = BOB_KEY=
 PresharedKey = BOB_PSK=
 AllowedIPs = 10.66.66.3/32,fd42:0042:0042:0000:0000:0000:0000:0003/128
 ";
-        let used = find_used_dots(config, "10.66.66", "fd42:0042:0042:0000");
+        let used = find_used_ipv4_dots(config, "10.66.66");
         assert!(used.contains(&2));
         assert!(used.contains(&3));
         assert!(!used.contains(&4));
+    }
+
+    #[test]
+    fn find_existing_ipv6_normalized_collects_normalized() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
+
+[Peer]
+AllowedIPs = 10.66.66.3/32,fd42:0042:0042:0000:0000:0000:0000:0003/128
+";
+        let ipv6s = find_existing_ipv6_normalized(config);
+        // Both compressed and expanded forms should normalize to the same thing
+        assert!(ipv6s.contains("fd42:0042:0042:0000:0000:0000:0000:0002"));
+        assert!(ipv6s.contains("fd42:0042:0042:0000:0000:0000:0000:0003"));
+        assert_eq!(ipv6s.len(), 2);
     }
 
     #[test]
@@ -946,19 +1002,31 @@ AllowedIPs = 10.66.66.3/32,fd42:0042:0042:0000:0000:0000:0000:0003/128
         let mut used = HashSet::new();
         used.insert(2);
         used.insert(3);
-        assert_eq!(find_available_dot(&used), Some(4));
+        let empty_ipv6s = HashSet::new();
+        assert_eq!(find_available_dot(&used, &empty_ipv6s, "fd42:0042:0042:0000"), Some(4));
     }
 
     #[test]
     fn find_available_dot_returns_2_when_empty() {
         let used = HashSet::new();
-        assert_eq!(find_available_dot(&used), Some(2));
+        let empty_ipv6s = HashSet::new();
+        assert_eq!(find_available_dot(&used, &empty_ipv6s, "fd42:0042:0042:0000"), Some(2));
     }
 
     #[test]
     fn find_available_dot_none_when_full() {
         let used: HashSet<u16> = (2..=254).collect();
-        assert_eq!(find_available_dot(&used), None);
+        let empty_ipv6s = HashSet::new();
+        assert_eq!(find_available_dot(&used, &empty_ipv6s, "fd42:0042:0042:0000"), None);
+    }
+
+    #[test]
+    fn find_available_dot_ipv6_collision_blocks_candidate() {
+        // DOT_IP 2 is free in IPv4, but its IPv6 form is already used
+        let used_ipv4 = HashSet::new();
+        let mut existing_ipv6s = HashSet::new();
+        existing_ipv6s.insert("fd42:0042:0042:0000:0000:0000:0000:0002".to_string());
+        assert_eq!(find_available_dot(&used_ipv4, &existing_ipv6s, "fd42:0042:0042:0000"), Some(3));
     }
 
     // ── Config generation ───────────────────────────────────────────────

@@ -1055,7 +1055,9 @@ adjust_unit_hardening() {
                 || [[ "${config_dir}" == "${etc_dir}/"* ]]; then
             sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}|" "${unit_file}"
         else
-            sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}\nReadWritePaths=${config_dir}|" "${unit_file}"
+            # Replace the legacy line, then append an extra ReadWritePaths line.
+            sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}|" "${unit_file}"
+            sed -i "/^ReadWritePaths=${etc_dir//\//\\/}\$/a ReadWritePaths=${config_dir}" "${unit_file}"
         fi
         info "Replaced ReadOnlyPaths with ReadWritePaths (${etc_dir}, ${config_dir})"
     elif grep -q '^ReadWritePaths=' "${unit_file}" 2>/dev/null; then
