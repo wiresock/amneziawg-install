@@ -880,20 +880,17 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-WEB_UPGRADER_WRAPPER="${PROJECT_ROOT}/amneziawg-web-upgrade.sh"
-WEB_UNINSTALLER_WRAPPER="${PROJECT_ROOT}/amneziawg-web-uninstall.sh"
-
-if [[ -f "${WEB_UPGRADER_WRAPPER}" ]]; then
-	echo "OK: Legacy upgrade wrapper exists: ${WEB_UPGRADER_WRAPPER}"
+if [[ -f "${PROJECT_ROOT}/amneziawg-web-upgrade.sh" ]]; then
+	echo "OK: Legacy upgrade wrapper exists: ${PROJECT_ROOT}/amneziawg-web-upgrade.sh"
 else
-	echo "FAIL: Legacy upgrade wrapper missing: ${WEB_UPGRADER_WRAPPER}"
+	echo "FAIL: Legacy upgrade wrapper missing: ${PROJECT_ROOT}/amneziawg-web-upgrade.sh"
 	FAILED=$((FAILED + 1))
 fi
 
-if [[ -f "${WEB_UNINSTALLER_WRAPPER}" ]]; then
-	echo "OK: Legacy uninstall wrapper exists: ${WEB_UNINSTALLER_WRAPPER}"
+if [[ -f "${PROJECT_ROOT}/amneziawg-web-uninstall.sh" ]]; then
+	echo "OK: Legacy uninstall wrapper exists: ${PROJECT_ROOT}/amneziawg-web-uninstall.sh"
 else
-	echo "FAIL: Legacy uninstall wrapper missing: ${WEB_UNINSTALLER_WRAPPER}"
+	echo "FAIL: Legacy uninstall wrapper missing: ${PROJECT_ROOT}/amneziawg-web-uninstall.sh"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -2855,12 +2852,12 @@ echo "=== Phase 8: Peer visibility tests complete ==="
 # a) Repo-clone scenario: all three root-level wrappers (install, uninstall,
 #    upgrade) correctly delegate to the inner scripts when the repository is
 #    present locally.
-# b) Standalone bootstrap scenario: root wrappers work when the inner scripts
-#    are NOT present locally. A mock git simulates a successful bootstrap clone
-#    by copying from the local repository checkout, so no network access is
-#    required.
-# c) Standalone error path: root wrappers exit non-zero with a helpful message
-#    when the inner script is missing and git clone fails.
+# b) Standalone bootstrap scenario: install/uninstall root wrappers work when
+#    the inner scripts are NOT present locally. A mock git simulates a
+#    successful bootstrap clone by copying from the local repository checkout,
+#    so no network access is required.
+# c) Standalone error path: install/uninstall root wrappers exit non-zero with
+#    a helpful message when the inner script is missing and git clone fails.
 #
 echo ""
 echo "=== Phase 9: Root wrapper delegation and standalone bootstrap ==="

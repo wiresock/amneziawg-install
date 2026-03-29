@@ -14,10 +14,24 @@
 
 set -euo pipefail
 
-# Allow overriding repository URL and ref via environment variables for pinning.
-# Defaults preserve original behavior.
-readonly REPO_URL="${REPO_URL:-https://github.com/wiresock/amneziawg-install.git}"
-readonly REPO_REF="${REPO_REF:-main}"
+# To avoid privilege-escalation via environment injection, overrides are ignored when EUID=0.
+readonly DEFAULT_REPO_URL="https://github.com/wiresock/amneziawg-install.git"
+readonly DEFAULT_REPO_REF="main"
+
+_AWG_IS_ROOT=1
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    _AWG_IS_ROOT=0
+fi
+
+if [[ "${_AWG_IS_ROOT}" -eq 0 ]]; then
+    # Non-root: honor environment overrides for pinning.
+    readonly REPO_URL="${REPO_URL:-${DEFAULT_REPO_URL}}"
+    readonly REPO_REF="${REPO_REF:-${DEFAULT_REPO_REF}}"
+else
+    # Root: ignore environment overrides to avoid cloning arbitrary code as root.
+    readonly REPO_URL="${DEFAULT_REPO_URL}"
+    readonly REPO_REF="${DEFAULT_REPO_REF}"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="${SCRIPT_DIR}/amneziawg-web/scripts"
@@ -33,9 +47,36 @@ readonly BINARY_NAME="amneziawg-web"
 
 # ── Output helpers ───────────────────────────────────────────────────────────
 
-red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }
-green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
-yellow() { printf '\033[0;33m%s\033[0m\n' "$*"; }
+# Enable colors only if stdout is a TTY and NO_COLOR is not set.
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    _AWG_COLOR=1
+else
+    _AWG_COLOR=0
+fi
+
+red() {
+    if [[ "${_AWG_COLOR}" -eq 1 ]]; then
+        printf '\033[0;31m%s\033[0m\n' "$*"
+    else
+        printf '%s\n' "$*"
+    fi
+}
+
+green() {
+    if [[ "${_AWG_COLOR}" -eq 1 ]]; then
+        printf '\033[0;32m%s\033[0m\n' "$*"
+    else
+        printf '%s\n' "$*"
+    fi
+}
+
+yellow() {
+    if [[ "${_AWG_COLOR}" -eq 1 ]]; then
+        printf '\033[0;33m%s\033[0m\n' "$*"
+    else
+        printf '%s\n' "$*"
+    fi
+}
 
 # ── Clean-up ─────────────────────────────────────────────────────────────────
 
