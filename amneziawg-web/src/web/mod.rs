@@ -99,8 +99,10 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 
 /// Build a safe, user-facing diagnostic for create-user failures.
 ///
-/// This message is shown in both JSON API and HTML form responses. It keeps
-/// useful context (error kind) while avoiding raw OS/path details.
+/// This message is shown in both JSON API and HTML form responses. It uses
+/// fixed, non-sensitive messages for error variants that may contain raw
+/// stderr or filesystem paths, while keeping useful context for variants
+/// that are inherently safe (e.g. duplicate name, no free IP).
 fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateClientError) -> String {
     use crate::admin::client_manager::CreateClientError;
     match error {
@@ -114,20 +116,22 @@ fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateCl
         CreateClientError::NoInterface => {
             "Failed to create user: no AWG interface found.".to_string()
         }
-        CreateClientError::ParamsRead(msg) => {
-            format!("Failed to create user: could not read server configuration ({msg}).")
+        // The following variants may contain raw stderr/paths from sudo
+        // commands or OS errors; use fixed messages and log details server-side.
+        CreateClientError::ParamsRead(_) => {
+            "Failed to create user: could not read server configuration.".to_string()
         }
-        CreateClientError::KeyGen(msg) => {
-            format!("Failed to create user: key generation failed ({msg}).")
+        CreateClientError::KeyGen(_) => {
+            "Failed to create user: key generation failed.".to_string()
         }
-        CreateClientError::FileWrite(msg) => {
-            format!("Failed to create user: file operation failed ({msg}).")
+        CreateClientError::FileWrite(_) => {
+            "Failed to create user: file operation failed.".to_string()
         }
-        CreateClientError::ConfigParse(msg) => {
-            format!("Failed to create user: configuration error ({msg}).")
+        CreateClientError::ConfigParse(_) => {
+            "Failed to create user: server configuration error.".to_string()
         }
-        CreateClientError::Awg(e) => {
-            format!("Failed to create user: AWG command failed ({e}).")
+        CreateClientError::Awg(_) => {
+            "Failed to create user: AWG command failed.".to_string()
         }
     }
 }

@@ -877,8 +877,9 @@ install_sudoers() {
 
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
     local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
-    # Direct client creation: read params/config and append peer blocks.
-    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat /etc/amnezia/amneziawg/*, /usr/bin/tee -a /etc/amnezia/amneziawg/*.conf"
+    # Direct client creation: read params file and server config, append peer blocks.
+    # Scoped to specific file patterns to minimize privilege surface.
+    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf"
 
     info "Sudoers rule (AWG): ${rule_awg}"
     info "Sudoers rule (install): ${rule_install}"

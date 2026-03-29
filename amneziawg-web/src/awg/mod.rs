@@ -294,7 +294,7 @@ pub fn genpsk() -> Result<String, AwgError> {
 /// service user direct filesystem access to sensitive files.
 pub fn read_file_via_sudo(path: &std::path::Path) -> Result<String, AwgError> {
     let output = Command::new(SUDO_BIN)
-        .args(["-n", "/usr/bin/cat"])
+        .args(["-n", "/usr/bin/cat", "--"])
         .arg(path)
         .output()?;
 
@@ -315,7 +315,7 @@ pub fn read_file_via_sudo(path: &std::path::Path) -> Result<String, AwgError> {
 /// add peer blocks to the server config file.
 pub fn append_file_via_sudo(path: &std::path::Path, content: &str) -> Result<(), AwgError> {
     let mut child = Command::new(SUDO_BIN)
-        .args(["-n", "/usr/bin/tee", "-a"])
+        .args(["-n", "/usr/bin/tee", "-a", "--"])
         .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

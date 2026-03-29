@@ -108,7 +108,9 @@ pub struct ServerParams {
 /// Parse params file content (KEY='VALUE' format) into [`ServerParams`].
 ///
 /// The format is produced by `serializeParams()` in the install script,
-/// which uses `safeQuoteParam()` to single-quote each value.
+/// which uses `safeQuoteParam()` to single-quote each value.  Embedded
+/// single quotes are escaped as `'"'"'` (end-quote, double-quoted literal
+/// quote, start-quote).
 pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
     let mut map = std::collections::HashMap::new();
     for line in content.lines() {
@@ -119,15 +121,26 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
             let value = value.trim();
-            // Remove surrounding single or double quotes
-            let value = if (value.starts_with('\'') && value.ends_with('\''))
+            // Remove surrounding single or double quotes and decode
+            // safeQuoteParam() encoding for embedded single quotes.
+            let was_single_quoted = value.starts_with('\'') && value.ends_with('\'');
+            let unquoted = if was_single_quoted
                 || (value.starts_with('"') && value.ends_with('"'))
             {
                 &value[1..value.len() - 1]
             } else {
                 value
             };
-            map.insert(key.to_string(), value.to_string());
+            // Decode safeQuoteParam() encoding: embedded single quotes are
+            // serialized as '"'"' (end-quote, literal quote via double-quoting,
+            // start-quote).  After stripping the outer quotes above, the
+            // remaining pattern is '"'"' which we collapse back to a single '.
+            let final_value = if was_single_quoted {
+                unquoted.replace("'\"'\"'", "'")
+            } else {
+                unquoted.to_string()
+            };
+            map.insert(key.to_string(), final_value);
         }
     }
 
@@ -139,7 +152,7 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
 
     let get_opt = |key: &str| -> String { map.get(key).cloned().unwrap_or_default() };
 
-    Ok(ServerParams {
+    let params = ServerParams {
         server_pub_ip: get("SERVER_PUB_IP")?,
         server_awg_nic: get("SERVER_AWG_NIC")?,
         server_awg_ipv4: get("SERVER_AWG_IPV4")?,
@@ -160,7 +173,52 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
         h2: get("SERVER_AWG_H2")?,
         h3: get("SERVER_AWG_H3")?,
         h4: get("SERVER_AWG_H4")?,
-    })
+    };
+
+    // Validate server_awg_nic: must be a safe interface name (alphanumeric,
+    // underscore, dot, hyphen; no path separators or leading dashes; < 16 chars).
+    // This prevents path-traversal when constructing filesystem paths and
+    // option-injection when the name is passed as a command argument.
+    validate_interface_name(&params.server_awg_nic)?;
+
+    Ok(params)
+}
+
+/// Validate that a string is a safe AWG interface name.
+///
+/// Rules (matching the install script's validation):
+/// - Non-empty
+/// - Only `[a-zA-Z0-9_.-]`
+/// - Must not start with `-` (prevents option injection)
+/// - Less than 16 characters (Linux IFNAMSIZ)
+/// - Must not contain `..` (prevents path traversal)
+fn validate_interface_name(name: &str) -> Result<(), CreateClientError> {
+    if name.is_empty() {
+        return Err(CreateClientError::ConfigParse(
+            "SERVER_AWG_NIC must not be empty".into(),
+        ));
+    }
+    if name.len() >= 16 {
+        return Err(CreateClientError::ConfigParse(
+            "SERVER_AWG_NIC must be less than 16 characters".into(),
+        ));
+    }
+    if name.starts_with('-') {
+        return Err(CreateClientError::ConfigParse(
+            "SERVER_AWG_NIC must not start with '-'".into(),
+        ));
+    }
+    if name.contains("..") {
+        return Err(CreateClientError::ConfigParse(
+            "SERVER_AWG_NIC must not contain '..'".into(),
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-') {
+        return Err(CreateClientError::ConfigParse(
+            "SERVER_AWG_NIC contains invalid characters (only alphanumeric, _, ., - allowed)".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ── IPv6 helpers ────────────────────────────────────────────────────────────
@@ -365,11 +423,7 @@ fn build_peer_block(
     client_ipv6_normalized: &str,
 ) -> String {
     format!(
-        "\n### Client {name}\n\
-         [Peer]\n\
-         PublicKey = {client_pub_key}\n\
-         PresharedKey = {client_psk}\n\
-         AllowedIPs = {client_ipv4}/32,{client_ipv6_normalized}/128\n"
+        "\n### Client {name}\n[Peer]\nPublicKey = {client_pub_key}\nPresharedKey = {client_psk}\nAllowedIPs = {client_ipv4}/32,{client_ipv6_normalized}/128\n"
     )
 }
 
@@ -660,6 +714,103 @@ SERVER_AWG_H4=11
         assert_eq!(params.server_pub_ip, "1.2.3.4");
     }
 
+    #[test]
+    fn parse_params_safe_quote_param_embedded_single_quote() {
+        // safeQuoteParam("O'Reilly") produces: 'O'"'"'Reilly'
+        // After the outer single quotes are stripped, the remainder is:
+        // O'"'"'Reilly — which should decode back to O'Reilly.
+        let content = "\
+SERVER_PUB_IP='O'\"'\"'Reilly'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.0.0.1'
+SERVER_AWG_IPV6='fd00::1'
+SERVER_PORT='51820'
+SERVER_PUB_KEY='KEY='
+CLIENT_DNS_1='8.8.8.8'
+ALLOWED_IPS='0.0.0.0/0'
+SERVER_AWG_JC='1'
+SERVER_AWG_JMIN='2'
+SERVER_AWG_JMAX='3'
+SERVER_AWG_S1='4'
+SERVER_AWG_S2='5'
+SERVER_AWG_S3='6'
+SERVER_AWG_S4='7'
+SERVER_AWG_H1='8'
+SERVER_AWG_H2='9'
+SERVER_AWG_H3='10'
+SERVER_AWG_H4='11'
+";
+        let params = parse_params(content).unwrap();
+        assert_eq!(params.server_pub_ip, "O'Reilly");
+    }
+
+    // ── validate_interface_name ──────────────────────────────────────────
+
+    #[test]
+    fn validate_interface_name_valid() {
+        assert!(validate_interface_name("awg0").is_ok());
+        assert!(validate_interface_name("wg0").is_ok());
+        assert!(validate_interface_name("eth0.1").is_ok());
+        assert!(validate_interface_name("my_iface").is_ok());
+    }
+
+    #[test]
+    fn validate_interface_name_rejects_empty() {
+        assert!(validate_interface_name("").is_err());
+    }
+
+    #[test]
+    fn validate_interface_name_rejects_leading_dash() {
+        assert!(validate_interface_name("-awg0").is_err());
+    }
+
+    #[test]
+    fn validate_interface_name_rejects_path_traversal() {
+        assert!(validate_interface_name("../etc").is_err());
+        assert!(validate_interface_name("awg0/..").is_err());
+    }
+
+    #[test]
+    fn validate_interface_name_rejects_slashes() {
+        assert!(validate_interface_name("awg0/conf").is_err());
+    }
+
+    #[test]
+    fn validate_interface_name_rejects_too_long() {
+        assert!(validate_interface_name("1234567890123456").is_err());
+    }
+
+    #[test]
+    fn validate_interface_name_rejects_spaces() {
+        assert!(validate_interface_name("awg 0").is_err());
+    }
+
+    #[test]
+    fn parse_params_rejects_invalid_nic() {
+        let content = "\
+SERVER_PUB_IP='1.2.3.4'
+SERVER_AWG_NIC='../etc'
+SERVER_AWG_IPV4='10.0.0.1'
+SERVER_AWG_IPV6='fd00::1'
+SERVER_PORT='51820'
+SERVER_PUB_KEY='KEY='
+CLIENT_DNS_1='8.8.8.8'
+ALLOWED_IPS='0.0.0.0/0'
+SERVER_AWG_JC='1'
+SERVER_AWG_JMIN='2'
+SERVER_AWG_JMAX='3'
+SERVER_AWG_S1='4'
+SERVER_AWG_S2='5'
+SERVER_AWG_S3='6'
+SERVER_AWG_S4='7'
+SERVER_AWG_H1='8'
+SERVER_AWG_H2='9'
+SERVER_AWG_H3='10'
+SERVER_AWG_H4='11'
+";
+        assert!(parse_params(content).is_err());
+    }
+
     // ── IPv6 helpers ────────────────────────────────────────────────────
 
     #[test]
@@ -781,9 +932,10 @@ AllowedIPs = 10.66.66.3/32,fd42:0042:0042:0000:0000:0000:0000:0003/128
             "fd42:0042:0042:0000:0000:0000:0000:0002",
         );
         assert!(block.contains("### Client alice"));
-        assert!(block.contains("PublicKey = PUB_KEY="));
-        assert!(block.contains("PresharedKey = PSK_KEY="));
-        assert!(block.contains("AllowedIPs = 10.66.66.2/32,fd42:0042:0042:0000:0000:0000:0000:0002/128"));
+        assert!(block.contains("\n[Peer]\n"), "section header must start at line beginning");
+        assert!(block.contains("\nPublicKey = PUB_KEY=\n"), "keys must start at line beginning");
+        assert!(block.contains("\nPresharedKey = PSK_KEY=\n"));
+        assert!(block.contains("\nAllowedIPs = 10.66.66.2/32,fd42:0042:0042:0000:0000:0000:0000:0002/128\n"));
     }
 
     #[test]

@@ -112,9 +112,31 @@ pub async fn execute_create_user(
     .await;
 
     // Fetch disabled keys so the sync step doesn't reactivate disabled peers.
-    let disabled_keys = crate::db::peers::list_disabled_public_keys(&db.pool)
-        .await
-        .unwrap_or_default();
+    // Fail closed: if the DB lookup fails, abort the operation so disabled
+    // peers are never accidentally reactivated.
+    let disabled_keys = match crate::db::peers::list_disabled_public_keys(&db.pool).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to load disabled peers from database");
+            let detail = serde_json::json!({
+                "name": name,
+                "error": format!("failed to load disabled peers from database: {e}"),
+            })
+            .to_string();
+            log_event(
+                &db.pool,
+                EVT_USER_CREATE_FAILED,
+                None,
+                None,
+                Some(&detail),
+                actor,
+            )
+            .await;
+            return Err(client_manager::CreateClientError::ParamsRead(
+                "failed to load disabled peers from database".to_string(),
+            ));
+        }
+    };
 
     let dir = config_dir.to_path_buf();
     let client_name = name.to_string();
@@ -125,12 +147,15 @@ pub async fn execute_create_user(
     })
     .await;
 
-    // Handle JoinError from spawn_blocking.
+    // Handle JoinError from spawn_blocking (panic or cancellation).
     let result = match result {
         Ok(inner) => inner,
-        Err(e) => Err(client_manager::CreateClientError::FileWrite(format!(
-            "client creation task failed: {e}"
-        ))),
+        Err(e) => {
+            tracing::error!(error = %e, "client creation task panicked or was cancelled");
+            Err(client_manager::CreateClientError::FileWrite(
+                "internal error while running client creation task".to_string(),
+            ))
+        }
     };
 
     match result {
