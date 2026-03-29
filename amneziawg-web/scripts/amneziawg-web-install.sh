@@ -572,6 +572,31 @@ Generate with:
 
 # ── Filesystem setup ───────────────────────────────────────────────────────────
 
+validate_awg_config_dir() {
+    local dir_path="$1"
+
+    # Reject empty or non-absolute paths.
+    if [[ -z "${dir_path}" ]]; then
+        warn "AWG_CONFIG_DIR is empty; skipping automatic ownership/permission changes."
+        return 1
+    fi
+    if [[ "${dir_path}" != /* ]]; then
+        warn "AWG_CONFIG_DIR '${dir_path}' is not an absolute path; skipping automatic ownership/permission changes."
+        return 1
+    fi
+
+    # Reject sensitive system directories that should never have their
+    # ownership changed to the service user.
+    case "${dir_path}" in
+        "/"|"/etc"|"/etc/amnezia"|"/etc/amnezia/amneziawg"|"/var"|"/home"|"/tmp"|"/usr"|"/usr/local")
+            warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
 setup_filesystem() {
     step "Filesystem setup"
 
@@ -733,31 +758,6 @@ is_script_safe_for_sudoers() {
     if (( (mode_octal & 8#022) != 0 )); then
         return 1
     fi
-
-    return 0
-}
-
-validate_awg_config_dir() {
-    local dir_path="$1"
-
-    # Reject empty or non-absolute paths.
-    if [[ -z "${dir_path}" ]]; then
-        warn "AWG_CONFIG_DIR is empty; skipping automatic ownership/permission changes."
-        return 1
-    fi
-    if [[ "${dir_path}" != /* ]]; then
-        warn "AWG_CONFIG_DIR '${dir_path}' is not an absolute path; skipping automatic ownership/permission changes."
-        return 1
-    fi
-
-    # Reject sensitive system directories that should never have their
-    # ownership changed to the service user.
-    case "${dir_path}" in
-        "/"|"/etc"|"/etc/amnezia"|"/etc/amnezia/amneziawg"|"/var"|"/home"|"/tmp"|"/usr"|"/usr/local")
-            warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
-            return 1
-            ;;
-    esac
 
     return 0
 }
