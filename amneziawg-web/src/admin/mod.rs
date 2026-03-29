@@ -335,10 +335,25 @@ pub async fn execute_remove_user(
             Ok(())
         }
         Err(e) => {
+            tracing::warn!(
+                peer_id = %peer_id,
+                name = %client_name,
+                error = %e,
+                "failed to remove client via script"
+            );
+            let error_kind = match &e {
+                ScriptError::LockBusy => "lock_busy",
+                ScriptError::LockFailed(_) => "lock_failed",
+                ScriptError::Timeout(_) => "timeout",
+                ScriptError::Spawn(_) => "spawn_failed",
+                ScriptError::Wait(_) => "wait_failed",
+                ScriptError::NonZeroExit { .. } | ScriptError::Signal { .. } => "script_failed",
+                ScriptError::InvalidName(_) => "invalid_name",
+            };
             let detail = serde_json::json!({
                 "peer_id": peer_id,
                 "name": client_name,
-                "error": e.to_string(),
+                "error": error_kind,
             })
             .to_string();
             log_event(
