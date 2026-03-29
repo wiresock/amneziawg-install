@@ -16,6 +16,7 @@
 set -euo pipefail
 
 readonly REPO_URL="https://github.com/wiresock/amneziawg-install.git"
+readonly REPO_REF="main"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="${SCRIPT_DIR}/amneziawg-web/scripts/amneziawg-web-install.sh"
@@ -42,8 +43,8 @@ bootstrap_repo_if_needed() {
 
     BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/amneziawg-install.XXXXXX")"
 
-    echo "Installer files not found locally. Cloning ${REPO_URL} into ${BOOTSTRAP_DIR} ..." >&2
-    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 "${REPO_URL}" "${BOOTSTRAP_DIR}" >&2; then
+    echo "Installer files not found locally. Cloning ${REPO_URL} (${REPO_REF}) into ${BOOTSTRAP_DIR} ..." >&2
+    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" "${BOOTSTRAP_DIR}" >&2; then
         echo "ERROR: Failed to clone ${REPO_URL}" >&2
         echo "       Clone the repository manually and run ./amneziawg-web-install.sh from there." >&2
         exit 1
@@ -58,6 +59,6 @@ bootstrap_repo_if_needed() {
 
 bootstrap_repo_if_needed
 
-bash "${INSTALLER}" "$@"
-exit_code=$?
+exit_code=0
+bash "${INSTALLER}" "$@" || exit_code=$?
 exit "${exit_code}"
