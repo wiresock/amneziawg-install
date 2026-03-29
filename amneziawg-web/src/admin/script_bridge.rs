@@ -7,11 +7,18 @@
 //!
 //! # Supported operations
 //!
+//! The web admin bridge only exposes the following non-interactive operations,
+//! which are permitted by the production sudoers configuration:
+//!
 //! | Flag | Description |
 //! |------|-------------|
-//! | `--add-client <NAME>` | Create a new client; prints config path to stdout |
 //! | `--remove-client <NAME>` | Remove an existing client |
 //! | `--list-clients` | List all client names (one per line) |
+//!
+//! Client creation is implemented directly in Rust (`admin::client_manager`)
+//! using AWG commands and does not use the install script.  The `add_client`
+//! method exists in `ScriptBridge` for completeness but is **not** granted
+//! sudo permission in production and should not be relied upon.
 //!
 //! # Security notes
 //!

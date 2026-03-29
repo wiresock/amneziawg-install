@@ -202,6 +202,12 @@ pub async fn execute_create_user(
 /// The `client_name` should be the script-side client identifier (the same
 /// value used in `### Client <name>` markers in the server config).
 ///
+/// After the script removes the peer block from the server config and deletes
+/// the client config from its default location (`/etc/amnezia/amneziawg/clients`),
+/// this function also attempts to remove any matching config file from
+/// `config_dir` (the web panel's monitored directory) if it differs from
+/// the default, so stale configs don't linger after a rescan.
+///
 /// Historical peer data (snapshots, events) is preserved in the database;
 /// the peer row itself will become "unlinked" after the next config rescan
 /// and will eventually stop appearing in `awg show` output.
@@ -290,6 +296,28 @@ pub async fn execute_remove_user(
 
     match bridge.remove_client(client_name).await {
         Ok(()) => {
+            // Best-effort cleanup: remove any matching client config from
+            // config_dir in case it differs from the script's default
+            // location (/etc/amnezia/amneziawg/clients).  Without this,
+            // a stale config file would linger and keep the peer "linked"
+            // after the next rescan.
+            if let Ok(entries) = std::fs::read_dir(config_dir) {
+                let suffix = format!("-client-{client_name}.conf");
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.ends_with(&suffix) {
+                            if let Err(e) = std::fs::remove_file(entry.path()) {
+                                tracing::warn!(
+                                    path = %entry.path().display(),
+                                    error = %e,
+                                    "failed to remove client config from config_dir"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             let detail = serde_json::json!({
                 "peer_id": peer_id,
                 "name": client_name,

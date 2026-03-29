@@ -116,11 +116,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if ! command -v realpath >/dev/null 2>&1; then
-    die "realpath is required but not available on this system"
-fi
-ENV_FILE="$(realpath -m -- "${ENV_FILE}")"
-ENV_DIR="$(realpath -m -- "${ENV_DIR}")"
+normalize_path() {
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m -- "$1"
+    elif command -v readlink >/dev/null 2>&1; then
+        readlink -f -- "$1"
+    else
+        die "Neither realpath nor readlink is available; cannot normalize paths"
+    fi
+}
+
+ENV_FILE="$(normalize_path "${ENV_FILE}")"
+ENV_DIR="$(normalize_path "${ENV_DIR}")"
 
 if [[ "${ENV_FILE}" != /* ]]; then
     die "Env file path must be absolute after normalization: ${ENV_FILE}"

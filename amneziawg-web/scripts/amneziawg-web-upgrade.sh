@@ -118,7 +118,7 @@ validate_awg_config_dir() {
     # Reject sensitive system directories that should never have their
     # ownership changed to the service user.
     case "${dir_path}" in
-        "/"|"/etc"|"/etc/amnezia"|"/etc/amnezia/amneziawg"|"/var"|"/home"|"/tmp"|"/usr"|"/usr/local")
+        "/"|"/etc"|"/etc/amnezia"|"/etc/amnezia/amneziawg"|"/var"|"/var/lib"|"/home"|"/tmp"|"/usr"|"/usr/local"|"/opt"|"/bin"|"/sbin"|"/lib"|"/lib64"|"/run"|"/sys"|"/proc"|"/dev"|"/boot")
             warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
             return 1
             ;;
@@ -140,7 +140,7 @@ adjust_unit_hardening() {
 
     # Escape config_dir for safe use in sed replacement / append text.
     local config_dir_sed
-    config_dir_sed=$(printf '%s' "${config_dir}" | sed 's|[\\&/|]|\\&|g')
+    config_dir_sed=$(printf '%s' "${config_dir}" | sed 's/[\\&\/|]/\\&/g')
 
     # 1. Update ReadWritePaths for the AWG config directory.
     #    Also handle legacy ReadOnlyPaths left over from older installs.

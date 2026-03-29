@@ -142,7 +142,7 @@ If installing manually, create the sudoers rules:
 ```bash
 cat <<'EOF' | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
 awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *
-awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients
+awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients
 EOF
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
 ```

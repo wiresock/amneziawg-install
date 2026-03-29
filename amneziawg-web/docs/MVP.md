@@ -25,9 +25,9 @@
 |19 | Auth middleware on all protected routes   | HTML → redirect `/login`; API → 401 JSON; health always public           |
 |20 | Optional bearer token for API             | `Authorization: Bearer <token>` via `AUTH_API_TOKEN`                     |
 |21 | 232 unit + integration tests              | Auth, domain, DB, config, history, web handler, script bridge layers     |
-|22 | User create via install script            | `POST /api/admin/users`, HTML form at `/admin/users/add`; validates name; reuses `amneziawg-install.sh --add-client` |
+|22 | User create (direct)                     | `POST /api/admin/users`, HTML form at `/admin/users/add`; validates name; creates client directly via AWG commands (no install script) |
 |23 | User remove via install script            | `POST /api/admin/users/:id/remove`, HTML form at `/admin/users/:id/remove`; confirmation required; reuses `amneziawg-install.sh --remove-client` |
-|24 | Script bridge layer                       | `admin/script_bridge.rs`; explicit subprocess args; no shell interpolation; timeout handling |
+|24 | Script bridge layer                       | `admin/script_bridge.rs`; explicit subprocess args; no shell interpolation; timeout handling; used for `--remove-client` and `--list-clients` only |
 |25 | User lifecycle audit events               | `user_create_requested`, `user_created`, `user_create_failed`, `user_remove_requested`, `user_removed`, `user_remove_failed` |
 |26 | Post-action config rescan                 | `poller::rescan_configs()` called after create/remove; no manual restart needed |
 
