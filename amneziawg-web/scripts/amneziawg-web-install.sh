@@ -600,7 +600,8 @@ detect_awg_config_dir() {
         # for an [Interface] section before trusting the directory.
         local cfg_file=""
         cfg_file="$(compgen -G "${dir}/awg*-client-*.conf" | head -n 1 || true)"
-        if [[ -n "${cfg_file}" ]] && grep -qE '^\[Interface\]' "${cfg_file}" 2>/dev/null; then
+        if [[ -n "${cfg_file}" ]] && [[ -f "${cfg_file}" && -r "${cfg_file}" ]] && \
+            grep -qE '^\[Interface\]' "${cfg_file}" 2>/dev/null; then
             AWG_CONFIG_DIR="${dir}"
             info "Auto-detected AWG client config directory: ${AWG_CONFIG_DIR}"
             return 0
@@ -665,42 +666,75 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
         # a default ACL so that future files created by amneziawg-install.sh
         # are also readable — even when those files are created with mode 600.
         if command -v setfacl >/dev/null 2>&1; then
-            setfacl -m "u:${SERVICE_USER}:rx" "${AWG_CONFIG_DIR}" 2>/dev/null \
-                && info "Granted read ACL for ${SERVICE_USER} on ${AWG_CONFIG_DIR}." \
-                || warn "setfacl failed on ${AWG_CONFIG_DIR}."
-            # Default ACL: new files inherit read for the service user, and
-            # new directories inherit read+execute (traverse).  Using rX grants
-            # execute only on directories while keeping regular files non-executable.
-            # Avoid setting a default ACL on a home directory itself (e.g. /home/<user> or /root),
-            # since that would grant the service user access to all future files in the home.
-            local is_home_dir=0
-            case "${AWG_CONFIG_DIR}" in
-                /root)
-                    is_home_dir=1
-                    ;;
-                /home/*)
-                    # Strip the /home/ prefix; if there are no further slashes, this is /home/<user>
-                    local rel_path="${AWG_CONFIG_DIR#/home/}"
-                    if [[ "${rel_path}" != *"/"* ]]; then
-                        is_home_dir=1
-                    fi
+            # Resolve AWG_CONFIG_DIR to an absolute, symlink-free path before applying ACLs.
+            local target_dir
+            if target_dir="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
+                :
+            else
+                target_dir="${AWG_CONFIG_DIR}"
+            fi
+
+            # Refuse to modify ACLs on clearly unsafe, broad system directories.
+            local unsafe_dir=0
+            case "${target_dir}" in
+                /|/etc|/home|/var|/tmp|/usr|/usr/local)
+                    unsafe_dir=1
                     ;;
             esac
-            if [[ ${is_home_dir} -eq 0 ]]; then
-                setfacl -d -m "u:${SERVICE_USER}:rX" "${AWG_CONFIG_DIR}" 2>/dev/null \
-                    && info "Set default ACL for future configs in ${AWG_CONFIG_DIR}." \
-                    || warn "setfacl -d failed on ${AWG_CONFIG_DIR}."
+
+            if [[ ${unsafe_dir} -eq 1 ]]; then
+                warn "Refusing to modify ACLs on unsafe directory ${target_dir} (from AWG_CONFIG_DIR=${AWG_CONFIG_DIR})."
             else
-                info "Skipping default ACL on ${AWG_CONFIG_DIR} because it appears to be a home directory; future configs may need manual ACLs."
-            fi
-            # Apply read ACL to any existing .conf files
-            find "${AWG_CONFIG_DIR}" -maxdepth 1 -name '*.conf' -type f -print0 2>/dev/null \
-                | while IFS= read -r -d '' cf; do
-                    setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
-                done
-            # Log only if there were any .conf files
-            if compgen -G "${AWG_CONFIG_DIR}/*.conf" > /dev/null 2>&1; then
-                info "Applied read ACL to existing config files."
+                # Determine whether this is a home directory (/root or /home/<user>).
+                local is_home_dir=0
+                case "${target_dir}" in
+                    /root)
+                        is_home_dir=1
+                        ;;
+                    /home/*)
+                        # Strip the /home/ prefix; if there are no further slashes, this is /home/<user>
+                        local rel_path="${target_dir#/home/}"
+                        if [[ "${rel_path}" != *"/"* ]]; then
+                            is_home_dir=1
+                        fi
+                        ;;
+                esac
+
+                # For home directories, grant traverse-only (x) so the service can
+                # reach config files by known path without being able to list the
+                # directory contents.  For dedicated config directories, grant rx.
+                if [[ ${is_home_dir} -eq 0 ]]; then
+                    setfacl -m "u:${SERVICE_USER}:rx" "${target_dir}" 2>/dev/null \
+                        && info "Granted read+traverse ACL for ${SERVICE_USER} on ${target_dir}." \
+                        || warn "setfacl failed on ${target_dir}."
+                else
+                    setfacl -m "u:${SERVICE_USER}:x" "${target_dir}" 2>/dev/null \
+                        && info "Granted traverse-only ACL for ${SERVICE_USER} on ${target_dir}." \
+                        || warn "setfacl failed on ${target_dir}."
+                fi
+
+                # Default ACL: new files inherit read for the service user, and
+                # new directories inherit read+execute (traverse).  Using rX grants
+                # execute only on directories while keeping regular files non-executable.
+                # Avoid setting a default ACL on a home directory itself (e.g. /home/<user> or /root),
+                # since that would grant the service user access to all future files in the home.
+                if [[ ${is_home_dir} -eq 0 ]]; then
+                    setfacl -d -m "u:${SERVICE_USER}:rX" "${target_dir}" 2>/dev/null \
+                        && info "Set default ACL for future configs in ${target_dir}." \
+                        || warn "setfacl -d failed on ${target_dir}."
+                else
+                    info "Skipping default ACL on ${target_dir} because it appears to be a home directory; future configs may need manual ACLs."
+                fi
+
+                # Apply read ACL to any existing .conf files
+                find "${target_dir}" -maxdepth 1 -name '*.conf' -type f -print0 2>/dev/null \
+                    | while IFS= read -r -d '' cf; do
+                        setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
+                    done
+                # Log only if there were any .conf files
+                if compgen -G "${target_dir}/*.conf" > /dev/null 2>&1; then
+                    info "Applied read ACL to existing config files."
+                fi
             fi
         elif [[ "${AWG_CONFIG_DIR}" != "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
             warn "setfacl is not installed but AWG_CONFIG_DIR (${AWG_CONFIG_DIR}) is non-default."
