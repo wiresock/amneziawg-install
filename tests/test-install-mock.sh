@@ -1205,9 +1205,12 @@ echo "--- Web installer: auto-detect AWG_CONFIG_DIR ---"
 
 # When --config-dir is not passed, the installer should auto-detect the
 # directory containing awg*-client-*.conf files and write it to AWG_CONFIG_DIR
-# in the env file.
-AUTODETECT_DIR="/root"
-AUTODETECT_CONF="${AUTODETECT_DIR}/awg0-client-autotest.conf"
+# in the env file.  When configs are found in a home directory (/root),
+# auto-detection creates a dedicated subdirectory and symlinks configs there
+# so the web panel can safely use read_dir() with rx ACLs.
+AUTODETECT_HOME="/root"
+AUTODETECT_EXPECTED_DIR="${AUTODETECT_HOME}/amneziawg-clients"
+AUTODETECT_CONF="${AUTODETECT_HOME}/awg0-client-autotest.conf"
 
 # Create a fake AWG client config with an [Interface] section
 cat >"${AUTODETECT_CONF}" <<'CONFEOF'
@@ -1236,12 +1239,20 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify auto-detected AWG_CONFIG_DIR appears in the env file
-if grep -q "^AWG_CONFIG_DIR=${AUTODETECT_DIR}$" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
-	echo "OK: AWG_CONFIG_DIR auto-detected as ${AUTODETECT_DIR}"
+# Verify auto-detected AWG_CONFIG_DIR points to the dedicated subdirectory (not the home dir)
+if grep -q "^AWG_CONFIG_DIR=${AUTODETECT_EXPECTED_DIR}$" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
+	echo "OK: AWG_CONFIG_DIR auto-detected as ${AUTODETECT_EXPECTED_DIR} (dedicated subdir, not home)"
 else
-	echo "FAIL: AWG_CONFIG_DIR not auto-detected; expected ${AUTODETECT_DIR}"
+	echo "FAIL: AWG_CONFIG_DIR not auto-detected; expected ${AUTODETECT_EXPECTED_DIR}"
 	echo "  Got: $(grep 'AWG_CONFIG_DIR=' "${WEB_TEST_ENV_FILE}" 2>/dev/null || echo 'not found')"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify symlink was created in the dedicated subdirectory
+if [[ -L "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" ]]; then
+	echo "OK: Symlink created in ${AUTODETECT_EXPECTED_DIR}"
+else
+	echo "FAIL: Expected symlink ${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf not found"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1256,9 +1267,9 @@ fi
 # Verify ProtectHome was relaxed for /root config dir and that this run changed it
 if grep -q "^ProtectHome=read-only" /etc/systemd/system/amneziawg-web.service 2>/dev/null && \
 	echo "${WEB_AUTODETECT_OUTPUT}" | grep -q "ProtectHome"; then
-	echo "OK: ProtectHome=read-only when config dir is /root and change logged by installer"
+	echo "OK: ProtectHome=read-only when config dir is under /root and change logged by installer"
 else
-	echo "FAIL: ProtectHome should be read-only when config dir is /root and change should be logged"
+	echo "FAIL: ProtectHome should be read-only when config dir is under /root and change should be logged"
 	echo "  Unit file ProtectHome line: $(grep 'ProtectHome=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
 	echo "  Installer output (grep ProtectHome): $(echo "${WEB_AUTODETECT_OUTPUT}" | grep -i 'ProtectHome' || echo 'no ProtectHome log found')"
 	FAILED=$((FAILED + 1))
@@ -1266,9 +1277,10 @@ fi
 
 rm -f "${AUTODETECT_CONF}"
 
-# Clean up any ACL entries on /root left by the auto-detection test.
+# Clean up the dedicated subdirectory and any ACL entries on /root left by the test.
 # Use the same service user name as the installer (SERVICE_USER in the script).
 WEB_SERVICE_USER="awg-web"
+rm -rf "${AUTODETECT_EXPECTED_DIR}"
 if command -v setfacl >/dev/null 2>&1; then
 	setfacl -x "u:${WEB_SERVICE_USER}" /root 2>/dev/null || true
 fi

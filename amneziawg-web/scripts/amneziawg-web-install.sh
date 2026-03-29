@@ -607,7 +607,53 @@ detect_awg_config_dir() {
         cfg_file="$(compgen -G "${dir}/awg*-client-*.conf" | head -n 1 || true)"
         if [[ -n "${cfg_file}" ]] && [[ -f "${cfg_file}" && -r "${cfg_file}" ]] && \
             grep -qE '^[[:space:]]*\[Interface\]' "${cfg_file}" 2>/dev/null; then
-            AWG_CONFIG_DIR="${dir}"
+
+            # Determine whether this is a home directory (/root or /home/<user>).
+            # Do not point AWG_CONFIG_DIR at the home directory itself, because
+            # later filesystem hardening only grants execute (x) on home dirs,
+            # which is insufficient for std::fs::read_dir().  Instead, create a
+            # dedicated subdirectory under the home that can safely be granted rx
+            # and populated with symlinks to the relevant client config files.
+            local detected_is_home=0
+            case "${dir}" in
+                /root)
+                    detected_is_home=1
+                    ;;
+                /home/*)
+                    local detected_rel="${dir#/home/}"
+                    if [[ "${detected_rel}" != *"/"* ]]; then
+                        detected_is_home=1
+                    fi
+                    ;;
+            esac
+
+            if [[ ${detected_is_home} -eq 1 ]]; then
+                local dest_dir="${dir}/amneziawg-clients"
+                if [[ ! -d "${dest_dir}" ]]; then
+                    mkdir -p "${dest_dir}" || {
+                        warn "Failed to create ${dest_dir}; skipping ${dir} for AWG config auto-detect."
+                        continue
+                    }
+                    # Best-effort permission tightening; failures here should not abort install.
+                    chmod 750 "${dest_dir}" 2>/dev/null || true
+                fi
+
+                # Symlink all matching client configs into the dedicated directory so the
+                # web panel can safely scan them.
+                (
+                    shopt -s nullglob
+                    for f in "${dir}"/awg*-client-*.conf; do
+                        if [[ -f "${f}" && -r "${f}" ]]; then
+                            ln -sf "${f}" "${dest_dir}/$(basename "${f}")" 2>/dev/null || true
+                        fi
+                    done
+                )
+
+                AWG_CONFIG_DIR="${dest_dir}"
+            else
+                AWG_CONFIG_DIR="${dir}"
+            fi
+
             info "Auto-detected AWG client config directory: ${AWG_CONFIG_DIR}"
             return 0
         fi
