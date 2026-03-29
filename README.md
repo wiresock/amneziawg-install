@@ -89,6 +89,14 @@ See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for all insta
 
 ## 🔄 Maintenance
 
+**Step 1 — Get the scripts** (skip if you already cloned the repo):
+
+```bash
+curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web-upgrade.sh
+curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web-uninstall.sh
+chmod +x amneziawg-web-upgrade.sh amneziawg-web-uninstall.sh
+```
+
 **Upgrade the web panel:**
 
 ```bash
@@ -107,7 +115,7 @@ sudo ./amneziawg-web-uninstall.sh --force
 sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force
 ```
 
-> Both `amneziawg-web-upgrade.sh` and `amneziawg-web-uninstall.sh` work standalone — they automatically download required files if the repository is not present locally.
+> Both scripts work standalone — they automatically download required files when run.
 
 ---
 
