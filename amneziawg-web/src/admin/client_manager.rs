@@ -11,8 +11,8 @@
 //!
 //! | Operation | Command |
 //! |-----------|---------|
-//! | Read params / server config | `sudo cat <path>` |
-//! | Append peer to server config | `sudo tee -a <path>` |
+//! | Read params / server config | `sudo -n /usr/bin/cat -- <path>` |
+//! | Append peer to server config | `sudo -n /usr/bin/tee -a -- <path>` |
 //! | Strip interface config | `sudo awg-quick strip <iface>` (existing) |
 //! | Sync interface | `sudo awg syncconf <iface> /dev/stdin` (existing) |
 //!
@@ -45,9 +45,6 @@ pub enum CreateClientError {
 
     #[error("no free IP address available (max 253 clients)")]
     NoFreeIp,
-
-    #[error("no AWG interface found")]
-    NoInterface,
 
     #[error("failed to read server parameters: {0}")]
     ParamsRead(String),

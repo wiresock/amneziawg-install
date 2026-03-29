@@ -113,9 +113,6 @@ fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateCl
         CreateClientError::NoFreeIp => {
             "Failed to create user: no free IP addresses available (max 253 clients).".to_string()
         }
-        CreateClientError::NoInterface => {
-            "Failed to create user: no AWG interface found.".to_string()
-        }
         // The following variants may contain raw stderr/paths from sudo
         // commands or OS errors; use fixed messages and log details server-side.
         CreateClientError::ParamsRead(_) => {
@@ -154,7 +151,6 @@ pub(crate) fn sanitized_create_error_category(
         CreateClientError::InvalidName(_) => "invalid_name",
         CreateClientError::DuplicateName(_) => "duplicate_name",
         CreateClientError::NoFreeIp => "no_free_ip",
-        CreateClientError::NoInterface => "no_interface",
         CreateClientError::ParamsRead(_) => "params_read_failed",
         CreateClientError::DbRead(_) => "db_read_failed",
         CreateClientError::KeyGen(_) => "key_generation_failed",

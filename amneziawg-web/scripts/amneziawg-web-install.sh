@@ -610,7 +610,9 @@ setup_filesystem() {
         chown "${SERVICE_USER}:${SERVICE_USER}" "${AWG_CONFIG_DIR}" 2>/dev/null \
             && info "Set ownership of ${AWG_CONFIG_DIR} to ${SERVICE_USER}." \
             || warn "Could not change ownership of ${AWG_CONFIG_DIR}. The service may not be able to create client configs."
-        chmod 0700 "${AWG_CONFIG_DIR}" 2>/dev/null || true
+        chmod 0700 "${AWG_CONFIG_DIR}" 2>/dev/null \
+            && info "Set permissions of ${AWG_CONFIG_DIR} to 0700." \
+            || warn "Could not change permissions of ${AWG_CONFIG_DIR}. The service may not be able to create or manage client configs."
     else
         # Create the directory owned by the service user so it can write configs.
         mkdir -p "${AWG_CONFIG_DIR}"
