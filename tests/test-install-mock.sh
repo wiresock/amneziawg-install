@@ -3049,7 +3049,7 @@ else
 fi
 
 # The wrapper prints the clone message to stderr; with 2>&1 it is in OUTPUT.
-if echo "${WEB_BOOTSTRAP9_INSTALL_OUTPUT}" | grep -qi "cloning\|clone\|bootstrap"; then
+if echo "${WEB_BOOTSTRAP9_INSTALL_OUTPUT}" | grep -qiE "cloning|clone|bootstrap"; then
 	echo "OK: Standalone install output mentions cloning/bootstrapping"
 else
 	echo "WARN: Standalone install output does not mention cloning (check stderr capture)"
@@ -3130,7 +3130,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if echo "${WEB_CLONEFAIL9_INSTALL_OUTPUT}" | grep -qi "failed\|error"; then
+if echo "${WEB_CLONEFAIL9_INSTALL_OUTPUT}" | grep -qiE "failed|error"; then
 	echo "OK: Standalone install error message is present when git clone fails"
 else
 	echo "FAIL: Standalone install missing helpful error message when git clone fails"
@@ -3154,7 +3154,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if echo "${WEB_CLONEFAIL9_UNINSTALL_OUTPUT}" | grep -qi "failed\|error"; then
+if echo "${WEB_CLONEFAIL9_UNINSTALL_OUTPUT}" | grep -qiE "failed|error"; then
 	echo "OK: Standalone uninstall error message is present when git clone fails"
 else
 	echo "FAIL: Standalone uninstall missing helpful error message when git clone fails"
@@ -3199,7 +3199,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if echo "${UNIFIED_NOARGS_OUTPUT}" | grep -qi "install\|upgrade\|uninstall\|status\|help"; then
+if echo "${UNIFIED_NOARGS_OUTPUT}" | grep -qiE "install|upgrade|uninstall|status|help"; then
 	echo "OK: No-args output lists available commands"
 else
 	echo "FAIL: No-args output does not list available commands"
@@ -3242,7 +3242,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if echo "${UNIFIED_UNKNOWN_OUTPUT}" | grep -qi "unknown\|frobnicate"; then
+if echo "${UNIFIED_UNKNOWN_OUTPUT}" | grep -qiE "unknown|frobnicate"; then
 	echo "OK: Unknown subcommand error message is present"
 else
 	echo "FAIL: Unknown subcommand missing helpful error message"
@@ -3279,7 +3279,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if echo "${UNIFIED_STATUS_OUTPUT}" | grep -qi "installed.*yes\|yes"; then
+if echo "${UNIFIED_STATUS_OUTPUT}" | grep -qiE '^Installed:[[:space:]]*yes([[:space:]]|$)'; then
 	echo "OK: Status reports installed = yes"
 else
 	echo "FAIL: Status does not report installed state"
@@ -3287,7 +3287,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if echo "${UNIFIED_STATUS_OUTPUT}" | grep -qi "service\|active\|inactive"; then
+if echo "${UNIFIED_STATUS_OUTPUT}" | grep -Eqi '^Service:.*(active|inactive)'; then
 	echo "OK: Status reports service state"
 else
 	echo "FAIL: Status does not report service state"
@@ -3466,7 +3466,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if echo "${UNIFIED_BOOTSTRAP_OUTPUT}" | grep -qi "cloning\|clone\|bootstrap"; then
+if echo "${UNIFIED_BOOTSTRAP_OUTPUT}" | grep -qiE "cloning|clone|bootstrap"; then
 	echo "OK: Standalone unified install output mentions cloning/bootstrapping"
 else
 	echo "WARN: Standalone unified install output does not mention cloning (check stderr capture)"
