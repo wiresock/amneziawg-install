@@ -1175,7 +1175,7 @@ async fn api_create_user(
         }
         Err(crate::admin::client_manager::CreateClientError::DuplicateName(name)) => {
             Ok((
-                StatusCode::BAD_REQUEST,
+                StatusCode::CONFLICT,
                 Json(json!({ "error": format!("a client named '{name}' already exists") })),
             )
                 .into_response())
