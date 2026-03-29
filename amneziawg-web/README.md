@@ -105,18 +105,27 @@ All state is in one SQLite file. No Redis, no Postgres, no container required.
 ### Using the installer (recommended for production)
 
 The installer lives at the repository root, next to `amneziawg-install.sh`.
-It builds from source by default — just point it at the source directory:
+If you run it from a repository checkout, it auto-detects `./amneziawg-web` and builds from source automatically:
 
 ```bash
+git clone https://github.com/wiresock/amneziawg-install.git
+cd amneziawg-install
+
 # 1. Install AmneziaWG (if not already done)
 sudo ./amneziawg-install.sh
 
 # 2. Install the web panel (builds from source automatically)
-sudo ./amneziawg-web-install.sh --source-dir ./amneziawg-web
+sudo ./amneziawg-web-install.sh
 
 # Or install Rust automatically if not present:
-sudo ./amneziawg-web-install.sh --source-dir ./amneziawg-web --install-rust
+sudo ./amneziawg-web-install.sh --install-rust
 ```
+
+If you prefer not to clone the repository with Git, download both
+`amneziawg-web-install.sh` and `amneziawg-web.sh` into the same directory.
+The `amneziawg-web-install.sh` wrapper delegates to `amneziawg-web.sh`, which
+handles cloning and build steps automatically (this requires `git` to be installed).
+If `git` is not available, build `amneziawg-web` manually and use `--binary-src` as shown below.
 
 If you already have a pre-built binary:
 
@@ -133,7 +142,7 @@ For non-interactive / automated installs, see [docs/INSTALL.md](docs/INSTALL.md)
 To upgrade by rebuilding from source:
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+sudo ./amneziawg-web-upgrade.sh
 ```
 
 To upgrade with a pre-built binary:

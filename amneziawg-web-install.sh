@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
-# amneziawg-web-install.sh (root-level entrypoint)
+# amneziawg-web-install.sh — legacy wrapper (kept for backward compatibility).
+# Prefer: sudo ./amneziawg-web.sh install [OPTIONS]
 #
-# This script is the operator-facing entrypoint for the amneziawg-web companion
-# installer. It lives next to amneziawg-install.sh so the recommended workflow is:
-#
-#   sudo ./amneziawg-install.sh           # install AmneziaWG
-#   sudo ./amneziawg-web-install.sh       # install the web panel
-#   # open http://127.0.0.1:8080
-#
-# All installer logic is in amneziawg-web/scripts/amneziawg-web-install.sh.
-# This file is a thin entrypoint that forwards all arguments to that script.
-#
+# Delegates to amneziawg-web.sh install.
 # https://github.com/wiresock/amneziawg-install
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALLER="${SCRIPT_DIR}/amneziawg-web/scripts/amneziawg-web-install.sh"
 
-if [[ ! -f "${INSTALLER}" ]]; then
-    echo "ERROR: Installer script not found at: ${INSTALLER}" >&2
-    echo "       Make sure you cloned the full repository." >&2
+if [[ ! -f "${SCRIPT_DIR}/amneziawg-web.sh" ]]; then
+    echo "Error: amneziawg-web.sh not found in ${SCRIPT_DIR}." >&2
+    echo >&2
+    echo "This script is a legacy wrapper around amneziawg-web.sh." >&2
+    echo "To use it, either:" >&2
+    echo "  * download amneziawg-web.sh into the same directory as this script, or" >&2
+    echo "  * clone the full repository:" >&2
+    echo "      git clone https://github.com/wiresock/amneziawg-install" >&2
+    echo "    and run it from the cloned directory." >&2
     exit 1
 fi
 
-exec bash "${INSTALLER}" "$@"
+exec bash "${SCRIPT_DIR}/amneziawg-web.sh" install "$@"
