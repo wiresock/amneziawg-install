@@ -68,17 +68,52 @@ warn()  { yellow "[WARN]  $*" >&2; }
 die()   { red    "[ERROR] $*" >&2; exit 1; }
 
 validate_awg_config_dir() {
-    local dir_path="$1"
+    local dir_path_raw="$1"
+    local dir_path
+    local resolved_path
 
     # Reject empty or non-absolute paths.
-    if [[ -z "${dir_path}" ]]; then
+    if [[ -z "${dir_path_raw}" ]]; then
         warn "AWG_CONFIG_DIR is empty; skipping automatic ownership/permission changes."
         return 1
     fi
-    if [[ "${dir_path}" != /* ]]; then
-        warn "AWG_CONFIG_DIR '${dir_path}' is not an absolute path; skipping automatic ownership/permission changes."
+    if [[ "${dir_path_raw}" != /* ]]; then
+        warn "AWG_CONFIG_DIR '${dir_path_raw}' is not an absolute path; skipping automatic ownership/permission changes."
         return 1
     fi
+
+    # Normalize: strip trailing slashes (but keep "/" as-is).
+    dir_path="${dir_path_raw%/}"
+    if [[ -z "${dir_path}" ]]; then
+        dir_path="/"
+    fi
+
+    # Reject paths that contain symlink components (TOCTOU defense: a symlink
+    # target could change between validation and the subsequent chown/chmod).
+    local check_path="${dir_path}"
+    while [[ "${check_path}" != "/" && "${check_path}" != "." ]]; do
+        if [[ -L "${check_path}" ]]; then
+            warn "AWG_CONFIG_DIR '${dir_path_raw}' contains a symbolic link at '${check_path}'; skipping automatic ownership/permission changes."
+            return 1
+        fi
+        check_path="$(dirname "${check_path}")"
+    done
+
+    # Try to resolve the real path to canonicalize and catch any remaining
+    # indirection (e.g. /foo/../etc).
+    resolved_path="${dir_path}"
+    if command -v realpath >/dev/null 2>&1; then
+        local resolved_tmp
+        if resolved_tmp="$(realpath -m -- "${dir_path}" 2>/dev/null)"; then
+            resolved_path="${resolved_tmp}"
+        fi
+    elif command -v readlink >/dev/null 2>&1; then
+        local resolved_tmp
+        if resolved_tmp="$(readlink -f -- "${dir_path}" 2>/dev/null)"; then
+            resolved_path="${resolved_tmp}"
+        fi
+    fi
+    dir_path="${resolved_path}"
 
     # Reject sensitive system directories that should never have their
     # ownership changed to the service user.
