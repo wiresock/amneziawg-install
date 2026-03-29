@@ -26,6 +26,10 @@ chmod +x amneziawg-web.sh
 sudo ./amneziawg-web.sh install
 ```
 
+> **Note:** The web panel installer requires `git` to bootstrap the repository when run
+> standalone. If `git` is not available, clone the repository manually or use `--binary-src`
+> with a pre-built binary.
+
 ✅ **After installation:**
 - VPN server is running
 - A client config file is generated at `~/awg0-client-<name>.conf`

@@ -43,7 +43,9 @@ installers are discoverable in the same place.
 
 If you download only `amneziawg-web.sh` (or both `amneziawg-web-install.sh` and
 `amneziawg-web.sh`), the script will shallow-clone the repository to a temporary
-directory automatically before continuing.
+directory automatically before continuing. This bootstrap step requires `git` to be
+installed and available in `PATH`; if `git` is missing, the script will fail early
+with an error and exit without making changes.
 
 The installer handles user creation, directory setup, environment file generation,
 and systemd service installation. See [Installer reference](#installer-reference)

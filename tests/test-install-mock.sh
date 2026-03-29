@@ -872,11 +872,28 @@ WEB_UNIFIED="${PROJECT_ROOT}/amneziawg-web.sh"
 WEB_INSTALLER="${PROJECT_ROOT}/amneziawg-web-install.sh"
 WEB_INSTALLER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-install.sh"
 
-# Verify unified entry point and both legacy entrypoints are present
+# Verify unified entry point and all legacy entrypoints are present
 if [[ -f "${WEB_UNIFIED}" ]]; then
 	echo "OK: Unified entry point exists: ${WEB_UNIFIED}"
 else
 	echo "FAIL: Unified entry point missing: ${WEB_UNIFIED}"
+	FAILED=$((FAILED + 1))
+fi
+
+WEB_UPGRADER_WRAPPER="${PROJECT_ROOT}/amneziawg-web-upgrade.sh"
+WEB_UNINSTALLER_WRAPPER="${PROJECT_ROOT}/amneziawg-web-uninstall.sh"
+
+if [[ -f "${WEB_UPGRADER_WRAPPER}" ]]; then
+	echo "OK: Legacy upgrade wrapper exists: ${WEB_UPGRADER_WRAPPER}"
+else
+	echo "FAIL: Legacy upgrade wrapper missing: ${WEB_UPGRADER_WRAPPER}"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_UNINSTALLER_WRAPPER}" ]]; then
+	echo "OK: Legacy uninstall wrapper exists: ${WEB_UNINSTALLER_WRAPPER}"
+else
+	echo "FAIL: Legacy uninstall wrapper missing: ${WEB_UNINSTALLER_WRAPPER}"
 	FAILED=$((FAILED + 1))
 fi
 

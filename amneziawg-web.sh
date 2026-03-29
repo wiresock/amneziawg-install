@@ -14,8 +14,10 @@
 
 set -euo pipefail
 
-readonly REPO_URL="https://github.com/wiresock/amneziawg-install.git"
-readonly REPO_REF="main"
+# Allow overriding repository URL and ref via environment variables for pinning.
+# Defaults preserve original behavior.
+readonly REPO_URL="${REPO_URL:-https://github.com/wiresock/amneziawg-install.git}"
+readonly REPO_REF="${REPO_REF:-main}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="${SCRIPT_DIR}/amneziawg-web/scripts"

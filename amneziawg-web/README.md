@@ -118,7 +118,8 @@ sudo ./amneziawg-web-install.sh --install-rust
 If you prefer not to clone the repository with Git, download both
 `amneziawg-web-install.sh` and `amneziawg-web.sh` into the same directory.
 The `amneziawg-web-install.sh` wrapper delegates to `amneziawg-web.sh`, which
-handles cloning and build steps automatically.
+handles cloning and build steps automatically (this requires `git` to be installed).
+If `git` is not available, build `amneziawg-web` manually and use `--binary-src` as shown below.
 
 If you already have a pre-built binary:
 
