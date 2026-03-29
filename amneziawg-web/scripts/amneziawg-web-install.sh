@@ -1020,11 +1020,11 @@ find_unit_template() {
     return 1
 }
 
-# Adjust ReadOnlyPaths and ProtectHome in the installed service unit to match
+# Adjust ReadWritePaths and ProtectHome in the installed service unit to match
 # the user's configured AWG_CONFIG_DIR.  The packaged template hard-codes
-# ReadOnlyPaths=/etc/amneziawg and ProtectHome=yes which is correct for the
+# ReadWritePaths=/etc/amneziawg and ProtectHome=yes which is correct for the
 # default config directory.  When a custom directory is chosen — especially
-# one under /home — we need to relax the sandboxing so the service can read
+# one under /home — we need to relax the sandboxing so the service can access
 # the config files.
 adjust_unit_hardening() {
     local unit_file="$1"
@@ -1035,22 +1035,28 @@ adjust_unit_hardening() {
     # Normalize: strip trailing slashes for consistent comparison
     config_dir="${config_dir%/}"
 
-    # 1. Update ReadOnlyPaths to include the actual config directory
+    # 1. Update ReadWritePaths for the AWG config directory.
+    #    Also handle legacy ReadOnlyPaths left over from older installs.
     if grep -q '^ReadOnlyPaths=' "${unit_file}" 2>/dev/null; then
-        local current_ro
-        current_ro="$(grep '^ReadOnlyPaths=' "${unit_file}" | head -1 | cut -d= -f2-)"
-        current_ro="${current_ro%/}"
+        # Upgrade: replace ReadOnlyPaths with ReadWritePaths so the service
+        # can write client configs directly.
+        sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${config_dir}|" "${unit_file}"
+        info "Replaced ReadOnlyPaths with ReadWritePaths=${config_dir}"
+    elif grep -q '^ReadWritePaths=.*amnezia' "${unit_file}" 2>/dev/null; then
+        local current_rw
+        current_rw="$(grep '^ReadWritePaths=.*amnezia' "${unit_file}" | head -1 | cut -d= -f2-)"
+        current_rw="${current_rw%/}"
         # If the configured directory is already covered, nothing to do
-        if [[ "${config_dir}" != "${current_ro}" ]] \
-                && [[ "${config_dir}" != "${current_ro}/"* ]]; then
-            sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${config_dir}|" "${unit_file}"
-            info "Updated ReadOnlyPaths to ${config_dir}"
+        if [[ "${config_dir}" != "${current_rw}" ]] \
+                && [[ "${config_dir}" != "${current_rw}/"* ]]; then
+            sed -i "0,/^ReadWritePaths=.*amnezia/s|^ReadWritePaths=.*|ReadWritePaths=${config_dir}|" "${unit_file}"
+            info "Updated ReadWritePaths to ${config_dir}"
         fi
     fi
 
     # 2. If the config directory lives under /home, relax ProtectHome so the
     #    service can traverse into it.  ProtectHome=read-only still prevents
-    #    writes while allowing reads.
+    #    writes to other home dirs while allowing access to the config dir.
     case "${config_dir}" in
         /home|/home/*)
             if grep -q '^ProtectHome=yes' "${unit_file}" 2>/dev/null; then
@@ -1098,7 +1104,7 @@ EnvironmentFile=${ENV_FILE}
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadOnlyPaths=${AWG_CONFIG_DIR}
+ReadWritePaths=${AWG_CONFIG_DIR}
 ReadWritePaths=${DATA_DIR}
 
 [Install]
@@ -1119,7 +1125,7 @@ UNITEOF
         info "Added EnvironmentFile directive to service unit."
     fi
 
-    # Adjust ReadOnlyPaths / ProtectHome for the configured AWG config directory
+    # Adjust ReadWritePaths / ProtectHome for the configured AWG config directory
     adjust_unit_hardening "${SYSTEMD_UNIT_DEST}" "${AWG_CONFIG_DIR}"
 
     systemctl daemon-reload

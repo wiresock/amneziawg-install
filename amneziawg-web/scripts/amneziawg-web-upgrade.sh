@@ -67,7 +67,7 @@ info()  { printf '[INFO]  %s\n' "$*"; }
 warn()  { yellow "[WARN]  $*" >&2; }
 die()   { red    "[ERROR] $*" >&2; exit 1; }
 
-# Adjust ReadOnlyPaths and ProtectHome in the installed service unit to match
+# Adjust ReadWritePaths and ProtectHome in the installed service unit to match
 # the configured AWG_CONFIG_DIR (mirrors the same function in the installer).
 adjust_unit_hardening() {
     local unit_file="$1"
@@ -78,15 +78,21 @@ adjust_unit_hardening() {
     # Normalize: strip trailing slashes for consistent comparison
     config_dir="${config_dir%/}"
 
-    # 1. Update ReadOnlyPaths to include the actual config directory
+    # 1. Update ReadWritePaths for the AWG config directory.
+    #    Also handle legacy ReadOnlyPaths left over from older installs.
     if grep -q '^ReadOnlyPaths=' "${unit_file}" 2>/dev/null; then
-        local current_ro
-        current_ro="$(grep '^ReadOnlyPaths=' "${unit_file}" | head -1 | cut -d= -f2-)"
-        current_ro="${current_ro%/}"
-        if [[ "${config_dir}" != "${current_ro}" ]] \
-                && [[ "${config_dir}" != "${current_ro}/"* ]]; then
-            sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${config_dir}|" "${unit_file}"
-            info "Updated ReadOnlyPaths to ${config_dir}"
+        # Upgrade: replace ReadOnlyPaths with ReadWritePaths so the service
+        # can write client configs directly.
+        sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${config_dir}|" "${unit_file}"
+        info "Replaced ReadOnlyPaths with ReadWritePaths=${config_dir}"
+    elif grep -q '^ReadWritePaths=.*amnezia' "${unit_file}" 2>/dev/null; then
+        local current_rw
+        current_rw="$(grep '^ReadWritePaths=.*amnezia' "${unit_file}" | head -1 | cut -d= -f2-)"
+        current_rw="${current_rw%/}"
+        if [[ "${config_dir}" != "${current_rw}" ]] \
+                && [[ "${config_dir}" != "${current_rw}/"* ]]; then
+            sed -i "0,/^ReadWritePaths=.*amnezia/s|^ReadWritePaths=.*|ReadWritePaths=${config_dir}|" "${unit_file}"
+            info "Updated ReadWritePaths to ${config_dir}"
         fi
     fi
 
@@ -466,7 +472,10 @@ main() {
     fi
 
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
-    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --add-client *, ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
+    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
+    # Direct client creation: read params file and server config, append peer blocks.
+    # Scoped to specific file patterns to minimize privilege surface.
+    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf"
     info "Installing/updating sudoers drop-in: ${SUDOERS_FILE}"
     mkdir -p "$(dirname "${SUDOERS_FILE}")"
     printf '# Allow amneziawg-web service to manage AWG state and peers.\n' \
@@ -474,9 +483,12 @@ main() {
     printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \
         >> "${SUDOERS_FILE}"
     printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
-    printf '# Allow amneziawg-web to manage clients via the install script.\n' \
+    printf '# Allow amneziawg-web to manage clients via the install script (remove/list).\n' \
         >> "${SUDOERS_FILE}"
     printf '%s\n' "${rule_install}" >> "${SUDOERS_FILE}"
+    printf '# Allow amneziawg-web to create clients directly (read params, append config).\n' \
+        >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule_direct}" >> "${SUDOERS_FILE}"
     chmod 0440 "${SUDOERS_FILE}"
     chown root:root "${SUDOERS_FILE}"
     if command -v visudo &>/dev/null; then
@@ -510,7 +522,7 @@ Please report this issue."
         mv -f -- "${tmp_unit}" "${SYSTEMD_UNIT_DEST}"
         info "Refreshed unit file: ${SYSTEMD_UNIT_DEST}"
 
-        # Adjust ReadOnlyPaths / ProtectHome for the configured config directory.
+        # Adjust ReadWritePaths / ProtectHome for the configured config directory.
         # Read AWG_CONFIG_DIR from the env file if it exists.
         local awg_config_dir=""
         if [[ -f "${ENV_FILE}" ]]; then

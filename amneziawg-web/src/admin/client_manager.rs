@@ -467,11 +467,11 @@ pub fn create_client(
     // Step 1: Validate the client name.
     script_bridge::validate_client_name(name)?;
 
-    // Step 2: Derive the amneziawg directory from config_dir.
-    //         config_dir is typically /etc/amnezia/amneziawg/clients.
-    let amneziawg_dir = config_dir
-        .parent()
-        .ok_or_else(|| CreateClientError::ConfigParse("cannot determine amneziawg dir".into()))?;
+    // Step 2: Use the fixed server config root that matches the sudoers rules.
+    //         AWG_CONFIG_DIR (config_dir) is configurable and may live outside
+    //         /etc, so we cannot rely on config_dir.parent() to locate the
+    //         params file and server config.
+    let amneziawg_dir = Path::new("/etc/amnezia/amneziawg");
 
     // Step 3: Read server parameters.
     let params_path = amneziawg_dir.join("params");
@@ -507,11 +507,12 @@ pub fn create_client(
                 "open lock file: {e}"
             )))?;
         use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            return Err(CreateClientError::FileWrite(
-                "failed to acquire lock for client creation".to_string(),
-            ));
+            let err = std::io::Error::last_os_error();
+            return Err(CreateClientError::FileWrite(format!(
+                "failed to acquire lock for client creation: {err}"
+            )));
         }
         f
     };

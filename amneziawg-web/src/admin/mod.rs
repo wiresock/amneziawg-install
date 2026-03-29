@@ -172,9 +172,14 @@ pub async fn execute_create_user(
             })
         }
         Err(e) => {
+            // Log full error details server-side only; the audit event
+            // visible via /api/events uses a fixed/sanitized message to
+            // avoid leaking raw stderr, OS errors, or filesystem paths.
+            tracing::error!(error = %e, name = name, "client creation failed");
+            let sanitized = crate::web::sanitized_create_error_category(&e);
             let detail = serde_json::json!({
                 "name": name,
-                "error": e.to_string(),
+                "error": sanitized,
             })
             .to_string();
             log_event(
