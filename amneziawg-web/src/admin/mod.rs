@@ -301,12 +301,12 @@ pub async fn execute_remove_user(
             // location (/etc/amnezia/amneziawg/clients).  Without this,
             // a stale config file would linger and keep the peer "linked"
             // after the next rescan.
-            if let Ok(entries) = std::fs::read_dir(config_dir) {
+            if let Ok(mut entries) = tokio::fs::read_dir(config_dir).await {
                 let suffix = format!("-client-{client_name}.conf");
-                for entry in entries.flatten() {
+                while let Ok(Some(entry)) = entries.next_entry().await {
                     if let Some(name) = entry.file_name().to_str() {
                         if name.ends_with(&suffix) {
-                            if let Err(e) = std::fs::remove_file(entry.path()) {
+                            if let Err(e) = tokio::fs::remove_file(entry.path()).await {
                                 tracing::warn!(
                                     path = %entry.path().display(),
                                     error = %e,

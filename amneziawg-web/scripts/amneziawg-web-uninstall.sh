@@ -119,10 +119,10 @@ done
 normalize_path() {
     if command -v realpath >/dev/null 2>&1; then
         realpath -m -- "$1"
-    elif command -v readlink >/dev/null 2>&1; then
-        readlink -f -- "$1"
     else
-        die "Neither realpath nor readlink is available; cannot normalize paths"
+        # readlink -f may fail for non-existent paths on some systems.
+        # Fall back to echoing the input as-is (paths are expected to be absolute).
+        readlink -f -- "$1" 2>/dev/null || printf '%s\n' "$1"
     fi
 }
 

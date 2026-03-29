@@ -264,15 +264,15 @@ awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, \
     /usr/bin/awg set * peer * remove, \
     /usr/bin/awg syncconf * /dev/stdin, \
     /usr/bin/awg-quick strip *
-awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, \
-    /usr/local/bin/amneziawg-install.sh --remove-client *, \
+awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --remove-client *, \
     /usr/local/bin/amneziawg-install.sh --list-clients
 ```
 
 The first rule grants the minimum privilege needed for AWG inspection,
 disabling peers (removal), and re-enabling peers (config sync).
 The second rule allows the web panel to manage clients via the install script's
-non-interactive `--add-client` / `--remove-client` / `--list-clients` flags.
+non-interactive `--remove-client` / `--list-clients` flags (user creation is
+performed directly in Rust without the install script).
 All invocations use `Command::new()` with explicit argument arrays — no shell
 interpolation.
 

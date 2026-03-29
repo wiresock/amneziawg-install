@@ -74,8 +74,8 @@ async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
     // Drain the remainder into a sink so the pipe stays open and the
     // child doesn't get a broken-pipe error.
     if buf.len() >= PIPE_CAPTURE_LIMIT {
-        let inner = limited.into_inner();
-        tokio::io::copy(inner, &mut tokio::io::sink()).await?;
+        let mut inner = limited.into_inner();
+        tokio::io::copy(&mut inner, &mut tokio::io::sink()).await?;
     }
     Ok(())
 }

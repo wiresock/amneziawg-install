@@ -163,7 +163,7 @@ commands:
 - `awg show all dump` – read tunnel state (read-only)
 - `awg set … peer … remove` – disable a peer by removing it from the running interface
 - `awg syncconf` + `awg-quick strip` – re-enable a peer by syncing a sanitized on-disk config
-- `amneziawg-install.sh --add-client` / `--remove-client` / `--list-clients` – manage client lifecycle
+- `amneziawg-install.sh --remove-client` / `--list-clients` – manage client lifecycle
 
 This follows the principle of least privilege.
 
