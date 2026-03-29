@@ -668,16 +668,14 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
         if command -v setfacl >/dev/null 2>&1; then
             # Resolve AWG_CONFIG_DIR to an absolute, symlink-free path before applying ACLs.
             local target_dir
-            if target_dir="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
-                :
-            else
+            if ! target_dir="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
                 target_dir="${AWG_CONFIG_DIR}"
             fi
 
             # Refuse to modify ACLs on clearly unsafe, broad system directories.
             local unsafe_dir=0
             case "${target_dir}" in
-                /|/etc|/home|/var|/tmp|/usr|/usr/local)
+                /|/etc|/home|/var|/tmp|/usr|/usr/local|/opt|/bin|/sbin)
                     unsafe_dir=1
                     ;;
             esac
