@@ -625,7 +625,8 @@ pub fn create_client(
 
     info!(client = name, "peer block appended to server config");
 
-    // _lock_file is dropped here, releasing the exclusive lock.
+    // Explicitly release the creation lock before the (potentially slow)
+    // interface sync so other concurrent create_client calls can proceed.
     drop(_lock_file);
 
     // Step 9: Sync the running AWG interface.
