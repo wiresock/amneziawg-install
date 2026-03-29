@@ -3279,7 +3279,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if echo "${UNIFIED_STATUS_OUTPUT}" | grep -qiE '^Installed:[[:space:]]*yes([[:space:]]|$)'; then
+if echo "${UNIFIED_STATUS_OUTPUT}" | grep -qiE '^[[:space:]]*Installed:[[:space:]]*yes([[:space:]]|$)'; then
 	echo "OK: Status reports installed = yes"
 else
 	echo "FAIL: Status does not report installed state"
@@ -3287,7 +3287,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if echo "${UNIFIED_STATUS_OUTPUT}" | grep -qiE '^Service:.*(active|inactive)'; then
+if echo "${UNIFIED_STATUS_OUTPUT}" | grep -qiE '^[[:space:]]*Service:.*(active|inactive)'; then
 	echo "OK: Status reports service state"
 else
 	echo "FAIL: Status does not report service state"
