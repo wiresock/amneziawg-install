@@ -588,9 +588,9 @@ detect_awg_config_dir() {
 
     search_dirs+=("/root")
 
-    for d in /home/*; do
+    for d in /home/*/; do
         if [[ -d "${d}" ]]; then
-            search_dirs+=("${d}")
+            search_dirs+=("${d%/}")
         fi
     done
 
@@ -665,16 +665,16 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                 && info "Granted read ACL for ${SERVICE_USER} on ${AWG_CONFIG_DIR}." \
                 || warn "setfacl failed on ${AWG_CONFIG_DIR}."
             # Default ACL: new files/dirs inherit read for the service user
-            setfacl -d -m "u:${SERVICE_USER}:r" "${AWG_CONFIG_DIR}" 2>/dev/null \
+            setfacl -d -m "u:${SERVICE_USER}:rx" "${AWG_CONFIG_DIR}" 2>/dev/null \
                 && info "Set default ACL for future configs in ${AWG_CONFIG_DIR}." \
                 || warn "setfacl -d failed on ${AWG_CONFIG_DIR}."
             # Apply read ACL to any existing .conf files
-            local existing_confs
-            existing_confs="$(find "${AWG_CONFIG_DIR}" -maxdepth 1 -name '*.conf' -type f 2>/dev/null)"
-            if [[ -n "${existing_confs}" ]]; then
-                echo "${existing_confs}" | while IFS= read -r cf; do
+            find "${AWG_CONFIG_DIR}" -maxdepth 1 -name '*.conf' -type f -print0 2>/dev/null \
+                | while IFS= read -r -d '' cf; do
                     setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
                 done
+            # Log only if there were any .conf files
+            if compgen -G "${AWG_CONFIG_DIR}/"*.conf > /dev/null 2>&1; then
                 info "Applied read ACL to existing config files."
             fi
         fi
