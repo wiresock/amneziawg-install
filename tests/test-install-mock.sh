@@ -1259,18 +1259,21 @@ fi
 # Verify the service user can actually read the config through the symlink.
 # This catches permission regressions where ACLs are not applied to the real
 # target file (the original config is typically mode 600).
+# The assertion requires setfacl to be installed: without it the installer
+# cannot grant the service user access to /root or the symlink targets, so
+# read access is expected to fail and we skip instead of reporting a false FAIL.
 WEB_SERVICE_USER="awg-web"
-if id "${WEB_SERVICE_USER}" &>/dev/null; then
-	if runuser -u "${WEB_SERVICE_USER}" -- cat "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" >/dev/null 2>&1; then
-		echo "OK: Service user ${WEB_SERVICE_USER} can read config through symlink"
-	else
-		echo "FAIL: Service user ${WEB_SERVICE_USER} cannot read config through symlink"
-		echo "  Symlink target perms: $(stat -c '%a' "${AUTODETECT_CONF}" 2>/dev/null || echo 'N/A')"
-		echo "  ACL on target: $(getfacl -p "${AUTODETECT_CONF}" 2>/dev/null | grep "${WEB_SERVICE_USER}" || echo 'none')"
-		FAILED=$((FAILED + 1))
-	fi
-else
+if ! command -v setfacl >/dev/null 2>&1; then
+	echo "SKIP: setfacl not installed; cannot verify ACL-based read access through symlink"
+elif ! id "${WEB_SERVICE_USER}" &>/dev/null; then
 	echo "SKIP: Service user ${WEB_SERVICE_USER} does not exist; cannot verify read access"
+elif runuser -u "${WEB_SERVICE_USER}" -- cat "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" >/dev/null 2>&1; then
+	echo "OK: Service user ${WEB_SERVICE_USER} can read config through symlink"
+else
+	echo "FAIL: Service user ${WEB_SERVICE_USER} cannot read config through symlink"
+	echo "  Symlink target perms: $(stat -c '%a' "${AUTODETECT_CONF}" 2>/dev/null || echo 'N/A')"
+	echo "  ACL on target: $(getfacl -p "${AUTODETECT_CONF}" 2>/dev/null | grep "${WEB_SERVICE_USER}" || echo 'none')"
+	FAILED=$((FAILED + 1))
 fi
 
 # Verify the auto-detection was logged
