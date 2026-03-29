@@ -121,6 +121,9 @@ fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateCl
         CreateClientError::ParamsRead(_) => {
             "Failed to create user: could not read server configuration.".to_string()
         }
+        CreateClientError::DbRead(_) => {
+            "Failed to create user: database operation failed.".to_string()
+        }
         CreateClientError::KeyGen(_) => {
             "Failed to create user: key generation failed.".to_string()
         }
@@ -132,6 +135,9 @@ fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateCl
         }
         CreateClientError::Awg(_) => {
             "Failed to create user: AWG command failed.".to_string()
+        }
+        CreateClientError::Internal(_) => {
+            "Failed to create user: internal server error.".to_string()
         }
     }
 }

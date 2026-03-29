@@ -24,7 +24,7 @@
 
 use std::collections::HashSet;
 use std::net::Ipv6Addr;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use thiserror::Error;
@@ -52,6 +52,9 @@ pub enum CreateClientError {
     #[error("failed to read server parameters: {0}")]
     ParamsRead(String),
 
+    #[error("failed to load data from database: {0}")]
+    DbRead(String),
+
     #[error("failed to generate keys: {0}")]
     KeyGen(String),
 
@@ -63,13 +66,16 @@ pub enum CreateClientError {
 
     #[error("AWG command failed: {0}")]
     Awg(#[from] crate::awg::AwgError),
+
+    #[error("internal error during client creation: {0}")]
+    Internal(String),
 }
 
 impl From<script_bridge::ScriptError> for CreateClientError {
     fn from(e: script_bridge::ScriptError) -> Self {
         match e {
             script_bridge::ScriptError::InvalidName(msg) => CreateClientError::InvalidName(msg),
-            other => CreateClientError::InvalidName(other.to_string()),
+            other => CreateClientError::Internal(other.to_string()),
         }
     }
 }
@@ -475,6 +481,41 @@ pub fn create_client(
 
     debug!(nic = %params.server_awg_nic, "server params loaded");
 
+    // Ensure the clients directory exists with restrictive permissions (0700).
+    if !config_dir.exists() {
+        std::fs::create_dir_all(config_dir)
+            .map_err(|e| CreateClientError::FileWrite(format!("mkdir {}: {e}", config_dir.display())))?;
+    }
+    // Always ensure correct permissions (fix pre-existing directories too).
+    std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| CreateClientError::FileWrite(format!(
+            "chmod {}: {e}", config_dir.display()
+        )))?;
+
+    // Acquire an exclusive lock on the clients directory to prevent concurrent
+    // create_client calls from allocating the same IP or appending duplicate
+    // peer blocks.  The lock is held for the read→allocate→append sequence
+    // and released automatically when `_lock_file` is dropped.
+    let lock_path = config_dir.join(".create-client.lock");
+    let _lock_file = {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|e| CreateClientError::FileWrite(format!(
+                "open lock file: {e}"
+            )))?;
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(CreateClientError::FileWrite(
+                "failed to acquire lock for client creation".to_string(),
+            ));
+        }
+        f
+    };
+
     // Step 4: Read server config to check for duplicates and find used IPs.
     let server_conf_path = amneziawg_dir.join(format!("{}.conf", params.server_awg_nic));
     let server_config = awg::read_file_via_sudo(&server_conf_path)
@@ -536,12 +577,6 @@ pub fn create_client(
         &endpoint,
     );
 
-    // Ensure the clients directory exists.
-    if !config_dir.exists() {
-        std::fs::create_dir_all(config_dir)
-            .map_err(|e| CreateClientError::FileWrite(format!("mkdir {}: {e}", config_dir.display())))?;
-    }
-
     // Write with restrictive permissions (mode 600).
     {
         let mut f = std::fs::OpenOptions::new()
@@ -589,6 +624,9 @@ pub fn create_client(
     }
 
     info!(client = name, "peer block appended to server config");
+
+    // _lock_file is dropped here, releasing the exclusive lock.
+    drop(_lock_file);
 
     // Step 9: Sync the running AWG interface.
     if let Err(e) = awg::sync_interface(&params.server_awg_nic, disabled_keys) {

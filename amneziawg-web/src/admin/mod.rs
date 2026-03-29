@@ -120,7 +120,7 @@ pub async fn execute_create_user(
             tracing::error!(error = %e, "failed to load disabled peers from database");
             let detail = serde_json::json!({
                 "name": name,
-                "error": format!("failed to load disabled peers from database: {e}"),
+                "error": "failed to load disabled peers from database",
             })
             .to_string();
             log_event(
@@ -132,7 +132,7 @@ pub async fn execute_create_user(
                 actor,
             )
             .await;
-            return Err(client_manager::CreateClientError::ParamsRead(
+            return Err(client_manager::CreateClientError::DbRead(
                 "failed to load disabled peers from database".to_string(),
             ));
         }
@@ -152,7 +152,7 @@ pub async fn execute_create_user(
         Ok(inner) => inner,
         Err(e) => {
             tracing::error!(error = %e, "client creation task panicked or was cancelled");
-            Err(client_manager::CreateClientError::FileWrite(
+            Err(client_manager::CreateClientError::Internal(
                 "internal error while running client creation task".to_string(),
             ))
         }
