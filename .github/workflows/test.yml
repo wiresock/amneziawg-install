@@ -34,7 +34,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Syntax check
-        run: bash -n amneziawg-install.sh
+        run: |
+          bash -n amneziawg-install.sh
+          bash -n amneziawg-web.sh
 
       - name: Run integration test in Docker
         run: |

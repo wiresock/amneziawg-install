@@ -2,6 +2,10 @@
 
 Set up an [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscated VPN on any supported Linux server in under 2 minutes.
 
+```
+VPN install → (optional) Web panel → Manage clients
+```
+
 ---
 
 ## 🚀 Quick Start
@@ -20,15 +24,23 @@ sudo ./amneziawg-install.sh
 curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web.sh
 chmod +x amneziawg-web.sh
 sudo ./amneziawg-web.sh install
-# open http://YOUR_SERVER_IP:8080
 ```
+
+✅ **After installation:**
+- VPN server is running
+- A client config file is generated at `~/awg0-client-<name>.conf`
+- (If installed) Web panel is available at `http://YOUR_SERVER_IP:8080`
 
 ---
 
 ## 🧠 How It Works
 
 - **`amneziawg-install.sh`** — **required.** Installs the VPN server, generates obfuscation parameters, and creates client configs.
-- **`amneziawg-web.sh`** — **optional.** One script to install, upgrade, uninstall, and check the status of the browser-accessible management panel.
+- **`amneziawg-web.sh`** — **optional.** Unified script for:
+  - `install` — install the web panel
+  - `upgrade` — upgrade the binary
+  - `uninstall` — remove the panel
+  - `status` — show installation status
 
 ---
 
@@ -38,14 +50,16 @@ sudo ./amneziawg-web.sh install
 |------|-------------|
 | VPN server only | `amneziawg-install.sh` |
 | VPN + web panel | `amneziawg-install.sh` then `amneziawg-web.sh install` |
-| Dev / full control | Clone the repo, then run both scripts from the checkout |
+| Advanced / development | Clone the repo, then run both scripts from the checkout |
 
 ---
 
-## 🟢 Minimal Setup — VPN Only
+## 🟢 Minimal Setup — VPN Only (Recommended)
+
+> Most users should start here.
 
 1. Update your system and reboot before installing.
-2. Run the commands from [Quick Start](#-quick-start) above.
+2. Run the commands from **[Quick Start](#-quick-start)**.
 3. Answer the prompts. The script installs AmneziaWG, configures the server, and generates a client config file.
 4. **Run the script again at any time** to add or remove clients.
 
@@ -53,20 +67,9 @@ sudo ./amneziawg-web.sh install
 
 ## 🟡 Advanced Setup — VPN + Web Panel
 
-> Requires the VPN to be installed first (see Minimal Setup above).
+> ⚠️ Requires VPN to be installed first (`amneziawg-install.sh`).
 
-Download and run the web panel installer:
-
-```bash
-curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web.sh
-chmod +x amneziawg-web.sh
-sudo ./amneziawg-web.sh install
-```
-
-The installer automatically downloads required files and builds the panel.  
-Add `--install-rust` if Rust is not already installed on the server.
-
-**Alternative: clone the repository** (best for teams or repeated upgrades):
+Use the **[Quick Start](#-quick-start)** commands above, or clone the repository (best for teams or repeated upgrades):
 
 ```bash
 git clone https://github.com/wiresock/amneziawg-install.git
@@ -74,6 +77,9 @@ cd amneziawg-install
 sudo ./amneziawg-install.sh
 sudo ./amneziawg-web.sh install
 ```
+
+The installer automatically downloads required files and builds the panel.
+Add `--install-rust` if Rust is not already installed on the server.
 
 See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for all installer options.
 
@@ -84,18 +90,17 @@ See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for all insta
 - **VPN client config** is saved to `~/awg0-client-<name>.conf`. Import it into any AmneziaWG client app.
 - **Web panel** is available at `http://YOUR_SERVER_IP:8080` once the service starts.
 - Re-run `sudo ./amneziawg-install.sh` to add or remove VPN clients interactively.
+- Check the web panel status at any time:
+  ```bash
+  ./amneziawg-web.sh status
+  ```
+  > The `status` command does not require `sudo`.
 
 ---
 
 ## 🔄 Maintenance
 
 All web panel lifecycle actions use the same script:
-
-**Check status:**
-
-```bash
-./amneziawg-web.sh status
-```
 
 **Upgrade the web panel:**
 
