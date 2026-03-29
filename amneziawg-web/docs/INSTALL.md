@@ -120,9 +120,11 @@ sudo chmod 0700 /etc/amneziawg-web
 ## 4. AWG binary and privilege setup
 
 `amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state,
-`sudo /usr/bin/awg set … peer … remove` to disable peers, and
+`sudo /usr/bin/awg set … peer … remove` to disable peers,
 `sudo /usr/bin/awg syncconf` + `sudo /usr/bin/awg-quick strip` to re-enable
-peers.  The service runs as a dedicated non-root user (`awg-web`) and uses
+peers, and `sudo /usr/local/bin/amneziawg-install.sh` for user lifecycle actions
+(add/remove clients).
+The service runs as a dedicated non-root user (`awg-web`) and uses
 tightly-scoped sudoers rules for only these commands.
 
 ### Automated setup (installer)
@@ -135,11 +137,13 @@ The installer (`amneziawg-web-install.sh`) handles all of this automatically:
 
 ### Manual setup
 
-If installing manually, create the sudoers rule:
+If installing manually, create the sudoers rules:
 
 ```bash
-echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *' \
-  | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
+cat <<'EOF' | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
+awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *
+awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --add-client *, /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients
+EOF
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
 ```
 
@@ -159,6 +163,7 @@ commands:
 - `awg show all dump` – read tunnel state (read-only)
 - `awg set … peer … remove` – disable a peer by removing it from the running interface
 - `awg syncconf` + `awg-quick strip` – re-enable a peer by syncing a sanitized on-disk config
+- `amneziawg-install.sh --add-client` / `--remove-client` / `--list-clients` – manage client lifecycle
 
 This follows the principle of least privilege.
 
@@ -171,12 +176,12 @@ active.
 
 | File | Purpose | Permissions |
 |---|---|---|
-| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump`, `awg set … peer … remove`, `awg syncconf`, and `awg-quick strip` as root | `0440 root:root` |
+| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`, and manage clients via install script | `0440 root:root` |
 
-The uninstaller removes this file.  The upgrader creates it if missing.
+The uninstaller removes this file.  The upgrader always rewrites it to keep rules current.
 
 Client config files are expected in `AWG_CONFIG_DIR` (default:
-`/etc/amneziawg/clients`).  Each file should be a standard WireGuard/AmneziaWG
+`/etc/amnezia/amneziawg/clients`).  Each file should be a standard WireGuard/AmneziaWG
 `*.conf` with a `[Peer] PublicKey` entry matching a live tunnel peer.
 
 The service user needs **read** access to the config directory:
@@ -186,7 +191,7 @@ The service user needs **read** access to the config directory:
 sudo usermod -aG amneziawg awg-web
 
 # Option B: grant read permission explicitly
-sudo chmod o+rx /etc/amneziawg/clients
+sudo chmod o+rx /etc/amnezia/amneziawg/clients
 ```
 
 ---
@@ -223,8 +228,9 @@ AUTH_SECURE_COOKIE=true
 # Server
 AWG_WEB_LISTEN=127.0.0.1:8080
 AWG_WEB_DB=/var/lib/amneziawg-web/awg-web.db
-AWG_CONFIG_DIR=/etc/amneziawg/clients
+AWG_CONFIG_DIR=/etc/amnezia/amneziawg/clients
 AWG_POLL_INTERVAL=30
+AWG_INSTALL_SCRIPT=/usr/local/bin/amneziawg-install.sh
 RUST_LOG=amneziawg_web=info
 EOF
 
@@ -341,7 +347,7 @@ docker run -d \
   --name amneziawg-web \
   -p 127.0.0.1:8080:8080 \
   -v /var/lib/amneziawg-web:/data \
-  -v /etc/amneziawg/clients:/etc/amneziawg/clients:ro \
+  -v /etc/amnezia/amneziawg/clients:/etc/amnezia/amneziawg/clients:ro \
   -e AUTH_ENABLED=true \
   -e AUTH_USERNAME=admin \
   -e AUTH_PASSWORD_HASH='$argon2id$...' \
@@ -362,7 +368,7 @@ docker run -d \
 |---|---|---|
 | `AWG_WEB_LISTEN` | `0.0.0.0:8080` | TCP bind address |
 | `AWG_WEB_DB` | `awg-web.db` | SQLite database path |
-| `AWG_CONFIG_DIR` | `/etc/amneziawg/clients` | Client `.conf` directory |
+| `AWG_CONFIG_DIR` | `/etc/amnezia/amneziawg/clients` | Client `.conf` directory |
 | `AWG_POLL_INTERVAL` | `30` | Poll interval in seconds |
 | `RUST_LOG` | `amneziawg_web=info` | Log verbosity |
 | `AUTH_ENABLED` | `false` | Enable auth; set `true` in production |
@@ -427,7 +433,7 @@ sudo ./amneziawg-web-install.sh \
 | `--install-dir DIR` | `/usr/local/bin` | Binary installation directory |
 | `--data-dir DIR` | `/var/lib/amneziawg-web` | SQLite database directory |
 | `--env-file FILE` | `/etc/amneziawg-web/env.conf` | Generated environment file path |
-| `--config-dir DIR` | `/etc/amneziawg/clients` | AWG client config directory |
+| `--config-dir DIR` | `/etc/amnezia/amneziawg/clients` | AWG client config directory |
 | `--host HOST` | `127.0.0.1` | Bind host |
 | `--port PORT` | `8080` | Bind port |
 | `--username NAME` | `admin` | Admin username |
@@ -448,7 +454,7 @@ sudo ./amneziawg-web-install.sh \
 2. **Build** – *(source mode only)* verifies Rust toolchain and runs `cargo build --release`
 3. **User + directories** – creates `awg-web` system user, data dir (`0750`), env dir (`0700`)
 4. **Binary install** – copies binary to `--install-dir`
-5. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440`) granting `awg-web` passwordless sudo for AWG inspection, peer removal, and config sync
+5. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440`) granting `awg-web` passwordless sudo for AWG inspection, peer removal, config sync, and install-script lifecycle actions
 6. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
 7. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
 

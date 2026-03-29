@@ -101,10 +101,9 @@ pub async fn find_by_public_key(
 pub async fn list_disabled_public_keys(
     pool: &SqlitePool,
 ) -> Result<std::collections::HashSet<String>, sqlx::Error> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT public_key FROM peers WHERE disabled = 1")
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT public_key FROM peers WHERE disabled = 1")
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(|(pk,)| pk).collect())
 }
 
@@ -329,9 +328,7 @@ mod tests {
         let db = test_db().await;
         insert_peer(&db.pool, "KEY_PK=", Some("PkLookup")).await;
 
-        let row = find_by_public_key(&db.pool, "KEY_PK=")
-            .await
-            .expect("find");
+        let row = find_by_public_key(&db.pool, "KEY_PK=").await.expect("find");
         assert!(row.is_some());
         let row = row.unwrap();
         assert_eq!(row.public_key, "KEY_PK=");

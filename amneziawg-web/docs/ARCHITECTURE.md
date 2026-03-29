@@ -27,7 +27,7 @@ server-rendered HTML UI.
 │   │       └──────────────────────┘      │ │
 │   └──────────────────────────────────────┘ │
 │                                            │
-│   /etc/amneziawg/clients/*.conf            │
+│   /etc/amnezia/amneziawg/clients/*.conf            │
 └────────────────────────────────────────────┘
 ```
 
@@ -54,7 +54,7 @@ interpolation**.  Parses the tab-separated output into Rust structs.
 
 ### `config_store` module (`src/config_store/`)
 
-Scans `/etc/amneziawg/clients/*.conf` (configurable) for client config files.
+Scans `/etc/amnezia/amneziawg/clients/*.conf` (configurable) for client config files.
 Extracts `PublicKey` from the `[Peer]` section to correlate configs with live
 peers.
 

@@ -323,16 +323,8 @@ Address = 10.8.0.3/32
     #[test]
     fn friendly_name_in_scan_result() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("awg0-client-gramm.conf"),
-            SAMPLE_CONFIG,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("awg0-client-iphone.conf"),
-            CONFIG_NO_PEER,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("awg0-client-gramm.conf"), SAMPLE_CONFIG).unwrap();
+        std::fs::write(dir.path().join("awg0-client-iphone.conf"), CONFIG_NO_PEER).unwrap();
         std::fs::write(dir.path().join("custom-peer.conf"), SAMPLE_CONFIG).unwrap();
 
         let mut result = scan(dir.path()).unwrap();

@@ -26,6 +26,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "libc",
  "rand",
  "serde",
  "serde_json",
