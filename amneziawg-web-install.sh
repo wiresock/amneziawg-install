@@ -27,6 +27,8 @@ cleanup() {
     fi
 }
 
+trap cleanup EXIT
+
 bootstrap_repo_if_needed() {
     if [[ -f "${INSTALLER}" ]]; then
         return 0
@@ -39,7 +41,6 @@ bootstrap_repo_if_needed() {
     fi
 
     BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/amneziawg-install.XXXXXX")"
-    trap cleanup EXIT
 
     echo "Installer files not found locally. Cloning ${REPO_URL} into ${BOOTSTRAP_DIR} ..." >&2
     if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 "${REPO_URL}" "${BOOTSTRAP_DIR}" >&2; then
@@ -59,5 +60,4 @@ bootstrap_repo_if_needed
 
 bash "${INSTALLER}" "$@"
 exit_code=$?
-cleanup
 exit "${exit_code}"
