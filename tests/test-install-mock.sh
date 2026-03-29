@@ -3287,7 +3287,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if echo "${UNIFIED_STATUS_OUTPUT}" | grep -Eqi '^Service:.*(active|inactive)'; then
+if echo "${UNIFIED_STATUS_OUTPUT}" | grep -qiE '^Service:.*(active|inactive)'; then
 	echo "OK: Status reports service state"
 else
 	echo "FAIL: Status does not report service state"
