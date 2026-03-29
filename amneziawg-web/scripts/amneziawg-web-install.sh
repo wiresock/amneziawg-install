@@ -595,8 +595,12 @@ detect_awg_config_dir() {
     done
 
     for dir in "${search_dirs[@]}"; do
-        # Look for the AWG client config naming pattern
-        if compgen -G "${dir}/"*-client-*.conf > /dev/null 2>&1; then
+        # Look for the AWG client config naming pattern (files like awg*-client-*.conf)
+        # Use a narrower glob and verify the file looks like an AWG config by checking
+        # for an [Interface] section before trusting the directory.
+        local cfg_file=""
+        cfg_file="$(compgen -G "${dir}/awg"*-client-*.conf | head -n 1 || true)"
+        if [[ -n "${cfg_file}" ]] && grep -qE '^\[Interface\]' "${cfg_file}" 2>/dev/null; then
             AWG_CONFIG_DIR="${dir}"
             info "Auto-detected AWG client config directory: ${AWG_CONFIG_DIR}"
             return 0
@@ -664,10 +668,29 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
             setfacl -m "u:${SERVICE_USER}:rx" "${AWG_CONFIG_DIR}" 2>/dev/null \
                 && info "Granted read ACL for ${SERVICE_USER} on ${AWG_CONFIG_DIR}." \
                 || warn "setfacl failed on ${AWG_CONFIG_DIR}."
-            # Default ACL: new files/dirs inherit read for the service user
-            setfacl -d -m "u:${SERVICE_USER}:rx" "${AWG_CONFIG_DIR}" 2>/dev/null \
-                && info "Set default ACL for future configs in ${AWG_CONFIG_DIR}." \
-                || warn "setfacl -d failed on ${AWG_CONFIG_DIR}."
+            # Default ACL: new files/dirs inherit read for the service user.
+            # Avoid setting a default ACL on a home directory itself (e.g. /home/<user> or /root),
+            # since that would grant the service user access to all future files in the home.
+            local is_home_dir=0
+            case "${AWG_CONFIG_DIR}" in
+                /root)
+                    is_home_dir=1
+                    ;;
+                /home/*)
+                    # Strip the /home/ prefix; if there are no further slashes, this is /home/<user>
+                    local rel_path="${AWG_CONFIG_DIR#/home/}"
+                    if [[ "${rel_path}" != *"/"* ]]; then
+                        is_home_dir=1
+                    fi
+                    ;;
+            esac
+            if [[ ${is_home_dir} -eq 0 ]]; then
+                setfacl -d -m "u:${SERVICE_USER}:r" "${AWG_CONFIG_DIR}" 2>/dev/null \
+                    && info "Set default ACL for future configs in ${AWG_CONFIG_DIR}." \
+                    || warn "setfacl -d failed on ${AWG_CONFIG_DIR}."
+            else
+                info "Skipping default ACL on ${AWG_CONFIG_DIR} because it appears to be a home directory; future configs may need manual ACLs."
+            fi
             # Apply read ACL to any existing .conf files
             find "${AWG_CONFIG_DIR}" -maxdepth 1 -name '*.conf' -type f -print0 2>/dev/null \
                 | while IFS= read -r -d '' cf; do
@@ -677,6 +700,10 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
             if compgen -G "${AWG_CONFIG_DIR}/"*.conf > /dev/null 2>&1; then
                 info "Applied read ACL to existing config files."
             fi
+        elif [[ "${AWG_CONFIG_DIR}" != "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
+            warn "setfacl is not installed but AWG_CONFIG_DIR (${AWG_CONFIG_DIR}) is non-default."
+            warn "The service user ${SERVICE_USER} may not be able to read client configs."
+            warn "Install the 'acl' package (e.g. apt install acl) and re-run, or manually adjust permissions."
         fi
 
         # For directories under /home, the parent home directory is typically
