@@ -2812,10 +2812,13 @@ echo "=== Phase 8: Peer visibility tests complete ==="
 #
 # Test scenarios:
 # a) help / no-args output
-# b) status subcommand
-# c) install / uninstall / upgrade via unified script
-# d) unknown subcommand error
-# e) standalone bootstrap via unified script
+# b) unknown subcommand error
+# c) status subcommand
+# d) install / uninstall via unified script
+# e) upgrade via unified script
+# f) standalone bootstrap via unified script (success path)
+# g) standalone bootstrap failure — git clone fails
+# h) standalone bootstrap failure — git not in PATH
 #
 echo ""
 echo "=== Phase 9: Unified entry point (amneziawg-web.sh) ==="
@@ -3112,6 +3115,123 @@ else
 fi
 
 rm -rf "${PHASE9_STANDALONE_DIR}" "${PHASE9_MOCK_GIT_DIR}"
+
+# ---- Phase 9g: standalone bootstrap failure — git clone fails ----
+echo ""
+echo "--- Phase 9g: standalone bootstrap failure — git clone fails ---"
+
+# Create a mock git that is present in PATH but always fails on clone,
+# simulating a network failure or an unreachable repository.
+PHASE9_FAIL_GIT_DIR="$(mktemp -d /tmp/awg-fail-git.XXXXXX)"
+cat > "${PHASE9_FAIL_GIT_DIR}/git" <<'PHASE9FAILGITMOCKEOF'
+#!/bin/bash
+# Mock git: fail on clone to simulate a network or repository error.
+if [[ "$1" == "clone" ]]; then
+	echo "fatal: unable to access repository (mock network failure)" >&2
+	exit 1
+fi
+exit 0
+PHASE9FAILGITMOCKEOF
+chmod +x "${PHASE9_FAIL_GIT_DIR}/git"
+
+PHASE9_STANDALONE_FAIL_DIR="$(mktemp -d /tmp/awg-standalone-fail.XXXXXX)"
+cp "${WEB_UNIFIED}" "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web.sh"
+
+# 9g-1: Install — git clone fails → exits non-zero with error message.
+UNIFIED_CLONEFAIL_INSTALL_RC=0
+UNIFIED_CLONEFAIL_INSTALL_OUTPUT=$(PATH="${PHASE9_FAIL_GIT_DIR}:${PATH}" \
+	bash "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web.sh" install \
+	--non-interactive \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable 2>&1) || UNIFIED_CLONEFAIL_INSTALL_RC=$?
+
+if [[ ${UNIFIED_CLONEFAIL_INSTALL_RC} -ne 0 ]]; then
+	echo "OK: Standalone unified install exits non-zero when git clone fails"
+else
+	echo "FAIL: Standalone unified install should fail when git clone fails"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${UNIFIED_CLONEFAIL_INSTALL_OUTPUT}" | grep -qiE "failed|error"; then
+	echo "OK: Standalone unified install error message is present when git clone fails"
+else
+	echo "FAIL: Standalone unified install missing helpful error message when git clone fails"
+	echo "  Output: ${UNIFIED_CLONEFAIL_INSTALL_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+# 9g-2: Uninstall — git clone fails → exits non-zero with error message.
+UNIFIED_CLONEFAIL_UNINSTALL_RC=0
+UNIFIED_CLONEFAIL_UNINSTALL_OUTPUT=$(PATH="${PHASE9_FAIL_GIT_DIR}:${PATH}" \
+	bash "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web.sh" uninstall \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--force 2>&1) || UNIFIED_CLONEFAIL_UNINSTALL_RC=$?
+
+if [[ ${UNIFIED_CLONEFAIL_UNINSTALL_RC} -ne 0 ]]; then
+	echo "OK: Standalone unified uninstall exits non-zero when git clone fails"
+else
+	echo "FAIL: Standalone unified uninstall should fail when git clone fails"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${UNIFIED_CLONEFAIL_UNINSTALL_OUTPUT}" | grep -qiE "failed|error"; then
+	echo "OK: Standalone unified uninstall error message is present when git clone fails"
+else
+	echo "FAIL: Standalone unified uninstall missing helpful error message when git clone fails"
+	echo "  Output: ${UNIFIED_CLONEFAIL_UNINSTALL_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+rm -rf "${PHASE9_STANDALONE_FAIL_DIR}" "${PHASE9_FAIL_GIT_DIR}"
+
+# ---- Phase 9h: standalone bootstrap failure — git not in PATH ----
+echo ""
+echo "--- Phase 9h: standalone bootstrap failure — git not in PATH ---"
+
+PHASE9_STANDALONE_NOGIT_DIR="$(mktemp -d /tmp/awg-standalone-nogit.XXXXXX)"
+cp "${WEB_UNIFIED}" "${PHASE9_STANDALONE_NOGIT_DIR}/amneziawg-web.sh"
+
+# Create a minimal PATH that has bash but not git
+PHASE9_NOGIT_PATH="/usr/bin:/bin"
+
+# 9h-1: Install — git missing → exits non-zero with error message.
+UNIFIED_NOGIT_INSTALL_RC=0
+UNIFIED_NOGIT_INSTALL_OUTPUT=$(PATH="${PHASE9_NOGIT_PATH}" \
+	bash "${PHASE9_STANDALONE_NOGIT_DIR}/amneziawg-web.sh" install \
+	--non-interactive \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable 2>&1) || UNIFIED_NOGIT_INSTALL_RC=$?
+
+if [[ ${UNIFIED_NOGIT_INSTALL_RC} -ne 0 ]]; then
+	echo "OK: Standalone unified install exits non-zero when git is not in PATH"
+else
+	echo "FAIL: Standalone unified install should fail when git is not in PATH"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${UNIFIED_NOGIT_INSTALL_OUTPUT}" | grep -qiE "git|not found|error"; then
+	echo "OK: Standalone unified install error mentions git when git is not in PATH"
+else
+	echo "FAIL: Standalone unified install missing helpful error message when git is not in PATH"
+	echo "  Output: ${UNIFIED_NOGIT_INSTALL_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+rm -rf "${PHASE9_STANDALONE_NOGIT_DIR}"
 
 echo ""
 echo "=== Phase 9: Unified entry point tests complete ==="
