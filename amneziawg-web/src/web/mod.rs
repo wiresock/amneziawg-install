@@ -1252,6 +1252,13 @@ async fn api_remove_user(
         Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
             Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
         }
+        Err(crate::admin::script_bridge::ScriptError::LockBusy) => {
+            Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "another add/remove operation is already in progress; please try again later" })),
+            )
+                .into_response())
+        }
         Err(e) => {
             tracing::error!(error = %e, "failed to remove user via script");
             Ok((

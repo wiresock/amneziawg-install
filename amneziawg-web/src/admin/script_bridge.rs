@@ -86,6 +86,9 @@ pub enum ScriptError {
     #[error("script timed out after {0:?}")]
     Timeout(Duration),
 
+    #[error("another add/remove operation is already in progress")]
+    LockBusy,
+
     #[error("failed to spawn script process: {0}")]
     Spawn(std::io::Error),
 
