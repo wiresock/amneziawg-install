@@ -748,10 +748,13 @@ pub fn create_client(
         // The peer is in the config file but not yet on the running interface.
         // It will become active only after an explicit AWG sync (e.g. `awg syncconf`)
         // or a full AWG restart; the poller does not perform this sync automatically.
+        let err_msg = e.to_string();
         tracing::warn!(
-            error = %e,
+            error = %err_msg,
             "interface sync failed after adding peer – peer will become active after an explicit AWG sync or restart"
         );
+        // Surface a hard error so callers know the operation was only partially applied.
+        return Err(CreateClientError::Awg(e));
     }
 
     Ok(CreateClientResult {
