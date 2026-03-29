@@ -2807,7 +2807,7 @@ echo ""
 echo "=== Phase 8: Peer visibility tests complete ==="
 
 # ============================================================
-# Phase 10: Unified entry point (amneziawg-web.sh)
+# Phase 9: Unified entry point (amneziawg-web.sh)
 # ============================================================
 #
 # Test scenarios:
@@ -2818,11 +2818,11 @@ echo "=== Phase 8: Peer visibility tests complete ==="
 # e) standalone bootstrap via unified script
 #
 echo ""
-echo "=== Phase 10: Unified entry point (amneziawg-web.sh) ==="
+echo "=== Phase 9: Unified entry point (amneziawg-web.sh) ==="
 
-# ---- Phase 10a: help and no-args ----
+# ---- Phase 9a: help and no-args ----
 echo ""
-echo "--- Phase 10a: help output and no-args default ---"
+echo "--- Phase 9a: help output and no-args default ---"
 
 # No arguments: should show help and exit 0
 UNIFIED_NOARGS_RC=0
@@ -2864,9 +2864,9 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# ---- Phase 10b: unknown subcommand ----
+# ---- Phase 9b: unknown subcommand ----
 echo ""
-echo "--- Phase 10b: unknown subcommand ---"
+echo "--- Phase 9b: unknown subcommand ---"
 
 UNIFIED_UNKNOWN_RC=0
 UNIFIED_UNKNOWN_OUTPUT=$(bash "${WEB_UNIFIED}" frobnicate 2>&1) || UNIFIED_UNKNOWN_RC=$?
@@ -2885,9 +2885,9 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# ---- Phase 10c: status subcommand ----
+# ---- Phase 9c: status subcommand ----
 echo ""
-echo "--- Phase 10c: status subcommand ---"
+echo "--- Phase 9c: status subcommand ---"
 
 # Re-install so status sees an installed binary
 rm -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
@@ -2933,9 +2933,9 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# ---- Phase 10d: install + uninstall via unified script ----
+# ---- Phase 9d: install + uninstall via unified script ----
 echo ""
-echo "--- Phase 10d: install and uninstall via unified script ---"
+echo "--- Phase 9d: install and uninstall via unified script ---"
 
 # Uninstall via unified script
 bash "${WEB_UNINSTALLER_IMPL}" \
@@ -2994,9 +2994,9 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# ---- Phase 10e: upgrade via unified script ----
+# ---- Phase 9e: upgrade via unified script ----
 echo ""
-echo "--- Phase 10e: upgrade via unified script ---"
+echo "--- Phase 9e: upgrade via unified script ---"
 
 # Re-install for upgrade test
 bash "${WEB_INSTALLER_IMPL}" \
@@ -3010,16 +3010,16 @@ bash "${WEB_INSTALLER_IMPL}" \
 	--password-hash "${TEST_PASSWORD_HASH}" \
 	--no-start --no-enable >/dev/null 2>&1
 
-PHASE10_UPGRADE_BIN="/tmp/amneziawg-web-phase10-upgrade"
-cat > "${PHASE10_UPGRADE_BIN}" <<'PHASE10UPGEOF'
+PHASE9_UPGRADE_BIN="/tmp/amneziawg-web-phase9-upgrade"
+cat > "${PHASE9_UPGRADE_BIN}" <<'PHASE9UPGEOF'
 #!/bin/bash
-echo "amneziawg-web stub v0.0.0-phase10-upgrade"
-PHASE10UPGEOF
-chmod +x "${PHASE10_UPGRADE_BIN}"
+echo "amneziawg-web stub v0.0.0-phase9-upgrade"
+PHASE9UPGEOF
+chmod +x "${PHASE9_UPGRADE_BIN}"
 
 UNIFIED_UPGRADE_RC=0
 bash "${WEB_UNIFIED}" upgrade \
-	--binary "${PHASE10_UPGRADE_BIN}" \
+	--binary "${PHASE9_UPGRADE_BIN}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
@@ -3034,22 +3034,22 @@ fi
 
 if [[ -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]] && \
 	[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" == \
-	   "$(sha256sum "${PHASE10_UPGRADE_BIN}" | awk '{print $1}')" ]]; then
+	   "$(sha256sum "${PHASE9_UPGRADE_BIN}" | awk '{print $1}')" ]]; then
 	echo "OK: Binary replaced via unified upgrade subcommand"
 else
 	echo "FAIL: Binary not replaced via unified upgrade subcommand"
 	FAILED=$((FAILED + 1))
 fi
 
-rm -f "${PHASE10_UPGRADE_BIN}"
+rm -f "${PHASE9_UPGRADE_BIN}"
 
-# ---- Phase 10f: standalone bootstrap via unified script ----
+# ---- Phase 9f: standalone bootstrap via unified script ----
 echo ""
-echo "--- Phase 10f: standalone bootstrap via unified script ---"
+echo "--- Phase 9f: standalone bootstrap via unified script ---"
 
 # Create a standalone directory containing only amneziawg-web.sh
-PHASE10_STANDALONE_DIR="$(mktemp -d /tmp/awg-standalone-unified.XXXXXX)"
-cp "${WEB_UNIFIED}" "${PHASE10_STANDALONE_DIR}/amneziawg-web.sh"
+PHASE9_STANDALONE_DIR="$(mktemp -d /tmp/awg-standalone-unified.XXXXXX)"
+cp "${WEB_UNIFIED}" "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh"
 
 # Ensure a clean state
 bash "${WEB_UNINSTALLER_IMPL}" \
@@ -3062,9 +3062,9 @@ rm -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
 mkdir -p "${WEB_TEST_INSTALL_DIR}" "${WEB_TEST_DATA_DIR}" \
 	"$(dirname "${WEB_TEST_ENV_FILE}")"
 
-# Use mock git from Phase 9 (or create one if clean-up removed it)
-PHASE10_MOCK_GIT_DIR="$(mktemp -d /tmp/awg-mock-git-ph10.XXXXXX)"
-cat > "${PHASE10_MOCK_GIT_DIR}/git" <<PHASE10GITMOCKEOF
+# Create a mock git that simulates a successful bootstrap clone
+PHASE9_MOCK_GIT_DIR="$(mktemp -d /tmp/awg-mock-git-ph9.XXXXXX)"
+cat > "${PHASE9_MOCK_GIT_DIR}/git" <<PHASE9GITMOCKEOF
 #!/bin/bash
 if [[ "\$1" == "clone" ]]; then
 	TARGET=""
@@ -3073,13 +3073,13 @@ if [[ "\$1" == "clone" ]]; then
 	exit 0
 fi
 exit 0
-PHASE10GITMOCKEOF
-chmod +x "${PHASE10_MOCK_GIT_DIR}/git"
+PHASE9GITMOCKEOF
+chmod +x "${PHASE9_MOCK_GIT_DIR}/git"
 
 # Install via standalone unified script with mock git
 UNIFIED_BOOTSTRAP_RC=0
-UNIFIED_BOOTSTRAP_OUTPUT=$(PATH="${PHASE10_MOCK_GIT_DIR}:${PATH}" \
-	bash "${PHASE10_STANDALONE_DIR}/amneziawg-web.sh" install \
+UNIFIED_BOOTSTRAP_OUTPUT=$(PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
+	bash "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh" install \
 	--non-interactive --force \
 	--binary-src "${STUB_BINARY}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
@@ -3111,10 +3111,10 @@ else
 	echo "WARN: Standalone unified install output does not mention cloning (check stderr capture)"
 fi
 
-rm -rf "${PHASE10_STANDALONE_DIR}" "${PHASE10_MOCK_GIT_DIR}"
+rm -rf "${PHASE9_STANDALONE_DIR}" "${PHASE9_MOCK_GIT_DIR}"
 
 echo ""
-echo "=== Phase 10: Unified entry point tests complete ==="
+echo "=== Phase 9: Unified entry point tests complete ==="
 
 echo ""
 echo "=========================================="
