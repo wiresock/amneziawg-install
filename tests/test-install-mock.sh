@@ -1499,7 +1499,7 @@ while IFS= read -r rw_line; do
 		break
 	fi
 done < <(grep '^ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null)
-if ${AWG_RW_MATCH}; then
+if [[ "${AWG_RW_MATCH}" == "true" ]]; then
 	echo "OK: systemd unit ReadWritePaths covers config dir"
 else
 	echo "FAIL: systemd unit ReadWritePaths does not cover config dir ${WEB_TEST_AWG_CONFIG_DIR}"
@@ -1666,7 +1666,7 @@ while IFS= read -r rw_line; do
 		break
 	fi
 done < <(grep '^ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null)
-if ${HOME_RW_MATCH}; then
+if [[ "${HOME_RW_MATCH}" == "true" ]]; then
 	echo "OK: ReadWritePaths covers ${HOME_CONFIG_DIR}"
 else
 	echo "FAIL: ReadWritePaths should cover ${HOME_CONFIG_DIR}"

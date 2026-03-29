@@ -133,6 +133,9 @@ fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateCl
         CreateClientError::Awg(_) => {
             "Failed to create user: AWG command failed.".to_string()
         }
+        CreateClientError::LockBusy => {
+            "Failed to create user: another add/remove operation is already in progress; please try again later.".to_string()
+        }
         CreateClientError::Internal(_) => {
             "Failed to create user: internal server error.".to_string()
         }
@@ -1177,6 +1180,13 @@ async fn api_create_user(
             )
                 .into_response())
         }
+        Err(crate::admin::client_manager::CreateClientError::LockBusy) => {
+            Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "another add/remove operation is already in progress; please try again later" })),
+            )
+                .into_response())
+        }
         Err(e) => {
             tracing::error!(error = %e, "failed to create user");
             Ok((
@@ -1309,6 +1319,13 @@ async fn post_add_user_form(
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             Ok(Html(render_peer_list_with_error(&peers, &csrf, &msg)).into_response())
+        }
+        Err(crate::admin::client_manager::CreateClientError::LockBusy) => {
+            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+            let csrf = session_csrf_from_headers(&state, &headers);
+            let message = "Another add/remove operation is already in progress; please try again later.";
+            Ok(Html(render_peer_list_with_error(&peers, &csrf, message)).into_response())
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to create user via HTML form");

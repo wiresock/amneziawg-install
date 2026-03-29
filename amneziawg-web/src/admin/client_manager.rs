@@ -64,6 +64,9 @@ pub enum CreateClientError {
     #[error("AWG command failed: {0}")]
     Awg(#[from] crate::awg::AwgError),
 
+    #[error("another add/remove operation is already in progress")]
+    LockBusy,
+
     #[error("internal error during client creation: {0}")]
     Internal(String),
 }
@@ -83,6 +86,7 @@ pub fn sanitized_create_error_category(error: &CreateClientError) -> &'static st
         CreateClientError::FileWrite(_) => "file_write_failed",
         CreateClientError::ConfigParse(_) => "config_parse_failed",
         CreateClientError::Awg(_) => "awg_command_failed",
+        CreateClientError::LockBusy => "lock_busy",
         CreateClientError::Internal(_) => "internal_error",
     }
 }
@@ -614,9 +618,14 @@ pub fn create_client(
         let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
-            return Err(CreateClientError::FileWrite(format!(
-                "failed to acquire lock for client creation: {err}"
-            )));
+            return match err.raw_os_error() {
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+                    Err(CreateClientError::LockBusy)
+                }
+                _ => Err(CreateClientError::FileWrite(format!(
+                    "failed to acquire lock for client creation: {err}"
+                ))),
+            };
         }
         f
     };
@@ -732,11 +741,9 @@ pub fn create_client(
 
     info!(client = name, "peer block appended to server config");
 
-    // Explicitly release the creation lock before the (potentially slow)
-    // interface sync so other concurrent create_client calls can proceed.
-    drop(_lock_file);
-
     // Step 9: Sync the running AWG interface.
+    // Keep the lock held through strip+syncconf to prevent a concurrent
+    // remove/add from modifying on-disk config between the two steps.
     if let Err(e) = awg::sync_interface(&params.server_awg_nic, disabled_keys) {
         // The peer is in the config file but not yet on the running interface.
         // It will become active only after an explicit AWG sync (e.g. `awg syncconf`)
