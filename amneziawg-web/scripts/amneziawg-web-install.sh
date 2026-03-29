@@ -72,6 +72,7 @@ ENV_DIR="${DEFAULT_ENV_DIR}"
 ENV_FILE="${DEFAULT_ENV_FILE}"
 AWG_CONFIG_DIR="${DEFAULT_AWG_CONFIG_DIR}"
 AWG_CONFIG_DIR_SET=false
+AWG_DETECTED_HOME_DIR=""     # set by detect_awg_config_dir when configs are in a home dir
 LISTEN_HOST="${DEFAULT_LISTEN_HOST}"
 LISTEN_PORT="${DEFAULT_LISTEN_PORT}"
 POLL_INTERVAL="${DEFAULT_POLL_INTERVAL}"
@@ -569,6 +570,16 @@ detect_awg_config_dir() {
         return 0
     fi
 
+    # First, check whether the current default directory already contains
+    # valid client configs.  If so, no need to scan home directories.
+    local default_cfg=""
+    default_cfg="$(compgen -G "${DEFAULT_AWG_CONFIG_DIR}/awg*-client-*.conf" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${default_cfg}" ]] && [[ -f "${default_cfg}" && -r "${default_cfg}" ]] && \
+        grep -qE '^[[:space:]]*\[Interface\]' "${default_cfg}" 2>/dev/null; then
+        info "Default config directory ${DEFAULT_AWG_CONFIG_DIR} already contains client configs; skipping auto-detection."
+        return 0
+    fi
+
     # Search common locations for AWG client configs.
     # Priority: SUDO_USER's home, root's home, any /home/* directory.
     local -a search_dirs=()
@@ -611,9 +622,9 @@ detect_awg_config_dir() {
             # Determine whether this is a home directory (/root or /home/<user>).
             # Do not point AWG_CONFIG_DIR at the home directory itself, because
             # later filesystem hardening only grants execute (x) on home dirs,
-            # which is insufficient for std::fs::read_dir().  Instead, create a
-            # dedicated subdirectory under the home that can safely be granted rx
-            # and populated with symlinks to the relevant client config files.
+            # which is insufficient for std::fs::read_dir().  Instead, record the
+            # source home directory so setup_filesystem() can create a dedicated
+            # subdirectory and populate it with symlinks after user confirmation.
             local detected_is_home=0
             case "${dir}" in
                 /root)
@@ -628,28 +639,12 @@ detect_awg_config_dir() {
             esac
 
             if [[ ${detected_is_home} -eq 1 ]]; then
-                local dest_dir="${dir}/amneziawg-clients"
-                if [[ ! -d "${dest_dir}" ]]; then
-                    mkdir -p "${dest_dir}" || {
-                        warn "Failed to create ${dest_dir}; skipping ${dir} for AWG config auto-detect."
-                        continue
-                    }
-                    # Best-effort permission tightening; failures here should not abort install.
-                    chmod 750 "${dest_dir}" 2>/dev/null || true
-                fi
-
-                # Symlink all matching client configs into the dedicated directory so the
-                # web panel can safely scan them.
-                (
-                    shopt -s nullglob
-                    for f in "${dir}"/awg*-client-*.conf; do
-                        if [[ -f "${f}" && -r "${f}" ]]; then
-                            ln -sf "${f}" "${dest_dir}/$(basename "${f}")" 2>/dev/null || true
-                        fi
-                    done
-                )
-
-                AWG_CONFIG_DIR="${dest_dir}"
+                # Record the source home directory for deferred subdirectory
+                # creation in setup_filesystem().  Set AWG_CONFIG_DIR to the
+                # target subdirectory path so the rest of the installer sees
+                # the intended final directory (read-only at this stage).
+                AWG_DETECTED_HOME_DIR="${dir}"
+                AWG_CONFIG_DIR="${dir}/amneziawg-clients"
             else
                 AWG_CONFIG_DIR="${dir}"
             fi
@@ -701,6 +696,49 @@ setup_filesystem() {
     fi
     chown root:root "${ENV_DIR}"
     chmod 0700 "${ENV_DIR}"
+
+    # If auto-detection found configs in a home directory, create the dedicated
+    # subdirectory and populate it with symlinks now (deferred from detect to
+    # avoid filesystem side effects before user confirmation).
+    if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
+        local dest_dir="${AWG_CONFIG_DIR}"
+        if [[ ! -d "${dest_dir}" ]]; then
+            mkdir -p "${dest_dir}" || {
+                warn "Failed to create ${dest_dir}; skipping auto-detected config symlinks."
+                AWG_DETECTED_HOME_DIR=""
+            }
+            # Best-effort permission tightening; failures here should not abort install.
+            chmod 750 "${dest_dir}" 2>/dev/null || true
+        fi
+
+        if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
+            # Symlink all matching client configs into the dedicated directory so
+            # the web panel can safely scan them.
+            (
+                shopt -s nullglob
+                for f in "${AWG_DETECTED_HOME_DIR}"/awg*-client-*.conf; do
+                    if [[ -f "${f}" && -r "${f}" ]]; then
+                        link_name="${dest_dir}/$(basename "${f}")"
+                        # Do not overwrite existing non-symlink files.
+                        if [[ -e "${link_name}" && ! -L "${link_name}" ]]; then
+                            warn "Skipping ${f}: destination ${link_name} already exists and is not a symlink."
+                            continue
+                        fi
+                        # If symlink already points to the same target, skip.
+                        if [[ -L "${link_name}" ]]; then
+                            existing_target="$(readlink -f "${link_name}" 2>/dev/null || true)"
+                            new_target="$(readlink -f "${f}" 2>/dev/null || true)"
+                            if [[ -n "${existing_target}" && "${existing_target}" == "${new_target}" ]]; then
+                                continue
+                            fi
+                        fi
+                        ln -sf "${f}" "${link_name}" 2>/dev/null || true
+                    fi
+                done
+            )
+            info "Symlinked client configs from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}."
+        fi
+    fi
 
     # Give the service user read access to the AWG config directory if it exists
     if [[ -d "${AWG_CONFIG_DIR}" ]]; then
@@ -794,9 +832,18 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                         | while IFS= read -r -d '' cf; do
                             setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
                         done
-                    # Log only if there were any .conf files
+                    # Also handle symlinked configs by applying ACLs to their real targets,
+                    # which are often mode 600 and would otherwise be unreadable.
+                    find "${target_dir}" -maxdepth 1 -name '*.conf' -type l -print0 2>/dev/null \
+                        | while IFS= read -r -d '' link; do
+                            target_path="$(readlink -f -- "${link}" 2>/dev/null || true)"
+                            if [[ -n "${target_path}" && -f "${target_path}" ]]; then
+                                setfacl -m "u:${SERVICE_USER}:r" "${target_path}" 2>/dev/null || true
+                            fi
+                        done
+                    # Log only if there were any .conf files (regular or symlinked)
                     if compgen -G "${target_dir}/*.conf" > /dev/null 2>&1; then
-                        info "Applied read ACL to existing config files."
+                        info "Applied read ACL to existing config files and symlink targets."
                     fi
                 else
                     # Home directory: limit to expected AmneziaWG client configs.
@@ -804,9 +851,17 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                         | while IFS= read -r -d '' cf; do
                             setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
                         done
+                    # Also handle symlinked configs by applying ACLs to their real targets.
+                    find "${target_dir}" -maxdepth 1 -name 'awg*-client-*.conf' -type l -print0 2>/dev/null \
+                        | while IFS= read -r -d '' link; do
+                            target_path="$(readlink -f -- "${link}" 2>/dev/null || true)"
+                            if [[ -n "${target_path}" && -f "${target_path}" ]]; then
+                                setfacl -m "u:${SERVICE_USER}:r" "${target_path}" 2>/dev/null || true
+                            fi
+                        done
                     # Log only if there were any matching client config files
                     if compgen -G "${target_dir}/awg*-client-*.conf" > /dev/null 2>&1; then
-                        info "Applied read ACL to existing client config files in home directory."
+                        info "Applied read ACL to existing client config files and symlink targets in home directory."
                     fi
                 fi
             fi

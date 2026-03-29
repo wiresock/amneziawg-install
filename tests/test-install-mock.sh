@@ -1256,6 +1256,23 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+# Verify the service user can actually read the config through the symlink.
+# This catches permission regressions where ACLs are not applied to the real
+# target file (the original config is typically mode 600).
+WEB_SERVICE_USER="awg-web"
+if id "${WEB_SERVICE_USER}" &>/dev/null; then
+	if runuser -u "${WEB_SERVICE_USER}" -- cat "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" >/dev/null 2>&1; then
+		echo "OK: Service user ${WEB_SERVICE_USER} can read config through symlink"
+	else
+		echo "FAIL: Service user ${WEB_SERVICE_USER} cannot read config through symlink"
+		echo "  Symlink target perms: $(stat -c '%a' "${AUTODETECT_CONF}" 2>/dev/null || echo 'N/A')"
+		echo "  ACL on target: $(getfacl -p "${AUTODETECT_CONF}" 2>/dev/null | grep "${WEB_SERVICE_USER}" || echo 'none')"
+		FAILED=$((FAILED + 1))
+	fi
+else
+	echo "SKIP: Service user ${WEB_SERVICE_USER} does not exist; cannot verify read access"
+fi
+
 # Verify the auto-detection was logged
 if echo "${WEB_AUTODETECT_OUTPUT}" | grep -q "Auto-detected AWG client config directory"; then
 	echo "OK: Auto-detection logged in output"
@@ -1278,8 +1295,6 @@ fi
 rm -f "${AUTODETECT_CONF}"
 
 # Clean up the dedicated subdirectory and any ACL entries on /root left by the test.
-# Use the same service user name as the installer (SERVICE_USER in the script).
-WEB_SERVICE_USER="awg-web"
 rm -rf "${AUTODETECT_EXPECTED_DIR}"
 if command -v setfacl >/dev/null 2>&1; then
 	setfacl -x "u:${WEB_SERVICE_USER}" /root 2>/dev/null || true
