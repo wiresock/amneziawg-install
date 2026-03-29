@@ -3199,10 +3199,15 @@ echo "--- Phase 9h: standalone bootstrap failure — git not in PATH ---"
 PHASE9_STANDALONE_NOGIT_DIR="$(mktemp -d /tmp/awg-standalone-nogit.XXXXXX)"
 cp "${WEB_UNIFIED}" "${PHASE9_STANDALONE_NOGIT_DIR}/amneziawg-web.sh"
 
-# Resolve bash to an absolute path before clobbering PATH, then set PATH to
-# a dedicated empty directory so that `command -v git` reliably fails.
+# Resolve bash to an absolute path before clobbering PATH, then build a
+# minimal PATH directory that has required coreutils but intentionally omits
+# git so the unified script reliably hits `command -v git` failure.
 PHASE9_BASH_ABS="$(command -v bash)"
 PHASE9_NOGIT_DIR="$(mktemp -d /tmp/awg-nogit-path.XXXXXX)"
+for _cmd in dirname id basename cat rm mkdir mktemp readlink; do
+	_abs="$(command -v "$_cmd" 2>/dev/null || true)"
+	[[ -n "$_abs" ]] && ln -sf "$_abs" "${PHASE9_NOGIT_DIR}/"
+done
 
 # 9h-1: Install — git missing → exits non-zero with error message.
 UNIFIED_NOGIT_INSTALL_RC=0
