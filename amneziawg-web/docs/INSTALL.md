@@ -35,14 +35,15 @@ If you have a pre-built binary, use `--binary-src` instead:
 sudo ./amneziawg-web-install.sh --binary-src ./target/release/amneziawg-web
 ```
 
-The root-level `amneziawg-web-install.sh` is a thin entrypoint that delegates to
+The root-level `amneziawg-web-install.sh` is a thin legacy wrapper that delegates to
+`amneziawg-web.sh install`, which in turn runs
 `amneziawg-web/scripts/amneziawg-web-install.sh`. All installer logic lives in
-the sub-script; the root-level file exists purely for operator convenience so both
+the sub-script; the root-level files exist purely for operator convenience so both
 installers are discoverable in the same place.
 
-If you download only the root-level `amneziawg-web-install.sh`, it will
-shallow-clone the repository to a temporary directory automatically before
-continuing.
+If you download only `amneziawg-web.sh` (or both `amneziawg-web-install.sh` and
+`amneziawg-web.sh`), the script will shallow-clone the repository to a temporary
+directory automatically before continuing.
 
 The installer handles user creation, directory setup, environment file generation,
 and systemd service installation. See [Installer reference](#installer-reference)
@@ -480,12 +481,15 @@ sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
 sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
 ```
 
-Like the installer, the root-level `amneziawg-web-upgrade.sh` is a thin entrypoint
-that delegates to `amneziawg-web/scripts/amneziawg-web-upgrade.sh`.
+Like the installer, the root-level `amneziawg-web-upgrade.sh` is a thin legacy wrapper
+that delegates to `amneziawg-web.sh`, which in turn runs
+`amneziawg-web/scripts/amneziawg-web-upgrade.sh`.
 
 If the web panel was installed via the standalone wrapper and the repository files are
-not present locally, the wrapper will shallow-clone the repository to a temporary
-directory automatically (source-mode upgrades will then build from that checkout).
+not present locally, `amneziawg-web.sh` will shallow-clone the repository to a
+temporary directory automatically (source-mode upgrades will then build from that
+checkout). Only the wrapper script itself needs to be present; the repository tree is
+fetched on demand when missing.
 
 ### Default behavior
 
@@ -609,12 +613,13 @@ A companion uninstall script is provided at the repository root:
 sudo ./amneziawg-web-uninstall.sh
 ```
 
-Like the installer, the root-level `amneziawg-web-uninstall.sh` is a thin entrypoint
-that delegates to `amneziawg-web/scripts/amneziawg-web-uninstall.sh`.
+Like the installer, the root-level `amneziawg-web-uninstall.sh` is a thin legacy wrapper
+that delegates to `amneziawg-web.sh`, which in turn runs
+`amneziawg-web/scripts/amneziawg-web-uninstall.sh`.
 
 If the web panel was installed via the standalone wrapper and the repository files are
-not present locally, the wrapper will shallow-clone the repository to a temporary
-directory automatically:
+not present locally, `amneziawg-web.sh` will shallow-clone the repository to a
+temporary directory automatically:
 
 ```bash
 # Works even if you never cloned the repository

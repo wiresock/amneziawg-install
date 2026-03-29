@@ -114,9 +114,21 @@ cmd_status() {
     # Allow overriding paths for non-default installs
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --install-dir) install_dir="$2"; shift 2 ;;
-            --env-file)    env_file="$2"; shift 2 ;;
-            --data-dir)    data_dir="$2"; shift 2 ;;
+            --install-dir)
+                if [[ $# -lt 2 ]]; then
+                    echo "Missing value for --install-dir" >&2; exit 1
+                fi
+                install_dir="$2"; shift 2 ;;
+            --env-file)
+                if [[ $# -lt 2 ]]; then
+                    echo "Missing value for --env-file" >&2; exit 1
+                fi
+                env_file="$2"; shift 2 ;;
+            --data-dir)
+                if [[ $# -lt 2 ]]; then
+                    echo "Missing value for --data-dir" >&2; exit 1
+                fi
+                data_dir="$2"; shift 2 ;;
             --help)
                 cat <<EOF
 Usage: $0 status [--install-dir DIR] [--env-file FILE] [--data-dir DIR]
