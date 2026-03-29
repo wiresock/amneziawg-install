@@ -1,17 +1,12 @@
-# AmneziaWG installer
+# AmneziaWG Installer
 
-**This project is a bash script that aims to setup a [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) VPN on a Linux server, as easily as possible!**
+Set up an [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscated VPN on any supported Linux server in under 2 minutes.
 
-There are two ways to use this repository:
+---
 
-- **Standalone AmneziaWG installer:** download only `amneziawg-install.sh` and use it by itself.
-- **AmneziaWG + web panel:** use the repository checkout, or download `amneziawg-web-install.sh` and let it clone the repository automatically before building the web panel.
+## 🚀 Quick Start
 
-### Which flow should I use?
-
-#### 1. Install AmneziaWG only
-
-Use this if you only need the VPN server and client configuration files:
+**VPN only (required):**
 
 ```bash
 curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-install.sh
@@ -19,21 +14,48 @@ chmod +x amneziawg-install.sh
 sudo ./amneziawg-install.sh
 ```
 
-#### 2. Install the web panel too
-
-Use this if you want the browser-accessible management interface in addition to the VPN server.
-
-**Option A: clone the repository (best for install / upgrade / uninstall workflows)**
+**Add the web panel (optional):**
 
 ```bash
-git clone https://github.com/wiresock/amneziawg-install.git
-cd amneziawg-install
-sudo ./amneziawg-install.sh
+curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web-install.sh
+chmod +x amneziawg-web-install.sh
 sudo ./amneziawg-web-install.sh
-# open http://127.0.0.1:8080
+# open http://YOUR_SERVER_IP:8080
 ```
 
-**Option B: download the web installer only**
+---
+
+## 🧠 How It Works
+
+- **`amneziawg-install.sh`** — **required.** Installs the VPN server, generates obfuscation parameters, and creates client configs.
+- **`amneziawg-web-install.sh`** — **optional.** Adds a browser-accessible management panel on top of the VPN. Automatically downloads everything it needs.
+
+---
+
+## 🤔 Choose Your Setup
+
+| Goal | What to run |
+|------|-------------|
+| VPN server only | `amneziawg-install.sh` |
+| VPN + web panel | `amneziawg-install.sh` then `amneziawg-web-install.sh` |
+| Dev / full control | Clone the repo, then run both scripts from the checkout |
+
+---
+
+## 🟢 Minimal Setup — VPN Only
+
+1. Update your system and reboot before installing.
+2. Run the commands from [Quick Start](#-quick-start) above.
+3. Answer the prompts. The script installs AmneziaWG, configures the server, and generates a client config file.
+4. **Run the script again at any time** to add or remove clients.
+
+---
+
+## 🟡 Advanced Setup — VPN + Web Panel
+
+> Requires the VPN to be installed first (see Minimal Setup above).
+
+Download and run the web panel installer:
 
 ```bash
 curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web-install.sh
@@ -41,86 +63,63 @@ chmod +x amneziawg-web-install.sh
 sudo ./amneziawg-web-install.sh
 ```
 
-When `amneziawg-web-install.sh` does not find the repository files next to it, it
-will shallow-clone the repository to a temporary directory and continue from there.
-Add `--install-rust` if the target host does not already have Rust installed.
+The installer automatically downloads required files and builds the panel.  
+Add `--install-rust` if Rust is not already installed on the server.
 
-To upgrade the web panel (rebuild from source and replace):
+**Alternative: clone the repository** (best for teams or repeated upgrades):
+
+```bash
+git clone https://github.com/wiresock/amneziawg-install.git
+cd amneziawg-install
+sudo ./amneziawg-install.sh
+sudo ./amneziawg-web-install.sh
+```
+
+See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for all installer options.
+
+---
+
+## ⚙️ After Installation
+
+- **VPN client config** is saved to `~/awg0-client-<name>.conf`. Import it into any AmneziaWG client app.
+- **Web panel** is available at `http://YOUR_SERVER_IP:8080` once the service starts.
+- Re-run `sudo ./amneziawg-install.sh` to add or remove VPN clients interactively.
+
+---
+
+## 🔄 Maintenance
+
+**Upgrade the web panel:**
 
 ```bash
 sudo ./amneziawg-web-upgrade.sh
 ```
 
-To upgrade with a pre-built binary:
+**Uninstall the web panel (keeps config and data):**
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+sudo ./amneziawg-web-uninstall.sh --force
 ```
 
-To uninstall the web panel later:
+**Uninstall and purge all data:**
 
 ```bash
-sudo ./amneziawg-web-uninstall.sh                              # safe: removes service + binary, keeps config/data
-sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force  # full purge
+sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force
 ```
 
-Both `amneziawg-web-upgrade.sh` and `amneziawg-web-uninstall.sh` support the same
-standalone auto-clone behavior as the installer: if the repository files are not
-present locally they will shallow-clone the repository to a temporary directory
-and continue from there.
-
-See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for details.
+> Both `amneziawg-web-upgrade.sh` and `amneziawg-web-uninstall.sh` work standalone — they automatically download required files if the repository is not present locally.
 
 ---
 
-## Requirements
+## ⚡ Non-Interactive Install
 
-Supported distributions:
-
-- AlmaLinux >= 9
-- Debian >= 11
-- Rocky Linux >= 9
-- Ubuntu >= 22.04
-
-2GB of free space is required for temporary files.
-
-## Usage
-
-Before installation it is strictly recommended to upgrade your system to the latest available version and perform the reboot afterwards.
-
-Use curl or wget to download the standalone script:
-```bash
-curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-install.sh
-```
-```bash
-wget https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-install.sh
-```
-
-Set permissions:
-```bash
-chmod +x amneziawg-install.sh
-```
-
-And execute:
-```bash
-./amneziawg-install.sh
-```
-
-Answer the questions asked by the script and it will take care of the rest.
-
-It will install AmneziaWG (kernel module and tools) on the server, configure it, create a systemd service and a client configuration file.
-
-Run the script again to add or remove clients!
-
-## Non-Interactive Installation
-
-For automated deployments, set `AUTO_INSTALL=y` to skip all prompts and use sensible defaults:
+Skip all prompts and use sensible defaults:
 
 ```bash
-AUTO_INSTALL=y ./amneziawg-install.sh
+sudo AUTO_INSTALL=y ./amneziawg-install.sh
 ```
 
-You can override individual defaults via environment variables:
+Override specific defaults with environment variables:
 
 | Variable | Default |
 |----------|---------|
@@ -129,63 +128,87 @@ You can override individual defaults via environment variables:
 | `SERVER_AWG_NIC` | `awg0` |
 | `SERVER_AWG_IPV4` | `10.66.66.1` |
 | `SERVER_AWG_IPV6` | `fd42:42:42::1` |
-| `SERVER_PORT` | Random (49152-65535) |
+| `SERVER_PORT` | Random (49152–65535) |
 | `CLIENT_DNS_1` | `1.1.1.1` |
 | `CLIENT_DNS_2` | `1.0.0.1` |
 | `ALLOWED_IPS` | `0.0.0.0/0,::/0` |
 
-Example with custom port and DNS:
+Example:
+
 ```bash
-AUTO_INSTALL=y SERVER_PORT=51820 CLIENT_DNS_1=8.8.8.8 ./amneziawg-install.sh
+sudo AUTO_INSTALL=y SERVER_PORT=51820 CLIENT_DNS_1=8.8.8.8 ./amneziawg-install.sh
 ```
 
-A default client named `client` is created automatically when the server interface is successfully brought up. If the AmneziaWG kernel module cannot be loaded (e.g., missing kernel headers), client generation is skipped and you can add clients by re-running the script after resolving the issue, or (for existing installations, especially after migration) by using the interactive menu to regenerate all client configurations. Obfuscation parameters (Jc, Jmin/Jmax, S1-S4, H1-H4) are randomly generated.
+---
 
-## AmneziaWG 2.0 Features
+## 📦 Requirements
 
-This installer supports AmneziaWG 2.0 parameters:
+Supported Linux distributions:
 
-- **S3/S4**: Additional obfuscation parameters with bidirectional constraint validation. The protocol requires both `S3 + 56 != S4` AND `S4 + 56 != S3` to avoid the 56-byte WireGuard handshake initiation message size in both directions.
-- **H1-H4 Ranges**: Header randomization using non-overlapping ranges for enhanced traffic obfuscation. Each H parameter accepts a range in `min-max` format (e.g., `100-200`) or a single value.
+- AlmaLinux ≥ 9
+- Debian ≥ 11
+- Rocky Linux ≥ 9
+- Ubuntu ≥ 22.04
 
-### Parameter Constraints
+2 GB of free space required for temporary build files.
+
+---
+
+<details>
+<summary>⚙️ AmneziaWG 2.0 Parameters</summary>
+
+### Obfuscation Parameters
+
+AmneziaWG 2.0 adds S3/S4 and H1–H4 range parameters for enhanced traffic obfuscation. The installer generates all values automatically.
 
 | Parameter | Range | Constraint |
 |-----------|-------|------------|
-| Jc | 1-128 | None |
-| Jmin | 1-1280 | Jmin <= Jmax |
-| Jmax | 1-1280 | Jmin <= Jmax |
-| S1 | 15-150 | S1 + 56 != S2 AND S2 + 56 != S1 |
-| S2 | 15-150 | S1 + 56 != S2 AND S2 + 56 != S1 |
-| S3 | 15-150 | S3 + 56 != S4 AND S4 + 56 != S3 |
-| S4 | 15-150 | S3 + 56 != S4 AND S4 + 56 != S3 |
-| H1-H4 | 5-2147483647 | Ranges must not overlap |
+| Jc | 1–128 | — |
+| Jmin | 1–1280 | Jmin ≤ Jmax |
+| Jmax | 1–1280 | Jmin ≤ Jmax |
+| S1 | 15–150 | S1 + 56 ≠ S2 and S2 + 56 ≠ S1 |
+| S2 | 15–150 | S1 + 56 ≠ S2 and S2 + 56 ≠ S1 |
+| S3 | 15–150 | S3 + 56 ≠ S4 and S4 + 56 ≠ S3 |
+| S4 | 15–150 | S3 + 56 ≠ S4 and S4 + 56 ≠ S3 |
+| H1–H4 | 5–2147483647 | Ranges must not overlap |
 
-### Migration from Pre-2.0
+H parameters accept a range (`min-max`) or a single value.
 
-When running the script on an existing pre-2.0 installation, it will automatically detect the need for migration and prompt for confirmation before proceeding.
+</details>
 
-**IMPORTANT:** After migration, all existing client configurations will be incompatible and must be regenerated using option 1 (Add a new user) in the management menu.
+<details>
+<summary>🔁 Migration from Pre-2.0</summary>
 
-The migration process:
-1. Creates backup files (`.bak`) before making changes
-2. Generates new S3/S4 values satisfying bidirectional constraints
-3. Converts single H values to range format or regenerates if overlapping
-4. Updates server configuration and params file atomically
-5. Renames outdated client configs with `.old` suffix
-6. Reloads the running VPN service (if active)
+Run the installer on an existing pre-2.0 installation. It detects the need for migration and prompts before proceeding.
 
-If migration fails, backups are automatically restored.
+**Important:** All existing client configs become incompatible after migration. Regenerate them using option 1 (Add a new user) in the management menu.
 
-## Security Features
+Migration steps:
+1. Creates `.bak` backup files before making any changes.
+2. Generates new S3/S4 values with bidirectional constraint validation.
+3. Converts single H values to range format (or regenerates if overlapping).
+4. Updates server config and params file atomically.
+5. Renames outdated client configs with `.old` suffix.
+6. Reloads the running VPN service (if active).
 
-- **Shell Injection Prevention**: String values in the params file are safely quoted to prevent shell injection when sourced
-- **Atomic File Writes**: Configuration updates use temporary files with atomic rename to prevent corruption on interruption
-- **Filesystem Boundary Protection**: Client config search uses `-xdev` to prevent crossing filesystem boundaries
+Backups are restored automatically if migration fails.
+
+</details>
+
+<details>
+<summary>🔒 Security Notes</summary>
+
+- **Shell injection prevention** — params file values are safely shell-quoted.
+- **Atomic writes** — config updates use a temp file + rename to prevent corruption on interruption.
+- **Filesystem boundary protection** — client config search uses `-xdev` to stay within the config filesystem.
+
+</details>
+
+---
 
 ## Credits
 
-This project is a fork of [RomikB/amneziawg-install](https://github.com/RomikB/amneziawg-install), which is the original AmneziaWG install script this work is based on.
+Fork of [RomikB/amneziawg-install](https://github.com/RomikB/amneziawg-install).
 
 ## License
 
