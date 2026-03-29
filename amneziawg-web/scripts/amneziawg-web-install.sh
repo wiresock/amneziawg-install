@@ -126,16 +126,15 @@ Options:
   --force                   Overwrite existing env.conf without prompting
 
 Examples:
-  # Install from source (recommended)
-  sudo $0 --source-dir ./amneziawg-web
+  # Install from a repository checkout (recommended)
+  sudo $0
 
-  # Source install with auto Rust setup
-  sudo $0 --source-dir ./amneziawg-web --install-rust
+  # Install from a repository checkout and auto-install Rust if needed
+  sudo $0 --install-rust
 
   # Non-interactive source install
   sudo $0 \\
     --non-interactive \\
-    --source-dir ./amneziawg-web \\
     --username admin \\
     --password-hash '\$argon2id\$v=19\$m=65536,t=3,p=4\$...'
 
@@ -341,9 +340,9 @@ locate_app_binary() {
 
     if [[ -z "${BINARY_SRC}" ]] || [[ ! -f "${BINARY_SRC}" ]]; then
         die "Application binary not found.
-Build from source with --source-dir, or provide a pre-built binary with --binary-src.
+Run the installer from a repository checkout, build from source with --source-dir, or provide a pre-built binary with --binary-src.
 Example:
-  sudo $0 --source-dir ./amneziawg-web
+  sudo $0
   sudo $0 --binary-src ./target/release/amneziawg-web"
     fi
 

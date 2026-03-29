@@ -2,19 +2,53 @@
 
 **This project is a bash script that aims to setup a [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) VPN on a Linux server, as easily as possible!**
 
-A companion web panel is also available. Once AmneziaWG is installed, run the
-second script to set up a browser-accessible management interface:
+There are two ways to use this repository:
+
+- **Standalone AmneziaWG installer:** download only `amneziawg-install.sh` and use it by itself.
+- **AmneziaWG + web panel:** use the repository checkout, or download `amneziawg-web-install.sh` and let it clone the repository automatically before building the web panel.
+
+### Which flow should I use?
+
+#### 1. Install AmneziaWG only
+
+Use this if you only need the VPN server and client configuration files:
 
 ```bash
-sudo ./amneziawg-install.sh        # install AmneziaWG
-sudo ./amneziawg-web-install.sh    # install the web panel (builds from source)
+curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-install.sh
+chmod +x amneziawg-install.sh
+sudo ./amneziawg-install.sh
+```
+
+#### 2. Install the web panel too
+
+Use this if you want the browser-accessible management interface in addition to the VPN server.
+
+**Option A: clone the repository (best for install / upgrade / uninstall workflows)**
+
+```bash
+git clone https://github.com/wiresock/amneziawg-install.git
+cd amneziawg-install
+sudo ./amneziawg-install.sh
+sudo ./amneziawg-web-install.sh
 # open http://127.0.0.1:8080
 ```
+
+**Option B: download the web installer only**
+
+```bash
+curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web-install.sh
+chmod +x amneziawg-web-install.sh
+sudo ./amneziawg-web-install.sh
+```
+
+When `amneziawg-web-install.sh` does not find the repository files next to it, it
+will shallow-clone the repository to a temporary directory and continue from there.
+Add `--install-rust` if the target host does not already have Rust installed.
 
 To upgrade the web panel (rebuild from source and replace):
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+sudo ./amneziawg-web-upgrade.sh
 ```
 
 To upgrade with a pre-built binary:
@@ -49,7 +83,7 @@ Supported distributions:
 
 Before installation it is strictly recommended to upgrade your system to the latest available version and perform the reboot afterwards.
 
-Use curl or wget to download the script:
+Use curl or wget to download the standalone script:
 ```bash
 curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-install.sh
 ```

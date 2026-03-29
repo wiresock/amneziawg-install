@@ -9,21 +9,24 @@ For production hardening details, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Quick install (recommended)
 
-The installer builds from source by default — just point it at the source directory.
-It lives at the repository root next to `amneziawg-install.sh`:
+The installer builds from source by default. When you run it from a repository
+checkout, it auto-detects the source directory for you. It lives at the repository root next to `amneziawg-install.sh`:
 
 ```bash
+git clone https://github.com/wiresock/amneziawg-install.git
+cd amneziawg-install
+
 # 1. Install AmneziaWG (if not already done)
 sudo ./amneziawg-install.sh
 
 # 2. Install the web panel (builds from source)
-sudo ./amneziawg-web-install.sh --source-dir ./amneziawg-web
+sudo ./amneziawg-web-install.sh
 ```
 
 If Rust is not installed, add `--install-rust` to automatically install the toolchain:
 
 ```bash
-sudo ./amneziawg-web-install.sh --source-dir ./amneziawg-web --install-rust
+sudo ./amneziawg-web-install.sh --install-rust
 ```
 
 If you have a pre-built binary, use `--binary-src` instead:
@@ -36,6 +39,10 @@ The root-level `amneziawg-web-install.sh` is a thin entrypoint that delegates to
 `amneziawg-web/scripts/amneziawg-web-install.sh`. All installer logic lives in
 the sub-script; the root-level file exists purely for operator convenience so both
 installers are discoverable in the same place.
+
+If you download only the root-level `amneziawg-web-install.sh`, it will
+shallow-clone the repository to a temporary directory automatically before
+continuing.
 
 The installer handles user creation, directory setup, environment file generation,
 and systemd service installation. See [Installer reference](#installer-reference)

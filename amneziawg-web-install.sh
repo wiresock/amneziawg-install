@@ -15,13 +15,49 @@
 
 set -euo pipefail
 
+readonly REPO_URL="https://github.com/wiresock/amneziawg-install.git"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="${SCRIPT_DIR}/amneziawg-web/scripts/amneziawg-web-install.sh"
+BOOTSTRAP_DIR=""
 
-if [[ ! -f "${INSTALLER}" ]]; then
-    echo "ERROR: Installer script not found at: ${INSTALLER}" >&2
-    echo "       Make sure you cloned the full repository." >&2
-    exit 1
-fi
+cleanup() {
+    if [[ -n "${BOOTSTRAP_DIR}" ]] && [[ -d "${BOOTSTRAP_DIR}" ]]; then
+        rm -rf "${BOOTSTRAP_DIR}"
+    fi
+}
 
-exec bash "${INSTALLER}" "$@"
+bootstrap_repo_if_needed() {
+    if [[ -f "${INSTALLER}" ]]; then
+        return 0
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        echo "ERROR: Installer script not found at: ${INSTALLER}" >&2
+        echo "       Install git and re-run this script, or clone ${REPO_URL} manually." >&2
+        exit 1
+    fi
+
+    BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/amneziawg-install.XXXXXX")"
+    trap cleanup EXIT
+
+    echo "Installer files not found locally. Cloning ${REPO_URL} into ${BOOTSTRAP_DIR} ..." >&2
+    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 "${REPO_URL}" "${BOOTSTRAP_DIR}" >&2; then
+        echo "ERROR: Failed to clone ${REPO_URL}" >&2
+        echo "       Clone the repository manually and run ./amneziawg-web-install.sh from there." >&2
+        exit 1
+    fi
+
+    INSTALLER="${BOOTSTRAP_DIR}/amneziawg-web/scripts/amneziawg-web-install.sh"
+    if [[ ! -f "${INSTALLER}" ]]; then
+        echo "ERROR: Installer script not found after cloning: ${INSTALLER}" >&2
+        exit 1
+    fi
+}
+
+bootstrap_repo_if_needed
+
+bash "${INSTALLER}" "$@"
+exit_code=$?
+cleanup
+exit "${exit_code}"
