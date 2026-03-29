@@ -121,7 +121,7 @@ pub async fn execute_create_user(
             tracing::error!(error = %e, "failed to load disabled peers from database");
             let detail = serde_json::json!({
                 "name": name,
-                "error": "failed to load disabled peers from database",
+                "error": "db_read_failed",
             })
             .to_string();
             log_event(
@@ -236,7 +236,7 @@ pub async fn execute_remove_user(
     // Non-blocking (LOCK_NB) to avoid hanging web requests; returns an error
     // if another operation is in progress, matching create_client() behavior.
     let lock_path = config_dir.join(".create-client.lock");
-    let _lock_file = {
+    let lock_result: Result<std::fs::File, ScriptError> = (|| {
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -261,7 +261,28 @@ pub async fn execute_remove_user(
                 stderr,
             });
         }
-        f
+        Ok(f)
+    })();
+    let _lock_file = match lock_result {
+        Ok(f) => f,
+        Err(e) => {
+            let detail = serde_json::json!({
+                "peer_id": peer_id,
+                "name": client_name,
+                "error": "lock_failed",
+            })
+            .to_string();
+            log_event(
+                &db.pool,
+                EVT_USER_REMOVE_FAILED,
+                Some(peer_id),
+                None,
+                Some(&detail),
+                actor,
+            )
+            .await;
+            return Err(e);
+        }
     };
 
     match bridge.remove_client(client_name).await {

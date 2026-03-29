@@ -551,17 +551,40 @@ pub fn create_client(
     }
     // Best-effort: ensure correct permissions (fix pre-existing directories too).
     // On upgrades from older installs the directory may be root-owned, in which
-    // case chmod will fail with EPERM.  Log a warning and proceed – the service
-    // can still create client configs if the directory is group-writable or if
-    // sudoers rules cover the write path.
+    // case chmod will fail with EPERM.
     if let Err(e) = std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700)) {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
+            // Verify the directory is safe to use despite the chmod failure:
+            // it must be owned by the current (service) user and not writable
+            // by group or other.  Refuse to proceed otherwise to prevent
+            // symlink/race attacks and secret disclosure.
+            let meta = std::fs::metadata(config_dir).map_err(|me| {
+                CreateClientError::FileWrite(format!(
+                    "cannot stat {}: {me}", config_dir.display()
+                ))
+            })?;
+            let uid = unsafe { libc::getuid() };
+            let dir_uid = std::os::unix::fs::MetadataExt::uid(&meta);
+            let dir_mode = meta.permissions().mode();
+            if dir_uid != uid {
+                return Err(CreateClientError::FileWrite(format!(
+                    "AWG_CONFIG_DIR {} is owned by uid {dir_uid}, not the service user (uid {uid}); \
+                     run: sudo chown awg-web:awg-web {}",
+                    config_dir.display(), config_dir.display(),
+                )));
+            }
+            if dir_mode & 0o022 != 0 {
+                return Err(CreateClientError::FileWrite(format!(
+                    "AWG_CONFIG_DIR {} has unsafe permissions {dir_mode:#o} (group/world writable); \
+                     run: sudo chmod 0700 {}",
+                    config_dir.display(), config_dir.display(),
+                )));
+            }
             tracing::warn!(
                 dir = %config_dir.display(),
                 error = %e,
                 "could not chmod config dir (not owned by service user?); \
-                 ensure it is writable by the awg-web user or run: \
-                 sudo chown awg-web:awg-web {}", config_dir.display(),
+                 directory ownership/permissions are acceptable, proceeding",
             );
         } else {
             return Err(CreateClientError::FileWrite(format!(
@@ -713,10 +736,11 @@ pub fn create_client(
     // Step 9: Sync the running AWG interface.
     if let Err(e) = awg::sync_interface(&params.server_awg_nic, disabled_keys) {
         // The peer is in the config file but not yet on the running interface.
-        // It will be picked up on the next AWG restart or poller sync.
+        // It will become active only after an explicit AWG sync (e.g. `awg syncconf`)
+        // or a full AWG restart; the poller does not perform this sync automatically.
         tracing::warn!(
             error = %e,
-            "interface sync failed after adding peer – peer will be active after next AWG restart"
+            "interface sync failed after adding peer – peer will become active after an explicit AWG sync or restart"
         );
     }
 
