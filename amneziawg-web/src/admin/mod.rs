@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+pub mod client_manager;
 pub mod script_bridge;
 
 use crate::db::events::{
@@ -81,21 +82,22 @@ pub struct CreateUserResult {
     pub client_name: String,
 }
 
-/// Create a new AmneziaWG user/client via the install script.
+/// Create a new AmneziaWG user/client directly, without the external script.
 ///
 /// 1. Validates the name.
 /// 2. Logs `user_create_requested`.
-/// 3. Invokes `--add-client` through the script bridge.
+/// 3. Reads server params, generates keys, writes configs, and syncs the
+///    interface — all natively in Rust using individual AWG commands.
 /// 4. Logs `user_created` or `user_create_failed`.
 ///
 /// The caller is responsible for triggering a config rescan after success.
 pub async fn execute_create_user(
     db: &Database,
-    bridge: &ScriptBridge,
+    config_dir: &std::path::Path,
     name: &str,
     actor: &str,
-) -> Result<CreateUserResult, ScriptError> {
-    // Pre-validate name (the script validates too, but fail fast for the UI).
+) -> Result<CreateUserResult, client_manager::CreateClientError> {
+    // Pre-validate name (fail fast for the UI).
     script_bridge::validate_client_name(name)?;
 
     let detail = serde_json::json!({ "name": name }).to_string();
@@ -109,17 +111,39 @@ pub async fn execute_create_user(
     )
     .await;
 
-    match bridge.add_client(name).await {
-        Ok(config_path) => {
+    // Fetch disabled keys so the sync step doesn't reactivate disabled peers.
+    let disabled_keys = crate::db::peers::list_disabled_public_keys(&db.pool)
+        .await
+        .unwrap_or_default();
+
+    let dir = config_dir.to_path_buf();
+    let client_name = name.to_string();
+
+    // Run the blocking client-creation logic on a dedicated thread.
+    let result = tokio::task::spawn_blocking(move || {
+        client_manager::create_client(&dir, &client_name, &disabled_keys)
+    })
+    .await;
+
+    // Handle JoinError from spawn_blocking.
+    let result = match result {
+        Ok(inner) => inner,
+        Err(e) => Err(client_manager::CreateClientError::FileWrite(format!(
+            "task panicked: {e}"
+        ))),
+    };
+
+    match result {
+        Ok(r) => {
             let detail = serde_json::json!({
                 "name": name,
-                "config_path": &config_path,
+                "config_path": &r.config_path,
             })
             .to_string();
             log_event(&db.pool, EVT_USER_CREATED, None, None, Some(&detail), actor).await;
             Ok(CreateUserResult {
-                config_path,
-                client_name: name.to_string(),
+                config_path: r.config_path,
+                client_name: r.client_name,
             })
         }
         Err(e) => {

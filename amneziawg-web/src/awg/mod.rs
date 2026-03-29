@@ -149,24 +149,13 @@ pub fn remove_peer(interface: &str, public_key: &str) -> Result<(), AwgError> {
     Ok(())
 }
 
-/// Synchronise a running AWG interface with its on-disk config, excluding
-/// disabled peers.
+/// Obtain the stripped AWG config for a given interface.
 ///
-/// 1. Calls `sudo -n /usr/bin/awg-quick strip <interface>` to obtain the
-///    config with non-WG directives (Address, DNS, etc.) removed.
-/// 2. Filters out any `[Peer]` sections whose `PublicKey` appears in
-///    `disabled_keys`, so disabled peers are **never** piped into `syncconf`
-///    and cannot be temporarily reactivated.
-/// 3. Pipes the filtered config into
-///    `sudo -n /usr/bin/awg syncconf <interface> /dev/stdin` which adds any
-///    peers present in the config but missing from the running interface and
-///    updates peers whose settings have changed.  Peers already active on the
-///    interface but absent from the config file are left untouched.
-pub fn sync_interface(
-    interface: &str,
-    disabled_keys: &std::collections::HashSet<String>,
-) -> Result<(), AwgError> {
-    // Step 1: obtain the stripped config via awg-quick.
+/// Executes `sudo -n /usr/bin/awg-quick strip <interface>` and returns the
+/// config text with non-WG directives (Address, DNS, PostUp, etc.) removed.
+/// The `[Interface]` and `[Peer]` sections with their WireGuard/AWG-specific
+/// keys are preserved.
+pub fn strip_interface(interface: &str) -> Result<String, AwgError> {
     let strip_output = Command::new(SUDO_BIN)
         .args(["-n", AWG_QUICK_BIN, "strip", interface])
         .output()?;
@@ -180,8 +169,30 @@ pub fn sync_interface(
         });
     }
 
+    Ok(String::from_utf8_lossy(&strip_output.stdout).into_owned())
+}
+
+/// Synchronise a running AWG interface with its on-disk config, excluding
+/// disabled peers.
+///
+/// 1. Calls [`strip_interface`] to obtain the config with non-WG directives
+///    removed.
+/// 2. Filters out any `[Peer]` sections whose `PublicKey` appears in
+///    `disabled_keys`, so disabled peers are **never** piped into `syncconf`
+///    and cannot be temporarily reactivated.
+/// 3. Pipes the filtered config into
+///    `sudo -n /usr/bin/awg syncconf <interface> /dev/stdin` which adds any
+///    peers present in the config but missing from the running interface and
+///    updates peers whose settings have changed.  Peers already active on the
+///    interface but absent from the config file are left untouched.
+pub fn sync_interface(
+    interface: &str,
+    disabled_keys: &std::collections::HashSet<String>,
+) -> Result<(), AwgError> {
+    // Step 1: obtain the stripped config.
+    let stripped_text = strip_interface(interface)?;
+
     // Step 2: filter out disabled peers so they are never re-added.
-    let stripped_text = String::from_utf8_lossy(&strip_output.stdout);
     let filtered = filter_disabled_peers(&stripped_text, disabled_keys);
 
     // Step 3: pipe the filtered config into `awg syncconf`.
@@ -207,6 +218,122 @@ pub fn sync_interface(
         let code = output.status.code().unwrap_or(-1);
         return Err(AwgError::NonZeroExit {
             status: code,
+            stderr,
+        });
+    }
+
+    Ok(())
+}
+
+/// Generate a new WireGuard private key.
+///
+/// Executes `/usr/bin/awg genkey` (no sudo required — key generation only
+/// reads from `/dev/urandom`).
+pub fn genkey() -> Result<String, AwgError> {
+    let output = Command::new(AWG_BIN).arg("genkey").output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Derive a public key from the given private key.
+///
+/// Pipes `private_key` into `/usr/bin/awg pubkey` (no sudo required).
+pub fn pubkey(private_key: &str) -> Result<String, AwgError> {
+    let mut child = Command::new(AWG_BIN)
+        .arg("pubkey")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(private_key.as_bytes())?;
+    }
+
+    let output = child.wait_with_output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Generate a new pre-shared key.
+///
+/// Executes `/usr/bin/awg genpsk` (no sudo required).
+pub fn genpsk() -> Result<String, AwgError> {
+    let output = Command::new(AWG_BIN).arg("genpsk").output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Read a root-owned file via `sudo -n /usr/bin/cat`.
+///
+/// Used to read the params file and server config without granting the
+/// service user direct filesystem access to sensitive files.
+pub fn read_file_via_sudo(path: &std::path::Path) -> Result<String, AwgError> {
+    let output = Command::new(SUDO_BIN)
+        .args(["-n", "/usr/bin/cat"])
+        .arg(path)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Append content to a root-owned file via `sudo -n /usr/bin/tee -a`.
+///
+/// The content is piped via stdin to avoid shell interpolation.  Used to
+/// add peer blocks to the server config file.
+pub fn append_file_via_sudo(path: &std::path::Path, content: &str) -> Result<(), AwgError> {
+    let mut child = Command::new(SUDO_BIN)
+        .args(["-n", "/usr/bin/tee", "-a"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(content.as_bytes()) {
+            tracing::debug!(error = %e, "stdin write to tee failed – checking exit status");
+        }
+    }
+
+    let output = child.wait_with_output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
             stderr,
         });
     }

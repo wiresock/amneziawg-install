@@ -100,57 +100,34 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 /// Build a safe, user-facing diagnostic for create-user failures.
 ///
 /// This message is shown in both JSON API and HTML form responses. It keeps
-/// useful context (error kind, exit code, timeout) while sanitizing stderr and
-/// avoiding raw OS/path details from spawn/wait errors.
-fn create_user_diagnostic_message(error: &crate::admin::script_bridge::ScriptError) -> String {
-    fn sanitize_diagnostic_fragment(input: &str) -> String {
-        let mut out = String::with_capacity(input.len());
-        let mut last_was_space = false;
-        for ch in input.chars() {
-            let is_space = ch.is_whitespace() || ch.is_control();
-            if is_space {
-                if !last_was_space {
-                    out.push(' ');
-                }
-                last_was_space = true;
-            } else {
-                out.push(ch);
-                last_was_space = false;
-            }
-        }
-        out.trim().to_string()
-    }
-
+/// useful context (error kind) while avoiding raw OS/path details.
+fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateClientError) -> String {
+    use crate::admin::client_manager::CreateClientError;
     match error {
-        crate::admin::script_bridge::ScriptError::NonZeroExit { code, stderr } => {
-            let stderr = sanitize_diagnostic_fragment(stderr);
-            if stderr.is_empty() {
-                format!("Failed to create user (script exit code {code}).")
-            } else {
-                format!("Failed to create user (script exit code {code}): {stderr}")
-            }
+        CreateClientError::InvalidName(msg) => format!("Failed to create user: {msg}"),
+        CreateClientError::DuplicateName(name) => {
+            format!("Failed to create user: a client named '{name}' already exists.")
         }
-        crate::admin::script_bridge::ScriptError::Signal { stderr } => {
-            let stderr = sanitize_diagnostic_fragment(stderr);
-            if stderr.is_empty() {
-                "Failed to create user (script terminated by signal).".to_string()
-            } else {
-                format!("Failed to create user (script terminated by signal): {stderr}")
-            }
+        CreateClientError::NoFreeIp => {
+            "Failed to create user: no free IP addresses available (max 253 clients).".to_string()
         }
-        crate::admin::script_bridge::ScriptError::Timeout(duration) => {
-            format!("Failed to create user (script timed out after {duration:?}).")
+        CreateClientError::NoInterface => {
+            "Failed to create user: no AWG interface found.".to_string()
         }
-        crate::admin::script_bridge::ScriptError::Spawn(e) => format!(
-            "Failed to create user (unable to start install script; OS error kind: {:?}).",
-            e.kind()
-        ),
-        crate::admin::script_bridge::ScriptError::Wait(e) => format!(
-            "Failed to create user (failed while waiting for install script; OS error kind: {:?}).",
-            e.kind()
-        ),
-        crate::admin::script_bridge::ScriptError::InvalidName(msg) => {
-            format!("Failed to create user: {msg}")
+        CreateClientError::ParamsRead(msg) => {
+            format!("Failed to create user: could not read server configuration ({msg}).")
+        }
+        CreateClientError::KeyGen(msg) => {
+            format!("Failed to create user: key generation failed ({msg}).")
+        }
+        CreateClientError::FileWrite(msg) => {
+            format!("Failed to create user: file operation failed ({msg}).")
+        }
+        CreateClientError::ConfigParse(msg) => {
+            format!("Failed to create user: configuration error ({msg}).")
+        }
+        CreateClientError::Awg(e) => {
+            format!("Failed to create user: AWG command failed ({e}).")
         }
     }
 }
@@ -1163,7 +1140,7 @@ async fn api_create_user(
     let name = body.name.trim().to_string();
     match crate::admin::execute_create_user(
         &state.db,
-        &state.script_bridge,
+        &state.config_dir,
         &name,
         &state.auth.username,
     )
@@ -1171,10 +1148,6 @@ async fn api_create_user(
     {
         Ok(result) => {
             // Trigger a config rescan so config-to-peer mappings are updated after creation.
-            // rescan_configs() scans client *.conf files under config_dir, so config_dir
-            // must point to the directory where the install script writes client configs
-            // (non-interactive mode writes to ${AMNEZIAWG_DIR}/clients by default).
-            // The client config path is also returned in the API response for direct access.
             if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
                 tracing::warn!(error = %e, "post-create config rescan failed");
             }
@@ -1187,11 +1160,18 @@ async fn api_create_user(
             )
                 .into_response())
         }
-        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
+        Err(crate::admin::client_manager::CreateClientError::InvalidName(msg)) => {
             Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
         }
+        Err(crate::admin::client_manager::CreateClientError::DuplicateName(name)) => {
+            Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("a client named '{name}' already exists") })),
+            )
+                .into_response())
+        }
         Err(e) => {
-            tracing::error!(error = %e, "failed to create user via script");
+            tracing::error!(error = %e, "failed to create user");
             Ok((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": create_user_diagnostic_message(&e) })),
@@ -1295,7 +1275,7 @@ async fn post_add_user_form(
     let name = form.name.trim().to_string();
     match crate::admin::execute_create_user(
         &state.db,
-        &state.script_bridge,
+        &state.config_dir,
         &name,
         &state.auth.username,
     )
@@ -1308,7 +1288,7 @@ async fn post_add_user_form(
             // Redirect back to the peer list.
             Ok(Redirect::to("/").into_response())
         }
-        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
+        Err(crate::admin::client_manager::CreateClientError::InvalidName(msg)) => {
             // Show the peer list page with an error message.
             let rows = crate::db::peers::list_all(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
@@ -4018,8 +3998,8 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("error must be a string");
         assert!(
-            message.starts_with("Failed to create user ("),
-            "API should include diagnostic context in create-user failure message"
+            message.starts_with("Failed to create user"),
+            "API should include diagnostic context in create-user failure message, got: {message}"
         );
         assert_ne!(message, "internal server error");
     }
@@ -4044,18 +4024,10 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         assert!(
-            html.contains("Add user failed: Failed to create user ("),
-            "HTML should include a diagnostic add-user error message"
+            html.contains("Add user failed: Failed to create user"),
+            "HTML should include a diagnostic add-user error message, got: {html}"
         );
         assert!(!html.contains("Add user failed: internal server error"));
-        assert!(
-            html.contains("script exit code")
-                || html.contains("unable to start install script")
-                || html.contains("script terminated by signal")
-                || html.contains("script timed out")
-                || html.contains("failed while waiting for install script"),
-            "HTML should include concrete diagnostic reason"
-        );
     }
 
     #[tokio::test]

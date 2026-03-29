@@ -603,12 +603,28 @@ setup_filesystem() {
     chown root:root "${ENV_DIR}"
     chmod 0700 "${ENV_DIR}"
 
-    # Give the service user read access to the AWG config directory if it exists
+    # Give the service user read+write access to the AWG config directory.
+    # The web service creates client config files directly in this directory,
+    # so it needs write permission (not just read).
+    if [[ -d "${AWG_CONFIG_DIR}" ]]; then
+        chown "${SERVICE_USER}:${SERVICE_USER}" "${AWG_CONFIG_DIR}" 2>/dev/null \
+            && info "Set ownership of ${AWG_CONFIG_DIR} to ${SERVICE_USER}." \
+            || warn "Could not change ownership of ${AWG_CONFIG_DIR}. The service may not be able to create client configs."
+        chmod 0700 "${AWG_CONFIG_DIR}" 2>/dev/null || true
+    else
+        # Create the directory owned by the service user so it can write configs.
+        mkdir -p "${AWG_CONFIG_DIR}"
+        chown "${SERVICE_USER}:${SERVICE_USER}" "${AWG_CONFIG_DIR}"
+        chmod 0700 "${AWG_CONFIG_DIR}"
+        info "Created config directory: ${AWG_CONFIG_DIR}"
+    fi
+
+    # For existing client configs, ensure the service user can read them.
     if [[ -d "${AWG_CONFIG_DIR}" ]]; then
         # Best-effort: add to group owning the directory
         local awg_group
         awg_group="$(stat -c '%G' "${AWG_CONFIG_DIR}")"
-        if [[ "${awg_group}" != "root" ]] && ! id -Gn "${SERVICE_USER}" | grep -qw "${awg_group}"; then
+        if [[ "${awg_group}" != "root" ]] && [[ "${awg_group}" != "${SERVICE_USER}" ]] && ! id -Gn "${SERVICE_USER}" | grep -qw "${awg_group}"; then
             usermod -aG "${awg_group}" "${SERVICE_USER}" 2>/dev/null \
                 || warn "Could not add ${SERVICE_USER} to group ${awg_group}. \
 You may need to grant read access to ${AWG_CONFIG_DIR} manually."
@@ -836,7 +852,9 @@ install_sudoers() {
     # 2. Remove disabled peers via `awg set <iface> peer <key> remove`.
     # 3. Sync interface config via `awg syncconf` + `awg-quick strip` to
     #    restore re-enabled peers to the running interface.
-    # 4. Manage clients via the install script (add/remove/list).
+    # 4. Manage clients via the install script (remove/list).
+    # 5. Read server params and config for direct client creation.
+    # 6. Append peer blocks to the server config for direct client creation.
     #
     # Instead of running the whole service as root, we install tightly-scoped
     # sudoers rules that grant the service user passwordless sudo for only
@@ -858,10 +876,13 @@ install_sudoers() {
     fi
 
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
-    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --add-client *, ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
+    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
+    # Direct client creation: read params/config and append peer blocks.
+    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat /etc/amnezia/amneziawg/*, /usr/bin/tee -a /etc/amnezia/amneziawg/*.conf"
 
     info "Sudoers rule (AWG): ${rule_awg}"
     info "Sudoers rule (install): ${rule_install}"
+    info "Sudoers rule (direct): ${rule_direct}"
 
     # Ensure the sudoers drop-in directory exists (may be absent in minimal
     # containers or stripped images).
@@ -873,9 +894,12 @@ install_sudoers() {
     printf '# Installed by amneziawg-web-install.sh – do not edit manually.\n' \
         >> "${SUDOERS_FILE}"
     printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
-    printf '# Allow amneziawg-web to manage clients via the install script.\n' \
+    printf '# Allow amneziawg-web to manage clients via the install script (remove/list).\n' \
         >> "${SUDOERS_FILE}"
     printf '%s\n' "${rule_install}" >> "${SUDOERS_FILE}"
+    printf '# Allow amneziawg-web to create clients directly (read params, append config).\n' \
+        >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule_direct}" >> "${SUDOERS_FILE}"
 
     chmod 0440 "${SUDOERS_FILE}"
     chown root:root "${SUDOERS_FILE}"
