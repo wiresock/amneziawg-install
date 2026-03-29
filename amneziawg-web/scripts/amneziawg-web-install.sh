@@ -706,17 +706,25 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                         ;;
                 esac
 
-                # Grant rx on the config directory so the service can list its
-                # contents (std::fs::read_dir) and traverse into it.  The web
-                # panel needs directory read permission to discover configs.
+                # Grant ACL on the config directory so the service can access it.
+                # On home directories (/root or /home/<user>), only grant traverse (x)
+                # to avoid exposing unrelated filenames.  The web panel uses
+                # std::fs::read_dir() which requires directory read (r), so configs
+                # stored directly in a home directory will not be auto-discovered.
+                # For full discovery, use a dedicated subdirectory where rx is safe.
                 if [[ ${is_home_dir} -eq 1 ]]; then
-                    warn "Granting directory read access on home directory ${target_dir}."
-                    warn "This allows the service user to list filenames in ${target_dir}."
-                    warn "For better privacy, use a dedicated subdirectory (e.g. ${target_dir}/amneziawg-clients)."
+                    setfacl -m "u:${SERVICE_USER}:x" "${target_dir}" 2>/dev/null \
+                        && info "Granted traverse-only ACL for ${SERVICE_USER} on ${target_dir}." \
+                        || warn "setfacl failed on ${target_dir}."
+                    warn "Config directory ${target_dir} is a home directory."
+                    warn "Only traverse (x) permission was granted to avoid exposing unrelated files."
+                    warn "The web panel may not auto-discover configs here (read_dir requires rx)."
+                    warn "For full support, use a dedicated subdirectory (e.g. ${target_dir}/amneziawg-clients)."
+                else
+                    setfacl -m "u:${SERVICE_USER}:rx" "${target_dir}" 2>/dev/null \
+                        && info "Granted read+traverse ACL for ${SERVICE_USER} on ${target_dir}." \
+                        || warn "setfacl failed on ${target_dir}."
                 fi
-                setfacl -m "u:${SERVICE_USER}:rx" "${target_dir}" 2>/dev/null \
-                    && info "Granted read+traverse ACL for ${SERVICE_USER} on ${target_dir}." \
-                    || warn "setfacl failed on ${target_dir}."
 
                 # Default ACL: new files inherit read for the service user, and
                 # new directories inherit read+execute (traverse).  Using rX grants
