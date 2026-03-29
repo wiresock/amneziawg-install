@@ -1487,11 +1487,22 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify ReadWritePaths matches the configured config directory
-if grep -q "^ReadWritePaths=${WEB_TEST_AWG_CONFIG_DIR}" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
-	echo "OK: systemd unit ReadWritePaths matches config dir"
+# Verify ReadWritePaths covers the configured config directory (either directly
+# or via a parent path like /etc/amnezia/amneziawg that contains the clients subdir).
+AWG_RW_MATCH=false
+while IFS= read -r rw_line; do
+	rw_val="${rw_line#ReadWritePaths=}"
+	rw_val="${rw_val%/}"
+	cfg_val="${WEB_TEST_AWG_CONFIG_DIR%/}"
+	if [[ "${cfg_val}" == "${rw_val}" ]] || [[ "${cfg_val}" == "${rw_val}/"* ]]; then
+		AWG_RW_MATCH=true
+		break
+	fi
+done < <(grep '^ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null)
+if ${AWG_RW_MATCH}; then
+	echo "OK: systemd unit ReadWritePaths covers config dir"
 else
-	echo "FAIL: systemd unit ReadWritePaths does not match config dir ${WEB_TEST_AWG_CONFIG_DIR}"
+	echo "FAIL: systemd unit ReadWritePaths does not cover config dir ${WEB_TEST_AWG_CONFIG_DIR}"
 	echo "  Got: $(grep 'ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
 	FAILED=$((FAILED + 1))
 fi
@@ -1644,11 +1655,21 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify ReadWritePaths was updated to the /home config dir
-if grep -q "^ReadWritePaths=${HOME_CONFIG_DIR}" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
-	echo "OK: ReadWritePaths updated to ${HOME_CONFIG_DIR}"
+# Verify ReadWritePaths includes the /home config dir among its entries
+HOME_RW_MATCH=false
+while IFS= read -r rw_line; do
+	rw_val="${rw_line#ReadWritePaths=}"
+	rw_val="${rw_val%/}"
+	hcfg_val="${HOME_CONFIG_DIR%/}"
+	if [[ "${hcfg_val}" == "${rw_val}" ]] || [[ "${hcfg_val}" == "${rw_val}/"* ]]; then
+		HOME_RW_MATCH=true
+		break
+	fi
+done < <(grep '^ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null)
+if ${HOME_RW_MATCH}; then
+	echo "OK: ReadWritePaths covers ${HOME_CONFIG_DIR}"
 else
-	echo "FAIL: ReadWritePaths should point to ${HOME_CONFIG_DIR}"
+	echo "FAIL: ReadWritePaths should cover ${HOME_CONFIG_DIR}"
 	echo "  Got: $(grep 'ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
 	FAILED=$((FAILED + 1))
 fi

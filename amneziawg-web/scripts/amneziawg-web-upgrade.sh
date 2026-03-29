@@ -80,35 +80,65 @@ adjust_unit_hardening() {
 
     # 1. Update ReadWritePaths for the AWG config directory.
     #    Also handle legacy ReadOnlyPaths left over from older installs.
+    #    The server config root (/etc/amnezia/amneziawg) must always remain in
+    #    ReadWritePaths because direct client creation appends peer blocks to
+    #    /etc/amnezia/amneziawg/*.conf.  If AWG_CONFIG_DIR is outside that tree,
+    #    a separate ReadWritePaths entry is added to cover both paths.
+    local etc_dir="/etc/amnezia/amneziawg"
+
     if grep -q '^ReadOnlyPaths=' "${unit_file}" 2>/dev/null; then
-        # Upgrade: replace ReadOnlyPaths with ReadWritePaths so the service
-        # can write client configs directly.
-        sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${config_dir}|" "${unit_file}"
-        info "Replaced ReadOnlyPaths with ReadWritePaths=${config_dir}"
+        # Upgrade: replace ReadOnlyPaths with ReadWritePaths.
+        if [[ "${config_dir}" == "${etc_dir}" ]] \
+                || [[ "${config_dir}" == "${etc_dir}/"* ]]; then
+            sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}|" "${unit_file}"
+        else
+            sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}\nReadWritePaths=${config_dir}|" "${unit_file}"
+        fi
+        info "Replaced ReadOnlyPaths with ReadWritePaths (${etc_dir}, ${config_dir})"
     elif grep -q '^ReadWritePaths=' "${unit_file}" 2>/dev/null; then
-        # Find the ReadWritePaths entry for the AWG config directory.
-        # Skip the data-dir entry (DATA_DIR) — we only want the config-dir entry.
+        # Scan existing non-DATA_DIR ReadWritePaths entries.
         local data_base="${DATA_DIR%/}"
-        local target_linenum=""
-        local current_rw=""
-        while IFS=: read -r ln line; do
+        local has_etc_dir=false
+        local has_config_dir=false
+
+        while IFS=: read -r _ln line; do
             local val="${line#ReadWritePaths=}"
             val="${val%/}"
-            # Skip the data directory entry
             if [[ "${val}" == "${data_base}" ]] || [[ "${val}" == "${data_base}/"* ]]; then
                 continue
             fi
-            current_rw="${val}"
-            target_linenum="${ln}"
-            break
+            if [[ "${val}" == "${etc_dir}" ]] || [[ "${etc_dir}" == "${val}/"* ]]; then
+                has_etc_dir=true
+            fi
+            if [[ "${val}" == "${config_dir}" ]] || [[ "${config_dir}" == "${val}/"* ]]; then
+                has_config_dir=true
+            fi
         done < <(grep -n '^ReadWritePaths=' "${unit_file}")
 
-        if [[ -n "${target_linenum}" ]]; then
-            if [[ "${config_dir}" != "${current_rw}" ]] \
-                    && [[ "${config_dir}" != "${current_rw}/"* ]]; then
-                sed -i "${target_linenum}s|^ReadWritePaths=.*|ReadWritePaths=${config_dir}|" "${unit_file}"
-                info "Updated ReadWritePaths to ${config_dir}"
+        if ! ${has_etc_dir}; then
+            local data_linenum=""
+            data_linenum=$(grep -n "^ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1)
+            if [[ -n "${data_linenum}" ]]; then
+                sed -i "${data_linenum}i\\ReadWritePaths=${etc_dir}" "${unit_file}"
+            else
+                local last_rw
+                last_rw=$(grep -n '^ReadWritePaths=' "${unit_file}" | tail -1 | cut -d: -f1)
+                sed -i "${last_rw}a\\ReadWritePaths=${etc_dir}" "${unit_file}"
             fi
+            info "Added ReadWritePaths=${etc_dir}"
+        fi
+
+        if ! ${has_config_dir}; then
+            local data_linenum2=""
+            data_linenum2=$(grep -n "^ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1)
+            if [[ -n "${data_linenum2}" ]]; then
+                sed -i "${data_linenum2}i\\ReadWritePaths=${config_dir}" "${unit_file}"
+            else
+                local last_rw2
+                last_rw2=$(grep -n '^ReadWritePaths=' "${unit_file}" | tail -1 | cut -d: -f1)
+                sed -i "${last_rw2}a\\ReadWritePaths=${config_dir}" "${unit_file}"
+            fi
+            info "Added ReadWritePaths=${config_dir}"
         fi
     fi
 

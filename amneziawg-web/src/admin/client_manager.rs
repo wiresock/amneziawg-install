@@ -548,7 +548,7 @@ pub fn create_client(
         find_available_dot(&used_dots).ok_or(CreateClientError::NoFreeIp)?;
 
     let client_ipv4 = format!("{base_ipv4}.{dot_ip}");
-    let client_ipv6_full = format!("{base_ipv6}::{dot_ip:x}");
+    let client_ipv6_full = format!("{base_ipv6}::{dot_ip}");
     let client_ipv6_normalized = normalize_ipv6(&client_ipv6_full)?;
     let client_ipv6_display = compress_ipv6(&client_ipv6_full)?;
 

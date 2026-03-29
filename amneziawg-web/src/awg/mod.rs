@@ -324,7 +324,14 @@ pub fn append_file_via_sudo(path: &std::path::Path, content: &str) -> Result<(),
 
     if let Some(mut stdin) = child.stdin.take() {
         if let Err(e) = stdin.write_all(content.as_bytes()) {
-            tracing::debug!(error = %e, "stdin write to tee failed – checking exit status");
+            tracing::debug!(error = %e, "stdin write to tee failed – aborting append");
+            // Ensure the stdin handle is closed before manipulating the child.
+            drop(stdin);
+            // Best-effort cleanup of the child process; ignore errors here
+            // so that the original I/O error is preserved.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e.into());
         }
     }
 
