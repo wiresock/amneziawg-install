@@ -68,6 +68,25 @@ pub enum CreateClientError {
     Internal(String),
 }
 
+/// Return a short, sanitized error category for use in audit event detail.
+///
+/// This is stored in `events.detail` which is exposed via `/api/events`,
+/// so it must not contain raw stderr, OS errors, or filesystem paths.
+pub fn sanitized_create_error_category(error: &CreateClientError) -> &'static str {
+    match error {
+        CreateClientError::InvalidName(_) => "invalid_name",
+        CreateClientError::DuplicateName(_) => "duplicate_name",
+        CreateClientError::NoFreeIp => "no_free_ip",
+        CreateClientError::ParamsRead(_) => "params_read_failed",
+        CreateClientError::DbRead(_) => "db_read_failed",
+        CreateClientError::KeyGen(_) => "key_generation_failed",
+        CreateClientError::FileWrite(_) => "file_write_failed",
+        CreateClientError::ConfigParse(_) => "config_parse_failed",
+        CreateClientError::Awg(_) => "awg_command_failed",
+        CreateClientError::Internal(_) => "internal_error",
+    }
+}
+
 impl From<script_bridge::ScriptError> for CreateClientError {
     fn from(e: script_bridge::ScriptError) -> Self {
         match e {
@@ -530,11 +549,26 @@ pub fn create_client(
             config_dir.display()
         )));
     }
-    // Always ensure correct permissions (fix pre-existing directories too).
-    std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| CreateClientError::FileWrite(format!(
-            "chmod {}: {e}", config_dir.display()
-        )))?;
+    // Best-effort: ensure correct permissions (fix pre-existing directories too).
+    // On upgrades from older installs the directory may be root-owned, in which
+    // case chmod will fail with EPERM.  Log a warning and proceed – the service
+    // can still create client configs if the directory is group-writable or if
+    // sudoers rules cover the write path.
+    if let Err(e) = std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700)) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            tracing::warn!(
+                dir = %config_dir.display(),
+                error = %e,
+                "could not chmod config dir (not owned by service user?); \
+                 ensure it is writable by the awg-web user or run: \
+                 sudo chown awg-web:awg-web {}", config_dir.display(),
+            );
+        } else {
+            return Err(CreateClientError::FileWrite(format!(
+                "chmod {}: {e}", config_dir.display()
+            )));
+        }
+    }
 
     // Acquire an exclusive lock on the clients directory to prevent concurrent
     // create_client calls from allocating the same IP or appending duplicate

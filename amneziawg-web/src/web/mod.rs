@@ -139,28 +139,6 @@ fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateCl
     }
 }
 
-/// Return a short, sanitized error category for use in audit event detail.
-///
-/// This is stored in `events.detail` which is exposed via `/api/events`,
-/// so it must not contain raw stderr, OS errors, or filesystem paths.
-pub(crate) fn sanitized_create_error_category(
-    error: &crate::admin::client_manager::CreateClientError,
-) -> &'static str {
-    use crate::admin::client_manager::CreateClientError;
-    match error {
-        CreateClientError::InvalidName(_) => "invalid_name",
-        CreateClientError::DuplicateName(_) => "duplicate_name",
-        CreateClientError::NoFreeIp => "no_free_ip",
-        CreateClientError::ParamsRead(_) => "params_read_failed",
-        CreateClientError::DbRead(_) => "db_read_failed",
-        CreateClientError::KeyGen(_) => "key_generation_failed",
-        CreateClientError::FileWrite(_) => "file_write_failed",
-        CreateClientError::ConfigParse(_) => "config_parse_failed",
-        CreateClientError::Awg(_) => "awg_command_failed",
-        CreateClientError::Internal(_) => "internal_error",
-    }
-}
-
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
 /// Summary of one peer, returned by `GET /api/peers`.

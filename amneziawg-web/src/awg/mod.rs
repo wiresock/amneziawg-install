@@ -255,7 +255,16 @@ pub fn pubkey(private_key: &str) -> Result<String, AwgError> {
         .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(private_key.as_bytes())?;
+        if let Err(e) = stdin.write_all(private_key.as_bytes()) {
+            tracing::debug!(error = %e, "stdin write to awg pubkey failed – aborting");
+            // Ensure the stdin handle is closed before manipulating the child.
+            drop(stdin);
+            // Best-effort cleanup of the child process; ignore errors here
+            // so that the original I/O error is preserved.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e.into());
+        }
     }
 
     let output = child.wait_with_output()?;

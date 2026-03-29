@@ -555,6 +555,36 @@ Please report this issue."
         fi
     fi
 
+    # 3b. Ensure AWG_CONFIG_DIR is writable by the service user.
+    #     Direct client creation writes config files into AWG_CONFIG_DIR, so
+    #     the directory must exist and be owned by the service user. Older
+    #     installs may have left it root-owned; fix that here.
+    local awg_config_dir_upgrade=""
+    if [[ -f "${ENV_FILE}" ]]; then
+        awg_config_dir_upgrade="$(grep '^AWG_CONFIG_DIR=' "${ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
+        awg_config_dir_upgrade="${awg_config_dir_upgrade#\"}"
+        awg_config_dir_upgrade="${awg_config_dir_upgrade%\"}"
+        awg_config_dir_upgrade="${awg_config_dir_upgrade#\'}"
+        awg_config_dir_upgrade="${awg_config_dir_upgrade%\'}"
+    fi
+    # Fall back to the default clients directory used by the installer.
+    awg_config_dir_upgrade="${awg_config_dir_upgrade:-/etc/amnezia/amneziawg/clients}"
+
+    if [[ -d "${awg_config_dir_upgrade}" ]]; then
+        chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}" 2>/dev/null \
+            && info "Set ownership of ${awg_config_dir_upgrade} to ${SERVICE_USER}." \
+            || warn "Could not change ownership of ${awg_config_dir_upgrade}. Direct client creation may fail."
+        chmod 0700 "${awg_config_dir_upgrade}" 2>/dev/null \
+            && info "Set permissions of ${awg_config_dir_upgrade} to 0700." \
+            || warn "Could not change permissions of ${awg_config_dir_upgrade}. Direct client creation may fail."
+    else
+        mkdir -p "${awg_config_dir_upgrade}" 2>/dev/null \
+            && chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}" \
+            && chmod 0700 "${awg_config_dir_upgrade}" \
+            && info "Created config directory: ${awg_config_dir_upgrade}" \
+            || warn "Could not create ${awg_config_dir_upgrade}. Direct client creation may fail until the directory is created with correct ownership."
+    fi
+
     # 4. Optional: refresh systemd unit file
     if [[ "${REFRESH_UNIT}" == "true" ]]; then
         info "Refreshing systemd unit..."
