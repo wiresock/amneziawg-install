@@ -1109,7 +1109,7 @@ adjust_unit_hardening() {
     # special in sed address patterns.  The delimiter '|' is used for s|||
     # commands, so escape that as well.
     local config_dir_sed
-    config_dir_sed=$(printf '%s' "${config_dir}" | sed 's/[\\&|/]/\\&/g')
+    config_dir_sed=$(printf '%s' "${config_dir}" | sed 's|[\\&/|]|\\&|g')
 
     # 1. Update ReadWritePaths for the AWG config directory.
     #    Also handle legacy ReadOnlyPaths left over from older installs.
