@@ -131,7 +131,7 @@ fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateCl
             "Failed to create user: server configuration error.".to_string()
         }
         CreateClientError::Awg(_) => {
-            "Failed to create user: AWG command failed.".to_string()
+            "Client was created, but interface sync failed. Please sync the VPN interface configuration or restart the service, then try again.".to_string()
         }
         CreateClientError::LockBusy => {
             "Failed to create user: another add/remove operation is already in progress; please try again later.".to_string()
