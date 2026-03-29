@@ -59,3 +59,5 @@ bootstrap_repo_if_needed() {
 bootstrap_repo_if_needed
 
 bash "${INSTALLER}" "$@"
+exit_code=$?
+exit "${exit_code}"
