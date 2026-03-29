@@ -1217,7 +1217,7 @@ Address = 10.0.0.2/32
 CONFEOF
 
 WEB_AUTODETECT_RC=0
-WEB_AUTODETECT_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+WEB_AUTODETECT_OUTPUT=$(SUDO_USER="" bash "${WEB_INSTALLER_IMPL}" \
 	--non-interactive \
 	--force \
 	--binary-src "${STUB_BINARY}" \

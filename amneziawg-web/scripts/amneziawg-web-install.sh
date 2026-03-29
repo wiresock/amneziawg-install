@@ -671,6 +671,8 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
             if ! target_dir="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
                 target_dir="${AWG_CONFIG_DIR}"
             fi
+            # Strip trailing slashes so /home/user/ is correctly recognized as a home dir.
+            target_dir="${target_dir%/}"
 
             # Refuse to modify ACLs on clearly unsafe, broad system directories.
             local unsafe_dir=0
@@ -740,10 +742,32 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
             warn "Install the 'acl' package (e.g. apt install acl) and re-run, or manually adjust permissions."
         fi
 
-        # For directories under /home, the parent home directory is typically
+        # For directories under /home or /root, the parent directory is typically
         # mode 700/750.  Ensure the service user can traverse into it so that
         # the service can reach the config files.
         case "${AWG_CONFIG_DIR}" in
+            /root/*)
+                # Config is under /root (e.g. /root/awg-configs).  /root is
+                # typically mode 0700, so the service user needs traverse (x)
+                # permission to reach the subdirectory.
+                if [[ -d /root ]]; then
+                    local root_perms
+                    root_perms="$(stat -c '%a' /root)"
+                    local root_other_x=$(( 8#${root_perms} & 8#001 ))
+                    local root_group_x=$(( 8#${root_perms} & 8#010 ))
+                    if [[ ${root_other_x} -eq 0 ]] && [[ ${root_group_x} -eq 0 ]]; then
+                        if command -v setfacl >/dev/null 2>&1; then
+                            setfacl -m "u:${SERVICE_USER}:x" /root 2>/dev/null \
+                                && info "Granted traverse ACL for ${SERVICE_USER} on /root." \
+                                || warn "setfacl failed on /root. You may need to \
+grant traverse access manually: sudo setfacl -m u:${SERVICE_USER}:x /root"
+                        else
+                            warn "Config directory is under /root but 'setfacl' is not available. \
+Ensure user ${SERVICE_USER} can traverse /root (e.g., via ACL) or configs may be unreadable."
+                        fi
+                    fi
+                fi
+                ;;
             /home/*)
                 # Extract the top-level home directory (/home/<user>).
                 # Linux home directories are always at depth 3.
