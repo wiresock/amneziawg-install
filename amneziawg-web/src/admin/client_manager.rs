@@ -563,6 +563,7 @@ pub fn create_client(
                     "cannot stat {}: {me}", config_dir.display()
                 ))
             })?;
+            // SAFETY: getuid() is a trivial syscall that always succeeds.
             let uid = unsafe { libc::getuid() };
             let dir_uid = std::os::unix::fs::MetadataExt::uid(&meta);
             let dir_mode = meta.permissions().mode();
@@ -573,7 +574,9 @@ pub fn create_client(
                     config_dir.display(), config_dir.display(),
                 )));
             }
-            if dir_mode & 0o022 != 0 {
+            // S_IWGRP | S_IWOTH — reject group/world-writable directories.
+            const UNSAFE_WRITE_BITS: u32 = 0o022;
+            if dir_mode & UNSAFE_WRITE_BITS != 0 {
                 return Err(CreateClientError::FileWrite(format!(
                     "AWG_CONFIG_DIR {} has unsafe permissions {dir_mode:#o} (group/world writable); \
                      run: sudo chmod 0700 {}",
