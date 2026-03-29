@@ -598,12 +598,32 @@ setup_filesystem() {
     chown root:root "${ENV_DIR}"
     chmod 0700 "${ENV_DIR}"
 
+    # AWG client config directory – create if absent so amneziawg-install.sh
+    # can copy client configs here for the web panel to discover.
+    if [[ ! -d "${AWG_CONFIG_DIR}" ]]; then
+        mkdir -p "${AWG_CONFIG_DIR}"
+        info "Created AWG config directory: ${AWG_CONFIG_DIR}"
+    fi
+
     # Give the service user read access to the AWG config directory if it exists
     if [[ -d "${AWG_CONFIG_DIR}" ]]; then
         # Best-effort: add to group owning the directory
         local awg_group
         awg_group="$(stat -c '%G' "${AWG_CONFIG_DIR}")"
-        if [[ "${awg_group}" != "root" ]] && ! id -Gn "${SERVICE_USER}" | grep -qw "${awg_group}"; then
+        if [[ "${awg_group}" == "root" ]]; then
+            # Directory is root-owned with no dedicated group.  Change the
+            # group to the service user's primary group and grant group
+            # read+traverse so the web panel can discover client configs.
+            local svc_group
+            svc_group="$(id -gn "${SERVICE_USER}" 2>/dev/null || echo "")"
+            if [[ -n "${svc_group}" ]]; then
+                chgrp "${svc_group}" "${AWG_CONFIG_DIR}" 2>/dev/null \
+                    && chmod g+rx "${AWG_CONFIG_DIR}" 2>/dev/null \
+                    && info "Set group ${svc_group} on ${AWG_CONFIG_DIR} for service access." \
+                    || warn "Could not set group ${svc_group} on ${AWG_CONFIG_DIR}. \
+You may need to grant read access to ${AWG_CONFIG_DIR} manually."
+            fi
+        elif ! id -Gn "${SERVICE_USER}" | grep -qw "${awg_group}"; then
             usermod -aG "${awg_group}" "${SERVICE_USER}" 2>/dev/null \
                 || warn "Could not add ${SERVICE_USER} to group ${awg_group}. \
 You may need to grant read access to ${AWG_CONFIG_DIR} manually."
