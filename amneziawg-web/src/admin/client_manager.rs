@@ -129,10 +129,11 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
             let value = value.trim();
             // Remove surrounding single or double quotes and decode
             // safeQuoteParam() encoding for embedded single quotes.
-            let was_single_quoted = value.starts_with('\'') && value.ends_with('\'');
-            let unquoted = if was_single_quoted
-                || (value.starts_with('"') && value.ends_with('"'))
-            {
+            let was_single_quoted =
+                value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'');
+            let is_double_quoted =
+                value.len() >= 2 && value.starts_with('"') && value.ends_with('"');
+            let unquoted = if was_single_quoted || is_double_quoted {
                 &value[1..value.len() - 1]
             } else {
                 value
@@ -849,6 +850,37 @@ SERVER_AWG_H3='10'
 SERVER_AWG_H4='11'
 ";
         assert!(parse_params(content).is_err());
+    }
+
+    #[test]
+    fn parse_params_single_char_quote_no_panic() {
+        // A malformed value consisting of just a single quote character
+        // should not panic (it should be treated as a literal value).
+        let content = "\
+SERVER_PUB_IP='1.2.3.4'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.0.0.1'
+SERVER_AWG_IPV6='fd00::1'
+SERVER_PORT='51820'
+SERVER_PUB_KEY='
+CLIENT_DNS_1='8.8.8.8'
+ALLOWED_IPS='0.0.0.0/0'
+SERVER_AWG_JC='1'
+SERVER_AWG_JMIN='2'
+SERVER_AWG_JMAX='3'
+SERVER_AWG_S1='4'
+SERVER_AWG_S2='5'
+SERVER_AWG_S3='6'
+SERVER_AWG_S4='7'
+SERVER_AWG_H1='8'
+SERVER_AWG_H2='9'
+SERVER_AWG_H3='10'
+SERVER_AWG_H4='11'
+";
+        // Should not panic — the single-char ' is treated as an unquoted value
+        let result = parse_params(content);
+        // Parsing may fail (missing required keys) but must not panic
+        let _ = result;
     }
 
     // ── IPv6 helpers ────────────────────────────────────────────────────

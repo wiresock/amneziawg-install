@@ -1022,10 +1022,15 @@ find_unit_template() {
 
 # Adjust ReadWritePaths and ProtectHome in the installed service unit to match
 # the user's configured AWG_CONFIG_DIR.  The packaged template hard-codes
-# ReadWritePaths=/etc/amneziawg and ProtectHome=yes which is correct for the
-# default config directory.  When a custom directory is chosen — especially
-# one under /home — we need to relax the sandboxing so the service can access
-# the config files.
+# ReadWritePaths=/etc/amnezia/amneziawg and ProtectHome=yes which is correct
+# for the default config directory.  When a custom directory is chosen —
+# especially one under /home — we need to relax the sandboxing so the service
+# can access the config files.
+#
+# The function distinguishes the AWG-config ReadWritePaths entry from the
+# data-dir entry (DATA_DIR) by line number, skipping any entry whose path
+# matches DATA_DIR.  This avoids substring-based matching that could
+# accidentally target the wrong line.
 adjust_unit_hardening() {
     local unit_file="$1"
     local config_dir="$2"
@@ -1042,15 +1047,30 @@ adjust_unit_hardening() {
         # can write client configs directly.
         sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${config_dir}|" "${unit_file}"
         info "Replaced ReadOnlyPaths with ReadWritePaths=${config_dir}"
-    elif grep -q '^ReadWritePaths=.*amnezia' "${unit_file}" 2>/dev/null; then
-        local current_rw
-        current_rw="$(grep '^ReadWritePaths=.*amnezia' "${unit_file}" | head -1 | cut -d= -f2-)"
-        current_rw="${current_rw%/}"
-        # If the configured directory is already covered, nothing to do
-        if [[ "${config_dir}" != "${current_rw}" ]] \
-                && [[ "${config_dir}" != "${current_rw}/"* ]]; then
-            sed -i "0,/^ReadWritePaths=.*amnezia/s|^ReadWritePaths=.*|ReadWritePaths=${config_dir}|" "${unit_file}"
-            info "Updated ReadWritePaths to ${config_dir}"
+    elif grep -q '^ReadWritePaths=' "${unit_file}" 2>/dev/null; then
+        # Find the ReadWritePaths entry for the AWG config directory.
+        # Skip the data-dir entry (DATA_DIR) — we only want the config-dir entry.
+        local data_base="${DATA_DIR%/}"
+        local target_linenum=""
+        local current_rw=""
+        while IFS=: read -r ln line; do
+            local val="${line#ReadWritePaths=}"
+            val="${val%/}"
+            # Skip the data directory entry
+            if [[ "${val}" == "${data_base}" ]] || [[ "${val}" == "${data_base}/"* ]]; then
+                continue
+            fi
+            current_rw="${val}"
+            target_linenum="${ln}"
+            break
+        done < <(grep -n '^ReadWritePaths=' "${unit_file}")
+
+        if [[ -n "${target_linenum}" ]]; then
+            if [[ "${config_dir}" != "${current_rw}" ]] \
+                    && [[ "${config_dir}" != "${current_rw}/"* ]]; then
+                sed -i "${target_linenum}s|^ReadWritePaths=.*|ReadWritePaths=${config_dir}|" "${unit_file}"
+                info "Updated ReadWritePaths to ${config_dir}"
+            fi
         fi
     fi
 

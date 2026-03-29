@@ -44,7 +44,7 @@ Environment=RUST_LOG=amneziawg_web=info
 # --- Hardening ---------------------------------------------------------------
 # Allow the process to read AWG config files (typically owned by root)
 # and write client config files directly under the config directory.
-ReadWritePaths=/etc/amneziawg
+ReadWritePaths=/etc/amnezia/amneziawg
 
 # NoNewPrivileges is NOT set because the service invokes
 # `sudo /usr/bin/awg show all dump`, `sudo /usr/bin/awg set … peer … remove`,

@@ -1487,12 +1487,12 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify ReadOnlyPaths matches the configured config directory
-if grep -q "^ReadOnlyPaths=${WEB_TEST_AWG_CONFIG_DIR}" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
-	echo "OK: systemd unit ReadOnlyPaths matches config dir"
+# Verify ReadWritePaths matches the configured config directory
+if grep -q "^ReadWritePaths=${WEB_TEST_AWG_CONFIG_DIR}" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
+	echo "OK: systemd unit ReadWritePaths matches config dir"
 else
-	echo "FAIL: systemd unit ReadOnlyPaths does not match config dir ${WEB_TEST_AWG_CONFIG_DIR}"
-	echo "  Got: $(grep 'ReadOnlyPaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	echo "FAIL: systemd unit ReadWritePaths does not match config dir ${WEB_TEST_AWG_CONFIG_DIR}"
+	echo "  Got: $(grep 'ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1644,12 +1644,12 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify ReadOnlyPaths was updated to the /home config dir
-if grep -q "^ReadOnlyPaths=${HOME_CONFIG_DIR}" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
-	echo "OK: ReadOnlyPaths updated to ${HOME_CONFIG_DIR}"
+# Verify ReadWritePaths was updated to the /home config dir
+if grep -q "^ReadWritePaths=${HOME_CONFIG_DIR}" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
+	echo "OK: ReadWritePaths updated to ${HOME_CONFIG_DIR}"
 else
-	echo "FAIL: ReadOnlyPaths should point to ${HOME_CONFIG_DIR}"
-	echo "  Got: $(grep 'ReadOnlyPaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	echo "FAIL: ReadWritePaths should point to ${HOME_CONFIG_DIR}"
+	echo "  Got: $(grep 'ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
 	FAILED=$((FAILED + 1))
 fi
 
