@@ -1847,7 +1847,7 @@ function revokeClient() {
 	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
 	rm -f "${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
-	# remove client config from web panel directory (best-effort)
+	# Remove client config from web panel directory (best-effort)
 	removeClientConfigFromWebPanel "${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# restart AmneziaWG to apply changes
