@@ -1403,13 +1403,13 @@ async fn post_remove_user_form(
             Ok(Redirect::to("/").into_response())
         }
         Err(e) => {
-            let message = match &e {
+            let message: &str = match &e {
                 crate::admin::script_bridge::ScriptError::LockBusy => {
-                    "Remove failed: another add/remove operation is already in progress; please try again later.".to_string()
+                    "Remove failed: another add/remove operation is already in progress; please try again later."
                 }
                 _ => {
                     tracing::error!(error = %e, "failed to remove user via HTML form");
-                    "Remove failed: internal server error.".to_string()
+                    "Remove failed: internal server error."
                 }
             };
             // Re-fetch peer data to render the detail page with the error banner.
@@ -1425,7 +1425,7 @@ async fn post_remove_user_form(
             let events = list_events(&state.db.pool, Some(id), None, 20).await?;
             let dto = peer_row_to_detail(peer_row, snapshots);
             let csrf = session_csrf_from_headers(&state, &headers);
-            Ok(Html(render_peer_detail_with_error(&dto, &csrf, &events, &message)).into_response())
+            Ok(Html(render_peer_detail_with_error(&dto, &csrf, &events, message)).into_response())
         }
     }
 }
