@@ -483,6 +483,10 @@ sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
 Like the installer, the root-level `amneziawg-web-upgrade.sh` is a thin entrypoint
 that delegates to `amneziawg-web/scripts/amneziawg-web-upgrade.sh`.
 
+If the web panel was installed via the standalone wrapper and the repository files are
+not present locally, the wrapper will shallow-clone the repository to a temporary
+directory automatically (source-mode upgrades will then build from that checkout).
+
 ### Default behavior
 
 The upgrade script replaces the installed binary while preserving everything else:
@@ -607,6 +611,15 @@ sudo ./amneziawg-web-uninstall.sh
 
 Like the installer, the root-level `amneziawg-web-uninstall.sh` is a thin entrypoint
 that delegates to `amneziawg-web/scripts/amneziawg-web-uninstall.sh`.
+
+If the web panel was installed via the standalone wrapper and the repository files are
+not present locally, the wrapper will shallow-clone the repository to a temporary
+directory automatically:
+
+```bash
+# Works even if you never cloned the repository
+sudo ./amneziawg-web-uninstall.sh
+```
 
 ### Default behavior (safe)
 

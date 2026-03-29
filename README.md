@@ -64,6 +64,11 @@ sudo ./amneziawg-web-uninstall.sh                              # safe: removes s
 sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force  # full purge
 ```
 
+Both `amneziawg-web-upgrade.sh` and `amneziawg-web-uninstall.sh` support the same
+standalone auto-clone behavior as the installer: if the repository files are not
+present locally they will shallow-clone the repository to a temporary directory
+and continue from there.
+
 See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for details.
 
 ---
