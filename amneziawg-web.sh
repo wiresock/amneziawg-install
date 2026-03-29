@@ -71,15 +71,19 @@ bootstrap_repo_if_needed() {
     SCRIPTS_DIR="${BOOTSTRAP_DIR}/amneziawg-web/scripts"
 }
 
-# ── Subcommand: install ──────────────────────────────────────────────────────
+# ── Subcommand dispatch helper ───────────────────────────────────────────────
 
-cmd_install() {
-    local target="${SCRIPTS_DIR}/amneziawg-web-install.sh"
+run_inner_script() {
+    local script_name="$1"
+    shift
+
+    local target="${SCRIPTS_DIR}/${script_name}"
     bootstrap_repo_if_needed "${target}"
-    target="${SCRIPTS_DIR}/amneziawg-web-install.sh"
+    # Re-evaluate after bootstrap (SCRIPTS_DIR may have changed)
+    target="${SCRIPTS_DIR}/${script_name}"
 
     if [[ ! -f "${target}" ]]; then
-        echo "ERROR: Install script not found after cloning: ${target}" >&2
+        echo "ERROR: ${script_name} not found after cloning: ${target}" >&2
         exit 1
     fi
 
@@ -87,40 +91,18 @@ cmd_install() {
     bash "${target}" "$@" || exit_code=$?
     exit "${exit_code}"
 }
+
+# ── Subcommand: install ──────────────────────────────────────────────────────
+
+cmd_install()   { run_inner_script "amneziawg-web-install.sh" "$@"; }
 
 # ── Subcommand: upgrade ──────────────────────────────────────────────────────
 
-cmd_upgrade() {
-    local target="${SCRIPTS_DIR}/amneziawg-web-upgrade.sh"
-    bootstrap_repo_if_needed "${target}"
-    target="${SCRIPTS_DIR}/amneziawg-web-upgrade.sh"
-
-    if [[ ! -f "${target}" ]]; then
-        echo "ERROR: Upgrade script not found after cloning: ${target}" >&2
-        exit 1
-    fi
-
-    local exit_code=0
-    bash "${target}" "$@" || exit_code=$?
-    exit "${exit_code}"
-}
+cmd_upgrade()   { run_inner_script "amneziawg-web-upgrade.sh" "$@"; }
 
 # ── Subcommand: uninstall ────────────────────────────────────────────────────
 
-cmd_uninstall() {
-    local target="${SCRIPTS_DIR}/amneziawg-web-uninstall.sh"
-    bootstrap_repo_if_needed "${target}"
-    target="${SCRIPTS_DIR}/amneziawg-web-uninstall.sh"
-
-    if [[ ! -f "${target}" ]]; then
-        echo "ERROR: Uninstall script not found after cloning: ${target}" >&2
-        exit 1
-    fi
-
-    local exit_code=0
-    bash "${target}" "$@" || exit_code=$?
-    exit "${exit_code}"
-}
+cmd_uninstall() { run_inner_script "amneziawg-web-uninstall.sh" "$@"; }
 
 # ── Subcommand: status ───────────────────────────────────────────────────────
 
