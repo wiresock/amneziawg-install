@@ -296,14 +296,14 @@ fi
 # Verify destination directory exists
 if [[ ! -d "${INSTALL_DIR}" ]]; then
     die "Install directory does not exist: ${INSTALL_DIR}
-Has the web panel been installed? Run amneziawg-web-install.sh first."
+Has the web panel been installed? Run: sudo ./amneziawg-web.sh install"
 fi
 
 # Verify existing binary is present (upgrade requires a prior install)
 DEST_BINARY="${INSTALL_DIR}/${BINARY_NAME}"
 if [[ ! -f "${DEST_BINARY}" ]]; then
     die "Existing binary not found at: ${DEST_BINARY}
-Has the web panel been installed? Run amneziawg-web-install.sh first."
+Has the web panel been installed? Run: sudo ./amneziawg-web.sh install"
 fi
 
 # Validate refresh-unit: check the repo unit file exists

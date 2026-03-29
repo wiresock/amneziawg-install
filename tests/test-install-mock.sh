@@ -869,35 +869,13 @@ echo ""
 echo "=== Phase 3: Web panel installer ==="
 
 WEB_UNIFIED="${PROJECT_ROOT}/amneziawg-web.sh"
-WEB_INSTALLER="${PROJECT_ROOT}/amneziawg-web-install.sh"
 WEB_INSTALLER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-install.sh"
 
-# Verify unified entry point and all legacy entrypoints are present
+# Verify unified entry point and implementation script are present
 if [[ -f "${WEB_UNIFIED}" ]]; then
 	echo "OK: Unified entry point exists: ${WEB_UNIFIED}"
 else
 	echo "FAIL: Unified entry point missing: ${WEB_UNIFIED}"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ -f "${PROJECT_ROOT}/amneziawg-web-upgrade.sh" ]]; then
-	echo "OK: Legacy upgrade wrapper exists: ${PROJECT_ROOT}/amneziawg-web-upgrade.sh"
-else
-	echo "FAIL: Legacy upgrade wrapper missing: ${PROJECT_ROOT}/amneziawg-web-upgrade.sh"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ -f "${PROJECT_ROOT}/amneziawg-web-uninstall.sh" ]]; then
-	echo "OK: Legacy uninstall wrapper exists: ${PROJECT_ROOT}/amneziawg-web-uninstall.sh"
-else
-	echo "FAIL: Legacy uninstall wrapper missing: ${PROJECT_ROOT}/amneziawg-web-uninstall.sh"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ -f "${WEB_INSTALLER}" ]]; then
-	echo "OK: Root-level entrypoint exists: ${WEB_INSTALLER}"
-else
-	echo "FAIL: Root-level entrypoint missing: ${WEB_INSTALLER}"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1313,16 +1291,8 @@ echo ""
 echo "=== Phase 4: Web panel uninstaller ==="
 
 WEB_UNINSTALLER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-uninstall.sh"
-WEB_UNINSTALLER="${PROJECT_ROOT}/amneziawg-web-uninstall.sh"
 
-# Verify both entrypoints are present
-if [[ -f "${WEB_UNINSTALLER}" ]]; then
-	echo "OK: Root-level uninstall entrypoint exists: ${WEB_UNINSTALLER}"
-else
-	echo "FAIL: Root-level uninstall entrypoint missing: ${WEB_UNINSTALLER}"
-	FAILED=$((FAILED + 1))
-fi
-
+# Verify implementation script is present
 if [[ -f "${WEB_UNINSTALLER_IMPL}" ]]; then
 	echo "OK: Implementation script exists: ${WEB_UNINSTALLER_IMPL}"
 else
@@ -1623,16 +1593,8 @@ echo ""
 echo "=== Phase 5: Web panel upgrader ==="
 
 WEB_UPGRADER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-upgrade.sh"
-WEB_UPGRADER="${PROJECT_ROOT}/amneziawg-web-upgrade.sh"
 
-# Verify both entrypoints are present
-if [[ -f "${WEB_UPGRADER}" ]]; then
-	echo "OK: Root-level upgrade entrypoint exists: ${WEB_UPGRADER}"
-else
-	echo "FAIL: Root-level upgrade entrypoint missing: ${WEB_UPGRADER}"
-	FAILED=$((FAILED + 1))
-fi
-
+# Verify implementation script is present
 if [[ -f "${WEB_UPGRADER_IMPL}" ]]; then
 	echo "OK: Implementation script exists: ${WEB_UPGRADER_IMPL}"
 else
@@ -2845,345 +2807,25 @@ echo ""
 echo "=== Phase 8: Peer visibility tests complete ==="
 
 # ============================================================
-# Phase 9: Root wrapper delegation and standalone bootstrap
-# ============================================================
-#
-# Test scenarios:
-# a) Repo-clone scenario: all three root-level wrappers (install, uninstall,
-#    upgrade) correctly delegate to the inner scripts when the repository is
-#    present locally.
-# b) Standalone bootstrap scenario: install/uninstall root wrappers work when
-#    the inner scripts are NOT present locally. A mock git simulates a
-#    successful bootstrap clone by copying from the local repository checkout,
-#    so no network access is required.
-# c) Standalone error path: install/uninstall root wrappers exit non-zero with
-#    a helpful message when the inner script is missing and git clone fails.
-#
-echo ""
-echo "=== Phase 9: Root wrapper delegation and standalone bootstrap ==="
-
-# ---- Phase 9a: Repo-clone scenario — root wrappers delegate to inner scripts ----
-echo ""
-echo "--- Phase 9a: Root wrappers with inner scripts present ---"
-
-# Establish a clean installed baseline using the inner installer directly.
-rm -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
-bash "${WEB_INSTALLER_IMPL}" \
-	--non-interactive --force \
-	--binary-src "${STUB_BINARY}" \
-	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--data-dir "${WEB_TEST_DATA_DIR}" \
-	--env-file "${WEB_TEST_ENV_FILE}" \
-	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
-	--username testadmin \
-	--password-hash "${TEST_PASSWORD_HASH}" \
-	--no-start --no-enable >/dev/null 2>&1
-
-# 9a-1: Uninstall via root wrapper
-WEB_ROOT9_UNINSTALL_RC=0
-bash "${WEB_UNINSTALLER}" \
-	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--data-dir "${WEB_TEST_DATA_DIR}" \
-	--env-file "${WEB_TEST_ENV_FILE}" \
-	--force >/dev/null 2>&1 || WEB_ROOT9_UNINSTALL_RC=$?
-
-if [[ ${WEB_ROOT9_UNINSTALL_RC} -eq 0 ]]; then
-	echo "OK: Root uninstall wrapper delegates to inner script (rc=0)"
-else
-	echo "FAIL: Root uninstall wrapper exited non-zero (rc=${WEB_ROOT9_UNINSTALL_RC})"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ ! -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
-	echo "OK: Binary removed via root uninstall wrapper"
-else
-	echo "FAIL: Binary still present after root uninstall wrapper"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
-	echo "OK: Env file preserved (safe default) by root uninstall wrapper"
-else
-	echo "FAIL: Env file removed — root uninstall should preserve it by default"
-	FAILED=$((FAILED + 1))
-fi
-
-# 9a-2: Install via root wrapper
-WEB_ROOT9_INSTALL_RC=0
-bash "${WEB_INSTALLER}" \
-	--non-interactive --force \
-	--binary-src "${STUB_BINARY}" \
-	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--data-dir "${WEB_TEST_DATA_DIR}" \
-	--env-file "${WEB_TEST_ENV_FILE}" \
-	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
-	--username testadmin \
-	--password-hash "${TEST_PASSWORD_HASH}" \
-	--no-start --no-enable >/dev/null 2>&1 || WEB_ROOT9_INSTALL_RC=$?
-
-if [[ ${WEB_ROOT9_INSTALL_RC} -eq 0 ]]; then
-	echo "OK: Root install wrapper delegates to inner script (rc=0)"
-else
-	echo "FAIL: Root install wrapper exited non-zero (rc=${WEB_ROOT9_INSTALL_RC})"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
-	echo "OK: Binary installed via root install wrapper"
-else
-	echo "FAIL: Binary not found after root install wrapper"
-	FAILED=$((FAILED + 1))
-fi
-
-# 9a-3: Upgrade via root wrapper
-PHASE9_UPGRADE_BIN="/tmp/amneziawg-web-phase9-upgrade"
-cat > "${PHASE9_UPGRADE_BIN}" <<'PHASE9UPGEOF'
-#!/bin/bash
-echo "amneziawg-web stub v0.0.0-phase9-upgrade"
-PHASE9UPGEOF
-chmod +x "${PHASE9_UPGRADE_BIN}"
-
-WEB_ROOT9_UPGRADE_RC=0
-bash "${WEB_UPGRADER}" \
-	--binary "${PHASE9_UPGRADE_BIN}" \
-	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--env-file "${WEB_TEST_ENV_FILE}" \
-	--data-dir "${WEB_TEST_DATA_DIR}" \
-	--force >/dev/null 2>&1 || WEB_ROOT9_UPGRADE_RC=$?
-
-if [[ ${WEB_ROOT9_UPGRADE_RC} -eq 0 ]]; then
-	echo "OK: Root upgrade wrapper delegates to inner script (rc=0)"
-else
-	echo "FAIL: Root upgrade wrapper exited non-zero (rc=${WEB_ROOT9_UPGRADE_RC})"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]] && \
-	[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" == \
-	   "$(sha256sum "${PHASE9_UPGRADE_BIN}" | awk '{print $1}')" ]]; then
-	echo "OK: Binary replaced via root upgrade wrapper"
-else
-	echo "FAIL: Binary not replaced via root upgrade wrapper"
-	FAILED=$((FAILED + 1))
-fi
-
-# ---- Phase 9b: Standalone bootstrap — mock git clone (no inner scripts) ----
-echo ""
-echo "--- Phase 9b: Standalone bootstrap via mock git clone ---"
-
-# Create a mock git that simulates a successful bootstrap clone by copying the
-# local repository checkout.  The real git clone call in the wrapper is:
-#   git clone --depth 1 --branch main <url> <target_dir>
-# The target_dir is the last positional argument and is already created by
-# mktemp before git is invoked, so we copy INTO that existing directory.
-PHASE9_MOCK_GIT_DIR="$(mktemp -d /tmp/awg-mock-git.XXXXXX)"
-cat > "${PHASE9_MOCK_GIT_DIR}/git" <<PHASE9GITMOCKEOF
-#!/bin/bash
-# Mock git: simulate a successful clone by copying from the local repository.
-if [[ "\$1" == "clone" ]]; then
-	# Get the last positional argument (the target directory).
-	TARGET=""
-	for _a in "\$@"; do TARGET="\${_a}"; done
-	cp -r "${PROJECT_ROOT}/." "\${TARGET}/"
-	exit 0
-fi
-exit 0
-PHASE9GITMOCKEOF
-chmod +x "${PHASE9_MOCK_GIT_DIR}/git"
-
-# Create a standalone directory containing only the root-level wrappers —
-# no amneziawg-web/scripts/ directory — to simulate a bare-download scenario.
-PHASE9_STANDALONE_DIR="$(mktemp -d /tmp/awg-standalone.XXXXXX)"
-cp "${WEB_UNIFIED}"     "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh"
-cp "${WEB_INSTALLER}"   "${PHASE9_STANDALONE_DIR}/amneziawg-web-install.sh"
-cp "${WEB_UNINSTALLER}" "${PHASE9_STANDALONE_DIR}/amneziawg-web-uninstall.sh"
-
-# Ensure a clean state for the standalone install.
-bash "${WEB_UNINSTALLER_IMPL}" \
-	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--data-dir "${WEB_TEST_DATA_DIR}" \
-	--env-file "${WEB_TEST_ENV_FILE}" \
-	--purge-config --purge-data \
-	--force >/dev/null 2>&1 || true
-rm -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
-mkdir -p "${WEB_TEST_INSTALL_DIR}" "${WEB_TEST_DATA_DIR}" \
-	"$(dirname "${WEB_TEST_ENV_FILE}")"
-
-# 9b-1: Standalone install — root wrapper bootstraps via mock git clone.
-WEB_BOOTSTRAP9_INSTALL_RC=0
-WEB_BOOTSTRAP9_INSTALL_OUTPUT=$(PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
-	bash "${PHASE9_STANDALONE_DIR}/amneziawg-web-install.sh" \
-	--non-interactive --force \
-	--binary-src "${STUB_BINARY}" \
-	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--data-dir "${WEB_TEST_DATA_DIR}" \
-	--env-file "${WEB_TEST_ENV_FILE}" \
-	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
-	--username testadmin \
-	--password-hash "${TEST_PASSWORD_HASH}" \
-	--no-start --no-enable 2>&1) || WEB_BOOTSTRAP9_INSTALL_RC=$?
-
-if [[ ${WEB_BOOTSTRAP9_INSTALL_RC} -eq 0 ]]; then
-	echo "OK: Standalone install bootstraps via mock git clone (rc=0)"
-else
-	echo "FAIL: Standalone install via bootstrap clone failed (rc=${WEB_BOOTSTRAP9_INSTALL_RC})"
-	echo "  Output tail: $(echo "${WEB_BOOTSTRAP9_INSTALL_OUTPUT}" | tail -10)"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
-	echo "OK: Binary installed via standalone bootstrap"
-else
-	echo "FAIL: Binary not found after standalone bootstrap install"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
-	echo "OK: Env file created via standalone bootstrap install"
-else
-	echo "FAIL: Env file missing after standalone bootstrap install"
-	FAILED=$((FAILED + 1))
-fi
-
-# The wrapper prints the clone message to stderr; with 2>&1 it is in OUTPUT.
-if echo "${WEB_BOOTSTRAP9_INSTALL_OUTPUT}" | grep -qiE "cloning|clone|bootstrap"; then
-	echo "OK: Standalone install output mentions cloning/bootstrapping"
-else
-	echo "WARN: Standalone install output does not mention cloning (check stderr capture)"
-fi
-
-# 9b-2: Standalone uninstall — root wrapper bootstraps via mock git clone.
-WEB_BOOTSTRAP9_UNINSTALL_RC=0
-WEB_BOOTSTRAP9_UNINSTALL_OUTPUT=$(PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
-	bash "${PHASE9_STANDALONE_DIR}/amneziawg-web-uninstall.sh" \
-	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--data-dir "${WEB_TEST_DATA_DIR}" \
-	--env-file "${WEB_TEST_ENV_FILE}" \
-	--force 2>&1) || WEB_BOOTSTRAP9_UNINSTALL_RC=$?
-
-if [[ ${WEB_BOOTSTRAP9_UNINSTALL_RC} -eq 0 ]]; then
-	echo "OK: Standalone uninstall bootstraps via mock git clone (rc=0)"
-else
-	echo "FAIL: Standalone uninstall via bootstrap clone failed (rc=${WEB_BOOTSTRAP9_UNINSTALL_RC})"
-	echo "  Output tail: $(echo "${WEB_BOOTSTRAP9_UNINSTALL_OUTPUT}" | tail -10)"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ ! -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
-	echo "OK: Binary removed via standalone bootstrap uninstall"
-else
-	echo "FAIL: Binary still present after standalone bootstrap uninstall"
-	FAILED=$((FAILED + 1))
-fi
-
-if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
-	echo "OK: Env file preserved (safe default) after standalone bootstrap uninstall"
-else
-	echo "FAIL: Env file removed — root uninstall should preserve it by default"
-	FAILED=$((FAILED + 1))
-fi
-
-# ---- Phase 9c: Standalone error path — git clone fails ----
-echo ""
-echo "--- Phase 9c: Standalone error path — git clone fails ---"
-
-# Create a mock git that is present in PATH but always fails on clone,
-# simulating a network failure or an unreachable repository.
-PHASE9_FAIL_GIT_DIR="$(mktemp -d /tmp/awg-fail-git.XXXXXX)"
-cat > "${PHASE9_FAIL_GIT_DIR}/git" <<'PHASE9FAILGITMOCKEOF'
-#!/bin/bash
-# Mock git: fail on clone to simulate a network or repository error.
-if [[ "$1" == "clone" ]]; then
-	echo "fatal: unable to access repository (mock network failure)" >&2
-	exit 1
-fi
-exit 0
-PHASE9FAILGITMOCKEOF
-chmod +x "${PHASE9_FAIL_GIT_DIR}/git"
-
-PHASE9_STANDALONE_FAIL_DIR="$(mktemp -d /tmp/awg-standalone-fail.XXXXXX)"
-cp "${WEB_UNIFIED}"     "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web.sh"
-cp "${WEB_INSTALLER}"   "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web-install.sh"
-cp "${WEB_UNINSTALLER}" "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web-uninstall.sh"
-
-# 9c-1: Install wrapper — git clone fails → exits non-zero with error message.
-WEB_CLONEFAIL9_INSTALL_RC=0
-WEB_CLONEFAIL9_INSTALL_OUTPUT=$(PATH="${PHASE9_FAIL_GIT_DIR}:${PATH}" \
-	bash "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web-install.sh" \
-	--non-interactive \
-	--binary-src "${STUB_BINARY}" \
-	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--data-dir "${WEB_TEST_DATA_DIR}" \
-	--env-file "${WEB_TEST_ENV_FILE}" \
-	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
-	--username testadmin \
-	--password-hash "${TEST_PASSWORD_HASH}" \
-	--no-start --no-enable 2>&1) || WEB_CLONEFAIL9_INSTALL_RC=$?
-
-if [[ ${WEB_CLONEFAIL9_INSTALL_RC} -ne 0 ]]; then
-	echo "OK: Standalone install exits non-zero when git clone fails"
-else
-	echo "FAIL: Standalone install should fail when git clone fails"
-	FAILED=$((FAILED + 1))
-fi
-
-if echo "${WEB_CLONEFAIL9_INSTALL_OUTPUT}" | grep -qiE "failed|error"; then
-	echo "OK: Standalone install error message is present when git clone fails"
-else
-	echo "FAIL: Standalone install missing helpful error message when git clone fails"
-	echo "  Output: ${WEB_CLONEFAIL9_INSTALL_OUTPUT}"
-	FAILED=$((FAILED + 1))
-fi
-
-# 9c-2: Uninstall wrapper — git clone fails → exits non-zero with error message.
-WEB_CLONEFAIL9_UNINSTALL_RC=0
-WEB_CLONEFAIL9_UNINSTALL_OUTPUT=$(PATH="${PHASE9_FAIL_GIT_DIR}:${PATH}" \
-	bash "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web-uninstall.sh" \
-	--install-dir "${WEB_TEST_INSTALL_DIR}" \
-	--data-dir "${WEB_TEST_DATA_DIR}" \
-	--env-file "${WEB_TEST_ENV_FILE}" \
-	--force 2>&1) || WEB_CLONEFAIL9_UNINSTALL_RC=$?
-
-if [[ ${WEB_CLONEFAIL9_UNINSTALL_RC} -ne 0 ]]; then
-	echo "OK: Standalone uninstall exits non-zero when git clone fails"
-else
-	echo "FAIL: Standalone uninstall should fail when git clone fails"
-	FAILED=$((FAILED + 1))
-fi
-
-if echo "${WEB_CLONEFAIL9_UNINSTALL_OUTPUT}" | grep -qiE "failed|error"; then
-	echo "OK: Standalone uninstall error message is present when git clone fails"
-else
-	echo "FAIL: Standalone uninstall missing helpful error message when git clone fails"
-	echo "  Output: ${WEB_CLONEFAIL9_UNINSTALL_OUTPUT}"
-	FAILED=$((FAILED + 1))
-fi
-
-# ---- Phase 9 clean-up ----
-rm -rf "${PHASE9_STANDALONE_DIR}" "${PHASE9_STANDALONE_FAIL_DIR}"
-rm -rf "${PHASE9_MOCK_GIT_DIR}" "${PHASE9_FAIL_GIT_DIR}"
-rm -f  "${PHASE9_UPGRADE_BIN}"
-
-echo ""
-echo "=== Phase 9: Root wrapper and standalone bootstrap tests complete ==="
-
-# ============================================================
-# Phase 10: Unified entry point (amneziawg-web.sh)
+# Phase 9: Unified entry point (amneziawg-web.sh)
 # ============================================================
 #
 # Test scenarios:
 # a) help / no-args output
-# b) status subcommand
-# c) install / uninstall / upgrade via unified script
-# d) unknown subcommand error
-# e) standalone bootstrap via unified script
+# b) unknown subcommand error
+# c) status subcommand
+# d) install / uninstall via unified script
+# e) upgrade via unified script
+# f) standalone bootstrap via unified script (success path)
+# g) standalone bootstrap failure — git clone fails
+# h) standalone bootstrap failure — git not in PATH
 #
 echo ""
-echo "=== Phase 10: Unified entry point (amneziawg-web.sh) ==="
+echo "=== Phase 9: Unified entry point (amneziawg-web.sh) ==="
 
-# ---- Phase 10a: help and no-args ----
+# ---- Phase 9a: help and no-args ----
 echo ""
-echo "--- Phase 10a: help output and no-args default ---"
+echo "--- Phase 9a: help output and no-args default ---"
 
 # No arguments: should show help and exit 0
 UNIFIED_NOARGS_RC=0
@@ -3225,9 +2867,9 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# ---- Phase 10b: unknown subcommand ----
+# ---- Phase 9b: unknown subcommand ----
 echo ""
-echo "--- Phase 10b: unknown subcommand ---"
+echo "--- Phase 9b: unknown subcommand ---"
 
 UNIFIED_UNKNOWN_RC=0
 UNIFIED_UNKNOWN_OUTPUT=$(bash "${WEB_UNIFIED}" frobnicate 2>&1) || UNIFIED_UNKNOWN_RC=$?
@@ -3246,9 +2888,9 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# ---- Phase 10c: status subcommand ----
+# ---- Phase 9c: status subcommand ----
 echo ""
-echo "--- Phase 10c: status subcommand ---"
+echo "--- Phase 9c: status subcommand ---"
 
 # Re-install so status sees an installed binary
 rm -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
@@ -3294,9 +2936,9 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# ---- Phase 10d: install + uninstall via unified script ----
+# ---- Phase 9d: install + uninstall via unified script ----
 echo ""
-echo "--- Phase 10d: install and uninstall via unified script ---"
+echo "--- Phase 9d: install and uninstall via unified script ---"
 
 # Uninstall via unified script
 bash "${WEB_UNINSTALLER_IMPL}" \
@@ -3355,9 +2997,9 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# ---- Phase 10e: upgrade via unified script ----
+# ---- Phase 9e: upgrade via unified script ----
 echo ""
-echo "--- Phase 10e: upgrade via unified script ---"
+echo "--- Phase 9e: upgrade via unified script ---"
 
 # Re-install for upgrade test
 bash "${WEB_INSTALLER_IMPL}" \
@@ -3371,16 +3013,16 @@ bash "${WEB_INSTALLER_IMPL}" \
 	--password-hash "${TEST_PASSWORD_HASH}" \
 	--no-start --no-enable >/dev/null 2>&1
 
-PHASE10_UPGRADE_BIN="/tmp/amneziawg-web-phase10-upgrade"
-cat > "${PHASE10_UPGRADE_BIN}" <<'PHASE10UPGEOF'
+PHASE9_UPGRADE_BIN="/tmp/amneziawg-web-phase9-upgrade"
+cat > "${PHASE9_UPGRADE_BIN}" <<'PHASE9UPGEOF'
 #!/bin/bash
-echo "amneziawg-web stub v0.0.0-phase10-upgrade"
-PHASE10UPGEOF
-chmod +x "${PHASE10_UPGRADE_BIN}"
+echo "amneziawg-web stub v0.0.0-phase9-upgrade"
+PHASE9UPGEOF
+chmod +x "${PHASE9_UPGRADE_BIN}"
 
 UNIFIED_UPGRADE_RC=0
 bash "${WEB_UNIFIED}" upgrade \
-	--binary "${PHASE10_UPGRADE_BIN}" \
+	--binary "${PHASE9_UPGRADE_BIN}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" \
@@ -3395,22 +3037,22 @@ fi
 
 if [[ -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]] && \
 	[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" == \
-	   "$(sha256sum "${PHASE10_UPGRADE_BIN}" | awk '{print $1}')" ]]; then
+	   "$(sha256sum "${PHASE9_UPGRADE_BIN}" | awk '{print $1}')" ]]; then
 	echo "OK: Binary replaced via unified upgrade subcommand"
 else
 	echo "FAIL: Binary not replaced via unified upgrade subcommand"
 	FAILED=$((FAILED + 1))
 fi
 
-rm -f "${PHASE10_UPGRADE_BIN}"
+rm -f "${PHASE9_UPGRADE_BIN}"
 
-# ---- Phase 10f: standalone bootstrap via unified script ----
+# ---- Phase 9f: standalone bootstrap via unified script ----
 echo ""
-echo "--- Phase 10f: standalone bootstrap via unified script ---"
+echo "--- Phase 9f: standalone bootstrap via unified script ---"
 
 # Create a standalone directory containing only amneziawg-web.sh
-PHASE10_STANDALONE_DIR="$(mktemp -d /tmp/awg-standalone-unified.XXXXXX)"
-cp "${WEB_UNIFIED}" "${PHASE10_STANDALONE_DIR}/amneziawg-web.sh"
+PHASE9_STANDALONE_DIR="$(mktemp -d /tmp/awg-standalone-unified.XXXXXX)"
+cp "${WEB_UNIFIED}" "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh"
 
 # Ensure a clean state
 bash "${WEB_UNINSTALLER_IMPL}" \
@@ -3423,9 +3065,9 @@ rm -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
 mkdir -p "${WEB_TEST_INSTALL_DIR}" "${WEB_TEST_DATA_DIR}" \
 	"$(dirname "${WEB_TEST_ENV_FILE}")"
 
-# Use mock git from Phase 9 (or create one if clean-up removed it)
-PHASE10_MOCK_GIT_DIR="$(mktemp -d /tmp/awg-mock-git-ph10.XXXXXX)"
-cat > "${PHASE10_MOCK_GIT_DIR}/git" <<PHASE10GITMOCKEOF
+# Create a mock git that simulates a successful bootstrap clone
+PHASE9_MOCK_GIT_DIR="$(mktemp -d /tmp/awg-mock-git-ph9.XXXXXX)"
+cat > "${PHASE9_MOCK_GIT_DIR}/git" <<PHASE9GITMOCKEOF
 #!/bin/bash
 if [[ "\$1" == "clone" ]]; then
 	TARGET=""
@@ -3434,13 +3076,13 @@ if [[ "\$1" == "clone" ]]; then
 	exit 0
 fi
 exit 0
-PHASE10GITMOCKEOF
-chmod +x "${PHASE10_MOCK_GIT_DIR}/git"
+PHASE9GITMOCKEOF
+chmod +x "${PHASE9_MOCK_GIT_DIR}/git"
 
 # Install via standalone unified script with mock git
 UNIFIED_BOOTSTRAP_RC=0
-UNIFIED_BOOTSTRAP_OUTPUT=$(PATH="${PHASE10_MOCK_GIT_DIR}:${PATH}" \
-	bash "${PHASE10_STANDALONE_DIR}/amneziawg-web.sh" install \
+UNIFIED_BOOTSTRAP_OUTPUT=$(PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
+	bash "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh" install \
 	--non-interactive --force \
 	--binary-src "${STUB_BINARY}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
@@ -3472,10 +3114,134 @@ else
 	echo "WARN: Standalone unified install output does not mention cloning (check stderr capture)"
 fi
 
-rm -rf "${PHASE10_STANDALONE_DIR}" "${PHASE10_MOCK_GIT_DIR}"
+rm -rf "${PHASE9_STANDALONE_DIR}" "${PHASE9_MOCK_GIT_DIR}"
+
+# ---- Phase 9g: standalone bootstrap failure — git clone fails ----
+echo ""
+echo "--- Phase 9g: standalone bootstrap failure — git clone fails ---"
+
+# Create a mock git that is present in PATH but always fails on clone,
+# simulating a network failure or an unreachable repository.
+PHASE9_FAIL_GIT_DIR="$(mktemp -d /tmp/awg-fail-git.XXXXXX)"
+cat > "${PHASE9_FAIL_GIT_DIR}/git" <<'PHASE9FAILGITMOCKEOF'
+#!/bin/bash
+# Mock git: fail on clone to simulate a network or repository error.
+if [[ "$1" == "clone" ]]; then
+	echo "fatal: unable to access repository (mock network failure)" >&2
+	exit 1
+fi
+exit 0
+PHASE9FAILGITMOCKEOF
+chmod +x "${PHASE9_FAIL_GIT_DIR}/git"
+
+PHASE9_STANDALONE_FAIL_DIR="$(mktemp -d /tmp/awg-standalone-fail.XXXXXX)"
+cp "${WEB_UNIFIED}" "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web.sh"
+
+# 9g-1: Install — git clone fails → exits non-zero with error message.
+UNIFIED_CLONEFAIL_INSTALL_RC=0
+UNIFIED_CLONEFAIL_INSTALL_OUTPUT=$(PATH="${PHASE9_FAIL_GIT_DIR}:${PATH}" \
+	bash "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web.sh" install \
+	--non-interactive \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable 2>&1) || UNIFIED_CLONEFAIL_INSTALL_RC=$?
+
+if [[ ${UNIFIED_CLONEFAIL_INSTALL_RC} -ne 0 ]]; then
+	echo "OK: Standalone unified install exits non-zero when git clone fails"
+else
+	echo "FAIL: Standalone unified install should fail when git clone fails"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${UNIFIED_CLONEFAIL_INSTALL_OUTPUT}" | grep -qiE "failed|error"; then
+	echo "OK: Standalone unified install error message is present when git clone fails"
+else
+	echo "FAIL: Standalone unified install missing helpful error message when git clone fails"
+	echo "  Output: ${UNIFIED_CLONEFAIL_INSTALL_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+# 9g-2: Uninstall — git clone fails → exits non-zero with error message.
+UNIFIED_CLONEFAIL_UNINSTALL_RC=0
+UNIFIED_CLONEFAIL_UNINSTALL_OUTPUT=$(PATH="${PHASE9_FAIL_GIT_DIR}:${PATH}" \
+	bash "${PHASE9_STANDALONE_FAIL_DIR}/amneziawg-web.sh" uninstall \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--force 2>&1) || UNIFIED_CLONEFAIL_UNINSTALL_RC=$?
+
+if [[ ${UNIFIED_CLONEFAIL_UNINSTALL_RC} -ne 0 ]]; then
+	echo "OK: Standalone unified uninstall exits non-zero when git clone fails"
+else
+	echo "FAIL: Standalone unified uninstall should fail when git clone fails"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${UNIFIED_CLONEFAIL_UNINSTALL_OUTPUT}" | grep -qiE "failed|error"; then
+	echo "OK: Standalone unified uninstall error message is present when git clone fails"
+else
+	echo "FAIL: Standalone unified uninstall missing helpful error message when git clone fails"
+	echo "  Output: ${UNIFIED_CLONEFAIL_UNINSTALL_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+rm -rf "${PHASE9_STANDALONE_FAIL_DIR}" "${PHASE9_FAIL_GIT_DIR}"
+
+# ---- Phase 9h: standalone bootstrap failure — git not in PATH ----
+echo ""
+echo "--- Phase 9h: standalone bootstrap failure — git not in PATH ---"
+
+PHASE9_STANDALONE_NOGIT_DIR="$(mktemp -d /tmp/awg-standalone-nogit.XXXXXX)"
+cp "${WEB_UNIFIED}" "${PHASE9_STANDALONE_NOGIT_DIR}/amneziawg-web.sh"
+
+# Resolve bash to an absolute path before clobbering PATH, then build a
+# minimal PATH directory that has required coreutils but intentionally omits
+# git so the unified script reliably hits `command -v git` failure.
+PHASE9_BASH_ABS="$(command -v bash)"
+PHASE9_NOGIT_DIR="$(mktemp -d /tmp/awg-nogit-path.XXXXXX)"
+for _cmd in dirname id basename cat rm mkdir mktemp readlink; do
+	_abs="$(command -v "$_cmd" 2>/dev/null || true)"
+	[[ -n "$_abs" ]] && ln -sf "$_abs" "${PHASE9_NOGIT_DIR}/"
+done
+
+# 9h-1: Install — git missing → exits non-zero with error message.
+UNIFIED_NOGIT_INSTALL_RC=0
+UNIFIED_NOGIT_INSTALL_OUTPUT=$(PATH="${PHASE9_NOGIT_DIR}" \
+	"${PHASE9_BASH_ABS}" "${PHASE9_STANDALONE_NOGIT_DIR}/amneziawg-web.sh" install \
+	--non-interactive \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable 2>&1) || UNIFIED_NOGIT_INSTALL_RC=$?
+
+if [[ ${UNIFIED_NOGIT_INSTALL_RC} -ne 0 ]]; then
+	echo "OK: Standalone unified install exits non-zero when git is not in PATH"
+else
+	echo "FAIL: Standalone unified install should fail when git is not in PATH"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${UNIFIED_NOGIT_INSTALL_OUTPUT}" | grep -qiE "git|not found|error"; then
+	echo "OK: Standalone unified install error mentions git when git is not in PATH"
+else
+	echo "FAIL: Standalone unified install missing helpful error message when git is not in PATH"
+	echo "  Output: ${UNIFIED_NOGIT_INSTALL_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+rm -rf "${PHASE9_STANDALONE_NOGIT_DIR}" "${PHASE9_NOGIT_DIR}"
 
 echo ""
-echo "=== Phase 10: Unified entry point tests complete ==="
+echo "=== Phase 9: Unified entry point tests complete ==="
 
 echo ""
 echo "=========================================="
