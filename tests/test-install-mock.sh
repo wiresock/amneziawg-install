@@ -2936,7 +2936,9 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-if diff -q "${WEB_TEST_INSTALL_DIR}/amneziawg-web" "${PHASE9_UPGRADE_BIN}" >/dev/null 2>&1; then
+if [[ -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]] && \
+	[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" == \
+	   "$(sha256sum "${PHASE9_UPGRADE_BIN}" | awk '{print $1}')" ]]; then
 	echo "OK: Binary replaced via root upgrade wrapper"
 else
 	echo "FAIL: Binary not replaced via root upgrade wrapper"
