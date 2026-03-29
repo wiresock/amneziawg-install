@@ -670,6 +670,7 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
         # AWG_CONFIG_DIR is already normalized in main(), but resolve again as
         # defense-in-depth in case setup_filesystem is called from elsewhere.
         local target_dir="${AWG_CONFIG_DIR%/}"
+        local resolved
         if resolved="$(readlink -f -- "${target_dir}" 2>/dev/null)"; then
             target_dir="${resolved}"
         fi
@@ -980,6 +981,7 @@ adjust_unit_hardening() {
     # Normalize: resolve symlinks and strip trailing slashes so the case
     # checks match the actual filesystem location (AWG_CONFIG_DIR is already
     # normalized in main(), but resolve again as defense-in-depth).
+    local resolved
     if resolved="$(readlink -f -- "${config_dir}" 2>/dev/null)"; then
         config_dir="${resolved}"
     fi
@@ -1156,6 +1158,7 @@ main() {
 
     # Normalize AWG_CONFIG_DIR to an absolute, symlink-free path once and use
     # it consistently everywhere (ACLs, env file, systemd unit hardening).
+    local resolved
     if resolved="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
         AWG_CONFIG_DIR="${resolved}"
     fi
