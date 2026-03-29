@@ -599,7 +599,7 @@ detect_awg_config_dir() {
         # Use a narrower glob and verify the file looks like an AWG config by checking
         # for an [Interface] section before trusting the directory.
         local cfg_file=""
-        cfg_file="$(compgen -G "${dir}/awg"*-client-*.conf | head -n 1 || true)"
+        cfg_file="$(compgen -G "${dir}/awg*-client-*.conf" | head -n 1 || true)"
         if [[ -n "${cfg_file}" ]] && grep -qE '^\[Interface\]' "${cfg_file}" 2>/dev/null; then
             AWG_CONFIG_DIR="${dir}"
             info "Auto-detected AWG client config directory: ${AWG_CONFIG_DIR}"
@@ -668,7 +668,9 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
             setfacl -m "u:${SERVICE_USER}:rx" "${AWG_CONFIG_DIR}" 2>/dev/null \
                 && info "Granted read ACL for ${SERVICE_USER} on ${AWG_CONFIG_DIR}." \
                 || warn "setfacl failed on ${AWG_CONFIG_DIR}."
-            # Default ACL: new files/dirs inherit read for the service user.
+            # Default ACL: new files inherit read for the service user, and
+            # new directories inherit read+execute (traverse).  Using rX grants
+            # execute only on directories while keeping regular files non-executable.
             # Avoid setting a default ACL on a home directory itself (e.g. /home/<user> or /root),
             # since that would grant the service user access to all future files in the home.
             local is_home_dir=0
@@ -685,7 +687,7 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                     ;;
             esac
             if [[ ${is_home_dir} -eq 0 ]]; then
-                setfacl -d -m "u:${SERVICE_USER}:r" "${AWG_CONFIG_DIR}" 2>/dev/null \
+                setfacl -d -m "u:${SERVICE_USER}:rX" "${AWG_CONFIG_DIR}" 2>/dev/null \
                     && info "Set default ACL for future configs in ${AWG_CONFIG_DIR}." \
                     || warn "setfacl -d failed on ${AWG_CONFIG_DIR}."
             else
@@ -697,7 +699,7 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                     setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
                 done
             # Log only if there were any .conf files
-            if compgen -G "${AWG_CONFIG_DIR}/"*.conf > /dev/null 2>&1; then
+            if compgen -G "${AWG_CONFIG_DIR}/*.conf" > /dev/null 2>&1; then
                 info "Applied read ACL to existing config files."
             fi
         elif [[ "${AWG_CONFIG_DIR}" != "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
@@ -914,14 +916,14 @@ adjust_unit_hardening() {
         fi
     fi
 
-    # 2. If the config directory lives under /home, relax ProtectHome so the
-    #    service can traverse into it.  ProtectHome=read-only still prevents
-    #    writes while allowing reads.
+    # 2. If the config directory lives under /home or /root, relax ProtectHome
+    #    so the service can traverse into it.  ProtectHome=read-only still
+    #    prevents writes while allowing reads.
     case "${config_dir}" in
-        /home|/home/*)
+        /root|/root/*|/home|/home/*)
             if grep -q '^ProtectHome=yes' "${unit_file}" 2>/dev/null; then
                 sed -i 's|^ProtectHome=yes|ProtectHome=read-only|' "${unit_file}"
-                info "Changed ProtectHome to read-only (config dir is under /home)."
+                info "Changed ProtectHome to read-only (config dir is under /home or /root)."
             fi
             ;;
     esac

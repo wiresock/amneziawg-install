@@ -1201,6 +1201,83 @@ bash "${WEB_INSTALLER_IMPL}" \
 rm -rf "${HOME_CONFIG_DIR}"
 
 echo ""
+echo "--- Web installer: auto-detect AWG_CONFIG_DIR ---"
+
+# When --config-dir is not passed, the installer should auto-detect the
+# directory containing awg*-client-*.conf files and write it to AWG_CONFIG_DIR
+# in the env file.
+AUTODETECT_DIR="/root"
+AUTODETECT_CONF="${AUTODETECT_DIR}/awg0-client-autotest.conf"
+
+# Create a fake AWG client config with an [Interface] section
+cat >"${AUTODETECT_CONF}" <<'CONFEOF'
+[Interface]
+PrivateKey = fake+key+for+testing=
+Address = 10.0.0.2/32
+CONFEOF
+
+WEB_AUTODETECT_RC=0
+WEB_AUTODETECT_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable 2>&1) || WEB_AUTODETECT_RC=$?
+
+if [[ ${WEB_AUTODETECT_RC} -eq 0 ]]; then
+	echo "OK: Installer with auto-detection succeeded"
+else
+	echo "FAIL: Installer with auto-detection exited non-zero (rc=${WEB_AUTODETECT_RC})"
+	echo "  Output tail: $(echo "${WEB_AUTODETECT_OUTPUT}" | tail -20)"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify auto-detected AWG_CONFIG_DIR appears in the env file
+if grep -q "^AWG_CONFIG_DIR=${AUTODETECT_DIR}$" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
+	echo "OK: AWG_CONFIG_DIR auto-detected as ${AUTODETECT_DIR}"
+else
+	echo "FAIL: AWG_CONFIG_DIR not auto-detected; expected ${AUTODETECT_DIR}"
+	echo "  Got: $(grep 'AWG_CONFIG_DIR=' "${WEB_TEST_ENV_FILE}" 2>/dev/null || echo 'not found')"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify the auto-detection was logged
+if echo "${WEB_AUTODETECT_OUTPUT}" | grep -q "Auto-detected AWG client config directory"; then
+	echo "OK: Auto-detection logged in output"
+else
+	echo "FAIL: Auto-detection message not found in output"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify ProtectHome was relaxed for /root config dir
+if grep -q "^ProtectHome=read-only" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
+	echo "OK: ProtectHome=read-only when config dir is /root"
+else
+	echo "FAIL: ProtectHome should be read-only when config dir is /root"
+	echo "  Got: $(grep 'ProtectHome=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	FAILED=$((FAILED + 1))
+fi
+
+rm -f "${AUTODETECT_CONF}"
+
+# Restore the original config dir for subsequent tests
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1 || true
+
+echo ""
 echo "--- Web installer: sudoers drop-in ---"
 
 # Verify sudoers file was installed
