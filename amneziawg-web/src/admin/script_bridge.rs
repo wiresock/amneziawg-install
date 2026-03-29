@@ -89,6 +89,9 @@ pub enum ScriptError {
     #[error("another add/remove operation is already in progress")]
     LockBusy,
 
+    #[error("lock I/O failure: {0}")]
+    LockFailed(String),
+
     #[error("failed to spawn script process: {0}")]
     Spawn(std::io::Error),
 

@@ -242,10 +242,9 @@ pub async fn execute_remove_user(
             .create(true)
             .mode(0o600)
             .open(&lock_path)
-            .map_err(|err| ScriptError::NonZeroExit {
-                code: 1,
-                stderr: format!("failed to open lock file for client removal at {lock_path:?}: {err}"),
-            })?;
+            .map_err(|err| ScriptError::LockFailed(
+                format!("failed to open lock file for client removal at {lock_path:?}: {err}"),
+            ))?;
         use std::os::unix::io::AsRawFd;
         let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
@@ -256,10 +255,9 @@ pub async fn execute_remove_user(
                     Err(ScriptError::LockBusy)
                 }
                 // Any other I/O error: include the underlying OS error for diagnostics.
-                _ => Err(ScriptError::NonZeroExit {
-                    code: 1,
-                    stderr: format!("failed to acquire lock for client removal: {err}"),
-                }),
+                _ => Err(ScriptError::LockFailed(
+                    format!("failed to acquire lock for client removal: {err}"),
+                )),
             };
         }
         Ok(f)
@@ -267,10 +265,14 @@ pub async fn execute_remove_user(
     let _lock_file = match lock_result {
         Ok(f) => f,
         Err(e) => {
+            let error_kind = match &e {
+                ScriptError::LockBusy => "lock_busy",
+                _ => "lock_failed",
+            };
             let detail = serde_json::json!({
                 "peer_id": peer_id,
                 "name": client_name,
-                "error": "lock_failed",
+                "error": error_kind,
             })
             .to_string();
             log_event(
