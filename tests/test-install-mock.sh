@@ -1266,12 +1266,15 @@ fi
 
 rm -f "${AUTODETECT_CONF}"
 
-# Clean up any ACL entries on /root left by the auto-detection test
+# Clean up any ACL entries on /root left by the auto-detection test.
+# Use the same service user name as the installer (SERVICE_USER in the script).
+WEB_SERVICE_USER="awg-web"
 if command -v setfacl >/dev/null 2>&1; then
-	setfacl -x "u:awg-web" /root 2>/dev/null || true
+	setfacl -x "u:${WEB_SERVICE_USER}" /root 2>/dev/null || true
 fi
 
 # Restore the original config dir for subsequent tests
+WEB_RESTORE_RC=0
 bash "${WEB_INSTALLER_IMPL}" \
 	--non-interactive \
 	--force \
@@ -1282,7 +1285,12 @@ bash "${WEB_INSTALLER_IMPL}" \
 	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
 	--username testadmin \
 	--password-hash "${TEST_PASSWORD_HASH}" \
-	--no-start --no-enable >/dev/null 2>&1 || true
+	--no-start --no-enable >/dev/null 2>&1 || WEB_RESTORE_RC=$?
+
+if [[ ${WEB_RESTORE_RC} -ne 0 ]]; then
+	echo "FAIL: Restore of original config dir failed (rc=${WEB_RESTORE_RC})"
+	FAILED=$((FAILED + 1))
+fi
 
 echo ""
 echo "--- Web installer: sudoers drop-in ---"

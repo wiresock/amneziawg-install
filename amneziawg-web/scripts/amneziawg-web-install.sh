@@ -71,6 +71,7 @@ DATA_DIR="${DEFAULT_DATA_DIR}"
 ENV_DIR="${DEFAULT_ENV_DIR}"
 ENV_FILE="${DEFAULT_ENV_FILE}"
 AWG_CONFIG_DIR="${DEFAULT_AWG_CONFIG_DIR}"
+AWG_CONFIG_DIR_SET=false
 LISTEN_HOST="${DEFAULT_LISTEN_HOST}"
 LISTEN_PORT="${DEFAULT_LISTEN_PORT}"
 POLL_INTERVAL="${DEFAULT_POLL_INTERVAL}"
@@ -171,7 +172,7 @@ parse_args() {
                 ENV_DIR="$(dirname "${ENV_FILE}")"
                 shift 2 ;;
             --config-dir)
-                AWG_CONFIG_DIR="$2"; shift 2 ;;
+                AWG_CONFIG_DIR="$2"; AWG_CONFIG_DIR_SET=true; shift 2 ;;
             --host)
                 LISTEN_HOST="$2"; shift 2 ;;
             --port)
@@ -563,9 +564,8 @@ EOF
 # configs, use their parent directory as the default so the web panel discovers
 # them without manual configuration.
 detect_awg_config_dir() {
-    # Only auto-detect when no explicit --config-dir was provided
-    # (AWG_CONFIG_DIR still equals the compiled default).
-    if [[ "${AWG_CONFIG_DIR}" != "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
+    # Only auto-detect when no explicit --config-dir was provided.
+    if [[ "${AWG_CONFIG_DIR_SET}" == "true" ]]; then
         return 0
     fi
 
@@ -588,11 +588,16 @@ detect_awg_config_dir() {
 
     search_dirs+=("/root")
 
-    for d in /home/*/; do
-        if [[ -d "${d}" ]]; then
-            search_dirs+=("${d%/}")
-        fi
-    done
+    # Scanning all /home/* directories is disabled by default to avoid
+    # reading other users' configs on multi-user systems.  Set
+    # AMNEZIAWG_WEB_SCAN_ALL_HOMES=1 to enable.
+    if [[ "${AMNEZIAWG_WEB_SCAN_ALL_HOMES:-0}" == "1" ]]; then
+        for d in /home/*/; do
+            if [[ -d "${d}" ]]; then
+                search_dirs+=("${d%/}")
+            fi
+        done
+    fi
 
     for dir in "${search_dirs[@]}"; do
         # Look for the AWG client config naming pattern (files like awg*-client-*.conf)
@@ -601,7 +606,7 @@ detect_awg_config_dir() {
         local cfg_file=""
         cfg_file="$(compgen -G "${dir}/awg*-client-*.conf" | head -n 1 || true)"
         if [[ -n "${cfg_file}" ]] && [[ -f "${cfg_file}" && -r "${cfg_file}" ]] && \
-            grep -qE '^\[Interface\]' "${cfg_file}" 2>/dev/null; then
+            grep -qE '^[[:space:]]*\[Interface\]' "${cfg_file}" 2>/dev/null; then
             AWG_CONFIG_DIR="${dir}"
             info "Auto-detected AWG client config directory: ${AWG_CONFIG_DIR}"
             return 0
@@ -662,14 +667,12 @@ setup_filesystem() {
 You may need to grant read access to ${AWG_CONFIG_DIR} manually."
         fi
 
-        # Resolve AWG_CONFIG_DIR to an absolute, symlink-free path once, and use
-        # the resolved value consistently for ACL setup AND parent traversal.
-        local target_dir
-        if ! target_dir="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
-            target_dir="${AWG_CONFIG_DIR}"
+        # AWG_CONFIG_DIR is already normalized in main(), but resolve again as
+        # defense-in-depth in case setup_filesystem is called from elsewhere.
+        local target_dir="${AWG_CONFIG_DIR%/}"
+        if resolved="$(readlink -f -- "${target_dir}" 2>/dev/null)"; then
+            target_dir="${resolved}"
         fi
-        # Strip trailing slashes so /home/user/ is correctly recognized as a home dir.
-        target_dir="${target_dir%/}"
 
         # Grant the service user read access to existing *.conf files and set
         # a default ACL so that future files created by amneziawg-install.sh
@@ -703,9 +706,13 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                 esac
 
                 # Grant rx on the config directory so the service can list its
-                # contents (std::fs::read_dir) and traverse into it.  This applies
-                # to both home directories and dedicated config directories — the
-                # web panel needs directory read permission to discover configs.
+                # contents (std::fs::read_dir) and traverse into it.  The web
+                # panel needs directory read permission to discover configs.
+                if [[ ${is_home_dir} -eq 1 ]]; then
+                    warn "Granting directory read access on home directory ${target_dir}."
+                    warn "This allows the service user to list filenames in ${target_dir}."
+                    warn "For better privacy, use a dedicated subdirectory (e.g. ${target_dir}/amneziawg-clients)."
+                fi
                 setfacl -m "u:${SERVICE_USER}:rx" "${target_dir}" 2>/dev/null \
                     && info "Granted read+traverse ACL for ${SERVICE_USER} on ${target_dir}." \
                     || warn "setfacl failed on ${target_dir}."
@@ -970,7 +977,12 @@ adjust_unit_hardening() {
 
     [[ -f "${unit_file}" ]] || return 0
 
-    # Normalize: strip trailing slashes for consistent comparison
+    # Normalize: resolve symlinks and strip trailing slashes so the case
+    # checks match the actual filesystem location (AWG_CONFIG_DIR is already
+    # normalized in main(), but resolve again as defense-in-depth).
+    if resolved="$(readlink -f -- "${config_dir}" 2>/dev/null)"; then
+        config_dir="${resolved}"
+    fi
     config_dir="${config_dir%/}"
 
     # 1. Update ReadOnlyPaths to include the actual config directory
@@ -1141,6 +1153,13 @@ main() {
     parse_args "$@"
     preflight_checks
     detect_awg_config_dir
+
+    # Normalize AWG_CONFIG_DIR to an absolute, symlink-free path once and use
+    # it consistently everywhere (ACLs, env file, systemd unit hardening).
+    if resolved="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
+        AWG_CONFIG_DIR="${resolved}"
+    fi
+    AWG_CONFIG_DIR="${AWG_CONFIG_DIR%/}"
 
     if [[ "${NON_INTERACTIVE}" == "true" ]]; then
         non_interactive_validate
