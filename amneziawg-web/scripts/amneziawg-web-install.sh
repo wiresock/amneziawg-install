@@ -556,6 +556,54 @@ EOF
     fi
 }
 
+# Try to detect the directory where amneziawg-install.sh stores client configs.
+# The installer writes files like  awg0-client-<name>.conf  into the invoking
+# user's home directory (resolved via getHomeDirForClient).  If the default
+# AWG_CONFIG_DIR has not been overridden and we can find existing client
+# configs, use their parent directory as the default so the web panel discovers
+# them without manual configuration.
+detect_awg_config_dir() {
+    # Only auto-detect when no explicit --config-dir was provided
+    # (AWG_CONFIG_DIR still equals the compiled default).
+    if [[ "${AWG_CONFIG_DIR}" != "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
+        return 0
+    fi
+
+    # Search common locations for AWG client configs.
+    # Priority: SUDO_USER's home, root's home, any /home/* directory.
+    local -a search_dirs=()
+
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local sudo_home=""
+        if command -v getent &>/dev/null; then
+            sudo_home="$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)"
+        fi
+        if [[ -z "${sudo_home}" ]] && [[ -d "/home/${SUDO_USER}" ]]; then
+            sudo_home="/home/${SUDO_USER}"
+        fi
+        if [[ -n "${sudo_home}" ]] && [[ -d "${sudo_home}" ]]; then
+            search_dirs+=("${sudo_home}")
+        fi
+    fi
+
+    search_dirs+=("/root")
+
+    for d in /home/*; do
+        if [[ -d "${d}" ]]; then
+            search_dirs+=("${d}")
+        fi
+    done
+
+    for dir in "${search_dirs[@]}"; do
+        # Look for the AWG client config naming pattern
+        if compgen -G "${dir}/"*-client-*.conf > /dev/null 2>&1; then
+            AWG_CONFIG_DIR="${dir}"
+            info "Auto-detected AWG client config directory: ${AWG_CONFIG_DIR}"
+            return 0
+        fi
+    done
+}
+
 non_interactive_validate() {
     # In non-interactive mode, a password hash is required.
     if [[ -z "${PASSWORD_HASH}" ]]; then
@@ -598,35 +646,37 @@ setup_filesystem() {
     chown root:root "${ENV_DIR}"
     chmod 0700 "${ENV_DIR}"
 
-    # AWG client config directory – create if absent so amneziawg-install.sh
-    # can copy client configs here for the web panel to discover.
-    if [[ ! -d "${AWG_CONFIG_DIR}" ]]; then
-        mkdir -p "${AWG_CONFIG_DIR}"
-        info "Created AWG config directory: ${AWG_CONFIG_DIR}"
-    fi
-
     # Give the service user read access to the AWG config directory if it exists
     if [[ -d "${AWG_CONFIG_DIR}" ]]; then
         # Best-effort: add to group owning the directory
         local awg_group
         awg_group="$(stat -c '%G' "${AWG_CONFIG_DIR}")"
-        if [[ "${awg_group}" == "root" ]]; then
-            # Directory is root-owned with no dedicated group.  Change the
-            # group to the service user's primary group and grant group
-            # read+traverse so the web panel can discover client configs.
-            local svc_group
-            svc_group="$(id -gn "${SERVICE_USER}" 2>/dev/null || echo "")"
-            if [[ -n "${svc_group}" ]]; then
-                chgrp "${svc_group}" "${AWG_CONFIG_DIR}" 2>/dev/null \
-                    && chmod g+rx "${AWG_CONFIG_DIR}" 2>/dev/null \
-                    && info "Set group ${svc_group} on ${AWG_CONFIG_DIR} for service access." \
-                    || warn "Could not set group ${svc_group} on ${AWG_CONFIG_DIR}. \
-You may need to grant read access to ${AWG_CONFIG_DIR} manually."
-            fi
-        elif ! id -Gn "${SERVICE_USER}" | grep -qw "${awg_group}"; then
+        if [[ "${awg_group}" != "root" ]] && ! id -Gn "${SERVICE_USER}" | grep -qw "${awg_group}"; then
             usermod -aG "${awg_group}" "${SERVICE_USER}" 2>/dev/null \
                 || warn "Could not add ${SERVICE_USER} to group ${awg_group}. \
 You may need to grant read access to ${AWG_CONFIG_DIR} manually."
+        fi
+
+        # Grant the service user read access to existing *.conf files and set
+        # a default ACL so that future files created by amneziawg-install.sh
+        # are also readable — even when those files are created with mode 600.
+        if command -v setfacl >/dev/null 2>&1; then
+            setfacl -m "u:${SERVICE_USER}:rx" "${AWG_CONFIG_DIR}" 2>/dev/null \
+                && info "Granted read ACL for ${SERVICE_USER} on ${AWG_CONFIG_DIR}." \
+                || warn "setfacl failed on ${AWG_CONFIG_DIR}."
+            # Default ACL: new files/dirs inherit read for the service user
+            setfacl -d -m "u:${SERVICE_USER}:r" "${AWG_CONFIG_DIR}" 2>/dev/null \
+                && info "Set default ACL for future configs in ${AWG_CONFIG_DIR}." \
+                || warn "setfacl -d failed on ${AWG_CONFIG_DIR}."
+            # Apply read ACL to any existing .conf files
+            local existing_confs
+            existing_confs="$(find "${AWG_CONFIG_DIR}" -maxdepth 1 -name '*.conf' -type f 2>/dev/null)"
+            if [[ -n "${existing_confs}" ]]; then
+                echo "${existing_confs}" | while IFS= read -r cf; do
+                    setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
+                done
+                info "Applied read ACL to existing config files."
+            fi
         fi
 
         # For directories under /home, the parent home directory is typically
@@ -985,6 +1035,7 @@ print_summary() {
 main() {
     parse_args "$@"
     preflight_checks
+    detect_awg_config_dir
 
     if [[ "${NON_INTERACTIVE}" == "true" ]]; then
         non_interactive_validate

@@ -9,7 +9,6 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
-AWG_WEB_CLIENTS_DIR="/etc/amneziawg/clients"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
@@ -475,49 +474,6 @@ function getHomeDirForClient() {
 	fi
 
 	echo "${RESULT_DIR}"
-}
-
-# Copy a client config to the web panel's clients directory so that the
-# web UI can link the peer to its config (name, identity, download).
-# This is a best-effort operation: if the directory does not exist (web
-# panel not installed) or the copy fails, the error is silently ignored.
-function syncClientConfigToWebPanel() {
-	local SRC_CONF="$1"
-	local CONF_BASENAME
-	CONF_BASENAME="$(basename "${SRC_CONF}")"
-
-	if [[ ! -d "${AWG_WEB_CLIENTS_DIR}" ]]; then
-		return 0
-	fi
-
-	local DEST="${AWG_WEB_CLIENTS_DIR}/${CONF_BASENAME}"
-
-	if ! cp "${SRC_CONF}" "${DEST}" 2>/dev/null; then
-		return 0
-	fi
-
-	chmod 640 "${DEST}" 2>/dev/null || true
-
-	# Match file ownership to the directory so the web panel service
-	# (which is typically granted group access to this directory) can
-	# read the config.
-	if command -v stat >/dev/null 2>&1; then
-		local DIR_OWNER_GROUP
-		DIR_OWNER_GROUP="$(stat -c '%U:%G' "${AWG_WEB_CLIENTS_DIR}" 2>/dev/null || echo "")"
-		if [[ -n "${DIR_OWNER_GROUP}" ]]; then
-			chown "${DIR_OWNER_GROUP}" "${DEST}" 2>/dev/null || true
-		fi
-	fi
-}
-
-# Remove a client config from the web panel's clients directory.
-# Best-effort: silently ignored if the file or directory does not exist.
-function removeClientConfigFromWebPanel() {
-	local CONF_BASENAME="$1"
-
-	if [[ -d "${AWG_WEB_CLIENTS_DIR}" ]]; then
-		rm -f "${AWG_WEB_CLIENTS_DIR}/${CONF_BASENAME}" 2>/dev/null || true
-	fi
 }
 
 function initialCheck() {
@@ -1784,9 +1740,6 @@ AllowedIPs = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6}/128" >>"${SERVER_AWG_CONF}
 
 	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
 
-	# Copy client config to the web panel's clients directory (best-effort)
-	syncClientConfigToWebPanel "${client_conf}"
-
 	# Generate QR code if qrencode is installed
 	if command -v qrencode &>/dev/null; then
 		echo -e "${GREEN}\nHere is your client config file as a QR Code:\n${NC}"
@@ -1846,9 +1799,6 @@ function revokeClient() {
 	local HOME_DIR
 	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
 	rm -f "${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
-
-	# Remove client config from web panel directory (best-effort)
-	removeClientConfigFromWebPanel "${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# restart AmneziaWG to apply changes
 	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
@@ -2104,9 +2054,6 @@ EOF
 		fi
 
 		# Regeneration succeeded; existing client config has been updated.
-
-		# Copy regenerated config to web panel directory (best-effort)
-		syncClientConfigToWebPanel "${OUTPUT_CONF}"
 
 		# Generate QR code if qrencode is installed
 		if command -v qrencode &>/dev/null; then
