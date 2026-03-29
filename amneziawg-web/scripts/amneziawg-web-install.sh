@@ -726,14 +726,29 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                     info "Skipping default ACL on ${target_dir} because it appears to be a home directory; future configs may need manual ACLs."
                 fi
 
-                # Apply read ACL to any existing .conf files
-                find "${target_dir}" -maxdepth 1 -name '*.conf' -type f -print0 2>/dev/null \
-                    | while IFS= read -r -d '' cf; do
-                        setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
-                    done
-                # Log only if there were any .conf files
-                if compgen -G "${target_dir}/*.conf" > /dev/null 2>&1; then
-                    info "Applied read ACL to existing config files."
+                # Apply read ACL to any existing config files.
+                # For home directories, restrict to expected client config patterns
+                # so we don't grant the service user access to unrelated *.conf files.
+                if [[ ${is_home_dir} -eq 0 ]]; then
+                    # Dedicated config directory: all top-level *.conf files.
+                    find "${target_dir}" -maxdepth 1 -name '*.conf' -type f -print0 2>/dev/null \
+                        | while IFS= read -r -d '' cf; do
+                            setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
+                        done
+                    # Log only if there were any .conf files
+                    if compgen -G "${target_dir}/*.conf" > /dev/null 2>&1; then
+                        info "Applied read ACL to existing config files."
+                    fi
+                else
+                    # Home directory: limit to expected AmneziaWG client configs.
+                    find "${target_dir}" -maxdepth 1 -name 'awg*-client-*.conf' -type f -print0 2>/dev/null \
+                        | while IFS= read -r -d '' cf; do
+                            setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
+                        done
+                    # Log only if there were any matching client config files
+                    if compgen -G "${target_dir}/awg*-client-*.conf" > /dev/null 2>&1; then
+                        info "Applied read ACL to existing client config files in home directory."
+                    fi
                 fi
             fi
         elif [[ "${AWG_CONFIG_DIR}" != "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
