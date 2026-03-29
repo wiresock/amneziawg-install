@@ -48,7 +48,8 @@ readonly BINARY_NAME="amneziawg-web"
 # ── Output helpers ───────────────────────────────────────────────────────────
 
 # Enable colors only if stdout is a TTY and NO_COLOR is not set.
-if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+# Per https://no-color.org/, the variable's presence (even if empty) disables color.
+if [[ -t 1 ]] && [[ -z "${NO_COLOR+x}" ]]; then
     _AWG_COLOR=1
 else
     _AWG_COLOR=0
