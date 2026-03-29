@@ -183,7 +183,7 @@ adjust_unit_hardening() {
 
         if ! ${has_etc_dir}; then
             local data_linenum=""
-            data_linenum=$(grep -n "^ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1)
+            data_linenum=$(grep -n "^ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1 || true)
             if [[ -n "${data_linenum}" ]]; then
                 sed -i "${data_linenum}i\\ReadWritePaths=${etc_dir}" "${unit_file}"
             else
@@ -196,7 +196,7 @@ adjust_unit_hardening() {
 
         if ! ${has_config_dir}; then
             local data_linenum2=""
-            data_linenum2=$(grep -n "^ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1)
+            data_linenum2=$(grep -n "^ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1 || true)
             if [[ -n "${data_linenum2}" ]]; then
                 sed -i "${data_linenum2}i\\ReadWritePaths=${config_dir_sed}" "${unit_file}"
             else
