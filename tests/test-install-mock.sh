@@ -3272,6 +3272,9 @@ UNIFIED_STATUS_OUTPUT=$(bash "${WEB_UNIFIED}" status \
 	--env-file "${WEB_TEST_ENV_FILE}" \
 	--data-dir "${WEB_TEST_DATA_DIR}" 2>&1) || UNIFIED_STATUS_RC=$?
 
+# Strip ANSI color escape codes so anchored grep patterns match cleanly
+UNIFIED_STATUS_OUTPUT=$(printf '%s' "${UNIFIED_STATUS_OUTPUT}" | sed 's/\x1b\[[0-9;]*m//g')
+
 if [[ ${UNIFIED_STATUS_RC} -eq 0 ]]; then
 	echo "OK: Status subcommand exits 0"
 else
