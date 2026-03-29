@@ -129,7 +129,7 @@ pub async fn execute_create_user(
     let result = match result {
         Ok(inner) => inner,
         Err(e) => Err(client_manager::CreateClientError::FileWrite(format!(
-            "task panicked: {e}"
+            "client creation task failed: {e}"
         ))),
     };
 

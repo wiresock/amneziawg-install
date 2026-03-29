@@ -489,18 +489,31 @@ pub fn create_client(
     }
 
     // Write with restrictive permissions (mode 600).
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&client_conf_path)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, client_config.as_bytes()))
-        .map_err(|e| {
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&client_conf_path)
+            .map_err(|e| {
+                CreateClientError::FileWrite(format!(
+                    "open {}: {e}",
+                    client_conf_path.display()
+                ))
+            })?;
+        std::io::Write::write_all(&mut f, client_config.as_bytes()).map_err(|e| {
             CreateClientError::FileWrite(format!(
                 "write {}: {e}",
                 client_conf_path.display()
             ))
         })?;
+        std::io::Write::flush(&mut f).map_err(|e| {
+            CreateClientError::FileWrite(format!(
+                "flush {}: {e}",
+                client_conf_path.display()
+            ))
+        })?;
+    }
 
     info!(path = %client_conf_path.display(), "client config written");
 
