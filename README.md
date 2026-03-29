@@ -33,7 +33,7 @@ sudo ./amneziawg-web.sh install
 ✅ **After installation:**
 - VPN server is running
 - A client config file is generated at `~/awg0-client-<name>.conf`
-- (If installed) Web panel is available at `http://YOUR_SERVER_IP:8080`
+- (If installed) Web panel listens on `127.0.0.1:8080` by default — access it on the server at `http://127.0.0.1:8080`, or change `AWG_WEB_LISTEN` / use a reverse proxy for remote access
 
 ---
 
@@ -92,7 +92,7 @@ See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for all insta
 ## ⚙️ After Installation
 
 - **VPN client config** is saved to `~/awg0-client-<name>.conf`. Import it into any AmneziaWG client app.
-- **Web panel** is available at `http://YOUR_SERVER_IP:8080` once the service starts.
+- **Web panel** listens on `127.0.0.1:8080` by default. Access it on the server at `http://127.0.0.1:8080`, or change `AWG_WEB_LISTEN` / use a reverse proxy for remote access.
 - Re-run `sudo ./amneziawg-install.sh` to add or remove VPN clients interactively.
 - Check the web panel status at any time:
   ```bash
