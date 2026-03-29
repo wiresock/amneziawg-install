@@ -233,6 +233,8 @@ pub async fn execute_remove_user(
     // Acquire the same exclusive lock used by create_client() to prevent
     // concurrent add/remove operations from corrupting the server config
     // (the remove path uses `sed -i` + rename which can race with `tee -a`).
+    // Non-blocking (LOCK_NB) to avoid hanging web requests; returns an error
+    // if another operation is in progress, matching create_client() behavior.
     let lock_path = config_dir.join(".create-client.lock");
     let _lock_file = {
         let f = std::fs::OpenOptions::new()
@@ -244,7 +246,11 @@ pub async fn execute_remove_user(
         use std::os::unix::io::AsRawFd;
         let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            return Err(ScriptError::Wait(std::io::Error::last_os_error()));
+            let err = std::io::Error::last_os_error();
+            return Err(ScriptError::NonZeroExit {
+                code: -1,
+                stderr: format!("failed to acquire lock for client removal: {err}"),
+            });
         }
         f
     };
