@@ -3199,13 +3199,15 @@ echo "--- Phase 9h: standalone bootstrap failure — git not in PATH ---"
 PHASE9_STANDALONE_NOGIT_DIR="$(mktemp -d /tmp/awg-standalone-nogit.XXXXXX)"
 cp "${WEB_UNIFIED}" "${PHASE9_STANDALONE_NOGIT_DIR}/amneziawg-web.sh"
 
-# Create a minimal PATH that has bash but not git
-PHASE9_NOGIT_PATH="/usr/bin:/bin"
+# Resolve bash to an absolute path before clobbering PATH, then set PATH to
+# a dedicated empty directory so that `command -v git` reliably fails.
+PHASE9_BASH_ABS="$(command -v bash)"
+PHASE9_NOGIT_DIR="$(mktemp -d /tmp/awg-nogit-path.XXXXXX)"
 
 # 9h-1: Install — git missing → exits non-zero with error message.
 UNIFIED_NOGIT_INSTALL_RC=0
-UNIFIED_NOGIT_INSTALL_OUTPUT=$(PATH="${PHASE9_NOGIT_PATH}" \
-	bash "${PHASE9_STANDALONE_NOGIT_DIR}/amneziawg-web.sh" install \
+UNIFIED_NOGIT_INSTALL_OUTPUT=$(PATH="${PHASE9_NOGIT_DIR}" \
+	"${PHASE9_BASH_ABS}" "${PHASE9_STANDALONE_NOGIT_DIR}/amneziawg-web.sh" install \
 	--non-interactive \
 	--binary-src "${STUB_BINARY}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
@@ -3231,7 +3233,7 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-rm -rf "${PHASE9_STANDALONE_NOGIT_DIR}"
+rm -rf "${PHASE9_STANDALONE_NOGIT_DIR}" "${PHASE9_NOGIT_DIR}"
 
 echo ""
 echo "=== Phase 9: Unified entry point tests complete ==="
