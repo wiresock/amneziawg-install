@@ -723,11 +723,13 @@ setup_filesystem() {
 
         if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
             # Symlink all matching client configs into the dedicated directory so
-            # the web panel can safely scan them.
+            # the web panel can safely scan them.  Only link real regular files
+            # (not symlinks) to avoid inadvertently granting the service user
+            # read access to arbitrary files outside the intended config set.
             (
                 shopt -s nullglob
                 for f in "${AWG_DETECTED_HOME_DIR}"/awg*-client-*.conf; do
-                    if [[ -f "${f}" && -r "${f}" ]]; then
+                    if [[ -f "${f}" && ! -L "${f}" && -r "${f}" ]]; then
                         link_name="${dest_dir}/$(basename "${f}")"
                         # Do not overwrite existing non-symlink files.
                         if [[ -e "${link_name}" && ! -L "${link_name}" ]]; then
@@ -777,7 +779,9 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
             # Refuse to modify ACLs on clearly unsafe, broad system directories.
             local unsafe_dir=0
             case "${target_dir}" in
-                /|/etc|/home|/var|/tmp|/usr|/usr/local|/opt|/bin|/sbin)
+                /|/etc|/home|/var|/var/lib|/tmp|/usr|/usr/local|/opt|/bin|/sbin|\
+                /proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*|/boot|/boot/*|\
+                /lib|/lib/*|/lib32|/lib32/*|/lib64|/lib64/*)
                     unsafe_dir=1
                     ;;
             esac
@@ -844,11 +848,28 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                         done
                     # Also handle symlinked configs by applying ACLs to their real targets,
                     # which are often mode 600 and would otherwise be unreadable.
+                    # Validate that resolved targets stay within allowed directories
+                    # to avoid granting the service user access to unrelated files.
                     find "${target_dir}" -maxdepth 1 -name '*.conf' -type l -print0 2>/dev/null \
                         | while IFS= read -r -d '' link; do
                             target_path="$(readlink -f -- "${link}" 2>/dev/null || true)"
                             if [[ -n "${target_path}" && -f "${target_path}" ]]; then
-                                setfacl -m "u:${SERVICE_USER}:r" "${target_path}" 2>/dev/null || true
+                                # Only apply ACLs if the target is within the config dir
+                                # or the detected home dir (for auto-symlinked configs).
+                                local allowed=0
+                                case "${target_path}" in
+                                    "${target_dir}"/*)  allowed=1 ;;
+                                esac
+                                if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
+                                    case "${target_path}" in
+                                        "${AWG_DETECTED_HOME_DIR}"/*)  allowed=1 ;;
+                                    esac
+                                fi
+                                if [[ ${allowed} -eq 1 ]]; then
+                                    setfacl -m "u:${SERVICE_USER}:r" "${target_path}" 2>/dev/null || true
+                                else
+                                    warn "Skipping ACL on symlink target ${target_path}: outside allowed directories."
+                                fi
                             fi
                         done
                     # Log only if there were any .conf files (regular or symlinked)
@@ -862,11 +883,25 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                             setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
                         done
                     # Also handle symlinked configs by applying ACLs to their real targets.
+                    # Validate that resolved targets stay within allowed directories.
                     find "${target_dir}" -maxdepth 1 -name 'awg*-client-*.conf' -type l -print0 2>/dev/null \
                         | while IFS= read -r -d '' link; do
                             target_path="$(readlink -f -- "${link}" 2>/dev/null || true)"
                             if [[ -n "${target_path}" && -f "${target_path}" ]]; then
-                                setfacl -m "u:${SERVICE_USER}:r" "${target_path}" 2>/dev/null || true
+                                local allowed=0
+                                case "${target_path}" in
+                                    "${target_dir}"/*)  allowed=1 ;;
+                                esac
+                                if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
+                                    case "${target_path}" in
+                                        "${AWG_DETECTED_HOME_DIR}"/*)  allowed=1 ;;
+                                    esac
+                                fi
+                                if [[ ${allowed} -eq 1 ]]; then
+                                    setfacl -m "u:${SERVICE_USER}:r" "${target_path}" 2>/dev/null || true
+                                else
+                                    warn "Skipping ACL on symlink target ${target_path}: outside allowed directories."
+                                fi
                             fi
                         done
                     # Log only if there were any matching client config files
@@ -1275,11 +1310,20 @@ main() {
     preflight_checks
     detect_awg_config_dir
 
-    # Normalize AWG_CONFIG_DIR to an absolute, symlink-free path once and use
-    # it consistently everywhere (ACLs, env file, systemd unit hardening).
+    # Best-effort normalization: resolve AWG_CONFIG_DIR to a canonical path
+    # when the directory already exists.  readlink -f requires the path to
+    # exist; when it does not (e.g. auto-detected subdirectory not yet
+    # created), we fall back to ensuring the path is absolute and stripped
+    # of trailing slashes.
     local resolved
     if resolved="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
         AWG_CONFIG_DIR="${resolved}"
+    else
+        # Ensure the path is absolute even when readlink -f fails.
+        case "${AWG_CONFIG_DIR}" in
+            /*) ;;  # already absolute
+            *)  AWG_CONFIG_DIR="$(cd -- "$(dirname -- "${AWG_CONFIG_DIR}")" 2>/dev/null && pwd)/$(basename -- "${AWG_CONFIG_DIR}")" || true ;;
+        esac
     fi
     AWG_CONFIG_DIR="${AWG_CONFIG_DIR%/}"
 

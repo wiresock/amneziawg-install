@@ -1268,6 +1268,8 @@ if ! command -v setfacl >/dev/null 2>&1; then
 	echo "SKIP: setfacl not installed; cannot verify ACL-based read access through symlink"
 elif ! id "${WEB_SERVICE_USER}" &>/dev/null; then
 	echo "SKIP: Service user ${WEB_SERVICE_USER} does not exist; cannot verify read access"
+elif ! command -v runuser >/dev/null 2>&1; then
+	echo "SKIP: runuser not installed; cannot verify read access as service user"
 elif runuser -u "${WEB_SERVICE_USER}" -- cat "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" >/dev/null 2>&1; then
 	echo "OK: Service user ${WEB_SERVICE_USER} can read config through symlink"
 else
