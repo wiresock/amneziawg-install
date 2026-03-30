@@ -634,6 +634,13 @@ Please report this issue."
             chmod 0700 "${awg_config_dir_upgrade}" 2>/dev/null \
                 && info "Set permissions of ${awg_config_dir_upgrade} to 0700." \
                 || warn "Could not change permissions of ${awg_config_dir_upgrade}. Direct client creation may fail."
+            # Ensure existing client config files are owned by the service user
+            # so they are readable after the directory ownership change.
+            if compgen -G "${awg_config_dir_upgrade}/*.conf" > /dev/null 2>&1; then
+                chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}"/*.conf 2>/dev/null \
+                    && info "Adjusted ownership of existing client configs in ${awg_config_dir_upgrade} to ${SERVICE_USER}." \
+                    || warn "Could not change ownership of existing client configs in ${awg_config_dir_upgrade}. They may not be readable by ${SERVICE_USER}."
+            fi
         else
             mkdir -p "${awg_config_dir_upgrade}" 2>/dev/null \
                 && chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}" \

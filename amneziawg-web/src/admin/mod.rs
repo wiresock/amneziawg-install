@@ -178,14 +178,34 @@ pub async fn execute_create_user(
             // avoid leaking raw stderr, OS errors, or filesystem paths.
             tracing::error!(error = %e, name = name, "client creation failed");
             let sanitized = client_manager::sanitized_create_error_category(&e);
-            let detail = serde_json::json!({
-                "name": name,
-                "error": sanitized,
-            })
-            .to_string();
+            let is_awg_partial_success = matches!(e, client_manager::CreateClientError::Awg(_));
+            let (event_type, detail) = if is_awg_partial_success {
+                // Configs were written, but interface sync failed. The HTTP API
+                // reports this as a successful creation with `sync_required`.
+                // Reflect that in the audit log by recording a created event
+                // with an explicit `sync_required` flag instead of a failure.
+                (
+                    EVT_USER_CREATED,
+                    serde_json::json!({
+                        "name": name,
+                        "error": sanitized,
+                        "sync_required": true,
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    EVT_USER_CREATE_FAILED,
+                    serde_json::json!({
+                        "name": name,
+                        "error": sanitized,
+                    })
+                    .to_string(),
+                )
+            };
             log_event(
                 &db.pool,
-                EVT_USER_CREATE_FAILED,
+                event_type,
                 None,
                 None,
                 Some(&detail),

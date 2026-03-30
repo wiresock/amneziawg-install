@@ -184,14 +184,14 @@ Client config files are expected in `AWG_CONFIG_DIR` (default:
 `/etc/amnezia/amneziawg/clients`).  Each file should be a standard WireGuard/AmneziaWG
 `*.conf` with a `[Peer] PublicKey` entry matching a live tunnel peer.
 
-The service user needs **read** access to the config directory:
+The service user needs **read+write** access to the config directory because
+client creation writes new config files directly (in Rust).  The installer
+sets `AWG_CONFIG_DIR` to `0700` owned by the service user automatically.
+If you need to adjust permissions manually:
 
 ```bash
-# Option A: add awg-web to the group that owns the directory
-sudo usermod -aG amneziawg awg-web
-
-# Option B: grant read permission explicitly
-sudo chmod o+rx /etc/amnezia/amneziawg/clients
+sudo chown awg-web:awg-web /etc/amnezia/amneziawg/clients
+sudo chmod 0700 /etc/amnezia/amneziawg/clients
 ```
 
 ---

@@ -673,6 +673,13 @@ setup_filesystem() {
             chmod 0700 "${AWG_CONFIG_DIR}" 2>/dev/null \
                 && info "Set permissions of ${AWG_CONFIG_DIR} to 0700." \
                 || warn "Could not change permissions of ${AWG_CONFIG_DIR}. The service may not be able to create or manage client configs."
+            # Ensure existing client config files are owned by the service user
+            # so they are readable after the directory ownership change.
+            if compgen -G "${AWG_CONFIG_DIR}/*.conf" > /dev/null 2>&1; then
+                chown "${SERVICE_USER}:${SERVICE_USER}" "${AWG_CONFIG_DIR}"/*.conf 2>/dev/null \
+                    && info "Adjusted ownership of existing client configs in ${AWG_CONFIG_DIR} to ${SERVICE_USER}." \
+                    || warn "Could not change ownership of existing client configs in ${AWG_CONFIG_DIR}. They may not be readable by ${SERVICE_USER}."
+            fi
         else
             # Create the directory owned by the service user so it can write configs.
             mkdir -p "${AWG_CONFIG_DIR}"
