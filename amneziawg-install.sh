@@ -55,7 +55,7 @@ function copyToWebPanelDir() {
 	local src_file="$1"
 	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" ]]; then
 		cp -f "${src_file}" "${WEB_PANEL_CONFIG_DIR}/" 2>/dev/null || true
-		chmod 644 "${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")" 2>/dev/null || true
+		chmod 640 "${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")" 2>/dev/null || true
 	fi
 }
 

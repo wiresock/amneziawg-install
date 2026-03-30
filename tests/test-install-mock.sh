@@ -765,12 +765,12 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify copied config is world-readable (644)
+# Verify copied config has least-privilege permissions (640)
 WEB_COPY_PERMS=$(stat -c '%a' "${WEB_PANEL_CONFIG_DIR}/awg0-client-client2.conf" 2>/dev/null)
-if [[ "${WEB_COPY_PERMS}" == "644" ]]; then
-	echo "OK: Copied config has mode 644"
+if [[ "${WEB_COPY_PERMS}" == "640" ]]; then
+	echo "OK: Copied config has mode 640"
 else
-	echo "FAIL: Copied config permissions are ${WEB_COPY_PERMS} (expected 644)"
+	echo "FAIL: Copied config permissions are ${WEB_COPY_PERMS} (expected 640)"
 	FAILED=$((FAILED + 1))
 fi
 

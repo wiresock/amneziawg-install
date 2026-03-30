@@ -735,6 +735,7 @@ setup_filesystem() {
                 AWG_DETECTED_HOME_DIR=""
             }
             # Best-effort permission tightening; failures here should not abort install.
+            chown "root:${SERVICE_USER}" "${dest_dir}" 2>/dev/null || true
             chmod 750 "${dest_dir}" 2>/dev/null || true
         fi
 
@@ -754,7 +755,7 @@ setup_filesystem() {
                             continue
                         fi
                         cp -f "${f}" "${dest_name}" 2>/dev/null || true
-                        chmod 644 "${dest_name}" 2>/dev/null || true
+                        chmod 640 "${dest_name}" 2>/dev/null || true
                     fi
                 done
             )
