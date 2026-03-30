@@ -53,7 +53,7 @@ fi
 # panel is not installed (directory absent), the copy is silently skipped.
 function copyToWebPanelDir() {
 	local src_file="$1"
-	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" && ! -L "${src_file}" ]]; then
+	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && ! -L "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" && ! -L "${src_file}" ]]; then
 		local dest
 		dest="${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")"
 		# Avoid following or overwriting a pre-existing symlink at the destination.

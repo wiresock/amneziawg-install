@@ -757,8 +757,10 @@ setup_filesystem() {
             # the web panel can read them without traversing home directories.
             # Only copy real regular files (not symlinks) to avoid
             # inadvertently exposing arbitrary files.
-            (
+            local copy_count
+            copy_count=$(
                 shopt -s nullglob
+                count=0
                 for f in "${AWG_DETECTED_HOME_DIR}"/awg*-client-*.conf; do
                     if [[ -f "${f}" && ! -L "${f}" && -r "${f}" ]]; then
                         dest_name="${dest_dir}/$(basename "${f}")"
@@ -781,17 +783,20 @@ setup_filesystem() {
                                 continue
                             fi
                         fi
-                        cp -f "${f}" "${dest_name}" 2>/dev/null || true
-                        # Only adjust permissions on a real regular file we just created.
-                        if [[ -f "${dest_name}" && ! -L "${dest_name}" ]]; then
-                            chmod 640 "${dest_name}" 2>/dev/null || true
-                            chown "root:${SERVICE_USER}" "${dest_name}" 2>/dev/null || true
+                        if cp -f "${f}" "${dest_name}" 2>/dev/null; then
+                            # Only adjust permissions on a real regular file we just created.
+                            if [[ -f "${dest_name}" && ! -L "${dest_name}" ]]; then
+                                chmod 640 "${dest_name}" 2>/dev/null || true
+                                chown "root:${SERVICE_USER}" "${dest_name}" 2>/dev/null || true
+                            fi
+                            count=$((count + 1))
                         fi
                     fi
                 done
+                echo "${count}"
             )
-            if compgen -G "${dest_dir}/awg*-client-*.conf" > /dev/null; then
-                info "Copied client configs from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}."
+            if [[ "${copy_count}" -gt 0 ]]; then
+                info "Copied ${copy_count} client config(s) from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}."
             else
                 warn "No client configs were copied from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}. Check permissions and available files."
             fi
