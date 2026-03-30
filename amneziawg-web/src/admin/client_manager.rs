@@ -543,16 +543,22 @@ pub fn create_client(
     // Reject a symlinked AWG_CONFIG_DIR to prevent redirection attacks:
     // a symlink swap between validation and use could redirect client
     // configs and the lock file to an attacker-controlled location.
-    if config_dir.exists() {
-        let sym_meta = std::fs::symlink_metadata(config_dir).map_err(|e| {
-            CreateClientError::FileWrite(format!(
-                "cannot lstat {}: {e}",
-                config_dir.display()
-            ))
-        })?;
-        if sym_meta.file_type().is_symlink() {
+    // Use symlink_metadata directly (no exists() pre-check) to avoid TOCTOU.
+    match std::fs::symlink_metadata(config_dir) {
+        Ok(sym_meta) => {
+            if sym_meta.file_type().is_symlink() {
+                return Err(CreateClientError::FileWrite(format!(
+                    "AWG_CONFIG_DIR {} is a symbolic link; refusing to use it for client configs",
+                    config_dir.display()
+                )));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Path does not exist yet — will be created below.
+        }
+        Err(e) => {
             return Err(CreateClientError::FileWrite(format!(
-                "AWG_CONFIG_DIR {} is a symbolic link; refusing to use it for client configs",
+                "cannot lstat {}: {e}",
                 config_dir.display()
             )));
         }

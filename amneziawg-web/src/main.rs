@@ -157,14 +157,21 @@ async fn main() -> anyhow::Result<()> {
                 p.display()
             );
         }
-        if p.exists() {
-            let sym_meta = std::fs::symlink_metadata(p)
-                .with_context(|| format!("cannot lstat AWG_CONFIG_DIR: {}", p.display()))?;
-            if sym_meta.file_type().is_symlink() {
-                anyhow::bail!(
-                    "AWG_CONFIG_DIR is a symbolic link, which is not allowed: {}",
-                    p.display()
-                );
+        // Use symlink_metadata directly (no exists() pre-check) to avoid TOCTOU.
+        match std::fs::symlink_metadata(p) {
+            Ok(sym_meta) => {
+                if sym_meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "AWG_CONFIG_DIR is a symbolic link, which is not allowed: {}",
+                        p.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Path does not exist yet — will be created on first client creation.
+            }
+            Err(e) => {
+                anyhow::bail!("cannot lstat AWG_CONFIG_DIR {}: {e}", p.display());
             }
         }
         info!(path = %p.display(), "config dir validated");
