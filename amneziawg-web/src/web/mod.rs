@@ -131,7 +131,7 @@ fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateCl
             "Failed to create user: server configuration error.".to_string()
         }
         CreateClientError::Awg(_) => {
-            "Client was created, but interface sync failed. Please sync the VPN interface configuration or restart the service, then try again.".to_string()
+            "Client was created, but interface sync failed. The client configuration already exists; please sync the VPN interface configuration or restart the service. You do not need to recreate the client.".to_string()
         }
         CreateClientError::LockBusy => {
             "Failed to create user: another add/remove operation is already in progress; please try again later.".to_string()
@@ -1353,6 +1353,16 @@ async fn post_add_user_form(
             let csrf = session_csrf_from_headers(&state, &headers);
             let message = "Another add/remove operation is already in progress; please try again later.";
             Ok(Html(render_peer_list_with_error(&peers, &csrf, message)).into_response())
+        }
+        Err(crate::admin::client_manager::CreateClientError::Awg(ref awg_err)) => {
+            // Configs were written, but interface sync failed. Treat as a
+            // partial success: rescan so the new peer appears, log the
+            // warning, and redirect (PRG) instead of showing an error page.
+            tracing::warn!(error = %awg_err, "interface sync failed after client creation (HTML form)");
+            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
+                tracing::warn!(error = %e, "post-create config rescan failed");
+            }
+            Ok(Redirect::to("/").into_response())
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to create user via HTML form");

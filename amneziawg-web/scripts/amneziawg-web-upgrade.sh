@@ -617,7 +617,7 @@ Please report this issue."
     #     installs may have left it root-owned; fix that here.
     local awg_config_dir_upgrade=""
     if [[ -f "${ENV_FILE}" ]]; then
-        awg_config_dir_upgrade="$(grep '^AWG_CONFIG_DIR=' "${ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
+        awg_config_dir_upgrade="$(grep '^AWG_CONFIG_DIR=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
         awg_config_dir_upgrade="${awg_config_dir_upgrade#\"}"
         awg_config_dir_upgrade="${awg_config_dir_upgrade%\"}"
         awg_config_dir_upgrade="${awg_config_dir_upgrade#\'}"
