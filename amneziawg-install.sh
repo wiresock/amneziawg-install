@@ -9,6 +9,7 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
+WEB_PANEL_CONFIG_DIR="/etc/amneziawg/clients"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
@@ -46,6 +47,46 @@ if [[ "${SAFE_QUOTE_PARAM_SELFTEST:-0}" == "1" ]]; then
 		exit 1
 	fi
 fi
+
+# Copy a client config file to the web panel config directory so the panel
+# can discover and display it.  This is a best-effort operation: if the web
+# panel is not installed (directory absent), the copy is silently skipped.
+function copyToWebPanelDir() {
+	local src_file="$1"
+	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && ! -L "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" && ! -L "${src_file}" ]]; then
+		local dest
+		dest="${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")"
+		# Avoid following or overwriting a pre-existing symlink at the destination.
+		if [[ -L "${dest}" ]]; then
+			# Best-effort: warn and skip rather than risk clobbering the symlink target.
+			echo "Warning: refusing to copy '${src_file}' to '${dest}' because destination is a symlink" >&2
+			return 0
+		fi
+		cp -f "${src_file}" "${WEB_PANEL_CONFIG_DIR}/" 2>/dev/null || true
+		# Only adjust ownership and permissions on a regular non-symlink file we just copied.
+		if [[ -f "${dest}" && ! -L "${dest}" ]]; then
+			# Determine the directory's group; use it if available, otherwise fall back to root.
+			local dir_group dest_group
+			dir_group="$(stat -c '%G' "${WEB_PANEL_CONFIG_DIR}" 2>/dev/null || true)"
+			if [[ -n "${dir_group}" ]]; then
+				dest_group="${dir_group}"
+			else
+				dest_group="root"
+			fi
+			# Enforce root ownership and the chosen group before tightening permissions.
+			chown "root:${dest_group}" "${dest}" 2>/dev/null || true
+			chmod 640 "${dest}" 2>/dev/null || true
+		fi
+	fi
+}
+
+# Remove a client config file from the web panel config directory.
+function removeFromWebPanelDir() {
+	local filename="$1"
+	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && ! -L "${WEB_PANEL_CONFIG_DIR}" ]]; then
+		rm -f -- "${WEB_PANEL_CONFIG_DIR}/${filename}" 2>/dev/null || true
+	fi
+}
 
 # Serialize all server parameters to a params file
 # Uses safe quoting for string values to prevent shell injection when sourced
@@ -1680,6 +1721,11 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 		echo "Warning: failed to set permissions on ${client_conf}" >&2
 	fi
 
+	# Copy config to the web panel directory (best-effort) *before* chowning
+	# to a non-root user, so the source file is still root-owned and cannot
+	# be swapped via a TOCTOU race in a user-writable directory.
+	copyToWebPanelDir "${client_conf}"
+
 	# Ensure the generated client config is readable by the intended non-root user,
 	# without unintentionally granting access to the sudo-invoking user.
 	# Prefer:
@@ -1799,6 +1845,9 @@ function revokeClient() {
 	local HOME_DIR
 	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
 	rm -f "${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+
+	# Remove config from the web panel directory (best-effort)
+	removeFromWebPanelDir "${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# restart AmneziaWG to apply changes
 	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
@@ -2040,6 +2089,11 @@ PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
 AllowedIPs = ${ALLOWED_IPS}
 EOF
+
+		# Copy regenerated config to the web panel directory (best-effort)
+		# *before* chowning to a non-root user, so the source file is still
+		# root-owned and cannot be swapped via a TOCTOU race.
+		copyToWebPanelDir "${OUTPUT_CONF}"
 
 		# If running as root and the output directory is owned by a non-root user,
 		# ensure the regenerated client config is owned by that user so they can

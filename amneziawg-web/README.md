@@ -115,22 +115,21 @@ cd amneziawg-install
 sudo ./amneziawg-install.sh
 
 # 2. Install the web panel (builds from source automatically)
-sudo ./amneziawg-web-install.sh
+sudo ./amneziawg-web.sh install
 
 # Or install Rust automatically if not present:
-sudo ./amneziawg-web-install.sh --install-rust
+sudo ./amneziawg-web.sh install --install-rust
 ```
 
-If you prefer not to clone the repository with Git, download both
-`amneziawg-web-install.sh` and `amneziawg-web.sh` into the same directory.
-The `amneziawg-web-install.sh` wrapper delegates to `amneziawg-web.sh`, which
-handles cloning and build steps automatically (this requires `git` to be installed).
+If you prefer not to clone the repository with Git, download just
+`amneziawg-web.sh`. It handles cloning and build steps automatically (this
+requires `git` to be installed).
 If `git` is not available, build `amneziawg-web` manually and use `--binary-src` as shown below.
 
 If you already have a pre-built binary:
 
 ```bash
-sudo ./amneziawg-web-install.sh --binary-src ./target/release/amneziawg-web
+sudo ./amneziawg-web.sh install --binary-src ./target/release/amneziawg-web
 ```
 
 The installer handles user creation, directory setup, environment file generation,
@@ -142,13 +141,13 @@ For non-interactive / automated installs, see [docs/INSTALL.md](docs/INSTALL.md)
 To upgrade by rebuilding from source:
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh
+sudo ./amneziawg-web.sh upgrade
 ```
 
 To upgrade with a pre-built binary:
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+sudo ./amneziawg-web.sh upgrade --binary ./target/release/amneziawg-web
 ```
 
 The upgrade script replaces the binary and restarts the service if it was running.
@@ -161,10 +160,10 @@ To remove the web panel:
 
 ```bash
 # Safe uninstall: removes service + binary, preserves config/data
-sudo ./amneziawg-web-uninstall.sh
+sudo ./amneziawg-web.sh uninstall
 
 # Full purge: also removes config and data
-sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force
+sudo ./amneziawg-web.sh uninstall --purge-config --purge-data --force
 ```
 
 By default the uninstaller is safe: it stops the service and removes the binary

@@ -249,7 +249,7 @@ If the systemd unit still has `NoNewPrivileges=yes`, sudo will not work.
 Refresh the unit file:
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web --refresh-unit --force
+sudo ./amneziawg-web.sh upgrade --source-dir ./amneziawg-web --refresh-unit --force
 ```
 
 ---

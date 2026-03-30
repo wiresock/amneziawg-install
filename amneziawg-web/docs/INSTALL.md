@@ -20,32 +20,28 @@ cd amneziawg-install
 sudo ./amneziawg-install.sh
 
 # 2. Install the web panel (builds from source)
-sudo ./amneziawg-web-install.sh
+sudo ./amneziawg-web.sh install
 ```
 
 If Rust is not installed, add `--install-rust` to automatically install the toolchain:
 
 ```bash
-sudo ./amneziawg-web-install.sh --install-rust
+sudo ./amneziawg-web.sh install --install-rust
 ```
 
 If you have a pre-built binary, use `--binary-src` instead:
 
 ```bash
-sudo ./amneziawg-web-install.sh --binary-src ./target/release/amneziawg-web
+sudo ./amneziawg-web.sh install --binary-src ./target/release/amneziawg-web
 ```
 
-The root-level `amneziawg-web-install.sh` is a thin legacy wrapper that delegates to
-`amneziawg-web.sh install`, which in turn runs
-`amneziawg-web/scripts/amneziawg-web-install.sh`. All installer logic lives in
-the sub-script; the root-level files exist purely for operator convenience so both
-installers are discoverable in the same place.
+`amneziawg-web.sh install` runs `amneziawg-web/scripts/amneziawg-web-install.sh`
+internally. All installer logic lives in the sub-script.
 
-If you download only `amneziawg-web.sh` (or both `amneziawg-web-install.sh` and
-`amneziawg-web.sh`), the script will shallow-clone the repository to a temporary
-directory automatically before continuing. This bootstrap step requires `git` to be
-installed and available in `PATH`; if `git` is missing, the script will fail early
-with an error and exit without making changes.
+If you download only `amneziawg-web.sh`, the script will shallow-clone the repository
+to a temporary directory automatically before continuing. This bootstrap step requires
+`git` to be installed and available in `PATH`; if `git` is missing, the script will
+fail early with an error and exit without making changes.
 
 The installer handles user creation, directory setup, environment file generation,
 and systemd service installation. See [Installer reference](#installer-reference)
@@ -129,7 +125,7 @@ tightly-scoped sudoers rules for only these commands.
 
 ### Automated setup (installer)
 
-The installer (`amneziawg-web-install.sh`) handles all of this automatically:
+The installer (`amneziawg-web.sh install`) handles all of this automatically:
 
 - Installs a sudoers drop-in at `/etc/sudoers.d/amneziawg-web`
 - Validates the file with `visudo -cf` (if available)
@@ -392,13 +388,12 @@ Database migrations run automatically on startup.
 
 ## Installer reference
 
-The companion installer script `amneziawg-web-install.sh` (root-level) automates
-the full installation process.
+The `amneziawg-web.sh install` command automates the full installation process.
 
 ### Interactive mode
 
 ```bash
-sudo ./amneziawg-web-install.sh
+sudo ./amneziawg-web.sh install
 ```
 
 You will be prompted for all important settings; press Enter to accept the defaults.
@@ -409,14 +404,14 @@ You will be prompted for all important settings; press Enter to accept the defau
 # Source-build (recommended)
 HASH="$(python3 -c "import argon2; print(argon2.PasswordHasher().hash('yourpassword'))")"
 
-sudo ./amneziawg-web-install.sh \
+sudo ./amneziawg-web.sh install \
   --non-interactive \
   --source-dir ./amneziawg-web \
   --username admin \
   --password-hash "${HASH}"
 
 # Pre-built binary (advanced / CI)
-sudo ./amneziawg-web-install.sh \
+sudo ./amneziawg-web.sh install \
   --non-interactive \
   --binary-src ./target/release/amneziawg-web \
   --username admin \
@@ -469,34 +464,33 @@ To upgrade, use the dedicated upgrade script (see [Upgrade reference](#upgrade-r
 
 ```bash
 # Rebuild from source and upgrade
-sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+sudo ./amneziawg-web.sh upgrade --source-dir ./amneziawg-web
 
 # Or upgrade with a pre-built binary
-sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+sudo ./amneziawg-web.sh upgrade --binary ./target/release/amneziawg-web
 ```
 
 ---
 
 ## Upgrade reference
 
-A companion upgrade script is provided at the repository root:
+The upgrade command is available via the unified entry point:
 
 ```bash
 # Rebuild from source and upgrade (recommended)
-sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+sudo ./amneziawg-web.sh upgrade --source-dir ./amneziawg-web
 
 # Or upgrade with a pre-built binary
-sudo ./amneziawg-web-upgrade.sh --binary ./target/release/amneziawg-web
+sudo ./amneziawg-web.sh upgrade --binary ./target/release/amneziawg-web
 ```
 
-Like the installer, the root-level `amneziawg-web-upgrade.sh` is a thin legacy wrapper
-that delegates to `amneziawg-web.sh`, which in turn runs
-`amneziawg-web/scripts/amneziawg-web-upgrade.sh`.
+`amneziawg-web.sh upgrade` runs `amneziawg-web/scripts/amneziawg-web-upgrade.sh`
+internally.
 
-If the web panel was installed via the standalone wrapper and the repository files are
+If the web panel was installed via the standalone script and the repository files are
 not present locally, `amneziawg-web.sh` will shallow-clone the repository to a
 temporary directory automatically (source-mode upgrades will then build from that
-checkout). Only the wrapper script itself needs to be present; the repository tree is
+checkout). Only the script itself needs to be present; the repository tree is
 fetched on demand when missing.
 
 ### Default behavior
@@ -525,7 +519,7 @@ to skip restarting entirely.
 ### Interactive mode
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web
+sudo ./amneziawg-web.sh upgrade --source-dir ./amneziawg-web
 ```
 
 The script prints a plan showing what will be replaced and what will be preserved,
@@ -534,20 +528,20 @@ then asks for confirmation.
 ### Non-interactive mode
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web --force
+sudo ./amneziawg-web.sh upgrade --source-dir ./amneziawg-web --force
 # or equivalently:
-sudo ./amneziawg-web-upgrade.sh --source-dir ./amneziawg-web --non-interactive
+sudo ./amneziawg-web.sh upgrade --source-dir ./amneziawg-web --non-interactive
 ```
 
 ### CI/automation example
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh \
+sudo ./amneziawg-web.sh upgrade \
   --source-dir ./amneziawg-web \
   --force --restart
 
 # Or with a pre-built binary:
-sudo ./amneziawg-web-upgrade.sh \
+sudo ./amneziawg-web.sh upgrade \
   --binary ./target/release/amneziawg-web \
   --force --restart
 ```
@@ -557,7 +551,7 @@ sudo ./amneziawg-web-upgrade.sh \
 If the service unit file has changed in the repository, use `--refresh-unit`:
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh \
+sudo ./amneziawg-web.sh upgrade \
   --source-dir ./amneziawg-web \
   --refresh-unit --force
 ```
@@ -592,7 +586,7 @@ custom `--install-dir`, `--data-dir`, or `--env-file` during installation,
 pass the same values to the upgrade script:
 
 ```bash
-sudo ./amneziawg-web-upgrade.sh \
+sudo ./amneziawg-web.sh upgrade \
   --source-dir ./amneziawg-web \
   --install-dir /opt/awg/bin \
   --env-file /opt/awg/env.conf \
@@ -615,23 +609,22 @@ sudo ./amneziawg-web-upgrade.sh \
 
 ## Uninstaller reference
 
-A companion uninstall script is provided at the repository root:
+The uninstall command is available via the unified entry point:
 
 ```bash
-sudo ./amneziawg-web-uninstall.sh
+sudo ./amneziawg-web.sh uninstall
 ```
 
-Like the installer, the root-level `amneziawg-web-uninstall.sh` is a thin legacy wrapper
-that delegates to `amneziawg-web.sh`, which in turn runs
-`amneziawg-web/scripts/amneziawg-web-uninstall.sh`.
+`amneziawg-web.sh uninstall` runs `amneziawg-web/scripts/amneziawg-web-uninstall.sh`
+internally.
 
-If the web panel was installed via the standalone wrapper and the repository files are
+If the web panel was installed via the standalone script and the repository files are
 not present locally, `amneziawg-web.sh` will shallow-clone the repository to a
 temporary directory automatically:
 
 ```bash
 # Works even if you never cloned the repository
-sudo ./amneziawg-web-uninstall.sh
+sudo ./amneziawg-web.sh uninstall
 ```
 
 ### Default behavior (safe)
@@ -650,13 +643,13 @@ while preserving all configuration and data:
 | **Preserved** | data directory (`/var/lib/amneziawg-web/`) |
 | **Preserved** | service user (`awg-web`) |
 
-This makes uninstall reversible — re-install with `./amneziawg-web-install.sh --force`
+This makes uninstall reversible — re-install with `./amneziawg-web.sh install --force`
 and your configuration and database are still in place.
 
 ### Interactive mode
 
 ```bash
-sudo ./amneziawg-web-uninstall.sh
+sudo ./amneziawg-web.sh uninstall
 ```
 
 The script prints a plan showing what will be removed and what will be preserved,
@@ -665,9 +658,9 @@ then asks for confirmation before proceeding.
 ### Non-interactive mode
 
 ```bash
-sudo ./amneziawg-web-uninstall.sh --force
+sudo ./amneziawg-web.sh uninstall --force
 # or equivalently:
-sudo ./amneziawg-web-uninstall.sh --non-interactive
+sudo ./amneziawg-web.sh uninstall --non-interactive
 ```
 
 ### Purge flags
@@ -676,10 +669,10 @@ To remove configuration or data, you must explicitly request it:
 
 ```bash
 # Remove config + data, no prompts
-sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --force
+sudo ./amneziawg-web.sh uninstall --purge-config --purge-data --force
 
 # Full cleanup including service user
-sudo ./amneziawg-web-uninstall.sh --purge-config --purge-data --remove-user --force
+sudo ./amneziawg-web.sh uninstall --purge-config --purge-data --remove-user --force
 ```
 
 ### All options
@@ -703,7 +696,7 @@ custom `--install-dir`, `--data-dir`, or `--env-file` during installation,
 pass the same values to the uninstaller:
 
 ```bash
-sudo ./amneziawg-web-uninstall.sh \
+sudo ./amneziawg-web.sh uninstall \
   --install-dir /opt/awg/bin \
   --data-dir /opt/awg/data \
   --env-file /opt/awg/env.conf \

@@ -75,6 +75,8 @@ DATA_DIR="${DEFAULT_DATA_DIR}"
 ENV_DIR="${DEFAULT_ENV_DIR}"
 ENV_FILE="${DEFAULT_ENV_FILE}"
 AWG_CONFIG_DIR="${DEFAULT_AWG_CONFIG_DIR}"
+AWG_CONFIG_DIR_SET=false
+AWG_DETECTED_HOME_DIR=""     # set by detect_awg_config_dir when configs are in a home dir
 LISTEN_HOST="${DEFAULT_LISTEN_HOST}"
 LISTEN_PORT="${DEFAULT_LISTEN_PORT}"
 POLL_INTERVAL="${DEFAULT_POLL_INTERVAL}"
@@ -175,7 +177,7 @@ parse_args() {
                 ENV_DIR="$(dirname "${ENV_FILE}")"
                 shift 2 ;;
             --config-dir)
-                AWG_CONFIG_DIR="$2"; shift 2 ;;
+                AWG_CONFIG_DIR="$2"; AWG_CONFIG_DIR_SET=true; shift 2 ;;
             --host)
                 LISTEN_HOST="$2"; shift 2 ;;
             --port)
@@ -560,6 +562,102 @@ EOF
     fi
 }
 
+# Try to detect the directory where amneziawg-install.sh stores client configs.
+# The installer writes files like  awg0-client-<name>.conf  into the invoking
+# user's home directory (resolved via getHomeDirForClient).  If the default
+# AWG_CONFIG_DIR has not been overridden and we can find existing client
+# configs, use their parent directory as the default so the web panel discovers
+# them without manual configuration.
+detect_awg_config_dir() {
+    # Only auto-detect when no explicit --config-dir was provided.
+    if [[ "${AWG_CONFIG_DIR_SET}" == "true" ]]; then
+        return 0
+    fi
+
+    # First, check whether the current default directory already contains
+    # valid client configs.  If so, no need to scan home directories.
+    local default_cfg=""
+    default_cfg="$(compgen -G "${DEFAULT_AWG_CONFIG_DIR}/awg*-client-*.conf" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${default_cfg}" ]] && [[ -f "${default_cfg}" && -r "${default_cfg}" ]] && \
+        grep -qE '^[[:space:]]*\[Interface\]' "${default_cfg}" 2>/dev/null; then
+        info "Default config directory ${DEFAULT_AWG_CONFIG_DIR} already contains client configs; skipping auto-detection."
+        return 0
+    fi
+
+    # Search common locations for AWG client configs.
+    # Priority: SUDO_USER's home, root's home, any /home/* directory.
+    local -a search_dirs=()
+
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local sudo_home=""
+        if command -v getent &>/dev/null; then
+            sudo_home="$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)"
+        fi
+        if [[ -z "${sudo_home}" ]] && [[ -d "/home/${SUDO_USER}" ]]; then
+            sudo_home="/home/${SUDO_USER}"
+        fi
+        if [[ -n "${sudo_home}" ]] && [[ -d "${sudo_home}" ]]; then
+            search_dirs+=("${sudo_home}")
+        fi
+    fi
+
+    search_dirs+=("/root")
+
+    # Scanning all /home/* directories is disabled by default to avoid
+    # reading other users' configs on multi-user systems.  Set
+    # AMNEZIAWG_WEB_SCAN_ALL_HOMES=1 to enable.
+    if [[ "${AMNEZIAWG_WEB_SCAN_ALL_HOMES:-0}" == "1" ]]; then
+        for d in /home/*/; do
+            if [[ -d "${d}" ]]; then
+                search_dirs+=("${d%/}")
+            fi
+        done
+    fi
+
+    for dir in "${search_dirs[@]}"; do
+        # Look for the AWG client config naming pattern (files like awg*-client-*.conf)
+        # Use a narrower glob and verify the file looks like an AWG config by checking
+        # for an [Interface] section before trusting the directory.
+        local cfg_file=""
+        cfg_file="$(compgen -G "${dir}/awg*-client-*.conf" | head -n 1 || true)"
+        if [[ -n "${cfg_file}" ]] && [[ -f "${cfg_file}" && -r "${cfg_file}" ]] && \
+            grep -qE '^[[:space:]]*\[Interface\]' "${cfg_file}" 2>/dev/null; then
+
+            # Determine whether this is a home directory (/root or /home/<user>).
+            # Do not point AWG_CONFIG_DIR at the home directory itself, because
+            # later filesystem hardening only grants execute (x) on home dirs,
+            # which is insufficient for std::fs::read_dir().  Instead, record the
+            # source home directory so setup_filesystem() can copy configs into
+            # the system-level AWG_CONFIG_DIR after user confirmation.
+            local detected_is_home=0
+            case "${dir}" in
+                /root)
+                    detected_is_home=1
+                    ;;
+                /home/*)
+                    local detected_rel="${dir#/home/}"
+                    if [[ "${detected_rel}" != *"/"* ]]; then
+                        detected_is_home=1
+                    fi
+                    ;;
+            esac
+
+            if [[ ${detected_is_home} -eq 1 ]]; then
+                # Record the source home directory so setup_filesystem() can
+                # copy configs into the system-level AWG_CONFIG_DIR.  Keep
+                # AWG_CONFIG_DIR at its default (a system directory) so the
+                # web panel does not need access to home directories.
+                AWG_DETECTED_HOME_DIR="${dir}"
+            else
+                AWG_CONFIG_DIR="${dir}"
+            fi
+
+            info "Auto-detected AWG client configs in: ${AWG_DETECTED_HOME_DIR:-${AWG_CONFIG_DIR}}"
+            return 0
+        fi
+    done
+}
+
 non_interactive_validate() {
     # In non-interactive mode, a password hash is required.
     if [[ -z "${PASSWORD_HASH}" ]]; then
@@ -658,6 +756,34 @@ validate_awg_config_dir() {
     return 0
 }
 
+# Apply a read ACL to the resolved target of a symlinked config file,
+# but only if the target resides within an allowed directory (target_dir
+# or AWG_DETECTED_HOME_DIR).  This prevents granting the service user
+# access to arbitrary files via crafted symlinks.
+# Usage: _apply_acl_to_symlink_target <link_path> <target_dir> <service_user>
+_apply_acl_to_symlink_target() {
+    local link="$1" base_dir="$2" svc_user="$3"
+    local target_path
+    target_path="$(readlink -f -- "${link}" 2>/dev/null || true)"
+    if [[ -z "${target_path}" || ! -f "${target_path}" ]]; then
+        return
+    fi
+    local allowed=0
+    case "${target_path}" in
+        "${base_dir}"/*)  allowed=1 ;;
+    esac
+    if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
+        case "${target_path}" in
+            "${AWG_DETECTED_HOME_DIR}"/*)  allowed=1 ;;
+        esac
+    fi
+    if [[ ${allowed} -eq 1 ]]; then
+        setfacl -m "u:${svc_user}:r" "${target_path}" 2>/dev/null || true
+    else
+        warn "Skipping ACL on symlink target ${target_path}: outside allowed directories."
+    fi
+}
+
 setup_filesystem() {
     step "Filesystem setup"
 
@@ -688,6 +814,84 @@ setup_filesystem() {
     fi
     chown root:root "${ENV_DIR}"
     chmod 0700 "${ENV_DIR}"
+
+    # If auto-detection found configs in a home directory, copy them into the
+    # system-level AWG_CONFIG_DIR now (deferred from detect_awg_config_dir to
+    # avoid filesystem side effects before user confirmation).
+    # Only perform the copy when AWG_CONFIG_DIR is still the default; if the
+    # user overrode it (via --config-dir or interactive prompt), we must not
+    # blindly copy into an arbitrary directory, and any previously detected
+    # AWG_DETECTED_HOME_DIR must not be used for subsequent ACL/allowlist logic.
+    if [[ -n "${AWG_DETECTED_HOME_DIR}" && "${AWG_CONFIG_DIR}" != "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
+        # Clear stale home-dir detection when the config dir has been overridden.
+        AWG_DETECTED_HOME_DIR=""
+    fi
+    if [[ -n "${AWG_DETECTED_HOME_DIR}" && "${AWG_CONFIG_DIR}" == "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
+        local dest_dir="${AWG_CONFIG_DIR}"
+        if [[ ! -d "${dest_dir}" ]]; then
+            mkdir -p "${dest_dir}" || {
+                warn "Failed to create ${dest_dir}; skipping config file copy."
+                AWG_DETECTED_HOME_DIR=""
+            }
+        fi
+        if [[ -d "${dest_dir}" ]]; then
+            if [[ -L "${dest_dir}" ]]; then
+                warn "Config directory ${dest_dir} is a symlink; skipping permission/ownership changes to avoid affecting the symlink target."
+            else
+                chown "root:${SERVICE_USER}" "${dest_dir}" 2>/dev/null || true
+                chmod 750 "${dest_dir}" 2>/dev/null || true
+            fi
+        fi
+
+        if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
+            # Copy all matching client configs into the config directory so
+            # the web panel can read them without traversing home directories.
+            # Only copy real regular files (not symlinks) to avoid
+            # inadvertently exposing arbitrary files.
+            local copy_count=0
+            local _saved_nullglob
+            _saved_nullglob=$(shopt -p nullglob 2>/dev/null || true)
+            shopt -s nullglob
+            for f in "${AWG_DETECTED_HOME_DIR}"/awg*-client-*.conf; do
+                if [[ -f "${f}" && ! -L "${f}" && -r "${f}" ]]; then
+                    dest_name="${dest_dir}/$(basename "${f}")"
+                    # Do not overwrite existing regular files.
+                    if [[ -e "${dest_name}" && ! -L "${dest_name}" ]]; then
+                        warn "Skipping ${f}: destination ${dest_name} already exists."
+                        continue
+                    fi
+                    # If a symlink exists at the destination, remove it so cp
+                    # cannot follow it and overwrite an arbitrary target.
+                    if [[ -L "${dest_name}" ]]; then
+                        warn "Removing symlink at ${dest_name} before copying ${f}."
+                        if ! rm -f "${dest_name}" 2>/dev/null; then
+                            warn "Failed to remove symlink at ${dest_name}; skipping copy of ${f} to avoid following symlink."
+                            continue
+                        fi
+                        # If the destination is still a symlink after attempted removal, skip to avoid following it.
+                        if [[ -L "${dest_name}" ]]; then
+                            warn "Destination ${dest_name} remains a symlink after removal attempt; skipping copy of ${f}."
+                            continue
+                        fi
+                    fi
+                    if cp -f "${f}" "${dest_name}" 2>/dev/null; then
+                        # Only adjust permissions on a real regular file we just created.
+                        if [[ -f "${dest_name}" && ! -L "${dest_name}" ]]; then
+                            chmod 640 "${dest_name}" 2>/dev/null || true
+                            chown "root:${SERVICE_USER}" "${dest_name}" 2>/dev/null || true
+                        fi
+                        copy_count=$((copy_count + 1))
+                    fi
+                fi
+            done
+            eval "${_saved_nullglob}"
+            if [[ "${copy_count}" -gt 0 ]]; then
+                info "Copied ${copy_count} client config(s) from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}."
+            else
+                warn "No client configs were copied from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}. Check permissions and available files."
+            fi
+        fi
+    fi
 
     # Give the service user read+write access to the AWG config directory.
     # The web service creates client config files directly in this directory,
@@ -727,15 +931,158 @@ setup_filesystem() {
 You may need to grant read access to ${AWG_CONFIG_DIR} manually."
         fi
 
-        # For directories under /home, the parent home directory is typically
+        # AWG_CONFIG_DIR is already normalized in main(), but resolve again as
+        # defense-in-depth in case setup_filesystem is called from elsewhere.
+        local target_dir="${AWG_CONFIG_DIR%/}"
+        local resolved
+        if resolved="$(readlink -f -- "${target_dir}" 2>/dev/null)"; then
+            target_dir="${resolved}"
+        fi
+
+        # Grant the service user read access to existing *.conf files and set
+        # a default ACL so that future files created by amneziawg-install.sh
+        # are also readable — even when those files are created with mode 600.
+        if command -v setfacl >/dev/null 2>&1; then
+
+            # Refuse to modify ACLs on clearly unsafe, broad system directories.
+            local unsafe_dir=0
+            case "${target_dir}" in
+                /|/etc|/home|/var|/var/lib|/tmp|/usr|/usr/local|/opt|/bin|/sbin|\
+                /proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*|/boot|/boot/*|\
+                /lib|/lib/*|/lib32|/lib32/*|/lib64|/lib64/*)
+                    unsafe_dir=1
+                    ;;
+            esac
+
+            if [[ ${unsafe_dir} -eq 1 ]]; then
+                warn "Refusing to modify ACLs on unsafe directory ${target_dir} (from AWG_CONFIG_DIR=${AWG_CONFIG_DIR})."
+            else
+                # Determine whether this is a home directory (/root or /home/<user>).
+                local is_home_dir=0
+                case "${target_dir}" in
+                    /root)
+                        is_home_dir=1
+                        ;;
+                    /home/*)
+                        # Strip the /home/ prefix; if there are no further slashes, this is /home/<user>
+                        local rel_path="${target_dir#/home/}"
+                        if [[ "${rel_path}" != *"/"* ]]; then
+                            is_home_dir=1
+                        fi
+                        ;;
+                esac
+
+                # Grant ACL on the config directory so the service can access it.
+                # On home directories (/root or /home/<user>), only grant traverse (x)
+                # to avoid exposing unrelated filenames.  The web panel uses
+                # std::fs::read_dir() which requires directory read (r), so configs
+                # stored directly in a home directory will not be auto-discovered.
+                # For full discovery, use a dedicated subdirectory where rx is safe.
+                if [[ ${is_home_dir} -eq 1 ]]; then
+                    setfacl -m "u:${SERVICE_USER}:x" "${target_dir}" 2>/dev/null \
+                        && info "Granted traverse-only ACL for ${SERVICE_USER} on ${target_dir}." \
+                        || warn "setfacl failed on ${target_dir}."
+                    warn "Config directory ${target_dir} is a home directory."
+                    warn "Only traverse (x) permission was granted to avoid exposing unrelated files."
+                    warn "The web panel may not auto-discover configs here (read_dir requires rx)."
+                    warn "For full support, use a dedicated subdirectory (e.g. ${target_dir}/amneziawg-clients)."
+                else
+                    setfacl -m "u:${SERVICE_USER}:rx" "${target_dir}" 2>/dev/null \
+                        && info "Granted read+traverse ACL for ${SERVICE_USER} on ${target_dir}." \
+                        || warn "setfacl failed on ${target_dir}."
+                fi
+
+                # Default ACL: new files inherit read for the service user, and
+                # new directories inherit read+execute (traverse).  Using rX grants
+                # execute only on directories while keeping regular files non-executable.
+                # Avoid setting a default ACL on a home directory itself (e.g. /home/<user> or /root),
+                # since that would grant the service user access to all future files in the home.
+                if [[ ${is_home_dir} -eq 0 ]]; then
+                    setfacl -d -m "u:${SERVICE_USER}:rX" "${target_dir}" 2>/dev/null \
+                        && info "Set default ACL for future configs in ${target_dir}." \
+                        || warn "setfacl -d failed on ${target_dir}."
+                else
+                    info "Skipping default ACL on ${target_dir} because it appears to be a home directory; future configs may need manual ACLs."
+                fi
+
+                # Apply read ACL to any existing config files.
+                # For home directories, restrict to expected client config patterns
+                # so we don't grant the service user access to unrelated *.conf files.
+                if [[ ${is_home_dir} -eq 0 ]]; then
+                    # Dedicated config directory: all top-level *.conf files.
+                    find "${target_dir}" -maxdepth 1 -name '*.conf' -type f -print0 2>/dev/null \
+                        | while IFS= read -r -d '' cf; do
+                            setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
+                        done || true
+                    # Also handle symlinked configs by applying ACLs to their real targets,
+                    # which are often mode 600 and would otherwise be unreadable.
+                    # Validate that resolved targets stay within allowed directories
+                    # to avoid granting the service user access to unrelated files.
+                    find "${target_dir}" -maxdepth 1 -name '*.conf' -type l -print0 2>/dev/null \
+                        | while IFS= read -r -d '' link; do
+                            _apply_acl_to_symlink_target "${link}" "${target_dir}" "${SERVICE_USER}"
+                        done || true
+                    # Log only if there were any .conf files (regular or symlinked)
+                    if compgen -G "${target_dir}/*.conf" > /dev/null 2>&1; then
+                        info "Applied read ACL to existing config files and symlink targets."
+                    fi
+                else
+                    # Home directory: limit to expected AmneziaWG client configs.
+                    find "${target_dir}" -maxdepth 1 -name 'awg*-client-*.conf' -type f -print0 2>/dev/null \
+                        | while IFS= read -r -d '' cf; do
+                            setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
+                        done || true
+                    # Also handle symlinked configs by applying ACLs to their real targets.
+                    # Validate that resolved targets stay within allowed directories.
+                    find "${target_dir}" -maxdepth 1 -name 'awg*-client-*.conf' -type l -print0 2>/dev/null \
+                        | while IFS= read -r -d '' link; do
+                            _apply_acl_to_symlink_target "${link}" "${target_dir}" "${SERVICE_USER}"
+                        done || true
+                    # Log only if there were any matching client config files
+                    if compgen -G "${target_dir}/awg*-client-*.conf" > /dev/null 2>&1; then
+                        info "Applied read ACL to existing client config files and symlink targets in home directory."
+                    fi
+                fi
+            fi
+        elif [[ "${AWG_CONFIG_DIR}" != "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
+            warn "setfacl is not installed but AWG_CONFIG_DIR (${AWG_CONFIG_DIR}) is non-default."
+            warn "The service user ${SERVICE_USER} may not be able to read client configs."
+            warn "Install the 'acl' package (e.g. apt install acl) and re-run, or manually adjust permissions."
+        fi
+
+        # For directories under /home or /root, the parent directory is typically
         # mode 700/750.  Ensure the service user can traverse into it so that
         # the service can reach the config files.
-        case "${AWG_CONFIG_DIR}" in
+        # Use the resolved target_dir so symlinks are handled consistently.
+        case "${target_dir}" in
+            /root/*)
+                # Config is under /root (e.g. /root/awg-configs).  /root is
+                # typically mode 0700, so the service user needs traverse (x)
+                # permission to reach the subdirectory.
+                if [[ -d /root ]]; then
+                    local root_perms
+                    root_perms="$(stat -c '%a' /root)"
+                    local root_other_x=$(( 8#${root_perms} & 8#001 ))
+                    # Only treat "other+x" as sufficient for traversal. The service user is
+                    # not in the root group, so "group+x" on /root does not help it.
+                    if [[ ${root_other_x} -eq 0 ]]; then
+                        if command -v setfacl >/dev/null 2>&1; then
+                            setfacl -m "u:${SERVICE_USER}:x" /root 2>/dev/null \
+                                && info "Granted traverse ACL for ${SERVICE_USER} on /root." \
+                                || warn "setfacl failed on /root. You may need to \
+grant traverse access manually: sudo setfacl -m u:${SERVICE_USER}:x /root"
+                        else
+                            warn "Config directory is under /root but 'setfacl' is not available. \
+Ensure user ${SERVICE_USER} can traverse /root (e.g., via ACL) or configs may be unreadable."
+                        fi
+                    fi
+                fi
+                ;;
             /home/*)
                 # Extract the top-level home directory (/home/<user>).
                 # Linux home directories are always at depth 3.
                 local home_dir
-                home_dir="$(echo "${AWG_CONFIG_DIR}" | cut -d/ -f1-3)"
+                home_dir="$(echo "${target_dir}" | cut -d/ -f1-3)"
                 if [[ -d "${home_dir}" ]]; then
                     # Check whether the awg-web user can traverse into the
                     # home directory (needs at least the execute bit for
@@ -1134,7 +1481,13 @@ adjust_unit_hardening() {
 
     [[ -f "${unit_file}" ]] || return 0
 
-    # Normalize: strip trailing slashes for consistent comparison
+    # Normalize: resolve symlinks and strip trailing slashes so the case
+    # checks match the actual filesystem location (AWG_CONFIG_DIR is already
+    # normalized in main(), but resolve again as defense-in-depth).
+    local resolved
+    if resolved="$(readlink -f -- "${config_dir}" 2>/dev/null)"; then
+        config_dir="${resolved}"
+    fi
     config_dir="${config_dir%/}"
 
     # 1. Update ReadWritePaths for the AWG config directory.
@@ -1214,10 +1567,16 @@ adjust_unit_hardening() {
     #    service can traverse into it.  ProtectHome=read-only still prevents
     #    writes to other home dirs while allowing access to the config dir.
     case "${config_dir}" in
-        /home|/home/*)
+        /root|/root/*|/home|/home/*)
             if grep -q '^ProtectHome=yes' "${unit_file}" 2>/dev/null; then
                 sed -i 's|^ProtectHome=yes|ProtectHome=read-only|' "${unit_file}"
-                info "Changed ProtectHome to read-only (config dir is under /home)."
+                info "Changed ProtectHome to read-only (config dir is under /home or /root)."
+            fi
+            ;;
+        *)
+            if grep -q '^ProtectHome=read-only' "${unit_file}" 2>/dev/null; then
+                sed -i 's|^ProtectHome=read-only|ProtectHome=yes|' "${unit_file}"
+                info "Restored ProtectHome to yes (config dir is not under /home or /root)."
             fi
             ;;
     esac
@@ -1359,6 +1718,40 @@ print_summary() {
 main() {
     parse_args "$@"
     preflight_checks
+    detect_awg_config_dir
+
+    # Best-effort normalization: resolve AWG_CONFIG_DIR to a canonical path
+    # when the directory already exists.  readlink -f requires the path to
+    # exist; when it does not (e.g. auto-detected subdirectory not yet
+    # created), we fall back to ensuring the path is absolute and stripped
+    # of trailing slashes.
+    local resolved
+    if resolved="$(readlink -f -- "${AWG_CONFIG_DIR}" 2>/dev/null)"; then
+        AWG_CONFIG_DIR="${resolved}"
+    else
+        # Ensure the path is absolute even when readlink -f fails.
+        case "${AWG_CONFIG_DIR}" in
+            /*) ;;  # already absolute
+            *)
+                local parent_dir abs_parent
+                parent_dir="$(dirname -- "${AWG_CONFIG_DIR}")"
+                if [ -d "${parent_dir}" ]; then
+                    # Parent directory exists: we can safely normalize via cd + pwd.
+                    # Only update AWG_CONFIG_DIR if we obtained a non-empty absolute path.
+                    if abs_parent="$(cd -- "${parent_dir}" 2>/dev/null && pwd)"; then
+                        if [ -n "${abs_parent}" ]; then
+                            AWG_CONFIG_DIR="${abs_parent}/$(basename -- "${AWG_CONFIG_DIR}")"
+                        fi
+                    fi
+                else
+                    # Parent directory does not exist: resolve relative to current working directory.
+                    # This avoids constructing an incorrect root-relative path like "/basename".
+                    AWG_CONFIG_DIR="$(pwd)/${AWG_CONFIG_DIR#./}"
+                fi
+                ;;
+        esac
+    fi
+    AWG_CONFIG_DIR="${AWG_CONFIG_DIR%/}"
 
     if [[ "${NON_INTERACTIVE}" == "true" ]]; then
         non_interactive_validate
