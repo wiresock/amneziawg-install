@@ -623,8 +623,8 @@ detect_awg_config_dir() {
             # Do not point AWG_CONFIG_DIR at the home directory itself, because
             # later filesystem hardening only grants execute (x) on home dirs,
             # which is insufficient for std::fs::read_dir().  Instead, record the
-            # source home directory so setup_filesystem() can create a dedicated
-            # subdirectory and populate it with symlinks after user confirmation.
+            # source home directory so setup_filesystem() can copy configs into
+            # the system-level AWG_CONFIG_DIR after user confirmation.
             local detected_is_home=0
             case "${dir}" in
                 /root)
@@ -724,7 +724,6 @@ setup_filesystem() {
     chown root:root "${ENV_DIR}"
     chmod 0700 "${ENV_DIR}"
 
-    # If auto-detection found configs in a home directory, create the dedicated
     # If auto-detection found configs in a home directory, copy them into the
     # system-level AWG_CONFIG_DIR now (deferred from detect_awg_config_dir to
     # avoid filesystem side effects before user confirmation).
