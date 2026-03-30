@@ -729,7 +729,12 @@ setup_filesystem() {
     # avoid filesystem side effects before user confirmation).
     # Only perform the copy when AWG_CONFIG_DIR is still the default; if the
     # user overrode it (via --config-dir or interactive prompt), we must not
-    # blindly copy into an arbitrary directory.
+    # blindly copy into an arbitrary directory, and any previously detected
+    # AWG_DETECTED_HOME_DIR must not be used for subsequent ACL/allowlist logic.
+    if [[ -n "${AWG_DETECTED_HOME_DIR}" && "${AWG_CONFIG_DIR}" != "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
+        # Clear stale home-dir detection when the config dir has been overridden.
+        AWG_DETECTED_HOME_DIR=""
+    fi
     if [[ -n "${AWG_DETECTED_HOME_DIR}" && "${AWG_CONFIG_DIR}" == "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
         local dest_dir="${AWG_CONFIG_DIR}"
         if [[ ! -d "${dest_dir}" ]]; then

@@ -63,16 +63,19 @@ function copyToWebPanelDir() {
 			return 0
 		fi
 		cp -f "${src_file}" "${WEB_PANEL_CONFIG_DIR}/" 2>/dev/null || true
-		# Only adjust permissions on a regular non-symlink file we just copied.
+		# Only adjust ownership and permissions on a regular non-symlink file we just copied.
 		if [[ -f "${dest}" && ! -L "${dest}" ]]; then
-			chmod 640 "${dest}" 2>/dev/null || true
-			# Match the file's group to the directory's group so the web service
-			# user can read it (the directory is expected to be root:<service-user>).
-			local dir_group
+			# Determine the directory's group; use it if available, otherwise fall back to root.
+			local dir_group dest_group
 			dir_group="$(stat -c '%G' "${WEB_PANEL_CONFIG_DIR}" 2>/dev/null || true)"
-			if [[ -n "${dir_group}" && "${dir_group}" != "root" ]]; then
-				chgrp "${dir_group}" "${dest}" 2>/dev/null || true
+			if [[ -n "${dir_group}" && "${dir_group}" != "" ]]; then
+				dest_group="${dir_group}"
+			else
+				dest_group="root"
 			fi
+			# Enforce root ownership and the chosen group before tightening permissions.
+			chown "root:${dest_group}" "${dest}" 2>/dev/null || true
+			chmod 640 "${dest}" 2>/dev/null || true
 		fi
 	fi
 }
