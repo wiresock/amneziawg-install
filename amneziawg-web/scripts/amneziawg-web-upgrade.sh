@@ -116,9 +116,29 @@ validate_awg_config_dir() {
     dir_path="${resolved_path}"
 
     # Reject sensitive system directories that should never have their
-    # ownership changed to the service user.
+    # ownership changed to the service user.  In addition to exact matches,
+    # block any path under sensitive prefixes unless it falls within an
+    # explicitly allowed subtree (e.g. /etc/amnezia/amneziawg/*).
     case "${dir_path}" in
-        "/"|"/etc"|"/etc/amnezia"|"/etc/amnezia/amneziawg"|"/var"|"/var/lib"|"/home"|"/tmp"|"/usr"|"/usr/local"|"/opt"|"/bin"|"/sbin"|"/lib"|"/lib64"|"/run"|"/sys"|"/proc"|"/dev"|"/boot")
+        "/"|"/home"|"/tmp")
+            warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
+            return 1
+            ;;
+        /etc/amnezia/amneziawg/*)
+            # Allowed subtree — fall through to return 0
+            ;;
+        /etc|/etc/*)
+            warn "AWG_CONFIG_DIR '${dir_path}' is under /etc (only /etc/amnezia/amneziawg/* is allowed); skipping automatic ownership/permission changes."
+            return 1
+            ;;
+        /var/lib/amneziawg-web/*)
+            # Allowed subtree — fall through to return 0
+            ;;
+        /var|/var/*)
+            warn "AWG_CONFIG_DIR '${dir_path}' is under /var (only /var/lib/amneziawg-web/* is allowed); skipping automatic ownership/permission changes."
+            return 1
+            ;;
+        /sys|/sys/*|/proc|/proc/*|/dev|/dev/*|/boot|/boot/*|/run|/run/*|/lib|/lib/*|/lib64|/lib64/*|/bin|/bin/*|/sbin|/sbin/*|/usr|/usr/*|/opt|/opt/*)
             warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
             return 1
             ;;
