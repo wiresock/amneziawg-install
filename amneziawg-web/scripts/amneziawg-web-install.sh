@@ -1316,7 +1316,16 @@ main() {
         # Ensure the path is absolute even when readlink -f fails.
         case "${AWG_CONFIG_DIR}" in
             /*) ;;  # already absolute
-            *)  AWG_CONFIG_DIR="$(cd -- "$(dirname -- "${AWG_CONFIG_DIR}")" 2>/dev/null && pwd)/$(basename -- "${AWG_CONFIG_DIR}")" || true ;;
+            *)
+                if [ -d "$(dirname -- "${AWG_CONFIG_DIR}")" ]; then
+                    # Parent directory exists: we can safely normalize via cd + pwd.
+                    AWG_CONFIG_DIR="$(cd -- "$(dirname -- "${AWG_CONFIG_DIR}")" 2>/dev/null && pwd)/$(basename -- "${AWG_CONFIG_DIR}")" || true
+                else
+                    # Parent directory does not exist: resolve relative to current working directory.
+                    # This avoids constructing an incorrect root-relative path like "/basename".
+                    AWG_CONFIG_DIR="$(pwd)/${AWG_CONFIG_DIR#./}"
+                fi
+                ;;
         esac
     fi
     AWG_CONFIG_DIR="${AWG_CONFIG_DIR%/}"
