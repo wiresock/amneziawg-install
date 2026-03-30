@@ -737,17 +737,14 @@ SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
 # --- 2a: Add a second client ---
 
-# Create the web panel config directory so copyToWebPanelDir can use it.
-# Simulate realistic web-panel ownership (root:<service-group>, mode 0750)
-# so that copyToWebPanelDir() inherits the correct group on copied files.
-# Create the service user+group the same way the real installer does so that
-# later phases that call the installer don't fail on duplicate group names.
-WEB_PANEL_GROUP="awg-web"
-if ! id "${WEB_PANEL_GROUP}" &>/dev/null; then
-	useradd --system --no-create-home --shell /usr/sbin/nologin "${WEB_PANEL_GROUP}"
+# Create the service user (and its matching group) the same way the real installer
+# does so that later phases that call the installer don't fail on duplicate names.
+WEB_SERVICE_USER="awg-web"
+if ! id "${WEB_SERVICE_USER}" &>/dev/null; then
+	useradd --system --no-create-home --shell /usr/sbin/nologin "${WEB_SERVICE_USER}"
 fi
 mkdir -p "${WEB_PANEL_CONFIG_DIR}"
-chown "root:${WEB_PANEL_GROUP}" "${WEB_PANEL_CONFIG_DIR}"
+chown "root:${WEB_SERVICE_USER}" "${WEB_PANEL_CONFIG_DIR}"
 chmod 750 "${WEB_PANEL_CONFIG_DIR}"
 
 newClient

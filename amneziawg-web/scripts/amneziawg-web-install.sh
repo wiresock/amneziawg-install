@@ -727,7 +727,10 @@ setup_filesystem() {
     # If auto-detection found configs in a home directory, copy them into the
     # system-level AWG_CONFIG_DIR now (deferred from detect_awg_config_dir to
     # avoid filesystem side effects before user confirmation).
-    if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
+    # Only perform the copy when AWG_CONFIG_DIR is still the default; if the
+    # user overrode it (via --config-dir or interactive prompt), we must not
+    # blindly copy into an arbitrary directory.
+    if [[ -n "${AWG_DETECTED_HOME_DIR}" && "${AWG_CONFIG_DIR}" == "${DEFAULT_AWG_CONFIG_DIR}" ]]; then
         local dest_dir="${AWG_CONFIG_DIR}"
         if [[ ! -d "${dest_dir}" ]]; then
             mkdir -p "${dest_dir}" || {
@@ -760,7 +763,15 @@ setup_filesystem() {
                         # cannot follow it and overwrite an arbitrary target.
                         if [[ -L "${dest_name}" ]]; then
                             warn "Removing symlink at ${dest_name} before copying ${f}."
-                            rm -f "${dest_name}" 2>/dev/null || true
+                            if ! rm -f "${dest_name}" 2>/dev/null; then
+                                warn "Failed to remove symlink at ${dest_name}; skipping copy of ${f} to avoid following symlink."
+                                continue
+                            fi
+                            # If the destination is still a symlink after attempted removal, skip to avoid following it.
+                            if [[ -L "${dest_name}" ]]; then
+                                warn "Destination ${dest_name} remains a symlink after removal attempt; skipping copy of ${f}."
+                                continue
+                            fi
                         fi
                         cp -f "${f}" "${dest_name}" 2>/dev/null || true
                         # Only adjust permissions on a real regular file we just created.
