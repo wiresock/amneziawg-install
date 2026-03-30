@@ -82,6 +82,13 @@ validate_awg_config_dir() {
         return 1
     fi
 
+    # Reject paths containing whitespace or control characters — they break
+    # systemd unit ReadWritePaths= directives and sudoers entries.
+    if [[ "${dir_path_raw}" =~ [[:space:][:cntrl:]] ]]; then
+        warn "AWG_CONFIG_DIR '${dir_path_raw}' contains whitespace or control characters; rejecting."
+        return 1
+    fi
+
     # Normalize: strip trailing slashes (but keep "/" as-is).
     dir_path="${dir_path_raw%/}"
     if [[ -z "${dir_path}" ]]; then

@@ -138,6 +138,38 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // --- Validate config-dir path early --------------------------------------
+    // AWG_CONFIG_DIR ends up in systemd ReadWritePaths= directives and is used
+    // by the service to write client configs.  Reject whitespace/control chars
+    // (they break unit-file parsing) and top-level symlinks (redirect attacks).
+    {
+        let p = &config.config_dir;
+        if !p.is_absolute() {
+            anyhow::bail!(
+                "AWG_CONFIG_DIR must be an absolute path, got: {}",
+                p.display()
+            );
+        }
+        let s = p.to_string_lossy();
+        if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            anyhow::bail!(
+                "AWG_CONFIG_DIR must not contain whitespace or control characters, got: {}",
+                p.display()
+            );
+        }
+        if p.exists() {
+            let sym_meta = std::fs::symlink_metadata(p)
+                .with_context(|| format!("cannot lstat AWG_CONFIG_DIR: {}", p.display()))?;
+            if sym_meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "AWG_CONFIG_DIR is a symbolic link, which is not allowed: {}",
+                    p.display()
+                );
+            }
+        }
+        info!(path = %p.display(), "config dir validated");
+    }
+
     if config.auth_enabled {
         if config.auth_password_hash.is_empty() {
             anyhow::bail!(
