@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         let s = p.to_string_lossy();
-        if s.contains(char::is_whitespace) || s.contains(',') {
+        if s.chars().any(|c| c.is_whitespace()) || s.contains(',') {
             anyhow::bail!(
                 "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: {}",
                 p.display()
