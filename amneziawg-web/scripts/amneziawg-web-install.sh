@@ -944,7 +944,7 @@ setup_filesystem() {
                     dir_uid="$(stat -c '%u' "${parent_dir}" 2>/dev/null || echo "")"
                     dir_gid="$(stat -c '%g' "${parent_dir}" 2>/dev/null || echo "")"
                     dir_mode="$(stat -c '%a' "${parent_dir}" 2>/dev/null || echo "")"
-                    if [[ -n "${dir_mode}" ]]; then
+                    if [[ -n "${dir_mode}" && "${dir_mode}" =~ ^[0-7]+$ ]]; then
                         local can_traverse=0
                         local mode_oct=$(( 8#${dir_mode} ))
                         # Check other execute
@@ -973,6 +973,7 @@ setup_filesystem() {
                                 chmod o+x "${parent_dir}" 2>/dev/null \
                                     && info "Added traverse permission (o+x) on ${parent_dir} for service access." \
                                     || warn "Could not set o+x on ${parent_dir}. The service may not be able to reach ${AWG_CONFIG_DIR}."
+                                warn "Consider installing ACL tools (apt install acl) for a more targeted permission grant."
                             fi
                         fi
                     fi
