@@ -39,6 +39,7 @@ readonly SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
 readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_ENV_FILE="/etc/amneziawg-web/env.conf"
 readonly DEFAULT_DATA_DIR="/var/lib/amneziawg-web"
+readonly DEFAULT_AWG_INSTALL_SCRIPT="/usr/local/bin/amneziawg-install.sh"
 readonly BINARY_NAME="amneziawg-web"
 
 # Script location (for finding the service unit file relative to the repo)
@@ -150,6 +151,106 @@ validate_awg_config_dir() {
             return 1
             ;;
     esac
+
+    return 0
+}
+
+# Check whether a script file is safe to embed in a sudoers rule:
+# - must be a regular file (not a symlink)
+# - must be executable
+# - must be owned by root:root
+# - must not be group or world-writable
+# Returns 0 (safe) or 1 (unsafe).
+is_script_safe_for_sudoers() {
+    local script_path="$1"
+
+    if [[ ! -f "${script_path}" ]] || [[ -L "${script_path}" ]]; then
+        return 1
+    fi
+    if [[ ! -x "${script_path}" ]]; then
+        return 1
+    fi
+
+    local owner_uid owner_gid mode
+    owner_uid="$(stat -c '%u' "${script_path}" 2>/dev/null || echo "")"
+    owner_gid="$(stat -c '%g' "${script_path}" 2>/dev/null || echo "")"
+    mode="$(stat -c '%a' "${script_path}" 2>/dev/null || echo "")"
+    if [[ -z "${owner_uid}" ]] || [[ -z "${owner_gid}" ]] || [[ -z "${mode}" ]]; then
+        return 1
+    fi
+    if [[ ! "${mode}" =~ ^[0-7]{3,4}$ ]]; then
+        return 1
+    fi
+
+    # Require root ownership and no group/other write bits.
+    if [[ "${owner_uid}" != "0" ]] || [[ "${owner_gid}" != "0" ]]; then
+        return 1
+    fi
+    local mode_octal
+    mode_octal=$((8#${mode}))
+    if (( (mode_octal & 8#022) != 0 )); then
+        return 1
+    fi
+
+    return 0
+}
+
+# Validate that the install script path points to amneziawg-install.sh in a
+# trusted root-controlled directory.  Returns 0 on success, 1 on failure.
+validate_awg_install_script_path_policy() {
+    local script_path="$1"
+    local script_name script_dir
+    script_name="$(basename "${script_path}")"
+    script_dir="$(dirname "${script_path}")"
+
+    if [[ "${script_name}" != "amneziawg-install.sh" ]]; then
+        return 1
+    fi
+
+    case "${script_dir}" in
+        /usr/local/bin|/usr/bin|/opt/amneziawg-web/bin)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Full validation of install script path for sudoers embedding:
+# checks policy (trusted directory, correct filename) and, if the directory
+# exists, verifies root ownership and no group/other-writable permissions.
+# Returns 0 on success, 1 on failure.
+validate_awg_install_script_path() {
+    local script_path="$1"
+    local script_dir
+    script_dir="$(dirname "${script_path}")"
+
+    if ! validate_awg_install_script_path_policy "${script_path}"; then
+        return 1
+    fi
+
+    if [[ -d "${script_dir}" ]]; then
+        local dir_uid dir_gid dir_mode
+        dir_uid="$(stat -c '%u' "${script_dir}" 2>/dev/null || echo "")"
+        dir_gid="$(stat -c '%g' "${script_dir}" 2>/dev/null || echo "")"
+        dir_mode="$(stat -c '%a' "${script_dir}" 2>/dev/null || echo "")"
+        if [[ -z "${dir_uid}" ]] || [[ -z "${dir_gid}" ]] || [[ -z "${dir_mode}" ]]; then
+            return 1
+        fi
+        if [[ ! "${dir_mode}" =~ ^[0-7]{3,4}$ ]]; then
+            return 1
+        fi
+
+        if [[ "${dir_uid}" != "0" ]] || [[ "${dir_gid}" != "0" ]]; then
+            return 1
+        fi
+        local dir_mode_octal
+        dir_mode_octal=$((8#${dir_mode}))
+        if (( (dir_mode_octal & 8#022) != 0 )); then
+            return 1
+        fi
+    fi
 
     return 0
 }
@@ -609,14 +710,28 @@ main() {
     fi
 
     # Validate install_script_path before embedding it into sudoers.
+    # For upgrades, we warn and fall back to the default path rather than die,
+    # because the installation already exists and we don't want to brick it.
     if [[ "${install_script_path}" != /* ]]; then
         die "AWG_INSTALL_SCRIPT must be an absolute path, got: ${install_script_path}"
     fi
     if [[ "${install_script_path}" =~ [[:space:],] ]]; then
         die "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: ${install_script_path}"
     fi
-    if [[ ! -x "${install_script_path}" ]]; then
-        warn "Install script not found or not executable (will be checked at service startup): ${install_script_path}"
+
+    # Require the script to be in a trusted root-owned directory, be a regular
+    # non-symlink file owned by root:root, and not group/other-writable.
+    if ! validate_awg_install_script_path "${install_script_path}"; then
+        warn "AWG_INSTALL_SCRIPT '${install_script_path}' failed path/directory policy validation."
+        warn "Falling back to default: ${DEFAULT_AWG_INSTALL_SCRIPT}"
+        install_script_path="${DEFAULT_AWG_INSTALL_SCRIPT}"
+    fi
+    if [[ -e "${install_script_path}" ]] && ! is_script_safe_for_sudoers "${install_script_path}"; then
+        warn "Install script '${install_script_path}' is not safe for sudoers (must be a regular non-symlink file owned by root:root, executable, not group/other-writable)."
+        warn "The sudoers rule will still reference this path, but the script may not work until fixed."
+    fi
+    if [[ ! -e "${install_script_path}" ]]; then
+        warn "Install script not found (will be checked at service startup): ${install_script_path}"
     fi
 
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
