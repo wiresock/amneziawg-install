@@ -68,7 +68,7 @@ function copyToWebPanelDir() {
 			# Determine the directory's group; use it if available, otherwise fall back to root.
 			local dir_group dest_group
 			dir_group="$(stat -c '%G' "${WEB_PANEL_CONFIG_DIR}" 2>/dev/null || true)"
-			if [[ -n "${dir_group}" && "${dir_group}" != "" ]]; then
+			if [[ -n "${dir_group}" ]]; then
 				dest_group="${dir_group}"
 			else
 				dest_group="root"
