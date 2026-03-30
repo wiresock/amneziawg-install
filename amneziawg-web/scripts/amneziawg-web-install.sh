@@ -666,6 +666,34 @@ Generate with:
 
 # ── Filesystem setup ───────────────────────────────────────────────────────────
 
+# Apply a read ACL to the resolved target of a symlinked config file,
+# but only if the target resides within an allowed directory (target_dir
+# or AWG_DETECTED_HOME_DIR).  This prevents granting the service user
+# access to arbitrary files via crafted symlinks.
+# Usage: _apply_acl_to_symlink_target <link_path> <target_dir> <service_user>
+_apply_acl_to_symlink_target() {
+    local link="$1" base_dir="$2" svc_user="$3"
+    local target_path
+    target_path="$(readlink -f -- "${link}" 2>/dev/null || true)"
+    if [[ -z "${target_path}" || ! -f "${target_path}" ]]; then
+        return
+    fi
+    local allowed=0
+    case "${target_path}" in
+        "${base_dir}"/*)  allowed=1 ;;
+    esac
+    if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
+        case "${target_path}" in
+            "${AWG_DETECTED_HOME_DIR}"/*)  allowed=1 ;;
+        esac
+    fi
+    if [[ ${allowed} -eq 1 ]]; then
+        setfacl -m "u:${svc_user}:r" "${target_path}" 2>/dev/null || true
+    else
+        warn "Skipping ACL on symlink target ${target_path}: outside allowed directories."
+    fi
+}
+
 setup_filesystem() {
     step "Filesystem setup"
 
@@ -852,25 +880,7 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                     # to avoid granting the service user access to unrelated files.
                     find "${target_dir}" -maxdepth 1 -name '*.conf' -type l -print0 2>/dev/null \
                         | while IFS= read -r -d '' link; do
-                            target_path="$(readlink -f -- "${link}" 2>/dev/null || true)"
-                            if [[ -n "${target_path}" && -f "${target_path}" ]]; then
-                                # Only apply ACLs if the target is within the config dir
-                                # or the detected home dir (for auto-symlinked configs).
-                                local allowed=0
-                                case "${target_path}" in
-                                    "${target_dir}"/*)  allowed=1 ;;
-                                esac
-                                if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
-                                    case "${target_path}" in
-                                        "${AWG_DETECTED_HOME_DIR}"/*)  allowed=1 ;;
-                                    esac
-                                fi
-                                if [[ ${allowed} -eq 1 ]]; then
-                                    setfacl -m "u:${SERVICE_USER}:r" "${target_path}" 2>/dev/null || true
-                                else
-                                    warn "Skipping ACL on symlink target ${target_path}: outside allowed directories."
-                                fi
-                            fi
+                            _apply_acl_to_symlink_target "${link}" "${target_dir}" "${SERVICE_USER}"
                         done
                     # Log only if there were any .conf files (regular or symlinked)
                     if compgen -G "${target_dir}/*.conf" > /dev/null 2>&1; then
@@ -886,23 +896,7 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                     # Validate that resolved targets stay within allowed directories.
                     find "${target_dir}" -maxdepth 1 -name 'awg*-client-*.conf' -type l -print0 2>/dev/null \
                         | while IFS= read -r -d '' link; do
-                            target_path="$(readlink -f -- "${link}" 2>/dev/null || true)"
-                            if [[ -n "${target_path}" && -f "${target_path}" ]]; then
-                                local allowed=0
-                                case "${target_path}" in
-                                    "${target_dir}"/*)  allowed=1 ;;
-                                esac
-                                if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
-                                    case "${target_path}" in
-                                        "${AWG_DETECTED_HOME_DIR}"/*)  allowed=1 ;;
-                                    esac
-                                fi
-                                if [[ ${allowed} -eq 1 ]]; then
-                                    setfacl -m "u:${SERVICE_USER}:r" "${target_path}" 2>/dev/null || true
-                                else
-                                    warn "Skipping ACL on symlink target ${target_path}: outside allowed directories."
-                                fi
-                            fi
+                            _apply_acl_to_symlink_target "${link}" "${target_dir}" "${SERVICE_USER}"
                         done
                     # Log only if there were any matching client config files
                     if compgen -G "${target_dir}/awg*-client-*.conf" > /dev/null 2>&1; then
