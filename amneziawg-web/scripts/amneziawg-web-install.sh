@@ -639,17 +639,16 @@ detect_awg_config_dir() {
             esac
 
             if [[ ${detected_is_home} -eq 1 ]]; then
-                # Record the source home directory for deferred subdirectory
-                # creation in setup_filesystem().  Set AWG_CONFIG_DIR to the
-                # target subdirectory path so the rest of the installer sees
-                # the intended final directory (read-only at this stage).
+                # Record the source home directory so setup_filesystem() can
+                # copy configs into the system-level AWG_CONFIG_DIR.  Keep
+                # AWG_CONFIG_DIR at its default (a system directory) so the
+                # web panel does not need access to home directories.
                 AWG_DETECTED_HOME_DIR="${dir}"
-                AWG_CONFIG_DIR="${dir}/amneziawg-clients"
             else
                 AWG_CONFIG_DIR="${dir}"
             fi
 
-            info "Auto-detected AWG client config directory: ${AWG_CONFIG_DIR}"
+            info "Auto-detected AWG client configs in: ${AWG_DETECTED_HOME_DIR:-${AWG_CONFIG_DIR}}"
             return 0
         fi
     done
@@ -726,23 +725,14 @@ setup_filesystem() {
     chmod 0700 "${ENV_DIR}"
 
     # If auto-detection found configs in a home directory, create the dedicated
-    # subdirectory and populate it with symlinks now (deferred from detect to
+    # If auto-detection found configs in a home directory, copy them into the
+    # system-level AWG_CONFIG_DIR now (deferred from detect_awg_config_dir to
     # avoid filesystem side effects before user confirmation).
-    # Only perform this auto-symlink step if AWG_CONFIG_DIR still matches the
-    # directory derived from the detected home. This avoids acting on stale
-    # detection results when the user has overridden AWG_CONFIG_DIR.
-    if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
-        local expected_dir="${AWG_DETECTED_HOME_DIR}/amneziawg-clients"
-        if [[ "${AWG_CONFIG_DIR}" != "${expected_dir}" ]]; then
-            info "Skipping auto-detected config symlinks: AWG_CONFIG_DIR (${AWG_CONFIG_DIR}) no longer matches ${expected_dir}."
-            AWG_DETECTED_HOME_DIR=""
-        fi
-    fi
     if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
         local dest_dir="${AWG_CONFIG_DIR}"
         if [[ ! -d "${dest_dir}" ]]; then
             mkdir -p "${dest_dir}" || {
-                warn "Failed to create ${dest_dir}; skipping auto-detected config symlinks."
+                warn "Failed to create ${dest_dir}; skipping config file copy."
                 AWG_DETECTED_HOME_DIR=""
             }
             # Best-effort permission tightening; failures here should not abort install.
@@ -750,33 +740,26 @@ setup_filesystem() {
         fi
 
         if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
-            # Symlink all matching client configs into the dedicated directory so
-            # the web panel can safely scan them.  Only link real regular files
-            # (not symlinks) to avoid inadvertently granting the service user
-            # read access to arbitrary files outside the intended config set.
+            # Copy all matching client configs into the config directory so
+            # the web panel can read them without traversing home directories.
+            # Only copy real regular files (not symlinks) to avoid
+            # inadvertently exposing arbitrary files.
             (
                 shopt -s nullglob
                 for f in "${AWG_DETECTED_HOME_DIR}"/awg*-client-*.conf; do
                     if [[ -f "${f}" && ! -L "${f}" && -r "${f}" ]]; then
-                        link_name="${dest_dir}/$(basename "${f}")"
-                        # Do not overwrite existing non-symlink files.
-                        if [[ -e "${link_name}" && ! -L "${link_name}" ]]; then
-                            warn "Skipping ${f}: destination ${link_name} already exists and is not a symlink."
+                        dest_name="${dest_dir}/$(basename "${f}")"
+                        # Do not overwrite existing regular files.
+                        if [[ -e "${dest_name}" && ! -L "${dest_name}" ]]; then
+                            warn "Skipping ${f}: destination ${dest_name} already exists."
                             continue
                         fi
-                        # If symlink already points to the same target, skip.
-                        if [[ -L "${link_name}" ]]; then
-                            existing_target="$(readlink -f "${link_name}" 2>/dev/null || true)"
-                            new_target="$(readlink -f "${f}" 2>/dev/null || true)"
-                            if [[ -n "${existing_target}" && "${existing_target}" == "${new_target}" ]]; then
-                                continue
-                            fi
-                        fi
-                        ln -sf "${f}" "${link_name}" 2>/dev/null || true
+                        cp -f "${f}" "${dest_name}" 2>/dev/null || true
+                        chmod 644 "${dest_name}" 2>/dev/null || true
                     fi
                 done
             )
-            info "Symlinked client configs from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}."
+            info "Copied client configs from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}."
         fi
     fi
 

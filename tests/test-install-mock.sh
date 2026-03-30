@@ -736,6 +736,10 @@ source /etc/amnezia/amneziawg/params
 SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
 # --- 2a: Add a second client ---
+
+# Create the web panel config directory so copyToWebPanelDir can use it
+mkdir -p "${WEB_PANEL_CONFIG_DIR}"
+
 newClient
 
 if grep -q "^### Client client2$" "${SERVER_AWG_CONF}"; then
@@ -750,6 +754,23 @@ if [[ -n "${CLIENT2_CONF}" ]] && [[ -f "${CLIENT2_CONF}" ]]; then
 	echo "OK: Second client config exists at ${CLIENT2_CONF}"
 else
 	echo "FAIL: Second client config not found"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify config was copied to web panel directory
+if [[ -f "${WEB_PANEL_CONFIG_DIR}/awg0-client-client2.conf" && ! -L "${WEB_PANEL_CONFIG_DIR}/awg0-client-client2.conf" ]]; then
+	echo "OK: Client config copied to web panel directory"
+else
+	echo "FAIL: Client config not copied to ${WEB_PANEL_CONFIG_DIR}"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify copied config is world-readable (644)
+WEB_COPY_PERMS=$(stat -c '%a' "${WEB_PANEL_CONFIG_DIR}/awg0-client-client2.conf" 2>/dev/null)
+if [[ "${WEB_COPY_PERMS}" == "644" ]]; then
+	echo "OK: Copied config has mode 644"
+else
+	echo "FAIL: Copied config permissions are ${WEB_COPY_PERMS} (expected 644)"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -783,6 +804,15 @@ if grep -q "^H1 = ${ORIG_H1}$" "${CLIENT1_CONF}"; then
 	FAILED=$((FAILED + 1))
 else
 	echo "OK: Old H1 value replaced in client config"
+fi
+
+# Verify regenerated configs were copied to web panel directory
+if [[ -f "${WEB_PANEL_CONFIG_DIR}/awg0-client-client.conf" ]] && \
+   grep -q "^H1 = 999-9999$" "${WEB_PANEL_CONFIG_DIR}/awg0-client-client.conf"; then
+	echo "OK: Regenerated client config copied to web panel directory with updated H1"
+else
+	echo "FAIL: Regenerated client config not updated in ${WEB_PANEL_CONFIG_DIR}"
+	FAILED=$((FAILED + 1))
 fi
 
 # Verify private keys were preserved (no "generating new key pair" messages)
@@ -1184,10 +1214,10 @@ echo "--- Web installer: auto-detect AWG_CONFIG_DIR ---"
 # When --config-dir is not passed, the installer should auto-detect the
 # directory containing awg*-client-*.conf files and write it to AWG_CONFIG_DIR
 # in the env file.  When configs are found in a home directory (/root),
-# auto-detection creates a dedicated subdirectory and symlinks configs there
-# so the web panel can safely use read_dir() with rx ACLs.
+# auto-detection copies configs into the default system directory so the
+# web panel can read them without traversing home directories.
 AUTODETECT_HOME="/root"
-AUTODETECT_EXPECTED_DIR="${AUTODETECT_HOME}/amneziawg-clients"
+AUTODETECT_EXPECTED_DIR="/etc/amneziawg/clients"
 AUTODETECT_CONF="${AUTODETECT_HOME}/awg0-client-autotest.conf"
 
 # Create a fake AWG client config with an [Interface] section
@@ -1218,67 +1248,57 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify auto-detected AWG_CONFIG_DIR points to the dedicated subdirectory (not the home dir)
+# Verify auto-detected AWG_CONFIG_DIR points to the default system directory
 if grep -q "^AWG_CONFIG_DIR=${AUTODETECT_EXPECTED_DIR}$" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
-	echo "OK: AWG_CONFIG_DIR auto-detected as ${AUTODETECT_EXPECTED_DIR} (dedicated subdir, not home)"
+	echo "OK: AWG_CONFIG_DIR auto-detected as ${AUTODETECT_EXPECTED_DIR} (system dir)"
 else
 	echo "FAIL: AWG_CONFIG_DIR not auto-detected; expected ${AUTODETECT_EXPECTED_DIR}"
 	echo "  Got: $(grep 'AWG_CONFIG_DIR=' "${WEB_TEST_ENV_FILE}" 2>/dev/null || echo 'not found')"
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify symlink was created in the dedicated subdirectory
-if [[ -L "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" ]]; then
-	echo "OK: Symlink created in ${AUTODETECT_EXPECTED_DIR}"
+# Verify config was copied (not symlinked) into the system directory
+if [[ -f "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" && ! -L "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" ]]; then
+	echo "OK: Config copied (not symlinked) into ${AUTODETECT_EXPECTED_DIR}"
 else
-	echo "FAIL: Expected symlink ${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf not found"
+	echo "FAIL: Expected copied file ${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf not found"
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify the service user can actually read the config through the symlink.
-# This catches permission regressions where ACLs are not applied to the real
-# target file (the original config is typically mode 600).
-# The assertion requires setfacl to be installed: without it the installer
-# cannot grant the service user access to /root or the symlink targets, so
-# read access is expected to fail and we skip instead of reporting a false FAIL.
+# Verify the service user can actually read the copied config file.
 WEB_SERVICE_USER="awg-web"
-if ! command -v setfacl >/dev/null 2>&1; then
-	echo "SKIP: setfacl not installed; cannot verify ACL-based read access through symlink"
-elif ! id "${WEB_SERVICE_USER}" &>/dev/null; then
+if ! id "${WEB_SERVICE_USER}" &>/dev/null; then
 	echo "SKIP: Service user ${WEB_SERVICE_USER} does not exist; cannot verify read access"
 elif ! command -v runuser >/dev/null 2>&1; then
 	echo "SKIP: runuser not installed; cannot verify read access as service user"
 elif runuser -u "${WEB_SERVICE_USER}" -- cat "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" >/dev/null 2>&1; then
-	echo "OK: Service user ${WEB_SERVICE_USER} can read config through symlink"
+	echo "OK: Service user ${WEB_SERVICE_USER} can read copied config file"
 else
-	echo "FAIL: Service user ${WEB_SERVICE_USER} cannot read config through symlink"
-	echo "  Symlink target perms: $(stat -c '%a' "${AUTODETECT_CONF}" 2>/dev/null || echo 'N/A')"
-	echo "  ACL on target: $(getfacl -p "${AUTODETECT_CONF}" 2>/dev/null | grep "${WEB_SERVICE_USER}" || echo 'none')"
+	echo "FAIL: Service user ${WEB_SERVICE_USER} cannot read copied config file"
+	echo "  File perms: $(stat -c '%a' "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" 2>/dev/null || echo 'N/A')"
 	FAILED=$((FAILED + 1))
 fi
 
 # Verify the auto-detection was logged
-if echo "${WEB_AUTODETECT_OUTPUT}" | grep -q "Auto-detected AWG client config directory"; then
+if echo "${WEB_AUTODETECT_OUTPUT}" | grep -q "Auto-detected AWG client configs in"; then
 	echo "OK: Auto-detection logged in output"
 else
 	echo "FAIL: Auto-detection message not found in output"
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify ProtectHome was relaxed for /root config dir and that this run changed it
-if grep -q "^ProtectHome=read-only" /etc/systemd/system/amneziawg-web.service 2>/dev/null && \
-	echo "${WEB_AUTODETECT_OUTPUT}" | grep -q "ProtectHome"; then
-	echo "OK: ProtectHome=read-only when config dir is under /root and change logged by installer"
+# Verify ProtectHome=yes is preserved since config dir is a system path (not under /home or /root)
+if grep -q "^ProtectHome=yes" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
+	echo "OK: ProtectHome=yes preserved when config dir is a system path"
 else
-	echo "FAIL: ProtectHome should be read-only when config dir is under /root and change should be logged"
+	echo "FAIL: ProtectHome should be yes when config dir is not under /home or /root"
 	echo "  Unit file ProtectHome line: $(grep 'ProtectHome=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
-	echo "  Installer output (grep ProtectHome): $(echo "${WEB_AUTODETECT_OUTPUT}" | grep -i 'ProtectHome' || echo 'no ProtectHome log found')"
 	FAILED=$((FAILED + 1))
 fi
 
 rm -f "${AUTODETECT_CONF}"
 
-# Clean up the dedicated subdirectory and any ACL entries on /root left by the test.
+# Clean up the copied config and any ACL entries left by the test.
 rm -rf "${AUTODETECT_EXPECTED_DIR}"
 if command -v setfacl >/dev/null 2>&1; then
 	setfacl -x "u:${WEB_SERVICE_USER}" /root 2>/dev/null || true

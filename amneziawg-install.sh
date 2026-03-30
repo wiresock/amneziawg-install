@@ -9,6 +9,7 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
+WEB_PANEL_CONFIG_DIR="/etc/amneziawg/clients"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
@@ -46,6 +47,25 @@ if [[ "${SAFE_QUOTE_PARAM_SELFTEST:-0}" == "1" ]]; then
 		exit 1
 	fi
 fi
+
+# Copy a client config file to the web panel config directory so the panel
+# can discover and display it.  This is a best-effort operation: if the web
+# panel is not installed (directory absent), the copy is silently skipped.
+function copyToWebPanelDir() {
+	local src_file="$1"
+	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" ]]; then
+		cp -f "${src_file}" "${WEB_PANEL_CONFIG_DIR}/" 2>/dev/null || true
+		chmod 644 "${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")" 2>/dev/null || true
+	fi
+}
+
+# Remove a client config file from the web panel config directory.
+function removeFromWebPanelDir() {
+	local filename="$1"
+	if [[ -d "${WEB_PANEL_CONFIG_DIR}" ]]; then
+		rm -f "${WEB_PANEL_CONFIG_DIR}/${filename}" 2>/dev/null || true
+	fi
+}
 
 # Serialize all server parameters to a params file
 # Uses safe quoting for string values to prevent shell injection when sourced
@@ -1731,6 +1751,9 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 		fi
 	fi
 
+	# Copy config to the web panel directory (best-effort)
+	copyToWebPanelDir "${client_conf}"
+
 	# Add the client as a peer to the server
 	echo -e "\n### Client ${CLIENT_NAME}
 [Peer]
@@ -1799,6 +1822,9 @@ function revokeClient() {
 	local HOME_DIR
 	HOME_DIR=$(getHomeDirForClient "${CLIENT_NAME}")
 	rm -f "${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+
+	# Remove config from the web panel directory (best-effort)
+	removeFromWebPanelDir "${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# restart AmneziaWG to apply changes
 	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
@@ -2054,6 +2080,9 @@ EOF
 		fi
 
 		# Regeneration succeeded; existing client config has been updated.
+
+		# Copy regenerated config to the web panel directory (best-effort)
+		copyToWebPanelDir "${OUTPUT_CONF}"
 
 		# Generate QR code if qrencode is installed
 		if command -v qrencode &>/dev/null; then
