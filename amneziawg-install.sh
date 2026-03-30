@@ -53,7 +53,7 @@ fi
 # panel is not installed (directory absent), the copy is silently skipped.
 function copyToWebPanelDir() {
 	local src_file="$1"
-	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" ]]; then
+	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" && ! -L "${src_file}" ]]; then
 		local dest
 		dest="${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")"
 		# Avoid following or overwriting a pre-existing symlink at the destination.
@@ -1721,6 +1721,11 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 		echo "Warning: failed to set permissions on ${client_conf}" >&2
 	fi
 
+	# Copy config to the web panel directory (best-effort) *before* chowning
+	# to a non-root user, so the source file is still root-owned and cannot
+	# be swapped via a TOCTOU race in a user-writable directory.
+	copyToWebPanelDir "${client_conf}"
+
 	# Ensure the generated client config is readable by the intended non-root user,
 	# without unintentionally granting access to the sudo-invoking user.
 	# Prefer:
@@ -1771,9 +1776,6 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 			chown "${sudo_chown_target}" "${client_conf}" || true
 		fi
 	fi
-
-	# Copy config to the web panel directory (best-effort)
-	copyToWebPanelDir "${client_conf}"
 
 	# Add the client as a peer to the server
 	echo -e "\n### Client ${CLIENT_NAME}
@@ -2088,6 +2090,11 @@ Endpoint = ${ENDPOINT}
 AllowedIPs = ${ALLOWED_IPS}
 EOF
 
+		# Copy regenerated config to the web panel directory (best-effort)
+		# *before* chowning to a non-root user, so the source file is still
+		# root-owned and cannot be swapped via a TOCTOU race.
+		copyToWebPanelDir "${OUTPUT_CONF}"
+
 		# If running as root and the output directory is owned by a non-root user,
 		# ensure the regenerated client config is owned by that user so they can
 		# actually read it (while keeping permissions at 600).
@@ -2101,9 +2108,6 @@ EOF
 		fi
 
 		# Regeneration succeeded; existing client config has been updated.
-
-		# Copy regenerated config to the web panel directory (best-effort)
-		copyToWebPanelDir "${OUTPUT_CONF}"
 
 		# Generate QR code if qrencode is installed
 		if command -v qrencode &>/dev/null; then
