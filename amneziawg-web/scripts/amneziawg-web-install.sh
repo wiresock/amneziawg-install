@@ -1753,6 +1753,13 @@ main() {
     fi
     AWG_CONFIG_DIR="${AWG_CONFIG_DIR%/}"
 
+    # Reject AWG_CONFIG_DIR containing whitespace or control characters early.
+    # These break systemd ReadWritePaths= directives and sudoers entries, and
+    # must be caught before the path is written into the unit or env file.
+    if [[ "${AWG_CONFIG_DIR}" =~ [[:space:][:cntrl:]] ]]; then
+        die "AWG_CONFIG_DIR '${AWG_CONFIG_DIR}' contains whitespace or control characters. Please choose a path without spaces."
+    fi
+
     if [[ "${NON_INTERACTIVE}" == "true" ]]; then
         non_interactive_validate
     else

@@ -666,7 +666,14 @@ Please report this issue."
     # Fall back to the default clients directory used by the installer.
     awg_config_dir_upgrade="${awg_config_dir_upgrade:-/etc/amnezia/amneziawg/clients}"
 
-    if validate_awg_config_dir "${awg_config_dir_upgrade}"; then
+    # Reject paths containing whitespace or control characters early.  These
+    # break systemd ReadWritePaths= directives and sudoers entries.
+    if [[ "${awg_config_dir_upgrade}" =~ [[:space:][:cntrl:]] ]]; then
+        warn "AWG_CONFIG_DIR '${awg_config_dir_upgrade}' contains whitespace or control characters; skipping config-dir adjustments."
+        awg_config_dir_upgrade=""
+    fi
+
+    if [[ -n "${awg_config_dir_upgrade}" ]] && validate_awg_config_dir "${awg_config_dir_upgrade}"; then
         if [[ -d "${awg_config_dir_upgrade}" ]]; then
             chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}" 2>/dev/null \
                 && info "Set ownership of ${awg_config_dir_upgrade} to ${SERVICE_USER}." \
@@ -721,7 +728,13 @@ Please report this issue."
             awg_config_dir="${awg_config_dir%\'}"
         fi
         if [[ -n "${awg_config_dir}" ]]; then
-            adjust_unit_hardening "${SYSTEMD_UNIT_DEST}" "${awg_config_dir}"
+            # Reject paths with whitespace/control chars before writing into
+            # the systemd unit file (ReadWritePaths= is whitespace-delimited).
+            if [[ "${awg_config_dir}" =~ [[:space:][:cntrl:]] ]]; then
+                warn "AWG_CONFIG_DIR '${awg_config_dir}' contains whitespace or control characters; skipping unit hardening."
+            else
+                adjust_unit_hardening "${SYSTEMD_UNIT_DEST}" "${awg_config_dir}"
+            fi
         fi
 
         systemctl daemon-reload

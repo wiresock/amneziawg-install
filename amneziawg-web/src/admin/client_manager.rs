@@ -630,10 +630,12 @@ pub fn create_client(
     // and released automatically when `_lock_file` is dropped.
     let lock_path = config_dir.join(".create-client.lock");
     let _lock_file = {
+        use std::os::unix::fs::OpenOptionsExt;
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&lock_path)
             .map_err(|e| CreateClientError::FileWrite(format!(
                 "open lock file: {e}"
