@@ -737,8 +737,16 @@ SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
 # --- 2a: Add a second client ---
 
-# Create the web panel config directory so copyToWebPanelDir can use it
+# Create the web panel config directory so copyToWebPanelDir can use it.
+# Simulate realistic web-panel ownership (root:<service-group>, mode 0750)
+# so that copyToWebPanelDir() inherits the correct group on copied files.
+WEB_PANEL_GROUP="awg-web"
+if ! getent group "${WEB_PANEL_GROUP}" &>/dev/null; then
+	groupadd --system "${WEB_PANEL_GROUP}"
+fi
 mkdir -p "${WEB_PANEL_CONFIG_DIR}"
+chown "root:${WEB_PANEL_GROUP}" "${WEB_PANEL_CONFIG_DIR}"
+chmod 750 "${WEB_PANEL_CONFIG_DIR}"
 
 newClient
 
