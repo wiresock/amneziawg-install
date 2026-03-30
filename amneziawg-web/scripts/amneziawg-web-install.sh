@@ -700,6 +700,16 @@ setup_filesystem() {
     # If auto-detection found configs in a home directory, create the dedicated
     # subdirectory and populate it with symlinks now (deferred from detect to
     # avoid filesystem side effects before user confirmation).
+    # Only perform this auto-symlink step if AWG_CONFIG_DIR still matches the
+    # directory derived from the detected home. This avoids acting on stale
+    # detection results when the user has overridden AWG_CONFIG_DIR.
+    if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
+        local expected_dir="${AWG_DETECTED_HOME_DIR}/amneziawg-clients"
+        if [[ "${AWG_CONFIG_DIR}" != "${expected_dir}" ]]; then
+            info "Skipping auto-detected config symlinks: AWG_CONFIG_DIR (${AWG_CONFIG_DIR}) no longer matches ${expected_dir}."
+            AWG_DETECTED_HOME_DIR=""
+        fi
+    fi
     if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
         local dest_dir="${AWG_CONFIG_DIR}"
         if [[ ! -d "${dest_dir}" ]]; then

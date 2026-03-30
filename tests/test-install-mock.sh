@@ -1218,6 +1218,7 @@ cat >"${AUTODETECT_CONF}" <<'CONFEOF'
 PrivateKey = fake+key+for+testing=
 Address = 10.0.0.2/32
 CONFEOF
+chmod 600 "${AUTODETECT_CONF}"
 
 WEB_AUTODETECT_RC=0
 WEB_AUTODETECT_OUTPUT=$(SUDO_USER="" bash "${WEB_INSTALLER_IMPL}" \
