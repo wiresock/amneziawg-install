@@ -757,44 +757,43 @@ setup_filesystem() {
             # the web panel can read them without traversing home directories.
             # Only copy real regular files (not symlinks) to avoid
             # inadvertently exposing arbitrary files.
-            local copy_count
-            copy_count=$(
-                shopt -s nullglob
-                count=0
-                for f in "${AWG_DETECTED_HOME_DIR}"/awg*-client-*.conf; do
-                    if [[ -f "${f}" && ! -L "${f}" && -r "${f}" ]]; then
-                        dest_name="${dest_dir}/$(basename "${f}")"
-                        # Do not overwrite existing regular files.
-                        if [[ -e "${dest_name}" && ! -L "${dest_name}" ]]; then
-                            warn "Skipping ${f}: destination ${dest_name} already exists."
+            local copy_count=0
+            local _saved_nullglob
+            _saved_nullglob=$(shopt -p nullglob 2>/dev/null || true)
+            shopt -s nullglob
+            for f in "${AWG_DETECTED_HOME_DIR}"/awg*-client-*.conf; do
+                if [[ -f "${f}" && ! -L "${f}" && -r "${f}" ]]; then
+                    dest_name="${dest_dir}/$(basename "${f}")"
+                    # Do not overwrite existing regular files.
+                    if [[ -e "${dest_name}" && ! -L "${dest_name}" ]]; then
+                        warn "Skipping ${f}: destination ${dest_name} already exists."
+                        continue
+                    fi
+                    # If a symlink exists at the destination, remove it so cp
+                    # cannot follow it and overwrite an arbitrary target.
+                    if [[ -L "${dest_name}" ]]; then
+                        warn "Removing symlink at ${dest_name} before copying ${f}."
+                        if ! rm -f "${dest_name}" 2>/dev/null; then
+                            warn "Failed to remove symlink at ${dest_name}; skipping copy of ${f} to avoid following symlink."
                             continue
                         fi
-                        # If a symlink exists at the destination, remove it so cp
-                        # cannot follow it and overwrite an arbitrary target.
+                        # If the destination is still a symlink after attempted removal, skip to avoid following it.
                         if [[ -L "${dest_name}" ]]; then
-                            warn "Removing symlink at ${dest_name} before copying ${f}."
-                            if ! rm -f "${dest_name}" 2>/dev/null; then
-                                warn "Failed to remove symlink at ${dest_name}; skipping copy of ${f} to avoid following symlink."
-                                continue
-                            fi
-                            # If the destination is still a symlink after attempted removal, skip to avoid following it.
-                            if [[ -L "${dest_name}" ]]; then
-                                warn "Destination ${dest_name} remains a symlink after removal attempt; skipping copy of ${f}."
-                                continue
-                            fi
-                        fi
-                        if cp -f "${f}" "${dest_name}" 2>/dev/null; then
-                            # Only adjust permissions on a real regular file we just created.
-                            if [[ -f "${dest_name}" && ! -L "${dest_name}" ]]; then
-                                chmod 640 "${dest_name}" 2>/dev/null || true
-                                chown "root:${SERVICE_USER}" "${dest_name}" 2>/dev/null || true
-                            fi
-                            count=$((count + 1))
+                            warn "Destination ${dest_name} remains a symlink after removal attempt; skipping copy of ${f}."
+                            continue
                         fi
                     fi
-                done
-                echo "${count}"
-            )
+                    if cp -f "${f}" "${dest_name}" 2>/dev/null; then
+                        # Only adjust permissions on a real regular file we just created.
+                        if [[ -f "${dest_name}" && ! -L "${dest_name}" ]]; then
+                            chmod 640 "${dest_name}" 2>/dev/null || true
+                            chown "root:${SERVICE_USER}" "${dest_name}" 2>/dev/null || true
+                        fi
+                        copy_count=$((copy_count + 1))
+                    fi
+                fi
+            done
+            eval "${_saved_nullglob}"
             if [[ "${copy_count}" -gt 0 ]]; then
                 info "Copied ${copy_count} client config(s) from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}."
             else
