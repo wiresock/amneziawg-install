@@ -1220,6 +1220,10 @@ AUTODETECT_HOME="/root"
 AUTODETECT_EXPECTED_DIR="/etc/amneziawg/clients"
 AUTODETECT_CONF="${AUTODETECT_HOME}/awg0-client-autotest.conf"
 
+# Clean up the default config directory so auto-detection is not short-circuited
+# by configs left there from Phase 2 (copyToWebPanelDir).
+rm -rf "${AUTODETECT_EXPECTED_DIR}"
+
 # Create a fake AWG client config with an [Interface] section
 cat >"${AUTODETECT_CONF}" <<'CONFEOF'
 [Interface]
