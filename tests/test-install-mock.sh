@@ -1750,7 +1750,7 @@ echo "--- Web installer: auto-detect AWG_CONFIG_DIR ---"
 # auto-detection copies configs into the default system directory so the
 # web panel can read them without traversing home directories.
 AUTODETECT_HOME="/root"
-AUTODETECT_EXPECTED_DIR="/etc/amneziawg/clients"
+AUTODETECT_EXPECTED_DIR="/etc/amnezia/amneziawg/clients"
 AUTODETECT_CONF="${AUTODETECT_HOME}/awg0-client-autotest.conf"
 
 # Clean up the default config directory so auto-detection is not short-circuited
