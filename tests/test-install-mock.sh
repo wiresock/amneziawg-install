@@ -1813,6 +1813,9 @@ elif runuser -u "${WEB_SERVICE_USER}" -- cat "${AUTODETECT_EXPECTED_DIR}/awg0-cl
 else
 	echo "FAIL: Service user ${WEB_SERVICE_USER} cannot read copied config file"
 	echo "  File perms: $(stat -c '%a' "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" 2>/dev/null || echo 'N/A')"
+	echo "  File owner: $(stat -c '%U:%G' "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" 2>/dev/null || echo 'N/A')"
+	echo "  Dir info: $(stat -c '%U:%G %a' "${AUTODETECT_EXPECTED_DIR}" 2>/dev/null || echo 'N/A')"
+	echo "  Parent info: $(stat -c '%U:%G %a' "$(dirname "${AUTODETECT_EXPECTED_DIR}")" 2>/dev/null || echo 'N/A')"
 	FAILED=$((FAILED + 1))
 fi
 

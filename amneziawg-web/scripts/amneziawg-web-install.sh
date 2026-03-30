@@ -920,6 +920,68 @@ setup_filesystem() {
         fi
     fi
 
+    # Ensure the service user can traverse all parent directories of the
+    # config directory.  The main AWG installer typically creates
+    # /etc/amnezia/amneziawg with mode 0700 root:root, which blocks the
+    # web-panel service user from reaching the clients subdirectory.
+    if [[ -d "${AWG_CONFIG_DIR}" ]]; then
+        local check_dir="${AWG_CONFIG_DIR}"
+        local svc_uid svc_gids
+        svc_uid="$(id -u "${SERVICE_USER}" 2>/dev/null || echo "")"
+        svc_gids="$(id -G "${SERVICE_USER}" 2>/dev/null || echo "")"
+        if [[ -n "${svc_uid}" ]]; then
+            while true; do
+                local parent_dir
+                parent_dir="$(dirname "${check_dir}")"
+                # Stop at filesystem root.
+                if [[ "${parent_dir}" == "${check_dir}" || "${parent_dir}" == "/" ]]; then
+                    break
+                fi
+                if [[ -d "${parent_dir}" && ! -L "${parent_dir}" ]]; then
+                    # Check whether the service user can traverse this directory
+                    # by examining owner/group/other execute bits.
+                    local dir_uid dir_gid dir_mode
+                    dir_uid="$(stat -c '%u' "${parent_dir}" 2>/dev/null || echo "")"
+                    dir_gid="$(stat -c '%g' "${parent_dir}" 2>/dev/null || echo "")"
+                    dir_mode="$(stat -c '%a' "${parent_dir}" 2>/dev/null || echo "")"
+                    if [[ -n "${dir_mode}" ]]; then
+                        local can_traverse=0
+                        local mode_oct=$(( 8#${dir_mode} ))
+                        # Check other execute
+                        if (( mode_oct & 8#001 )); then
+                            can_traverse=1
+                        fi
+                        # Check owner execute
+                        if [[ ${can_traverse} -eq 0 && "${dir_uid}" == "${svc_uid}" ]] && (( mode_oct & 8#100 )); then
+                            can_traverse=1
+                        fi
+                        # Check group execute
+                        if [[ ${can_traverse} -eq 0 && -n "${dir_gid}" ]]; then
+                            for gid in ${svc_gids}; do
+                                if [[ "${gid}" == "${dir_gid}" ]] && (( mode_oct & 8#010 )); then
+                                    can_traverse=1
+                                    break
+                                fi
+                            done
+                        fi
+                        if [[ ${can_traverse} -eq 0 ]]; then
+                            if command -v setfacl >/dev/null 2>&1; then
+                                setfacl -m "u:${SERVICE_USER}:x" "${parent_dir}" 2>/dev/null \
+                                    && info "Granted traverse ACL for ${SERVICE_USER} on ${parent_dir}." \
+                                    || warn "setfacl failed on ${parent_dir}. The service may not be able to reach ${AWG_CONFIG_DIR}."
+                            else
+                                chmod o+x "${parent_dir}" 2>/dev/null \
+                                    && info "Added traverse permission (o+x) on ${parent_dir} for service access." \
+                                    || warn "Could not set o+x on ${parent_dir}. The service may not be able to reach ${AWG_CONFIG_DIR}."
+                            fi
+                        fi
+                    fi
+                fi
+                check_dir="${parent_dir}"
+            done
+        fi
+    fi
+
     # For existing client configs, ensure the service user can read them.
     if [[ -d "${AWG_CONFIG_DIR}" ]]; then
         # Best-effort: add to group owning the directory
