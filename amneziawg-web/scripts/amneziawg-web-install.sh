@@ -744,9 +744,12 @@ setup_filesystem() {
             }
         fi
         if [[ -d "${dest_dir}" ]]; then
-            # Best-effort permission tightening; failures here should not abort install.
-            chown "root:${SERVICE_USER}" "${dest_dir}" 2>/dev/null || true
-            chmod 750 "${dest_dir}" 2>/dev/null || true
+            if [[ -L "${dest_dir}" ]]; then
+                warn "Config directory ${dest_dir} is a symlink; skipping permission/ownership changes to avoid affecting the symlink target."
+            else
+                chown "root:${SERVICE_USER}" "${dest_dir}" 2>/dev/null || true
+                chmod 750 "${dest_dir}" 2>/dev/null || true
+            fi
         fi
 
         if [[ -n "${AWG_DETECTED_HOME_DIR}" ]]; then
@@ -787,7 +790,11 @@ setup_filesystem() {
                     fi
                 done
             )
-            info "Copied client configs from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}."
+            if compgen -G "${dest_dir}/awg*-client-*.conf" > /dev/null; then
+                info "Copied client configs from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}."
+            else
+                warn "No client configs were copied from ${AWG_DETECTED_HOME_DIR} into ${dest_dir}. Check permissions and available files."
+            fi
         fi
     fi
 

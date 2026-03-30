@@ -83,8 +83,8 @@ function copyToWebPanelDir() {
 # Remove a client config file from the web panel config directory.
 function removeFromWebPanelDir() {
 	local filename="$1"
-	if [[ -d "${WEB_PANEL_CONFIG_DIR}" ]]; then
-		rm -f "${WEB_PANEL_CONFIG_DIR}/${filename}" 2>/dev/null || true
+	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && ! -L "${WEB_PANEL_CONFIG_DIR}" ]]; then
+		rm -f -- "${WEB_PANEL_CONFIG_DIR}/${filename}" 2>/dev/null || true
 	fi
 }
 
