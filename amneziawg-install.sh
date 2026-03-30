@@ -54,16 +54,25 @@ fi
 function copyToWebPanelDir() {
 	local src_file="$1"
 	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" ]]; then
-		cp -f "${src_file}" "${WEB_PANEL_CONFIG_DIR}/" 2>/dev/null || true
 		local dest
 		dest="${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")"
-		chmod 640 "${dest}" 2>/dev/null || true
-		# Match the file's group to the directory's group so the web service
-		# user can read it (the directory is expected to be root:<service-user>).
-		local dir_group
-		dir_group="$(stat -c '%G' "${WEB_PANEL_CONFIG_DIR}" 2>/dev/null || true)"
-		if [[ -n "${dir_group}" && "${dir_group}" != "root" ]]; then
-			chgrp "${dir_group}" "${dest}" 2>/dev/null || true
+		# Avoid following or overwriting a pre-existing symlink at the destination.
+		if [[ -L "${dest}" ]]; then
+			# Best-effort: warn and skip rather than risk clobbering the symlink target.
+			echo "Warning: refusing to copy '${src_file}' to '${dest}' because destination is a symlink" >&2
+			return 0
+		fi
+		cp -f "${src_file}" "${WEB_PANEL_CONFIG_DIR}/" 2>/dev/null || true
+		# Only adjust permissions on a regular non-symlink file we just copied.
+		if [[ -f "${dest}" && ! -L "${dest}" ]]; then
+			chmod 640 "${dest}" 2>/dev/null || true
+			# Match the file's group to the directory's group so the web service
+			# user can read it (the directory is expected to be root:<service-user>).
+			local dir_group
+			dir_group="$(stat -c '%G' "${WEB_PANEL_CONFIG_DIR}" 2>/dev/null || true)"
+			if [[ -n "${dir_group}" && "${dir_group}" != "root" ]]; then
+				chgrp "${dir_group}" "${dest}" 2>/dev/null || true
+			fi
 		fi
 	fi
 }

@@ -774,6 +774,22 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+# Verify copied config group matches web panel directory group and is non-root
+WEB_DIR_GROUP=$(stat -c '%G' "${WEB_PANEL_CONFIG_DIR}" 2>/dev/null || echo "")
+WEB_COPY_GROUP=$(stat -c '%G' "${WEB_PANEL_CONFIG_DIR}/awg0-client-client2.conf" 2>/dev/null || echo "")
+if [[ -z "${WEB_DIR_GROUP}" || -z "${WEB_COPY_GROUP}" ]]; then
+	echo "FAIL: Unable to determine group ownership for web panel directory or copied config"
+	FAILED=$((FAILED + 1))
+elif [[ "${WEB_COPY_GROUP}" != "${WEB_DIR_GROUP}" ]]; then
+	echo "FAIL: Copied config group '${WEB_COPY_GROUP}' does not match web panel directory group '${WEB_DIR_GROUP}'"
+	FAILED=$((FAILED + 1))
+elif [[ "${WEB_COPY_GROUP}" == "root" ]]; then
+	echo "FAIL: Copied config group is 'root'; expected a non-root service group for web panel access"
+	FAILED=$((FAILED + 1))
+else
+	echo "OK: Copied config group '${WEB_COPY_GROUP}' matches web panel directory group and is non-root"
+fi
+
 # --- 2b: Regenerate with modified parameter, verify configs updated ---
 ORIG_H1="${SERVER_AWG_H1}"
 SERVER_AWG_H1="999-9999"

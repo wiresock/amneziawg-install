@@ -756,9 +756,18 @@ setup_filesystem() {
                             warn "Skipping ${f}: destination ${dest_name} already exists."
                             continue
                         fi
+                        # If a symlink exists at the destination, remove it so cp
+                        # cannot follow it and overwrite an arbitrary target.
+                        if [[ -L "${dest_name}" ]]; then
+                            warn "Removing symlink at ${dest_name} before copying ${f}."
+                            rm -f "${dest_name}" 2>/dev/null || true
+                        fi
                         cp -f "${f}" "${dest_name}" 2>/dev/null || true
-                        chmod 640 "${dest_name}" 2>/dev/null || true
-                        chown "root:${SERVICE_USER}" "${dest_name}" 2>/dev/null || true
+                        # Only adjust permissions on a real regular file we just created.
+                        if [[ -f "${dest_name}" && ! -L "${dest_name}" ]]; then
+                            chmod 640 "${dest_name}" 2>/dev/null || true
+                            chown "root:${SERVICE_USER}" "${dest_name}" 2>/dev/null || true
+                        fi
                     fi
                 done
             )
