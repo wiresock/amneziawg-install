@@ -55,7 +55,16 @@ function copyToWebPanelDir() {
 	local src_file="$1"
 	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" ]]; then
 		cp -f "${src_file}" "${WEB_PANEL_CONFIG_DIR}/" 2>/dev/null || true
-		chmod 640 "${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")" 2>/dev/null || true
+		local dest
+		dest="${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")"
+		chmod 640 "${dest}" 2>/dev/null || true
+		# Match the file's group to the directory's group so the web service
+		# user can read it (the directory is expected to be root:<service-user>).
+		local dir_group
+		dir_group="$(stat -c '%G' "${WEB_PANEL_CONFIG_DIR}" 2>/dev/null)" || true
+		if [[ -n "${dir_group}" && "${dir_group}" != "root" ]]; then
+			chgrp "${dir_group}" "${dest}" 2>/dev/null || true
+		fi
 	fi
 }
 

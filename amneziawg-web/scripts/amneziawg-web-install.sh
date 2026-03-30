@@ -734,6 +734,8 @@ setup_filesystem() {
                 warn "Failed to create ${dest_dir}; skipping config file copy."
                 AWG_DETECTED_HOME_DIR=""
             }
+        fi
+        if [[ -d "${dest_dir}" ]]; then
             # Best-effort permission tightening; failures here should not abort install.
             chown "root:${SERVICE_USER}" "${dest_dir}" 2>/dev/null || true
             chmod 750 "${dest_dir}" 2>/dev/null || true
@@ -756,6 +758,7 @@ setup_filesystem() {
                         fi
                         cp -f "${f}" "${dest_name}" 2>/dev/null || true
                         chmod 640 "${dest_name}" 2>/dev/null || true
+                        chown "root:${SERVICE_USER}" "${dest_name}" 2>/dev/null || true
                     fi
                 done
             )
