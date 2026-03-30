@@ -85,7 +85,11 @@ adjust_unit_hardening() {
         current_ro="${current_ro%/}"
         if [[ "${config_dir}" != "${current_ro}" ]] \
                 && [[ "${config_dir}" != "${current_ro}/"* ]]; then
-            sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${config_dir}|" "${unit_file}"
+            # Escape sed replacement metacharacters (& and the | delimiter)
+            # to prevent path contents from corrupting the unit file.
+            local escaped_dir="${config_dir//&/\\&}"
+            escaped_dir="${escaped_dir//|/\\|}"
+            sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${escaped_dir}|" "${unit_file}"
             info "Updated ReadOnlyPaths to ${config_dir}"
         fi
     fi

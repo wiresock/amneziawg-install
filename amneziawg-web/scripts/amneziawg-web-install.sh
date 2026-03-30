@@ -873,7 +873,7 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                     find "${target_dir}" -maxdepth 1 -name '*.conf' -type f -print0 2>/dev/null \
                         | while IFS= read -r -d '' cf; do
                             setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
-                        done
+                        done || true
                     # Also handle symlinked configs by applying ACLs to their real targets,
                     # which are often mode 600 and would otherwise be unreadable.
                     # Validate that resolved targets stay within allowed directories
@@ -881,7 +881,7 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                     find "${target_dir}" -maxdepth 1 -name '*.conf' -type l -print0 2>/dev/null \
                         | while IFS= read -r -d '' link; do
                             _apply_acl_to_symlink_target "${link}" "${target_dir}" "${SERVICE_USER}"
-                        done
+                        done || true
                     # Log only if there were any .conf files (regular or symlinked)
                     if compgen -G "${target_dir}/*.conf" > /dev/null 2>&1; then
                         info "Applied read ACL to existing config files and symlink targets."
@@ -891,13 +891,13 @@ You may need to grant read access to ${AWG_CONFIG_DIR} manually."
                     find "${target_dir}" -maxdepth 1 -name 'awg*-client-*.conf' -type f -print0 2>/dev/null \
                         | while IFS= read -r -d '' cf; do
                             setfacl -m "u:${SERVICE_USER}:r" "${cf}" 2>/dev/null || true
-                        done
+                        done || true
                     # Also handle symlinked configs by applying ACLs to their real targets.
                     # Validate that resolved targets stay within allowed directories.
                     find "${target_dir}" -maxdepth 1 -name 'awg*-client-*.conf' -type l -print0 2>/dev/null \
                         | while IFS= read -r -d '' link; do
                             _apply_acl_to_symlink_target "${link}" "${target_dir}" "${SERVICE_USER}"
-                        done
+                        done || true
                     # Log only if there were any matching client config files
                     if compgen -G "${target_dir}/awg*-client-*.conf" > /dev/null 2>&1; then
                         info "Applied read ACL to existing client config files and symlink targets in home directory."
@@ -1143,7 +1143,11 @@ adjust_unit_hardening() {
         # If the configured directory is already covered, nothing to do
         if [[ "${config_dir}" != "${current_ro}" ]] \
                 && [[ "${config_dir}" != "${current_ro}/"* ]]; then
-            sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${config_dir}|" "${unit_file}"
+            # Escape sed replacement metacharacters (& and the | delimiter)
+            # to prevent path contents from corrupting the unit file.
+            local escaped_dir="${config_dir//&/\\&}"
+            escaped_dir="${escaped_dir//|/\\|}"
+            sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${escaped_dir}|" "${unit_file}"
             info "Updated ReadOnlyPaths to ${config_dir}"
         fi
     fi
@@ -1317,9 +1321,16 @@ main() {
         case "${AWG_CONFIG_DIR}" in
             /*) ;;  # already absolute
             *)
-                if [ -d "$(dirname -- "${AWG_CONFIG_DIR}")" ]; then
+                local parent_dir abs_parent
+                parent_dir="$(dirname -- "${AWG_CONFIG_DIR}")"
+                if [ -d "${parent_dir}" ]; then
                     # Parent directory exists: we can safely normalize via cd + pwd.
-                    AWG_CONFIG_DIR="$(cd -- "$(dirname -- "${AWG_CONFIG_DIR}")" 2>/dev/null && pwd)/$(basename -- "${AWG_CONFIG_DIR}")" || true
+                    # Only update AWG_CONFIG_DIR if we obtained a non-empty absolute path.
+                    if abs_parent="$(cd -- "${parent_dir}" 2>/dev/null && pwd)"; then
+                        if [ -n "${abs_parent}" ]; then
+                            AWG_CONFIG_DIR="${abs_parent}/$(basename -- "${AWG_CONFIG_DIR}")"
+                        fi
+                    fi
                 else
                     # Parent directory does not exist: resolve relative to current working directory.
                     # This avoids constructing an incorrect root-relative path like "/basename".
