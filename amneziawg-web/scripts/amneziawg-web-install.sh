@@ -742,8 +742,12 @@ validate_awg_config_dir() {
     # block any path under sensitive prefixes unless it falls within an
     # explicitly allowed subtree (e.g. /etc/amnezia/amneziawg/*).
     case "${dir_path}" in
-        "/"|"/home"|"/tmp")
+        "/"|"/home"|"/home/"|"/root"|"/tmp")
             warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
+            return 1
+            ;;
+        /home/*|/root/*)
+            warn "AWG_CONFIG_DIR '${dir_path}' is under a user home directory; skipping automatic ownership/permission changes. Please adjust it manually if needed."
             return 1
             ;;
         /etc/amnezia/amneziawg/*)
@@ -983,10 +987,16 @@ setup_filesystem() {
                                     && info "Granted traverse ACL for ${SERVICE_USER} on ${parent_dir}." \
                                     || warn "setfacl failed on ${parent_dir}. The service may not be able to reach ${AWG_CONFIG_DIR}."
                             else
-                                chmod o+x "${parent_dir}" 2>/dev/null \
-                                    && info "Added traverse permission (o+x) on ${parent_dir} for service access." \
-                                    || warn "Could not set o+x on ${parent_dir}. The service may not be able to reach ${AWG_CONFIG_DIR}."
-                                warn "Consider installing ACL tools (apt install acl) for a more targeted permission grant."
+                                # Fallback without ACL support: only relax traversal on known-safe prefixes.
+                                if [[ "${AWG_CONFIG_DIR}" == /etc/amnezia/amneziawg* ]]; then
+                                    chmod o+x "${parent_dir}" 2>/dev/null \
+                                        && info "Added traverse permission (o+x) on ${parent_dir} for service access." \
+                                        || warn "Could not set o+x on ${parent_dir}. The service may not be able to reach ${AWG_CONFIG_DIR}."
+                                    warn "Consider installing ACL tools (apt install acl) for a more targeted permission grant."
+                                else
+                                    warn "ACL tools (setfacl) are not available; refusing to broaden directory permissions for custom AWG_CONFIG_DIR '${AWG_CONFIG_DIR}'."
+                                    warn "Install ACL tools (e.g. apt install acl) or adjust directory ownership/permissions so ${SERVICE_USER} can traverse ancestors of ${AWG_CONFIG_DIR}."
+                                fi
                             fi
                         fi
                     fi

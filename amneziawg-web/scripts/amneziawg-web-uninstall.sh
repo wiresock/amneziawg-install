@@ -121,8 +121,22 @@ normalize_path() {
         realpath -m -- "$1"
     else
         # readlink -f may fail for non-existent paths on some systems.
-        # Fall back to echoing the input as-is (paths are expected to be absolute).
-        readlink -f -- "$1" 2>/dev/null || printf '%s\n' "$1"
+        # If it fails, avoid blindly returning a path with dot-segments,
+        # which could bypass prefix-based safety checks.
+        if norm_path="$(readlink -f -- "$1" 2>/dev/null)"; then
+            printf '%s\n' "${norm_path}"
+        else
+            case "$1" in
+                *"/../"*|*"/./"*|"../"*|"./"*)
+                    die "Cannot safely normalize path with dot segments: $1"
+                    ;;
+                *)
+                    # Fall back to echoing the input as-is (paths are expected to be absolute)
+                    # but only when there are no dot-segments.
+                    printf '%s\n' "$1"
+                    ;;
+            esac
+        fi
     fi
 }
 

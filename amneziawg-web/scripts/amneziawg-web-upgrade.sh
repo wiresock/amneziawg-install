@@ -138,8 +138,12 @@ validate_awg_config_dir() {
     # block any path under sensitive prefixes unless it falls within an
     # explicitly allowed subtree (e.g. /etc/amnezia/amneziawg/*).
     case "${dir_path}" in
-        "/"|"/home"|"/tmp")
+        "/"|"/home"|"/home/"|"/root"|"/tmp")
             warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
+            return 1
+            ;;
+        /home/*|/root/*)
+            warn "AWG_CONFIG_DIR '${dir_path}' is under a user home directory; skipping automatic ownership/permission changes. Please adjust it manually if needed."
             return 1
             ;;
         /etc/amnezia/amneziawg/*)
