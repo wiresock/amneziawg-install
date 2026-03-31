@@ -257,20 +257,17 @@ pub async fn execute_create_user(
     }
 }
 
-/// Remove an existing AmneziaWG user/client via the install script.
+/// Remove an existing AmneziaWG user/client via the native Rust client manager.
 ///
-/// The `client_name` should be the script-side client identifier (the same
-/// value used in `### Client <name>` markers in the server config).
+/// The `client_name` should be the client identifier used in
+/// `### Client <name>` markers in the server config.
 ///
-/// After the script removes the peer block from the server config and deletes
-/// the client config from its default location (`/etc/amnezia/amneziawg/clients`),
-/// this function also attempts to remove any matching config file from
-/// `config_dir` (the web panel's monitored directory) if it differs from
-/// the default, so stale configs don't linger after a rescan.
+/// This function delegates to `client_manager::remove_client`, which rewrites
+/// the server config to remove the peer block, removes matching client config
+/// files from `config_dir`, and syncs the running interface.
 ///
-/// Historical peer data (snapshots, events) is preserved in the database;
-/// the peer row itself will become "unlinked" after the next config rescan
-/// and will eventually stop appearing in `awg show` output.
+/// Historical snapshots/events are preserved; the peer row itself is deleted
+/// from the `peers` table on successful removal.
 pub async fn execute_remove_user(
     db: &Database,
     config_dir: &std::path::Path,
@@ -296,8 +293,8 @@ pub async fn execute_remove_user(
     .await;
 
     // Acquire the same exclusive lock used by create_client() to prevent
-    // concurrent add/remove operations from corrupting the server config
-    // (the remove path uses `sed -i` + rename which can race with `tee -a`).
+    // concurrent add/remove operations from racing while rewriting the server
+    // config and syncing the interface.
     // Non-blocking (LOCK_NB) to avoid hanging web requests; returns an error
     // if another operation is in progress, matching create_client() behavior.
     let lock_path = config_dir.join(".create-client.lock");

@@ -904,6 +904,26 @@ pub fn remove_client(
     awg::write_file_via_sudo(&server_conf_path, &updated)
         .map_err(|e| RemoveClientError::FileWrite(format!("rewrite server config: {e}")))?;
 
+    match std::fs::symlink_metadata(config_dir) {
+        Ok(sym_meta) => {
+            if sym_meta.file_type().is_symlink() {
+                return Err(RemoveClientError::FileWrite(format!(
+                    "AWG_CONFIG_DIR {} is a symbolic link; refusing to remove client configs from it",
+                    config_dir.display()
+                )));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // If the directory does not exist, there are no config files to remove.
+        }
+        Err(e) => {
+            return Err(RemoveClientError::FileWrite(format!(
+                "cannot lstat {}: {e}",
+                config_dir.display()
+            )));
+        }
+    }
+
     if let Ok(entries) = std::fs::read_dir(config_dir) {
         let suffix = format!("-client-{name}.conf");
         for entry in entries.flatten() {

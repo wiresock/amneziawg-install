@@ -173,7 +173,7 @@ active.
 
 | File | Purpose | Permissions |
 |---|---|---|
-| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`, and manage clients via install script | `0440 root:root` |
+| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`, and scoped `cat`/`tee` access under `/etc/amnezia/amneziawg` for lifecycle operations | `0440 root:root` |
 
 The uninstaller removes this file.  The upgrader always rewrites it to keep rules current.
 
