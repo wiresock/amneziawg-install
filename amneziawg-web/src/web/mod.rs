@@ -1139,8 +1139,24 @@ async fn post_peer_edit(
 /// `POST /api/admin/users` – JSON API to create a new user/client.
 async fn api_create_user(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateUserRequest>,
 ) -> Result<Response, ApiError> {
+    #[cfg(test)]
+    if headers.contains_key("x-test-force-create-user-failure") {
+        let e = crate::admin::client_manager::CreateClientError::Internal(
+            "forced test create-user failure".to_string(),
+        );
+        return Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": create_user_diagnostic_message(&e) })),
+        )
+            .into_response());
+    }
+
+    #[cfg(not(test))]
+    let _ = headers;
+
     let name = body.name.trim().to_string();
     match crate::admin::execute_create_user(
         &state.db,
@@ -1298,6 +1314,18 @@ async fn post_add_user_form(
     headers: axum::http::HeaderMap,
     Form(form): Form<AddUserForm>,
 ) -> Result<Response, ApiError> {
+    #[cfg(test)]
+    if headers.contains_key("x-test-force-create-user-failure") {
+        let rows = crate::db::peers::list_all(&state.db.pool).await?;
+        let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+        let csrf = session_csrf_from_headers(&state, &headers);
+        let e = crate::admin::client_manager::CreateClientError::Internal(
+            "forced test create-user failure".to_string(),
+        );
+        let message = create_user_diagnostic_message(&e);
+        return Ok(Html(render_peer_list_with_error(&peers, &csrf, &message)).into_response());
+    }
+
     if state.auth.enabled {
         let cookie_header = headers
             .get("cookie")
@@ -4099,6 +4127,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/admin/users")
                     .header("content-type", "application/json")
+                    .header("x-test-force-create-user-failure", "1")
                     .body(Body::from(r#"{"name":"alice"}"#))
                     .unwrap(),
             )
@@ -4129,6 +4158,7 @@ mod tests {
                     .method("POST")
                     .uri("/admin/users/add")
                     .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-test-force-create-user-failure", "1")
                     .body(Body::from("name=alice"))
                     .unwrap(),
             )
