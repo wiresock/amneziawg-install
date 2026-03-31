@@ -325,9 +325,28 @@ pub async fn execute_remove_user(
         }
     };
 
-    let disabled_keys = crate::db::peers::list_disabled_public_keys(&db.pool)
-        .await
-        .map_err(|e| RemoveClientError::DbRead(e.to_string()))?;
+    let disabled_keys = match crate::db::peers::list_disabled_public_keys(&db.pool).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            let err = RemoveClientError::DbRead(e.to_string());
+            let detail = serde_json::json!({
+                "peer_id": peer_id,
+                "name": client_name,
+                "error": "db_read_failed",
+            })
+            .to_string();
+            log_event(
+                &db.pool,
+                EVT_USER_REMOVE_FAILED,
+                Some(peer_id),
+                None,
+                Some(&detail),
+                actor,
+            )
+            .await;
+            return Err(err);
+        }
+    };
     let dir = config_dir.to_path_buf();
     let name = client_name.to_string();
     let remove_result = tokio::task::spawn_blocking(move || {

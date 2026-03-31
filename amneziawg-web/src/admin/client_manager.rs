@@ -644,13 +644,25 @@ pub fn create_client(
     }
 
     // Ensure the clients directory exists with restrictive permissions (0700).
-    if !config_dir.exists() {
-        std::fs::create_dir_all(config_dir)
-            .map_err(|e| CreateClientError::FileWrite(format!("mkdir {}: {e}", config_dir.display())))?;
+    // Tolerate pre-existing paths (including those created by another process),
+    // then re-validate using symlink_metadata to avoid TOCTOU symlink swaps.
+    std::fs::create_dir_all(config_dir)
+        .map_err(|e| CreateClientError::FileWrite(format!("mkdir {}: {e}", config_dir.display())))?;
+
+    let cfg_meta = std::fs::symlink_metadata(config_dir).map_err(|e| {
+        CreateClientError::FileWrite(format!("cannot lstat {}: {e}", config_dir.display()))
+    })?;
+    let cfg_ftype = cfg_meta.file_type();
+    if cfg_ftype.is_symlink() {
+        return Err(CreateClientError::FileWrite(format!(
+            "AWG_CONFIG_DIR {} is a symbolic link; refusing to use it for client configs",
+            config_dir.display()
+        )));
     }
-    // Reject non-directory paths (e.g. regular file, symlink to file) before
-    // we attempt to set permissions or create the lock file inside it.
-    if !config_dir.is_dir() {
+
+    // Reject non-directory paths (e.g. regular file) before we attempt to set
+    // permissions or create the lock file inside it.
+    if !cfg_ftype.is_dir() {
         return Err(CreateClientError::FileWrite(format!(
             "config path exists but is not a directory: {}",
             config_dir.display()
