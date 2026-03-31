@@ -675,13 +675,46 @@ Please report this issue."
                 || warn "Could not create ${awg_config_dir_upgrade}. Direct client creation may fail until the directory is created with correct ownership."
         fi
 
-        # Verify the service user can traverse all parent directories up to
-        # AWG_CONFIG_DIR. Fixing only the leaf directory is not sufficient if
-        # an ancestor lacks execute permission for ${SERVICE_USER}.
+        # Verify and (best-effort) remediate traversal permissions for parent
+        # directories. Fixing only AWG_CONFIG_DIR itself is insufficient when
+        # ancestors (e.g. /etc/amnezia/amneziawg) block execute/traverse.
         if command -v sudo >/dev/null 2>&1; then
             if ! sudo -u "${SERVICE_USER}" test -x "${awg_config_dir_upgrade}" 2>/dev/null; then
-                warn "Service user '${SERVICE_USER}' may not be able to traverse all parent directories of '${awg_config_dir_upgrade}'."
-                warn "Ensure each parent directory grants execute ('x') permission to '${SERVICE_USER}' or rerun installer filesystem setup."
+                warn "Service user '${SERVICE_USER}' cannot traverse '${awg_config_dir_upgrade}' – attempting parent-directory traversal fix."
+
+                local current_dir="${awg_config_dir_upgrade}"
+                while [[ -n "${current_dir}" && "${current_dir}" != "/" ]]; do
+                    local parent_dir
+                    parent_dir="$(dirname "${current_dir}")"
+                    if [[ "${parent_dir}" == "${current_dir}" || "${parent_dir}" == "/" ]]; then
+                        break
+                    fi
+
+                    if [[ -d "${parent_dir}" && ! -L "${parent_dir}" ]] \
+                            && ! sudo -u "${SERVICE_USER}" test -x "${parent_dir}" 2>/dev/null; then
+                        if command -v setfacl >/dev/null 2>&1; then
+                            if setfacl -m "u:${SERVICE_USER}:x" "${parent_dir}" 2>/dev/null; then
+                                info "Granted traverse ACL for ${SERVICE_USER} on ${parent_dir}."
+                            else
+                                warn "Failed to adjust ACL on ${parent_dir}."
+                            fi
+                        else
+                            chmod o+x "${parent_dir}" 2>/dev/null \
+                                && info "Added traverse permission (o+x) on ${parent_dir} for service access." \
+                                || warn "Could not set o+x on ${parent_dir}."
+                            warn "Consider installing ACL tools for a more targeted permission grant."
+                        fi
+                    fi
+
+                    current_dir="${parent_dir}"
+                done
+
+                if ! sudo -u "${SERVICE_USER}" test -x "${awg_config_dir_upgrade}" 2>/dev/null; then
+                    warn "Service user '${SERVICE_USER}' may still be unable to traverse all parent directories of '${awg_config_dir_upgrade}'."
+                    warn "Ensure each parent directory grants execute ('x') permission to '${SERVICE_USER}' or rerun installer filesystem setup."
+                else
+                    info "Traversal permissions for '${SERVICE_USER}' on '${awg_config_dir_upgrade}' and its parents look correct."
+                fi
             fi
         else
             warn "Could not verify traversal permissions for '${SERVICE_USER}' (sudo not available)."
