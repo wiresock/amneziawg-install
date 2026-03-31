@@ -21,6 +21,17 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use self::client_manager::{RemoveClientError, acquire_lifecycle_lock};
 
+fn map_lock_error(err: std::io::Error) -> RemoveClientError {
+    match err.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+            RemoveClientError::LockBusy
+        }
+        _ => RemoveClientError::Internal(format!(
+            "failed to acquire lock for client removal: {err}"
+        )),
+    }
+}
+
 /// Enable or disable a peer (admin action).
 pub struct SetPeerEnabledCommand {
     pub public_key: PublicKey,
