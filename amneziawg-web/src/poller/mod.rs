@@ -236,9 +236,19 @@ impl Poller {
     /// cleared (they retain whatever values they had from the previous cycle).
     async fn apply_config_mapping_step(&self) -> anyhow::Result<()> {
         let config_dir = self.config_dir.clone();
-        let configs = match tokio::task::spawn_blocking(move || config_store::scan(&config_dir))
-            .await?
-        {
+        let configs = match tokio::task::spawn_blocking(move || config_store::scan(&config_dir)).await {
+            Ok(scan_result) => scan_result,
+            Err(e) => {
+                warn!(
+                    config_dir = %self.config_dir.display(),
+                    error = %e,
+                    "config scan task failed – skipping config mapping"
+                );
+                return Ok(());
+            }
+        };
+
+        let configs = match configs {
             Ok(c) => c,
             Err(e) => {
                 warn!(
@@ -562,7 +572,19 @@ pub async fn rescan_configs(
     config_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     let dir = config_dir.to_path_buf();
-    let configs = match tokio::task::spawn_blocking(move || config_store::scan(&dir)).await? {
+    let configs = match tokio::task::spawn_blocking(move || config_store::scan(&dir)).await {
+        Ok(scan_result) => scan_result,
+        Err(e) => {
+            warn!(
+                config_dir = %config_dir.display(),
+                error = %e,
+                "config scan task failed during rescan"
+            );
+            return Ok(());
+        }
+    };
+
+    let configs = match configs {
         Ok(c) => c,
         Err(e) => {
             warn!(
