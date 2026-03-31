@@ -350,6 +350,14 @@ pub async fn execute_remove_user(
 
     match remove_result {
         Ok(()) => {
+            if let Err(e) = crate::db::events::clear_peer_id_references(&db.pool, peer_id).await {
+                tracing::warn!(
+                    peer_id = %peer_id,
+                    error = %e,
+                    "failed to clear event peer_id references before peer deletion"
+                );
+            }
+
             if let Err(e) = crate::db::peers::delete_by_id(&db.pool, peer_id).await {
                 tracing::warn!(
                     peer_id = %peer_id,

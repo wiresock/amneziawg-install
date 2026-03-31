@@ -1289,11 +1289,12 @@ validate_awg_install_script_target_path() {
 }
 
 install_awg_install_script() {
-    step "Installing AmneziaWG lifecycle script"
+    step "Installing optional AmneziaWG compatibility script"
 
     local source_path="${SCRIPT_DIR}/../../amneziawg-install.sh"
     if [[ ! -f "${source_path}" ]]; then
-        die "Required script not found: ${source_path}. The web panel requires amneziawg-install.sh for add/remove/list client operations."
+        warn "Optional compatibility script not found: ${source_path}; skipping amneziawg-install.sh installation."
+        return 0
     fi
 
     # Ensure destination directory exists so installation does not fail on

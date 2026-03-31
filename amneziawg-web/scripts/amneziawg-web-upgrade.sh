@@ -154,106 +154,6 @@ validate_awg_config_dir() {
     return 0
 }
 
-# Check whether a script file is safe to embed in a sudoers rule:
-# - must be a regular file (not a symlink)
-# - must be executable
-# - must be owned by root:root
-# - must not be group or world-writable
-# Returns 0 (safe) or 1 (unsafe).
-is_script_safe_for_sudoers() {
-    local script_path="$1"
-
-    if [[ ! -f "${script_path}" ]] || [[ -L "${script_path}" ]]; then
-        return 1
-    fi
-    if [[ ! -x "${script_path}" ]]; then
-        return 1
-    fi
-
-    local owner_uid owner_gid mode
-    owner_uid="$(stat -c '%u' "${script_path}" 2>/dev/null || echo "")"
-    owner_gid="$(stat -c '%g' "${script_path}" 2>/dev/null || echo "")"
-    mode="$(stat -c '%a' "${script_path}" 2>/dev/null || echo "")"
-    if [[ -z "${owner_uid}" ]] || [[ -z "${owner_gid}" ]] || [[ -z "${mode}" ]]; then
-        return 1
-    fi
-    if [[ ! "${mode}" =~ ^[0-7]{3,4}$ ]]; then
-        return 1
-    fi
-
-    # Require root ownership and no group/other write bits.
-    if [[ "${owner_uid}" != "0" ]] || [[ "${owner_gid}" != "0" ]]; then
-        return 1
-    fi
-    local mode_octal
-    mode_octal=$((8#${mode}))
-    if (( (mode_octal & 8#022) != 0 )); then
-        return 1
-    fi
-
-    return 0
-}
-
-# Validate that the install script path points to amneziawg-install.sh in a
-# trusted root-controlled directory.  Returns 0 on success, 1 on failure.
-validate_awg_install_script_path_policy() {
-    local script_path="$1"
-    local script_name script_dir
-    script_name="$(basename "${script_path}")"
-    script_dir="$(dirname "${script_path}")"
-
-    if [[ "${script_name}" != "amneziawg-install.sh" ]]; then
-        return 1
-    fi
-
-    case "${script_dir}" in
-        /usr/local/bin|/usr/bin|/opt/amneziawg-web/bin)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-# Full validation of install script path for sudoers embedding:
-# checks policy (trusted directory, correct filename) and, if the directory
-# exists, verifies root ownership and no group/other-writable permissions.
-# Returns 0 on success, 1 on failure.
-validate_awg_install_script_path() {
-    local script_path="$1"
-    local script_dir
-    script_dir="$(dirname "${script_path}")"
-
-    if ! validate_awg_install_script_path_policy "${script_path}"; then
-        return 1
-    fi
-
-    if [[ -d "${script_dir}" ]]; then
-        local dir_uid dir_gid dir_mode
-        dir_uid="$(stat -c '%u' "${script_dir}" 2>/dev/null || echo "")"
-        dir_gid="$(stat -c '%g' "${script_dir}" 2>/dev/null || echo "")"
-        dir_mode="$(stat -c '%a' "${script_dir}" 2>/dev/null || echo "")"
-        if [[ -z "${dir_uid}" ]] || [[ -z "${dir_gid}" ]] || [[ -z "${dir_mode}" ]]; then
-            return 1
-        fi
-        if [[ ! "${dir_mode}" =~ ^[0-7]{3,4}$ ]]; then
-            return 1
-        fi
-
-        if [[ "${dir_uid}" != "0" ]] || [[ "${dir_gid}" != "0" ]]; then
-            return 1
-        fi
-        local dir_mode_octal
-        dir_mode_octal=$((8#${dir_mode}))
-        if (( (dir_mode_octal & 8#022) != 0 )); then
-            return 1
-        fi
-    fi
-
-    return 0
-}
-
 # Adjust ReadWritePaths and ProtectHome in the installed service unit to match
 # the configured AWG_CONFIG_DIR (mirrors the same function in the installer).
 adjust_unit_hardening() {
@@ -688,14 +588,8 @@ main() {
 
     # 3. Ensure the sudoers drop-in is up-to-date.
     #    Always rewrite so that upgrades from older versions pick up the
-    #    additional `awg syncconf` / `awg-quick strip` and install-script rules.
-
-    # Determine the install script path for sudoers.
-    # We use grep instead of sourcing the env file to avoid triggering
-    # `set -u` errors from other variables (e.g. $argon2id in password hashes).
-    # Precedence:
-    #   1. AWG_INSTALL_SCRIPT environment variable (if set)
-    #   2. AWG_INSTALL_SCRIPT from the env file (if present)
+    #    current native-lifecycle rules (`awg syncconf`/`awg-quick strip`
+    #    and scoped `cat`/`tee` access under /etc/amnezia/amneziawg).
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
     # Direct client lifecycle in native Rust: read params/server config and
     # rewrite or append peer blocks.

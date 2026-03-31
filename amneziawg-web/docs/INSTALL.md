@@ -118,8 +118,8 @@ sudo chmod 0700 /etc/amneziawg-web
 `amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state,
 `sudo /usr/bin/awg set … peer … remove` to disable peers,
 `sudo /usr/bin/awg syncconf` + `sudo /usr/bin/awg-quick strip` to re-enable
-peers, and `sudo /usr/local/bin/amneziawg-install.sh` for user lifecycle actions
-(add/remove clients).
+peers, and scoped `cat`/`tee` access to `/etc/amnezia/amneziawg/{params,*.conf}`
+for native Rust user lifecycle actions (add/remove clients).
 The service runs as a dedicated non-root user (`awg-web`) and uses
 tightly-scoped sudoers rules for only these commands.
 
@@ -138,7 +138,7 @@ If installing manually, create the sudoers rules:
 ```bash
 cat <<'EOF' | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
 awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *
-awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --remove-client *, /usr/local/bin/amneziawg-install.sh --list-clients
+awg-web ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf
 EOF
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
 ```
@@ -159,7 +159,8 @@ commands:
 - `awg show all dump` – read tunnel state (read-only)
 - `awg set … peer … remove` – disable a peer by removing it from the running interface
 - `awg syncconf` + `awg-quick strip` – re-enable a peer by syncing a sanitized on-disk config
-- `amneziawg-install.sh --remove-client` / `--list-clients` – manage client lifecycle
+- `cat /etc/amnezia/amneziawg/{params,*.conf}` – read params and server config for lifecycle operations
+- `tee /etc/amnezia/amneziawg/*.conf` + `tee -a /etc/amnezia/amneziawg/*.conf` – rewrite/append peer blocks during remove/create
 
 This follows the principle of least privilege.
 

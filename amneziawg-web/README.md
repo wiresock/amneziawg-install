@@ -86,7 +86,7 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 │  │  └──────────┘  └──────────┘  └────────────┘ │  │
 │  └──────────────────────────────────────────────┘  │
 │                                                    │
-│  /etc/sudoers.d/amneziawg-web  (AWG read + peer remove + install script) │
+│  /etc/sudoers.d/amneziawg-web  (AWG read/remove + cat/tee /etc/amnezia/amneziawg/*) │
 │  /etc/amnezia/amneziawg/clients/*.conf                     │
 └────────────────────────────────────────────────────┘
          ▲

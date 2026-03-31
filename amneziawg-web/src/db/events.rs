@@ -154,6 +154,21 @@ pub async fn list_events(
     .await
 }
 
+/// Remove `peer_id` references from historical events for a deleted peer.
+///
+/// This preserves audit rows while allowing the peer row itself to be deleted.
+/// Returns the number of events that were updated.
+pub async fn clear_peer_id_references(
+    pool: &SqlitePool,
+    peer_id: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("UPDATE events SET peer_id = NULL WHERE peer_id = ?")
+        .bind(peer_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -496,5 +511,25 @@ mod tests {
             .expect("list_events");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].detail.as_deref().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn clear_peer_id_references_nulls_matching_rows() {
+        let db = test_db().await;
+        let pid = insert_peer(&db.pool, "CLR_PID==").await;
+
+        log_event(&db.pool, EVT_PEER_UPDATED, Some(pid), Some("CLR_PID=="), None, "admin").await;
+        log_event(&db.pool, EVT_LOGIN_SUCCESS, None, None, None, "admin").await;
+
+        let changed = clear_peer_id_references(&db.pool, pid)
+            .await
+            .expect("clear peer refs");
+        assert_eq!(changed, 1);
+
+        let rows = list_events(&db.pool, None, Some(EVT_PEER_UPDATED), 10)
+            .await
+            .expect("list events");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].peer_id.is_none());
     }
 }
