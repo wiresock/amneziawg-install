@@ -337,19 +337,55 @@ pub async fn execute_remove_user(
     match remove_result {
         Ok(()) => {
             if let Err(e) = crate::db::events::clear_peer_id_references(&db.pool, peer_id).await {
-                tracing::warn!(
+                tracing::error!(
                     peer_id = %peer_id,
                     error = %e,
-                    "failed to clear event peer_id references before peer deletion"
+                    "failed to clear event peer_id references after client removal"
                 );
+                let detail = serde_json::json!({
+                    "peer_id": peer_id,
+                    "name": client_name,
+                    "error": "db_cleanup_failed",
+                })
+                .to_string();
+                log_event(
+                    &db.pool,
+                    EVT_USER_REMOVE_FAILED,
+                    Some(peer_id),
+                    None,
+                    Some(&detail),
+                    actor,
+                )
+                .await;
+                return Err(RemoveClientError::Internal(format!(
+                    "client removed from WireGuard but database cleanup failed: {e}"
+                )));
             }
 
             if let Err(e) = crate::db::peers::delete_by_id(&db.pool, peer_id).await {
-                tracing::warn!(
+                tracing::error!(
                     peer_id = %peer_id,
                     error = %e,
                     "failed to delete removed peer row from database"
                 );
+                let detail = serde_json::json!({
+                    "peer_id": peer_id,
+                    "name": client_name,
+                    "error": "db_cleanup_failed",
+                })
+                .to_string();
+                log_event(
+                    &db.pool,
+                    EVT_USER_REMOVE_FAILED,
+                    Some(peer_id),
+                    None,
+                    Some(&detail),
+                    actor,
+                )
+                .await;
+                return Err(RemoveClientError::Internal(format!(
+                    "client removed from WireGuard but failed to delete peer row: {e}"
+                )));
             }
 
             let detail = serde_json::json!({

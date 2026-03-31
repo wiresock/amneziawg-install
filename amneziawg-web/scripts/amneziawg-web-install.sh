@@ -1339,6 +1339,12 @@ install_awg_install_script() {
         marker_target="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
     fi
 
+    # Refuse to overwrite a symlink at the destination to prevent a root-level
+    # symlink clobber attack.  The operator must remove the symlink first.
+    if [[ -L "${install_script_path}" ]]; then
+        die "Refusing to install AWG lifecycle script: '${install_script_path}' is a symlink. Remove the symlink first and re-run the installer."
+    fi
+
     if [[ -e "${install_script_path}" ]] && \
        [[ "${marker_target}" != "${install_script_path}" ]] && \
        [[ "${FORCE}" != "true" ]]; then
