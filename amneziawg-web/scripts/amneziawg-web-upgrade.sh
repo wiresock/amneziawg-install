@@ -39,7 +39,6 @@ readonly SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
 readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_ENV_FILE="/etc/amneziawg-web/env.conf"
 readonly DEFAULT_DATA_DIR="/var/lib/amneziawg-web"
-readonly DEFAULT_AWG_INSTALL_SCRIPT="/usr/local/bin/amneziawg-install.sh"
 readonly BINARY_NAME="amneziawg-web"
 
 # Script location (for finding the service unit file relative to the repo)
