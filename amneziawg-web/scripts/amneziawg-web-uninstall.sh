@@ -127,7 +127,7 @@ normalize_path() {
             printf '%s\n' "${norm_path}"
         else
             case "$1" in
-                *"/../"*|*"/./"*|"../"*|"./"*)
+                *"/../"*|*"/./"*|"../"*|"./"*|*"/."|*"/..")
                     die "Cannot safely normalize path with dot segments: $1"
                     ;;
                 *)
