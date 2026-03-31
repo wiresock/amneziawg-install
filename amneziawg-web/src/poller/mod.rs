@@ -325,13 +325,31 @@ impl Poller {
 /// and does not touch config mapping; it only upserts the latest peer rows so
 /// UI pages can reflect lifecycle changes immediately.
 pub async fn sync_peers_from_awg(db: &crate::db::Database) -> anyhow::Result<()> {
-    let interfaces = match awg::show_all_dump() {
-        Ok(ifaces) => ifaces,
-        Err(awg::AwgError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+    let interfaces = match tokio::task::spawn_blocking(awg::show_all_dump).await {
+        Ok(Ok(ifaces)) => ifaces,
+        Ok(Err(awg::AwgError::Io(e))) if e.kind() == std::io::ErrorKind::NotFound => {
             warn!("awg binary not found at /usr/bin/awg – skipping one-shot peer sync");
             return Ok(());
         }
-        Err(e) => return Err(e.into()),
+        Ok(Err(e)) => return Err(e.into()),
+        Err(e) if e.is_panic() => {
+            error!(error = %e, "spawn_blocking for one-shot peer sync panicked");
+            return Err(anyhow::anyhow!(
+                "one-shot peer sync task panicked while reading AWG state"
+            ));
+        }
+        Err(e) if e.is_cancelled() => {
+            error!(error = %e, "spawn_blocking for one-shot peer sync was cancelled");
+            return Err(anyhow::anyhow!(
+                "one-shot peer sync task was cancelled while reading AWG state"
+            ));
+        }
+        Err(e) => {
+            error!(error = %e, "spawn_blocking for one-shot peer sync failed");
+            return Err(anyhow::anyhow!(
+                "one-shot peer sync task failed while reading AWG state"
+            ));
+        }
     };
 
     for iface in &interfaces {

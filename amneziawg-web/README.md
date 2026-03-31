@@ -57,9 +57,8 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
   `user_create_requested`, `user_created`, `user_create_failed`,
   `user_remove_requested`, `user_removed`, `user_remove_failed`
   written to the `events` table; queryable via `GET /api/events`.
-- **User lifecycle** – add and remove AmneziaWG clients directly from the panel.
-  Reuses the `amneziawg-install.sh` script via a subprocess bridge layer
-  (`admin/script_bridge.rs`), with no shell interpolation and strict name validation.
+- **User lifecycle** – add and remove AmneziaWG clients directly from the panel,
+  implemented natively in Rust (no install-script bridge for lifecycle operations).
 - **Server-rendered HTML** – peer list, peer detail, edit form, add/remove user,
   recent activity — no JavaScript framework.
 - **Zero external dependencies** – single binary + one SQLite file.
@@ -249,7 +248,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | Rate limiting | 5 login attempts per 5-minute window per IP; `429` on excess |
 | Audit log | Every peer write, login, and logout recorded |
 | No shell injection | AWG binary called via `Command::new()` with explicit args |
-| AWG access | Narrowly-scoped sudoers rules (`awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`, install script lifecycle) |
+| AWG access | Narrowly-scoped sudoers rules (`awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`, scoped `cat`/`tee` under `/etc/amnezia/amneziawg`) |
 
 ### AWG privilege model
 
@@ -263,15 +262,17 @@ awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, \
     /usr/bin/awg set * peer * remove, \
     /usr/bin/awg syncconf * /dev/stdin, \
     /usr/bin/awg-quick strip *
-awg-web ALL=(root) NOPASSWD: /usr/local/bin/amneziawg-install.sh --remove-client *, \
-    /usr/local/bin/amneziawg-install.sh --list-clients
+awg-web ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, \
+    /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, \
+    /usr/bin/tee -- /etc/amnezia/amneziawg/*.conf, \
+    /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf
 ```
 
 The first rule grants the minimum privilege needed for AWG inspection,
 disabling peers (removal), and re-enabling peers (config sync).
-The second rule allows the web panel to manage clients via the install script's
-non-interactive `--remove-client` / `--list-clients` flags (user creation is
-performed directly in Rust without the install script).
+The second rule grants tightly scoped read/write access required by native
+Rust lifecycle operations that read params/server config and rewrite/append
+peer blocks.
 All invocations use `Command::new()` with explicit argument arrays — no shell
 interpolation.
 

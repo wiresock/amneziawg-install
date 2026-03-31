@@ -450,7 +450,7 @@ sudo ./amneziawg-web.sh install \
 2. **Build** – *(source mode only)* verifies Rust toolchain and runs `cargo build --release`
 3. **User + directories** – creates `awg-web` system user, data dir (`0750`), env dir (`0700`)
 4. **Binary install** – copies binary to `--install-dir`
-5. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440`) granting `awg-web` passwordless sudo for AWG inspection, peer removal, config sync, and install-script lifecycle actions
+5. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440`) granting `awg-web` passwordless sudo for AWG inspection, peer removal, config sync, and scoped `cat`/`tee` access under `/etc/amnezia/amneziawg` used by native lifecycle operations
 6. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
 7. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
 
