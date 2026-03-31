@@ -33,7 +33,7 @@ pub struct Config {
     pub database_url: String,
 
     /// Directory where AWG client configs are stored.
-    #[arg(long, env = "AWG_CONFIG_DIR", default_value = "/etc/amneziawg/clients")]
+    #[arg(long, env = "AWG_CONFIG_DIR", default_value = "/etc/amnezia/amneziawg/clients")]
     pub config_dir: std::path::PathBuf,
 
     /// Polling interval in seconds.
@@ -85,6 +85,62 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::parse();
     info!(listen = %config.listen, db = %config.database_url, "starting amneziawg-web");
 
+    // --- Validate config-dir path early --------------------------------------
+    // AWG_CONFIG_DIR ends up in systemd ReadWritePaths= directives and is used
+    // by the service to write client configs.  Reject whitespace/control chars
+    // (they break unit-file parsing) and top-level symlinks (redirect attacks).
+    {
+        let p = &config.config_dir;
+        if !p.is_absolute() {
+            anyhow::bail!(
+                "AWG_CONFIG_DIR must be an absolute path, got: {}",
+                p.display()
+            );
+        }
+        let s = p.to_string_lossy();
+        if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            anyhow::bail!(
+                "AWG_CONFIG_DIR must not contain whitespace or control characters, got: {}",
+                p.display()
+            );
+        }
+        if p.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        }) {
+            anyhow::bail!(
+                "AWG_CONFIG_DIR must not contain '.' or '..' path components, got: {}",
+                p.display()
+            );
+        }
+        // Use symlink_metadata directly (no exists() pre-check) to avoid TOCTOU.
+        match std::fs::symlink_metadata(p) {
+            Ok(sym_meta) => {
+                if sym_meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "AWG_CONFIG_DIR is a symbolic link, which is not allowed: {}",
+                        p.display()
+                    );
+                }
+                if !sym_meta.is_dir() {
+                    anyhow::bail!(
+                        "AWG_CONFIG_DIR exists but is not a directory: {}",
+                        p.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Path does not exist yet — will be created on first client creation.
+            }
+            Err(e) => {
+                anyhow::bail!("cannot lstat AWG_CONFIG_DIR {}: {e}", p.display());
+            }
+        }
+        info!(path = %p.display(), "config dir validated");
+    }
+
     if config.auth_enabled {
         if config.auth_password_hash.is_empty() {
             anyhow::bail!(
@@ -114,13 +170,14 @@ async fn main() -> anyhow::Result<()> {
     info!("database ready");
 
     // --- Background poller --------------------------------------------------
+    let config_dir = config.config_dir.clone();
     let poller = Poller::new(db.clone(), config.poll_interval, config.config_dir);
     tokio::spawn(async move {
         poller.run().await;
     });
 
     // --- HTTP server --------------------------------------------------------
-    let app = router(db, auth);
+    let app = router(db, auth, config_dir);
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .context("failed to bind TCP listener")?;

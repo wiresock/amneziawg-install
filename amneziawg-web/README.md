@@ -53,9 +53,14 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 - **CSRF protection** – per-session tokens on all write forms;
   short-lived single-use pre-login token on the login form.
 - **Login rate limiting** – 5 attempts per 5-minute window per client IP.
-- **Audit logging** – `peer_updated`, `login_success`, `login_failed`, `logout`
+- **Audit logging** – `peer_updated`, `login_success`, `login_failed`, `logout`,
+  `user_create_requested`, `user_created`, `user_create_failed`,
+  `user_remove_requested`, `user_removed`, `user_remove_failed`
   written to the `events` table; queryable via `GET /api/events`.
-- **Server-rendered HTML** – peer list, peer detail, edit form, recent activity — no JavaScript framework.
+- **User lifecycle** – add and remove AmneziaWG clients directly from the panel,
+  implemented natively in Rust (no install-script bridge for lifecycle operations).
+- **Server-rendered HTML** – peer list, peer detail, edit form, add/remove user,
+  recent activity — no JavaScript framework.
 - **Zero external dependencies** – single binary + one SQLite file.
 
 ---
@@ -80,8 +85,8 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 │  │  └──────────┘  └──────────┘  └────────────┘ │  │
 │  └──────────────────────────────────────────────┘  │
 │                                                    │
-│  /etc/sudoers.d/amneziawg-web  (read-only AWG)     │
-│  /etc/amneziawg/clients/*.conf                     │
+│  /etc/sudoers.d/amneziawg-web  (AWG read/remove + cat/tee /etc/amnezia/amneziawg/*) │
+│  /etc/amnezia/amneziawg/clients/*.conf                     │
 └────────────────────────────────────────────────────┘
          ▲
   reverse proxy (nginx / Caddy)
@@ -194,7 +199,7 @@ All settings are read from environment variables (or a `.env`-style file via sys
 |---|---|---|
 | `AWG_WEB_LISTEN` | `0.0.0.0:8080` | TCP bind address |
 | `AWG_WEB_DB` | `awg-web.db` | Path to SQLite database file (created automatically) |
-| `AWG_CONFIG_DIR` | `/etc/amneziawg/clients` | Directory of client `.conf` files |
+| `AWG_CONFIG_DIR` | `/etc/amnezia/amneziawg/clients` | Directory of client `.conf` files |
 | `AWG_POLL_INTERVAL` | `30` | Polling interval in seconds |
 | `RUST_LOG` | `amneziawg_web=info` | Log level (`error`/`warn`/`info`/`debug`) |
 | `AUTH_ENABLED` | `false` | Enable authentication (set `true` in production) |
@@ -212,9 +217,11 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/` | Yes | HTML peer list |
-| `GET` | `/peers/:id` | Yes | HTML peer detail + edit form + activity |
+| `GET` | `/` | Yes | HTML peer list + add user form |
+| `GET` | `/peers/:id` | Yes | HTML peer detail + edit form + remove user + activity |
 | `POST` | `/peers/:id` | Yes | HTML form update (PRG redirect) |
+| `POST` | `/admin/users/add` | Yes | HTML form: add new user (PRG redirect) |
+| `POST` | `/admin/users/:id/remove` | Yes | HTML form: remove user (PRG redirect) |
 | `GET` | `/login` | No | Login form |
 | `POST` | `/login` | No | Validate credentials, set cookie |
 | `POST` | `/logout` | No | Clear session cookie |
@@ -224,6 +231,8 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `PATCH` | `/api/peers/:id` | Yes | Update `display_name` and/or `comment` |
 | `GET` | `/api/peers/:id/history` | Yes | Traffic history (`?range=24h\|7d\|30d`) |
 | `GET` | `/api/events` | Yes | Audit log (`?peer_id=`, `?event_type=`, `?limit=`) |
+| `POST` | `/api/admin/users` | Yes | JSON API: create user `{"name":"..."}` |
+| `POST` | `/api/admin/users/:id/remove` | Yes | JSON API: remove user |
 
 ---
 
@@ -239,7 +248,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | Rate limiting | 5 login attempts per 5-minute window per IP; `429` on excess |
 | Audit log | Every peer write, login, and logout recorded |
 | No shell injection | AWG binary called via `Command::new()` with explicit args |
-| AWG access | Narrowly-scoped sudoers rule (`awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`) |
+| AWG access | Narrowly-scoped sudoers rules (`awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`, scoped `cat`/`tee` under `/etc/amnezia/amneziawg`) |
 
 ### AWG privilege model
 
@@ -253,12 +262,19 @@ awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, \
     /usr/bin/awg set * peer * remove, \
     /usr/bin/awg syncconf * /dev/stdin, \
     /usr/bin/awg-quick strip *
+awg-web ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, \
+    /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, \
+    /usr/bin/tee -- /etc/amnezia/amneziawg/*.conf, \
+    /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf
 ```
 
-This grants the minimum privilege needed for AWG inspection, disabling
-peers (removal), and re-enabling peers (config sync).  The Rust
-application invokes these commands via `Command::new()` with explicit
-argument arrays — no shell interpolation.
+The first rule grants the minimum privilege needed for AWG inspection,
+disabling peers (removal), and re-enabling peers (config sync).
+The second rule grants tightly scoped read/write access required by native
+Rust lifecycle operations that read params/server config and rewrite/append
+peer blocks.
+All invocations use `Command::new()` with explicit argument arrays — no shell
+interpolation.
 
 **Troubleshooting:** If peer polling fails with "Operation not permitted",
 verify the sudoers file exists and is correct:

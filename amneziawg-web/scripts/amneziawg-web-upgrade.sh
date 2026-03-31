@@ -67,7 +67,109 @@ info()  { printf '[INFO]  %s\n' "$*"; }
 warn()  { yellow "[WARN]  $*" >&2; }
 die()   { red    "[ERROR] $*" >&2; exit 1; }
 
-# Adjust ReadOnlyPaths and ProtectHome in the installed service unit to match
+validate_awg_config_dir() {
+    local dir_path_raw="$1"
+    local dir_path
+    local resolved_path
+
+    # Reject empty or non-absolute paths.
+    if [[ -z "${dir_path_raw}" ]]; then
+        warn "AWG_CONFIG_DIR is empty; skipping automatic ownership/permission changes."
+        return 1
+    fi
+    if [[ "${dir_path_raw}" != /* ]]; then
+        warn "AWG_CONFIG_DIR '${dir_path_raw}' is not an absolute path; skipping automatic ownership/permission changes."
+        return 1
+    fi
+
+    # Reject paths containing whitespace or control characters — they break
+    # systemd unit ReadWritePaths= directives and sudoers entries.
+    if [[ "${dir_path_raw}" =~ [[:space:][:cntrl:]] ]]; then
+        warn "AWG_CONFIG_DIR '${dir_path_raw}' contains whitespace or control characters; rejecting."
+        return 1
+    fi
+
+    # Normalize: strip trailing slashes (but keep "/" as-is).
+    dir_path="${dir_path_raw%/}"
+    if [[ -z "${dir_path}" ]]; then
+        dir_path="/"
+    fi
+
+    # Reject paths that contain symlink components (TOCTOU defense: a symlink
+    # target could change between validation and the subsequent chown/chmod).
+    local check_path="${dir_path}"
+    while [[ "${check_path}" != "/" && "${check_path}" != "." ]]; do
+        if [[ -L "${check_path}" ]]; then
+            warn "AWG_CONFIG_DIR '${dir_path_raw}' contains a symbolic link at '${check_path}'; skipping automatic ownership/permission changes."
+            return 1
+        fi
+        check_path="$(dirname "${check_path}")"
+    done
+
+    # Try to resolve the real path to canonicalize and catch any remaining
+    # indirection (e.g. /foo/../etc).
+    local resolved_ok=0
+    resolved_path="${dir_path}"
+    if command -v realpath >/dev/null 2>&1; then
+        local resolved_tmp
+        if resolved_tmp="$(realpath -m -- "${dir_path}" 2>/dev/null)"; then
+            resolved_path="${resolved_tmp}"
+            resolved_ok=1
+        fi
+    elif command -v readlink >/dev/null 2>&1; then
+        local resolved_tmp
+        if resolved_tmp="$(readlink -f -- "${dir_path}" 2>/dev/null)"; then
+            resolved_path="${resolved_tmp}"
+            resolved_ok=1
+        fi
+    fi
+
+    if [[ "${resolved_ok}" -ne 1 ]]; then
+        if [[ "${dir_path}" == *"/../"* || "${dir_path}" == "../"* || "${dir_path}" == *"/.." || \
+              "${dir_path}" == *"/./"*  || "${dir_path}" == "./"*  || "${dir_path}" == *"/." ]]; then
+            warn "AWG_CONFIG_DIR '${dir_path_raw}' contains '.' or '..' segments; skipping automatic ownership/permission changes."
+            return 1
+        fi
+    fi
+    dir_path="${resolved_path}"
+
+    # Reject sensitive system directories that should never have their
+    # ownership changed to the service user.  In addition to exact matches,
+    # block any path under sensitive prefixes unless it falls within an
+    # explicitly allowed subtree (e.g. /etc/amnezia/amneziawg/*).
+    case "${dir_path}" in
+        "/"|"/home"|"/root"|"/tmp")
+            warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
+            return 1
+            ;;
+        /home/*|/root/*)
+            warn "AWG_CONFIG_DIR '${dir_path}' is under a user home directory; skipping automatic ownership/permission changes. Please adjust it manually if needed."
+            return 1
+            ;;
+        /etc/amnezia/amneziawg/*)
+            # Allowed subtree — fall through to return 0
+            ;;
+        /etc|/etc/*)
+            warn "AWG_CONFIG_DIR '${dir_path}' is under /etc (only /etc/amnezia/amneziawg/* is allowed); skipping automatic ownership/permission changes."
+            return 1
+            ;;
+        /var/lib/amneziawg-web/*)
+            # Allowed subtree — fall through to return 0
+            ;;
+        /var|/var/*)
+            warn "AWG_CONFIG_DIR '${dir_path}' is under /var (only /var/lib/amneziawg-web/* is allowed); skipping automatic ownership/permission changes."
+            return 1
+            ;;
+        /sys|/sys/*|/proc|/proc/*|/dev|/dev/*|/boot|/boot/*|/run|/run/*|/lib|/lib/*|/lib64|/lib64/*|/bin|/bin/*|/sbin|/sbin/*|/usr|/usr/*|/opt|/opt/*)
+            warn "AWG_CONFIG_DIR '${dir_path}' is a sensitive system path; skipping automatic ownership/permission changes. Please adjust it manually if needed."
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+# Adjust ReadWritePaths and ProtectHome in the installed service unit to match
 # the configured AWG_CONFIG_DIR (mirrors the same function in the installer).
 adjust_unit_hardening() {
     local unit_file="$1"
@@ -83,19 +185,70 @@ adjust_unit_hardening() {
     fi
     config_dir="${config_dir%/}"
 
-    # 1. Update ReadOnlyPaths to include the actual config directory
+    # 1. Update ReadWritePaths for the AWG config directory.
+    #    Also handle legacy ReadOnlyPaths left over from older installs.
+    #    The server config root (/etc/amnezia/amneziawg) must always remain in
+    #    ReadWritePaths because direct client creation appends peer blocks to
+    #    /etc/amnezia/amneziawg/*.conf.  If AWG_CONFIG_DIR is outside that tree,
+    #    a separate ReadWritePaths entry is added to cover both paths.
+    local etc_dir="/etc/amnezia/amneziawg"
+    local config_dir_sed="${config_dir//\\/\\\\}"
+
     if grep -q '^ReadOnlyPaths=' "${unit_file}" 2>/dev/null; then
-        local current_ro
-        current_ro="$(grep '^ReadOnlyPaths=' "${unit_file}" | head -1 | cut -d= -f2-)"
-        current_ro="${current_ro%/}"
-        if [[ "${config_dir}" != "${current_ro}" ]] \
-                && [[ "${config_dir}" != "${current_ro}/"* ]]; then
-            # Escape sed replacement metacharacters (& and the | delimiter)
-            # to prevent path contents from corrupting the unit file.
-            local escaped_dir="${config_dir//&/\\&}"
-            escaped_dir="${escaped_dir//|/\\|}"
-            sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${escaped_dir}|" "${unit_file}"
-            info "Updated ReadOnlyPaths to ${config_dir}"
+        # Upgrade: replace ReadOnlyPaths with ReadWritePaths.
+        if [[ "${config_dir}" == "${etc_dir}" ]] \
+                || [[ "${config_dir}" == "${etc_dir}/"* ]]; then
+            sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}|" "${unit_file}"
+        else
+            # Replace the legacy line, then append an extra ReadWritePaths line.
+            sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}|" "${unit_file}"
+            sed -i "/^ReadWritePaths=${etc_dir//\//\\/}\$/a ReadWritePaths=${config_dir_sed}" "${unit_file}"
+        fi
+        info "Replaced ReadOnlyPaths with ReadWritePaths (${etc_dir}, ${config_dir})"
+    elif grep -q '^ReadWritePaths=' "${unit_file}" 2>/dev/null; then
+        # Scan existing non-DATA_DIR ReadWritePaths entries.
+        local data_base="${DATA_DIR%/}"
+        local has_etc_dir=false
+        local has_config_dir=false
+
+        while IFS=: read -r _ln line; do
+            local val="${line#ReadWritePaths=}"
+            val="${val%/}"
+            if [[ "${val}" == "${data_base}" ]] || [[ "${val}" == "${data_base}/"* ]]; then
+                continue
+            fi
+            if [[ "${val}" == "${etc_dir}" ]] || [[ "${etc_dir}" == "${val}/"* ]]; then
+                has_etc_dir=true
+            fi
+            if [[ "${val}" == "${config_dir}" ]] || [[ "${config_dir}" == "${val}/"* ]]; then
+                has_config_dir=true
+            fi
+        done < <(grep -n '^ReadWritePaths=' "${unit_file}")
+
+        if ! ${has_etc_dir}; then
+            local data_linenum=""
+            data_linenum=$(grep -n -F "ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1 || true)
+            if [[ -n "${data_linenum}" ]]; then
+                sed -i "${data_linenum}i\\ReadWritePaths=${etc_dir}" "${unit_file}"
+            else
+                local last_rw
+                last_rw=$(grep -n '^ReadWritePaths=' "${unit_file}" | tail -1 | cut -d: -f1)
+                sed -i "${last_rw}a\\ReadWritePaths=${etc_dir}" "${unit_file}"
+            fi
+            info "Added ReadWritePaths=${etc_dir}"
+        fi
+
+        if ! ${has_config_dir}; then
+            local data_linenum2=""
+            data_linenum2=$(grep -n -F "ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1 || true)
+            if [[ -n "${data_linenum2}" ]]; then
+                sed -i "${data_linenum2}i\\ReadWritePaths=${config_dir_sed}" "${unit_file}"
+            else
+                local last_rw2
+                last_rw2=$(grep -n '^ReadWritePaths=' "${unit_file}" | tail -1 | cut -d: -f1)
+                sed -i "${last_rw2}a\\ReadWritePaths=${config_dir_sed}" "${unit_file}"
+            fi
+            info "Added ReadWritePaths=${config_dir}"
         fi
     fi
 
@@ -451,15 +604,22 @@ main() {
 
     # 3. Ensure the sudoers drop-in is up-to-date.
     #    Always rewrite so that upgrades from older versions pick up the
-    #    additional `awg syncconf` / `awg-quick strip` rules.
-    local rule="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
+    #    current native-lifecycle rules (`awg syncconf`/`awg-quick strip`
+    #    and scoped `cat`/`tee` access under /etc/amnezia/amneziawg).
+    local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
+    # Direct client lifecycle in native Rust: read params/server config and
+    # rewrite or append peer blocks.
+    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf"
     info "Installing/updating sudoers drop-in: ${SUDOERS_FILE}"
     mkdir -p "$(dirname "${SUDOERS_FILE}")"
     printf '# Allow amneziawg-web service to manage AWG state and peers.\n' \
         > "${SUDOERS_FILE}"
     printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \
         >> "${SUDOERS_FILE}"
-    printf '%s\n' "${rule}" >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
+    printf '# Allow amneziawg-web to manage clients directly in Rust (read/rewrite config).\n' \
+        >> "${SUDOERS_FILE}"
+    printf '%s\n' "${rule_direct}" >> "${SUDOERS_FILE}"
     chmod 0440 "${SUDOERS_FILE}"
     chown root:root "${SUDOERS_FILE}"
     if command -v visudo &>/dev/null; then
@@ -471,6 +631,104 @@ main() {
             rm -f "${SUDOERS_FILE}"
             die "Sudoers file syntax check failed. This should not happen with the default rule.
 Please report this issue."
+        fi
+    fi
+
+    # 3b. Ensure AWG_CONFIG_DIR is writable by the service user.
+    #     Direct client creation writes config files into AWG_CONFIG_DIR, so
+    #     the directory must exist and be owned by the service user. Older
+    #     installs may have left it root-owned; fix that here.
+    local awg_config_dir_upgrade=""
+    if [[ -f "${ENV_FILE}" ]]; then
+        awg_config_dir_upgrade="$(grep '^AWG_CONFIG_DIR=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+        awg_config_dir_upgrade="${awg_config_dir_upgrade#\"}"
+        awg_config_dir_upgrade="${awg_config_dir_upgrade%\"}"
+        awg_config_dir_upgrade="${awg_config_dir_upgrade#\'}"
+        awg_config_dir_upgrade="${awg_config_dir_upgrade%\'}"
+    fi
+    # Fall back to the default clients directory used by the installer.
+    awg_config_dir_upgrade="${awg_config_dir_upgrade:-/etc/amnezia/amneziawg/clients}"
+
+    # Reject paths containing whitespace or control characters early.  These
+    # break systemd ReadWritePaths= directives and sudoers entries.
+    if [[ "${awg_config_dir_upgrade}" =~ [[:space:][:cntrl:]] ]]; then
+        warn "AWG_CONFIG_DIR '${awg_config_dir_upgrade}' contains whitespace or control characters; skipping config-dir adjustments."
+        awg_config_dir_upgrade=""
+    fi
+
+    if [[ -n "${awg_config_dir_upgrade}" ]] && validate_awg_config_dir "${awg_config_dir_upgrade}"; then
+        if [[ -d "${awg_config_dir_upgrade}" ]]; then
+            chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}" 2>/dev/null \
+                && info "Set ownership of ${awg_config_dir_upgrade} to ${SERVICE_USER}." \
+                || warn "Could not change ownership of ${awg_config_dir_upgrade}. Direct client creation may fail."
+            chmod 0700 "${awg_config_dir_upgrade}" 2>/dev/null \
+                && info "Set permissions of ${awg_config_dir_upgrade} to 0700." \
+                || warn "Could not change permissions of ${awg_config_dir_upgrade}. Direct client creation may fail."
+            # Ensure existing client config files are owned by the service user
+            # so they are readable after the directory ownership change.
+            if compgen -G "${awg_config_dir_upgrade}/*.conf" > /dev/null 2>&1; then
+                chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}"/*.conf 2>/dev/null \
+                    && info "Adjusted ownership of existing client configs in ${awg_config_dir_upgrade} to ${SERVICE_USER}." \
+                    || warn "Could not change ownership of existing client configs in ${awg_config_dir_upgrade}. They may not be readable by ${SERVICE_USER}."
+            fi
+        else
+            mkdir -p "${awg_config_dir_upgrade}" 2>/dev/null \
+                && chown "${SERVICE_USER}:${SERVICE_USER}" "${awg_config_dir_upgrade}" \
+                && chmod 0700 "${awg_config_dir_upgrade}" \
+                && info "Created config directory: ${awg_config_dir_upgrade}" \
+                || warn "Could not create ${awg_config_dir_upgrade}. Direct client creation may fail until the directory is created with correct ownership."
+        fi
+
+        # Verify and (best-effort) remediate traversal permissions for parent
+        # directories. Fixing only AWG_CONFIG_DIR itself is insufficient when
+        # ancestors (e.g. /etc/amnezia/amneziawg) block execute/traverse.
+        if command -v sudo >/dev/null 2>&1; then
+            if ! sudo -u "${SERVICE_USER}" test -x "${awg_config_dir_upgrade}" 2>/dev/null; then
+                warn "Service user '${SERVICE_USER}' cannot traverse '${awg_config_dir_upgrade}' – attempting parent-directory traversal fix."
+
+                local current_dir="${awg_config_dir_upgrade}"
+                while [[ -n "${current_dir}" && "${current_dir}" != "/" ]]; do
+                    local parent_dir
+                    parent_dir="$(dirname "${current_dir}")"
+                    if [[ "${parent_dir}" == "${current_dir}" || "${parent_dir}" == "/" ]]; then
+                        break
+                    fi
+
+                    if [[ -d "${parent_dir}" && ! -L "${parent_dir}" ]] \
+                            && ! sudo -u "${SERVICE_USER}" test -x "${parent_dir}" 2>/dev/null; then
+                        if command -v setfacl >/dev/null 2>&1; then
+                            if setfacl -m "u:${SERVICE_USER}:x" "${parent_dir}" 2>/dev/null; then
+                                info "Granted traverse ACL for ${SERVICE_USER} on ${parent_dir}."
+                            else
+                                warn "Failed to adjust ACL on ${parent_dir}."
+                            fi
+                        else
+                            # Fallback without ACL support: only relax traversal on known-safe prefixes.
+                            if [[ "${awg_config_dir_upgrade}" == /etc/amnezia/amneziawg* ]] && [[ "${parent_dir}" == /etc/amnezia/amneziawg* ]]; then
+                                chmod o+x "${parent_dir}" 2>/dev/null \
+                                    && info "Added traverse permission (o+x) on ${parent_dir} for service access." \
+                                    || warn "Could not set o+x on ${parent_dir}."
+                                warn "Consider installing ACL tools for a more targeted permission grant."
+                            else
+                                warn "Refusing to broaden permissions on ancestor directory '${parent_dir}' outside allowed prefix '/etc/amnezia/amneziawg*'."
+                                warn "Install ACL tools (e.g. apt install acl) or adjust directory ownership/permissions so ${SERVICE_USER} can traverse ancestors of '${awg_config_dir_upgrade}'."
+                            fi
+                        fi
+                    fi
+
+                    current_dir="${parent_dir}"
+                done
+
+                if ! sudo -u "${SERVICE_USER}" test -x "${awg_config_dir_upgrade}" 2>/dev/null; then
+                    warn "Service user '${SERVICE_USER}' may still be unable to traverse all parent directories of '${awg_config_dir_upgrade}'."
+                    warn "Ensure each parent directory grants execute ('x') permission to '${SERVICE_USER}' or rerun installer filesystem setup."
+                else
+                    info "Traversal permissions for '${SERVICE_USER}' on '${awg_config_dir_upgrade}' and its parents look correct."
+                fi
+            fi
+        else
+            warn "Could not verify traversal permissions for '${SERVICE_USER}' (sudo not available)."
+            warn "Ensure all parent directories of '${awg_config_dir_upgrade}' grant execute ('x') permission to '${SERVICE_USER}'."
         fi
     fi
 
@@ -493,7 +751,7 @@ Please report this issue."
         mv -f -- "${tmp_unit}" "${SYSTEMD_UNIT_DEST}"
         info "Refreshed unit file: ${SYSTEMD_UNIT_DEST}"
 
-        # Adjust ReadOnlyPaths / ProtectHome for the configured config directory.
+        # Adjust ReadWritePaths / ProtectHome for the configured config directory.
         # Read AWG_CONFIG_DIR from the env file if it exists.
         local awg_config_dir=""
         if [[ -f "${ENV_FILE}" ]]; then
@@ -505,7 +763,13 @@ Please report this issue."
             awg_config_dir="${awg_config_dir%\'}"
         fi
         if [[ -n "${awg_config_dir}" ]]; then
-            adjust_unit_hardening "${SYSTEMD_UNIT_DEST}" "${awg_config_dir}"
+            # Reject paths with whitespace/control chars before writing into
+            # the systemd unit file (ReadWritePaths= is whitespace-delimited).
+            if [[ "${awg_config_dir}" =~ [[:space:][:cntrl:]] ]]; then
+                warn "AWG_CONFIG_DIR '${awg_config_dir}' contains whitespace or control characters; skipping unit hardening."
+            else
+                adjust_unit_hardening "${SYSTEMD_UNIT_DEST}" "${awg_config_dir}"
+            fi
         fi
 
         systemctl daemon-reload

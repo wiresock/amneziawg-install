@@ -907,8 +907,416 @@ else
 fi
 
 # ============================================================
-# Phase 3: Web panel installer integration test
+# Phase 2d: validateParamsFile – chmod failure handling
 # ============================================================
+#
+# Regression tests for the "add user failed: chmod: ... Read-only file system"
+# error.  When the params file has non-standard permissions (e.g. a legacy
+# install) and chmod fails:
+#   - If the file has no group/other read or write bits after chmod (e.g. mock fixes to 600): warn and continue.
+#   - If the file is group/other-readable only (e.g. 644): warn and continue (info-disclosure only).
+#   - If the file is group/other-writable (e.g. 666): abort for security (privilege-escalation risk).
+#
+echo ""
+echo "--- validateParamsFile: chmod failure on insecure perms with safe post-chmod mode is non-fatal ---"
+
+(
+	VPFTEST_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_DIR}"' EXIT
+
+	# Write a minimal-but-valid params file.
+	cat > "${VPFTEST_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Set mode 700 (insecure: not 600/400) to trigger the chmod remediation path.
+	# The mock will actually fix it to 600 (so the re-stat passes the 066 check)
+	# while still reporting failure — simulating a filesystem that partially applies
+	# the permission change but returns an error (e.g. a FUSE driver quirk).
+	command chmod 700 "${VPFTEST_DIR}/params"
+
+	# Create the fake server config that validateParamsFile checks for.
+	touch "${VPFTEST_DIR}/awg0.conf"
+
+	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file applies
+	# the permission change but still returns non-zero with a stderr message,
+	# exercising the chmod-failure / warning path in validateParamsFile.
+	AMNEZIAWG_DIR="${VPFTEST_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_DIR}/params"* ]]; then
+			command chmod 600 "${VPFTEST_DIR}/params"  # actually fix to a safe mode
+			echo "chmod: changing permissions of '${VPFTEST_DIR}/params': Read-only file system" >&2
+			return 1  # Simulate chmod reporting failure despite applying the change
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -eq 0 ]]; then
+		echo "OK: validateParamsFile returned 0 when chmod failed but post-failure mode is safe (non-fatal)"
+	else
+		echo "FAIL: validateParamsFile hard-failed (rc=${RC}) when chmod failed on params"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "warning\|could not fix\|fix when possible"; then
+		echo "OK: validateParamsFile emitted a warning about chmod failure"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected warning"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	# Verify that the captured chmod error message is surfaced in the warning.
+	if echo "${OUTPUT}" | grep -q "Read-only file system"; then
+		echo "OK: validateParamsFile included the chmod error message in the warning"
+	else
+		echo "FAIL: validateParamsFile did not include chmod error message in warning"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
+echo "--- validateParamsFile: chmod failure on writable perms is fatal (security) ---"
+
+(
+	VPFTEST2_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST2_DIR}"' EXIT
+
+	# Write a minimal-but-valid params file.
+	cat > "${VPFTEST2_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Set group/other-writable permissions (666 – write bits set for group and other).
+	command chmod 666 "${VPFTEST2_DIR}/params"
+
+	# Create the fake server config that validateParamsFile checks for.
+	touch "${VPFTEST2_DIR}/awg0.conf"
+
+	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file fails.
+	AMNEZIAWG_DIR="${VPFTEST2_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST2_DIR}/params"* ]]; then
+			echo "chmod: changing permissions of '${VPFTEST2_DIR}/params': Read-only file system" >&2
+			return 1  # Simulate read-only filesystem
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -ne 0 ]]; then
+		echo "OK: validateParamsFile correctly rejected group/other-writable params when chmod failed (security)"
+	else
+		echo "FAIL: validateParamsFile should have rejected group/other-writable params when chmod failed"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "writable by group/other\|refusing to source\|security"; then
+		echo "OK: validateParamsFile emitted a security error for writable params"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected security error"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
+echo "--- validateParamsFile: chmod failure on read-only perms (644) is non-fatal (info-disclosure only) ---"
+
+(
+	VPFTEST_644_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_644_DIR}"' EXIT
+
+	# Write a minimal-but-valid params file.
+	cat > "${VPFTEST_644_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Set mode 644 (read-only by group/other, no write bits — the exact case from the issue).
+	command chmod 644 "${VPFTEST_644_DIR}/params"
+
+	# Create the fake server config that validateParamsFile checks for.
+	touch "${VPFTEST_644_DIR}/awg0.conf"
+
+	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file fails
+	# without changing permissions — simulating a read-only filesystem.
+	AMNEZIAWG_DIR="${VPFTEST_644_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_644_DIR}/params"* ]]; then
+			echo "chmod: changing permissions of '${VPFTEST_644_DIR}/params': Read-only file system" >&2
+			return 1  # Simulate read-only filesystem
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -eq 0 ]]; then
+		echo "OK: validateParamsFile returned 0 for mode 644 when chmod failed (non-fatal, info-disclosure only)"
+	else
+		echo "FAIL: validateParamsFile hard-failed (rc=${RC}) for mode 644 — should have warned and continued"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "readable by group/other\|private key may be exposed"; then
+		echo "OK: validateParamsFile emitted a warning about readable params"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected readability warning"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -q "Read-only file system"; then
+		echo "OK: validateParamsFile included the chmod error message in the warning"
+	else
+		echo "FAIL: validateParamsFile did not include chmod error message in warning"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
+echo "--- validateParamsFile: chmod failure on mode 604 (other-readable only) is non-fatal ---"
+
+(
+	VPFTEST_604_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_604_DIR}"' EXIT
+
+	cat > "${VPFTEST_604_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Mode 604: other-readable only (owner rw-, group ---, other r--), no write bits for group/other.
+	command chmod 604 "${VPFTEST_604_DIR}/params"
+
+	touch "${VPFTEST_604_DIR}/awg0.conf"
+
+	AMNEZIAWG_DIR="${VPFTEST_604_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_604_DIR}/params"* ]]; then
+			echo "chmod: changing permissions of '${VPFTEST_604_DIR}/params': Read-only file system" >&2
+			return 1
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -eq 0 ]]; then
+		echo "OK: validateParamsFile returned 0 for mode 604 when chmod failed (non-fatal, info-disclosure only)"
+	else
+		echo "FAIL: validateParamsFile hard-failed (rc=${RC}) for mode 604 — should have warned and continued"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "readable by group/other\|private key may be exposed"; then
+		echo "OK: validateParamsFile emitted a warning about readable params (mode 604)"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected readability warning for mode 604"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
+echo "--- validateParamsFile: chmod failure on mode 646 (other-writable) is fatal ---"
+
+(
+	VPFTEST_646_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST_646_DIR}"' EXIT
+
+	cat > "${VPFTEST_646_DIR}/params" <<'PARAMS_EOF'
+SERVER_PUB_IP='198.51.100.1'
+SERVER_PUB_NIC='eth0'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42:0:0:0:0:1'
+SERVER_PORT='51820'
+SERVER_PRIV_KEY='test_priv_key'
+SERVER_PUB_KEY='test_pub_key'
+CLIENT_DNS_1='1.1.1.1'
+CLIENT_DNS_2=''
+ALLOWED_IPS='0.0.0.0/0,::/0'
+SERVER_AWG_JC='5'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='30'
+SERVER_AWG_S2='100'
+SERVER_AWG_S3='45'
+SERVER_AWG_S4='120'
+SERVER_AWG_H1='5-100000004'
+SERVER_AWG_H2='100000006-200000010'
+SERVER_AWG_H3='200000012-300000016'
+SERVER_AWG_H4='300000018-400000022'
+PARAMS_EOF
+
+	# Mode 646: other-writable (owner rw-, group r--, other rw-) — must be fatal.
+	command chmod 646 "${VPFTEST_646_DIR}/params"
+
+	touch "${VPFTEST_646_DIR}/awg0.conf"
+
+	AMNEZIAWG_DIR="${VPFTEST_646_DIR}"
+	chmod() {
+		if [[ "$*" == *"${VPFTEST_646_DIR}/params"* ]]; then
+			echo "chmod: changing permissions of '${VPFTEST_646_DIR}/params': Read-only file system" >&2
+			return 1
+		fi
+		command chmod "$@"
+	}
+
+	OUTPUT=$(validateParamsFile 2>&1)
+	RC=$?
+	if [[ ${RC} -ne 0 ]]; then
+		echo "OK: validateParamsFile correctly rejected other-writable params (mode 646) when chmod failed"
+	else
+		echo "FAIL: validateParamsFile should have rejected other-writable params (mode 646) when chmod failed"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+	if echo "${OUTPUT}" | grep -qi "writable by group/other\|refusing to source\|security"; then
+		echo "OK: validateParamsFile emitted a security error for writable params (mode 646)"
+	else
+		echo "FAIL: validateParamsFile did not emit an expected security error for mode 646"
+		echo "  output: ${OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+echo ""
+echo "--- validateParamsFile: errors go to stderr, not stdout ---"
+
+(
+	VPFTEST3_DIR=$(mktemp -d)
+	trap 'rm -rf "${VPFTEST3_DIR}"' EXIT
+
+	# Create a symlink instead of a regular file — this should make validateParamsFile return 1
+	ln -s /dev/null "${VPFTEST3_DIR}/params"
+
+	AMNEZIAWG_DIR="${VPFTEST3_DIR}"
+
+	# Capture stdout only (discard stderr) to verify no errors appear on stdout
+	STDOUT_OUTPUT=$(validateParamsFile 2>/dev/null)
+	RC=$?
+
+	if [[ ${RC} -ne 0 ]]; then
+		echo "OK: validateParamsFile returned non-zero for symlink params"
+	else
+		echo "FAIL: validateParamsFile should have failed for symlink params"
+		exit 1
+	fi
+	if [[ -z "${STDOUT_OUTPUT}" ]]; then
+		echo "OK: validateParamsFile error goes to stderr, not stdout (stdout is empty on failure)"
+	else
+		echo "FAIL: validateParamsFile wrote error message to stdout instead of stderr"
+		echo "  stdout: ${STDOUT_OUTPUT}"
+		exit 1
+	fi
+
+	# Capture stderr only (redirect stdout away) to verify the diagnostic appears on stderr
+	STDERR_OUTPUT=$(validateParamsFile 2>&1 >/dev/null)
+	if [[ -n "${STDERR_OUTPUT}" ]]; then
+		echo "OK: validateParamsFile emitted diagnostic text on stderr"
+	else
+		echo "FAIL: validateParamsFile emitted no diagnostic text on stderr"
+		exit 1
+	fi
+	if echo "${STDERR_OUTPUT}" | grep -q "symbolic link"; then
+		echo "OK: validateParamsFile stderr contains expected 'symbolic link' message"
+	else
+		echo "FAIL: validateParamsFile stderr missing expected 'symbolic link' message"
+		echo "  stderr: ${STDERR_OUTPUT}"
+		exit 1
+	fi
+) || FAILED=$((FAILED + 1))
+
+# ============================================================
+# Phase 3: Web panel installer integration test
 #
 # Test assumptions / harness notes:
 # - systemctl is mocked (daemon-reload, enable, start return exit 0)
@@ -923,6 +1331,7 @@ echo "=== Phase 3: Web panel installer ==="
 
 WEB_UNIFIED="${PROJECT_ROOT}/amneziawg-web.sh"
 WEB_INSTALLER_IMPL="${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-install.sh"
+WEB_AWG_SCRIPT_PATH="/usr/local/bin/amneziawg-install.sh"
 
 # Verify unified entry point and implementation script are present
 if [[ -f "${WEB_UNIFIED}" ]]; then
@@ -962,6 +1371,7 @@ WEB_TEST_INSTALL_DIR="/tmp/awg-web-test/bin"
 WEB_TEST_DATA_DIR="/var/lib/awg-web-test"
 WEB_TEST_ENV_FILE="/etc/awg-web-test/env.conf"
 WEB_TEST_AWG_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
+WEB_AWG_SCRIPT_MARKER="$(dirname "${WEB_TEST_ENV_FILE}")/installed-awg-script.path"
 
 # Create the AWG client config directory (populated by Phase 1 install)
 mkdir -p "${WEB_TEST_AWG_CONFIG_DIR}" "${WEB_TEST_INSTALL_DIR}" "${WEB_TEST_DATA_DIR}"
@@ -1031,6 +1441,7 @@ echo "--- Web installer: successful non-interactive install ---"
 
 # Clean any previous partial run
 rm -f "${WEB_TEST_ENV_FILE}" "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
+rm -f "${WEB_AWG_SCRIPT_PATH}" "${WEB_AWG_SCRIPT_MARKER}"
 
 WEB_INSTALL_RC=0
 WEB_INSTALL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
@@ -1129,12 +1540,23 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify ReadOnlyPaths matches the configured config directory
-if grep -q "^ReadOnlyPaths=${WEB_TEST_AWG_CONFIG_DIR}" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
-	echo "OK: systemd unit ReadOnlyPaths matches config dir"
+# Verify ReadWritePaths covers the configured config directory (either directly
+# or via a parent path like /etc/amnezia/amneziawg that contains the clients subdir).
+AWG_RW_MATCH=false
+while IFS= read -r rw_line; do
+	rw_val="${rw_line#ReadWritePaths=}"
+	rw_val="${rw_val%/}"
+	cfg_val="${WEB_TEST_AWG_CONFIG_DIR%/}"
+	if [[ "${cfg_val}" == "${rw_val}" ]] || [[ "${cfg_val}" == "${rw_val}/"* ]]; then
+		AWG_RW_MATCH=true
+		break
+	fi
+done < <(grep '^ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null)
+if [[ "${AWG_RW_MATCH}" == "true" ]]; then
+	echo "OK: systemd unit ReadWritePaths covers config dir"
 else
-	echo "FAIL: systemd unit ReadOnlyPaths does not match config dir ${WEB_TEST_AWG_CONFIG_DIR}"
-	echo "  Got: $(grep 'ReadOnlyPaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	echo "FAIL: systemd unit ReadWritePaths does not cover config dir ${WEB_TEST_AWG_CONFIG_DIR}"
+	echo "  Got: $(grep 'ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1168,6 +1590,84 @@ if [[ ${WEB_RERUN_RC} -eq 0 ]]; then
 	echo "OK: Installer is idempotent (re-run with --force succeeded)"
 else
 	echo "FAIL: Re-run with --force exited non-zero (rc=${WEB_RERUN_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web installer: preserve unmanaged AWG script unless --force ---"
+
+mkdir -p "$(dirname "${WEB_AWG_SCRIPT_PATH}")"
+cat > "${WEB_AWG_SCRIPT_PATH}" <<'EOF'
+#!/usr/bin/env bash
+echo operator-managed-awg-script
+EOF
+chmod 0755 "${WEB_AWG_SCRIPT_PATH}"
+rm -f "${WEB_AWG_SCRIPT_MARKER}"
+
+WEB_UNMANAGED_INSTALL_RC=0
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1 || WEB_UNMANAGED_INSTALL_RC=$?
+
+if [[ ${WEB_UNMANAGED_INSTALL_RC} -eq 0 ]]; then
+	echo "OK: Installer succeeds with unmanaged AWG script present"
+else
+	echo "FAIL: Installer failed when unmanaged AWG script exists (rc=${WEB_UNMANAGED_INSTALL_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+if grep -q "operator-managed-awg-script" "${WEB_AWG_SCRIPT_PATH}" 2>/dev/null; then
+	echo "OK: Unmanaged AWG lifecycle script preserved on install"
+else
+	echo "FAIL: Installer overwrote unmanaged AWG lifecycle script without --force"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -x "${WEB_AWG_SCRIPT_PATH}" ]]; then
+	echo "OK: Preserved unmanaged AWG lifecycle script remains executable"
+else
+	echo "FAIL: Preserved unmanaged AWG lifecycle script lost executable permissions"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ ! -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
+	echo "OK: Ownership marker not written for unmanaged AWG script"
+else
+	echo "FAIL: Ownership marker unexpectedly written for unmanaged AWG script"
+	FAILED=$((FAILED + 1))
+fi
+
+WEB_MANAGED_FORCE_RC=0
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1 || WEB_MANAGED_FORCE_RC=$?
+
+if [[ ${WEB_MANAGED_FORCE_RC} -eq 0 ]]; then
+	echo "OK: --force replaces unmanaged AWG lifecycle script"
+else
+	echo "FAIL: --force install failed while replacing unmanaged AWG script (rc=${WEB_MANAGED_FORCE_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
+	echo "OK: Ownership marker written after forced AWG script install"
+else
+	echo "FAIL: Ownership marker missing after forced AWG script install"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1208,12 +1708,22 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Verify ReadOnlyPaths was updated to the /home config dir
-if grep -q "^ReadOnlyPaths=${HOME_CONFIG_DIR}" /etc/systemd/system/amneziawg-web.service 2>/dev/null; then
-	echo "OK: ReadOnlyPaths updated to ${HOME_CONFIG_DIR}"
+# Verify ReadWritePaths includes the /home config dir among its entries
+HOME_RW_MATCH=false
+while IFS= read -r rw_line; do
+	rw_val="${rw_line#ReadWritePaths=}"
+	rw_val="${rw_val%/}"
+	hcfg_val="${HOME_CONFIG_DIR%/}"
+	if [[ "${hcfg_val}" == "${rw_val}" ]] || [[ "${hcfg_val}" == "${rw_val}/"* ]]; then
+		HOME_RW_MATCH=true
+		break
+	fi
+done < <(grep '^ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null)
+if [[ "${HOME_RW_MATCH}" == "true" ]]; then
+	echo "OK: ReadWritePaths covers ${HOME_CONFIG_DIR}"
 else
-	echo "FAIL: ReadOnlyPaths should point to ${HOME_CONFIG_DIR}"
-	echo "  Got: $(grep 'ReadOnlyPaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
+	echo "FAIL: ReadWritePaths should cover ${HOME_CONFIG_DIR}"
+	echo "  Got: $(grep 'ReadWritePaths=' /etc/systemd/system/amneziawg-web.service 2>/dev/null || echo 'not found')"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1240,7 +1750,7 @@ echo "--- Web installer: auto-detect AWG_CONFIG_DIR ---"
 # auto-detection copies configs into the default system directory so the
 # web panel can read them without traversing home directories.
 AUTODETECT_HOME="/root"
-AUTODETECT_EXPECTED_DIR="/etc/amneziawg/clients"
+AUTODETECT_EXPECTED_DIR="/etc/amnezia/amneziawg/clients"
 AUTODETECT_CONF="${AUTODETECT_HOME}/awg0-client-autotest.conf"
 
 # Clean up the default config directory so auto-detection is not short-circuited
@@ -1303,6 +1813,9 @@ elif runuser -u "${WEB_SERVICE_USER}" -- cat "${AUTODETECT_EXPECTED_DIR}/awg0-cl
 else
 	echo "FAIL: Service user ${WEB_SERVICE_USER} cannot read copied config file"
 	echo "  File perms: $(stat -c '%a' "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" 2>/dev/null || echo 'N/A')"
+	echo "  File owner: $(stat -c '%U:%G' "${AUTODETECT_EXPECTED_DIR}/awg0-client-autotest.conf" 2>/dev/null || echo 'N/A')"
+	echo "  Dir info: $(stat -c '%U:%G %a' "${AUTODETECT_EXPECTED_DIR}" 2>/dev/null || echo 'N/A')"
+	echo "  Parent info: $(stat -c '%U:%G %a' "$(dirname "${AUTODETECT_EXPECTED_DIR}")" 2>/dev/null || echo 'N/A')"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1483,6 +1996,20 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+if [[ -f "${WEB_AWG_SCRIPT_PATH}" ]]; then
+	echo "OK: Pre-condition: AWG lifecycle script exists before uninstall"
+else
+	echo "FAIL: Pre-condition: AWG lifecycle script missing before uninstall test"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
+	echo "OK: Pre-condition: AWG lifecycle marker exists before uninstall"
+else
+	echo "FAIL: Pre-condition: AWG lifecycle marker missing before uninstall test"
+	FAILED=$((FAILED + 1))
+fi
+
 if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
 	echo "OK: Pre-condition: env file exists before uninstall"
 else
@@ -1518,6 +2045,21 @@ if [[ ! -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
 	echo "OK: Binary removed after uninstall"
 else
 	echo "FAIL: Binary still exists after uninstall"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify installed AWG lifecycle script was removed
+if [[ ! -f "${WEB_AWG_SCRIPT_PATH}" ]]; then
+	echo "OK: Installed AWG lifecycle script removed after uninstall"
+else
+	echo "FAIL: Installed AWG lifecycle script still exists after uninstall"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ ! -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
+	echo "OK: AWG lifecycle marker removed after uninstall"
+else
+	echo "FAIL: AWG lifecycle marker still exists after uninstall"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -1599,6 +2141,38 @@ if [[ ${WEB_RERUN_UNINSTALL_RC} -eq 0 ]]; then
 	echo "OK: Uninstaller is idempotent (re-run after absent artifacts succeeded)"
 else
 	echo "FAIL: Uninstaller re-run exited non-zero (rc=${WEB_RERUN_UNINSTALL_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web uninstaller: preserve unmanaged AWG script ---"
+
+mkdir -p "$(dirname "${WEB_AWG_SCRIPT_PATH}")"
+cat > "${WEB_AWG_SCRIPT_PATH}" <<'EOF'
+#!/usr/bin/env bash
+echo unmanaged-awg-script
+EOF
+chmod 0755 "${WEB_AWG_SCRIPT_PATH}"
+rm -f "${WEB_AWG_SCRIPT_MARKER}"
+
+WEB_PRESERVE_UNMANAGED_RC=0
+bash "${WEB_UNINSTALLER_IMPL}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--force >/dev/null 2>&1 || WEB_PRESERVE_UNMANAGED_RC=$?
+
+if [[ ${WEB_PRESERVE_UNMANAGED_RC} -eq 0 ]]; then
+	echo "OK: Uninstaller succeeds when unmanaged AWG script exists"
+else
+	echo "FAIL: Uninstaller failed with unmanaged AWG script (rc=${WEB_PRESERVE_UNMANAGED_RC})"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_AWG_SCRIPT_PATH}" ]]; then
+	echo "OK: Unmanaged AWG lifecycle script preserved"
+else
+	echo "FAIL: Unmanaged AWG lifecycle script was removed"
 	FAILED=$((FAILED + 1))
 fi
 

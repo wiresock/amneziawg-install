@@ -11,6 +11,7 @@
 # Default behavior (safe):
 #   - stops and disables the systemd service
 #   - removes the installed binary
+#   - removes AWG lifecycle script only when it was installed by amneziawg-web
 #   - removes the systemd unit file
 #   - reloads systemd daemon
 #   - PRESERVES: env/config file, data directory, service user
@@ -22,6 +23,7 @@
 #
 # Assumed install paths (same defaults as the installer):
 #   Binary:       /usr/local/bin/amneziawg-web
+#   AWG script:   /usr/local/bin/amneziawg-install.sh
 #   Env file:     /etc/amneziawg-web/env.conf
 #   Env dir:      /etc/amneziawg-web/
 #   Data dir:     /var/lib/amneziawg-web/
@@ -38,6 +40,8 @@ readonly SERVICE_NAME="amneziawg-web"
 readonly SERVICE_USER="awg-web"
 readonly SYSTEMD_UNIT_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
+readonly AWG_INSTALL_SCRIPT_DEST="/usr/local/bin/amneziawg-install.sh"
+readonly AWG_INSTALL_SCRIPT_MARKER_NAME="installed-awg-script.path"
 readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_DATA_DIR="/var/lib/amneziawg-web"
 readonly DEFAULT_ENV_DIR="/etc/amneziawg-web"
@@ -111,6 +115,46 @@ while [[ $# -gt 0 ]]; do
         *) die "Unknown option: $1  (use --help for usage)" ;;
     esac
 done
+
+normalize_path() {
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m -- "$1"
+    else
+        # readlink -f may fail for non-existent paths on some systems.
+        # If it fails, avoid blindly returning a path with dot-segments,
+        # which could bypass prefix-based safety checks.
+        if norm_path="$(readlink -f -- "$1" 2>/dev/null)"; then
+            printf '%s\n' "${norm_path}"
+        else
+            case "$1" in
+                *"/../"*|*"/./"*|"../"*|"./"*|*"/."|*"/..")
+                    die "Cannot safely normalize path with dot segments: $1"
+                    ;;
+                *)
+                    # Fall back to echoing the input as-is (paths are expected to be absolute)
+                    # but only when there are no dot-segments.
+                    printf '%s\n' "$1"
+                    ;;
+            esac
+        fi
+    fi
+}
+
+ENV_FILE="$(normalize_path "${ENV_FILE}")"
+ENV_DIR="$(normalize_path "${ENV_DIR}")"
+
+if [[ "${ENV_FILE}" != /* ]]; then
+    die "Env file path must be absolute after normalization: ${ENV_FILE}"
+fi
+if [[ "${ENV_DIR}" != /* ]]; then
+    die "Env directory path must be absolute after normalization: ${ENV_DIR}"
+fi
+if [[ "${ENV_DIR}" == "/etc" ]]; then
+    die "Env directory must not be /etc itself: ${ENV_DIR}"
+fi
+if [[ "${ENV_DIR}" != /etc/* ]]; then
+    die "Env directory must reside under /etc: ${ENV_DIR}"
+fi
 
 # ── Root check ─────────────────────────────────────────────────────────────────
 
@@ -214,11 +258,22 @@ systemctl_if_enabled() {
 # ── Summary / plan ─────────────────────────────────────────────────────────────
 
 print_plan() {
+    local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
+    local awg_script_plan_path="${AWG_INSTALL_SCRIPT_DEST}"
+    if [[ -f "${marker_path}" ]]; then
+        local marker_target
+        marker_target="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
+        if is_safe_awg_script_path "${marker_target}"; then
+            awg_script_plan_path="${marker_target}"
+        fi
+    fi
+
     printf '\n'
     printf '=== amneziawg-web uninstall plan ===\n'
     printf '\n'
     printf 'Will REMOVE:\n'
     printf '  Binary:       %s\n'  "${INSTALL_DIR}/${BINARY_NAME}"
+    printf '  AWG script:   %s (if installed by amneziawg-web)\n'  "${awg_script_plan_path}"
     printf '  Systemd unit: %s\n'  "${SYSTEMD_UNIT_DEST}"
     printf '  Sudoers:      %s\n'  "${SUDOERS_FILE}"
     printf '  Service:      stop + disable %s\n' "${SERVICE_NAME}"
@@ -240,6 +295,48 @@ print_plan() {
         printf '  Service user: %s  [WILL BE REMOVED --remove-user]\n' "${SERVICE_USER}"
     fi
     printf '\n'
+}
+
+is_safe_awg_script_path() {
+    local path="$1"
+    if [[ "${path}" != /* ]] || [[ "${path}" =~ [[:space:],] ]]; then
+        return 1
+    fi
+
+    local filename="${path##*/}"
+    if [[ "${filename}" != "amneziawg-install.sh" ]]; then
+        return 1
+    fi
+
+    case "${path}" in
+        /usr/local/bin/amneziawg-install.sh|\
+        /usr/bin/amneziawg-install.sh|\
+        /opt/amneziawg-web/bin/amneziawg-install.sh)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+remove_managed_awg_install_script() {
+    local marker_path="${ENV_DIR}/${AWG_INSTALL_SCRIPT_MARKER_NAME}"
+
+    if [[ ! -f "${marker_path}" ]]; then
+        info "Preserving AWG lifecycle script because it is not marked as installer-managed (no marker file found)"
+        return 0
+    fi
+
+    local marker_target
+    marker_target="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
+    if ! is_safe_awg_script_path "${marker_target}"; then
+        warn "AWG lifecycle script marker contains unsafe path '${marker_target}', preserving AWG script"
+        return 0
+    fi
+
+    safe_rm_file "${marker_target}"
+    safe_rm_file "${marker_path}"
 }
 
 # ── Main uninstall ─────────────────────────────────────────────────────────────
@@ -281,7 +378,10 @@ main() {
     fi
     safe_rm_file "${binary_path}"
 
-    # 5. Optional: purge config
+    # 5. Remove installer-managed AWG lifecycle script
+    remove_managed_awg_install_script
+
+    # 6. Optional: purge config
     if [[ "${PURGE_CONFIG}" == "true" ]]; then
         if [[ "${FORCE}" != "true" ]]; then
             if ! confirm "PURGE config/env directory '${ENV_DIR}'? THIS IS IRREVERSIBLE." "false"; then
@@ -294,7 +394,7 @@ main() {
         fi
     fi
 
-    # 6. Optional: purge data
+    # 7. Optional: purge data
     if [[ "${PURGE_DATA}" == "true" ]]; then
         if [[ "${FORCE}" != "true" ]]; then
             if ! confirm "PURGE data directory '${DATA_DIR}'? ALL DATABASE DATA WILL BE LOST." "false"; then
@@ -307,7 +407,7 @@ main() {
         fi
     fi
 
-    # 7. Optional: remove service user
+    # 8. Optional: remove service user
     if [[ "${REMOVE_USER}" == "true" ]]; then
         if [[ "${FORCE}" != "true" ]]; then
             if ! confirm "Remove service user '${SERVICE_USER}'?" "false"; then

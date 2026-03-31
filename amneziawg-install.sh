@@ -366,7 +366,7 @@ fi
 
 function isRoot() {
 	if [[ "${EUID}" -ne 0 ]]; then
-		echo "You need to run this script as root"
+		echo "You need to run this script as root" >&2
 		exit 1
 	fi
 }
@@ -377,92 +377,92 @@ function checkVirt() {
 	fi
 
 	if [[ "$(systemd-detect-virt)" == "openvz" ]]; then
-		echo "OpenVZ is not supported"
+		echo "OpenVZ is not supported" >&2
 		exit 1
 	fi
 
 	if [[ "$(systemd-detect-virt)" == "lxc" ]]; then
-		echo "LXC is not supported (yet)."
-		echo "WireGuard can technically run in an LXC container,"
-		echo "but the kernel module has to be installed on the host,"
-		echo "the container has to be run with some specific parameters"
-		echo "and only the tools need to be installed in the container."
+		echo "LXC is not supported (yet)." >&2
+		echo "WireGuard can technically run in an LXC container," >&2
+		echo "but the kernel module has to be installed on the host," >&2
+		echo "the container has to be run with some specific parameters" >&2
+		echo "and only the tools need to be installed in the container." >&2
 		exit 1
 	fi
 }
 
 function checkOS() {
 	if [[ ! -f /etc/os-release ]] || [[ ! -r /etc/os-release ]]; then
-		echo "Cannot detect OS: /etc/os-release is missing or not readable"
+		echo "Cannot detect OS: /etc/os-release is missing or not readable" >&2
 		exit 1
 	fi
 	# shellcheck source=/etc/os-release
 	source /etc/os-release
 	OS="${ID}"
 	if [[ -z "${OS}" ]]; then
-		echo "Cannot detect OS: /etc/os-release is missing the ID field"
+		echo "Cannot detect OS: /etc/os-release is missing the ID field" >&2
 		exit 1
 	fi
 	if [[ ${OS} == "debian" || ${OS} == "raspbian" ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
-			echo "Cannot detect Debian version: VERSION_ID is missing from /etc/os-release"
+			echo "Cannot detect Debian version: VERSION_ID is missing from /etc/os-release" >&2
 			exit 1
 		fi
 		# Extract major version to handle point-release formats (e.g., "11.7")
 		local DEBIAN_MAJOR
 		DEBIAN_MAJOR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
 		if ! [[ ${DEBIAN_MAJOR} =~ ^[0-9]+$ ]] || [[ ${DEBIAN_MAJOR} -lt 11 ]]; then
-			echo "Your version of Debian (${VERSION_ID}) is not supported. Please use Debian 11 Bullseye or later"
+			echo "Your version of Debian (${VERSION_ID}) is not supported. Please use Debian 11 Bullseye or later" >&2
 			exit 1
 		fi
 		OS=debian # overwrite if raspbian
 	elif [[ ${OS} == "ubuntu" ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
-			echo "Cannot detect Ubuntu version: VERSION_ID is missing from /etc/os-release"
+			echo "Cannot detect Ubuntu version: VERSION_ID is missing from /etc/os-release" >&2
 			exit 1
 		fi
 		local RELEASE_YEAR
 		RELEASE_YEAR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
 		if ! [[ ${RELEASE_YEAR} =~ ^[0-9]+$ ]] || [[ ${RELEASE_YEAR} -lt 22 ]]; then
-			echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 22.04 or later"
+			echo "Your version of Ubuntu (${VERSION_ID}) is not supported. Please use Ubuntu 22.04 or later" >&2
 			exit 1
 		fi
 	elif [[ ${OS} == "linuxmint" ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
-			echo "Cannot detect Linux Mint version: VERSION_ID is missing from /etc/os-release"
+			echo "Cannot detect Linux Mint version: VERSION_ID is missing from /etc/os-release" >&2
 			exit 1
 		fi
 		# Linux Mint 21.x is based on Ubuntu 22.04; require major version >= 21
 		local MINT_MAJOR
 		MINT_MAJOR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
 		if ! [[ ${MINT_MAJOR} =~ ^[0-9]+$ ]] || [[ ${MINT_MAJOR} -lt 21 ]]; then
-			echo "Your version of Linux Mint (${VERSION_ID}) is not supported. Please use Linux Mint 21 or later"
+			echo "Your version of Linux Mint (${VERSION_ID}) is not supported. Please use Linux Mint 21 or later" >&2
 			exit 1
 		fi
 		OS=ubuntu # treat Linux Mint as Ubuntu for package management
 	elif [[ ${OS} == "fedora" ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
-			echo "Cannot detect Fedora version: VERSION_ID is missing from /etc/os-release"
+			echo "Cannot detect Fedora version: VERSION_ID is missing from /etc/os-release" >&2
 			exit 1
 		fi
 		# Extract major version to handle potential future format changes
 		local FEDORA_MAJOR
 		FEDORA_MAJOR=$(echo "${VERSION_ID}" | cut -d'.' -f1)
 		if ! [[ ${FEDORA_MAJOR} =~ ^[0-9]+$ ]] || [[ ${FEDORA_MAJOR} -lt 39 ]]; then
-			echo "Your version of Fedora (${VERSION_ID}) is not supported. Please use Fedora 39 or later"
+			echo "Your version of Fedora (${VERSION_ID}) is not supported. Please use Fedora 39 or later" >&2
 			exit 1
 		fi
 	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
 		if [[ -z "${VERSION_ID}" ]]; then
-			echo "Cannot detect CentOS/AlmaLinux/Rocky version: VERSION_ID is missing from /etc/os-release"
+			echo "Cannot detect CentOS/AlmaLinux/Rocky version: VERSION_ID is missing from /etc/os-release" >&2
 			exit 1
 		fi
 		if [[ ${VERSION_ID} == 7* ]] || [[ ${VERSION_ID} == 8* ]]; then
-			echo "Your version of CentOS (${VERSION_ID}) is not supported. Please use CentOS 9 or later"
+			echo "Your version of CentOS (${VERSION_ID}) is not supported. Please use CentOS 9 or later" >&2
 			exit 1
 		fi
 	else
-		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Linux Mint, Fedora, CentOS, AlmaLinux or Rocky Linux system"
+		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Linux Mint, Fedora, CentOS, AlmaLinux or Rocky Linux system" >&2
 		exit 1
 	fi
 }
@@ -1784,7 +1784,15 @@ PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6}/128" >>"${SERVER_AWG_CONF}"
 
-	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+	local sync_err
+	sync_err=""
+	if ! sync_err="$(awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>&1)"; then
+		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after adding client '${CLIENT_NAME}'" >&2
+		if [[ -n "${sync_err}" ]]; then
+			echo "${sync_err}" >&2
+		fi
+		exit 1
+	fi
 
 	# Generate QR code if qrencode is installed
 	if command -v qrencode &>/dev/null; then
@@ -2236,75 +2244,102 @@ function validateParamsFile() {
 	# This mitigates the risk of arbitrary code execution or private key exposure
 	# Reject symlinks explicitly so we don't accidentally source an unexpected file via a link.
 	if [[ -L "${AMNEZIAWG_DIR}/params" ]] || [[ -h "${AMNEZIAWG_DIR}/params" ]]; then
-		echo -e "${RED}ERROR: Params file must not be a symbolic link: ${AMNEZIAWG_DIR}/params${NC}"
-		echo -e "${ORANGE}Remove the symlink and create a regular file owned by root with mode 600 or 400.${NC}"
+		echo -e "${RED}ERROR: Params file must not be a symbolic link: ${AMNEZIAWG_DIR}/params${NC}" >&2
+		echo -e "${ORANGE}Remove the symlink and create a regular file owned by root with mode 600 or 400.${NC}" >&2
 		return 1
 	fi
 	if [[ ! -f "${AMNEZIAWG_DIR}/params" ]]; then
-		echo -e "${RED}ERROR: Params file not found or is not a regular file: ${AMNEZIAWG_DIR}/params${NC}"
-		echo -e "${ORANGE}The installer cannot continue without a valid params file.${NC}"
+		echo -e "${RED}ERROR: Params file not found or is not a regular file: ${AMNEZIAWG_DIR}/params${NC}" >&2
+		echo -e "${ORANGE}The installer cannot continue without a valid params file.${NC}" >&2
 		return 1
 	fi
 	if [[ ! -r "${AMNEZIAWG_DIR}/params" ]]; then
-		echo -e "${RED}ERROR: Params file is not readable: ${AMNEZIAWG_DIR}/params${NC}"
-		echo -e "${ORANGE}Ensure the file is readable by root and try again.${NC}"
+		echo -e "${RED}ERROR: Params file is not readable: ${AMNEZIAWG_DIR}/params${NC}" >&2
+		echo -e "${ORANGE}Ensure the file is readable by root and try again.${NC}" >&2
 		return 1
 	fi
 	local PARAMS_OWNER PARAMS_PERMS
 	PARAMS_OWNER=$(stat -c '%u' "${AMNEZIAWG_DIR}/params" 2>/dev/null)
 	PARAMS_PERMS=$(stat -c '%a' "${AMNEZIAWG_DIR}/params" 2>/dev/null)
 	if [[ -z "${PARAMS_OWNER}" ]] || [[ -z "${PARAMS_PERMS}" ]]; then
-		echo -e "${RED}ERROR: Failed to read file metadata for ${AMNEZIAWG_DIR}/params.${NC}"
-		echo -e "${ORANGE}Ensure the file exists and is accessible, then retry.${NC}"
+		echo -e "${RED}ERROR: Failed to read file metadata for ${AMNEZIAWG_DIR}/params.${NC}" >&2
+		echo -e "${ORANGE}Ensure the file exists and is accessible, then retry.${NC}" >&2
 		return 1
 	fi
 	if [[ "${PARAMS_OWNER}" != "0" ]]; then
-		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params is not owned by root (owner UID: ${PARAMS_OWNER}).${NC}"
-		echo -e "${ORANGE}This is a security risk. Fix with: chown root:root ${AMNEZIAWG_DIR}/params${NC}"
+		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params is not owned by root (owner UID: ${PARAMS_OWNER}).${NC}" >&2
+		echo -e "${ORANGE}This is a security risk. Fix with: chown root:root ${AMNEZIAWG_DIR}/params${NC}" >&2
 		return 1
 	fi
 	# Require mode 600 or 400: the file contains SERVER_PRIV_KEY and must not be
 	# readable or writable by group/other. Modes like 644 would leak the private key.
 	if [[ "${PARAMS_PERMS}" != "600" ]] && [[ "${PARAMS_PERMS}" != "400" ]]; then
-		echo -e "${RED}WARNING: ${AMNEZIAWG_DIR}/params has insecure permissions (${PARAMS_PERMS}).${NC}"
-		echo -e "${RED}This file contains the server private key and must not be accessible by non-root users.${NC}"
+		echo -e "${RED}WARNING: ${AMNEZIAWG_DIR}/params has insecure permissions (${PARAMS_PERMS}).${NC}" >&2
+		echo -e "${RED}This file contains the server private key and must not be accessible by non-root users.${NC}" >&2
 		# For legacy installs created before strict umask/chmod logic, try to auto-remediate
 		# when running as root and the file is owned by root, to avoid locking out management actions.
 		if [[ "${EUID}" -eq 0 ]] && [[ "${PARAMS_OWNER}" == "0" ]]; then
-			echo -e "${ORANGE}Attempting to fix permissions by setting mode 600 on ${AMNEZIAWG_DIR}/params...${NC}"
-			if chmod 600 "${AMNEZIAWG_DIR}/params"; then
-				echo -e "${GREEN}Permissions on ${AMNEZIAWG_DIR}/params updated to 600. Continuing.${NC}"
+			echo -e "${ORANGE}Attempting to fix permissions by setting mode 600 on ${AMNEZIAWG_DIR}/params...${NC}" >&2
+			local chmod_err
+			if chmod_err=$(chmod 600 "${AMNEZIAWG_DIR}/params" 2>&1); then
+				echo -e "${GREEN}Permissions on ${AMNEZIAWG_DIR}/params updated to 600. Continuing.${NC}" >&2
 			else
-				echo -e "${RED}ERROR: Failed to automatically fix permissions on ${AMNEZIAWG_DIR}/params.${NC}"
-				echo -e "${ORANGE}Fix manually with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
-				return 1
+				# chmod failed (e.g. read-only filesystem or immutable file attribute).
+				# Re-stat first so the warning shows the actual post-failure mode, not
+				# the stale pre-chmod value.  Abort only when group/other WRITE bits
+				# remain (privilege-escalation risk); group/other READ-only exposure
+				# is warned but allowed so management operations are not blocked.
+				local current_mode
+				if ! current_mode=$(stat -c '%a' "${AMNEZIAWG_DIR}/params" 2>/dev/null); then
+					echo -e "${RED}ERROR: Could not re-read permissions on ${AMNEZIAWG_DIR}/params after chmod failure; refusing to source an unverified file as root.${NC}" >&2
+					return 1
+				fi
+				echo -e "${ORANGE}WARNING: Could not fix permissions on ${AMNEZIAWG_DIR}/params (current: ${current_mode}): ${chmod_err}${NC}" >&2
+				echo -e "${ORANGE}The filesystem may be read-only or the file may have the immutable attribute set.${NC}" >&2
+				echo -e "${ORANGE}Fix when possible: chmod 600 ${AMNEZIAWG_DIR}/params${NC}" >&2
+				# Abort if any group/other WRITE bit remains set (mode & 022 != 0).
+				# Writable params files are a privilege-escalation risk: a
+				# non-root user could inject code that runs as root when the
+				# file is sourced.
+				if (( (8#${current_mode} & 022) != 0 )); then
+					echo -e "${RED}ERROR: ${AMNEZIAWG_DIR}/params is writable by group/other (mode: ${current_mode}). Refusing to source for security reasons.${NC}" >&2
+					echo -e "${ORANGE}Fix manually: chmod 600 ${AMNEZIAWG_DIR}/params${NC}" >&2
+					return 1
+				fi
+				# Warn if group/other READ bits remain (mode & 044 != 0).
+				# This exposes SERVER_PRIV_KEY but is an information-disclosure
+				# risk only; blocking the operation does not un-expose the key,
+				# so we warn and continue.
+				if (( (8#${current_mode} & 044) != 0 )); then
+					echo -e "${ORANGE}WARNING: ${AMNEZIAWG_DIR}/params is readable by group/other (mode: ${current_mode}). The server private key may be exposed to non-root users.${NC}" >&2
+				fi
 			fi
 		else
-			echo -e "${ORANGE}Fix with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}"
+			echo -e "${ORANGE}Fix with: chmod 600 ${AMNEZIAWG_DIR}/params${NC}" >&2
 			return 1
 		fi
 	fi
 
 	# shellcheck source=/etc/amnezia/amneziawg/params
 	if ! source "${AMNEZIAWG_DIR}/params"; then
-		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}"
-		echo -e "${ORANGE}The file may be corrupted or contain a syntax error. Fix or regenerate it and rerun the installer.${NC}"
+		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}" >&2
+		echo -e "${ORANGE}The file may be corrupted or contain a syntax error. Fix or regenerate it and rerun the installer.${NC}" >&2
 		return 1
 	fi
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
 	# Verify server config file exists before attempting migration
 	if [[ ! -f "${SERVER_AWG_CONF}" ]]; then
-		echo -e "${RED}ERROR: Server configuration file not found: ${SERVER_AWG_CONF}${NC}"
-		echo -e "${ORANGE}The params file exists but the config file is missing.${NC}"
+		echo -e "${RED}ERROR: Server configuration file not found: ${SERVER_AWG_CONF}${NC}" >&2
+		echo -e "${ORANGE}The params file exists but the config file is missing.${NC}" >&2
 		return 1
 	fi
 
 	# Validate and normalize SERVER_AWG_IPV6 from params file
 	# Older installations may have stored non-normalized or oddly formatted IPv6
 	if ! isValidIPv6 "${SERVER_AWG_IPV6}"; then
-		echo -e "${RED}ERROR: Invalid IPv6 address in params file: ${SERVER_AWG_IPV6}${NC}"
-		echo -e "${ORANGE}Fix the SERVER_AWG_IPV6 value in ${AMNEZIAWG_DIR}/params${NC}"
+		echo -e "${RED}ERROR: Invalid IPv6 address in params file: ${SERVER_AWG_IPV6}${NC}" >&2
+		echo -e "${ORANGE}Fix the SERVER_AWG_IPV6 value in ${AMNEZIAWG_DIR}/params${NC}" >&2
 		return 1
 	fi
 	# Global used by loadParams to detect IPv6 normalization changes;
@@ -2804,7 +2839,7 @@ function quietIPv6Rewrite() {
 
 function loadParams() {
 	if ! validateParamsFile; then
-		echo -e "${RED}Failed to validate params file. Aborting parameter loading.${NC}"
+		echo -e "${RED}Failed to validate params file. Aborting parameter loading.${NC}" >&2
 		exit 1
 	fi
 
@@ -2872,8 +2907,280 @@ function manageMenu() {
 	esac
 }
 
+# ── Non-interactive client management ─────────────────────────────────────────
+#
+# These functions support the --add-client and --remove-client flags,
+# enabling fully non-interactive client lifecycle management from the
+# amneziawg-web panel or other automation tooling.
+#
+# Contract:
+#   --add-client NAME     → validates name, creates client config, exits 0 on success
+#   --remove-client NAME  → validates name, removes client config, exits 0 on success
+#   --list-clients        → lists all client names (one per line), exits 0
+#
+# On error, prints a message to stderr and exits with a non-zero code.
+
+function nonInteractiveAddClient() {
+	local CLIENT_NAME="$1"
+
+	# Validate the name format (same rules as interactive mode)
+	if [[ -z "${CLIENT_NAME}" ]]; then
+		echo "ERROR: client name must not be empty" >&2
+		exit 1
+	fi
+	if ! [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+		echo "ERROR: client name must be alphanumeric (plus underscores/dashes)" >&2
+		exit 1
+	fi
+	if [[ ${#CLIENT_NAME} -gt 15 ]]; then
+		echo "ERROR: client name must be at most 15 characters" >&2
+		exit 1
+	fi
+
+	# Ensure params are loaded and config path is set
+	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+
+	# Check for duplicate name
+	if [[ $(grep -c -xF "### Client ${CLIENT_NAME}" "${SERVER_AWG_CONF}") != 0 ]]; then
+		echo "ERROR: a client named '${CLIENT_NAME}' already exists" >&2
+		exit 1
+	fi
+
+	# Auto-assign the first available IP pair (same logic as AUTO_INSTALL)
+	local BASE_IP DOT_IP DOT_EXISTS IPV6_EXISTS CLIENT_AWG_IPV4 CLIENT_AWG_IPV6
+	BASE_IP="${SERVER_AWG_IPV4%.*}"
+
+	local NORMALIZED_SERVER_IPV6 BASE_IPV6
+	NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
+	BASE_IPV6=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
+
+	local FREE_FOUND=0
+	for DOT_IP in {2..254}; do
+		DOT_EXISTS=$(grep -cF "${BASE_IP}.${DOT_IP}/32" "${SERVER_AWG_CONF}")
+		local CLIENT_IPV6_CANDIDATE
+		CLIENT_IPV6_CANDIDATE=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
+		IPV6_EXISTS=0
+		while IFS= read -r _existing_ip_cidr; do
+			local _existing_ip="${_existing_ip_cidr%/*}"
+			local _normalized_existing
+			_normalized_existing=$(normalizeIPv6 "${_existing_ip}")
+			if [[ "${_normalized_existing}" == "${CLIENT_IPV6_CANDIDATE}" ]]; then
+				IPV6_EXISTS=1
+				break
+			fi
+		done < <(grep -oE '([0-9a-fA-F:]+)/128' "${SERVER_AWG_CONF}")
+		if [[ ${DOT_EXISTS} == '0' && ${IPV6_EXISTS} == '0' ]]; then
+			FREE_FOUND=1
+			break
+		fi
+	done
+
+	if [[ ${FREE_FOUND} -eq 0 ]]; then
+		echo "ERROR: no free IP addresses available (max 253 clients)" >&2
+		exit 1
+	fi
+
+	CLIENT_AWG_IPV4="${BASE_IP}.${DOT_IP}"
+	CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
+
+	# Generate key pair
+	local CLIENT_PRIV_KEY CLIENT_PUB_KEY CLIENT_PRE_SHARED_KEY
+	CLIENT_PRIV_KEY=$(awg genkey)
+	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | awg pubkey)
+	CLIENT_PRE_SHARED_KEY=$(awg genpsk)
+
+	# Non-interactive mode writes client configs to a dedicated directory under
+	# AMNEZIAWG_DIR with restrictive root-only permissions. This avoids writing
+	# into home directories and keeps access scoped to privileged callers.
+	local HOME_DIR="${AMNEZIAWG_DIR}/clients"
+	mkdir -p "${HOME_DIR}"
+	chmod 700 "${HOME_DIR}"
+
+	local CLIENT_DNS="${CLIENT_DNS_1}"
+	if [[ -n "${CLIENT_DNS_2}" ]]; then
+		CLIENT_DNS="${CLIENT_DNS_1},${CLIENT_DNS_2}"
+	fi
+
+	local CLIENT_AWG_IPV6_DISPLAY
+	CLIENT_AWG_IPV6_DISPLAY=$(compressIPv6 "${CLIENT_AWG_IPV6}")
+
+	# If SERVER_PUB_IP is IPv6, normalize brackets
+	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
+		SERVER_PUB_IP="${SERVER_PUB_IP#\[}"
+		SERVER_PUB_IP="${SERVER_PUB_IP%\]}"
+		SERVER_PUB_IP="[${SERVER_PUB_IP}]"
+	fi
+	local ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
+
+	local OLD_UMASK
+	OLD_UMASK="$(umask)"
+	umask 077
+
+	echo "[Interface]
+PrivateKey = ${CLIENT_PRIV_KEY}
+Address = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6_DISPLAY}/128
+DNS = ${CLIENT_DNS}
+Jc = ${SERVER_AWG_JC}
+Jmin = ${SERVER_AWG_JMIN}
+Jmax = ${SERVER_AWG_JMAX}
+S1 = ${SERVER_AWG_S1}
+S2 = ${SERVER_AWG_S2}
+S3 = ${SERVER_AWG_S3}
+S4 = ${SERVER_AWG_S4}
+H1 = ${SERVER_AWG_H1}
+H2 = ${SERVER_AWG_H2}
+H3 = ${SERVER_AWG_H3}
+H4 = ${SERVER_AWG_H4}
+
+[Peer]
+PublicKey = ${SERVER_PUB_KEY}
+PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+Endpoint = ${ENDPOINT}
+AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+
+	umask "${OLD_UMASK}"
+
+	local client_conf
+	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+	chmod 600 "${client_conf}" 2>/dev/null || true
+
+	# Keep non-interactive client configs root-owned.  The parent directory is
+	# intentionally root-owned with mode 0700, so chowning only the file does not
+	# make it readable/traversable by an unprivileged user.
+	if [[ -n "${AWG_WEB_USER:-}" ]] || { [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; }; then
+		echo "Warning: client config ${client_conf} is stored under a root-only directory and usually requires sudo or a privileged service account to read." >&2
+	fi
+
+	# Add peer to server config
+	echo -e "\n### Client ${CLIENT_NAME}
+[Peer]
+PublicKey = ${CLIENT_PUB_KEY}
+PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+AllowedIPs = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6}/128" >>"${SERVER_AWG_CONF}"
+
+	if ! awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>/tmp/amneziawg-syncconf.err; then
+		local sync_err
+		sync_err="$(cat /tmp/amneziawg-syncconf.err 2>/dev/null || true)"
+		rm -f /tmp/amneziawg-syncconf.err
+		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after adding client '${CLIENT_NAME}'" >&2
+		if [[ -n "${sync_err}" ]]; then
+			echo "${sync_err}" >&2
+		fi
+		exit 1
+	fi
+	rm -f /tmp/amneziawg-syncconf.err
+
+	# Print the config path to stdout for the caller
+	echo "${client_conf}"
+}
+
+function nonInteractiveRemoveClient() {
+	local CLIENT_NAME="$1"
+
+	if [[ -z "${CLIENT_NAME}" ]]; then
+		echo "ERROR: client name must not be empty" >&2
+		exit 1
+	fi
+	if ! [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+		echo "ERROR: client name contains unsafe characters" >&2
+		exit 1
+	fi
+	if [[ ${#CLIENT_NAME} -gt 15 ]]; then
+		echo "ERROR: client name must be at most 15 characters" >&2
+		exit 1
+	fi
+
+	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+
+	# Check the client exists
+	if [[ $(grep -c -xF "### Client ${CLIENT_NAME}" "${SERVER_AWG_CONF}") == 0 ]]; then
+		echo "ERROR: no client named '${CLIENT_NAME}' found" >&2
+		exit 1
+	fi
+
+	# Remove [Peer] block
+	# Note: CLIENT_NAME is validated to [a-zA-Z0-9_-]+ so it cannot contain
+	# sed metacharacters — safe to interpolate directly.
+	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "${SERVER_AWG_CONF}"
+
+	# Remove client config file (non-interactive configs are stored under
+	# ${AMNEZIAWG_DIR}/clients to keep them in a traversable directory).
+	local CLIENT_DIR="${AMNEZIAWG_DIR}/clients"
+	rm -f "${CLIENT_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+
+	local sync_err
+	sync_err=""
+	if ! sync_err="$(awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>&1)"; then
+		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after removing client '${CLIENT_NAME}'" >&2
+		if [[ -n "${sync_err}" ]]; then
+			echo "${sync_err}" >&2
+		fi
+		exit 1
+	fi
+
+	echo "OK"
+}
+
+function nonInteractiveListClients() {
+	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+	grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3 || true
+}
+
 # Only run main logic when executed directly (not when sourced for testing)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	# ── Non-interactive flags ─────────────────────────────────────────────
+	#
+	# These flags allow automation tooling (e.g. amneziawg-web) to invoke
+	# client lifecycle operations without interactive prompts.
+	#
+	# Usage:
+	#   amneziawg-install.sh --add-client <NAME>
+	#   amneziawg-install.sh --remove-client <NAME>
+	#   amneziawg-install.sh --list-clients
+	#
+	# Requires AmneziaWG to be already installed (params file must exist).
+	case "${1:-}" in
+		--add-client)
+			if [[ -z "${2:-}" ]]; then
+				echo "ERROR: --add-client requires a client name argument" >&2
+				exit 1
+			fi
+			initialCheck
+			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
+				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
+				exit 1
+			fi
+			loadParams
+			nonInteractiveAddClient "$2"
+			exit $?
+			;;
+		--remove-client)
+			if [[ -z "${2:-}" ]]; then
+				echo "ERROR: --remove-client requires a client name argument" >&2
+				exit 1
+			fi
+			initialCheck
+			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
+				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
+				exit 1
+			fi
+			loadParams
+			nonInteractiveRemoveClient "$2"
+			exit $?
+			;;
+		--list-clients)
+			initialCheck
+			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
+				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
+				exit 1
+			fi
+			loadParams
+			nonInteractiveListClients
+			exit $?
+			;;
+	esac
+
+	# ── Default interactive flow ──────────────────────────────────────────
 	# Check for root, virt, OS...
 	initialCheck
 

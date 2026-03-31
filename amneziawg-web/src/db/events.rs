@@ -44,6 +44,18 @@ pub const EVT_LOGIN_FAILED: &str = "login_failed";
 pub const EVT_LOGOUT: &str = "logout";
 /// Audit event for enabling or disabling a peer.
 pub const EVT_PEER_DISABLED: &str = "peer_disabled";
+/// Audit event when a user creation is requested.
+pub const EVT_USER_CREATE_REQUESTED: &str = "user_create_requested";
+/// Audit event when a user creation succeeds.
+pub const EVT_USER_CREATED: &str = "user_created";
+/// Audit event when a user creation fails.
+pub const EVT_USER_CREATE_FAILED: &str = "user_create_failed";
+/// Audit event when a user removal is requested.
+pub const EVT_USER_REMOVE_REQUESTED: &str = "user_remove_requested";
+/// Audit event when a user removal succeeds.
+pub const EVT_USER_REMOVED: &str = "user_removed";
+/// Audit event when a user removal fails.
+pub const EVT_USER_REMOVE_FAILED: &str = "user_remove_failed";
 
 /// Maximum number of events that can be returned in a single [`list_events`] call.
 pub const MAX_EVENTS_LIMIT: i64 = 200;
@@ -140,6 +152,21 @@ pub async fn list_events(
     .bind(capped_limit)
     .fetch_all(pool)
     .await
+}
+
+/// Remove `peer_id` references from historical events for a deleted peer.
+///
+/// This preserves audit rows while allowing the peer row itself to be deleted.
+/// Returns the number of events that were updated.
+pub async fn clear_peer_id_references(
+    pool: &SqlitePool,
+    peer_id: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("UPDATE events SET peer_id = NULL WHERE peer_id = ?")
+        .bind(peer_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -366,5 +393,143 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].peer_id, Some(pid));
         assert_eq!(rows[0].action, EVT_PEER_UPDATED);
+    }
+
+    // ── User lifecycle event constants ────────────────────────────────────
+
+    #[tokio::test]
+    async fn user_create_events_logged_correctly() {
+        let db = test_db().await;
+
+        log_event(
+            &db.pool,
+            EVT_USER_CREATE_REQUESTED,
+            None,
+            None,
+            Some(r#"{"name":"alice"}"#),
+            "admin",
+        )
+        .await;
+
+        log_event(
+            &db.pool,
+            EVT_USER_CREATED,
+            None,
+            None,
+            Some(r#"{"name":"alice","config_path":"/root/awg0-client-alice.conf"}"#),
+            "admin",
+        )
+        .await;
+
+        let rows = list_events(&db.pool, None, Some(EVT_USER_CREATED), 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, EVT_USER_CREATED);
+        assert!(rows[0].detail.as_deref().unwrap().contains("alice"));
+
+        let rows = list_events(&db.pool, None, Some(EVT_USER_CREATE_REQUESTED), 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn user_remove_events_logged_correctly() {
+        let db = test_db().await;
+        let pid = insert_peer(&db.pool, "REMOVE_KEY==").await;
+
+        let detail = format!(r#"{{"peer_id":{},"name":"bob"}}"#, pid);
+
+        log_event(
+            &db.pool,
+            EVT_USER_REMOVE_REQUESTED,
+            Some(pid),
+            None,
+            Some(&detail),
+            "admin",
+        )
+        .await;
+
+        log_event(
+            &db.pool,
+            EVT_USER_REMOVED,
+            Some(pid),
+            None,
+            Some(&detail),
+            "admin",
+        )
+        .await;
+
+        let rows = list_events(&db.pool, Some(pid), None, 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 2);
+
+        let rows = list_events(&db.pool, None, Some(EVT_USER_REMOVED), 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, EVT_USER_REMOVED);
+    }
+
+    #[tokio::test]
+    async fn user_create_failed_event_logged() {
+        let db = test_db().await;
+        log_event(
+            &db.pool,
+            EVT_USER_CREATE_FAILED,
+            None,
+            None,
+            Some(r#"{"name":"bad","error":"script failed"}"#),
+            "admin",
+        )
+        .await;
+
+        let rows = list_events(&db.pool, None, Some(EVT_USER_CREATE_FAILED), 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].detail.as_deref().unwrap().contains("script failed"));
+    }
+
+    #[tokio::test]
+    async fn user_remove_failed_event_logged() {
+        let db = test_db().await;
+        log_event(
+            &db.pool,
+            EVT_USER_REMOVE_FAILED,
+            None,
+            None,
+            Some(r#"{"name":"missing","error":"not found"}"#),
+            "admin",
+        )
+        .await;
+
+        let rows = list_events(&db.pool, None, Some(EVT_USER_REMOVE_FAILED), 10)
+            .await
+            .expect("list_events");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].detail.as_deref().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn clear_peer_id_references_nulls_matching_rows() {
+        let db = test_db().await;
+        let pid = insert_peer(&db.pool, "CLR_PID==").await;
+
+        log_event(&db.pool, EVT_PEER_UPDATED, Some(pid), Some("CLR_PID=="), None, "admin").await;
+        log_event(&db.pool, EVT_LOGIN_SUCCESS, None, None, None, "admin").await;
+
+        let changed = clear_peer_id_references(&db.pool, pid)
+            .await
+            .expect("clear peer refs");
+        assert_eq!(changed, 1);
+
+        let rows = list_events(&db.pool, None, Some(EVT_PEER_UPDATED), 10)
+            .await
+            .expect("list events");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].peer_id.is_none());
     }
 }

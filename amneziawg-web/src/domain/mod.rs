@@ -194,7 +194,7 @@ pub fn normalize_comment(s: &str) -> Option<String> {
 /// `max_chars + 1` characters to decide whether truncation is needed.
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
-        None => s.to_owned(),           // within limit – no truncation needed
+        None => s.to_owned(),                  // within limit – no truncation needed
         Some((idx, _)) => s[..idx].to_owned(), // truncate at byte boundary
     }
 }
@@ -414,7 +414,12 @@ mod tests {
     #[test]
     fn uses_display_name_first() {
         assert_eq!(
-            resolve_display_name(Some("Alice"), Some("gramm"), Some("awg0-client-gramm"), "abcdef1234567890"),
+            resolve_display_name(
+                Some("Alice"),
+                Some("gramm"),
+                Some("awg0-client-gramm"),
+                "abcdef1234567890"
+            ),
             "Alice"
         );
     }
@@ -422,7 +427,12 @@ mod tests {
     #[test]
     fn falls_back_to_friendly_name() {
         assert_eq!(
-            resolve_display_name(None, Some("gramm"), Some("awg0-client-gramm"), "abcdef1234567890"),
+            resolve_display_name(
+                None,
+                Some("gramm"),
+                Some("awg0-client-gramm"),
+                "abcdef1234567890"
+            ),
             "gramm"
         );
     }
@@ -451,7 +461,12 @@ mod tests {
     #[test]
     fn empty_display_name_uses_friendly_name() {
         assert_eq!(
-            resolve_display_name(Some(""), Some("gramm"), Some("awg0-client-gramm"), "abcdef1234567890"),
+            resolve_display_name(
+                Some(""),
+                Some("gramm"),
+                Some("awg0-client-gramm"),
+                "abcdef1234567890"
+            ),
             "gramm"
         );
     }

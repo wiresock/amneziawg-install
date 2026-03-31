@@ -158,6 +158,23 @@ sudo AUTO_INSTALL=y SERVER_PORT=51820 CLIENT_DNS_1=8.8.8.8 ./amneziawg-install.s
 
 ---
 
+## 🤖 Non-Interactive Client Management
+
+The install script also supports non-interactive flags for automation and scripting:
+
+```bash
+# Add a new client
+sudo ./amneziawg-install.sh --add-client alice
+
+# Remove a client
+sudo ./amneziawg-install.sh --remove-client alice
+
+# List all clients
+sudo ./amneziawg-install.sh --list-clients
+```
+
+---
+
 ## 📦 Requirements
 
 Supported Linux distributions:

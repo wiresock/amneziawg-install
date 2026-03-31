@@ -57,8 +57,7 @@ impl Database {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
-                SqliteConnectOptions::from_str("sqlite::memory:")
-                    .context("parse memory url")?,
+                SqliteConnectOptions::from_str("sqlite::memory:").context("parse memory url")?,
             )
             .await
             .context("connect test db")?;
@@ -76,8 +75,7 @@ impl Database {
 /// - anything else → treated as a filesystem path with `create_if_missing(true)`
 fn parse_db_options(input: &str) -> anyhow::Result<SqliteConnectOptions> {
     if input == "sqlite::memory:" || input == ":memory:" {
-        return SqliteConnectOptions::from_str("sqlite::memory:")
-            .context("parse in-memory url");
+        return SqliteConnectOptions::from_str("sqlite::memory:").context("parse in-memory url");
     }
 
     if input.starts_with("sqlite:") {
@@ -127,8 +125,7 @@ mod tests {
 
     #[test]
     fn parse_sqlite_url_absolute() {
-        let opts =
-            parse_db_options("sqlite:///var/lib/amneziawg-web/awg-web.db").expect("parse");
+        let opts = parse_db_options("sqlite:///var/lib/amneziawg-web/awg-web.db").expect("parse");
         drop(opts);
     }
 
@@ -206,7 +203,10 @@ mod tests {
         db.migrate().await.expect("migrate failed");
 
         let created = dir.path().join("rel-test.db");
-        assert!(created.exists(), "database file was not created for relative path");
+        assert!(
+            created.exists(),
+            "database file was not created for relative path"
+        );
 
         // Restore original directory
         std::env::set_current_dir(orig_dir).expect("restore cwd");
