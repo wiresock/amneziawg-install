@@ -988,13 +988,14 @@ setup_filesystem() {
                                     || warn "setfacl failed on ${parent_dir}. The service may not be able to reach ${AWG_CONFIG_DIR}."
                             else
                                 # Fallback without ACL support: only relax traversal on known-safe prefixes.
-                                if [[ "${AWG_CONFIG_DIR}" == /etc/amnezia/amneziawg* ]]; then
+                                # Ensure both AWG_CONFIG_DIR and the specific parent_dir are within the safe subtree.
+                                if [[ "${AWG_CONFIG_DIR}" == /etc/amnezia/amneziawg* ]] && [[ "${parent_dir}" == /etc/amnezia/amneziawg* ]]; then
                                     chmod o+x "${parent_dir}" 2>/dev/null \
                                         && info "Added traverse permission (o+x) on ${parent_dir} for service access." \
                                         || warn "Could not set o+x on ${parent_dir}. The service may not be able to reach ${AWG_CONFIG_DIR}."
                                     warn "Consider installing ACL tools (apt install acl) for a more targeted permission grant."
                                 else
-                                    warn "ACL tools (setfacl) are not available; refusing to broaden directory permissions for custom AWG_CONFIG_DIR '${AWG_CONFIG_DIR}'."
+                                    warn "Refusing to broaden permissions on ancestor directory '${parent_dir}' outside allowed prefix '/etc/amnezia/amneziawg*'."
                                     warn "Install ACL tools (e.g. apt install acl) or adjust directory ownership/permissions so ${SERVICE_USER} can traverse ancestors of ${AWG_CONFIG_DIR}."
                                 fi
                             fi

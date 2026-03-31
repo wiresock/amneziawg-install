@@ -703,10 +703,16 @@ Please report this issue."
                                 warn "Failed to adjust ACL on ${parent_dir}."
                             fi
                         else
-                            chmod o+x "${parent_dir}" 2>/dev/null \
-                                && info "Added traverse permission (o+x) on ${parent_dir} for service access." \
-                                || warn "Could not set o+x on ${parent_dir}."
-                            warn "Consider installing ACL tools for a more targeted permission grant."
+                            # Fallback without ACL support: only relax traversal on known-safe prefixes.
+                            if [[ "${awg_config_dir_upgrade}" == /etc/amnezia/amneziawg* ]] && [[ "${parent_dir}" == /etc/amnezia/amneziawg* ]]; then
+                                chmod o+x "${parent_dir}" 2>/dev/null \
+                                    && info "Added traverse permission (o+x) on ${parent_dir} for service access." \
+                                    || warn "Could not set o+x on ${parent_dir}."
+                                warn "Consider installing ACL tools for a more targeted permission grant."
+                            else
+                                warn "Refusing to broaden permissions on ancestor directory '${parent_dir}' outside allowed prefix '/etc/amnezia/amneziawg*'."
+                                warn "Install ACL tools (e.g. apt install acl) or adjust directory ownership/permissions so ${SERVICE_USER} can traverse ancestors of '${awg_config_dir_upgrade}'."
+                            fi
                         fi
                     fi
 
