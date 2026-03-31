@@ -24,13 +24,16 @@
 
 use std::collections::HashSet;
 use std::net::Ipv6Addr;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use thiserror::Error;
+#[cfg(unix)]
 use tracing::{debug, info};
 
 use crate::admin::script_bridge;
+#[cfg(unix)]
 use crate::awg;
 
 // ── Error type ──────────────────────────────────────────────────────────────
@@ -518,6 +521,7 @@ pub struct CreateClientResult {
 /// 6. Write the client config file to `config_dir`.
 /// 7. Append the peer block to the server config.
 /// 8. Sync the running AWG interface.
+#[cfg(unix)]
 pub fn create_client(
     config_dir: &Path,
     name: &str,
@@ -787,6 +791,17 @@ pub fn create_client(
         config_path: client_conf_path.to_string_lossy().to_string(),
         client_name: name.to_string(),
     })
+}
+
+#[cfg(not(unix))]
+pub fn create_client(
+    _config_dir: &Path,
+    _name: &str,
+    _disabled_keys: &HashSet<String>,
+) -> Result<CreateClientResult, CreateClientError> {
+    Err(CreateClientError::Internal(
+        "create_client is supported only on unix targets".to_string(),
+    ))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

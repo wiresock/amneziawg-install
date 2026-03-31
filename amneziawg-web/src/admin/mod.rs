@@ -16,9 +16,49 @@ use crate::db::events::{
 use crate::db::peers::{find_by_public_key, update_peer_disabled, PeerRow};
 use crate::db::Database;
 use crate::domain::PublicKey;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
 use self::script_bridge::{ScriptBridge, ScriptError};
+
+#[cfg(unix)]
+fn acquire_lifecycle_lock(lock_path: &std::path::Path) -> Result<std::fs::File, ScriptError> {
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)
+        .map_err(|err| {
+            ScriptError::LockFailed(format!(
+                "failed to open lock file for client removal at {lock_path:?}: {err}",
+            ))
+        })?;
+
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+                Err(ScriptError::LockBusy)
+            }
+            _ => Err(ScriptError::LockFailed(format!(
+                "failed to acquire lock for client removal: {err}"
+            ))),
+        };
+    }
+
+    Ok(f)
+}
+
+#[cfg(not(unix))]
+fn acquire_lifecycle_lock(lock_path: &std::path::Path) -> Result<std::fs::File, ScriptError> {
+    let _ = lock_path;
+    Err(ScriptError::LockFailed(
+        "file locking for add/remove lifecycle is supported only on unix targets".to_string(),
+    ))
+}
 
 /// Enable or disable a peer (admin action).
 pub struct SetPeerEnabledCommand {
@@ -262,32 +302,7 @@ pub async fn execute_remove_user(
     // Non-blocking (LOCK_NB) to avoid hanging web requests; returns an error
     // if another operation is in progress, matching create_client() behavior.
     let lock_path = config_dir.join(".create-client.lock");
-    let lock_result: Result<std::fs::File, ScriptError> = (|| {
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .open(&lock_path)
-            .map_err(|err| ScriptError::LockFailed(
-                format!("failed to open lock file for client removal at {lock_path:?}: {err}"),
-            ))?;
-        use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            return match err.raw_os_error() {
-                // Another process holds the lock: surface as a dedicated variant.
-                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-                    Err(ScriptError::LockBusy)
-                }
-                // Any other I/O error: include the underlying OS error for diagnostics.
-                _ => Err(ScriptError::LockFailed(
-                    format!("failed to acquire lock for client removal: {err}"),
-                )),
-            };
-        }
-        Ok(f)
-    })();
+    let lock_result = acquire_lifecycle_lock(&lock_path);
     let _lock_file = match lock_result {
         Ok(f) => f,
         Err(e) => {

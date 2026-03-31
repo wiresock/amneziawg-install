@@ -229,6 +229,7 @@ pub fn sync_interface(
 ///
 /// Executes `/usr/bin/awg genkey` (no sudo required — key generation only
 /// reads from `/dev/urandom`).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn genkey() -> Result<String, AwgError> {
     let output = Command::new(AWG_BIN).arg("genkey").output()?;
 
@@ -246,6 +247,7 @@ pub fn genkey() -> Result<String, AwgError> {
 /// Derive a public key from the given private key.
 ///
 /// Pipes `private_key` into `/usr/bin/awg pubkey` (no sudo required).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn pubkey(private_key: &str) -> Result<String, AwgError> {
     let mut child = Command::new(AWG_BIN)
         .arg("pubkey")
@@ -283,6 +285,7 @@ pub fn pubkey(private_key: &str) -> Result<String, AwgError> {
 /// Generate a new pre-shared key.
 ///
 /// Executes `/usr/bin/awg genpsk` (no sudo required).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn genpsk() -> Result<String, AwgError> {
     let output = Command::new(AWG_BIN).arg("genpsk").output()?;
 
@@ -301,6 +304,7 @@ pub fn genpsk() -> Result<String, AwgError> {
 ///
 /// Used to read the params file and server config without granting the
 /// service user direct filesystem access to sensitive files.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn read_file_via_sudo(path: &std::path::Path) -> Result<String, AwgError> {
     let output = Command::new(SUDO_BIN)
         .args(["-n", "/usr/bin/cat", "--"])
@@ -322,6 +326,7 @@ pub fn read_file_via_sudo(path: &std::path::Path) -> Result<String, AwgError> {
 ///
 /// The content is piped via stdin to avoid shell interpolation.  Used to
 /// add peer blocks to the server config file.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn append_file_via_sudo(path: &std::path::Path, content: &str) -> Result<(), AwgError> {
     let mut child = Command::new(SUDO_BIN)
         .args(["-n", "/usr/bin/tee", "-a", "--"])

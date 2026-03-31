@@ -1416,6 +1416,16 @@ async fn post_remove_user_form(
         }
     };
 
+    if let Err(e) = crate::admin::script_bridge::validate_client_name(&client_name) {
+        let public_key = peer.public_key.clone();
+        let snapshots = crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
+        let events = list_events(&state.db.pool, Some(id), None, 20).await?;
+        let dto = peer_row_to_detail(peer, snapshots);
+        let csrf = session_csrf_from_headers(&state, &headers);
+        let message = format!("Remove failed: peer is not managed by installer: {e}");
+        return Ok(Html(render_peer_detail_with_error(&dto, &csrf, &events, &message)).into_response());
+    }
+
     match crate::admin::execute_remove_user(
         &state.db,
         &state.script_bridge,
@@ -4183,6 +4193,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_remove_user_form_invalid_installer_name_renders_validation_error() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "DOTNAME_REMOVE_KEY==", Some("custom.name")).await;
+
+        sqlx::query(
+            "UPDATE peers SET has_config = 1, friendly_name = 'custom.name', \
+             config_name = 'custom.name' WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/users/{id}/remove"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=yes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("Remove failed: peer is not managed by installer"),
+            "HTML should include installer-managed validation error, got: {html}"
+        );
+        assert!(!html.contains("Remove failed: internal server error."));
     }
 
     #[test]
