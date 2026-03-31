@@ -2989,9 +2989,9 @@ function nonInteractiveAddClient() {
 	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | awg pubkey)
 	CLIENT_PRE_SHARED_KEY=$(awg genpsk)
 
-	# Non-interactive mode writes client configs to a dedicated, traversable
-	# directory under AMNEZIAWG_DIR.  This avoids writing into home directories
-	# that may not be traversable by the web service (e.g. /root).
+	# Non-interactive mode writes client configs to a dedicated directory under
+	# AMNEZIAWG_DIR with restrictive root-only permissions. This avoids writing
+	# into home directories and keeps access scoped to privileged callers.
 	local HOME_DIR="${AMNEZIAWG_DIR}/clients"
 	mkdir -p "${HOME_DIR}"
 	chmod 700 "${HOME_DIR}"

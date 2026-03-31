@@ -121,6 +121,32 @@ pub fn sanitized_create_error_category(error: &CreateClientError) -> &'static st
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn acquire_lifecycle_lock(lock_path: &Path) -> Result<std::fs::File, std::io::Error> {
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)?;
+
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(f)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn acquire_lifecycle_lock(_lock_path: &Path) -> Result<std::fs::File, std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "file locking for add/remove lifecycle is supported only on unix targets",
+    ))
+}
+
 pub fn sanitized_remove_error_category(error: &RemoveClientError) -> &'static str {
     match error {
         RemoveClientError::InvalidName(_) => "invalid_name",
@@ -720,32 +746,14 @@ pub fn create_client(
     // peer blocks.  The lock is held for the read→allocate→append sequence
     // and released automatically when `_lock_file` is dropped.
     let lock_path = config_dir.join(".create-client.lock");
-    let _lock_file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&lock_path)
-            .map_err(|e| CreateClientError::FileWrite(format!(
-                "open lock file: {e}"
-            )))?;
-        use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            return match err.raw_os_error() {
-                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-                    Err(CreateClientError::LockBusy)
-                }
-                _ => Err(CreateClientError::FileWrite(format!(
-                    "failed to acquire lock for client creation: {err}"
-                ))),
-            };
+    let _lock_file = acquire_lifecycle_lock(&lock_path).map_err(|err| match err.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+            CreateClientError::LockBusy
         }
-        f
-    };
+        _ => CreateClientError::FileWrite(format!(
+            "failed to acquire lock for client creation: {err}"
+        )),
+    })?;
 
     // Step 4: Read server config to check for duplicates and find used IPs.
     let server_conf_path = amneziawg_dir.join(format!("{}.conf", params.server_awg_nic));
