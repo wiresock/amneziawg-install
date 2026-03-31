@@ -104,6 +104,17 @@ async fn main() -> anyhow::Result<()> {
                 p.display()
             );
         }
+        if p.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        }) {
+            anyhow::bail!(
+                "AWG_CONFIG_DIR must not contain '.' or '..' path components, got: {}",
+                p.display()
+            );
+        }
         // Use symlink_metadata directly (no exists() pre-check) to avoid TOCTOU.
         match std::fs::symlink_metadata(p) {
             Ok(sym_meta) => {

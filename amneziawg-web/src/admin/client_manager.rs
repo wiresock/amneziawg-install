@@ -705,8 +705,8 @@ pub fn create_client(
             tracing::warn!(
                 dir = %config_dir.display(),
                 error = %e,
-                "could not chmod config dir (not owned by service user?); \
-                 directory ownership/permissions are acceptable, proceeding",
+                "chmod on config dir failed; verified directory is owned by service user \
+                 and not group/world-writable, proceeding",
             );
         } else {
             return Err(CreateClientError::FileWrite(format!(

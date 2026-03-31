@@ -710,16 +710,29 @@ validate_awg_config_dir() {
 
     # Try to resolve the real path to canonicalize and catch any remaining
     # indirection (e.g. /foo/../etc).
+    local resolved_ok=0
     resolved_path="${dir_path}"
     if command -v realpath >/dev/null 2>&1; then
         local resolved_tmp
         if resolved_tmp="$(realpath -m -- "${dir_path}" 2>/dev/null)"; then
             resolved_path="${resolved_tmp}"
+            resolved_ok=1
         fi
     elif command -v readlink >/dev/null 2>&1; then
         local resolved_tmp
         if resolved_tmp="$(readlink -f -- "${dir_path}" 2>/dev/null)"; then
             resolved_path="${resolved_tmp}"
+            resolved_ok=1
+        fi
+    fi
+
+    # If canonicalization is unavailable, reject dot-segment paths to avoid
+    # allowlist bypasses like /safe/../etc.
+    if [[ "${resolved_ok}" -ne 1 ]]; then
+        if [[ "${dir_path}" == *"/../"* || "${dir_path}" == "../"* || "${dir_path}" == *"/.." || \
+              "${dir_path}" == *"/./"*  || "${dir_path}" == "./"*  || "${dir_path}" == *"/." ]]; then
+            warn "AWG_CONFIG_DIR '${dir_path_raw}' contains '.' or '..' segments; skipping automatic ownership/permission changes."
+            return 1
         fi
     fi
     dir_path="${resolved_path}"
@@ -1540,6 +1553,7 @@ adjust_unit_hardening() {
     #    /etc/amnezia/amneziawg/*.conf.  If AWG_CONFIG_DIR is outside that tree,
     #    a separate ReadWritePaths entry is added to cover both paths.
     local etc_dir="/etc/amnezia/amneziawg"
+    local config_dir_sed="${config_dir//\\/\\\\}"
 
     if grep -q '^ReadOnlyPaths=' "${unit_file}" 2>/dev/null; then
         # Upgrade: replace ReadOnlyPaths with ReadWritePaths.
@@ -1550,7 +1564,7 @@ adjust_unit_hardening() {
         else
             # Replace the legacy line, then append an extra ReadWritePaths line.
             sed -i "s|^ReadOnlyPaths=.*|ReadWritePaths=${etc_dir}|" "${unit_file}"
-            sed -i "/^ReadWritePaths=${etc_dir//\//\\/}\$/a ReadWritePaths=${config_dir}" "${unit_file}"
+            sed -i "/^ReadWritePaths=${etc_dir//\//\\/}\$/a ReadWritePaths=${config_dir_sed}" "${unit_file}"
         fi
         info "Replaced ReadOnlyPaths with ReadWritePaths (${etc_dir}, ${config_dir})"
     elif grep -q '^ReadWritePaths=' "${unit_file}" 2>/dev/null; then
@@ -1596,11 +1610,11 @@ adjust_unit_hardening() {
             local data_linenum2=""
             data_linenum2=$(grep -n -F "ReadWritePaths=${data_base}" "${unit_file}" | head -1 | cut -d: -f1 || true)
             if [[ -n "${data_linenum2}" ]]; then
-                sed -i "${data_linenum2}i\\ReadWritePaths=${config_dir}" "${unit_file}"
+                sed -i "${data_linenum2}i\\ReadWritePaths=${config_dir_sed}" "${unit_file}"
             else
                 local last_rw2
                 last_rw2=$(grep -n '^ReadWritePaths=' "${unit_file}" | tail -1 | cut -d: -f1)
-                sed -i "${last_rw2}a\\ReadWritePaths=${config_dir}" "${unit_file}"
+                sed -i "${last_rw2}a\\ReadWritePaths=${config_dir_sed}" "${unit_file}"
             fi
             info "Added ReadWritePaths=${config_dir}"
         fi
