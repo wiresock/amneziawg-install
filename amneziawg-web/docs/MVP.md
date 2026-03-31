@@ -24,10 +24,10 @@
 |18 | Session cookie authentication             | `GET /login`, `POST /login`, `POST /logout`; Argon2id, `SameSite=Lax`   |
 |19 | Auth middleware on all protected routes   | HTML → redirect `/login`; API → 401 JSON; health always public           |
 |20 | Optional bearer token for API             | `Authorization: Bearer <token>` via `AUTH_API_TOKEN`                     |
-|21 | 232 unit + integration tests              | Auth, domain, DB, config, history, web handler, script bridge layers     |
-|22 | User create (direct)                     | `POST /api/admin/users`, HTML form at `/admin/users/add`; validates name; creates client directly via AWG commands (no install script) |
-|23 | User remove via install script            | `POST /api/admin/users/:id/remove`, HTML form at `/admin/users/:id/remove`; confirmation required; reuses `amneziawg-install.sh --remove-client` |
-|24 | Script bridge layer                       | `admin/script_bridge.rs`; explicit subprocess args; no shell interpolation; timeout handling; used for `--remove-client` and `--list-clients` only |
+|21 | 232 unit + integration tests              | Auth, domain, DB, config, history, web handler, lifecycle/admin layers    |
+|22 | User create (native Rust)                 | `POST /api/admin/users`, HTML form at `/admin/users/add`; validates name; allocates IPs; writes configs; syncs AWG directly |
+|23 | User remove (native Rust)                 | `POST /api/admin/users/:id/remove`, HTML form at `/admin/users/:id/remove`; confirmation required; rewrites server config and syncs AWG directly |
+|24 | Lifecycle locking + validation             | Shared add/remove lock (`.create-client.lock`) and installer-name validation for managed user actions |
 |25 | User lifecycle audit events               | `user_create_requested`, `user_created`, `user_create_failed`, `user_remove_requested`, `user_removed`, `user_remove_failed` |
 |26 | Post-action config rescan                 | `poller::rescan_configs()` called after create/remove; no manual restart needed |
 
@@ -162,10 +162,10 @@ never modify the same row in-place.
 |---|---|---|
 | `peer_updated` | `PATCH /api/peers/:id` and `POST /peers/:id` | `old_display_name`, `new_display_name`, `old_comment`, `new_comment` |
 | `peer_disabled` | Enable/disable peer | `old_disabled`, `new_disabled` |
-| `user_create_requested` | Before invoking install script to add client | `name` |
+| `user_create_requested` | Before native client creation starts | `name` |
 | `user_created` | After successful client creation | `name`, `config_path` |
 | `user_create_failed` | After failed client creation | `name`, `error` |
-| `user_remove_requested` | Before invoking install script to remove client | `peer_id`, `name` |
+| `user_remove_requested` | Before native client removal starts | `peer_id`, `name` |
 | `user_removed` | After successful client removal | `peer_id`, `name` |
 | `user_remove_failed` | After failed client removal | `peer_id`, `name`, `error` |
 | `login_success` | Successful `POST /login` | *(none)* |

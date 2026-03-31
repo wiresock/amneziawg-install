@@ -697,48 +697,10 @@ main() {
     # Precedence:
     #   1. AWG_INSTALL_SCRIPT environment variable (if set)
     #   2. AWG_INSTALL_SCRIPT from the env file (if present)
-    #   3. Default to /usr/local/bin/amneziawg-install.sh
-    local install_script_path="/usr/local/bin/amneziawg-install.sh"
-    if [[ -n "${AWG_INSTALL_SCRIPT:-}" ]]; then
-        install_script_path="${AWG_INSTALL_SCRIPT}"
-    elif [[ -f "${ENV_FILE}" ]]; then
-        local env_script_path
-        env_script_path="$(grep -E '^AWG_INSTALL_SCRIPT=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true)"
-        if [[ -n "${env_script_path}" ]]; then
-            install_script_path="${env_script_path}"
-        fi
-    fi
-
-    # Validate install_script_path before embedding it into sudoers.
-    # For upgrades, we warn and fall back to the default path rather than die,
-    # because the installation already exists and we don't want to brick it.
-    if [[ "${install_script_path}" != /* ]]; then
-        die "AWG_INSTALL_SCRIPT must be an absolute path, got: ${install_script_path}"
-    fi
-    if [[ "${install_script_path}" =~ [[:space:],] ]]; then
-        die "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: ${install_script_path}"
-    fi
-
-    # Require the script to be in a trusted root-owned directory, be a regular
-    # non-symlink file owned by root:root, and not group/other-writable.
-    if ! validate_awg_install_script_path "${install_script_path}"; then
-        warn "AWG_INSTALL_SCRIPT '${install_script_path}' failed path/directory policy validation."
-        warn "Falling back to default: ${DEFAULT_AWG_INSTALL_SCRIPT}"
-        install_script_path="${DEFAULT_AWG_INSTALL_SCRIPT}"
-    fi
-    if [[ -e "${install_script_path}" ]] && ! is_script_safe_for_sudoers "${install_script_path}"; then
-        warn "Install script '${install_script_path}' is not safe for sudoers (must be a regular non-symlink file owned by root:root, executable, not group/other-writable)."
-        warn "The sudoers rule will still reference this path, but the script may not work until fixed."
-    fi
-    if [[ ! -e "${install_script_path}" ]]; then
-        warn "Install script not found (will be checked at service startup): ${install_script_path}"
-    fi
-
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
-    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
-    # Direct client creation: read params file and server config, append peer blocks.
-    # Scoped to specific file patterns to minimize privilege surface.
-    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf"
+    # Direct client lifecycle in native Rust: read params/server config and
+    # rewrite or append peer blocks.
+    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf"
     info "Installing/updating sudoers drop-in: ${SUDOERS_FILE}"
     mkdir -p "$(dirname "${SUDOERS_FILE}")"
     printf '# Allow amneziawg-web service to manage AWG state and peers.\n' \
@@ -746,10 +708,7 @@ main() {
     printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \
         >> "${SUDOERS_FILE}"
     printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
-    printf '# Allow amneziawg-web to manage clients via the install script (remove/list).\n' \
-        >> "${SUDOERS_FILE}"
-    printf '%s\n' "${rule_install}" >> "${SUDOERS_FILE}"
-    printf '# Allow amneziawg-web to create clients directly (read params, append config).\n' \
+    printf '# Allow amneziawg-web to manage clients directly in Rust (read/rewrite config).\n' \
         >> "${SUDOERS_FILE}"
     printf '%s\n' "${rule_direct}" >> "${SUDOERS_FILE}"
     chmod 0440 "${SUDOERS_FILE}"

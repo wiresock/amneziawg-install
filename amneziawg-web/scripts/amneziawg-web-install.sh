@@ -1359,37 +1359,19 @@ install_sudoers() {
     # 2. Remove disabled peers via `awg set <iface> peer <key> remove`.
     # 3. Sync interface config via `awg syncconf` + `awg-quick strip` to
     #    restore re-enabled peers to the running interface.
-    # 4. Manage clients via the install script (remove/list).
-    # 5. Read server params and config for direct client creation.
-    # 6. Append peer blocks to the server config for direct client creation.
+    # 4. Read server params and config for native client lifecycle actions.
+    # 5. Rewrite/append peer blocks in the server config for create/remove.
     #
     # Instead of running the whole service as root, we install tightly-scoped
     # sudoers rules that grant the service user passwordless sudo for only
     # these specific commands.
 
-    local install_script_path
-    install_script_path="$(resolve_awg_install_script_path)"
-
-    # Validate install_script_path before embedding it into sudoers.
-    if [[ "${install_script_path}" != /* ]]; then
-        die "AWG_INSTALL_SCRIPT must be an absolute path, got: ${install_script_path}"
-    fi
-    if [[ "${install_script_path}" =~ [[:space:],] ]]; then
-        die "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: ${install_script_path}"
-    fi
-    validate_awg_install_script_target_path "${install_script_path}"
-    if [[ ! -x "${install_script_path}" ]]; then
-        warn "Install script not found or not executable (will be checked at service startup): ${install_script_path}"
-    fi
-
     local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
-    local rule_install="${SERVICE_USER} ALL=(root) NOPASSWD: ${install_script_path} --remove-client *, ${install_script_path} --list-clients"
-    # Direct client creation: read params file and server config, append peer blocks.
-    # Scoped to specific file patterns to minimize privilege surface.
-    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf"
+    # Direct client lifecycle in native Rust: read params/server config and
+    # rewrite or append peer blocks.
+    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf"
 
     info "Sudoers rule (AWG): ${rule_awg}"
-    info "Sudoers rule (install): ${rule_install}"
     info "Sudoers rule (direct): ${rule_direct}"
 
     # Ensure the sudoers drop-in directory exists (may be absent in minimal
@@ -1402,10 +1384,7 @@ install_sudoers() {
     printf '# Installed by amneziawg-web-install.sh – do not edit manually.\n' \
         >> "${SUDOERS_FILE}"
     printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
-    printf '# Allow amneziawg-web to manage clients via the install script (remove/list).\n' \
-        >> "${SUDOERS_FILE}"
-    printf '%s\n' "${rule_install}" >> "${SUDOERS_FILE}"
-    printf '# Allow amneziawg-web to create clients directly (read params, append config).\n' \
+    printf '# Allow amneziawg-web to manage clients directly in Rust (read/rewrite config).\n' \
         >> "${SUDOERS_FILE}"
     printf '%s\n' "${rule_direct}" >> "${SUDOERS_FILE}"
 

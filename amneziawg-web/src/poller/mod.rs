@@ -319,6 +319,54 @@ impl Poller {
     }
 }
 
+/// Perform a one-shot AWG peer snapshot into the `peers` table.
+///
+/// Unlike the full poller cycle, this helper does not write traffic snapshots
+/// and does not touch config mapping; it only upserts the latest peer rows so
+/// UI pages can reflect lifecycle changes immediately.
+pub async fn sync_peers_from_awg(db: &crate::db::Database) -> anyhow::Result<()> {
+    let interfaces = match awg::show_all_dump() {
+        Ok(ifaces) => ifaces,
+        Err(awg::AwgError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!("awg binary not found at /usr/bin/awg – skipping one-shot peer sync");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    for iface in &interfaces {
+        for peer in &iface.peers {
+            let endpoint = peer.endpoint.as_deref();
+            let allowed_ips = peer.allowed_ips.join(",");
+            let last_handshake = peer.last_handshake.map(|ts| ts.timestamp());
+            let rx = saturating_u64_to_i64(peer.rx_bytes);
+            let tx = saturating_u64_to_i64(peer.tx_bytes);
+
+            sqlx::query(
+                "INSERT INTO peers (public_key, endpoint, allowed_ips, last_handshake_at, rx_bytes, tx_bytes) \
+                 VALUES (?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(public_key) DO UPDATE SET \
+                     endpoint            = excluded.endpoint, \
+                     allowed_ips         = excluded.allowed_ips, \
+                     last_handshake_at   = excluded.last_handshake_at, \
+                     rx_bytes            = excluded.rx_bytes, \
+                     tx_bytes            = excluded.tx_bytes, \
+                     updated_at          = CURRENT_TIMESTAMP",
+            )
+            .bind(&peer.public_key.0)
+            .bind(endpoint)
+            .bind(&allowed_ips)
+            .bind(last_handshake)
+            .bind(rx)
+            .bind(tx)
+            .execute(&db.pool)
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Convert a `u64` counter to `i64`, capping at [`i64::MAX`] instead of
 /// silently wrapping.  Traffic counters from `awg show` can theoretically
 /// exceed `i64::MAX` (~9.2 EiB), but saturating avoids writing incorrect

@@ -362,6 +362,44 @@ pub fn append_file_via_sudo(path: &std::path::Path, content: &str) -> Result<(),
     Ok(())
 }
 
+/// Overwrite a root-owned file via `sudo -n /usr/bin/tee`.
+///
+/// The full replacement content is piped via stdin (no shell interpolation).
+/// Used by native client removal to rewrite the server config after deleting
+/// a client block.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn write_file_via_sudo(path: &std::path::Path, content: &str) -> Result<(), AwgError> {
+    let mut child = Command::new(SUDO_BIN)
+        .args(["-n", "/usr/bin/tee", "--"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(content.as_bytes()) {
+            tracing::debug!(error = %e, "stdin write to tee failed – aborting overwrite");
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e.into());
+        }
+    }
+
+    let output = child.wait_with_output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+
+    Ok(())
+}
+
 /// Remove `[Peer]` sections from a WireGuard stripped config whose
 /// `PublicKey` appears in `disabled_keys`.
 ///

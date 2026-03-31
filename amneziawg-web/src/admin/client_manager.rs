@@ -74,6 +74,33 @@ pub enum CreateClientError {
     Internal(String),
 }
 
+#[derive(Debug, Error)]
+pub enum RemoveClientError {
+    #[error("invalid client name: {0}")]
+    InvalidName(String),
+
+    #[error("client '{0}' not found in server config")]
+    ClientNotFound(String),
+
+    #[error("failed to read server parameters: {0}")]
+    ParamsRead(String),
+
+    #[error("failed to load data from database: {0}")]
+    DbRead(String),
+
+    #[error("failed to write config file: {0}")]
+    FileWrite(String),
+
+    #[error("AWG command failed: {0}")]
+    Awg(#[from] crate::awg::AwgError),
+
+    #[error("another add/remove operation is already in progress")]
+    LockBusy,
+
+    #[error("internal error during client removal: {0}")]
+    Internal(String),
+}
+
 /// Return a short, sanitized error category for use in audit event detail.
 ///
 /// This is stored in `events.detail` which is exposed via `/api/events`,
@@ -94,11 +121,33 @@ pub fn sanitized_create_error_category(error: &CreateClientError) -> &'static st
     }
 }
 
+pub fn sanitized_remove_error_category(error: &RemoveClientError) -> &'static str {
+    match error {
+        RemoveClientError::InvalidName(_) => "invalid_name",
+        RemoveClientError::ClientNotFound(_) => "client_not_found",
+        RemoveClientError::ParamsRead(_) => "params_read_failed",
+        RemoveClientError::DbRead(_) => "db_read_failed",
+        RemoveClientError::FileWrite(_) => "file_write_failed",
+        RemoveClientError::Awg(_) => "awg_command_failed",
+        RemoveClientError::LockBusy => "lock_busy",
+        RemoveClientError::Internal(_) => "internal_error",
+    }
+}
+
 impl From<script_bridge::ScriptError> for CreateClientError {
     fn from(e: script_bridge::ScriptError) -> Self {
         match e {
             script_bridge::ScriptError::InvalidName(msg) => CreateClientError::InvalidName(msg),
             other => CreateClientError::Internal(other.to_string()),
+        }
+    }
+}
+
+impl From<script_bridge::ScriptError> for RemoveClientError {
+    fn from(e: script_bridge::ScriptError) -> Self {
+        match e {
+            script_bridge::ScriptError::InvalidName(msg) => RemoveClientError::InvalidName(msg),
+            other => RemoveClientError::Internal(other.to_string()),
         }
     }
 }
@@ -495,6 +544,32 @@ fn build_peer_block(
     )
 }
 
+fn remove_client_block(server_config: &str, name: &str) -> Option<String> {
+    let marker = format!("### Client {name}");
+    let lines: Vec<&str> = server_config.lines().collect();
+    let marker_index = lines.iter().position(|line| line.trim() == marker)?;
+
+    let mut start = marker_index;
+    while start > 0 && lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+
+    let mut end = marker_index + 1;
+    while end < lines.len() && !lines[end].trim_start().starts_with("### Client ") {
+        end += 1;
+    }
+
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i >= start && i < end {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
+
 // ── Client creation ─────────────────────────────────────────────────────────
 
 /// Result of a successful client creation.
@@ -804,11 +879,85 @@ pub fn create_client(
     ))
 }
 
+#[cfg(unix)]
+pub fn remove_client(
+    config_dir: &Path,
+    name: &str,
+    disabled_keys: &HashSet<String>,
+) -> Result<(), RemoveClientError> {
+    script_bridge::validate_client_name(name)?;
+
+    let amneziawg_dir = Path::new("/etc/amnezia/amneziawg");
+    let params_path = amneziawg_dir.join("params");
+    let params_content = awg::read_file_via_sudo(&params_path)
+        .map_err(|e| RemoveClientError::ParamsRead(format!("failed to read params file: {e}")))?;
+    let params = parse_params(&params_content)
+        .map_err(|e| RemoveClientError::ParamsRead(e.to_string()))?;
+
+    let server_conf_path = amneziawg_dir.join(format!("{}.conf", params.server_awg_nic));
+    let server_config = awg::read_file_via_sudo(&server_conf_path)
+        .map_err(|e| RemoveClientError::ParamsRead(format!("failed to read server config: {e}")))?;
+
+    let updated = remove_client_block(&server_config, name)
+        .ok_or_else(|| RemoveClientError::ClientNotFound(name.to_string()))?;
+
+    awg::write_file_via_sudo(&server_conf_path, &updated)
+        .map_err(|e| RemoveClientError::FileWrite(format!("rewrite server config: {e}")))?;
+
+    if let Ok(entries) = std::fs::read_dir(config_dir) {
+        let suffix = format!("-client-{name}.conf");
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            if let Some(n) = file_name.to_str() {
+                if n.ends_with(&suffix) {
+                    if let Err(e) = std::fs::remove_file(entry.path()) {
+                        tracing::warn!(
+                            path = %entry.path().display(),
+                            error = %e,
+                            "failed to remove client config from config_dir"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    awg::sync_interface(&params.server_awg_nic, disabled_keys)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn remove_client(
+    _config_dir: &Path,
+    _name: &str,
+    _disabled_keys: &HashSet<String>,
+) -> Result<(), RemoveClientError> {
+    Err(RemoveClientError::Internal(
+        "remove_client is supported only on unix targets".to_string(),
+    ))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_client_block_removes_only_target_client_section() {
+        let server = "[Interface]\nPrivateKey = S\n\n### Client alice\n[Peer]\nPublicKey = A\nAllowedIPs = 10.66.66.2/32,fd42::2/128\n\n### Client bob\n[Peer]\nPublicKey = B\nAllowedIPs = 10.66.66.3/32,fd42::3/128\n";
+        let updated = remove_client_block(server, "alice").expect("alice block should exist");
+
+        assert!(!updated.contains("### Client alice"));
+        assert!(updated.contains("### Client bob"));
+        assert!(updated.contains("[Interface]"));
+    }
+
+    #[test]
+    fn remove_client_block_returns_none_for_unknown_client() {
+        let server = "[Interface]\nPrivateKey = S\n\n### Client alice\n[Peer]\nPublicKey = A\n";
+        assert!(remove_client_block(server, "missing").is_none());
+    }
 
     // ── parse_params ────────────────────────────────────────────────────
 

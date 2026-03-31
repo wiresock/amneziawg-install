@@ -13,7 +13,7 @@ mod web;
 
 use anyhow::Context;
 use clap::Parser;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::auth::AuthConfig;
 use crate::db::Database;
@@ -70,14 +70,6 @@ pub struct Config {
     /// Default is 86400 (24 hours).
     #[arg(long, env = "AUTH_SESSION_TTL_SECS", default_value_t = 86_400)]
     pub auth_session_ttl_secs: u64,
-
-    /// Path to the amneziawg-install.sh script used for user lifecycle actions.
-    #[arg(
-        long,
-        env = "AWG_INSTALL_SCRIPT",
-        default_value = crate::admin::script_bridge::DEFAULT_SCRIPT_PATH
-    )]
-    pub install_script: std::path::PathBuf,
 }
 
 #[tokio::main]
@@ -92,51 +84,6 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::parse();
     info!(listen = %config.listen, db = %config.database_url, "starting amneziawg-web");
-
-    // --- Validate install-script path early --------------------------------
-    // The script path is security-critical: it is invoked via sudo and must
-    // be an absolute path, free of whitespace/commas (sudoers can't handle
-    // those).  If the file doesn't exist yet (e.g. mid-install or
-    // deployments that don't use user lifecycle), we warn instead of failing
-    // so the rest of the service can still start.
-    {
-        let p = &config.install_script;
-        if !p.is_absolute() {
-            anyhow::bail!(
-                "AWG_INSTALL_SCRIPT must be an absolute path, got: {}",
-                p.display()
-            );
-        }
-        let s = p.to_string_lossy();
-        if s.chars().any(|c| c.is_whitespace()) || s.contains(',') {
-            anyhow::bail!(
-                "AWG_INSTALL_SCRIPT must not contain whitespace or commas, got: {}",
-                p.display()
-            );
-        }
-        if !p.is_file() {
-            warn!(
-                path = %p.display(),
-                "AWG_INSTALL_SCRIPT not found; client creation/deletion will fail \
-                 until the script is installed at the configured path"
-            );
-        } else {
-            // Best-effort executable check on Unix.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let meta = std::fs::metadata(p)
-                    .with_context(|| format!("cannot stat AWG_INSTALL_SCRIPT: {}", p.display()))?;
-                if meta.permissions().mode() & 0o111 == 0 {
-                    anyhow::bail!(
-                        "AWG_INSTALL_SCRIPT is not executable: {}",
-                        p.display()
-                    );
-                }
-            }
-            info!(path = %p.display(), "install script validated");
-        }
-    }
 
     // --- Validate config-dir path early --------------------------------------
     // AWG_CONFIG_DIR ends up in systemd ReadWritePaths= directives and is used
@@ -163,6 +110,12 @@ async fn main() -> anyhow::Result<()> {
                 if sym_meta.file_type().is_symlink() {
                     anyhow::bail!(
                         "AWG_CONFIG_DIR is a symbolic link, which is not allowed: {}",
+                        p.display()
+                    );
+                }
+                if !sym_meta.is_dir() {
+                    anyhow::bail!(
+                        "AWG_CONFIG_DIR exists but is not a directory: {}",
                         p.display()
                     );
                 }
@@ -213,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // --- HTTP server --------------------------------------------------------
-    let app = router(db, auth, config_dir, config.install_script);
+    let app = router(db, auth, config_dir);
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .context("failed to bind TCP listener")?;

@@ -17,7 +17,6 @@ use serde_json::json;
 use tower_http::trace::TraceLayer;
 use tracing::error;
 
-use crate::admin::script_bridge::ScriptBridge;
 use crate::auth::{
     add_session, check_and_record_login_attempt, clear_session_cookie, consume_login_csrf, csrf_eq,
     extract_session_token, generate_login_csrf, generate_session_id, get_session_csrf,
@@ -51,8 +50,6 @@ pub struct AppState {
     pub rate_limiter: LoginRateLimiter,
     /// Directory where AWG client configs are stored (for rescan).
     pub config_dir: std::path::PathBuf,
-    /// Bridge to the install script for user lifecycle actions.
-    pub script_bridge: std::sync::Arc<ScriptBridge>,
 }
 
 impl AppState {
@@ -60,7 +57,6 @@ impl AppState {
         db: Database,
         auth: AuthConfig,
         config_dir: std::path::PathBuf,
-        install_script: std::path::PathBuf,
     ) -> Self {
         Self {
             db,
@@ -69,7 +65,6 @@ impl AppState {
             login_csrf: new_login_csrf_store(),
             rate_limiter: new_login_rate_limiter(),
             config_dir,
-            script_bridge: std::sync::Arc::new(ScriptBridge::new(install_script)),
         }
     }
 }
@@ -427,9 +422,8 @@ pub fn router(
     db: Database,
     auth: AuthConfig,
     config_dir: std::path::PathBuf,
-    install_script: std::path::PathBuf,
 ) -> Router {
-    let state = AppState::new(db, auth, config_dir, install_script);
+    let state = AppState::new(db, auth, config_dir);
 
     // Protected routes – all require a valid session.
     let protected = Router::new()
@@ -1157,10 +1151,7 @@ async fn api_create_user(
     .await
     {
         Ok(result) => {
-            // Trigger a config rescan so config-to-peer mappings are updated after creation.
-            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
-                tracing::warn!(error = %e, "post-create config rescan failed");
-            }
+            refresh_peer_state_after_lifecycle(&state).await;
             Ok((
                 StatusCode::CREATED,
                 Json(json!({
@@ -1200,10 +1191,7 @@ async fn api_create_user(
             // caller knows the peer will become active after an explicit
             // AWG sync or service restart.
             tracing::warn!(error = %awg_err, "client created but interface sync failed");
-            // Still trigger a rescan so config-to-peer mappings pick up the new file.
-            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
-                tracing::warn!(error = %e, "post-create config rescan failed");
-            }
+            refresh_peer_state_after_lifecycle(&state).await;
             Ok((
                 StatusCode::CREATED,
                 Json(json!({
@@ -1272,7 +1260,6 @@ async fn api_remove_user(
 
     match crate::admin::execute_remove_user(
         &state.db,
-        &state.script_bridge,
         &state.config_dir,
         id,
         &client_name,
@@ -1281,15 +1268,13 @@ async fn api_remove_user(
     .await
     {
         Ok(()) => {
-            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
-                tracing::warn!(error = %e, "post-remove config rescan failed");
-            }
+            refresh_peer_state_after_lifecycle(&state).await;
             Ok(Json(json!({ "ok": true })).into_response())
         }
-        Err(crate::admin::script_bridge::ScriptError::InvalidName(msg)) => {
+        Err(crate::admin::client_manager::RemoveClientError::InvalidName(msg)) => {
             Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
         }
-        Err(crate::admin::script_bridge::ScriptError::LockBusy) => {
+        Err(crate::admin::client_manager::RemoveClientError::LockBusy) => {
             Ok((
                 StatusCode::CONFLICT,
                 Json(json!({ "error": "another add/remove operation is already in progress; please try again later" })),
@@ -1297,7 +1282,7 @@ async fn api_remove_user(
                 .into_response())
         }
         Err(e) => {
-            tracing::error!(error = %e, "failed to remove user via script");
+            tracing::error!(error = %e, "failed to remove user");
             Ok((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "internal server error" })),
@@ -1334,9 +1319,7 @@ async fn post_add_user_form(
     .await
     {
         Ok(_result) => {
-            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
-                tracing::warn!(error = %e, "post-create config rescan failed");
-            }
+            refresh_peer_state_after_lifecycle(&state).await;
             // Redirect back to the peer list.
             Ok(Redirect::to("/").into_response())
         }
@@ -1359,9 +1342,7 @@ async fn post_add_user_form(
             // partial success: rescan so the new peer appears, log the
             // warning, and redirect (PRG) instead of showing an error page.
             tracing::warn!(error = %awg_err, "interface sync failed after client creation (HTML form)");
-            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
-                tracing::warn!(error = %e, "post-create config rescan failed");
-            }
+            refresh_peer_state_after_lifecycle(&state).await;
             Ok(Redirect::to("/").into_response())
         }
         Err(e) => {
@@ -1428,7 +1409,6 @@ async fn post_remove_user_form(
 
     match crate::admin::execute_remove_user(
         &state.db,
-        &state.script_bridge,
         &state.config_dir,
         id,
         &client_name,
@@ -1437,14 +1417,12 @@ async fn post_remove_user_form(
     .await
     {
         Ok(()) => {
-            if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
-                tracing::warn!(error = %e, "post-remove config rescan failed");
-            }
+            refresh_peer_state_after_lifecycle(&state).await;
             Ok(Redirect::to("/").into_response())
         }
         Err(e) => {
             let message: &str = match &e {
-                crate::admin::script_bridge::ScriptError::LockBusy => {
+                crate::admin::client_manager::RemoveClientError::LockBusy => {
                     "Remove failed: another add/remove operation is already in progress; please try again later."
                 }
                 _ => {
@@ -1467,6 +1445,19 @@ async fn post_remove_user_form(
             let csrf = session_csrf_from_headers(&state, &headers);
             Ok(Html(render_peer_detail_with_error(&dto, &csrf, &events, message)).into_response())
         }
+    }
+}
+
+/// Refresh peer rows + config mapping after user lifecycle operations.
+///
+/// This avoids waiting for the next background poll cycle before newly added
+/// users appear in the web UI.
+async fn refresh_peer_state_after_lifecycle(state: &AppState) {
+    if let Err(e) = crate::poller::sync_peers_from_awg(&state.db).await {
+        tracing::warn!(error = %e, "post-lifecycle peer sync failed");
+    }
+    if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
+        tracing::warn!(error = %e, "post-lifecycle config rescan failed");
     }
 }
 
@@ -2164,7 +2155,6 @@ mod tests {
             db,
             AuthConfig::disabled(),
             std::path::PathBuf::from("/tmp/test-configs"),
-            std::path::PathBuf::from("/tmp/test-install.sh"),
         )
     }
 
@@ -2184,7 +2174,6 @@ mod tests {
                 db,
                 auth,
                 std::path::PathBuf::from("/tmp/test-configs"),
-                std::path::PathBuf::from("/tmp/test-install.sh"),
             ),
             "testpassword".to_string(),
         )
@@ -3371,7 +3360,6 @@ mod tests {
             db,
             auth,
             std::path::PathBuf::from("/tmp/test-configs"),
-            std::path::PathBuf::from("/tmp/test-install.sh"),
         );
 
         // Login succeeds and we get a session cookie ...

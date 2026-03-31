@@ -19,10 +19,10 @@ use crate::domain::PublicKey;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use self::script_bridge::{ScriptBridge, ScriptError};
+use self::client_manager::RemoveClientError;
 
 #[cfg(unix)]
-fn acquire_lifecycle_lock(lock_path: &std::path::Path) -> Result<std::fs::File, ScriptError> {
+fn acquire_lifecycle_lock(lock_path: &std::path::Path) -> Result<std::fs::File, RemoveClientError> {
     let f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -30,7 +30,7 @@ fn acquire_lifecycle_lock(lock_path: &std::path::Path) -> Result<std::fs::File, 
         .custom_flags(libc::O_NOFOLLOW)
         .open(lock_path)
         .map_err(|err| {
-            ScriptError::LockFailed(format!(
+            RemoveClientError::Internal(format!(
                 "failed to open lock file for client removal at {lock_path:?}: {err}",
             ))
         })?;
@@ -41,9 +41,9 @@ fn acquire_lifecycle_lock(lock_path: &std::path::Path) -> Result<std::fs::File, 
         let err = std::io::Error::last_os_error();
         return match err.raw_os_error() {
             Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-                Err(ScriptError::LockBusy)
+                Err(RemoveClientError::LockBusy)
             }
-            _ => Err(ScriptError::LockFailed(format!(
+            _ => Err(RemoveClientError::Internal(format!(
                 "failed to acquire lock for client removal: {err}"
             ))),
         };
@@ -53,9 +53,9 @@ fn acquire_lifecycle_lock(lock_path: &std::path::Path) -> Result<std::fs::File, 
 }
 
 #[cfg(not(unix))]
-fn acquire_lifecycle_lock(lock_path: &std::path::Path) -> Result<std::fs::File, ScriptError> {
+fn acquire_lifecycle_lock(lock_path: &std::path::Path) -> Result<std::fs::File, RemoveClientError> {
     let _ = lock_path;
-    Err(ScriptError::LockFailed(
+    Err(RemoveClientError::Internal(
         "file locking for add/remove lifecycle is supported only on unix targets".to_string(),
     ))
 }
@@ -117,7 +117,7 @@ pub async fn execute_set_peer_enabled(
 /// Result of a successful user creation.
 #[derive(Debug)]
 pub struct CreateUserResult {
-    /// The config path returned by the install script.
+    /// Absolute path to the generated client config file.
     pub config_path: String,
     /// The client name that was requested.
     pub client_name: String,
@@ -273,12 +273,11 @@ pub async fn execute_create_user(
 /// and will eventually stop appearing in `awg show` output.
 pub async fn execute_remove_user(
     db: &Database,
-    bridge: &ScriptBridge,
     config_dir: &std::path::Path,
     peer_id: i64,
     client_name: &str,
     actor: &str,
-) -> Result<(), ScriptError> {
+) -> Result<(), RemoveClientError> {
     script_bridge::validate_client_name(client_name)?;
 
     let detail = serde_json::json!({
@@ -307,7 +306,7 @@ pub async fn execute_remove_user(
         Ok(f) => f,
         Err(e) => {
             let error_kind = match &e {
-                ScriptError::LockBusy => "lock_busy",
+                RemoveClientError::LockBusy => "lock_busy",
                 _ => "lock_failed",
             };
             let detail = serde_json::json!({
@@ -329,30 +328,28 @@ pub async fn execute_remove_user(
         }
     };
 
-    match bridge.remove_client(client_name).await {
-        Ok(()) => {
-            // Best-effort cleanup: remove any matching client config from
-            // config_dir in case it differs from the script's default
-            // location (/etc/amnezia/amneziawg/clients).  Without this,
-            // a stale config file would linger and keep the peer "linked"
-            // after the next rescan.
-            if let Ok(mut entries) = tokio::fs::read_dir(config_dir).await {
-                let suffix = format!("-client-{client_name}.conf");
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name.ends_with(&suffix) {
-                            if let Err(e) = tokio::fs::remove_file(entry.path()).await {
-                                tracing::warn!(
-                                    path = %entry.path().display(),
-                                    error = %e,
-                                    "failed to remove client config from config_dir"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+    let disabled_keys = crate::db::peers::list_disabled_public_keys(&db.pool)
+        .await
+        .map_err(|e| RemoveClientError::DbRead(e.to_string()))?;
+    let dir = config_dir.to_path_buf();
+    let name = client_name.to_string();
+    let remove_result = tokio::task::spawn_blocking(move || {
+        client_manager::remove_client(&dir, &name, &disabled_keys)
+    })
+    .await;
 
+    let remove_result = match remove_result {
+        Ok(inner) => inner,
+        Err(e) => {
+            tracing::error!(error = %e, "client removal task panicked or was cancelled");
+            Err(RemoveClientError::Internal(
+                "internal error while running client removal task".to_string(),
+            ))
+        }
+    };
+
+    match remove_result {
+        Ok(()) => {
             let detail = serde_json::json!({
                 "peer_id": peer_id,
                 "name": client_name,
@@ -374,17 +371,9 @@ pub async fn execute_remove_user(
                 peer_id = %peer_id,
                 name = %client_name,
                 error = %e,
-                "failed to remove client via script"
+                "failed to remove client natively"
             );
-            let error_kind = match &e {
-                ScriptError::LockBusy => "lock_busy",
-                ScriptError::LockFailed(_) => "lock_failed",
-                ScriptError::Timeout(_) => "timeout",
-                ScriptError::Spawn(_) => "spawn_failed",
-                ScriptError::Wait(_) => "wait_failed",
-                ScriptError::NonZeroExit { .. } | ScriptError::Signal { .. } => "script_failed",
-                ScriptError::InvalidName(_) => "invalid_name",
-            };
+            let error_kind = client_manager::sanitized_remove_error_category(&e);
             let detail = serde_json::json!({
                 "peer_id": peer_id,
                 "name": client_name,
