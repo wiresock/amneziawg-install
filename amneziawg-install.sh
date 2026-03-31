@@ -1784,7 +1784,15 @@ PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6}/128" >>"${SERVER_AWG_CONF}"
 
-	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+	local sync_err
+	sync_err=""
+	if ! sync_err="$(awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>&1)"; then
+		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after adding client '${CLIENT_NAME}'" >&2
+		if [[ -n "${sync_err}" ]]; then
+			echo "${sync_err}" >&2
+		fi
+		exit 1
+	fi
 
 	# Generate QR code if qrencode is installed
 	if command -v qrencode &>/dev/null; then
@@ -3036,12 +3044,11 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 	chmod 600 "${client_conf}" 2>/dev/null || true
 
-	# When invoked via sudo, ensure the generated config is readable by the
-	# calling service user so the web service can serve config downloads.
-	if [[ -n "${AWG_WEB_USER:-}" ]]; then
-		chown "${AWG_WEB_USER}":"${AWG_WEB_USER}" "${client_conf}" 2>/dev/null || true
-	elif [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
-		chown "${SUDO_USER}":"${SUDO_USER}" "${client_conf}" 2>/dev/null || true
+	# Keep non-interactive client configs root-owned.  The parent directory is
+	# intentionally root-owned with mode 0700, so chowning only the file does not
+	# make it readable/traversable by an unprivileged user.
+	if [[ -n "${AWG_WEB_USER:-}" ]] || { [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; }; then
+		echo "Warning: client config ${client_conf} is stored under a root-only directory and usually requires sudo or a privileged service account to read." >&2
 	fi
 
 	# Add peer to server config
@@ -3051,7 +3058,17 @@ PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6}/128" >>"${SERVER_AWG_CONF}"
 
-	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+	if ! awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>/tmp/amneziawg-syncconf.err; then
+		local sync_err
+		sync_err="$(cat /tmp/amneziawg-syncconf.err 2>/dev/null || true)"
+		rm -f /tmp/amneziawg-syncconf.err
+		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after adding client '${CLIENT_NAME}'" >&2
+		if [[ -n "${sync_err}" ]]; then
+			echo "${sync_err}" >&2
+		fi
+		exit 1
+	fi
+	rm -f /tmp/amneziawg-syncconf.err
 
 	# Print the config path to stdout for the caller
 	echo "${client_conf}"
@@ -3091,7 +3108,15 @@ function nonInteractiveRemoveClient() {
 	local CLIENT_DIR="${AMNEZIAWG_DIR}/clients"
 	rm -f "${CLIENT_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
-	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+	local sync_err
+	sync_err=""
+	if ! sync_err="$(awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>&1)"; then
+		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after removing client '${CLIENT_NAME}'" >&2
+		if [[ -n "${sync_err}" ]]; then
+			echo "${sync_err}" >&2
+		fi
+		exit 1
+	fi
 
 	echo "OK"
 }

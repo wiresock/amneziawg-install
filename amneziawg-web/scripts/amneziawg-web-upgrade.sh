@@ -674,6 +674,19 @@ Please report this issue."
                 && info "Created config directory: ${awg_config_dir_upgrade}" \
                 || warn "Could not create ${awg_config_dir_upgrade}. Direct client creation may fail until the directory is created with correct ownership."
         fi
+
+        # Verify the service user can traverse all parent directories up to
+        # AWG_CONFIG_DIR. Fixing only the leaf directory is not sufficient if
+        # an ancestor lacks execute permission for ${SERVICE_USER}.
+        if command -v sudo >/dev/null 2>&1; then
+            if ! sudo -u "${SERVICE_USER}" test -x "${awg_config_dir_upgrade}" 2>/dev/null; then
+                warn "Service user '${SERVICE_USER}' may not be able to traverse all parent directories of '${awg_config_dir_upgrade}'."
+                warn "Ensure each parent directory grants execute ('x') permission to '${SERVICE_USER}' or rerun installer filesystem setup."
+            fi
+        else
+            warn "Could not verify traversal permissions for '${SERVICE_USER}' (sudo not available)."
+            warn "Ensure all parent directories of '${awg_config_dir_upgrade}' grant execute ('x') permission to '${SERVICE_USER}'."
+        fi
     fi
 
     # 4. Optional: refresh systemd unit file
