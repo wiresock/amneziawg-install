@@ -176,6 +176,17 @@ pub async fn update_peer_metadata(
     find_by_id(pool, id).await
 }
 
+/// Delete a peer row by integer ID.
+///
+/// Returns `true` if a row was deleted, `false` if no peer with that ID exists.
+pub async fn delete_by_id(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM peers WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Update the `disabled` flag for a single peer.
 ///
 /// Returns the updated `PeerRow`, or `None` if no peer with the given `id`
@@ -620,6 +631,27 @@ mod tests {
             .await
             .expect("no db error");
         assert!(result.is_none());
+    }
+
+    // ── delete_by_id ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_by_id_existing_peer_removes_row() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_DEL=", Some("ToRemove")).await;
+
+        let deleted = delete_by_id(&db.pool, id).await.expect("delete");
+        assert!(deleted);
+
+        let row = find_by_id(&db.pool, id).await.expect("find");
+        assert!(row.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_by_id_missing_peer_returns_false() {
+        let db = test_db().await;
+        let deleted = delete_by_id(&db.pool, 9999).await.expect("delete");
+        assert!(!deleted);
     }
 
     // ── list_disabled_public_keys ───────────────────────────────────────

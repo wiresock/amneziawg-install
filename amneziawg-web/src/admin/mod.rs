@@ -350,6 +350,14 @@ pub async fn execute_remove_user(
 
     match remove_result {
         Ok(()) => {
+            if let Err(e) = crate::db::peers::delete_by_id(&db.pool, peer_id).await {
+                tracing::warn!(
+                    peer_id = %peer_id,
+                    error = %e,
+                    "failed to delete removed peer row from database"
+                );
+            }
+
             let detail = serde_json::json!({
                 "peer_id": peer_id,
                 "name": client_name,
@@ -358,7 +366,7 @@ pub async fn execute_remove_user(
             log_event(
                 &db.pool,
                 EVT_USER_REMOVED,
-                Some(peer_id),
+                None,
                 None,
                 Some(&detail),
                 actor,
