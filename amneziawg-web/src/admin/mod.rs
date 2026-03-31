@@ -16,8 +16,6 @@ use crate::db::events::{
 use crate::db::peers::{find_by_public_key, update_peer_disabled, PeerRow};
 use crate::db::Database;
 use crate::domain::PublicKey;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 
 use self::client_manager::{RemoveClientError, acquire_lifecycle_lock};
 
