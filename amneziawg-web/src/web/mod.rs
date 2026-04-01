@@ -2291,7 +2291,8 @@ function showQr(peerId){
     .catch(function(e){content.innerHTML='<p style="color:#c00">'+e.message+'</p>'});
 }
 function hideQr(ev){
-  if(ev.target===document.getElementById('qr-overlay')||ev.currentTarget.classList.contains('qr-modal-close'))
+  var el=ev.target;
+  if(el===document.getElementById('qr-overlay')||el.classList.contains('qr-modal-close'))
     document.getElementById('qr-overlay').classList.remove('active');
 }
 document.addEventListener('keydown',function(e){if(e.key==='Escape')document.getElementById('qr-overlay').classList.remove('active')});
