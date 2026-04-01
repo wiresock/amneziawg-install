@@ -876,7 +876,11 @@ async fn get_peer_config(
         }
     };
 
-    if !canonical_path.starts_with(&state.config_dir) {
+    let canonical_config_dir = tokio::fs::canonicalize(&state.config_dir)
+        .await
+        .unwrap_or_else(|_| state.config_dir.clone());
+
+    if !canonical_path.starts_with(&canonical_config_dir) {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
@@ -1003,7 +1007,11 @@ async fn get_peer_qr(
         }
     };
 
-    if !canonical_path.starts_with(&state.config_dir) {
+    let canonical_config_dir = tokio::fs::canonicalize(&state.config_dir)
+        .await
+        .unwrap_or_else(|_| state.config_dir.clone());
+
+    if !canonical_path.starts_with(&canonical_config_dir) {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
@@ -1044,7 +1052,7 @@ async fn get_peer_qr(
         [
             (
                 axum::http::header::CONTENT_TYPE,
-                "image/svg+xml".to_string(),
+                "image/svg+xml; charset=utf-8".to_string(),
             ),
             (
                 axum::http::header::CACHE_CONTROL,
@@ -2375,16 +2383,19 @@ Historical data (snapshots, events) will be preserved.</p>
 function showQr(peerId){
   var overlay=document.getElementById('qr-overlay');
   var content=document.getElementById('qr-content');
-  content.innerHTML='<p>Loading\u2026</p>';
+  while(content.firstChild) content.removeChild(content.firstChild);
+  var loadingP=document.createElement('p');
+  loadingP.textContent='Loading\u2026';
+  content.appendChild(loadingP);
   overlay.classList.add('active');
   var img=document.createElement('img');
   img.alt='QR code';
   img.onload=function(){
-    content.innerHTML='';
+    while(content.firstChild) content.removeChild(content.firstChild);
     content.appendChild(img);
   };
   img.onerror=function(){
-    content.innerHTML='';
+    while(content.firstChild) content.removeChild(content.firstChild);
     var p=document.createElement('p');
     p.style.color='#c00';
     p.textContent='Failed to load QR code';
