@@ -1004,6 +1004,8 @@ async fn get_all_usage(
     };
     Ok(Json(dto).into_response())
 }
+
+/// Check that a config path is absolute and free of `.`/`..` traversal
 /// components.  Shared by `get_peer_config` and `get_peer_qr` so the
 /// validation logic stays in sync.
 fn is_safe_config_path(path: &std::path::Path) -> bool {
