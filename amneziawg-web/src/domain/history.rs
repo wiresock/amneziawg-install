@@ -62,6 +62,9 @@ pub struct SnapshotInput {
 /// only need `rx_total_delta` / `tx_total_delta` (e.g. the usage-summary
 /// endpoints).  It avoids allocating the `Vec<HistoryPoint>` and cloning
 /// each snapshot timestamp.
+///
+/// - `snapshots` must be sorted **oldest first** (ascending `captured_at`).
+///   Passing descending-ordered snapshots will produce incorrect totals.
 pub fn compute_usage_summary(snapshots: &[SnapshotInput]) -> HistorySummary {
     let mut rx_total: u64 = 0;
     let mut tx_total: u64 = 0;

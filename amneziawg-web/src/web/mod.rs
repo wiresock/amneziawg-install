@@ -28,7 +28,7 @@ use crate::db::events::{
     list_events, log_event, EVT_LOGIN_FAILED, EVT_LOGIN_SUCCESS, EVT_LOGOUT, EVT_PEER_DISABLED,
     EVT_PEER_UPDATED,
 };
-use crate::db::peers::{PeerRow, SnapshotRow};
+use crate::db::peers::{PeerRow, SnapshotRow, UsageSnapshotRow};
 use crate::db::Database;
 use crate::domain::history::{
     compute_history, compute_usage_summary, HistoryPoint, HistorySummary, SnapshotInput,
@@ -430,6 +430,14 @@ fn snapshot_row_to_dto(row: SnapshotRow) -> SnapshotDto {
 }
 
 fn snapshot_row_to_input(row: SnapshotRow) -> SnapshotInput {
+    SnapshotInput {
+        captured_at: row.captured_at,
+        rx_bytes: row.rx_bytes as u64,
+        tx_bytes: row.tx_bytes as u64,
+    }
+}
+
+fn usage_snapshot_row_to_input(row: UsageSnapshotRow) -> SnapshotInput {
     SnapshotInput {
         captured_at: row.captured_at,
         rx_bytes: row.rx_bytes as u64,
@@ -977,7 +985,7 @@ async fn get_all_usage(
         snap_map
             .entry(key)
             .or_default()
-            .push(snapshot_row_to_input(row));
+            .push(usage_snapshot_row_to_input(row));
     }
 
     let mut peer_usages: Vec<PeerUsageDto> = Vec::with_capacity(peers.len());

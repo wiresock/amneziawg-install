@@ -50,6 +50,20 @@ pub struct SnapshotRow {
     pub tx_bytes: i64,
 }
 
+/// Narrower snapshot row used by the usage-summary endpoints.
+///
+/// Contains only the columns needed for traffic delta computation, avoiding the
+/// I/O and allocation overhead of fetching unused fields like `endpoint` and
+/// `last_handshake_at`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UsageSnapshotRow {
+    pub public_key: String,
+    /// ISO-8601 / RFC-3339 timestamp when this snapshot was captured.
+    pub captured_at: String,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+}
+
 /// Return all peers ordered by their integer ID.
 pub async fn list_all(pool: &SqlitePool) -> Result<Vec<PeerRow>, sqlx::Error> {
     sqlx::query_as::<_, PeerRow>(
@@ -132,13 +146,16 @@ pub async fn find_snapshots_since(
 /// Return snapshots for **all** peers captured on or after `since_rfc3339`,
 /// ordered by `public_key` then `captured_at` **ascending** (oldest first).
 ///
+/// Returns the narrower [`UsageSnapshotRow`] (only `public_key`, `captured_at`,
+/// `rx_bytes`, `tx_bytes`) to avoid fetching unused columns.
+///
 /// Used by the traffic-usage endpoint to compute per-peer deltas in bulk.
 pub async fn find_all_snapshots_since(
     pool: &SqlitePool,
     since_rfc3339: &str,
-) -> Result<Vec<SnapshotRow>, sqlx::Error> {
-    sqlx::query_as::<_, SnapshotRow>(
-        "SELECT id, public_key, captured_at, endpoint, last_handshake_at, rx_bytes, tx_bytes
+) -> Result<Vec<UsageSnapshotRow>, sqlx::Error> {
+    sqlx::query_as::<_, UsageSnapshotRow>(
+        "SELECT public_key, captured_at, rx_bytes, tx_bytes
          FROM   snapshots
          WHERE  captured_at >= ?
          ORDER  BY public_key, captured_at ASC",
