@@ -500,8 +500,8 @@ fn period_to_secs(period: &str) -> i64 {
     }
 }
 
-/// Normalise the `period` query parameter to one of the canonical strings.
-fn normalise_period(period: &str) -> &'static str {
+/// Normalize the `period` query parameter to one of the canonical strings.
+fn normalize_period(period: &str) -> &'static str {
     match period {
         "week" => "week",
         "month" => "month",
@@ -913,7 +913,7 @@ async fn get_peer_usage(
     };
 
     let period_raw = params.period.as_deref().unwrap_or("day");
-    let period = normalise_period(period_raw);
+    let period = normalize_period(period_raw);
     let secs = period_to_secs(period);
     let since = Utc::now() - chrono::Duration::seconds(secs);
     let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -956,7 +956,7 @@ async fn get_all_usage(
     Query(params): Query<UsageQuery>,
 ) -> Result<Response, ApiError> {
     let period_raw = params.period.as_deref().unwrap_or("day");
-    let period = normalise_period(period_raw);
+    let period = normalize_period(period_raw);
     let secs = period_to_secs(period);
     let since = Utc::now() - chrono::Duration::seconds(secs);
     let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -967,18 +967,20 @@ async fn get_all_usage(
         crate::db::peers::find_all_snapshots_since(&state.db.pool, &since_str).await?;
 
     // Group snapshots by public_key (already sorted by public_key, captured_at ASC).
-    let mut snap_map: std::collections::HashMap<&str, Vec<SnapshotInput>> =
+    // Consume rows to avoid cloning SnapshotRow.
+    let mut snap_map: std::collections::HashMap<String, Vec<SnapshotInput>> =
         std::collections::HashMap::new();
-    for row in &all_snapshots {
+    for row in all_snapshots {
+        let key = row.public_key.clone();
         snap_map
-            .entry(&row.public_key)
+            .entry(key)
             .or_default()
-            .push(snapshot_row_to_input(row.clone()));
+            .push(snapshot_row_to_input(row));
     }
 
     let mut peer_usages: Vec<PeerUsageDto> = Vec::with_capacity(peers.len());
     for peer in &peers {
-        let inputs = snap_map.remove(peer.public_key.as_str()).unwrap_or_default();
+        let inputs = snap_map.remove(&peer.public_key).unwrap_or_default();
         let (_, summary) = compute_history(&inputs);
 
         let name = resolve_display_name(
@@ -2561,8 +2563,12 @@ Historical data (snapshots, events) will be preserved.</p>
   }}
   periods.forEach(function(p){{
     fetch('/api/peers/{id}/usage?period='+p,{{credentials:'same-origin'}})
-      .then(function(r){{return r.json();}})
+      .then(function(r){{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+      }})
       .then(function(d){{
+        if(typeof d.rx_bytes!=='number'||typeof d.tx_bytes!=='number') throw new Error('Invalid data');
         document.getElementById('usage-rx-'+p).textContent=fmtBytes(d.rx_bytes);
         document.getElementById('usage-tx-'+p).textContent=fmtBytes(d.tx_bytes);
       }})
