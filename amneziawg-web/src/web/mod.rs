@@ -844,7 +844,47 @@ async fn get_peer_config(
             .into_response());
     }
 
-    let content = match tokio::fs::read_to_string(&config_path).await {
+    // Prevent serving arbitrary files via symlinked config paths.
+    let metadata = match tokio::fs::symlink_metadata(&config_path).await {
+        Ok(m) => m,
+        Err(_) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "config file not found on disk" })),
+            )
+                .into_response())
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "invalid config path" })),
+        )
+            .into_response());
+    }
+
+    // Ensure the resolved path remains within the configured directory.
+    let canonical_path = match tokio::fs::canonicalize(&config_path).await {
+        Ok(p) => p,
+        Err(_) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "config file not found on disk" })),
+            )
+                .into_response())
+        }
+    };
+
+    if !canonical_path.starts_with(&state.config_dir) {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "invalid config path" })),
+        )
+            .into_response());
+    }
+
+    let content = match tokio::fs::read_to_string(&canonical_path).await {
         Ok(c) => c,
         Err(_) => {
             return Ok((
@@ -931,7 +971,47 @@ async fn get_peer_qr(
             .into_response());
     }
 
-    let content = match tokio::fs::read_to_string(&config_path).await {
+    // Ensure the config file is not a symlink and remains within the configured
+    // config directory after path resolution, to avoid serving arbitrary files.
+    let metadata = match tokio::fs::symlink_metadata(&config_path).await {
+        Ok(m) => m,
+        Err(_) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "config file not found on disk" })),
+            )
+                .into_response())
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "invalid config path" })),
+        )
+            .into_response());
+    }
+
+    let canonical_path = match tokio::fs::canonicalize(&config_path).await {
+        Ok(p) => p,
+        Err(_) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "invalid config path" })),
+            )
+                .into_response())
+        }
+    };
+
+    if !canonical_path.starts_with(&state.config_dir) {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "invalid config path" })),
+        )
+            .into_response());
+    }
+
+    let content = match tokio::fs::read_to_string(&canonical_path).await {
         Ok(c) => c,
         Err(_) => {
             return Ok((
@@ -1900,7 +1980,7 @@ fn html_head(title: &str) -> String {
   .qr-modal-overlay.active {{ display:flex; }}
   .qr-modal {{ background:#fff; border-radius:8px; padding:1.5rem; max-width:360px; width:90%; text-align:center; position:relative; }}
   .qr-modal h3 {{ margin:0 0 1rem; font-size:1.1rem; }}
-  .qr-modal svg {{ max-width:100%; height:auto; }}
+  .qr-modal svg, .qr-modal img {{ max-width:100%; height:auto; }}
   .qr-modal-close {{ position:absolute; top:.5rem; right:.75rem; background:none; border:none; font-size:1.3rem; cursor:pointer; color:#666; }}
   .qr-modal-close:hover {{ color:#222; }}
   .qr-link {{ cursor:pointer; background:none; border:none; color:#0066cc; font:inherit; padding:0; text-decoration:none; }}
@@ -2350,6 +2430,11 @@ mod tests {
             AuthConfig::disabled(),
             std::path::PathBuf::from("/tmp/test-configs"),
         )
+    }
+
+    /// Build a router with auth disabled and a custom config directory.
+    fn test_router_with_config_dir(db: Database, config_dir: std::path::PathBuf) -> Router {
+        router(db, AuthConfig::disabled(), config_dir)
     }
 
     /// Build a router with auth enabled and known test credentials.
@@ -3993,7 +4078,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "KEY_DLCONF=", None).await;
 
-        // Create a temp config file.
+        // Create a temp config file inside the config directory.
         let dir = tempfile::tempdir().unwrap();
         let conf_path = dir.path().join("test-client.conf");
         std::fs::write(&conf_path, "[Interface]\nAddress = 10.0.0.2/32\n").unwrap();
@@ -4009,7 +4094,7 @@ mod tests {
         .await
         .unwrap();
 
-        let app = test_router(db);
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4489,7 +4574,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "KEY_QR_OK=", None).await;
 
-        // Create a temp config file.
+        // Create a temp config file inside the config directory.
         let dir = tempfile::tempdir().unwrap();
         let conf_path = dir.path().join("test-qr.conf");
         std::fs::write(&conf_path, "[Interface]\nAddress = 10.0.0.2/32\n").unwrap();
@@ -4504,7 +4589,7 @@ mod tests {
         .await
         .unwrap();
 
-        let app = test_router(db);
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
@@ -4563,7 +4648,7 @@ mod tests {
         .await
         .unwrap();
 
-        let app = test_router(db);
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
