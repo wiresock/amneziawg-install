@@ -87,7 +87,13 @@ impl AppState {
             .get_or_try_init(|| async {
                 tokio::fs::canonicalize(&self.config_dir)
                     .await
-                    .map_err(|_| ())
+                    .map_err(|e| {
+                        error!(
+                            error = ?e,
+                            config_dir = ?self.config_dir,
+                            "failed to canonicalize config directory"
+                        );
+                    })
             })
             .await
             .ok()
@@ -4544,6 +4550,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "QR 404 response must set Cache-Control: no-store",
+        );
+        assert_eq!(
+            headers.get("pragma").and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "QR 404 response must set Pragma: no-cache",
+        );
     }
 
     #[tokio::test]
@@ -4615,6 +4633,14 @@ mod tests {
             .unwrap();
         assert_eq!(cache_control, "no-store", "QR response must not be cached");
 
+        let pragma = response
+            .headers()
+            .get("pragma")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(pragma, "no-cache", "QR response must not be cached");
+
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -4654,6 +4680,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // 422 QR responses should also be non-cacheable.
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "QR 422 response must set Cache-Control: no-store",
+        );
+        assert_eq!(
+            headers.get("pragma").and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "QR 422 response must set Pragma: no-cache",
+        );
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
