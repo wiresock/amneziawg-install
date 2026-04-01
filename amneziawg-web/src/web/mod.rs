@@ -54,9 +54,10 @@ pub struct AppState {
     /// Populated on first successful canonicalization (either at startup or on
     /// the first request that triggers it), so that a `config_dir` created
     /// after the process starts still gets properly resolved.
-    /// Stored as `Option<PathBuf>`: `Some` on success, `None` when a persistent
-    /// (non-`NotFound`) error has been cached so we stop retrying/logging.
-    canonical_config_dir: std::sync::Arc<tokio::sync::OnceCell<Option<std::path::PathBuf>>>,
+    canonical_config_dir: std::sync::Arc<tokio::sync::OnceCell<std::path::PathBuf>>,
+    /// Set once after logging a non-`NotFound` canonicalization error so
+    /// subsequent retries don't flood the logs.
+    logged_canon_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -69,7 +70,7 @@ impl AppState {
         // Eagerly try to canonicalize at startup; if the dir exists now the
         // result is cached immediately and no filesystem hit is needed later.
         if let Ok(p) = std::fs::canonicalize(&config_dir) {
-            let _ = cell.set(Some(p));
+            let _ = cell.set(p);
         }
         Self {
             db,
@@ -79,38 +80,36 @@ impl AppState {
             rate_limiter: new_login_rate_limiter(),
             config_dir,
             canonical_config_dir: std::sync::Arc::new(cell),
+            logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     /// Return the canonicalized config directory, computing it lazily if
     /// the startup attempt failed (e.g. the directory didn't exist yet).
-    /// Non-`NotFound` failures are cached (logged once) so the service
-    /// degrades predictably without per-request error spam.
+    /// All failures are retried on the next request so transient issues
+    /// (permissions, IO) can recover without a restart.  Non-`NotFound`
+    /// errors are logged once via an atomic flag to avoid per-request spam.
     async fn get_canonical_config_dir(&self) -> Option<&std::path::PathBuf> {
         self.canonical_config_dir
             .get_or_try_init(|| async {
-                match tokio::fs::canonicalize(&self.config_dir).await {
-                    Ok(path) => Ok(Some(path)),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // Directory doesn't exist yet; retry on next request.
-                        Err(())
-                    }
-                    Err(e) => {
-                        // Persistent error (permissions, misconfiguration, etc.);
-                        // log once and cache the failure so we don't spam on
-                        // every request.
-                        error!(
-                            error = ?e,
-                            config_dir = ?self.config_dir,
-                            "failed to canonicalize config directory"
-                        );
-                        Ok(None)
-                    }
-                }
+                tokio::fs::canonicalize(&self.config_dir)
+                    .await
+                    .map_err(|e| {
+                        if e.kind() != std::io::ErrorKind::NotFound
+                            && !self
+                                .logged_canon_error
+                                .swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            error!(
+                                error = ?e,
+                                config_dir = ?self.config_dir,
+                                "failed to canonicalize config directory"
+                            );
+                        }
+                    })
             })
             .await
             .ok()
-            .and_then(|opt| opt.as_ref())
     }
 }
 
@@ -1076,9 +1075,9 @@ fn with_qr_no_cache(mut resp: Response) -> Response {
 /// the config file cannot be read from disk.
 /// Returns HTTP 422 if the config content is too large for a QR code.
 ///
-/// All responses (success *and* error) include `Cache-Control: no-store` and
-/// `Pragma: no-cache` because the endpoint is loaded via an `<img>` tag and
-/// browsers may otherwise cache error responses.
+/// All responses produced by this handler (success *and* error) include
+/// `Cache-Control: no-store` and `Pragma: no-cache` because the endpoint is
+/// loaded via an `<img>` tag and browsers may otherwise cache error responses.
 async fn get_peer_qr(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -2426,7 +2425,7 @@ Historical data (snapshots, events) will be preserved.</p>
         buf.push_str(
             r#"<div id="qr-overlay" class="qr-modal-overlay" onclick="hideQr(event)">
   <div class="qr-modal" role="dialog" aria-modal="true" aria-labelledby="qr-title">
-    <button type="button" class="qr-modal-close" onclick="hideQr(event)" aria-label="Close">&times;</button>
+    <button type="button" class="qr-modal-close" onclick="event.stopPropagation(); hideQr(event)" aria-label="Close">&times;</button>
     <h3 id="qr-title">Scan QR Code</h3>
     <div id="qr-content"><p>Loading…</p></div>
   </div>
