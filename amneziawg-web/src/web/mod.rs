@@ -837,11 +837,42 @@ fn is_safe_config_path(path: &std::path::Path) -> bool {
             .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
 }
 
+/// Open a file with `O_NOFOLLOW` and read its contents, preventing the
+/// kernel from following symlinks at open time.  This eliminates the
+/// TOCTOU gap between the earlier `symlink_metadata` / `canonicalize`
+/// checks and the actual read: even if the file is swapped to a symlink
+/// between those checks and this call, the open will fail with `ELOOP`.
+#[cfg(unix)]
+async fn read_file_nofollow(path: &std::path::Path) -> std::io::Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+}
+
+/// Fallback for non-Unix: regular async read (the `symlink_metadata`
+/// check still provides best-effort protection, but without `O_NOFOLLOW`
+/// there is an inherent TOCTOU window).
+#[cfg(not(unix))]
+async fn read_file_nofollow(path: &std::path::Path) -> std::io::Result<String> {
+    tokio::fs::read_to_string(path).await
+}
+
 /// Resolve, validate, and read a peer's config file.
 ///
 /// Shared by `get_peer_config` and `get_peer_qr` to keep the security
 /// validation logic (path-traversal check, symlink rejection, canonical-path
-/// prefix guard) in one place.
+/// prefix guard, `O_NOFOLLOW` open) in one place.
 ///
 /// Returns `Ok((content, config_path))` on success, or an error `Response`
 /// that the caller can return directly.
@@ -930,7 +961,9 @@ async fn read_validated_config(
             .into_response());
     }
 
-    let content = match tokio::fs::read_to_string(&canonical_path).await {
+    // Open with O_NOFOLLOW to prevent symlink-following at read time,
+    // eliminating the TOCTOU gap after the checks above.
+    let content = match read_file_nofollow(&canonical_path).await {
         Ok(c) => c,
         Err(_) => {
             return Err((
