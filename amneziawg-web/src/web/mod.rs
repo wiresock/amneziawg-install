@@ -2428,7 +2428,9 @@ Historical data (snapshots, events) will be preserved.</p>
   </div>
 </div>
 <script>
+var _qrTrigger=null;
 function showQr(peerId){
+  _qrTrigger=document.activeElement;
   var overlay=document.getElementById('qr-overlay');
   var content=document.getElementById('qr-content');
   while(content.firstChild) content.removeChild(content.firstChild);
@@ -2436,6 +2438,8 @@ function showQr(peerId){
   loadingP.textContent='Loading\u2026';
   content.appendChild(loadingP);
   overlay.classList.add('active');
+  var closeBtn=overlay.querySelector('.qr-modal-close');
+  if(closeBtn) closeBtn.focus();
   var img=document.createElement('img');
   img.alt='QR code';
   img.onload=function(){
@@ -2451,12 +2455,28 @@ function showQr(peerId){
   };
   img.src='/api/peers/'+peerId+'/qr';
 }
+function _closeQrModal(){
+  document.getElementById('qr-overlay').classList.remove('active');
+  if(_qrTrigger){_qrTrigger.focus();_qrTrigger=null;}
+}
 function hideQr(ev){
   var el=ev.target;
   if(el===document.getElementById('qr-overlay')||el.classList.contains('qr-modal-close'))
-    document.getElementById('qr-overlay').classList.remove('active');
+    _closeQrModal();
 }
-document.addEventListener('keydown',function(e){if(e.key==='Escape')document.getElementById('qr-overlay').classList.remove('active')});
+document.addEventListener('keydown',function(e){
+  var overlay=document.getElementById('qr-overlay');
+  if(!overlay.classList.contains('active')) return;
+  if(e.key==='Escape'){_closeQrModal();return;}
+  if(e.key==='Tab'){
+    var modal=overlay.querySelector('.qr-modal');
+    var focusable=modal.querySelectorAll('button,a,[tabindex],input,select,textarea,img');
+    if(focusable.length===0) return;
+    var first=focusable[0],last=focusable[focusable.length-1];
+    if(e.shiftKey){if(document.activeElement===first){e.preventDefault();last.focus();}}
+    else{if(document.activeElement===last){e.preventDefault();first.focus();}}
+  }
+});
 </script>
 "#,
         );
