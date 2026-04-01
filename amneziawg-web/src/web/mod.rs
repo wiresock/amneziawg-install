@@ -826,8 +826,13 @@ async fn get_peer_config(
         }
     };
 
-    // Security: ensure the path is absolute and doesn't contain traversal.
-    if !config_path.is_absolute() {
+    // Security: ensure the path is absolute and doesn't contain traversal
+    // components like `.` or `..`.
+    if !config_path.is_absolute()
+        || config_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+    {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
@@ -906,8 +911,13 @@ async fn get_peer_qr(
         }
     };
 
-    // Security: ensure the path is absolute and doesn't contain traversal.
-    if !config_path.is_absolute() {
+    // Security: ensure the path is absolute and doesn't contain traversal
+    // components like `.` or `..`.
+    if !config_path.is_absolute()
+        || config_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+    {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
@@ -926,24 +936,12 @@ async fn get_peer_qr(
         }
     };
 
-    // QR codes have a maximum data capacity; for alphanumeric data at the
-    // highest error-correction level this is roughly 4296 characters.  Typical
-    // WireGuard/AmneziaWG configs are well within this limit, but we guard
-    // against oversized content to avoid a panic in the encoder.
-    if content.len() > 4000 {
-        return Ok((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "config content is too large for a QR code" })),
-        )
-            .into_response());
-    }
-
     let qr = match qrcode::QrCode::new(content.as_bytes()) {
         Ok(q) => q,
         Err(_) => {
             return Ok((
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": "failed to encode config as QR code" })),
+                Json(json!({ "error": "config content is too large for a QR code" })),
             )
                 .into_response())
         }
@@ -957,10 +955,20 @@ async fn get_peer_qr(
 
     Ok((
         StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "image/svg+xml".to_string(),
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "image/svg+xml".to_string(),
+            ),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store".to_string(),
+            ),
+            (
+                axum::http::header::PRAGMA,
+                "no-cache".to_string(),
+            ),
+        ],
         svg,
     )
         .into_response())
@@ -1889,7 +1897,8 @@ fn html_head(title: &str) -> String {
   .qr-modal svg {{ max-width:100%; height:auto; }}
   .qr-modal-close {{ position:absolute; top:.5rem; right:.75rem; background:none; border:none; font-size:1.3rem; cursor:pointer; color:#666; }}
   .qr-modal-close:hover {{ color:#222; }}
-  .qr-link {{ cursor:pointer; }}
+  .qr-link {{ cursor:pointer; background:none; border:none; color:#0066cc; font:inherit; padding:0; text-decoration:none; }}
+  .qr-link:hover {{ text-decoration:underline; }}
 </style>
 </head>
 <body>
@@ -2131,7 +2140,7 @@ fn render_peer_detail_inner(
             "<tr><th>Config</th><td>\
              <a href=\"/api/peers/{id}/config\">&#x2B73; Download</a>\
              &nbsp; | &nbsp;\
-             <a class=\"qr-link\" onclick=\"showQr({id})\">&#x25A3; QR Code</a>\
+             <button type=\"button\" class=\"qr-link\" onclick=\"showQr({id})\">&#x25A3; QR Code</button>\
              </td></tr>\n",
             id = dto.id
         ));
@@ -2270,9 +2279,9 @@ Historical data (snapshots, events) will be preserved.</p>
     if dto.has_config {
         buf.push_str(
             r#"<div id="qr-overlay" class="qr-modal-overlay" onclick="hideQr(event)">
-  <div class="qr-modal">
+  <div class="qr-modal" role="dialog" aria-modal="true" aria-labelledby="qr-title">
     <button class="qr-modal-close" onclick="hideQr(event)" aria-label="Close">&times;</button>
-    <h3>Scan QR Code</h3>
+    <h3 id="qr-title">Scan QR Code</h3>
     <div id="qr-content"><p>Loading…</p></div>
   </div>
 </div>
@@ -2288,7 +2297,13 @@ function showQr(peerId){
       return r.text();
     })
     .then(function(svg){content.innerHTML=svg})
-    .catch(function(e){content.innerHTML='<p style="color:#c00">'+e.message+'</p>'});
+    .catch(function(e){
+      content.innerHTML='';
+      var p=document.createElement('p');
+      p.style.color='#c00';
+      p.textContent=e.message;
+      content.appendChild(p);
+    });
 }
 function hideQr(ev){
   var el=ev.target;
@@ -4489,11 +4504,62 @@ mod tests {
             "expected SVG content type, got: {content_type}"
         );
 
+        let cache_control = response
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cache_control, "no-store", "QR response must not be cached");
+
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let svg = std::str::from_utf8(&body).unwrap();
         assert!(svg.contains("<svg"), "response should contain SVG markup");
+    }
+
+    #[tokio::test]
+    async fn get_peer_qr_too_large_returns_422() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QR_BIG=", None).await;
+
+        // Create a config file that exceeds QR code data capacity.
+        let dir = tempfile::tempdir().unwrap();
+        let conf_path = dir.path().join("big-qr.conf");
+        let big_content = "A".repeat(5000);
+        std::fs::write(&conf_path, &big_content).unwrap();
+
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_QR_BIG=",
+            "big-qr",
+            conf_path.to_str().unwrap(),
+            "big-qr",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/qr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"].as_str().unwrap().contains("too large"),
+            "error should mention size limit"
+        );
     }
 
     #[tokio::test]
