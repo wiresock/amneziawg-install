@@ -30,7 +30,9 @@ use crate::db::events::{
 };
 use crate::db::peers::{PeerRow, SnapshotRow};
 use crate::db::Database;
-use crate::domain::history::{compute_history, HistoryPoint, HistorySummary, SnapshotInput};
+use crate::domain::history::{
+    compute_history, compute_usage_summary, HistoryPoint, HistorySummary, SnapshotInput,
+};
 use crate::domain::{
     normalize_comment, normalize_display_name, resolve_display_name, ConnectionStatus,
     IdentityStatus, PeerStatus, ONLINE_THRESHOLD_SECS,
@@ -926,7 +928,7 @@ async fn get_peer_usage(
         .into_iter()
         .map(snapshot_row_to_input)
         .collect();
-    let (_, summary) = compute_history(&inputs);
+    let summary = compute_usage_summary(&inputs);
 
     let name = resolve_display_name(
         peer.display_name.as_deref(),
@@ -967,11 +969,11 @@ async fn get_all_usage(
         crate::db::peers::find_all_snapshots_since(&state.db.pool, &since_str).await?;
 
     // Group snapshots by public_key (already sorted by public_key, captured_at ASC).
-    // Consume rows to avoid cloning SnapshotRow.
+    // Use std::mem::take to move public_key out of each row, avoiding a clone.
     let mut snap_map: std::collections::HashMap<String, Vec<SnapshotInput>> =
         std::collections::HashMap::new();
-    for row in all_snapshots {
-        let key = row.public_key.clone();
+    for mut row in all_snapshots {
+        let key = std::mem::take(&mut row.public_key);
         snap_map
             .entry(key)
             .or_default()
@@ -981,7 +983,7 @@ async fn get_all_usage(
     let mut peer_usages: Vec<PeerUsageDto> = Vec::with_capacity(peers.len());
     for peer in &peers {
         let inputs = snap_map.remove(&peer.public_key).unwrap_or_default();
-        let (_, summary) = compute_history(&inputs);
+        let summary = compute_usage_summary(&inputs);
 
         let name = resolve_display_name(
             peer.display_name.as_deref(),

@@ -56,6 +56,30 @@ pub struct SnapshotInput {
     pub tx_bytes: u64,
 }
 
+/// Compute only the aggregated totals without building per-step points.
+///
+/// This is a lightweight alternative to [`compute_history`] for callers that
+/// only need `rx_total_delta` / `tx_total_delta` (e.g. the usage-summary
+/// endpoints).  It avoids allocating the `Vec<HistoryPoint>` and cloning
+/// each snapshot timestamp.
+pub fn compute_usage_summary(snapshots: &[SnapshotInput]) -> HistorySummary {
+    let mut rx_total: u64 = 0;
+    let mut tx_total: u64 = 0;
+
+    for (i, snap) in snapshots.iter().enumerate() {
+        if i > 0 {
+            let prev = &snapshots[i - 1];
+            rx_total = rx_total.saturating_add(snap.rx_bytes.saturating_sub(prev.rx_bytes));
+            tx_total = tx_total.saturating_add(snap.tx_bytes.saturating_sub(prev.tx_bytes));
+        }
+    }
+
+    HistorySummary {
+        rx_total_delta: rx_total,
+        tx_total_delta: tx_total,
+    }
+}
+
 /// Compute history points and a summary from a slice of ordered snapshots.
 ///
 /// - `snapshots` must be sorted **oldest first**.
@@ -218,5 +242,35 @@ mod tests {
         assert_eq!(points[0].timestamp, "2026-01-01T00:00:00Z");
         assert_eq!(points[1].timestamp, "2026-01-02T00:00:00Z");
         assert_eq!(points[2].timestamp, "2026-01-03T00:00:00Z");
+    }
+
+    // ── compute_usage_summary tests ─────────────────────────────────────
+
+    #[test]
+    fn summary_empty_snapshots() {
+        let s = compute_usage_summary(&[]);
+        assert_eq!(s.rx_total_delta, 0);
+        assert_eq!(s.tx_total_delta, 0);
+    }
+
+    #[test]
+    fn summary_single_snapshot() {
+        let s = compute_usage_summary(&[snap("2026-01-01T00:00:00Z", 1000, 2000)]);
+        assert_eq!(s.rx_total_delta, 0);
+        assert_eq!(s.tx_total_delta, 0);
+    }
+
+    #[test]
+    fn summary_matches_compute_history() {
+        let snaps = vec![
+            snap("2026-01-01T00:00:00Z", 800, 1800),
+            snap("2026-01-01T00:01:00Z", 1000, 2000),
+            snap("2026-01-01T00:02:00Z", 50, 100), // reset
+            snap("2026-01-01T00:03:00Z", 300, 500),
+        ];
+        let (_, full) = compute_history(&snaps);
+        let light = compute_usage_summary(&snaps);
+        assert_eq!(full.rx_total_delta, light.rx_total_delta);
+        assert_eq!(full.tx_total_delta, light.tx_total_delta);
     }
 }
