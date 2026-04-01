@@ -433,6 +433,7 @@ pub fn router(
         .route("/api/peers/:id", get(get_peer).patch(patch_peer))
         .route("/api/peers/:id/history", get(get_peer_history))
         .route("/api/peers/:id/config", get(get_peer_config))
+        .route("/api/peers/:id/qr", get(get_peer_qr))
         .route("/api/events", get(list_events_handler))
         // ── User lifecycle routes ────────────────────────────────
         .route("/api/admin/users", post(api_create_user))
@@ -865,6 +866,102 @@ async fn get_peer_config(
             (axum::http::header::CONTENT_DISPOSITION, disposition),
         ],
         content,
+    )
+        .into_response())
+}
+
+/// `GET /api/peers/:id/qr` – render the client config as a QR code SVG.
+///
+/// Returns an SVG image (`Content-Type: image/svg+xml`) that encodes the full
+/// text of the client configuration file.  Mobile users can scan this QR code
+/// with their AmneziaWG / WireGuard app to import the tunnel.
+///
+/// Returns HTTP 404 if the peer does not exist, has no associated config, or
+/// the config file cannot be read from disk.
+/// Returns HTTP 422 if the config content is too large for a QR code.
+async fn get_peer_qr(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+    let peer = match row {
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "peer not found" })),
+            )
+                .into_response())
+        }
+        Some(r) => r,
+    };
+
+    let config_path = match peer.config_path {
+        Some(ref p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "no config file associated with this peer" })),
+            )
+                .into_response())
+        }
+    };
+
+    // Security: ensure the path is absolute and doesn't contain traversal.
+    if !config_path.is_absolute() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "invalid config path" })),
+        )
+            .into_response());
+    }
+
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "config file not found on disk" })),
+            )
+                .into_response())
+        }
+    };
+
+    // QR codes have a maximum data capacity; for alphanumeric data at the
+    // highest error-correction level this is roughly 4296 characters.  Typical
+    // WireGuard/AmneziaWG configs are well within this limit, but we guard
+    // against oversized content to avoid a panic in the encoder.
+    if content.len() > 4000 {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "config content is too large for a QR code" })),
+        )
+            .into_response());
+    }
+
+    let qr = match qrcode::QrCode::new(content.as_bytes()) {
+        Ok(q) => q,
+        Err(_) => {
+            return Ok((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": "failed to encode config as QR code" })),
+            )
+                .into_response())
+        }
+    };
+
+    let svg = qr
+        .render::<qrcode::render::svg::Color>()
+        .quiet_zone(true)
+        .min_dimensions(256, 256)
+        .build();
+
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "image/svg+xml".to_string(),
+        )],
+        svg,
     )
         .into_response())
 }
@@ -1785,6 +1882,14 @@ fn html_head(title: &str) -> String {
   .nav-logout button {{ padding: .3rem .8rem; background: #e55; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .85rem; }}
   .nav-logout button:hover {{ background: #c33; }}
   .error {{ color: #c00; margin-top: .5rem; font-size: .95rem; }}
+  .qr-modal-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:1000; justify-content:center; align-items:center; }}
+  .qr-modal-overlay.active {{ display:flex; }}
+  .qr-modal {{ background:#fff; border-radius:8px; padding:1.5rem; max-width:360px; width:90%; text-align:center; position:relative; }}
+  .qr-modal h3 {{ margin:0 0 1rem; font-size:1.1rem; }}
+  .qr-modal svg {{ max-width:100%; height:auto; }}
+  .qr-modal-close {{ position:absolute; top:.5rem; right:.75rem; background:none; border:none; font-size:1.3rem; cursor:pointer; color:#666; }}
+  .qr-modal-close:hover {{ color:#222; }}
+  .qr-link {{ cursor:pointer; }}
 </style>
 </head>
 <body>
@@ -2023,8 +2128,12 @@ fn render_peer_detail_inner(
     }
     if dto.has_config {
         buf.push_str(&format!(
-            "<tr><th>Config</th><td><a href=\"/api/peers/{}/config\">&#x2B73; Download</a></td></tr>\n",
-            dto.id
+            "<tr><th>Config</th><td>\
+             <a href=\"/api/peers/{id}/config\">&#x2B73; Download</a>\
+             &nbsp; | &nbsp;\
+             <a class=\"qr-link\" onclick=\"showQr({id})\">&#x25A3; QR Code</a>\
+             </td></tr>\n",
+            id = dto.id
         ));
     }
     if let Some(ref dn) = dto.display_name {
@@ -2155,6 +2264,40 @@ Historical data (snapshots, events) will be preserved.</p>
             ));
         }
         buf.push_str("</table>\n");
+    }
+
+    // QR code modal overlay (only when config exists)
+    if dto.has_config {
+        buf.push_str(
+            r#"<div id="qr-overlay" class="qr-modal-overlay" onclick="hideQr(event)">
+  <div class="qr-modal">
+    <button class="qr-modal-close" onclick="hideQr(event)" aria-label="Close">&times;</button>
+    <h3>Scan QR Code</h3>
+    <div id="qr-content"><p>Loading…</p></div>
+  </div>
+</div>
+<script>
+function showQr(peerId){
+  var overlay=document.getElementById('qr-overlay');
+  var content=document.getElementById('qr-content');
+  content.innerHTML='<p>Loading\u2026</p>';
+  overlay.classList.add('active');
+  fetch('/api/peers/'+peerId+'/qr')
+    .then(function(r){
+      if(!r.ok) return r.json().then(function(j){throw new Error(j.error||'Failed to load QR code')});
+      return r.text();
+    })
+    .then(function(svg){content.innerHTML=svg})
+    .catch(function(e){content.innerHTML='<p style="color:#c00">'+e.message+'</p>'});
+}
+function hideQr(ev){
+  if(ev.target===document.getElementById('qr-overlay')||ev.currentTarget.classList.contains('qr-modal-close'))
+    document.getElementById('qr-overlay').classList.remove('active');
+}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')document.getElementById('qr-overlay').classList.remove('active')});
+</script>
+"#,
+        );
     }
 
     buf.push_str("</body></html>");
@@ -4264,5 +4407,162 @@ mod tests {
     fn esc_js_escapes_line_terminators() {
         assert_eq!(super::esc_js("a\nb\rc"), "a\\nb\\rc");
         assert_eq!(super::esc_js("x\u{2028}y\u{2029}z"), "x\\u2028y\\u2029z");
+    }
+
+    // ── QR code tests ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_peer_qr_peer_not_found_returns_404() {
+        let app = test_router(test_db().await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers/9999/qr")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_peer_qr_no_config_returns_404() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QR_NC=", None).await;
+        let app = test_router(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/qr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_peer_qr_returns_svg() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QR_OK=", None).await;
+
+        // Create a temp config file.
+        let dir = tempfile::tempdir().unwrap();
+        let conf_path = dir.path().join("test-qr.conf");
+        std::fs::write(&conf_path, "[Interface]\nAddress = 10.0.0.2/32\n").unwrap();
+
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_QR_OK=",
+            "test-qr",
+            conf_path.to_str().unwrap(),
+            "test-qr",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/qr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("image/svg+xml"),
+            "expected SVG content type, got: {content_type}"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let svg = std::str::from_utf8(&body).unwrap();
+        assert!(svg.contains("<svg"), "response should contain SVG markup");
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_shows_qr_link_when_config_exists() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QRUI=", None).await;
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_QRUI=",
+            "test-qrui",
+            "/etc/awg/test-qrui.conf",
+            "test-qrui",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("QR Code"),
+            "peer detail page should contain QR Code link"
+        );
+        assert!(
+            html.contains("qr-overlay"),
+            "peer detail page should contain QR modal overlay"
+        );
+        assert!(
+            html.contains("showQr("),
+            "peer detail page should contain showQr JavaScript function"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_no_qr_link_when_no_config() {
+        let db = test_db().await;
+        let _id = insert_peer(&db, "KEY_NOQR=", None).await;
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !html.contains("QR Code"),
+            "peer detail page should NOT contain QR Code link when no config"
+        );
+        assert!(
+            !html.contains("qr-overlay"),
+            "peer detail page should NOT contain QR modal when no config"
+        );
     }
 }
