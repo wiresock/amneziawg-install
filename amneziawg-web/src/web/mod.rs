@@ -792,6 +792,16 @@ async fn get_peer_history(
     Ok(Json(dto).into_response())
 }
 
+/// Check that a config path is absolute and free of `.`/`..` traversal
+/// components.  Shared by `get_peer_config` and `get_peer_qr` so the
+/// validation logic stays in sync.
+fn is_safe_config_path(path: &std::path::Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+}
+
 /// `GET /api/peers/:id/config` – download the client config file.
 ///
 /// Returns the raw config file content with `Content-Type: text/plain` and a
@@ -826,13 +836,7 @@ async fn get_peer_config(
         }
     };
 
-    // Security: ensure the path is absolute and doesn't contain traversal
-    // components like `.` or `..`.
-    if !config_path.is_absolute()
-        || config_path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
-    {
+    if !is_safe_config_path(&config_path) {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
@@ -840,7 +844,7 @@ async fn get_peer_config(
             .into_response());
     }
 
-    let content = match std::fs::read_to_string(&config_path) {
+    let content = match tokio::fs::read_to_string(&config_path).await {
         Ok(c) => c,
         Err(_) => {
             return Ok((
@@ -869,6 +873,14 @@ async fn get_peer_config(
                 "text/plain; charset=utf-8".to_string(),
             ),
             (axum::http::header::CONTENT_DISPOSITION, disposition),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store".to_string(),
+            ),
+            (
+                axum::http::header::PRAGMA,
+                "no-cache".to_string(),
+            ),
         ],
         content,
     )
@@ -911,13 +923,7 @@ async fn get_peer_qr(
         }
     };
 
-    // Security: ensure the path is absolute and doesn't contain traversal
-    // components like `.` or `..`.
-    if !config_path.is_absolute()
-        || config_path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
-    {
+    if !is_safe_config_path(&config_path) {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
@@ -925,7 +931,7 @@ async fn get_peer_qr(
             .into_response());
     }
 
-    let content = match std::fs::read_to_string(&config_path) {
+    let content = match tokio::fs::read_to_string(&config_path).await {
         Ok(c) => c,
         Err(_) => {
             return Ok((
@@ -2280,7 +2286,7 @@ Historical data (snapshots, events) will be preserved.</p>
         buf.push_str(
             r#"<div id="qr-overlay" class="qr-modal-overlay" onclick="hideQr(event)">
   <div class="qr-modal" role="dialog" aria-modal="true" aria-labelledby="qr-title">
-    <button class="qr-modal-close" onclick="hideQr(event)" aria-label="Close">&times;</button>
+    <button type="button" class="qr-modal-close" onclick="hideQr(event)" aria-label="Close">&times;</button>
     <h3 id="qr-title">Scan QR Code</h3>
     <div id="qr-content"><p>Loading…</p></div>
   </div>
