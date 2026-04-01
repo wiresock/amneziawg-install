@@ -870,7 +870,7 @@ async fn get_peer_config(
         Err(_) => {
             return Ok((
                 StatusCode::NOT_FOUND,
-                Json(json!({ "error": "config file not found on disk" })),
+                Json(json!({ "error": "invalid config path" })),
             )
                 .into_response())
         }
