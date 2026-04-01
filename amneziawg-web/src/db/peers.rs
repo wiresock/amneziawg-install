@@ -166,6 +166,53 @@ pub async fn find_all_snapshots_since(
     .await
 }
 
+/// Return the last snapshot for `public_key` captured **before** `before_rfc3339`.
+///
+/// Used as a "baseline" so that delta computation includes the traffic
+/// between the last pre-window snapshot and the first in-window snapshot.
+pub async fn find_baseline_snapshot(
+    pool: &SqlitePool,
+    public_key: &str,
+    before_rfc3339: &str,
+) -> Result<Option<SnapshotRow>, sqlx::Error> {
+    sqlx::query_as::<_, SnapshotRow>(
+        "SELECT id, public_key, captured_at, endpoint, last_handshake_at, rx_bytes, tx_bytes
+         FROM   snapshots
+         WHERE  public_key = ?
+           AND  captured_at < ?
+         ORDER  BY captured_at DESC
+         LIMIT  1",
+    )
+    .bind(public_key)
+    .bind(before_rfc3339)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Return the last snapshot before `before_rfc3339` for **every** peer that has
+/// one.  The result contains at most one row per `public_key`.
+///
+/// Used to seed per-peer baseline counters when computing all-peers usage so
+/// that the delta for the first in-window snapshot of each peer is included.
+pub async fn find_all_baseline_snapshots(
+    pool: &SqlitePool,
+    before_rfc3339: &str,
+) -> Result<Vec<UsageSnapshotRow>, sqlx::Error> {
+    sqlx::query_as::<_, UsageSnapshotRow>(
+        "SELECT s.public_key, s.rx_bytes, s.tx_bytes
+         FROM   snapshots s
+         INNER  JOIN (
+             SELECT public_key, MAX(captured_at) AS max_ts
+             FROM   snapshots
+             WHERE  captured_at < ?
+             GROUP  BY public_key
+         ) latest ON s.public_key = latest.public_key AND s.captured_at = latest.max_ts",
+    )
+    .bind(before_rfc3339)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn find_snapshots(
     pool: &SqlitePool,
     public_key: &str,
@@ -518,6 +565,68 @@ mod tests {
     }
 
     // ── Config mapping ───────────────────────────────────────────────────────
+
+    // ── find_baseline_snapshot ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_baseline_snapshot_no_data() {
+        let db = test_db().await;
+        let row = find_baseline_snapshot(&db.pool, "NO_KEY=", "2026-01-01T00:00:00Z")
+            .await
+            .expect("baseline");
+        assert!(row.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_baseline_snapshot_returns_last_before_cutoff() {
+        let db = test_db().await;
+        insert_snapshot_with_rx(&db.pool, "KEY_BASE=", "2026-01-01T00:00:00Z", 10).await;
+        insert_snapshot_with_rx(&db.pool, "KEY_BASE=", "2026-01-03T00:00:00Z", 30).await;
+        // After cutoff – should not be returned.
+        insert_snapshot_with_rx(&db.pool, "KEY_BASE=", "2026-01-05T00:00:00Z", 50).await;
+
+        let row = find_baseline_snapshot(&db.pool, "KEY_BASE=", "2026-01-05T00:00:00Z")
+            .await
+            .expect("baseline")
+            .expect("should find a baseline");
+        assert_eq!(row.rx_bytes, 30); // last before cutoff
+    }
+
+    // ── find_all_baseline_snapshots ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_all_baseline_snapshots_empty() {
+        let db = test_db().await;
+        let rows = find_all_baseline_snapshots(&db.pool, "2026-01-01T00:00:00Z")
+            .await
+            .expect("all_baselines");
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_all_baseline_snapshots_returns_last_per_peer() {
+        let db = test_db().await;
+        // Peer A: two snapshots before cutoff
+        insert_snapshot_with_rx(&db.pool, "KEY_BL_A=", "2026-01-01T00:00:00Z", 10).await;
+        insert_snapshot_with_rx(&db.pool, "KEY_BL_A=", "2026-01-03T00:00:00Z", 30).await;
+        // Peer B: one snapshot before cutoff
+        insert_snapshot_with_rx(&db.pool, "KEY_BL_B=", "2026-01-02T00:00:00Z", 20).await;
+        // Both peers also have snapshots after cutoff – should be ignored.
+        insert_snapshot_with_rx(&db.pool, "KEY_BL_A=", "2026-01-10T00:00:00Z", 100).await;
+        insert_snapshot_with_rx(&db.pool, "KEY_BL_B=", "2026-01-10T00:00:00Z", 200).await;
+
+        let rows = find_all_baseline_snapshots(&db.pool, "2026-01-05T00:00:00Z")
+            .await
+            .expect("all_baselines");
+        assert_eq!(rows.len(), 2);
+        // Should return the last snapshot before cutoff for each peer.
+        let a = rows.iter().find(|r| r.public_key == "KEY_BL_A=").unwrap();
+        assert_eq!(a.rx_bytes, 30); // 2026-01-03
+        let b = rows.iter().find(|r| r.public_key == "KEY_BL_B=").unwrap();
+        assert_eq!(b.rx_bytes, 20); // 2026-01-02
+    }
+
+    // ── Config mapping (continued) ──────────────────────────────────────────
 
     async fn insert_peer_with_config(pool: &SqlitePool, public_key: &str) -> i64 {
         sqlx::query(

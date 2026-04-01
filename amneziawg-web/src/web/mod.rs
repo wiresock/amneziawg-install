@@ -274,6 +274,12 @@ pub struct UsageQuery {
     pub period: Option<String>,
 }
 
+/// Serialize a `u64` as a JSON string to avoid integer precision loss in
+/// JavaScript (which uses IEEE-754 doubles, losing precision above 2^53 − 1).
+fn serialize_u64_as_string<S: serde::Serializer>(val: &u64, ser: S) -> Result<S::Ok, S::Error> {
+    ser.serialize_str(&val.to_string())
+}
+
 /// Per-peer traffic usage for a requested period.
 #[derive(Debug, Serialize)]
 pub struct PeerUsageDto {
@@ -281,9 +287,11 @@ pub struct PeerUsageDto {
     pub name: String,
     pub public_key: String,
     pub period: String,
-    /// Sum of non-negative RX deltas in the period.
+    /// Sum of non-negative RX deltas in the period (serialized as string).
+    #[serde(serialize_with = "serialize_u64_as_string")]
     pub rx_bytes: u64,
-    /// Sum of non-negative TX deltas in the period.
+    /// Sum of non-negative TX deltas in the period (serialized as string).
+    #[serde(serialize_with = "serialize_u64_as_string")]
     pub tx_bytes: u64,
 }
 
@@ -297,9 +305,11 @@ pub struct AllUsageDto {
 /// Traffic totals for a single period (day, week, or month).
 #[derive(Debug, Serialize)]
 pub struct UsagePeriodDto {
-    /// Sum of non-negative RX deltas in this period.
+    /// Sum of non-negative RX deltas in this period (serialized as string).
+    #[serde(serialize_with = "serialize_u64_as_string")]
     pub rx_bytes: u64,
-    /// Sum of non-negative TX deltas in this period.
+    /// Sum of non-negative TX deltas in this period (serialized as string).
+    #[serde(serialize_with = "serialize_u64_as_string")]
     pub tx_bytes: u64,
 }
 
@@ -945,14 +955,21 @@ async fn get_peer_usage(
     let since = Utc::now() - chrono::Duration::seconds(secs);
     let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
+    // Fetch the baseline snapshot (last one before the window) so that the
+    // delta between it and the first in-window snapshot is not lost.
+    let baseline =
+        crate::db::peers::find_baseline_snapshot(&state.db.pool, &peer.public_key, &since_str)
+            .await?;
+
     let snapshot_rows =
         crate::db::peers::find_snapshots_since(&state.db.pool, &peer.public_key, &since_str)
             .await?;
 
-    let inputs: Vec<SnapshotInput> = snapshot_rows
-        .into_iter()
-        .map(snapshot_row_to_input)
-        .collect();
+    let mut inputs: Vec<SnapshotInput> = Vec::with_capacity(snapshot_rows.len() + 1);
+    if let Some(b) = baseline {
+        inputs.push(snapshot_row_to_input(b));
+    }
+    inputs.extend(snapshot_rows.into_iter().map(snapshot_row_to_input));
     let summary = compute_usage_summary(&inputs);
 
     let name = resolve_display_name(
@@ -1000,28 +1017,39 @@ async fn get_peer_usage_summary(
     let month_since = now - chrono::Duration::seconds(period_to_secs("month"));
     let month_str = month_since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
+    // Fetch the baseline snapshot (last one before the month window) so that
+    // the delta between it and the first in-window snapshot is included.
+    let baseline =
+        crate::db::peers::find_baseline_snapshot(&state.db.pool, &peer.public_key, &month_str)
+            .await?;
+
     let snapshot_rows =
         crate::db::peers::find_snapshots_since(&state.db.pool, &peer.public_key, &month_str)
             .await?;
 
-    let inputs: Vec<SnapshotInput> = snapshot_rows
-        .into_iter()
-        .map(snapshot_row_to_input)
-        .collect();
+    let mut inputs: Vec<SnapshotInput> = Vec::with_capacity(snapshot_rows.len() + 1);
+    if let Some(b) = baseline {
+        inputs.push(snapshot_row_to_input(b));
+    }
+    inputs.extend(snapshot_rows.into_iter().map(snapshot_row_to_input));
 
     // Month = full slice.
     let month_summary = compute_usage_summary(&inputs);
 
     // Week / day = suffix slices (snapshots are sorted oldest-first).
+    // Include the baseline snapshot immediately before the cutoff (if any)
+    // so that the delta across the boundary is not lost.
     let week_since = now - chrono::Duration::seconds(period_to_secs("week"));
     let week_str = week_since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let week_start = inputs.partition_point(|s| s.captured_at.as_str() < week_str.as_str());
-    let week_summary = compute_usage_summary(&inputs[week_start..]);
+    let week_baseline = week_start.saturating_sub(1);
+    let week_summary = compute_usage_summary(&inputs[week_baseline..]);
 
     let day_since = now - chrono::Duration::seconds(period_to_secs("day"));
     let day_str = day_since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let day_start = inputs.partition_point(|s| s.captured_at.as_str() < day_str.as_str());
-    let day_summary = compute_usage_summary(&inputs[day_start..]);
+    let day_baseline = day_start.saturating_sub(1);
+    let day_summary = compute_usage_summary(&inputs[day_baseline..]);
 
     let name = resolve_display_name(
         peer.display_name.as_deref(),
@@ -1067,6 +1095,8 @@ async fn get_all_usage(
 
     // Fetch all peers and all snapshots in the period in two queries.
     let peers = crate::db::peers::list_all(&state.db.pool).await?;
+    let baseline_snapshots =
+        crate::db::peers::find_all_baseline_snapshots(&state.db.pool, &since_str).await?;
     let all_snapshots =
         crate::db::peers::find_all_snapshots_since(&state.db.pool, &since_str).await?;
 
@@ -1076,6 +1106,15 @@ async fn get_all_usage(
     // addition to the O(snapshots) input that `find_all_snapshots_since` returns.
     let mut summaries: std::collections::HashMap<String, HistorySummary> =
         std::collections::HashMap::new();
+
+    // Seed prev_counters from the last snapshot before the window for each peer
+    // so the first in-window snapshot's delta is included.
+    let mut prev_counters: std::collections::HashMap<String, (u64, u64)> =
+        std::collections::HashMap::new();
+    for row in baseline_snapshots {
+        prev_counters.insert(row.public_key, (row.rx_bytes as u64, row.tx_bytes as u64));
+    }
+
     let mut current_key = String::new();
     let mut prev_rx: u64 = 0;
     let mut prev_tx: u64 = 0;
@@ -1090,14 +1129,19 @@ async fn get_all_usage(
             s.rx_total_delta = s.rx_total_delta.saturating_add(rx.saturating_sub(prev_rx));
             s.tx_total_delta = s.tx_total_delta.saturating_add(tx.saturating_sub(prev_tx));
         } else {
-            // New peer – start tracking.
+            // New peer – start tracking, using baseline counters if available.
             current_key = row.public_key;
-            summaries
+            let s = summaries
                 .entry(current_key.clone())
                 .or_insert(HistorySummary {
                     rx_total_delta: 0,
                     tx_total_delta: 0,
                 });
+            if let Some((base_rx, base_tx)) = prev_counters.get(&current_key) {
+                // Include delta from baseline to first in-window snapshot.
+                s.rx_total_delta = s.rx_total_delta.saturating_add(rx.saturating_sub(*base_rx));
+                s.tx_total_delta = s.tx_total_delta.saturating_add(tx.saturating_sub(*base_tx));
+            }
         }
         prev_rx = rx;
         prev_tx = tx;
@@ -2697,9 +2741,11 @@ Historical data (snapshots, events) will be preserved.</p>
     .then(function(d){{
       ['day','week','month'].forEach(function(p){{
         var u=d[p];
-        if(!u||typeof u.rx_bytes!=='number'||typeof u.tx_bytes!=='number') return;
-        document.getElementById('usage-rx-'+p).textContent=fmtBytes(u.rx_bytes);
-        document.getElementById('usage-tx-'+p).textContent=fmtBytes(u.tx_bytes);
+        if(!u||typeof u.rx_bytes==='undefined'||typeof u.tx_bytes==='undefined') return;
+        var rx=Number(u.rx_bytes),tx=Number(u.tx_bytes);
+        if(isNaN(rx)||isNaN(tx)) return;
+        document.getElementById('usage-rx-'+p).textContent=fmtBytes(rx);
+        document.getElementById('usage-tx-'+p).textContent=fmtBytes(tx);
       }});
     }})
     .catch(function(){{
@@ -3274,8 +3320,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["peer_id"], id);
         assert_eq!(json["period"], "day");
-        assert_eq!(json["rx_bytes"], 0);
-        assert_eq!(json["tx_bytes"], 0);
+        assert_eq!(json["rx_bytes"], "0");
+        assert_eq!(json["tx_bytes"], "0");
         assert_eq!(json["name"], "NoSnaps");
     }
 
@@ -3308,8 +3354,8 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["rx_bytes"], 300); // 400 - 100
-        assert_eq!(json["tx_bytes"], 500); // 700 - 200
+        assert_eq!(json["rx_bytes"], "300"); // 400 - 100
+        assert_eq!(json["tx_bytes"], "500"); // 700 - 200
         assert_eq!(json["period"], "day");
     }
 
@@ -3438,12 +3484,12 @@ mod tests {
         assert!(json["week"].is_object());
         assert!(json["month"].is_object());
         // Snapshots are within last 2 hours, so all periods include them.
-        assert_eq!(json["day"]["rx_bytes"], 300);
-        assert_eq!(json["day"]["tx_bytes"], 500);
-        assert_eq!(json["week"]["rx_bytes"], 300);
-        assert_eq!(json["week"]["tx_bytes"], 500);
-        assert_eq!(json["month"]["rx_bytes"], 300);
-        assert_eq!(json["month"]["tx_bytes"], 500);
+        assert_eq!(json["day"]["rx_bytes"], "300");
+        assert_eq!(json["day"]["tx_bytes"], "500");
+        assert_eq!(json["week"]["rx_bytes"], "300");
+        assert_eq!(json["week"]["tx_bytes"], "500");
+        assert_eq!(json["month"]["rx_bytes"], "300");
+        assert_eq!(json["month"]["tx_bytes"], "500");
     }
 
     #[tokio::test]
@@ -3467,12 +3513,12 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["day"]["rx_bytes"], 0);
-        assert_eq!(json["day"]["tx_bytes"], 0);
-        assert_eq!(json["week"]["rx_bytes"], 0);
-        assert_eq!(json["week"]["tx_bytes"], 0);
-        assert_eq!(json["month"]["rx_bytes"], 0);
-        assert_eq!(json["month"]["tx_bytes"], 0);
+        assert_eq!(json["day"]["rx_bytes"], "0");
+        assert_eq!(json["day"]["tx_bytes"], "0");
+        assert_eq!(json["week"]["rx_bytes"], "0");
+        assert_eq!(json["week"]["tx_bytes"], "0");
+        assert_eq!(json["month"]["rx_bytes"], "0");
+        assert_eq!(json["month"]["tx_bytes"], "0");
     }
 
     // ── All-peers usage endpoint ──────────────────────────────────────────
@@ -3538,13 +3584,56 @@ mod tests {
 
         // PeerA: 500 rx, 1000 tx
         let a = peers.iter().find(|p| p["name"] == "PeerA").unwrap();
-        assert_eq!(a["rx_bytes"], 500);
-        assert_eq!(a["tx_bytes"], 1000);
+        assert_eq!(a["rx_bytes"], "500");
+        assert_eq!(a["tx_bytes"], "1000");
 
         // PeerB: 0 rx, 0 tx (no change)
         let b = peers.iter().find(|p| p["name"] == "PeerB").unwrap();
-        assert_eq!(b["rx_bytes"], 0);
-        assert_eq!(b["tx_bytes"], 0);
+        assert_eq!(b["rx_bytes"], "0");
+        assert_eq!(b["tx_bytes"], "0");
+    }
+
+    #[tokio::test]
+    async fn usage_includes_baseline_delta() {
+        // Verify that the first in-window snapshot's delta against the last
+        // pre-window snapshot is included in the total.
+        let db = test_db().await;
+        let id = insert_peer(&db, "USAGE_BL_KEY=", Some("BaselinePeer")).await;
+
+        let now = Utc::now();
+        // Baseline snapshot: before the day window but after the month window.
+        let baseline = (now - chrono::Duration::hours(25))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // First in-window snapshot: within the last 24h.
+        let t1 = (now - chrono::Duration::hours(3))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t2 = (now - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        insert_snapshot_with_bytes(&db, "USAGE_BL_KEY=", &baseline, 100, 200).await;
+        insert_snapshot_with_bytes(&db, "USAGE_BL_KEY=", &t1, 400, 700).await;
+        insert_snapshot_with_bytes(&db, "USAGE_BL_KEY=", &t2, 600, 900).await;
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/usage?period=day"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Without baseline: 200 rx, 200 tx (only t1→t2 delta).
+        // With baseline:  500 rx, 700 tx (baseline→t1 delta + t1→t2 delta).
+        assert_eq!(json["rx_bytes"], "500"); // (400-100) + (600-400)
+        assert_eq!(json["tx_bytes"], "700"); // (700-200) + (900-700)
     }
 
     // ── period_to_secs ────────────────────────────────────────────────────
