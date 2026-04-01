@@ -50,17 +50,15 @@ pub struct SnapshotRow {
     pub tx_bytes: i64,
 }
 
-/// Narrower snapshot row used by the usage-summary endpoints.
+/// Narrower snapshot row used by the all-peers usage endpoint (`GET /api/usage`).
 ///
 /// Contains only the columns needed for traffic delta computation, avoiding the
-/// I/O and allocation overhead of fetching unused fields like `endpoint` and
-/// `last_handshake_at`.
+/// I/O and allocation overhead of fetching unused fields like `endpoint`,
+/// `last_handshake_at`, and `captured_at` (ordering by `captured_at` is enforced
+/// in the SQL query).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UsageSnapshotRow {
     pub public_key: String,
-    /// ISO-8601 / RFC-3339 timestamp when this snapshot was captured.
-    #[allow(dead_code)]
-    pub captured_at: String,
     pub rx_bytes: i64,
     pub tx_bytes: i64,
 }
@@ -147,16 +145,18 @@ pub async fn find_snapshots_since(
 /// Return snapshots for **all** peers captured on or after `since_rfc3339`,
 /// ordered by `public_key` then `captured_at` **ascending** (oldest first).
 ///
-/// Returns the narrower [`UsageSnapshotRow`] (only `public_key`, `captured_at`,
-/// `rx_bytes`, `tx_bytes`) to avoid fetching unused columns.
+/// Returns the narrower [`UsageSnapshotRow`] (only `public_key`, `rx_bytes`,
+/// `tx_bytes`) to avoid fetching unused columns.  The `ORDER BY captured_at`
+/// clause ensures chronological ordering without needing the column in the
+/// result set.
 ///
-/// Used by the traffic-usage endpoint to compute per-peer deltas in bulk.
+/// Used by the all-peers traffic-usage endpoint to compute per-peer deltas in bulk.
 pub async fn find_all_snapshots_since(
     pool: &SqlitePool,
     since_rfc3339: &str,
 ) -> Result<Vec<UsageSnapshotRow>, sqlx::Error> {
     sqlx::query_as::<_, UsageSnapshotRow>(
-        "SELECT public_key, captured_at, rx_bytes, tx_bytes
+        "SELECT public_key, rx_bytes, tx_bytes
          FROM   snapshots
          WHERE  captured_at >= ?
          ORDER  BY public_key, captured_at ASC",
@@ -322,6 +322,24 @@ mod tests {
         .expect("insert snapshot");
     }
 
+    async fn insert_snapshot_with_rx(
+        pool: &SqlitePool,
+        public_key: &str,
+        captured_at: &str,
+        rx_bytes: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO snapshots (public_key, captured_at, rx_bytes, tx_bytes)
+             VALUES (?, ?, ?, 200)",
+        )
+        .bind(public_key)
+        .bind(captured_at)
+        .bind(rx_bytes)
+        .execute(pool)
+        .await
+        .expect("insert snapshot");
+    }
+
     #[tokio::test]
     async fn list_all_empty_db() {
         let db = test_db().await;
@@ -479,11 +497,12 @@ mod tests {
     #[tokio::test]
     async fn find_all_snapshots_since_returns_multiple_peers() {
         let db = test_db().await;
-        insert_snapshot(&db.pool, "KEY_ALL_A=", "2026-01-05T00:00:00Z").await;
-        insert_snapshot(&db.pool, "KEY_ALL_A=", "2026-01-10T00:00:00Z").await;
-        insert_snapshot(&db.pool, "KEY_ALL_B=", "2026-01-06T00:00:00Z").await;
+        // Use distinct rx_bytes to verify ordering (captured_at is not in UsageSnapshotRow).
+        insert_snapshot_with_rx(&db.pool, "KEY_ALL_A=", "2026-01-05T00:00:00Z", 10).await;
+        insert_snapshot_with_rx(&db.pool, "KEY_ALL_A=", "2026-01-10T00:00:00Z", 20).await;
+        insert_snapshot_with_rx(&db.pool, "KEY_ALL_B=", "2026-01-06T00:00:00Z", 30).await;
         // One snapshot before the cutoff – should be excluded.
-        insert_snapshot(&db.pool, "KEY_ALL_A=", "2026-01-01T00:00:00Z").await;
+        insert_snapshot_with_rx(&db.pool, "KEY_ALL_A=", "2026-01-01T00:00:00Z", 1).await;
 
         let rows = find_all_snapshots_since(&db.pool, "2026-01-05T00:00:00Z")
             .await
@@ -491,11 +510,11 @@ mod tests {
         assert_eq!(rows.len(), 3);
         // Grouped by public_key, ordered by captured_at ASC within each group.
         assert_eq!(rows[0].public_key, "KEY_ALL_A=");
-        assert_eq!(rows[0].captured_at, "2026-01-05T00:00:00Z");
+        assert_eq!(rows[0].rx_bytes, 10); // 2026-01-05
         assert_eq!(rows[1].public_key, "KEY_ALL_A=");
-        assert_eq!(rows[1].captured_at, "2026-01-10T00:00:00Z");
+        assert_eq!(rows[1].rx_bytes, 20); // 2026-01-10
         assert_eq!(rows[2].public_key, "KEY_ALL_B=");
-        assert_eq!(rows[2].captured_at, "2026-01-06T00:00:00Z");
+        assert_eq!(rows[2].rx_bytes, 30); // 2026-01-06
     }
 
     // ── Config mapping ───────────────────────────────────────────────────────

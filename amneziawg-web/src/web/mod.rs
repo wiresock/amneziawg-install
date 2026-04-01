@@ -1070,9 +1070,10 @@ async fn get_all_usage(
     let all_snapshots =
         crate::db::peers::find_all_snapshots_since(&state.db.pool, &since_str).await?;
 
-    // Single-pass streaming: rows are ordered by (public_key, captured_at ASC).
-    // Track previous counters per key and accumulate deltas directly, storing
-    // only an O(peers) summary map instead of O(snapshots) input vectors.
+    // Single-pass aggregation over the in-memory snapshot Vec: rows are ordered
+    // by (public_key, captured_at ASC). Track previous counters per key and
+    // accumulate deltas directly, storing only an O(peers) summary map in
+    // addition to the O(snapshots) input that `find_all_snapshots_since` returns.
     let mut summaries: std::collections::HashMap<String, HistorySummary> =
         std::collections::HashMap::new();
     let mut current_key = String::new();
