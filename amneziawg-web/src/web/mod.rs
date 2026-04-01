@@ -2470,7 +2470,7 @@ document.addEventListener('keydown',function(e){
   if(e.key==='Escape'){_closeQrModal();return;}
   if(e.key==='Tab'){
     var modal=overlay.querySelector('.qr-modal');
-    var focusable=modal.querySelectorAll('button,a,[tabindex],input,select,textarea,img');
+    var focusable=modal.querySelectorAll('button:not([disabled]),a[href],[tabindex]:not([tabindex="-1"]),input:not([disabled]),select:not([disabled]),textarea:not([disabled])');
     if(focusable.length===0) return;
     var first=focusable[0],last=focusable[focusable.length-1];
     if(e.shiftKey){if(document.activeElement===first){e.preventDefault();last.focus();}}
