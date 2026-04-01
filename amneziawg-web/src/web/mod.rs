@@ -847,11 +847,15 @@ fn is_safe_config_path(path: &std::path::Path) -> bool {
             .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
 }
 
-/// Open a file with `O_NOFOLLOW` and read its contents, preventing the
-/// kernel from following symlinks at open time.  This eliminates the
-/// TOCTOU gap between the earlier `symlink_metadata` / `canonicalize`
-/// checks and the actual read: even if the file is swapped to a symlink
-/// between those checks and this call, the open will fail with `ELOOP`.
+/// Open a file with `O_NOFOLLOW` and read its contents.
+/// On Unix, `O_NOFOLLOW` only applies to the final path component: the
+/// kernel will refuse to follow a symlink at that point and the `open`
+/// will fail with `ELOOP` if the target file is (or has become) a
+/// symlink between the earlier `symlink_metadata` / `canonicalize`
+/// checks and this call. Ancestor directories may still be symlinks, so
+/// callers must ensure `path` and its parent directories are not
+/// replaceable by untrusted users (or use fd-based traversal such as
+/// `openat`/dirfd if stronger guarantees are required).
 #[cfg(unix)]
 async fn read_file_nofollow(path: &std::path::Path) -> std::io::Result<String> {
     let path = path.to_path_buf();
