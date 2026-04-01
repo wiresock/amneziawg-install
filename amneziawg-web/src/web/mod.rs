@@ -50,10 +50,11 @@ pub struct AppState {
     pub rate_limiter: LoginRateLimiter,
     /// Directory where AWG client configs are stored (for rescan).
     pub config_dir: std::path::PathBuf,
-    /// Canonicalized `config_dir` for safe `starts_with` comparisons.
-    /// Falls back to the raw `config_dir` if canonicalization fails at
-    /// startup (e.g. the directory does not exist yet).
-    pub canonical_config_dir: std::path::PathBuf,
+    /// Lazily-canonicalized `config_dir` for safe `starts_with` comparisons.
+    /// Populated on first successful canonicalization (either at startup or on
+    /// the first request that triggers it), so that a `config_dir` created
+    /// after the process starts still gets properly resolved.
+    canonical_config_dir: std::sync::Arc<tokio::sync::OnceCell<std::path::PathBuf>>,
 }
 
 impl AppState {
@@ -62,8 +63,12 @@ impl AppState {
         auth: AuthConfig,
         config_dir: std::path::PathBuf,
     ) -> Self {
-        let canonical_config_dir = std::fs::canonicalize(&config_dir)
-            .unwrap_or_else(|_| config_dir.clone());
+        let cell = tokio::sync::OnceCell::new();
+        // Eagerly try to canonicalize at startup; if the dir exists now the
+        // result is cached immediately and no filesystem hit is needed later.
+        if let Ok(p) = std::fs::canonicalize(&config_dir) {
+            let _ = cell.set(p);
+        }
         Self {
             db,
             auth,
@@ -71,8 +76,21 @@ impl AppState {
             login_csrf: new_login_csrf_store(),
             rate_limiter: new_login_rate_limiter(),
             config_dir,
-            canonical_config_dir,
+            canonical_config_dir: std::sync::Arc::new(cell),
         }
+    }
+
+    /// Return the canonicalized config directory, computing it lazily if
+    /// the startup attempt failed (e.g. the directory didn't exist yet).
+    async fn get_canonical_config_dir(&self) -> Option<&std::path::PathBuf> {
+        self.canonical_config_dir
+            .get_or_try_init(|| async {
+                tokio::fs::canonicalize(&self.config_dir)
+                    .await
+                    .map_err(|_| ())
+            })
+            .await
+            .ok()
     }
 }
 
@@ -809,21 +827,24 @@ fn is_safe_config_path(path: &std::path::Path) -> bool {
             .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
 }
 
-/// `GET /api/peers/:id/config` – download the client config file.
+/// Resolve, validate, and read a peer's config file.
 ///
-/// Returns the raw config file content with `Content-Type: text/plain` and a
-/// `Content-Disposition: attachment` header so browsers offer a download dialog.
+/// Shared by `get_peer_config` and `get_peer_qr` to keep the security
+/// validation logic (path-traversal check, symlink rejection, canonical-path
+/// prefix guard) in one place.
 ///
-/// Returns HTTP 404 if the peer does not exist or has no associated config file.
-/// Returns HTTP 404 if the config file cannot be read from disk.
-async fn get_peer_config(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Response, ApiError> {
-    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+/// Returns `Ok((content, config_path))` on success, or an error `Response`
+/// that the caller can return directly.
+async fn read_validated_config(
+    state: &AppState,
+    peer_id: i64,
+) -> Result<(String, std::path::PathBuf), Response> {
+    let row = crate::db::peers::find_by_id(&state.db.pool, peer_id)
+        .await
+        .map_err(|e| ApiError(e.into()).into_response())?;
     let peer = match row {
         None => {
-            return Ok((
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "peer not found" })),
             )
@@ -835,7 +856,7 @@ async fn get_peer_config(
     let config_path = match peer.config_path {
         Some(ref p) if !p.is_empty() => std::path::PathBuf::from(p),
         _ => {
-            return Ok((
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "no config file associated with this peer" })),
             )
@@ -844,7 +865,7 @@ async fn get_peer_config(
     };
 
     if !is_safe_config_path(&config_path) {
-        return Ok((
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
         )
@@ -855,7 +876,7 @@ async fn get_peer_config(
     let metadata = match tokio::fs::symlink_metadata(&config_path).await {
         Ok(m) => m,
         Err(_) => {
-            return Ok((
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "config file not found on disk" })),
             )
@@ -864,7 +885,7 @@ async fn get_peer_config(
     };
 
     if metadata.file_type().is_symlink() {
-        return Ok((
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
         )
@@ -875,7 +896,7 @@ async fn get_peer_config(
     let canonical_path = match tokio::fs::canonicalize(&config_path).await {
         Ok(p) => p,
         Err(_) => {
-            return Ok((
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "invalid config path" })),
             )
@@ -883,8 +904,16 @@ async fn get_peer_config(
         }
     };
 
-    if !canonical_path.starts_with(&state.canonical_config_dir) {
-        return Ok((
+    let canonical_config_dir = state.get_canonical_config_dir().await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "invalid config path" })),
+        )
+            .into_response()
+    })?;
+
+    if !canonical_path.starts_with(canonical_config_dir) {
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
         )
@@ -894,12 +923,31 @@ async fn get_peer_config(
     let content = match tokio::fs::read_to_string(&canonical_path).await {
         Ok(c) => c,
         Err(_) => {
-            return Ok((
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "config file not found on disk" })),
             )
                 .into_response())
         }
+    };
+
+    Ok((content, config_path))
+}
+
+/// `GET /api/peers/:id/config` – download the client config file.
+///
+/// Returns the raw config file content with `Content-Type: text/plain` and a
+/// `Content-Disposition: attachment` header so browsers offer a download dialog.
+///
+/// Returns HTTP 404 if the peer does not exist or has no associated config file.
+/// Returns HTTP 404 if the config file cannot be read from disk.
+async fn get_peer_config(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let (content, config_path) = match read_validated_config(&state, id).await {
+        Ok(pair) => pair,
+        Err(resp) => return Ok(resp),
     };
 
     let filename = config_path
@@ -934,109 +982,54 @@ async fn get_peer_config(
         .into_response())
 }
 
+/// No-cache headers applied to every QR response (success and error) so
+/// browsers / proxies do not cache private key material or stale errors.
+const QR_NO_CACHE_HEADERS: [(axum::http::header::HeaderName, &str); 2] = [
+    (axum::http::header::CACHE_CONTROL, "no-store"),
+    (axum::http::header::PRAGMA, "no-cache"),
+];
+
+/// Attach the standard no-cache headers to a response.
+fn with_qr_no_cache(mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    for (name, value) in &QR_NO_CACHE_HEADERS {
+        headers.insert(name, axum::http::HeaderValue::from_static(value));
+    }
+    resp
+}
+
 /// `GET /api/peers/:id/qr` – render the client config as a QR code SVG.
 ///
-/// Returns an SVG image (`Content-Type: image/svg+xml`) that encodes the full
-/// text of the client configuration file.  Mobile users can scan this QR code
-/// with their AmneziaWG / WireGuard app to import the tunnel.
+/// Returns an SVG image (`Content-Type: image/svg+xml; charset=utf-8`) that
+/// encodes the full text of the client configuration file.  Mobile users can
+/// scan this QR code with their AmneziaWG / WireGuard app to import the tunnel.
 ///
 /// Returns HTTP 404 if the peer does not exist, has no associated config, or
 /// the config file cannot be read from disk.
 /// Returns HTTP 422 if the config content is too large for a QR code.
+///
+/// All responses (success *and* error) include `Cache-Control: no-store` and
+/// `Pragma: no-cache` because the endpoint is loaded via an `<img>` tag and
+/// browsers may otherwise cache error responses.
 async fn get_peer_qr(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
-    let peer = match row {
-        None => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "peer not found" })),
-            )
-                .into_response())
-        }
-        Some(r) => r,
-    };
-
-    let config_path = match peer.config_path {
-        Some(ref p) if !p.is_empty() => std::path::PathBuf::from(p),
-        _ => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "no config file associated with this peer" })),
-            )
-                .into_response())
-        }
-    };
-
-    if !is_safe_config_path(&config_path) {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "invalid config path" })),
-        )
-            .into_response());
-    }
-
-    // Ensure the config file is not a symlink and remains within the configured
-    // config directory after path resolution, to avoid serving arbitrary files.
-    let metadata = match tokio::fs::symlink_metadata(&config_path).await {
-        Ok(m) => m,
-        Err(_) => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "config file not found on disk" })),
-            )
-                .into_response())
-        }
-    };
-
-    if metadata.file_type().is_symlink() {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "invalid config path" })),
-        )
-            .into_response());
-    }
-
-    let canonical_path = match tokio::fs::canonicalize(&config_path).await {
-        Ok(p) => p,
-        Err(_) => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "invalid config path" })),
-            )
-                .into_response())
-        }
-    };
-
-    if !canonical_path.starts_with(&state.canonical_config_dir) {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "invalid config path" })),
-        )
-            .into_response());
-    }
-
-    let content = match tokio::fs::read_to_string(&canonical_path).await {
-        Ok(c) => c,
-        Err(_) => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "config file not found on disk" })),
-            )
-                .into_response())
-        }
+    let (content, _config_path) = match read_validated_config(&state, id).await {
+        Ok(pair) => pair,
+        Err(resp) => return Ok(with_qr_no_cache(resp)),
     };
 
     let qr = match qrcode::QrCode::new(content.as_bytes()) {
         Ok(q) => q,
         Err(_) => {
-            return Ok((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": "config content is too large for a QR code" })),
-            )
-                .into_response())
+            return Ok(with_qr_no_cache(
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "config content is too large for a QR code" })),
+                )
+                    .into_response(),
+            ))
         }
     };
 
@@ -1046,25 +1039,17 @@ async fn get_peer_qr(
         .min_dimensions(256, 256)
         .build();
 
-    Ok((
-        StatusCode::OK,
-        [
-            (
+    Ok(with_qr_no_cache(
+        (
+            StatusCode::OK,
+            [(
                 axum::http::header::CONTENT_TYPE,
                 "image/svg+xml; charset=utf-8".to_string(),
-            ),
-            (
-                axum::http::header::CACHE_CONTROL,
-                "no-store".to_string(),
-            ),
-            (
-                axum::http::header::PRAGMA,
-                "no-cache".to_string(),
-            ),
-        ],
-        svg,
-    )
-        .into_response())
+            )],
+            svg,
+        )
+            .into_response(),
+    ))
 }
 
 /// `PATCH /api/peers/:id` – update a peer's display name and/or comment.
