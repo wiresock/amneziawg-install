@@ -98,7 +98,7 @@ impl AppState {
                         if e.kind() != std::io::ErrorKind::NotFound
                             && !self
                                 .logged_canon_error
-                                .swap(true, std::sync::atomic::Ordering::Relaxed)
+                                .swap(true, std::sync::atomic::Ordering::AcqRel)
                         {
                             error!(
                                 error = ?e,
