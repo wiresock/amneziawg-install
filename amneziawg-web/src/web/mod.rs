@@ -50,6 +50,10 @@ pub struct AppState {
     pub rate_limiter: LoginRateLimiter,
     /// Directory where AWG client configs are stored (for rescan).
     pub config_dir: std::path::PathBuf,
+    /// Canonicalized `config_dir` for safe `starts_with` comparisons.
+    /// Falls back to the raw `config_dir` if canonicalization fails at
+    /// startup (e.g. the directory does not exist yet).
+    pub canonical_config_dir: std::path::PathBuf,
 }
 
 impl AppState {
@@ -58,6 +62,8 @@ impl AppState {
         auth: AuthConfig,
         config_dir: std::path::PathBuf,
     ) -> Self {
+        let canonical_config_dir = std::fs::canonicalize(&config_dir)
+            .unwrap_or_else(|_| config_dir.clone());
         Self {
             db,
             auth,
@@ -65,6 +71,7 @@ impl AppState {
             login_csrf: new_login_csrf_store(),
             rate_limiter: new_login_rate_limiter(),
             config_dir,
+            canonical_config_dir,
         }
     }
 }
@@ -876,11 +883,7 @@ async fn get_peer_config(
         }
     };
 
-    let canonical_config_dir = tokio::fs::canonicalize(&state.config_dir)
-        .await
-        .unwrap_or_else(|_| state.config_dir.clone());
-
-    if !canonical_path.starts_with(&canonical_config_dir) {
+    if !canonical_path.starts_with(&state.canonical_config_dir) {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
@@ -1007,11 +1010,7 @@ async fn get_peer_qr(
         }
     };
 
-    let canonical_config_dir = tokio::fs::canonicalize(&state.config_dir)
-        .await
-        .unwrap_or_else(|_| state.config_dir.clone());
-
-    if !canonical_path.starts_with(&canonical_config_dir) {
+    if !canonical_path.starts_with(&state.canonical_config_dir) {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
