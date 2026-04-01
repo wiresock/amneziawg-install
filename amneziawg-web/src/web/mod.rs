@@ -50,6 +50,14 @@ pub struct AppState {
     pub rate_limiter: LoginRateLimiter,
     /// Directory where AWG client configs are stored (for rescan).
     pub config_dir: std::path::PathBuf,
+    /// Lazily-canonicalized `config_dir` for safe `starts_with` comparisons.
+    /// Populated on first successful canonicalization (either at startup or on
+    /// the first request that triggers it), so that a `config_dir` created
+    /// after the process starts still gets properly resolved.
+    canonical_config_dir: std::sync::Arc<tokio::sync::OnceCell<std::path::PathBuf>>,
+    /// Set once after logging a non-`NotFound` canonicalization error so
+    /// subsequent retries don't flood the logs.
+    logged_canon_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -58,6 +66,12 @@ impl AppState {
         auth: AuthConfig,
         config_dir: std::path::PathBuf,
     ) -> Self {
+        let cell = tokio::sync::OnceCell::new();
+        // Eagerly try to canonicalize at startup; if the dir exists now the
+        // result is cached immediately and no filesystem hit is needed later.
+        if let Ok(p) = std::fs::canonicalize(&config_dir) {
+            let _ = cell.set(p);
+        }
         Self {
             db,
             auth,
@@ -65,7 +79,37 @@ impl AppState {
             login_csrf: new_login_csrf_store(),
             rate_limiter: new_login_rate_limiter(),
             config_dir,
+            canonical_config_dir: std::sync::Arc::new(cell),
+            logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Return the canonicalized config directory, computing it lazily if
+    /// the startup attempt failed (e.g. the directory didn't exist yet).
+    /// All failures are retried on the next request so transient issues
+    /// (permissions, IO) can recover without a restart.  Non-`NotFound`
+    /// errors are logged once via an atomic flag to avoid per-request spam.
+    async fn get_canonical_config_dir(&self) -> Option<&std::path::PathBuf> {
+        self.canonical_config_dir
+            .get_or_try_init(|| async {
+                tokio::fs::canonicalize(&self.config_dir)
+                    .await
+                    .map_err(|e| {
+                        if e.kind() != std::io::ErrorKind::NotFound
+                            && !self
+                                .logged_canon_error
+                                .swap(true, std::sync::atomic::Ordering::AcqRel)
+                        {
+                            error!(
+                                error = ?e,
+                                config_dir = ?self.config_dir,
+                                "failed to canonicalize config directory"
+                            );
+                        }
+                    })
+            })
+            .await
+            .ok()
     }
 }
 
@@ -433,6 +477,7 @@ pub fn router(
         .route("/api/peers/:id", get(get_peer).patch(patch_peer))
         .route("/api/peers/:id/history", get(get_peer_history))
         .route("/api/peers/:id/config", get(get_peer_config))
+        .route("/api/peers/:id/qr", get(get_peer_qr))
         .route("/api/events", get(list_events_handler))
         // ── User lifecycle routes ────────────────────────────────
         .route("/api/admin/users", post(api_create_user))
@@ -791,21 +836,69 @@ async fn get_peer_history(
     Ok(Json(dto).into_response())
 }
 
-/// `GET /api/peers/:id/config` – download the client config file.
+/// Check that a config path is absolute and free of `.`/`..` traversal
+/// components.  Shared by `get_peer_config` and `get_peer_qr` so the
+/// validation logic stays in sync.
+fn is_safe_config_path(path: &std::path::Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+}
+
+/// Open a file with `O_NOFOLLOW` and read its contents.
+/// On Unix, `O_NOFOLLOW` only applies to the final path component: the
+/// kernel will refuse to follow a symlink at that point and the `open`
+/// will fail with `ELOOP` if the target file is (or has become) a
+/// symlink between the earlier `symlink_metadata` / `canonicalize`
+/// checks and this call. Ancestor directories may still be symlinks, so
+/// callers must ensure `path` and its parent directories are not
+/// replaceable by untrusted users (or use fd-based traversal such as
+/// `openat`/dirfd if stronger guarantees are required).
+#[cfg(unix)]
+async fn read_file_nofollow(path: &std::path::Path) -> std::io::Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+}
+
+/// Fallback for non-Unix: regular async read (the `symlink_metadata`
+/// check still provides best-effort protection, but without `O_NOFOLLOW`
+/// there is an inherent TOCTOU window).
+#[cfg(not(unix))]
+async fn read_file_nofollow(path: &std::path::Path) -> std::io::Result<String> {
+    tokio::fs::read_to_string(path).await
+}
+
+/// Resolve, validate, and read a peer's config file.
 ///
-/// Returns the raw config file content with `Content-Type: text/plain` and a
-/// `Content-Disposition: attachment` header so browsers offer a download dialog.
+/// Shared by `get_peer_config` and `get_peer_qr` to keep the security
+/// validation logic (path-traversal check, symlink rejection, canonical-path
+/// prefix guard, `O_NOFOLLOW` open) in one place.
 ///
-/// Returns HTTP 404 if the peer does not exist or has no associated config file.
-/// Returns HTTP 404 if the config file cannot be read from disk.
-async fn get_peer_config(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Response, ApiError> {
-    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+/// Returns `Ok((content, config_path))` on success, or an error `Response`
+/// that the caller can return directly.
+async fn read_validated_config(
+    state: &AppState,
+    peer_id: i64,
+) -> Result<(String, std::path::PathBuf), Response> {
+    let row = crate::db::peers::find_by_id(&state.db.pool, peer_id)
+        .await
+        .map_err(|e| ApiError(e.into()).into_response())?;
     let peer = match row {
         None => {
-            return Ok((
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "peer not found" })),
             )
@@ -817,7 +910,7 @@ async fn get_peer_config(
     let config_path = match peer.config_path {
         Some(ref p) if !p.is_empty() => std::path::PathBuf::from(p),
         _ => {
-            return Ok((
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "no config file associated with this peer" })),
             )
@@ -825,23 +918,102 @@ async fn get_peer_config(
         }
     };
 
-    // Security: ensure the path is absolute and doesn't contain traversal.
-    if !config_path.is_absolute() {
-        return Ok((
+    if !is_safe_config_path(&config_path) {
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "invalid config path" })),
         )
             .into_response());
     }
 
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(c) => c,
+    // Prevent serving arbitrary files via symlinked config paths.
+    let metadata = match tokio::fs::symlink_metadata(&config_path).await {
+        Ok(m) => m,
         Err(_) => {
-            return Ok((
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "config file not found on disk" })),
             )
                 .into_response())
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "invalid config path" })),
+        )
+            .into_response());
+    }
+
+    // Ensure the resolved path remains within the configured directory.
+    let canonical_path = match tokio::fs::canonicalize(&config_path).await {
+        Ok(p) => p,
+        Err(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "invalid config path" })),
+            )
+                .into_response())
+        }
+    };
+
+    let canonical_config_dir = state.get_canonical_config_dir().await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "invalid config path" })),
+        )
+            .into_response()
+    })?;
+
+    if !canonical_path.starts_with(canonical_config_dir) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "invalid config path" })),
+        )
+            .into_response());
+    }
+
+    // Open with O_NOFOLLOW to prevent symlink-following at read time,
+    // eliminating the TOCTOU gap after the checks above.
+    let content = match read_file_nofollow(&canonical_path).await {
+        Ok(c) => c,
+        Err(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "config file not found on disk" })),
+            )
+                .into_response())
+        }
+    };
+
+    Ok((content, config_path))
+}
+
+/// `GET /api/peers/:id/config` – download the client config file.
+///
+/// Returns the raw config file content with `Content-Type: text/plain` and a
+/// `Content-Disposition: attachment` header so browsers offer a download dialog.
+///
+/// Returns HTTP 404 if the peer does not exist or has no associated config file.
+/// Returns HTTP 404 if the config file cannot be read from disk.
+async fn get_peer_config(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let (content, config_path) = match read_validated_config(&state, id).await {
+        Ok(pair) => pair,
+        Err(mut resp) => {
+            let headers = resp.headers_mut();
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            headers.insert(
+                axum::http::header::PRAGMA,
+                axum::http::HeaderValue::from_static("no-cache"),
+            );
+            return Ok(resp);
         }
     };
 
@@ -863,10 +1035,88 @@ async fn get_peer_config(
                 "text/plain; charset=utf-8".to_string(),
             ),
             (axum::http::header::CONTENT_DISPOSITION, disposition),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store".to_string(),
+            ),
+            (
+                axum::http::header::PRAGMA,
+                "no-cache".to_string(),
+            ),
         ],
         content,
     )
         .into_response())
+}
+
+/// No-cache headers applied to every QR response (success and error) so
+/// browsers / proxies do not cache private key material or stale errors.
+const QR_NO_CACHE_HEADERS: [(axum::http::header::HeaderName, &str); 2] = [
+    (axum::http::header::CACHE_CONTROL, "no-store"),
+    (axum::http::header::PRAGMA, "no-cache"),
+];
+
+/// Attach the standard no-cache headers to a response.
+fn with_qr_no_cache(mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    for (name, value) in &QR_NO_CACHE_HEADERS {
+        headers.insert(name.clone(), axum::http::HeaderValue::from_static(*value));
+    }
+    resp
+}
+
+/// `GET /api/peers/:id/qr` – render the client config as a QR code SVG.
+///
+/// Returns an SVG image (`Content-Type: image/svg+xml; charset=utf-8`) that
+/// encodes the full text of the client configuration file.  Mobile users can
+/// scan this QR code with their AmneziaWG / WireGuard app to import the tunnel.
+///
+/// Returns HTTP 404 if the peer does not exist, has no associated config, or
+/// the config file cannot be read from disk.
+/// Returns HTTP 422 if the config content is too large for a QR code.
+///
+/// All responses produced by this handler (success *and* error) include
+/// `Cache-Control: no-store` and `Pragma: no-cache` because the endpoint is
+/// loaded via an `<img>` tag and browsers may otherwise cache error responses.
+async fn get_peer_qr(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let (content, _config_path) = match read_validated_config(&state, id).await {
+        Ok(pair) => pair,
+        Err(resp) => return Ok(with_qr_no_cache(resp)),
+    };
+
+    let qr = match qrcode::QrCode::new(content.as_bytes()) {
+        Ok(q) => q,
+        Err(_) => {
+            return Ok(with_qr_no_cache(
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "config content is too large for a QR code" })),
+                )
+                    .into_response(),
+            ))
+        }
+    };
+
+    let svg = qr
+        .render::<qrcode::render::svg::Color>()
+        .quiet_zone(true)
+        .min_dimensions(256, 256)
+        .build();
+
+    Ok(with_qr_no_cache(
+        (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "image/svg+xml; charset=utf-8".to_string(),
+            )],
+            svg,
+        )
+            .into_response(),
+    ))
 }
 
 /// `PATCH /api/peers/:id` – update a peer's display name and/or comment.
@@ -1785,6 +2035,15 @@ fn html_head(title: &str) -> String {
   .nav-logout button {{ padding: .3rem .8rem; background: #e55; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .85rem; }}
   .nav-logout button:hover {{ background: #c33; }}
   .error {{ color: #c00; margin-top: .5rem; font-size: .95rem; }}
+  .qr-modal-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:1000; justify-content:center; align-items:center; }}
+  .qr-modal-overlay.active {{ display:flex; }}
+  .qr-modal {{ background:#fff; border-radius:8px; padding:1.5rem; max-width:360px; width:90%; text-align:center; position:relative; }}
+  .qr-modal h3 {{ margin:0 0 1rem; font-size:1.1rem; }}
+  .qr-modal svg, .qr-modal img {{ max-width:100%; height:auto; }}
+  .qr-modal-close {{ position:absolute; top:.5rem; right:.75rem; background:none; border:none; font-size:1.3rem; cursor:pointer; color:#666; }}
+  .qr-modal-close:hover {{ color:#222; }}
+  .qr-link {{ cursor:pointer; background:none; border:none; color:#0066cc; font:inherit; padding:0; text-decoration:none; }}
+  .qr-link:hover {{ text-decoration:underline; }}
 </style>
 </head>
 <body>
@@ -2023,8 +2282,12 @@ fn render_peer_detail_inner(
     }
     if dto.has_config {
         buf.push_str(&format!(
-            "<tr><th>Config</th><td><a href=\"/api/peers/{}/config\">&#x2B73; Download</a></td></tr>\n",
-            dto.id
+            "<tr><th>Config</th><td>\
+             <a href=\"/api/peers/{id}/config\">&#x2B73; Download</a>\
+             &nbsp; | &nbsp;\
+             <button type=\"button\" class=\"qr-link\" onclick=\"showQr({id})\">&#x25A3; QR Code</button>\
+             </td></tr>\n",
+            id = dto.id
         ));
     }
     if let Some(ref dn) = dto.display_name {
@@ -2157,6 +2420,71 @@ Historical data (snapshots, events) will be preserved.</p>
         buf.push_str("</table>\n");
     }
 
+    // QR code modal overlay (only when config exists)
+    if dto.has_config {
+        buf.push_str(
+            r#"<div id="qr-overlay" class="qr-modal-overlay" onclick="hideQr(event)">
+  <div class="qr-modal" role="dialog" aria-modal="true" aria-labelledby="qr-title">
+    <button type="button" class="qr-modal-close" onclick="event.stopPropagation(); hideQr(event)" aria-label="Close">&times;</button>
+    <h3 id="qr-title">Scan QR Code</h3>
+    <div id="qr-content"><p>Loading…</p></div>
+  </div>
+</div>
+<script>
+var _qrTrigger=null;
+function showQr(peerId){
+  _qrTrigger=document.activeElement;
+  var overlay=document.getElementById('qr-overlay');
+  var content=document.getElementById('qr-content');
+  while(content.firstChild) content.removeChild(content.firstChild);
+  var loadingP=document.createElement('p');
+  loadingP.textContent='Loading\u2026';
+  content.appendChild(loadingP);
+  overlay.classList.add('active');
+  var closeBtn=overlay.querySelector('.qr-modal-close');
+  if(closeBtn) closeBtn.focus();
+  var img=document.createElement('img');
+  img.alt='QR code';
+  img.onload=function(){
+    while(content.firstChild) content.removeChild(content.firstChild);
+    content.appendChild(img);
+  };
+  img.onerror=function(){
+    while(content.firstChild) content.removeChild(content.firstChild);
+    var p=document.createElement('p');
+    p.style.color='#c00';
+    p.textContent='Failed to load QR code';
+    content.appendChild(p);
+  };
+  img.src='/api/peers/'+peerId+'/qr';
+}
+function _closeQrModal(){
+  document.getElementById('qr-overlay').classList.remove('active');
+  if(_qrTrigger){_qrTrigger.focus();_qrTrigger=null;}
+}
+function hideQr(ev){
+  var el=ev.target;
+  if(el===document.getElementById('qr-overlay')||el.classList.contains('qr-modal-close'))
+    _closeQrModal();
+}
+document.addEventListener('keydown',function(e){
+  var overlay=document.getElementById('qr-overlay');
+  if(!overlay.classList.contains('active')) return;
+  if(e.key==='Escape'){_closeQrModal();return;}
+  if(e.key==='Tab'){
+    var modal=overlay.querySelector('.qr-modal');
+    var focusable=modal.querySelectorAll('button:not([disabled]),a[href],[tabindex]:not([tabindex="-1"]),input:not([disabled]),select:not([disabled]),textarea:not([disabled])');
+    if(focusable.length===0) return;
+    var first=focusable[0],last=focusable[focusable.length-1];
+    if(e.shiftKey){if(document.activeElement===first){e.preventDefault();last.focus();}}
+    else{if(document.activeElement===last){e.preventDefault();first.focus();}}
+  }
+});
+</script>
+"#,
+        );
+    }
+
     buf.push_str("</body></html>");
     buf
 }
@@ -2184,6 +2512,11 @@ mod tests {
             AuthConfig::disabled(),
             std::path::PathBuf::from("/tmp/test-configs"),
         )
+    }
+
+    /// Build a router with auth disabled and a custom config directory.
+    fn test_router_with_config_dir(db: Database, config_dir: std::path::PathBuf) -> Router {
+        router(db, AuthConfig::disabled(), config_dir)
     }
 
     /// Build a router with auth enabled and known test credentials.
@@ -3827,7 +4160,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db, "KEY_DLCONF=", None).await;
 
-        // Create a temp config file.
+        // Create a temp config file inside the config directory.
         let dir = tempfile::tempdir().unwrap();
         let conf_path = dir.path().join("test-client.conf");
         std::fs::write(&conf_path, "[Interface]\nAddress = 10.0.0.2/32\n").unwrap();
@@ -3843,7 +4176,7 @@ mod tests {
         .await
         .unwrap();
 
-        let app = test_router(db);
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
         let response = app
             .oneshot(
                 Request::builder()
@@ -3862,6 +4195,22 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(content_type.contains("text/plain"));
+
+        let cache_control = response
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cache_control, "no-store");
+
+        let pragma = response
+            .headers()
+            .get("pragma")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(pragma, "no-cache");
 
         let disposition = response
             .headers()
@@ -4264,5 +4613,444 @@ mod tests {
     fn esc_js_escapes_line_terminators() {
         assert_eq!(super::esc_js("a\nb\rc"), "a\\nb\\rc");
         assert_eq!(super::esc_js("x\u{2028}y\u{2029}z"), "x\\u2028y\\u2029z");
+    }
+
+    // ── QR code tests ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_peer_qr_peer_not_found_returns_404() {
+        let app = test_router(test_db().await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers/9999/qr")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "QR 404 response must set Cache-Control: no-store",
+        );
+        assert_eq!(
+            headers.get("pragma").and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "QR 404 response must set Pragma: no-cache",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_peer_qr_no_config_returns_404() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QR_NC=", None).await;
+        let app = test_router(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/qr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "QR 404 (no config) response must set Cache-Control: no-store",
+        );
+        assert_eq!(
+            headers.get("pragma").and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "QR 404 (no config) response must set Pragma: no-cache",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_peer_qr_returns_svg() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QR_OK=", None).await;
+
+        // Create a temp config file inside the config directory.
+        let dir = tempfile::tempdir().unwrap();
+        let conf_path = dir.path().join("test-qr.conf");
+        std::fs::write(&conf_path, "[Interface]\nAddress = 10.0.0.2/32\n").unwrap();
+
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_QR_OK=",
+            "test-qr",
+            conf_path.to_str().unwrap(),
+            "test-qr",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/qr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("image/svg+xml"),
+            "expected SVG content type, got: {content_type}"
+        );
+
+        let cache_control = response
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cache_control, "no-store", "QR response must not be cached");
+
+        let pragma = response
+            .headers()
+            .get("pragma")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(pragma, "no-cache", "QR response must not be cached");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let svg = std::str::from_utf8(&body).unwrap();
+        assert!(svg.contains("<svg"), "response should contain SVG markup");
+    }
+
+    #[tokio::test]
+    async fn get_peer_qr_too_large_returns_422() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QR_BIG=", None).await;
+
+        // Create a config file that exceeds QR code data capacity.
+        let dir = tempfile::tempdir().unwrap();
+        let conf_path = dir.path().join("big-qr.conf");
+        let big_content = "A".repeat(5000);
+        std::fs::write(&conf_path, &big_content).unwrap();
+
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_QR_BIG=",
+            "big-qr",
+            conf_path.to_str().unwrap(),
+            "big-qr",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/qr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // 422 QR responses should also be non-cacheable.
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "QR 422 response must set Cache-Control: no-store",
+        );
+        assert_eq!(
+            headers.get("pragma").and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "QR 422 response must set Pragma: no-cache",
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"].as_str().unwrap().contains("too large"),
+            "error should mention size limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_shows_qr_link_when_config_exists() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QRUI=", None).await;
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_QRUI=",
+            "test-qrui",
+            "/etc/awg/test-qrui.conf",
+            "test-qrui",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("QR Code"),
+            "peer detail page should contain QR Code link"
+        );
+        assert!(
+            html.contains("qr-overlay"),
+            "peer detail page should contain QR modal overlay"
+        );
+        assert!(
+            html.contains("showQr("),
+            "peer detail page should contain showQr JavaScript function"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_no_qr_link_when_no_config() {
+        let db = test_db().await;
+        let _id = insert_peer(&db, "KEY_NOQR=", None).await;
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !html.contains("QR Code"),
+            "peer detail page should NOT contain QR Code link when no config"
+        );
+        assert!(
+            !html.contains("qr-overlay"),
+            "peer detail page should NOT contain QR modal when no config"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_peer_config_error_returns_no_cache_headers() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_CFGERR=", None).await;
+        let app = test_router(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "config 404 response must set Cache-Control: no-store",
+        );
+        assert_eq!(
+            headers.get("pragma").and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "config 404 response must set Pragma: no-cache",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_peer_config_outside_config_dir_returns_404() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_OUTSIDE=", None).await;
+
+        // Create two separate temp directories: one for config_dir and one for
+        // the actual config file so the file lives outside config_dir.
+        let config_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_conf = outside_dir.path().join("escaped.conf");
+        std::fs::write(&outside_conf, "[Interface]\nAddress = 10.0.0.99/32\n").unwrap();
+
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_OUTSIDE=",
+            "escaped",
+            outside_conf.to_str().unwrap(),
+            "escaped",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router_with_config_dir(db, config_dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "config file outside config_dir must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_peer_qr_outside_config_dir_returns_404() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QROUT=", None).await;
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_conf = outside_dir.path().join("escaped-qr.conf");
+        std::fs::write(&outside_conf, "[Interface]\nAddress = 10.0.0.99/32\n").unwrap();
+
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_QROUT=",
+            "escaped-qr",
+            outside_conf.to_str().unwrap(),
+            "escaped-qr",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router_with_config_dir(db, config_dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/qr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "QR for config file outside config_dir must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_peer_config_symlink_rejected() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_SYMLINK=", None).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Create a real config file and a symlink pointing to it.
+        let real_conf = dir.path().join("real.conf");
+        std::fs::write(&real_conf, "[Interface]\nAddress = 10.0.0.77/32\n").unwrap();
+        let link_conf = dir.path().join("link.conf");
+        std::os::unix::fs::symlink(&real_conf, &link_conf).unwrap();
+
+        // Map the peer to the symlink path.
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_SYMLINK=",
+            "link",
+            link_conf.to_str().unwrap(),
+            "link",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "symlinked config file must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_peer_qr_symlink_rejected() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QRSYM=", None).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_conf = dir.path().join("real-qr.conf");
+        std::fs::write(&real_conf, "[Interface]\nAddress = 10.0.0.78/32\n").unwrap();
+        let link_conf = dir.path().join("link-qr.conf");
+        std::os::unix::fs::symlink(&real_conf, &link_conf).unwrap();
+
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_QRSYM=",
+            "link-qr",
+            link_conf.to_str().unwrap(),
+            "link-qr",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/qr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "symlinked config file must be rejected for QR endpoint"
+        );
     }
 }
