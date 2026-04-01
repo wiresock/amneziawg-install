@@ -59,6 +59,7 @@ pub struct SnapshotRow {
 pub struct UsageSnapshotRow {
     pub public_key: String,
     /// ISO-8601 / RFC-3339 timestamp when this snapshot was captured.
+    #[allow(dead_code)]
     pub captured_at: String,
     pub rx_bytes: i64,
     pub tx_bytes: i64,

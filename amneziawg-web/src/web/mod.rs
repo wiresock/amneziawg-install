@@ -28,7 +28,7 @@ use crate::db::events::{
     list_events, log_event, EVT_LOGIN_FAILED, EVT_LOGIN_SUCCESS, EVT_LOGOUT, EVT_PEER_DISABLED,
     EVT_PEER_UPDATED,
 };
-use crate::db::peers::{PeerRow, SnapshotRow, UsageSnapshotRow};
+use crate::db::peers::{PeerRow, SnapshotRow};
 use crate::db::Database;
 use crate::domain::history::{
     compute_history, compute_usage_summary, HistoryPoint, HistorySummary, SnapshotInput,
@@ -294,6 +294,30 @@ pub struct AllUsageDto {
     pub peers: Vec<PeerUsageDto>,
 }
 
+/// Traffic totals for a single period (day, week, or month).
+#[derive(Debug, Serialize)]
+pub struct UsagePeriodDto {
+    /// Sum of non-negative RX deltas in this period.
+    pub rx_bytes: u64,
+    /// Sum of non-negative TX deltas in this period.
+    pub tx_bytes: u64,
+}
+
+/// Combined traffic usage across all three periods, returned by
+/// `GET /api/peers/:id/usage/summary`.
+///
+/// Computed from a single DB query (month window) so the client can populate
+/// day/week/month cells in one round-trip.
+#[derive(Debug, Serialize)]
+pub struct PeerUsageSummaryDto {
+    pub peer_id: i64,
+    pub name: String,
+    pub public_key: String,
+    pub day: UsagePeriodDto,
+    pub week: UsagePeriodDto,
+    pub month: UsagePeriodDto,
+}
+
 /// Request body for `PATCH /api/peers/:id`.
 ///
 /// Both fields are optional.  If a field is absent the existing value is kept.
@@ -437,14 +461,6 @@ fn snapshot_row_to_input(row: SnapshotRow) -> SnapshotInput {
     }
 }
 
-fn usage_snapshot_row_to_input(row: UsageSnapshotRow) -> SnapshotInput {
-    SnapshotInput {
-        captured_at: row.captured_at,
-        rx_bytes: row.rx_bytes as u64,
-        tx_bytes: row.tx_bytes as u64,
-    }
-}
-
 fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDto {
     let last_handshake = epoch_to_utc(row.last_handshake_at);
     let disabled = row.disabled != 0;
@@ -539,6 +555,7 @@ pub fn router(
         .route("/api/peers/:id/config", get(get_peer_config))
         .route("/api/peers/:id/qr", get(get_peer_qr))
         .route("/api/peers/:id/usage", get(get_peer_usage))
+        .route("/api/peers/:id/usage/summary", get(get_peer_usage_summary))
         .route("/api/usage", get(get_all_usage))
         .route("/api/events", get(list_events_handler))
         // ── User lifecycle routes ────────────────────────────────
@@ -956,6 +973,83 @@ async fn get_peer_usage(
     Ok(Json(dto).into_response())
 }
 
+/// `GET /api/peers/:id/usage/summary`
+///
+/// Returns aggregated RX/TX traffic usage for a single peer across **all
+/// three periods** (day, week, month) in a single response.  Fetches the
+/// month window (30 days) from the DB once and computes the shorter windows
+/// as sub-slices, avoiding three separate HTTP round-trips.
+async fn get_peer_usage_summary(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+    let peer = match row {
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "peer not found" })),
+            )
+                .into_response())
+        }
+        Some(r) => r,
+    };
+
+    let now = Utc::now();
+    // Fetch the full month window – day and week are subsets.
+    let month_since = now - chrono::Duration::seconds(period_to_secs("month"));
+    let month_str = month_since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let snapshot_rows =
+        crate::db::peers::find_snapshots_since(&state.db.pool, &peer.public_key, &month_str)
+            .await?;
+
+    let inputs: Vec<SnapshotInput> = snapshot_rows
+        .into_iter()
+        .map(snapshot_row_to_input)
+        .collect();
+
+    // Month = full slice.
+    let month_summary = compute_usage_summary(&inputs);
+
+    // Week / day = suffix slices (snapshots are sorted oldest-first).
+    let week_since = now - chrono::Duration::seconds(period_to_secs("week"));
+    let week_str = week_since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let week_start = inputs.partition_point(|s| s.captured_at.as_str() < week_str.as_str());
+    let week_summary = compute_usage_summary(&inputs[week_start..]);
+
+    let day_since = now - chrono::Duration::seconds(period_to_secs("day"));
+    let day_str = day_since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let day_start = inputs.partition_point(|s| s.captured_at.as_str() < day_str.as_str());
+    let day_summary = compute_usage_summary(&inputs[day_start..]);
+
+    let name = resolve_display_name(
+        peer.display_name.as_deref(),
+        peer.friendly_name.as_deref(),
+        peer.config_name.as_deref(),
+        &peer.public_key,
+    );
+
+    let dto = PeerUsageSummaryDto {
+        peer_id: id,
+        name,
+        public_key: peer.public_key,
+        day: UsagePeriodDto {
+            rx_bytes: day_summary.rx_total_delta,
+            tx_bytes: day_summary.tx_total_delta,
+        },
+        week: UsagePeriodDto {
+            rx_bytes: week_summary.rx_total_delta,
+            tx_bytes: week_summary.tx_total_delta,
+        },
+        month: UsagePeriodDto {
+            rx_bytes: month_summary.rx_total_delta,
+            tx_bytes: month_summary.tx_total_delta,
+        },
+    };
+    Ok(Json(dto).into_response())
+}
+
 /// `GET /api/usage?period=day|week|month`
 ///
 /// Returns aggregated RX/TX traffic usage for **all** known peers over the
@@ -976,22 +1070,46 @@ async fn get_all_usage(
     let all_snapshots =
         crate::db::peers::find_all_snapshots_since(&state.db.pool, &since_str).await?;
 
-    // Group snapshots by public_key (already sorted by public_key, captured_at ASC).
-    // Use std::mem::take to move public_key out of each row, avoiding a clone.
-    let mut snap_map: std::collections::HashMap<String, Vec<SnapshotInput>> =
+    // Single-pass streaming: rows are ordered by (public_key, captured_at ASC).
+    // Track previous counters per key and accumulate deltas directly, storing
+    // only an O(peers) summary map instead of O(snapshots) input vectors.
+    let mut summaries: std::collections::HashMap<String, HistorySummary> =
         std::collections::HashMap::new();
-    for mut row in all_snapshots {
-        let key = std::mem::take(&mut row.public_key);
-        snap_map
-            .entry(key)
-            .or_default()
-            .push(usage_snapshot_row_to_input(row));
+    let mut current_key = String::new();
+    let mut prev_rx: u64 = 0;
+    let mut prev_tx: u64 = 0;
+
+    for row in all_snapshots {
+        let rx = row.rx_bytes as u64;
+        let tx = row.tx_bytes as u64;
+
+        if !current_key.is_empty() && row.public_key == current_key {
+            // Same peer – accumulate delta.
+            let s = summaries.get_mut(&current_key).unwrap();
+            s.rx_total_delta = s.rx_total_delta.saturating_add(rx.saturating_sub(prev_rx));
+            s.tx_total_delta = s.tx_total_delta.saturating_add(tx.saturating_sub(prev_tx));
+        } else {
+            // New peer – start tracking.
+            current_key = row.public_key;
+            summaries
+                .entry(current_key.clone())
+                .or_insert(HistorySummary {
+                    rx_total_delta: 0,
+                    tx_total_delta: 0,
+                });
+        }
+        prev_rx = rx;
+        prev_tx = tx;
     }
 
     let mut peer_usages: Vec<PeerUsageDto> = Vec::with_capacity(peers.len());
     for peer in &peers {
-        let inputs = snap_map.remove(&peer.public_key).unwrap_or_default();
-        let summary = compute_usage_summary(&inputs);
+        let summary = summaries
+            .remove(&peer.public_key)
+            .unwrap_or(HistorySummary {
+                rx_total_delta: 0,
+                tx_total_delta: 0,
+            });
 
         let name = resolve_display_name(
             peer.display_name.as_deref(),
@@ -2560,33 +2678,35 @@ Historical data (snapshots, events) will be preserved.</p>
         ));
     }
     buf.push_str("</table>\n");
-    // Inline script to load usage data asynchronously.
+    // Inline script to load usage data asynchronously (single fetch).
     buf.push_str(&format!(
         r#"<script>
 (function(){{
-  var periods=['day','week','month'];
   function fmtBytes(b){{
     if(b<1024) return b+' B';
     if(b<1048576) return (b/1024).toFixed(1)+' KiB';
     if(b<1073741824) return (b/1048576).toFixed(1)+' MiB';
     return (b/1073741824).toFixed(2)+' GiB';
   }}
-  periods.forEach(function(p){{
-    fetch('/api/peers/{id}/usage?period='+p,{{credentials:'same-origin'}})
-      .then(function(r){{
-        if(!r.ok) throw new Error('HTTP '+r.status);
-        return r.json();
-      }})
-      .then(function(d){{
-        if(typeof d.rx_bytes!=='number'||typeof d.tx_bytes!=='number') throw new Error('Invalid data');
-        document.getElementById('usage-rx-'+p).textContent=fmtBytes(d.rx_bytes);
-        document.getElementById('usage-tx-'+p).textContent=fmtBytes(d.tx_bytes);
-      }})
-      .catch(function(){{
+  fetch('/api/peers/{id}/usage/summary',{{credentials:'same-origin'}})
+    .then(function(r){{
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      return r.json();
+    }})
+    .then(function(d){{
+      ['day','week','month'].forEach(function(p){{
+        var u=d[p];
+        if(!u||typeof u.rx_bytes!=='number'||typeof u.tx_bytes!=='number') return;
+        document.getElementById('usage-rx-'+p).textContent=fmtBytes(u.rx_bytes);
+        document.getElementById('usage-tx-'+p).textContent=fmtBytes(u.tx_bytes);
+      }});
+    }})
+    .catch(function(){{
+      ['day','week','month'].forEach(function(p){{
         document.getElementById('usage-rx-'+p).textContent='–';
         document.getElementById('usage-tx-'+p).textContent='–';
       }});
-  }});
+    }});
 }})();
 </script>
 "#,
@@ -3264,6 +3384,96 @@ mod tests {
         assert_eq!(json["period"], "day");
     }
 
+    // ── Per-peer usage summary endpoint ───────────────────────────────────
+
+    #[tokio::test]
+    async fn usage_summary_peer_not_found_returns_404() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers/9999/usage/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn usage_summary_returns_all_periods() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "USAGE_SUMMARY_KEY=", Some("SummaryPeer")).await;
+
+        let now = Utc::now();
+        let t1 = (now - chrono::Duration::hours(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t2 = (now - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        insert_snapshot_with_bytes(&db, "USAGE_SUMMARY_KEY=", &t1, 100, 200).await;
+        insert_snapshot_with_bytes(&db, "USAGE_SUMMARY_KEY=", &t2, 400, 700).await;
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/usage/summary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["peer_id"], id);
+        assert_eq!(json["name"], "SummaryPeer");
+        // All three period keys are present.
+        assert!(json["day"].is_object());
+        assert!(json["week"].is_object());
+        assert!(json["month"].is_object());
+        // Snapshots are within last 2 hours, so all periods include them.
+        assert_eq!(json["day"]["rx_bytes"], 300);
+        assert_eq!(json["day"]["tx_bytes"], 500);
+        assert_eq!(json["week"]["rx_bytes"], 300);
+        assert_eq!(json["week"]["tx_bytes"], 500);
+        assert_eq!(json["month"]["rx_bytes"], 300);
+        assert_eq!(json["month"]["tx_bytes"], 500);
+    }
+
+    #[tokio::test]
+    async fn usage_summary_no_snapshots_returns_zero() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "USAGE_SUM_EMPTY=", Some("EmptySummary")).await;
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/usage/summary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["day"]["rx_bytes"], 0);
+        assert_eq!(json["day"]["tx_bytes"], 0);
+        assert_eq!(json["week"]["rx_bytes"], 0);
+        assert_eq!(json["week"]["tx_bytes"], 0);
+        assert_eq!(json["month"]["rx_bytes"], 0);
+        assert_eq!(json["month"]["tx_bytes"], 0);
+    }
+
     // ── All-peers usage endpoint ──────────────────────────────────────────
 
     #[tokio::test]
@@ -3430,6 +3640,7 @@ mod tests {
         assert!(html.contains("Traffic usage"));
         assert!(html.contains("/api/peers/"));
         assert!(html.contains("usage?period="));
+        assert!(html.contains("usage/summary"));
     }
 
     // ── PATCH /api/peers/:id ───────────────────────────────────────────────
