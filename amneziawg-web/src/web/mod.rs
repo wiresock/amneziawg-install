@@ -1004,11 +1004,11 @@ async fn get_peer_config(
             let headers = resp.headers_mut();
             headers.insert(
                 axum::http::header::CACHE_CONTROL,
-                "no-store".parse().unwrap(),
+                axum::http::HeaderValue::from_static("no-store"),
             );
             headers.insert(
                 axum::http::header::PRAGMA,
-                "no-cache".parse().unwrap(),
+                axum::http::HeaderValue::from_static("no-cache"),
             );
             return Ok(resp);
         }
