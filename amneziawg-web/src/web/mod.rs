@@ -54,7 +54,9 @@ pub struct AppState {
     /// Populated on first successful canonicalization (either at startup or on
     /// the first request that triggers it), so that a `config_dir` created
     /// after the process starts still gets properly resolved.
-    canonical_config_dir: std::sync::Arc<tokio::sync::OnceCell<std::path::PathBuf>>,
+    /// Stored as `Option<PathBuf>`: `Some` on success, `None` when a persistent
+    /// (non-`NotFound`) error has been cached so we stop retrying/logging.
+    canonical_config_dir: std::sync::Arc<tokio::sync::OnceCell<Option<std::path::PathBuf>>>,
 }
 
 impl AppState {
@@ -67,7 +69,7 @@ impl AppState {
         // Eagerly try to canonicalize at startup; if the dir exists now the
         // result is cached immediately and no filesystem hit is needed later.
         if let Ok(p) = std::fs::canonicalize(&config_dir) {
-            let _ = cell.set(p);
+            let _ = cell.set(Some(p));
         }
         Self {
             db,
@@ -82,25 +84,33 @@ impl AppState {
 
     /// Return the canonicalized config directory, computing it lazily if
     /// the startup attempt failed (e.g. the directory didn't exist yet).
+    /// Non-`NotFound` failures are cached (logged once) so the service
+    /// degrades predictably without per-request error spam.
     async fn get_canonical_config_dir(&self) -> Option<&std::path::PathBuf> {
         self.canonical_config_dir
             .get_or_try_init(|| async {
-                tokio::fs::canonicalize(&self.config_dir)
-                    .await
-                    .map_err(|e| {
-                        // Avoid spamming error logs for the expected case where the
-                        // directory does not exist yet; only log unexpected errors.
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            error!(
-                                error = ?e,
-                                config_dir = ?self.config_dir,
-                                "failed to canonicalize config directory"
-                            );
-                        }
-                    })
+                match tokio::fs::canonicalize(&self.config_dir).await {
+                    Ok(path) => Ok(Some(path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Directory doesn't exist yet; retry on next request.
+                        Err(())
+                    }
+                    Err(e) => {
+                        // Persistent error (permissions, misconfiguration, etc.);
+                        // log once and cache the failure so we don't spam on
+                        // every request.
+                        error!(
+                            error = ?e,
+                            config_dir = ?self.config_dir,
+                            "failed to canonicalize config directory"
+                        );
+                        Ok(None)
+                    }
+                }
             })
             .await
             .ok()
+            .and_then(|opt| opt.as_ref())
     }
 }
 
@@ -990,7 +1000,18 @@ async fn get_peer_config(
 ) -> Result<Response, ApiError> {
     let (content, config_path) = match read_validated_config(&state, id).await {
         Ok(pair) => pair,
-        Err(resp) => return Ok(resp),
+        Err(mut resp) => {
+            let headers = resp.headers_mut();
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                "no-store".parse().unwrap(),
+            );
+            headers.insert(
+                axum::http::header::PRAGMA,
+                "no-cache".parse().unwrap(),
+            );
+            return Ok(resp);
+        }
     };
 
     let filename = config_path
@@ -4617,6 +4638,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "QR 404 (no config) response must set Cache-Control: no-store",
+        );
+        assert_eq!(
+            headers.get("pragma").and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "QR 404 (no config) response must set Pragma: no-cache",
+        );
     }
 
     #[tokio::test]
