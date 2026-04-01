@@ -1057,7 +1057,7 @@ const QR_NO_CACHE_HEADERS: [(axum::http::header::HeaderName, &str); 2] = [
 fn with_qr_no_cache(mut resp: Response) -> Response {
     let headers = resp.headers_mut();
     for (name, value) in &QR_NO_CACHE_HEADERS {
-        headers.insert(name, axum::http::HeaderValue::from_static(value));
+        headers.insert(name.clone(), axum::http::HeaderValue::from_static(*value));
     }
     resp
 }
