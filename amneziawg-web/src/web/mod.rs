@@ -2297,19 +2297,20 @@ function showQr(peerId){
   var content=document.getElementById('qr-content');
   content.innerHTML='<p>Loading\u2026</p>';
   overlay.classList.add('active');
-  fetch('/api/peers/'+peerId+'/qr')
-    .then(function(r){
-      if(!r.ok) return r.json().then(function(j){throw new Error(j.error||'Failed to load QR code')});
-      return r.text();
-    })
-    .then(function(svg){content.innerHTML=svg})
-    .catch(function(e){
-      content.innerHTML='';
-      var p=document.createElement('p');
-      p.style.color='#c00';
-      p.textContent=e.message;
-      content.appendChild(p);
-    });
+  var img=document.createElement('img');
+  img.alt='QR code';
+  img.onload=function(){
+    content.innerHTML='';
+    content.appendChild(img);
+  };
+  img.onerror=function(){
+    content.innerHTML='';
+    var p=document.createElement('p');
+    p.style.color='#c00';
+    p.textContent='Failed to load QR code';
+    content.appendChild(p);
+  };
+  img.src='/api/peers/'+peerId+'/qr';
 }
 function hideQr(ev){
   var el=ev.target;
@@ -4027,6 +4028,22 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(content_type.contains("text/plain"));
+
+        let cache_control = response
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cache_control, "no-store");
+
+        let pragma = response
+            .headers()
+            .get("pragma")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(pragma, "no-cache");
 
         let disposition = response
             .headers()
