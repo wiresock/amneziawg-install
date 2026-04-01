@@ -88,11 +88,15 @@ impl AppState {
                 tokio::fs::canonicalize(&self.config_dir)
                     .await
                     .map_err(|e| {
-                        error!(
-                            error = ?e,
-                            config_dir = ?self.config_dir,
-                            "failed to canonicalize config directory"
-                        );
+                        // Avoid spamming error logs for the expected case where the
+                        // directory does not exist yet; only log unexpected errors.
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            error!(
+                                error = ?e,
+                                config_dir = ?self.config_dir,
+                                "failed to canonicalize config directory"
+                            );
+                        }
                     })
             })
             .await
