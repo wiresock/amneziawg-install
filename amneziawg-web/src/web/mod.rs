@@ -4867,4 +4867,190 @@ mod tests {
             "peer detail page should NOT contain QR modal when no config"
         );
     }
+
+    #[tokio::test]
+    async fn get_peer_config_error_returns_no_cache_headers() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_CFGERR=", None).await;
+        let app = test_router(db);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "config 404 response must set Cache-Control: no-store",
+        );
+        assert_eq!(
+            headers.get("pragma").and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "config 404 response must set Pragma: no-cache",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_peer_config_outside_config_dir_returns_404() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_OUTSIDE=", None).await;
+
+        // Create two separate temp directories: one for config_dir and one for
+        // the actual config file so the file lives outside config_dir.
+        let config_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_conf = outside_dir.path().join("escaped.conf");
+        std::fs::write(&outside_conf, "[Interface]\nAddress = 10.0.0.99/32\n").unwrap();
+
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_OUTSIDE=",
+            "escaped",
+            outside_conf.to_str().unwrap(),
+            "escaped",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router_with_config_dir(db, config_dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "config file outside config_dir must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_peer_qr_outside_config_dir_returns_404() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QROUT=", None).await;
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_conf = outside_dir.path().join("escaped-qr.conf");
+        std::fs::write(&outside_conf, "[Interface]\nAddress = 10.0.0.99/32\n").unwrap();
+
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_QROUT=",
+            "escaped-qr",
+            outside_conf.to_str().unwrap(),
+            "escaped-qr",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router_with_config_dir(db, config_dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/qr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "QR for config file outside config_dir must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_peer_config_symlink_rejected() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_SYMLINK=", None).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Create a real config file and a symlink pointing to it.
+        let real_conf = dir.path().join("real.conf");
+        std::fs::write(&real_conf, "[Interface]\nAddress = 10.0.0.77/32\n").unwrap();
+        let link_conf = dir.path().join("link.conf");
+        std::os::unix::fs::symlink(&real_conf, &link_conf).unwrap();
+
+        // Map the peer to the symlink path.
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_SYMLINK=",
+            "link",
+            link_conf.to_str().unwrap(),
+            "link",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "symlinked config file must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_peer_qr_symlink_rejected() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_QRSYM=", None).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_conf = dir.path().join("real-qr.conf");
+        std::fs::write(&real_conf, "[Interface]\nAddress = 10.0.0.78/32\n").unwrap();
+        let link_conf = dir.path().join("link-qr.conf");
+        std::os::unix::fs::symlink(&real_conf, &link_conf).unwrap();
+
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_QRSYM=",
+            "link-qr",
+            link_conf.to_str().unwrap(),
+            "link-qr",
+        )
+        .await
+        .unwrap();
+
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/qr"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "symlinked config file must be rejected for QR endpoint"
+        );
+    }
 }
