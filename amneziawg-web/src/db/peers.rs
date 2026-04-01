@@ -129,6 +129,25 @@ pub async fn find_snapshots_since(
     .await
 }
 
+/// Return snapshots for **all** peers captured on or after `since_rfc3339`,
+/// ordered by `public_key` then `captured_at` **ascending** (oldest first).
+///
+/// Used by the traffic-usage endpoint to compute per-peer deltas in bulk.
+pub async fn find_all_snapshots_since(
+    pool: &SqlitePool,
+    since_rfc3339: &str,
+) -> Result<Vec<SnapshotRow>, sqlx::Error> {
+    sqlx::query_as::<_, SnapshotRow>(
+        "SELECT id, public_key, captured_at, endpoint, last_handshake_at, rx_bytes, tx_bytes
+         FROM   snapshots
+         WHERE  captured_at >= ?
+         ORDER  BY public_key, captured_at ASC",
+    )
+    .bind(since_rfc3339)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn find_snapshots(
     pool: &SqlitePool,
     public_key: &str,
@@ -426,6 +445,39 @@ mod tests {
         // Ascending: oldest first
         assert!(rows[0].captured_at < rows[1].captured_at);
         assert!(rows[1].captured_at < rows[2].captured_at);
+    }
+
+    // ── find_all_snapshots_since ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_all_snapshots_since_empty() {
+        let db = test_db().await;
+        let rows = find_all_snapshots_since(&db.pool, "2026-01-01T00:00:00Z")
+            .await
+            .expect("all_snapshots_since");
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_all_snapshots_since_returns_multiple_peers() {
+        let db = test_db().await;
+        insert_snapshot(&db.pool, "KEY_ALL_A=", "2026-01-05T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_ALL_A=", "2026-01-10T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_ALL_B=", "2026-01-06T00:00:00Z").await;
+        // One snapshot before the cutoff – should be excluded.
+        insert_snapshot(&db.pool, "KEY_ALL_A=", "2026-01-01T00:00:00Z").await;
+
+        let rows = find_all_snapshots_since(&db.pool, "2026-01-05T00:00:00Z")
+            .await
+            .expect("all_snapshots_since");
+        assert_eq!(rows.len(), 3);
+        // Grouped by public_key, ordered by captured_at ASC within each group.
+        assert_eq!(rows[0].public_key, "KEY_ALL_A=");
+        assert_eq!(rows[0].captured_at, "2026-01-05T00:00:00Z");
+        assert_eq!(rows[1].public_key, "KEY_ALL_A=");
+        assert_eq!(rows[1].captured_at, "2026-01-10T00:00:00Z");
+        assert_eq!(rows[2].public_key, "KEY_ALL_B=");
+        assert_eq!(rows[2].captured_at, "2026-01-06T00:00:00Z");
     }
 
     // ── Config mapping ───────────────────────────────────────────────────────
