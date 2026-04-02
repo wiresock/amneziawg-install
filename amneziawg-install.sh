@@ -59,28 +59,34 @@ _cleanup_apt_ipv4_and_chain() {
 	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
 		rm -f "${APT_FORCE_IPV4_CONF}"
 	fi
-	# Restore + chain: re-install the previous trap (if any), then invoke
-	# its handler body so pre-existing cleanup runs during this exit/signal.
+	# Restore + chain: re-install the previous trap (if any), then
+	# re-deliver the signal / exit so bash invokes the restored handler.
+	# This avoids parsing trap -p output entirely (no sed/eval of bodies).
 	local prev_var="_APT_IPV4_PREV_TRAP_${sig}"
 	local prev_trap="${!prev_var}"
 	if [[ -n "${prev_trap}" ]]; then
 		# Re-install the previous trap (e.g. trap -- 'handler' EXIT).
 		eval "${prev_trap}"
-		# Extract the handler body from the saved trap specification.
-		# trap -p output is always:  trap -- 'body' SIGNAL
-		# Use sed to safely parse the body between the outer single quotes.
-		local _trap_body
-		_trap_body=$(printf '%s\n' "${prev_trap}" | sed -E "s/^trap -- '(([^'\\\\]|\\\\.)*)' ${sig}\$/\\1/")
-		if [[ -n "${_trap_body}" ]]; then
-			# Restore original exit status before invoking the chained handler.
-			( exit "${_saved_status}" )
-			eval "${_trap_body}"
+		# Re-deliver the signal so bash invokes the just-restored handler.
+		if [[ "${sig}" == "EXIT" ]]; then
+			# For EXIT: exiting re-fires the EXIT trap with the original status.
+			exit "${_saved_status}"
+		else
+			# For INT/TERM: re-raise the signal to invoke the restored handler.
+			kill -s "${sig}" "$$" 2>/dev/null || {
+				case "${sig}" in
+					INT)  exit 130 ;;  # 128 + SIGINT(2)
+					TERM) exit 143 ;;  # 128 + SIGTERM(15)
+				esac
+			}
 		fi
 	else
 		trap - "${sig}"
-		# For INT/TERM with no previous trap, re-raise the signal so that
-		# default signal semantics (termination + exit status) are preserved.
-		if [[ "${sig}" == INT || "${sig}" == TERM ]]; then
+		if [[ "${sig}" == "EXIT" ]]; then
+			# Preserve the original exit status when no prior handler exists.
+			exit "${_saved_status}"
+		elif [[ "${sig}" == INT || "${sig}" == TERM ]]; then
+			# Re-raise the signal so default termination semantics are preserved.
 			kill -s "${sig}" "$$" 2>/dev/null || {
 				case "${sig}" in
 					INT)  exit 130 ;;  # 128 + SIGINT(2)
