@@ -49,6 +49,12 @@ pub enum CreateClientError {
     #[error("no free IP address available (max 253 clients)")]
     NoFreeIp,
 
+    #[error("invalid IP address: {0}")]
+    InvalidIp(String),
+
+    #[error("IP address already in use: {0}")]
+    IpInUse(String),
+
     #[error("failed to read server parameters: {0}")]
     ParamsRead(String),
 
@@ -72,6 +78,18 @@ pub enum CreateClientError {
 
     #[error("internal error during client creation: {0}")]
     Internal(String),
+}
+
+/// Optional IP address overrides for client creation.
+///
+/// When both fields are `None`, the first available IP pair is allocated
+/// automatically (existing behaviour).
+#[derive(Debug, Clone, Default)]
+pub struct IpOverride {
+    /// IPv4 host number (last octet, 2–254).
+    pub ipv4_host: Option<u16>,
+    /// IPv6 host segment (1–4 hex characters, e.g. `"2a"`).
+    pub ipv6_host: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -110,6 +128,8 @@ pub fn sanitized_create_error_category(error: &CreateClientError) -> &'static st
         CreateClientError::InvalidName(_) => "invalid_name",
         CreateClientError::DuplicateName(_) => "duplicate_name",
         CreateClientError::NoFreeIp => "no_free_ip",
+        CreateClientError::InvalidIp(_) => "invalid_ip",
+        CreateClientError::IpInUse(_) => "ip_in_use",
         CreateClientError::ParamsRead(_) => "params_read_failed",
         CreateClientError::DbRead(_) => "db_read_failed",
         CreateClientError::KeyGen(_) => "key_generation_failed",
@@ -486,6 +506,110 @@ fn parse_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     }
 }
 
+/// Resolve the IPv4/IPv6 host addresses for a new client.
+///
+/// If `ip_override` contains user-specified values, they are validated and
+/// checked against the server config for collisions.  Otherwise the first
+/// available IP pair is allocated automatically.
+///
+/// Returns `(client_ipv4, client_ipv6_full)`, e.g. `("10.66.66.5", "fd42:0042:0042:0000::5")`.
+fn resolve_client_ips(
+    server_config: &str,
+    base_ipv4: &str,
+    base_ipv6: &str,
+    ip_override: &IpOverride,
+) -> Result<(String, String), CreateClientError> {
+    let used_ipv4 = find_used_ipv4_dots(server_config, base_ipv4);
+    let existing_ipv6s = find_existing_ipv6_normalized(server_config);
+
+    match (&ip_override.ipv4_host, &ip_override.ipv6_host) {
+        // No overrides – auto-allocate.
+        (None, None) => {
+            let dot_ip = find_available_dot(&used_ipv4, &existing_ipv6s, base_ipv6)
+                .ok_or(CreateClientError::NoFreeIp)?;
+            Ok((
+                format!("{base_ipv4}.{dot_ip}"),
+                format!("{base_ipv6}::{dot_ip}"),
+            ))
+        }
+        // Both overrides specified.
+        (Some(ipv4_host), Some(ipv6_host)) => {
+            validate_ipv4_host(*ipv4_host)?;
+            validate_ipv6_host(ipv6_host)?;
+
+            if used_ipv4.contains(ipv4_host) {
+                return Err(CreateClientError::IpInUse(format!(
+                    "{base_ipv4}.{ipv4_host}"
+                )));
+            }
+            let ipv6_full = format!("{base_ipv6}::{ipv6_host}");
+            let ipv6_norm = normalize_ipv6(&ipv6_full)?;
+            if existing_ipv6s.contains(&ipv6_norm) {
+                return Err(CreateClientError::IpInUse(ipv6_full));
+            }
+            Ok((format!("{base_ipv4}.{ipv4_host}"), ipv6_full))
+        }
+        // Only IPv4 override – derive IPv6 from the same decimal host number.
+        (Some(ipv4_host), None) => {
+            validate_ipv4_host(*ipv4_host)?;
+
+            if used_ipv4.contains(ipv4_host) {
+                return Err(CreateClientError::IpInUse(format!(
+                    "{base_ipv4}.{ipv4_host}"
+                )));
+            }
+            let ipv6_full = format!("{base_ipv6}::{ipv4_host}");
+            let ipv6_norm = normalize_ipv6(&ipv6_full)?;
+            if existing_ipv6s.contains(&ipv6_norm) {
+                return Err(CreateClientError::IpInUse(ipv6_full));
+            }
+            Ok((format!("{base_ipv4}.{ipv4_host}"), ipv6_full))
+        }
+        // Only IPv6 override – auto-allocate IPv4 with collision check for the
+        // user-specified IPv6.
+        (None, Some(ipv6_host)) => {
+            validate_ipv6_host(ipv6_host)?;
+
+            let ipv6_full = format!("{base_ipv6}::{ipv6_host}");
+            let ipv6_norm = normalize_ipv6(&ipv6_full)?;
+            if existing_ipv6s.contains(&ipv6_norm) {
+                return Err(CreateClientError::IpInUse(ipv6_full));
+            }
+            // Auto-allocate the IPv4 host (skip IPv6 collision check since we
+            // already validated the user-supplied IPv6 above).
+            let dot_ip = (2..=254u16)
+                .find(|d| !used_ipv4.contains(d))
+                .ok_or(CreateClientError::NoFreeIp)?;
+            Ok((format!("{base_ipv4}.{dot_ip}"), ipv6_full))
+        }
+    }
+}
+
+/// Validate the IPv4 host number (last octet).
+fn validate_ipv4_host(host: u16) -> Result<(), CreateClientError> {
+    if !(2..=254).contains(&host) {
+        return Err(CreateClientError::InvalidIp(
+            "IPv4 host number must be between 2 and 254".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the IPv6 host segment (1–4 hex characters).
+fn validate_ipv6_host(host: &str) -> Result<(), CreateClientError> {
+    if host.is_empty() || host.len() > 4 {
+        return Err(CreateClientError::InvalidIp(
+            "IPv6 host must be 1–4 hexadecimal characters".to_string(),
+        ));
+    }
+    if !host.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(CreateClientError::InvalidIp(
+            "IPv6 host must contain only hexadecimal characters (0-9, a-f)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // ── Config generation ───────────────────────────────────────────────────────
 
 /// Build the endpoint string, bracketing IPv6 addresses.
@@ -617,7 +741,8 @@ pub struct CreateClientResult {
 /// 1. Validate the client name.
 /// 2. Read server parameters from the params file.
 /// 3. Read the server config to check for duplicate names and find used IPs.
-/// 4. Find the first available IP address pair (IPv4 + IPv6).
+/// 4. Find the first available IP address pair (IPv4 + IPv6), or use the
+///    user-specified overrides from `ip_override`.
 /// 5. Generate cryptographic keys (private, public, pre-shared).
 /// 6. Write the client config file to `config_dir`.
 /// 7. Append the peer block to the server config.
@@ -627,6 +752,7 @@ pub fn create_client(
     config_dir: &Path,
     name: &str,
     disabled_keys: &HashSet<String>,
+    ip_override: &IpOverride,
 ) -> Result<CreateClientResult, CreateClientError> {
     // Step 1: Validate the client name.
     script_bridge::validate_client_name(name)?;
@@ -775,26 +901,19 @@ pub fn create_client(
         return Err(CreateClientError::DuplicateName(name.to_string()));
     }
 
-    // Step 5: Find an available IP address pair.
+    // Step 5: Find an available IP address pair (or use overrides).
     let base_ipv4 = ipv4_base(&params.server_awg_ipv4);
     let server_ipv6_normalized = normalize_ipv6(&params.server_awg_ipv6)?;
     let base_ipv6 = ipv6_prefix(&server_ipv6_normalized);
 
-    let used_ipv4 = find_used_ipv4_dots(&server_config, base_ipv4);
-    let existing_ipv6s = find_existing_ipv6_normalized(&server_config);
-    let dot_ip =
-        find_available_dot(&used_ipv4, &existing_ipv6s, base_ipv6)
-            .ok_or(CreateClientError::NoFreeIp)?;
-
-    let client_ipv4 = format!("{base_ipv4}.{dot_ip}");
-    let client_ipv6_full = format!("{base_ipv6}::{dot_ip}");
+    let (client_ipv4, client_ipv6_full) =
+        resolve_client_ips(&server_config, base_ipv4, base_ipv6, ip_override)?;
     let client_ipv6_normalized = normalize_ipv6(&client_ipv6_full)?;
     let client_ipv6_display = compress_ipv6(&client_ipv6_full)?;
 
     debug!(
         ipv4 = %client_ipv4,
         ipv6 = %client_ipv6_display,
-        dot = dot_ip,
         "allocated client IP addresses"
     );
 
@@ -893,6 +1012,7 @@ pub fn create_client(
     _config_dir: &Path,
     _name: &str,
     _disabled_keys: &HashSet<String>,
+    _ip_override: &IpOverride,
 ) -> Result<CreateClientResult, CreateClientError> {
     Err(CreateClientError::Internal(
         "create_client is supported only on unix targets".to_string(),
@@ -1426,5 +1546,136 @@ AllowedIPs = 10.66.66.3/32,fd42:0042:0042:0000:0000:0000:0000:0003/128
         assert!(config.contains("PresharedKey = PSK_KEY="));
         assert!(config.contains("Endpoint = 1.2.3.4:51820"));
         assert!(config.contains("AllowedIPs = 0.0.0.0/0,::/0"));
+    }
+
+    // ── IP override / resolve_client_ips tests ─────────────────────────
+
+    #[test]
+    fn resolve_client_ips_auto_allocates_when_no_override() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
+";
+        let ovr = IpOverride::default();
+        let (ipv4, ipv6) = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap();
+        assert_eq!(ipv4, "10.66.66.3");
+        assert_eq!(ipv6, "fd42:0042:0042:0000::3");
+    }
+
+    #[test]
+    fn resolve_client_ips_uses_ipv4_override() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
+";
+        let ovr = IpOverride { ipv4_host: Some(100), ipv6_host: None };
+        let (ipv4, ipv6) = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap();
+        assert_eq!(ipv4, "10.66.66.100");
+        // When only IPv4 is specified, IPv6 derives from the same decimal host.
+        assert_eq!(ipv6, "fd42:0042:0042:0000::100");
+    }
+
+    #[test]
+    fn resolve_client_ips_uses_ipv6_override() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
+";
+        let ovr = IpOverride { ipv4_host: None, ipv6_host: Some("ff".to_string()) };
+        let (ipv4, ipv6) = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap();
+        // IPv4 auto-allocated to first free (3, since 2 is used).
+        assert_eq!(ipv4, "10.66.66.3");
+        assert_eq!(ipv6, "fd42:0042:0042:0000::ff");
+    }
+
+    #[test]
+    fn resolve_client_ips_uses_both_overrides() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
+";
+        let ovr = IpOverride { ipv4_host: Some(50), ipv6_host: Some("ab".to_string()) };
+        let (ipv4, ipv6) = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap();
+        assert_eq!(ipv4, "10.66.66.50");
+        assert_eq!(ipv6, "fd42:0042:0042:0000::ab");
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_ipv4_in_use() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.5/32,fd42:42:42::5/128
+";
+        let ovr = IpOverride { ipv4_host: Some(5), ipv6_host: None };
+        let err = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::IpInUse(_)));
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_ipv6_in_use() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::ff/128
+";
+        let ovr = IpOverride { ipv4_host: Some(100), ipv6_host: Some("ff".to_string()) };
+        let err = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::IpInUse(_)));
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_invalid_ipv4_host() {
+        let ovr = IpOverride { ipv4_host: Some(0), ipv6_host: None };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+
+        let ovr = IpOverride { ipv4_host: Some(1), ipv6_host: None };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+
+        let ovr = IpOverride { ipv4_host: Some(255), ipv6_host: None };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_invalid_ipv6_host() {
+        let ovr = IpOverride { ipv4_host: None, ipv6_host: Some("".to_string()) };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+
+        let ovr = IpOverride { ipv4_host: None, ipv6_host: Some("12345".to_string()) };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+
+        let ovr = IpOverride { ipv4_host: None, ipv6_host: Some("zzzz".to_string()) };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+    }
+
+    #[test]
+    fn validate_ipv4_host_boundary_values() {
+        assert!(validate_ipv4_host(2).is_ok());
+        assert!(validate_ipv4_host(254).is_ok());
+        assert!(validate_ipv4_host(128).is_ok());
+        assert!(validate_ipv4_host(0).is_err());
+        assert!(validate_ipv4_host(1).is_err());
+        assert!(validate_ipv4_host(255).is_err());
+    }
+
+    #[test]
+    fn validate_ipv6_host_valid_values() {
+        assert!(validate_ipv6_host("1").is_ok());
+        assert!(validate_ipv6_host("ff").is_ok());
+        assert!(validate_ipv6_host("abcd").is_ok());
+        assert!(validate_ipv6_host("DEAD").is_ok());
+        assert!(validate_ipv6_host("0").is_ok());
+    }
+
+    #[test]
+    fn validate_ipv6_host_invalid_values() {
+        assert!(validate_ipv6_host("").is_err());
+        assert!(validate_ipv6_host("12345").is_err());
+        assert!(validate_ipv6_host("zz").is_err());
+        assert!(validate_ipv6_host("ab cd").is_err());
     }
 }
