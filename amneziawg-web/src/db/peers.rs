@@ -134,7 +134,7 @@ pub async fn find_snapshots_since(
          FROM   snapshots
          WHERE  public_key = ?
            AND  captured_at >= ?
-         ORDER  BY captured_at ASC",
+         ORDER  BY captured_at ASC, id ASC",
     )
     .bind(public_key)
     .bind(since_rfc3339)
@@ -201,7 +201,7 @@ pub async fn find_baseline_snapshot(
          FROM   snapshots
          WHERE  public_key = ?
            AND  captured_at < ?
-         ORDER  BY captured_at DESC
+         ORDER  BY captured_at DESC, id DESC
          LIMIT  1",
     )
     .bind(public_key)

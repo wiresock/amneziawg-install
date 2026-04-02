@@ -3637,6 +3637,51 @@ mod tests {
         assert_eq!(json["tx_bytes"], "700"); // (700-200) + (900-700)
     }
 
+    #[tokio::test]
+    async fn all_peers_usage_includes_baseline_delta() {
+        // Verify that the all-peers endpoint includes the baseline→first-in-window
+        // delta, not just in-window deltas.
+        let db = test_db().await;
+        let id = insert_peer(&db, "ALLBL_KEY=", Some("AllBaselinePeer")).await;
+
+        let now = Utc::now();
+        let baseline = (now - chrono::Duration::hours(25))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t1 = (now - chrono::Duration::hours(3))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t2 = (now - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        insert_snapshot_with_bytes(&db, "ALLBL_KEY=", &baseline, 100, 200).await;
+        insert_snapshot_with_bytes(&db, "ALLBL_KEY=", &t1, 400, 700).await;
+        insert_snapshot_with_bytes(&db, "ALLBL_KEY=", &t2, 600, 900).await;
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/usage?period=day")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let peers = json["peers"].as_array().expect("peers array");
+        let peer_entry = peers
+            .iter()
+            .find(|p| p["peer_id"] == id as i64)
+            .expect("peer in response");
+        // With baseline: 500 rx, 700 tx (baseline→t1 + t1→t2)
+        assert_eq!(peer_entry["rx_bytes"], "500");
+        assert_eq!(peer_entry["tx_bytes"], "700");
+    }
+
     // ── period_to_secs ────────────────────────────────────────────────────
 
     #[test]
