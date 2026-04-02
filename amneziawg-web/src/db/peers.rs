@@ -170,21 +170,26 @@ pub async fn find_all_snapshots_since(
     .await
 }
 
-/// Stream snapshots for **all** peers captured on or after `since_rfc3339`,
-/// ordered by `public_key` then `captured_at ASC`, `id ASC`.
+/// Stream snapshots for peers that currently exist in the `peers` table,
+/// captured on or after `since_rfc3339`, ordered by `public_key` then
+/// `captured_at ASC`, `id ASC`.
 ///
 /// Unlike [`find_all_snapshots_since`] (which materializes the full `Vec`),
 /// this returns a [`futures_util::Stream`] so the caller can process rows
 /// incrementally without holding the entire result set in memory.
+///
+/// The `JOIN peers` filter excludes orphaned snapshot rows whose peer has
+/// been deleted, avoiding wasted work during aggregation.
 pub fn stream_all_snapshots_since<'a>(
     pool: &'a SqlitePool,
     since_rfc3339: &'a str,
 ) -> impl futures_util::Stream<Item = Result<UsageSnapshotRow, sqlx::Error>> + 'a {
     sqlx::query_as::<_, UsageSnapshotRow>(
-        "SELECT public_key, rx_bytes, tx_bytes
-         FROM   snapshots
-         WHERE  captured_at >= ?
-         ORDER  BY public_key, captured_at ASC, id ASC",
+        "SELECT s.public_key, s.rx_bytes, s.tx_bytes
+         FROM   snapshots s
+         JOIN   peers p ON p.public_key = s.public_key
+         WHERE  s.captured_at >= ?
+         ORDER  BY s.public_key, s.captured_at ASC, s.id ASC",
     )
     .bind(since_rfc3339)
     .fetch(pool)
@@ -213,13 +218,15 @@ pub async fn find_baseline_snapshot(
     .await
 }
 
-/// Return the last snapshot before `before_rfc3339` for **every** peer that has
-/// one.  Uses a correlated subquery to find the latest `captured_at` per peer,
-/// then breaks ties with `MAX(id)` to guarantee exactly one row per peer,
-/// correctly handling clock skew or backfilled snapshots.
+/// Return the last snapshot before `before_rfc3339` for every peer that
+/// currently exists in the `peers` table and has at least one snapshot before
+/// the cutoff.  Uses a two-CTE join to find the latest `captured_at` per
+/// peer, then breaks ties with `MAX(id)` to guarantee exactly one row per
+/// peer, correctly handling clock skew or backfilled snapshots.
 ///
 /// This avoids `ROW_NUMBER() OVER (...)` so the query works on SQLite < 3.25
-/// (which lacks window-function support).
+/// (which lacks window-function support).  The `JOIN peers` filter excludes
+/// orphaned snapshot rows whose peer has been deleted.
 ///
 /// Used to seed per-peer baseline counters when computing all-peers usage so
 /// that the delta for the first in-window snapshot of each peer is included.
@@ -230,11 +237,12 @@ pub async fn find_all_baseline_snapshots(
     sqlx::query_as::<_, UsageSnapshotRow>(
         "WITH latest AS (
              SELECT
-                 public_key,
-                 MAX(captured_at) AS max_captured_at
-             FROM snapshots
-             WHERE captured_at < ?
-             GROUP BY public_key
+                 s.public_key,
+                 MAX(s.captured_at) AS max_captured_at
+             FROM snapshots AS s
+             JOIN peers AS p ON p.public_key = s.public_key
+             WHERE s.captured_at < ?
+             GROUP BY s.public_key
          ),
          latest_with_id AS (
              SELECT
@@ -325,8 +333,10 @@ pub async fn delete_by_id(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Erro
 /// preserved because they were intentionally marked via the UI and may be
 /// re-enabled later.
 ///
-/// Returns the list of `(id, public_key)` pairs that were deleted so the
-/// caller can perform follow-up cleanup (e.g. clearing event references).
+/// Returns the list of `(id, public_key)` pairs that were **actually**
+/// deleted so the caller can perform follow-up cleanup (e.g. clearing event
+/// references).  Peers that were concurrently disabled between the initial
+/// SELECT and the DELETE are excluded from the returned list.
 pub async fn delete_stale_peers(
     pool: &SqlitePool,
     active_keys: &std::collections::HashSet<String>,
@@ -343,26 +353,52 @@ pub async fn delete_stale_peers(
         .filter(|(_, pk)| !active_keys.contains(pk))
         .collect();
 
-    if !stale.is_empty() {
-        // SQLite has a limit on the number of bound parameters (often 999).
-        // Delete in batches to avoid exceeding this limit.
-        const MAX_SQLITE_PARAMS: usize = 900;
-
-        for chunk in stale.chunks(MAX_SQLITE_PARAMS) {
-            let placeholders: String = std::iter::repeat("?")
-                .take(chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!("DELETE FROM peers WHERE id IN ({placeholders}) AND disabled = 0");
-            let mut query = sqlx::query(&sql);
-            for (id, _) in chunk {
-                query = query.bind(id);
-            }
-            query.execute(pool).await?;
-        }
+    if stale.is_empty() {
+        return Ok(stale);
     }
 
-    Ok(stale)
+    // SQLite has a limit on the number of bound parameters (often 999).
+    // Delete in batches to avoid exceeding this limit.
+    const MAX_SQLITE_PARAMS: usize = 900;
+
+    for chunk in stale.chunks(MAX_SQLITE_PARAMS) {
+        let placeholders: String = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM peers WHERE id IN ({placeholders}) AND disabled = 0");
+        let mut query = sqlx::query(&sql);
+        for (id, _) in chunk {
+            query = query.bind(id);
+        }
+        query.execute(pool).await?;
+    }
+
+    // Some stale peers may have been concurrently disabled between the
+    // SELECT and DELETE above.  The DELETE's `AND disabled = 0` guard
+    // prevents their removal, but they would still be in the `stale` list.
+    // Re-check which IDs still exist to return only actually-deleted peers.
+    let mut surviving_ids: std::collections::HashSet<i64> =
+        std::collections::HashSet::new();
+    let stale_ids: Vec<i64> = stale.iter().map(|(id, _)| *id).collect();
+    for chunk in stale_ids.chunks(MAX_SQLITE_PARAMS) {
+        let placeholders: String = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id FROM peers WHERE id IN ({placeholders})");
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        let found: Vec<i64> = query.fetch_all(pool).await?;
+        surviving_ids.extend(found);
+    }
+
+    Ok(stale
+        .into_iter()
+        .filter(|(id, _)| !surviving_ids.contains(id))
+        .collect())
 }
 
 /// Update the `disabled` flag for a single peer.
@@ -700,6 +736,9 @@ mod tests {
     #[tokio::test]
     async fn find_all_baseline_snapshots_returns_last_per_peer() {
         let db = test_db().await;
+        // Create peers so the JOIN filter matches.
+        insert_peer(&db.pool, "KEY_BL_A=", None).await;
+        insert_peer(&db.pool, "KEY_BL_B=", None).await;
         // Peer A: two snapshots before cutoff
         insert_snapshot_with_rx(&db.pool, "KEY_BL_A=", "2026-01-01T00:00:00Z", 10).await;
         insert_snapshot_with_rx(&db.pool, "KEY_BL_A=", "2026-01-03T00:00:00Z", 30).await;
