@@ -214,9 +214,12 @@ pub async fn find_baseline_snapshot(
 }
 
 /// Return the last snapshot before `before_rfc3339` for **every** peer that has
-/// one.  Uses a `ROW_NUMBER()` window function partitioned by `public_key` and
-/// ordered by `captured_at DESC, id DESC` to guarantee exactly one row per peer,
+/// one.  Uses a correlated subquery to find the latest `captured_at` per peer,
+/// then breaks ties with `MAX(id)` to guarantee exactly one row per peer,
 /// correctly handling clock skew or backfilled snapshots.
+///
+/// This avoids `ROW_NUMBER() OVER (...)` so the query works on SQLite < 3.25
+/// (which lacks window-function support).
 ///
 /// Used to seed per-peer baseline counters when computing all-peers usage so
 /// that the delta for the first in-window snapshot of each peer is included.
@@ -225,20 +228,32 @@ pub async fn find_all_baseline_snapshots(
     before_rfc3339: &str,
 ) -> Result<Vec<UsageSnapshotRow>, sqlx::Error> {
     sqlx::query_as::<_, UsageSnapshotRow>(
-        "SELECT public_key, rx_bytes, tx_bytes
-         FROM (
+        "WITH latest AS (
              SELECT
                  public_key,
-                 rx_bytes,
-                 tx_bytes,
-                 ROW_NUMBER() OVER (
-                     PARTITION BY public_key
-                     ORDER BY captured_at DESC, id DESC
-                 ) AS row_num
+                 MAX(captured_at) AS max_captured_at
              FROM snapshots
              WHERE captured_at < ?
+             GROUP BY public_key
+         ),
+         latest_with_id AS (
+             SELECT
+                 s.public_key,
+                 MAX(s.id) AS max_id
+             FROM snapshots AS s
+             JOIN latest AS l
+               ON s.public_key = l.public_key
+              AND s.captured_at = l.max_captured_at
+             GROUP BY s.public_key
          )
-         WHERE row_num = 1",
+         SELECT
+             s.public_key,
+             s.rx_bytes,
+             s.tx_bytes
+         FROM snapshots AS s
+         JOIN latest_with_id AS l
+           ON s.public_key = l.public_key
+          AND s.id = l.max_id",
     )
     .bind(before_rfc3339)
     .fetch_all(pool)
