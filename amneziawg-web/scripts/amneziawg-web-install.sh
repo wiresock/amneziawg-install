@@ -440,23 +440,34 @@ ensure_argon2() {
 
     # Try the Python3 argon2 package via apt (Debian/Ubuntu)
     if command -v apt-get &>/dev/null; then
-        if ! apt-get update -qq 2>/dev/null; then
-            warn "apt-get update failed; continuing without refreshing package lists."
+        local output
+        if ! output=$(apt-get update -qq 2>&1); then
+            warn "apt-get update failed; continuing without refreshing package lists. Details:"
+            warn "$output"
         fi
         # Prefer the argon2-cffi binding, which provides the `argon2` Python module.
-        if apt-get install -y python3-argon2-cffi 2>/dev/null; then
+        if output=$(apt-get install -y python3-argon2-cffi 2>&1); then
             info "Installed python3-argon2-cffi via apt."
             return 0
+        else
+            warn "Failed to install python3-argon2-cffi via apt. Details:"
+            warn "$output"
         fi
         # Optional fallback: some distros may package this as python3-argon2
-        if apt-get install -y python3-argon2 2>/dev/null; then
+        if output=$(apt-get install -y python3-argon2 2>&1); then
             info "Installed python3-argon2 via apt."
             return 0
+        else
+            warn "Failed to install python3-argon2 via apt. Details:"
+            warn "$output"
         fi
         warn "python3-argon2-cffi/python3-argon2 not available via apt; trying argon2 CLI..."
-        if apt-get install -y argon2 2>/dev/null; then
+        if output=$(apt-get install -y argon2 2>&1); then
             info "Installed argon2 CLI via apt."
             return 0
+        else
+            warn "Failed to install argon2 CLI via apt. Details:"
+            warn "$output"
         fi
     fi
 

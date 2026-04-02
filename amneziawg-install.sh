@@ -53,6 +53,8 @@ enable_apt_ipv4() {
 # during the same exit / signal delivery.
 _cleanup_apt_ipv4_and_chain() {
 	local sig="$1"
+	# Preserve the original exit status so chained handlers see the real value.
+	local _saved_status=$?
 	# Only remove the file if it carries our sentinel.
 	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
 		rm -f "${APT_FORCE_IPV4_CONF}"
@@ -66,14 +68,26 @@ _cleanup_apt_ipv4_and_chain() {
 		eval "${prev_trap}"
 		# Extract the handler body from the saved trap specification.
 		# trap -p output is always:  trap -- 'body' SIGNAL
+		# Use sed to safely parse the body between the outer single quotes.
 		local _trap_body
-		_trap_body=${prev_trap#*\'}
-		_trap_body=${_trap_body%\'*}
+		_trap_body=$(printf '%s\n' "${prev_trap}" | sed -E "s/^trap -- '(([^'\\\\]|\\\\.)*)' ${sig}\$/\\1/")
 		if [[ -n "${_trap_body}" ]]; then
+			# Restore original exit status before invoking the chained handler.
+			( exit "${_saved_status}" )
 			eval "${_trap_body}"
 		fi
 	else
 		trap - "${sig}"
+		# For INT/TERM with no previous trap, re-raise the signal so that
+		# default signal semantics (termination + exit status) are preserved.
+		if [[ "${sig}" == INT || "${sig}" == TERM ]]; then
+			kill -s "${sig}" "$$" 2>/dev/null || {
+				case "${sig}" in
+					INT)  exit 130 ;;  # 128 + SIGINT(2)
+					TERM) exit 143 ;;  # 128 + SIGTERM(15)
+				esac
+			}
+		fi
 	fi
 }
 disable_apt_ipv4() {
