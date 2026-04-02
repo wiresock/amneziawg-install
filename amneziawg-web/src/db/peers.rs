@@ -212,7 +212,8 @@ pub async fn find_baseline_snapshot(
 
 /// Return the last snapshot before `before_rfc3339` for **every** peer that has
 /// one.  Uses `MAX(id)` as a deterministic tie-breaker so the result contains
-/// exactly one row per `public_key`.
+/// exactly one row per `public_key` using a `ROW_NUMBER()` window function
+/// ordered by `captured_at DESC, id DESC` to handle clock skew or backfills.
 ///
 /// Used to seed per-peer baseline counters when computing all-peers usage so
 /// that the delta for the first in-window snapshot of each peer is included.
@@ -221,14 +222,20 @@ pub async fn find_all_baseline_snapshots(
     before_rfc3339: &str,
 ) -> Result<Vec<UsageSnapshotRow>, sqlx::Error> {
     sqlx::query_as::<_, UsageSnapshotRow>(
-        "SELECT s.public_key, s.rx_bytes, s.tx_bytes
-         FROM   snapshots s
-         WHERE  s.id IN (
-             SELECT MAX(s2.id)
-             FROM   snapshots s2
-             WHERE  s2.captured_at < ?
-             GROUP  BY s2.public_key
-         )",
+        "SELECT public_key, rx_bytes, tx_bytes
+         FROM (
+             SELECT
+                 public_key,
+                 rx_bytes,
+                 tx_bytes,
+                 ROW_NUMBER() OVER (
+                     PARTITION BY public_key
+                     ORDER BY captured_at DESC, id DESC
+                 ) AS row_num
+             FROM snapshots
+             WHERE captured_at < ?
+         )
+         WHERE row_num = 1",
     )
     .bind(before_rfc3339)
     .fetch_all(pool)
