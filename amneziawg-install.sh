@@ -22,6 +22,104 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	fi
 fi
 
+# Force APT to use IPv4 only.  Some cloud VPS providers resolve Launchpad /
+# Ubuntu keyserver hostnames to both A and AAAA records, but outbound IPv6
+# connectivity is broken, causing apt and add-apt-repository to hang.
+# Dropping a config file into apt.conf.d/ affects every apt-based tool
+# (including add-apt-repository, which uses python-apt internally).
+APT_FORCE_IPV4_CONF="/etc/apt/apt.conf.d/99amneziawg-force-ipv4"
+APT_FORCE_IPV4_SENTINEL="# Managed by amneziawg-install - safe to remove"
+_APT_IPV4_PREV_TRAP_EXIT=""
+_APT_IPV4_PREV_TRAP_INT=""
+_APT_IPV4_PREV_TRAP_TERM=""
+enable_apt_ipv4() {
+	mkdir -p /etc/apt/apt.conf.d
+	printf '%s\n%s\n' "${APT_FORCE_IPV4_SENTINEL}" 'Acquire::ForceIPv4 "true";' \
+		> "${APT_FORCE_IPV4_CONF}"
+	# Save existing trap commands so we can chain them (not just restore).
+	# trap -p output is eval-safe by design (bash always emits: trap -- 'body' SIG).
+	_APT_IPV4_PREV_TRAP_EXIT="$(trap -p EXIT || true)"
+	_APT_IPV4_PREV_TRAP_INT="$(trap -p INT || true)"
+	_APT_IPV4_PREV_TRAP_TERM="$(trap -p TERM || true)"
+	# Install traps that clean up *and* invoke any prior handler, so
+	# pre-existing cleanup logic still runs even if the script exits
+	# while IPv4 forcing is active.
+	trap '_cleanup_apt_ipv4_and_chain EXIT' EXIT
+	trap '_cleanup_apt_ipv4_and_chain INT'  INT
+	trap '_cleanup_apt_ipv4_and_chain TERM' TERM
+}
+# Internal: remove the config file, restore the previous trap for the
+# given signal, then immediately invoke the restored handler so it runs
+# during the same exit / signal delivery.
+_cleanup_apt_ipv4_and_chain() {
+	local sig="$1"
+	# Preserve the original exit status so chained handlers see the real value.
+	local _saved_status=$?
+	# Only remove the file if it carries our sentinel.
+	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
+		rm -f "${APT_FORCE_IPV4_CONF}"
+	fi
+	# Restore + chain: re-install the previous trap (if any), then
+	# re-deliver the signal / exit so bash invokes the restored handler.
+	# This avoids parsing trap -p output entirely (no sed/eval of bodies).
+	local prev_var="_APT_IPV4_PREV_TRAP_${sig}"
+	local prev_trap="${!prev_var}"
+	if [[ -n "${prev_trap}" ]]; then
+		# Re-install the previous trap (e.g. trap -- 'handler' EXIT).
+		eval "${prev_trap}"
+		# Re-deliver the signal so bash invokes the just-restored handler.
+		if [[ "${sig}" == "EXIT" ]]; then
+			# For EXIT: exiting re-fires the EXIT trap with the original status.
+			exit "${_saved_status}"
+		else
+			# For INT/TERM: re-raise the signal to invoke the restored handler.
+			kill -s "${sig}" "$$" 2>/dev/null || {
+				case "${sig}" in
+					INT)  exit 130 ;;  # 128 + SIGINT(2)
+					TERM) exit 143 ;;  # 128 + SIGTERM(15)
+				esac
+			}
+		fi
+	else
+		trap - "${sig}"
+		if [[ "${sig}" == "EXIT" ]]; then
+			# Preserve the original exit status when no prior handler exists.
+			exit "${_saved_status}"
+		elif [[ "${sig}" == INT || "${sig}" == TERM ]]; then
+			# Re-raise the signal so default termination semantics are preserved.
+			kill -s "${sig}" "$$" 2>/dev/null || {
+				case "${sig}" in
+					INT)  exit 130 ;;  # 128 + SIGINT(2)
+					TERM) exit 143 ;;  # 128 + SIGTERM(15)
+				esac
+			}
+		fi
+	fi
+}
+disable_apt_ipv4() {
+	# Only remove the file if it carries our sentinel (avoid clobbering
+	# an unrelated file that happens to live at the same path).
+	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
+		rm -f "${APT_FORCE_IPV4_CONF}"
+	fi
+	# Restore any previously installed traps.
+	if [[ -n "${_APT_IPV4_PREV_TRAP_EXIT}" ]]; then
+		eval "${_APT_IPV4_PREV_TRAP_EXIT}"
+	else
+		trap - EXIT
+	fi
+	if [[ -n "${_APT_IPV4_PREV_TRAP_INT}" ]]; then
+		eval "${_APT_IPV4_PREV_TRAP_INT}"
+	else
+		trap - INT
+	fi
+	if [[ -n "${_APT_IPV4_PREV_TRAP_TERM}" ]]; then
+		eval "${_APT_IPV4_PREV_TRAP_TERM}"
+	else
+		trap - TERM
+	fi
+}
+
 # For sensitive files (private keys, params, configs), a restrictive umask (077)
 # is applied locally around their creation to avoid them being briefly world-readable.
 # This avoids affecting subprocesses (apt/dnf, dkms, etc.) that expect the default umask.
@@ -1154,6 +1252,9 @@ function installAmneziaWG() {
 				chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 			fi
 		fi
+		# Force IPv4 for Launchpad PPA and all APT operations in this block — IPv6 may be resolvable
+		# but unreachable on some VPS providers, causing APT and add-apt-repository to hang.
+		enable_apt_ipv4
 		apt-get update || { echo -e "${RED}ERROR: Failed to refresh APT package index.${NC}"; exit 1; }
 		apt install -y software-properties-common || { echo -e "${RED}ERROR: Failed to install software-properties-common.${NC}"; exit 1; }
 		add-apt-repository -y ppa:amnezia/ppa || { echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
@@ -1177,6 +1278,7 @@ function installAmneziaWG() {
 			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi
 		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		disable_apt_ipv4
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
 			# Tag managed file with sentinel so uninstall can verify ownership
@@ -1186,6 +1288,9 @@ function installAmneziaWG() {
 			sed -i -E '/^[[:space:]]*deb-src[[:space:]]/!s/^[[:space:]]*deb[[:space:]]+/deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
 			chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 		fi
+		# Force IPv4 for all APT operations in this block — IPv6 may be resolvable
+		# but unreachable on some VPS providers, causing APT to hang.
+		enable_apt_ipv4
 		# Ensure required tools are available for key download/dearmor on minimal systems
 		if ! command -v gpg &>/dev/null; then
 			apt-get update
@@ -1205,10 +1310,12 @@ function installAmneziaWG() {
 		local TMP_KEY_ASC
 		TMP_KEY_ASC=$(mktemp /tmp/amneziawg-apt-key.XXXXXX) || { echo -e "${RED}ERROR: Failed to create temporary file for APT signing key.${NC}"; exit 1; }
 		local KEY_FETCH_OK=0
+		# Use -4 to avoid IPv6 timeouts on VPS providers where AAAA records
+		# resolve but outbound IPv6 connectivity to keyservers is broken.
 		if command -v curl &>/dev/null; then
-			curl -fsSL "${KEY_URL}" -o "${TMP_KEY_ASC}" && KEY_FETCH_OK=1
+			curl -4 -fsSL "${KEY_URL}" -o "${TMP_KEY_ASC}" && KEY_FETCH_OK=1
 		elif command -v wget &>/dev/null; then
-			wget -qO "${TMP_KEY_ASC}" "${KEY_URL}" && KEY_FETCH_OK=1
+			wget -4 -qO "${TMP_KEY_ASC}" "${KEY_URL}" && KEY_FETCH_OK=1
 		fi
 		if [[ ${KEY_FETCH_OK} -ne 1 ]] || [[ ! -s "${TMP_KEY_ASC}" ]]; then
 			rm -f "${TMP_KEY_ASC}"
@@ -1284,6 +1391,7 @@ function installAmneziaWG() {
 			echo -e "${ORANGE}WARNING: No suitable kernel headers package found. Continuing without installing headers; DKMS module builds may fail.${NC}"
 			apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 		fi
+		disable_apt_ipv4
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
@@ -2185,7 +2293,9 @@ function uninstallAmneziaWG() {
 
 		if [[ ${OS} == 'ubuntu' ]]; then
 			apt remove -y amneziawg amneziawg-tools
+			enable_apt_ipv4
 			add-apt-repository -ry ppa:amnezia/ppa
+			disable_apt_ipv4
 			# Only remove source files that we created (identified by sentinel comment)
 			if [[ -e /etc/apt/sources.list.d/ubuntu.sources ]]; then
 				if [[ -f /etc/apt/sources.list.d/amneziawg.sources ]] && head -1 /etc/apt/sources.list.d/amneziawg.sources | grep -q '# Managed by amneziawg-install'; then
