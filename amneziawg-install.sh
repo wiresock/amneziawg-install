@@ -1452,11 +1452,21 @@ function installAmneziaWG() {
 		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	fi
 
-	# Force DKMS to build the module
+	# Strip the deprecated REMAKE_INITRD directive from the amneziawg DKMS config
+	# (newer DKMS versions print noisy warnings for it).
+	local AWG_DKMS_CONF
+	for AWG_DKMS_CONF in /var/lib/dkms/amneziawg/*/source/dkms.conf; do
+		[[ -f "${AWG_DKMS_CONF}" ]] && sed -i '/^REMAKE_INITRD=/d' "${AWG_DKMS_CONF}"
+	done
+
+	# Force DKMS to build the module for the running kernel only.
+	# Using "dkms autoinstall -k" avoids errors from stale kernel directories in
+	# /lib/modules/ whose headers are no longer installed (e.g. after a kernel
+	# upgrade without reboot).
 	# The package post-install hook may not trigger if headers were installed in the
 	# same apt transaction, so an explicit autoinstall guarantees the .ko is present.
 	if command -v dkms &>/dev/null; then
-		dkms autoinstall || true
+		dkms autoinstall -k "$(uname -r)" || true
 	fi
 
 	# Rebuild module dependency cache (required for DKMS + compressed modules, especially on ARM/Ubuntu)
