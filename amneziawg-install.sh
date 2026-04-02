@@ -22,19 +22,23 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	fi
 fi
 
-# Force package managers to use IPv4 only.  Some cloud VPS providers resolve
+# Work around broken IPv6 on cloud VPS providers.  Some providers resolve
 # Launchpad / Ubuntu keyserver / COPR hostnames to both A and AAAA records,
 # but outbound IPv6 connectivity is broken, causing apt, dnf,
 # add-apt-repository, and COPR API calls to hang.
-# Dropping a config file into apt.conf.d/ affects every apt-based tool
-# (including add-apt-repository, which uses python-apt internally).
 #
-# Additionally, add-apt-repository is a Python script that contacts the
-# Launchpad API via httplib2, which does NOT honour Acquire::ForceIPv4.
-# On Ubuntu 24.04 this causes a Python traceback when IPv6 is broken.
-# We therefore also inject an IPv4-preference rule into /etc/gai.conf so
-# that glibc's getaddrinfo (and thus Python's socket.getaddrinfo and
-# libcurl used by dnf) prefers IPv4 addresses.  This benefits all distros.
+# Two complementary mitigations are applied:
+#
+#  1. APT ForceIPv4 (Debian/Ubuntu only) — a config file in apt.conf.d/
+#     forces all apt-based tools (including add-apt-repository, which uses
+#     python-apt internally) to use IPv4.  This file is only written when
+#     apt-get or apt is present to avoid creating /etc/apt on RPM distros.
+#
+#  2. gai.conf IPv4-preference rule (all distros) — an IPv4-preference rule
+#     is injected into /etc/gai.conf so that glibc's getaddrinfo (and thus
+#     Python's socket.getaddrinfo and libcurl used by dnf) *prefers* IPv4.
+#     On Ubuntu 24.04 this also fixes a Python traceback from httplib2
+#     used by add-apt-repository, which does NOT honour Acquire::ForceIPv4.
 APT_FORCE_IPV4_CONF="/etc/apt/apt.conf.d/99amneziawg-force-ipv4"
 APT_FORCE_IPV4_SENTINEL="# Managed by amneziawg-install - safe to remove"
 GAI_CONF="/etc/gai.conf"
@@ -44,12 +48,16 @@ _APT_IPV4_PREV_TRAP_EXIT=""
 _APT_IPV4_PREV_TRAP_INT=""
 _APT_IPV4_PREV_TRAP_TERM=""
 enable_apt_ipv4() {
-	mkdir -p /etc/apt/apt.conf.d
-	printf '%s\n%s\n' "${APT_FORCE_IPV4_SENTINEL}" 'Acquire::ForceIPv4 "true";' \
-		> "${APT_FORCE_IPV4_CONF}"
+	# Only write the APT ForceIPv4 config on distros that actually use APT,
+	# to avoid creating /etc/apt on RPM-based systems.
+	if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1 || [[ -d /etc/apt ]]; then
+		mkdir -p /etc/apt/apt.conf.d
+		printf '%s\n%s\n' "${APT_FORCE_IPV4_SENTINEL}" 'Acquire::ForceIPv4 "true";' \
+			> "${APT_FORCE_IPV4_CONF}"
+	fi
 
-	# Prefer IPv4 in the system resolver so Python (used by
-	# add-apt-repository) also connects over IPv4.
+	# Prefer IPv4 in the system resolver so all glibc consumers (Python,
+	# libcurl/dnf, etc.) connect over IPv4.
 	if ! grep -qF "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" 2>/dev/null; then
 		local _gai_existed=0
 		[[ -f "${GAI_CONF}" ]] && _gai_existed=1
@@ -80,10 +88,10 @@ _remove_ipv4_overrides() {
 	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
 		rm -f "${APT_FORCE_IPV4_CONF}"
 	fi
-	# Remove gai.conf lines we added (if any). This must be idempotent and
-	# based on file contents, not only on whether this process recorded a
-	# modification, so interrupted previous runs are also cleaned up.
-	if [[ -f "${GAI_CONF}" ]] && grep -qF -e "${GAI_CONF_SENTINEL}" -e "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}"; then
+	# Remove gai.conf lines we added (if any).  Only act when our sentinel
+	# is present so pre-existing admin rules are never touched.  This must
+	# be idempotent so interrupted previous runs are also cleaned up.
+	if [[ -f "${GAI_CONF}" ]] && grep -qF "${GAI_CONF_SENTINEL}" "${GAI_CONF}"; then
 		{ grep -vF -e "${GAI_CONF_SENTINEL}" -e "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" || true; } > "${GAI_CONF}.tmp"
 		if ! chmod --reference="${GAI_CONF}" "${GAI_CONF}.tmp" || ! chown --reference="${GAI_CONF}" "${GAI_CONF}.tmp"; then
 			rm -f "${GAI_CONF}.tmp"
