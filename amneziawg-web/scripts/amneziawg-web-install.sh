@@ -447,24 +447,33 @@ ensure_argon2() {
         fi
         # Prefer the argon2-cffi binding, which provides the `argon2` Python module.
         if output=$(apt-get install -y python3-argon2-cffi 2>&1); then
-            info "Installed python3-argon2-cffi via apt."
-            return 0
+            if python3 -c "from argon2 import PasswordHasher; PasswordHasher()" &>/dev/null; then
+                info "Installed python3-argon2-cffi via apt."
+                return 0
+            fi
+            warn "python3-argon2-cffi installed but PasswordHasher API not available."
         else
             warn "Failed to install python3-argon2-cffi via apt. Details:"
             warn "$output"
         fi
         # Optional fallback: some distros may package this as python3-argon2
         if output=$(apt-get install -y python3-argon2 2>&1); then
-            info "Installed python3-argon2 via apt."
-            return 0
+            if python3 -c "from argon2 import PasswordHasher; PasswordHasher()" &>/dev/null; then
+                info "Installed python3-argon2 via apt."
+                return 0
+            fi
+            warn "python3-argon2 installed but PasswordHasher API not available."
         else
             warn "Failed to install python3-argon2 via apt. Details:"
             warn "$output"
         fi
         warn "python3-argon2-cffi/python3-argon2 not available via apt; trying argon2 CLI..."
         if output=$(apt-get install -y argon2 2>&1); then
-            info "Installed argon2 CLI via apt."
-            return 0
+            if command -v argon2 &>/dev/null; then
+                info "Installed argon2 CLI via apt."
+                return 0
+            fi
+            warn "argon2 package installed but argon2 CLI not found in PATH."
         else
             warn "Failed to install argon2 CLI via apt. Details:"
             warn "$output"
