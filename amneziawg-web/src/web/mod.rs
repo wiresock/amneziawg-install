@@ -1988,7 +1988,7 @@ async fn post_add_user_form(
             let rows = crate::db::peers::list_all(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
-            let message = create_user_diagnostic_message(&e);
+            let message = e.to_string();
             return Ok(Html(render_peer_list_with_error(&peers, &csrf, &message)).into_response());
         }
     };
@@ -5448,9 +5448,16 @@ mod tests {
             )
             .await
             .unwrap();
-        // Name validation fails first → 400, proving the IP fields were parsed
-        // (if they were rejected by deserialization we'd get a different error).
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error_msg = json.get("error").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            error_msg.contains("name"),
+            "error should be a name-validation error (not a deserialization error), got: {error_msg}"
+        );
     }
 
     #[tokio::test]
@@ -5469,6 +5476,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error_msg = json.get("error").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            error_msg.contains("name"),
+            "error should be a name-validation error (not a deserialization error), got: {error_msg}"
+        );
     }
 
     #[tokio::test]

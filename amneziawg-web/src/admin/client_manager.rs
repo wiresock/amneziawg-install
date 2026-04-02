@@ -604,7 +604,7 @@ fn validate_ipv6_host(host: &str) -> Result<(), CreateClientError> {
     }
     if !host.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(CreateClientError::InvalidIp(
-            "IPv6 host must contain only hexadecimal characters (0-9, a-f)".to_string(),
+            "IPv6 host must contain only hexadecimal characters (0-9, a-f/A-F)".to_string(),
         ));
     }
     Ok(())
@@ -909,6 +909,9 @@ pub fn create_client(
     let (client_ipv4, client_ipv6_full) =
         resolve_client_ips(&server_config, base_ipv4, base_ipv6, ip_override)?;
     let client_ipv6_normalized = normalize_ipv6(&client_ipv6_full)?;
+    if client_ipv6_normalized == server_ipv6_normalized {
+        return Err(CreateClientError::IpInUse(client_ipv6_full.to_string()));
+    }
     let client_ipv6_display = compress_ipv6(&client_ipv6_full)?;
 
     let user_specified = ip_override.ipv4_host.is_some() || ip_override.ipv6_host.is_some();
