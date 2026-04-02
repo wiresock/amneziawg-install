@@ -9,7 +9,7 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
-WEB_PANEL_CONFIG_DIR="/etc/amneziawg/clients"
+WEB_PANEL_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
@@ -3044,12 +3044,10 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 	chmod 600 "${client_conf}" 2>/dev/null || true
 
-	# Keep non-interactive client configs root-owned.  The parent directory is
-	# intentionally root-owned with mode 0700, so chowning only the file does not
-	# make it readable/traversable by an unprivileged user.
-	if [[ -n "${AWG_WEB_USER:-}" ]] || { [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; }; then
-		echo "Warning: client config ${client_conf} is stored under a root-only directory and usually requires sudo or a privileged service account to read." >&2
-	fi
+	# Copy (or adjust permissions on) the config in the web panel directory so
+	# the web panel service user can read it.  When HOME_DIR already equals
+	# WEB_PANEL_CONFIG_DIR the cp is a no-op, but chown/chmod still run.
+	copyToWebPanelDir "${client_conf}"
 
 	# Add peer to server config
 	echo -e "\n### Client ${CLIENT_NAME}
@@ -3107,6 +3105,7 @@ function nonInteractiveRemoveClient() {
 	# ${AMNEZIAWG_DIR}/clients to keep them in a traversable directory).
 	local CLIENT_DIR="${AMNEZIAWG_DIR}/clients"
 	rm -f "${CLIENT_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+	removeFromWebPanelDir "${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	local sync_err
 	sync_err=""
