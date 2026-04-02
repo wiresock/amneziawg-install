@@ -154,6 +154,12 @@ fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateCl
         CreateClientError::NoFreeIp => {
             "Failed to create user: no free IP addresses available (max 253 clients).".to_string()
         }
+        CreateClientError::InvalidIp(msg) => {
+            format!("Failed to create user: {msg}")
+        }
+        CreateClientError::IpInUse(ip) => {
+            format!("Failed to create user: IP address already in use: {ip}")
+        }
         // The following variants may contain raw stderr/paths from sudo
         // commands or OS errors; use fixed messages and log details server-side.
         CreateClientError::ParamsRead(_) => {
@@ -397,6 +403,10 @@ pub struct EventDto {
 #[derive(Debug, Deserialize)]
 pub struct CreateUserRequest {
     pub name: String,
+    /// Optional full IPv4 address for the client (e.g. `"10.66.66.100"`).
+    pub ipv4_address: Option<String>,
+    /// Optional full IPv6 address for the client (e.g. `"fd42:42:42::ff"`).
+    pub ipv6_address: Option<String>,
 }
 
 /// HTML form body for `POST /admin/users/add`.
@@ -404,6 +414,10 @@ pub struct CreateUserRequest {
 pub struct AddUserForm {
     pub name: String,
     pub csrf_token: Option<String>,
+    /// Optional full IPv4 address for the client.
+    pub ipv4_address: Option<String>,
+    /// Optional full IPv6 address for the client.
+    pub ipv6_address: Option<String>,
 }
 
 /// HTML form body for `POST /admin/users/:id/remove`.
@@ -415,6 +429,13 @@ pub struct RemoveUserForm {
 }
 
 // ── Conversion helpers ───────────────────────────────────────────────────────
+
+/// Trim and filter an optional string, returning `None` for empty/whitespace-only values.
+fn trim_optional_string(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
 
 fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
     ts.and_then(|t| Utc.timestamp_opt(t, 0).single())
@@ -569,6 +590,7 @@ pub fn router(
         .route("/api/usage", get(get_all_usage))
         .route("/api/events", get(list_events_handler))
         // ── User lifecycle routes ────────────────────────────────
+        .route("/api/admin/next-ips", get(api_next_ips))
         .route("/api/admin/users", post(api_create_user))
         .route("/api/admin/users/:id/remove", post(api_remove_user))
         .route("/admin/users/add", post(post_add_user_form))
@@ -1731,6 +1753,26 @@ async fn post_peer_edit(
 
 // ── User lifecycle handlers ──────────────────────────────────────────────────
 
+/// `GET /api/admin/next-ips` – suggest the next available IP addresses.
+async fn api_next_ips() -> Result<Response, ApiError> {
+    match crate::admin::execute_suggest_ips().await {
+        Ok(suggested) => Ok(Json(json!({
+            "ipv4": suggested.ipv4,
+            "ipv6": suggested.ipv6,
+        }))
+        .into_response()),
+        Err(err) => {
+            // Gracefully return empty suggestions if we can't read the config,
+            // but log the underlying error for observability.
+            tracing::warn!(
+                error = ?err,
+                "execute_suggest_ips failed; returning empty IP suggestions"
+            );
+            Ok(Json(json!({ "ipv4": null, "ipv6": null })).into_response())
+        }
+    }
+}
+
 /// `POST /api/admin/users` – JSON API to create a new user/client.
 async fn api_create_user(
     State(state): State<AppState>,
@@ -1753,11 +1795,16 @@ async fn api_create_user(
     let _ = headers;
 
     let name = body.name.trim().to_string();
+    let ip_override = crate::admin::client_manager::IpOverride {
+        ipv4_address: trim_optional_string(body.ipv4_address.as_deref()),
+        ipv6_address: trim_optional_string(body.ipv6_address.as_deref()),
+    };
     match crate::admin::execute_create_user(
         &state.db,
         &state.config_dir,
         &name,
         &state.auth.username,
+        &ip_override,
     )
     .await
     {
@@ -1775,10 +1822,20 @@ async fn api_create_user(
         Err(crate::admin::client_manager::CreateClientError::InvalidName(msg)) => {
             Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
         }
+        Err(crate::admin::client_manager::CreateClientError::InvalidIp(msg)) => {
+            Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
+        }
         Err(crate::admin::client_manager::CreateClientError::DuplicateName(name)) => {
             Ok((
                 StatusCode::CONFLICT,
                 Json(json!({ "error": format!("a client named '{name}' already exists") })),
+            )
+                .into_response())
+        }
+        Err(crate::admin::client_manager::CreateClientError::IpInUse(ip)) => {
+            Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": format!("IP address already in use: {ip}") })),
             )
                 .into_response())
         }
@@ -1933,11 +1990,18 @@ async fn post_add_user_form(
     }
 
     let name = form.name.trim().to_string();
+    let ipv4_address = trim_optional_string(form.ipv4_address.as_deref());
+    let ipv6_address = trim_optional_string(form.ipv6_address.as_deref());
+    let ip_override = crate::admin::client_manager::IpOverride {
+        ipv4_address,
+        ipv6_address,
+    };
     match crate::admin::execute_create_user(
         &state.db,
         &state.config_dir,
         &name,
         &state.auth.username,
+        &ip_override,
     )
     .await
     {
@@ -1952,6 +2016,19 @@ async fn post_add_user_form(
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             Ok(Html(render_peer_list_with_error(&peers, &csrf, &msg)).into_response())
+        }
+        Err(crate::admin::client_manager::CreateClientError::InvalidIp(ref msg)) => {
+            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+            let csrf = session_csrf_from_headers(&state, &headers);
+            Ok(Html(render_peer_list_with_error(&peers, &csrf, msg)).into_response())
+        }
+        Err(crate::admin::client_manager::CreateClientError::IpInUse(ref ip)) => {
+            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+            let csrf = session_csrf_from_headers(&state, &headers);
+            let message = format!("IP address already in use: {ip}");
+            Ok(Html(render_peer_list_with_error(&peers, &csrf, &message)).into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::LockBusy) => {
             let rows = crate::db::peers::list_all(&state.db.pool).await?;
@@ -2528,9 +2605,55 @@ fn render_peer_list_inner(
          pattern="[a-zA-Z0-9_-]+" maxlength="15"
          placeholder="e.g. iphone" title="Alphanumeric, underscore, or hyphen (max 15 chars)">
   <p class="meta" style="margin-top:.25rem">Letters, digits, underscore, or hyphen. Max 15 characters.</p>
+  <label for="add_user_ipv4">IPv4 address <span class="meta">(optional)</span></label>
+  <input type="text" id="add_user_ipv4" name="ipv4_address"
+         placeholder="loading…" title="Full IPv4 address for this client">
+  <p class="meta" style="margin-top:.25rem">Full IPv4 address. Pre-filled with the next available address; edit as needed.</p>
+  <label for="add_user_ipv6">IPv6 address <span class="meta">(optional)</span></label>
+  <input type="text" id="add_user_ipv6" name="ipv6_address"
+         placeholder="loading…" title="Full IPv6 address for this client">
+  <p class="meta" style="margin-top:.25rem">Full IPv6 address. Pre-filled with the next available address; edit as needed.</p>
   <button type="submit">Add user</button>
 </form>
 </div>
+<script>
+(function() {{
+  var nextIpsRequested = false;
+  var ipv4Input = document.getElementById('add_user_ipv4');
+  var ipv6Input = document.getElementById('add_user_ipv6');
+
+  function applyAutoPlaceholders() {{
+    if (ipv4Input) ipv4Input.placeholder = 'auto';
+    if (ipv6Input) ipv6Input.placeholder = 'auto';
+  }}
+
+  function fetchNextIpsOnce() {{
+    if (nextIpsRequested) return;
+    nextIpsRequested = true;
+
+    fetch('/api/admin/next-ips', {{ credentials: 'same-origin' }})
+      .then(function(response) {{
+        if (!response.ok) throw new Error('Failed to fetch next IPs');
+        return response.json();
+      }})
+      .then(function(data) {{
+        if (data.ipv4 && ipv4Input && ipv4Input.value === '') {{
+          ipv4Input.value = data.ipv4;
+        }}
+        if (data.ipv6 && ipv6Input && ipv6Input.value === '') {{
+          ipv6Input.value = data.ipv6;
+        }}
+        applyAutoPlaceholders();
+      }})
+      .catch(function() {{
+        applyAutoPlaceholders();
+      }});
+  }}
+
+  if (ipv4Input) ipv4Input.addEventListener('focus', fetchNextIpsOnce);
+  if (ipv6Input) ipv6Input.addEventListener('focus', fetchNextIpsOnce);
+}})();
+</script>
 "#,
         csrf = esc(csrf_token)
     ));
@@ -5339,6 +5462,98 @@ mod tests {
             "HTML should include a diagnostic add-user error message, got: {html}"
         );
         assert!(!html.contains("Add user failed: internal server error"));
+    }
+
+    #[tokio::test]
+    async fn api_create_user_accepts_optional_ip_fields() {
+        // Verify the API accepts the optional ipv4_address and ipv6_address fields
+        // without error (actual creation would fail in test because there's no
+        // AWG interface, but the name validation runs first).
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"../bad","ipv4_address":"10.66.66.100","ipv6_address":"fd42:42:42::ff"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error_msg = json.get("error").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            error_msg.contains("name"),
+            "error should be a name-validation error (not a deserialization error), got: {error_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_create_user_works_without_ip_fields() {
+        // Backward compatibility: omitting IP fields still works.
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"../bad"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error_msg = json.get("error").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            error_msg.contains("name"),
+            "error should be a name-validation error (not a deserialization error), got: {error_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_list_page_contains_ip_fields() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("ipv4_address"),
+            "add user form should contain ipv4_address field"
+        );
+        assert!(
+            html.contains("ipv6_address"),
+            "add user form should contain ipv6_address field"
+        );
+        assert!(
+            html.contains("IPv4 address"),
+            "add user form should contain IPv4 address label"
+        );
+        assert!(
+            html.contains("IPv6 address"),
+            "add user form should contain IPv6 address label"
+        );
     }
 
     #[tokio::test]

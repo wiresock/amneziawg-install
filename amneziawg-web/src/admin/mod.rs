@@ -93,6 +93,21 @@ pub struct CreateUserResult {
     pub client_name: String,
 }
 
+/// Fetch the next available IP addresses for client creation.
+///
+/// This is a read-only operation that can be used to pre-populate the
+/// "Add user" form with suggested addresses.
+pub async fn execute_suggest_ips(
+) -> Result<client_manager::SuggestedIps, client_manager::CreateClientError> {
+    tokio::task::spawn_blocking(client_manager::suggest_next_ips)
+        .await
+        .map_err(|e| {
+            client_manager::CreateClientError::Internal(format!(
+                "suggest_next_ips task panicked: {e}"
+            ))
+        })?
+}
+
 /// Create a new AmneziaWG user/client directly, without the external script.
 ///
 /// 1. Validates the name.
@@ -107,6 +122,7 @@ pub async fn execute_create_user(
     config_dir: &std::path::Path,
     name: &str,
     actor: &str,
+    ip_override: &client_manager::IpOverride,
 ) -> Result<CreateUserResult, client_manager::CreateClientError> {
     // Pre-validate name (fail fast for the UI).
     script_bridge::validate_client_name(name)?;
@@ -151,10 +167,11 @@ pub async fn execute_create_user(
 
     let dir = config_dir.to_path_buf();
     let client_name = name.to_string();
+    let ip_ovr = ip_override.clone();
 
     // Run the blocking client-creation logic on a dedicated thread.
     let result = tokio::task::spawn_blocking(move || {
-        client_manager::create_client(&dir, &client_name, &disabled_keys)
+        client_manager::create_client(&dir, &client_name, &disabled_keys, &ip_ovr)
     })
     .await;
 

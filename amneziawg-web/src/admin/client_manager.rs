@@ -49,6 +49,12 @@ pub enum CreateClientError {
     #[error("no free IP address available (max 253 clients)")]
     NoFreeIp,
 
+    #[error("invalid IP address: {0}")]
+    InvalidIp(String),
+
+    #[error("IP address already in use: {0}")]
+    IpInUse(String),
+
     #[error("failed to read server parameters: {0}")]
     ParamsRead(String),
 
@@ -72,6 +78,29 @@ pub enum CreateClientError {
 
     #[error("internal error during client creation: {0}")]
     Internal(String),
+}
+
+/// Optional IP address overrides for client creation.
+///
+/// When both fields are `None`, the first available IP pair is allocated
+/// automatically (existing behaviour).  When set, each field contains the
+/// **full** client IP address (e.g. `"10.66.66.100"` or
+/// `"fd42:42:42::ff"`), which is validated against the server subnet.
+#[derive(Debug, Clone, Default)]
+pub struct IpOverride {
+    /// Full IPv4 address for the client (e.g. `"10.66.66.100"`).
+    pub ipv4_address: Option<String>,
+    /// Full IPv6 address for the client (e.g. `"fd42:42:42::ff"`).
+    pub ipv6_address: Option<String>,
+}
+
+/// Suggested IP addresses for a new client.
+#[derive(Debug, Clone)]
+pub struct SuggestedIps {
+    /// The next available full IPv4 address (e.g. `"10.66.66.3"`).
+    pub ipv4: String,
+    /// The next available full IPv6 address (e.g. `"fd42:42:42::3"`).
+    pub ipv6: String,
 }
 
 #[derive(Debug, Error)]
@@ -110,6 +139,8 @@ pub fn sanitized_create_error_category(error: &CreateClientError) -> &'static st
         CreateClientError::InvalidName(_) => "invalid_name",
         CreateClientError::DuplicateName(_) => "duplicate_name",
         CreateClientError::NoFreeIp => "no_free_ip",
+        CreateClientError::InvalidIp(_) => "invalid_ip",
+        CreateClientError::IpInUse(_) => "ip_in_use",
         CreateClientError::ParamsRead(_) => "params_read_failed",
         CreateClientError::DbRead(_) => "db_read_failed",
         CreateClientError::KeyGen(_) => "key_generation_failed",
@@ -486,6 +517,232 @@ fn parse_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     }
 }
 
+/// Resolve the IPv4/IPv6 addresses for a new client.
+///
+/// If `ip_override` contains user-specified full addresses, they are
+/// validated (subnet membership + range + collision) against the server
+/// config.  Otherwise the first available IP pair is allocated
+/// automatically.
+///
+/// Returns `(client_ipv4, client_ipv6_full)`, e.g. `("10.66.66.5", "fd42:0042:0042:0000::5")`.
+fn resolve_client_ips(
+    server_config: &str,
+    base_ipv4: &str,
+    base_ipv6: &str,
+    ip_override: &IpOverride,
+) -> Result<(String, String), CreateClientError> {
+    let used_ipv4 = find_used_ipv4_dots(server_config, base_ipv4);
+    let existing_ipv6s = find_existing_ipv6_normalized(server_config);
+
+    let ipv4_host = match &ip_override.ipv4_address {
+        Some(addr) => Some(parse_ipv4_address(addr, base_ipv4)?),
+        None => None,
+    };
+    let ipv6_full = match &ip_override.ipv6_address {
+        Some(addr) => Some(parse_ipv6_address(addr, base_ipv6)?),
+        None => None,
+    };
+
+    match (ipv4_host, &ipv6_full) {
+        // No overrides – auto-allocate.
+        (None, None) => {
+            let dot_ip = find_available_dot(&used_ipv4, &existing_ipv6s, base_ipv6)
+                .ok_or(CreateClientError::NoFreeIp)?;
+            Ok((
+                format!("{base_ipv4}.{dot_ip}"),
+                format!("{base_ipv6}::{dot_ip}"),
+            ))
+        }
+        // Both overrides specified.
+        (Some(host), Some(ipv6)) => {
+            if used_ipv4.contains(&host) {
+                return Err(CreateClientError::IpInUse(format!(
+                    "{base_ipv4}.{host}"
+                )));
+            }
+            let ipv6_norm = normalize_ipv6(ipv6)?;
+            if existing_ipv6s.contains(&ipv6_norm) {
+                return Err(CreateClientError::IpInUse(ipv6.to_string()));
+            }
+            Ok((format!("{base_ipv4}.{host}"), ipv6.to_string()))
+        }
+        // Only IPv4 override – derive IPv6 host segment by reusing the same host value as a string.
+        (Some(host), None) => {
+            if used_ipv4.contains(&host) {
+                return Err(CreateClientError::IpInUse(format!(
+                    "{base_ipv4}.{host}"
+                )));
+            }
+            let ipv6_derived = format!("{base_ipv6}::{host}");
+            let ipv6_norm = normalize_ipv6(&ipv6_derived)?;
+            if existing_ipv6s.contains(&ipv6_norm) {
+                return Err(CreateClientError::IpInUse(ipv6_derived));
+            }
+            Ok((format!("{base_ipv4}.{host}"), ipv6_derived))
+        }
+        // Only IPv6 override – auto-allocate IPv4 with collision check for the
+        // user-specified IPv6.
+        (None, Some(ipv6)) => {
+            let ipv6_norm = normalize_ipv6(ipv6)?;
+            if existing_ipv6s.contains(&ipv6_norm) {
+                return Err(CreateClientError::IpInUse(ipv6.to_string()));
+            }
+            let dot_ip = (2..=254u16)
+                .find(|d| !used_ipv4.contains(d))
+                .ok_or(CreateClientError::NoFreeIp)?;
+            Ok((format!("{base_ipv4}.{dot_ip}"), ipv6.to_string()))
+        }
+    }
+}
+
+/// Compute the next available full IP addresses for a new client.
+///
+/// This is a non-blocking, read-only function used to pre-fill the
+/// "Add user" form with suggested addresses.
+///
+/// Returns `Err` if the server params/config cannot be read, or if no
+/// free IP addresses are available.
+#[cfg(unix)]
+pub fn suggest_next_ips(
+) -> Result<SuggestedIps, CreateClientError> {
+    let amneziawg_dir = Path::new("/etc/amnezia/amneziawg");
+
+    let params_content = awg::read_file_via_sudo(&amneziawg_dir.join("params"))
+        .map_err(|e| CreateClientError::ParamsRead(format!("failed to read params file: {e}")))?;
+    let params = parse_params(&params_content)?;
+
+    let server_conf_path = amneziawg_dir.join(format!("{}.conf", params.server_awg_nic));
+    let server_config = awg::read_file_via_sudo(&server_conf_path)
+        .map_err(|e| CreateClientError::ParamsRead(format!("failed to read server config: {e}")))?;
+
+    let base_ipv4 = ipv4_base(&params.server_awg_ipv4);
+    let server_ipv6_normalized = normalize_ipv6(&params.server_awg_ipv6)?;
+    let base_ipv6 = ipv6_prefix(&server_ipv6_normalized);
+
+    let used_ipv4 = find_used_ipv4_dots(&server_config, base_ipv4);
+    let existing_ipv6s = find_existing_ipv6_normalized(&server_config);
+
+    let dot_ip = find_available_dot(&used_ipv4, &existing_ipv6s, base_ipv6)
+        .ok_or(CreateClientError::NoFreeIp)?;
+
+    let ipv4 = format!("{base_ipv4}.{dot_ip}");
+    let ipv6 = compress_ipv6(&format!("{base_ipv6}::{dot_ip}"))?;
+
+    Ok(SuggestedIps { ipv4, ipv6 })
+}
+
+/// Non-Unix stub: IP suggestion requires reading AWG config files.
+#[cfg(not(unix))]
+pub fn suggest_next_ips() -> Result<SuggestedIps, CreateClientError> {
+    Err(CreateClientError::Internal(
+        "IP suggestion is only supported on Unix targets".to_string(),
+    ))
+}
+
+/// Length of a normalised IPv6 /64 prefix in "xxxx:xxxx:xxxx:xxxx" form.
+const IPV6_NORMALIZED_PREFIX_LEN: usize = 19;
+
+/// Parse and validate a full IPv4 address, returning the host (last octet).
+///
+/// The address must belong to the expected subnet (`base_ipv4`, e.g.
+/// `"10.66.66"`) and have a host number in the 2–254 range.
+fn parse_ipv4_address(addr: &str, base_ipv4: &str) -> Result<u16, CreateClientError> {
+    let prefix_with_dot = format!("{base_ipv4}.");
+    let host_str = addr.strip_prefix(&prefix_with_dot).ok_or_else(|| {
+        CreateClientError::InvalidIp(format!(
+            "IPv4 address must be in the {base_ipv4}.x subnet, got: {addr}"
+        ))
+    })?;
+    let host: u16 = host_str.parse().map_err(|_| {
+        CreateClientError::InvalidIp(format!(
+            "IPv4 host part must be a number, got: {host_str}"
+        ))
+    })?;
+    validate_ipv4_host(host)?;
+    Ok(host)
+}
+
+/// Parse and validate a full IPv6 address, returning a canonical form under the given /64 prefix.
+///
+/// The address must belong to the expected /64 prefix (`base_ipv6`, e.g.
+/// `"fd42:0042:0042:0000"`) and have a non-empty host part.  The input
+/// may use compressed notation (e.g. `"fd42:42:42::ff"`), but the returned
+/// value is reconstructed as `<base_ipv6>::<host>` to match the server config format.
+fn parse_ipv6_address(addr: &str, base_ipv6: &str) -> Result<String, CreateClientError> {
+    // Parse to get the normalised full form, then check the prefix.
+    let normalized = normalize_ipv6(addr).map_err(|_| {
+        CreateClientError::InvalidIp(format!("invalid IPv6 address: {addr}"))
+    })?;
+    let base_normalized = normalize_ipv6(&format!("{base_ipv6}::0")).map_err(|_| {
+        CreateClientError::ConfigParse(format!("cannot normalise base IPv6: {base_ipv6}"))
+    })?;
+    // Compare /64 prefixes (first 4 groups of normalised form).
+    if normalized[..IPV6_NORMALIZED_PREFIX_LEN] != base_normalized[..IPV6_NORMALIZED_PREFIX_LEN] {
+        return Err(CreateClientError::InvalidIp(format!(
+            "IPv6 address must be in the {base_ipv6}:: subnet, got: {addr}"
+        )));
+    }
+    // Check that the host part is not all zeros (that's the network address).
+    let host_part = &normalized[IPV6_NORMALIZED_PREFIX_LEN..];
+    if host_part.chars().all(|c| c == ':' || c == '0') {
+        return Err(CreateClientError::InvalidIp(
+            "IPv6 host part must be non-zero".to_string(),
+        ));
+    }
+    // Return the user-supplied form after normalisation for consistent storage.
+    // Use the expanded notation that matches the server config format.
+    Ok(format!("{base_ipv6}::{}", extract_ipv6_host_segment(addr, base_ipv6)?))
+}
+
+/// Extract the host segment from a full IPv6 address relative to a /64 prefix.
+///
+/// For example, given `"fd42:42:42::ff"` and prefix `"fd42:0042:0042:0000"`,
+/// returns `"ff"`.
+fn extract_ipv6_host_segment(addr: &str, base_ipv6: &str) -> Result<String, CreateClientError> {
+    let normalized = normalize_ipv6(addr)?;
+    let base_norm = normalize_ipv6(&format!("{base_ipv6}::0"))?;
+
+    // The normalised form is xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx.
+    // The last 4 groups (after group 4) form the interface identifier.
+    let segments: Vec<&str> = normalized.split(':').collect();
+    let base_segments: Vec<&str> = base_norm.split(':').collect();
+
+    // Verify prefix match (groups 0–3).
+    if segments[..4] != base_segments[..4] {
+        return Err(CreateClientError::InvalidIp(format!(
+            "IPv6 address does not match server subnet: {addr}"
+        )));
+    }
+
+    // Build the host portion, stripping leading-zero groups.
+    // Re-assemble groups 4–7, skipping all-zero leading groups.
+    let host_groups = &segments[4..];
+    let mut found_nonzero = false;
+    let mut result_parts = Vec::new();
+    for &g in host_groups {
+        let trimmed = g.trim_start_matches('0');
+        let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+        if trimmed != "0" || found_nonzero {
+            found_nonzero = true;
+            result_parts.push(trimmed);
+        }
+    }
+    if result_parts.is_empty() {
+        result_parts.push("0");
+    }
+    Ok(result_parts.join(":"))
+}
+
+/// Validate the IPv4 host number (last octet).
+fn validate_ipv4_host(host: u16) -> Result<(), CreateClientError> {
+    if !(2..=254).contains(&host) {
+        return Err(CreateClientError::InvalidIp(
+            "IPv4 host number must be between 2 and 254".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // ── Config generation ───────────────────────────────────────────────────────
 
 /// Build the endpoint string, bracketing IPv6 addresses.
@@ -617,7 +874,8 @@ pub struct CreateClientResult {
 /// 1. Validate the client name.
 /// 2. Read server parameters from the params file.
 /// 3. Read the server config to check for duplicate names and find used IPs.
-/// 4. Find the first available IP address pair (IPv4 + IPv6).
+/// 4. Find the first available IP address pair (IPv4 + IPv6), or use the
+///    user-specified overrides from `ip_override`.
 /// 5. Generate cryptographic keys (private, public, pre-shared).
 /// 6. Write the client config file to `config_dir`.
 /// 7. Append the peer block to the server config.
@@ -627,6 +885,7 @@ pub fn create_client(
     config_dir: &Path,
     name: &str,
     disabled_keys: &HashSet<String>,
+    ip_override: &IpOverride,
 ) -> Result<CreateClientResult, CreateClientError> {
     // Step 1: Validate the client name.
     script_bridge::validate_client_name(name)?;
@@ -775,27 +1034,25 @@ pub fn create_client(
         return Err(CreateClientError::DuplicateName(name.to_string()));
     }
 
-    // Step 5: Find an available IP address pair.
+    // Step 5: Find an available IP address pair (or use overrides).
     let base_ipv4 = ipv4_base(&params.server_awg_ipv4);
     let server_ipv6_normalized = normalize_ipv6(&params.server_awg_ipv6)?;
     let base_ipv6 = ipv6_prefix(&server_ipv6_normalized);
 
-    let used_ipv4 = find_used_ipv4_dots(&server_config, base_ipv4);
-    let existing_ipv6s = find_existing_ipv6_normalized(&server_config);
-    let dot_ip =
-        find_available_dot(&used_ipv4, &existing_ipv6s, base_ipv6)
-            .ok_or(CreateClientError::NoFreeIp)?;
-
-    let client_ipv4 = format!("{base_ipv4}.{dot_ip}");
-    let client_ipv6_full = format!("{base_ipv6}::{dot_ip}");
+    let (client_ipv4, client_ipv6_full) =
+        resolve_client_ips(&server_config, base_ipv4, base_ipv6, ip_override)?;
     let client_ipv6_normalized = normalize_ipv6(&client_ipv6_full)?;
+    if client_ipv6_normalized == server_ipv6_normalized {
+        return Err(CreateClientError::IpInUse(client_ipv6_full.to_string()));
+    }
     let client_ipv6_display = compress_ipv6(&client_ipv6_full)?;
 
+    let user_specified = ip_override.ipv4_address.is_some() || ip_override.ipv6_address.is_some();
     debug!(
         ipv4 = %client_ipv4,
         ipv6 = %client_ipv6_display,
-        dot = dot_ip,
-        "allocated client IP addresses"
+        user_specified = user_specified,
+        "resolved client IP addresses"
     );
 
     // Step 6: Generate cryptographic keys.
@@ -893,6 +1150,7 @@ pub fn create_client(
     _config_dir: &Path,
     _name: &str,
     _disabled_keys: &HashSet<String>,
+    _ip_override: &IpOverride,
 ) -> Result<CreateClientResult, CreateClientError> {
     Err(CreateClientError::Internal(
         "create_client is supported only on unix targets".to_string(),
@@ -1426,5 +1684,166 @@ AllowedIPs = 10.66.66.3/32,fd42:0042:0042:0000:0000:0000:0000:0003/128
         assert!(config.contains("PresharedKey = PSK_KEY="));
         assert!(config.contains("Endpoint = 1.2.3.4:51820"));
         assert!(config.contains("AllowedIPs = 0.0.0.0/0,::/0"));
+    }
+
+    // ── IP override / resolve_client_ips tests ─────────────────────────
+
+    #[test]
+    fn resolve_client_ips_auto_allocates_when_no_override() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
+";
+        let ovr = IpOverride::default();
+        let (ipv4, ipv6) = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap();
+        assert_eq!(ipv4, "10.66.66.3");
+        assert_eq!(ipv6, "fd42:0042:0042:0000::3");
+    }
+
+    #[test]
+    fn resolve_client_ips_uses_ipv4_override() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
+";
+        let ovr = IpOverride { ipv4_address: Some("10.66.66.100".to_string()), ipv6_address: None };
+        let (ipv4, ipv6) = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap();
+        assert_eq!(ipv4, "10.66.66.100");
+        // When only IPv4 is specified, the IPv6 host segment reuses the same host value as a string.
+        assert_eq!(ipv6, "fd42:0042:0042:0000::100");
+    }
+
+    #[test]
+    fn resolve_client_ips_uses_ipv6_override() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
+";
+        let ovr = IpOverride { ipv4_address: None, ipv6_address: Some("fd42:42:42::ff".to_string()) };
+        let (ipv4, ipv6) = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap();
+        // IPv4 auto-allocated to first free (3, since 2 is used).
+        assert_eq!(ipv4, "10.66.66.3");
+        assert_eq!(ipv6, "fd42:0042:0042:0000::ff");
+    }
+
+    #[test]
+    fn resolve_client_ips_uses_both_overrides() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
+";
+        let ovr = IpOverride {
+            ipv4_address: Some("10.66.66.50".to_string()),
+            ipv6_address: Some("fd42:42:42::ab".to_string()),
+        };
+        let (ipv4, ipv6) = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap();
+        assert_eq!(ipv4, "10.66.66.50");
+        assert_eq!(ipv6, "fd42:0042:0042:0000::ab");
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_ipv4_in_use() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.5/32,fd42:42:42::5/128
+";
+        let ovr = IpOverride { ipv4_address: Some("10.66.66.5".to_string()), ipv6_address: None };
+        let err = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::IpInUse(_)));
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_ipv6_in_use() {
+        let config = "\
+[Peer]
+AllowedIPs = 10.66.66.2/32,fd42:42:42::ff/128
+";
+        let ovr = IpOverride {
+            ipv4_address: Some("10.66.66.100".to_string()),
+            ipv6_address: Some("fd42:42:42::ff".to_string()),
+        };
+        let err = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::IpInUse(_)));
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_invalid_ipv4_host() {
+        // Host 0 is network address, host 1 is server.
+        let ovr = IpOverride { ipv4_address: Some("10.66.66.0".to_string()), ipv6_address: None };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+
+        let ovr = IpOverride { ipv4_address: Some("10.66.66.1".to_string()), ipv6_address: None };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+
+        let ovr = IpOverride { ipv4_address: Some("10.66.66.255".to_string()), ipv6_address: None };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_wrong_ipv4_subnet() {
+        let ovr = IpOverride { ipv4_address: Some("192.168.1.5".to_string()), ipv6_address: None };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_invalid_ipv6_address() {
+        let ovr = IpOverride { ipv4_address: None, ipv6_address: Some("not-an-ipv6".to_string()) };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_wrong_ipv6_subnet() {
+        let ovr = IpOverride { ipv4_address: None, ipv6_address: Some("fe80::1".to_string()) };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_zero_ipv6_host() {
+        let ovr = IpOverride { ipv4_address: None, ipv6_address: Some("fd42:42:42::0".to_string()) };
+        let err = resolve_client_ips("", "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap_err();
+        assert!(matches!(err, CreateClientError::InvalidIp(_)));
+    }
+
+    #[test]
+    fn validate_ipv4_host_boundary_values() {
+        assert!(validate_ipv4_host(2).is_ok());
+        assert!(validate_ipv4_host(254).is_ok());
+        assert!(validate_ipv4_host(128).is_ok());
+        assert!(validate_ipv4_host(0).is_err());
+        assert!(validate_ipv4_host(1).is_err());
+        assert!(validate_ipv4_host(255).is_err());
+    }
+
+    #[test]
+    fn parse_ipv4_address_valid() {
+        assert_eq!(parse_ipv4_address("10.66.66.5", "10.66.66").unwrap(), 5);
+        assert_eq!(parse_ipv4_address("10.66.66.254", "10.66.66").unwrap(), 254);
+    }
+
+    #[test]
+    fn parse_ipv4_address_wrong_subnet() {
+        assert!(parse_ipv4_address("192.168.1.5", "10.66.66").is_err());
+    }
+
+    #[test]
+    fn parse_ipv6_address_valid() {
+        let result = parse_ipv6_address("fd42:42:42::ff", "fd42:0042:0042:0000").unwrap();
+        assert_eq!(result, "fd42:0042:0042:0000::ff");
+    }
+
+    #[test]
+    fn parse_ipv6_address_wrong_subnet() {
+        assert!(parse_ipv6_address("fe80::1", "fd42:0042:0042:0000").is_err());
+    }
+
+    #[test]
+    fn parse_ipv6_address_zero_host() {
+        assert!(parse_ipv6_address("fd42:42:42::", "fd42:0042:0042:0000").is_err());
     }
 }
