@@ -2612,20 +2612,24 @@ fn render_peer_list_inner(
 </form>
 </div>
 <script>
-(function(){{
+(function() {{
   fetch('/api/admin/next-ips')
-    .then(function(r){{ return r.json(); }})
-    .then(function(d){{
-      var v4=document.getElementById('add_user_ipv4');
-      var v6=document.getElementById('add_user_ipv6');
-      if(d.ipv4){{ v4.value=d.ipv4; v4.placeholder='auto'; }}
-      else{{ v4.placeholder='auto'; }}
-      if(d.ipv6){{ v6.value=d.ipv6; v6.placeholder='auto'; }}
-      else{{ v6.placeholder='auto'; }}
+    .then(function(response) {{ return response.json(); }})
+    .then(function(data) {{
+      var ipv4Input = document.getElementById('add_user_ipv4');
+      var ipv6Input = document.getElementById('add_user_ipv6');
+      if (data.ipv4) {{
+        ipv4Input.value = data.ipv4;
+      }}
+      ipv4Input.placeholder = 'auto';
+      if (data.ipv6) {{
+        ipv6Input.value = data.ipv6;
+      }}
+      ipv6Input.placeholder = 'auto';
     }})
-    .catch(function(){{
-      document.getElementById('add_user_ipv4').placeholder='auto';
-      document.getElementById('add_user_ipv6').placeholder='auto';
+    .catch(function() {{
+      document.getElementById('add_user_ipv4').placeholder = 'auto';
+      document.getElementById('add_user_ipv6').placeholder = 'auto';
     }});
 }})();
 </script>

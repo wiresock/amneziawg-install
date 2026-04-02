@@ -631,6 +631,17 @@ pub fn suggest_next_ips(
     Ok(SuggestedIps { ipv4, ipv6 })
 }
 
+/// Non-Unix stub: IP suggestion requires reading AWG config files.
+#[cfg(not(unix))]
+pub fn suggest_next_ips() -> Result<SuggestedIps, CreateClientError> {
+    Err(CreateClientError::Internal(
+        "IP suggestion is only supported on Unix targets".to_string(),
+    ))
+}
+
+/// Length of a normalised IPv6 /64 prefix in "xxxx:xxxx:xxxx:xxxx" form.
+const IPV6_NORMALIZED_PREFIX_LEN: usize = 19;
+
 /// Parse and validate a full IPv4 address, returning the host (last octet).
 ///
 /// The address must belong to the expected subnet (`base_ipv4`, e.g.
@@ -664,15 +675,14 @@ fn parse_ipv6_address(addr: &str, base_ipv6: &str) -> Result<String, CreateClien
     let base_normalized = normalize_ipv6(&format!("{base_ipv6}::0")).map_err(|_| {
         CreateClientError::ConfigParse(format!("cannot normalise base IPv6: {base_ipv6}"))
     })?;
-    // Compare /64 prefixes (first 4 groups = first 19 characters of normalised form).
-    let prefix_len = "xxxx:xxxx:xxxx:xxxx".len(); // 19
-    if normalized[..prefix_len] != base_normalized[..prefix_len] {
+    // Compare /64 prefixes (first 4 groups of normalised form).
+    if normalized[..IPV6_NORMALIZED_PREFIX_LEN] != base_normalized[..IPV6_NORMALIZED_PREFIX_LEN] {
         return Err(CreateClientError::InvalidIp(format!(
             "IPv6 address must be in the {base_ipv6}:: subnet, got: {addr}"
         )));
     }
     // Check that the host part is not all zeros (that's the network address).
-    let host_part = &normalized[prefix_len..];
+    let host_part = &normalized[IPV6_NORMALIZED_PREFIX_LEN..];
     if host_part.chars().all(|c| c == ':' || c == '0') {
         return Err(CreateClientError::InvalidIp(
             "IPv6 host part must be non-zero".to_string(),
