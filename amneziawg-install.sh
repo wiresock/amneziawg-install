@@ -36,16 +36,49 @@ enable_apt_ipv4() {
 	mkdir -p /etc/apt/apt.conf.d
 	printf '%s\n%s\n' "${APT_FORCE_IPV4_SENTINEL}" 'Acquire::ForceIPv4 "true";' \
 		> "${APT_FORCE_IPV4_CONF}"
-	# Install traps so the config file is always cleaned up on exit / interruption.
+	# Save existing trap commands so we can chain them (not just restore).
+	# trap -p output is eval-safe by design (bash always emits: trap -- 'body' SIG).
 	_APT_IPV4_PREV_TRAP_EXIT="$(trap -p EXIT || true)"
 	_APT_IPV4_PREV_TRAP_INT="$(trap -p INT || true)"
 	_APT_IPV4_PREV_TRAP_TERM="$(trap -p TERM || true)"
-	trap 'disable_apt_ipv4' EXIT INT TERM
+	# Install traps that clean up *and* invoke any prior handler, so
+	# pre-existing cleanup logic still runs even if the script exits
+	# while IPv4 forcing is active.
+	trap '_cleanup_apt_ipv4_and_chain EXIT' EXIT
+	trap '_cleanup_apt_ipv4_and_chain INT'  INT
+	trap '_cleanup_apt_ipv4_and_chain TERM' TERM
+}
+# Internal: remove the config file, restore the previous trap for the
+# given signal, then immediately invoke the restored handler so it runs
+# during the same exit / signal delivery.
+_cleanup_apt_ipv4_and_chain() {
+	local sig="$1"
+	# Only remove the file if it carries our sentinel.
+	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
+		rm -f "${APT_FORCE_IPV4_CONF}"
+	fi
+	# Restore + chain: re-install the previous trap (if any), then invoke
+	# its handler body so pre-existing cleanup runs during this exit/signal.
+	local prev_var="_APT_IPV4_PREV_TRAP_${sig}"
+	local prev_trap="${!prev_var}"
+	if [[ -n "${prev_trap}" ]]; then
+		# Re-install the previous trap (e.g. trap -- 'handler' EXIT).
+		eval "${prev_trap}"
+		# Extract the handler body via eval + array.  trap -p output is
+		# always:  trap -- 'body' SIGNAL  — eval handles the quoting.
+		local _trap_parts
+		eval "_trap_parts=($(trap -p "${sig}" 2>/dev/null || true))"
+		if (( ${#_trap_parts[@]} >= 3 )); then
+			eval "${_trap_parts[2]}"
+		fi
+	else
+		trap - "${sig}"
+	fi
 }
 disable_apt_ipv4() {
 	# Only remove the file if it carries our sentinel (avoid clobbering
 	# an unrelated file that happens to live at the same path).
-	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && head -1 "${APT_FORCE_IPV4_CONF}" | grep -qF "${APT_FORCE_IPV4_SENTINEL}"; then
+	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
 		rm -f "${APT_FORCE_IPV4_CONF}"
 	fi
 	# Restore any previously installed traps.
@@ -1198,11 +1231,11 @@ function installAmneziaWG() {
 				chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 			fi
 		fi
+		# Force IPv4 for Launchpad PPA and all APT operations in this block — IPv6 may be resolvable
+		# but unreachable on some VPS providers, causing APT and add-apt-repository to hang.
+		enable_apt_ipv4
 		apt-get update || { echo -e "${RED}ERROR: Failed to refresh APT package index.${NC}"; exit 1; }
 		apt install -y software-properties-common || { echo -e "${RED}ERROR: Failed to install software-properties-common.${NC}"; exit 1; }
-		# Force IPv4 for Launchpad PPA operations — IPv6 may be resolvable
-		# but unreachable on some VPS providers, causing add-apt-repository to hang.
-		enable_apt_ipv4
 		add-apt-repository -y ppa:amnezia/ppa || { echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
 		apt-get update || { echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.

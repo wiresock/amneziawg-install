@@ -428,7 +428,8 @@ generate_hash() {
 }
 
 # Ensure at least one Argon2 hashing back-end is available.
-# Tries to auto-install python3-argon2 (apt) or the argon2 CLI package.
+# Tries to auto-install python3-argon2-cffi (apt), python3-argon2 (apt),
+# argon2 CLI, or argon2-cffi (pip3).
 ensure_argon2() {
     # Already available?
     if python3 -c "import argon2" &>/dev/null || command -v argon2 &>/dev/null; then
@@ -442,11 +443,17 @@ ensure_argon2() {
         if ! apt-get update -qq 2>/dev/null; then
             warn "apt-get update failed; continuing without refreshing package lists."
         fi
+        # Prefer the argon2-cffi binding, which provides the `argon2` Python module.
+        if apt-get install -y python3-argon2-cffi 2>/dev/null; then
+            info "Installed python3-argon2-cffi via apt."
+            return 0
+        fi
+        # Optional fallback: some distros may package this as python3-argon2
         if apt-get install -y python3-argon2 2>/dev/null; then
             info "Installed python3-argon2 via apt."
             return 0
         fi
-        warn "python3-argon2 not available via apt; trying argon2 CLI..."
+        warn "python3-argon2-cffi/python3-argon2 not available via apt; trying argon2 CLI..."
         if apt-get install -y argon2 2>/dev/null; then
             info "Installed argon2 CLI via apt."
             return 0
