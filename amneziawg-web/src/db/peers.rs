@@ -151,7 +151,10 @@ pub async fn find_snapshots_since(
 /// clause ensures chronological ordering without needing the column in the
 /// result set.
 ///
-/// Used by the all-peers traffic-usage endpoint to compute per-peer deltas in bulk.
+/// This is the non-streaming (fully-materialized) counterpart of
+/// [`stream_all_snapshots_since`].  Production code uses the streaming
+/// variant; this function is retained for tests.
+#[cfg(test)]
 pub async fn find_all_snapshots_since(
     pool: &SqlitePool,
     since_rfc3339: &str,
