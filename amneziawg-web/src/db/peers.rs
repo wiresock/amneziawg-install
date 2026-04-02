@@ -338,7 +338,7 @@ pub async fn delete_stale_peers(
                 .take(chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
-            let sql = format!("DELETE FROM peers WHERE id IN ({placeholders})");
+            let sql = format!("DELETE FROM peers WHERE id IN ({placeholders}) AND disabled = 0");
             let mut query = sqlx::query(&sql);
             for (id, _) in chunk {
                 query = query.bind(id);
