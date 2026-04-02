@@ -22,9 +22,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	fi
 fi
 
-# Force APT to use IPv4 only.  Some cloud VPS providers resolve Launchpad /
-# Ubuntu keyserver hostnames to both A and AAAA records, but outbound IPv6
-# connectivity is broken, causing apt and add-apt-repository to hang.
+# Force package managers to use IPv4 only.  Some cloud VPS providers resolve
+# Launchpad / Ubuntu keyserver / COPR hostnames to both A and AAAA records,
+# but outbound IPv6 connectivity is broken, causing apt, dnf,
+# add-apt-repository, and COPR API calls to hang.
 # Dropping a config file into apt.conf.d/ affects every apt-based tool
 # (including add-apt-repository, which uses python-apt internally).
 #
@@ -32,8 +33,8 @@ fi
 # Launchpad API via httplib2, which does NOT honour Acquire::ForceIPv4.
 # On Ubuntu 24.04 this causes a Python traceback when IPv6 is broken.
 # We therefore also inject an IPv4-preference rule into /etc/gai.conf so
-# that glibc's getaddrinfo (and thus Python's socket.getaddrinfo) prefers
-# IPv4 addresses.
+# that glibc's getaddrinfo (and thus Python's socket.getaddrinfo and
+# libcurl used by dnf) prefers IPv4 addresses.  This benefits all distros.
 APT_FORCE_IPV4_CONF="/etc/apt/apt.conf.d/99amneziawg-force-ipv4"
 APT_FORCE_IPV4_SENTINEL="# Managed by amneziawg-install - safe to remove"
 GAI_CONF="/etc/gai.conf"
@@ -1260,6 +1261,10 @@ function installAmneziaWG() {
 	installQuestions
 
 	# Install AmneziaWG tools and module
+	# Force IPv4 preference for all package-manager operations — IPv6 may be
+	# resolvable but unreachable on some VPS providers, causing apt, dnf,
+	# add-apt-repository, and COPR API calls to hang.
+	enable_apt_ipv4
 	if [[ ${OS} == 'ubuntu' ]]; then
 		if [[ -e /etc/apt/sources.list.d/ubuntu.sources ]]; then
 			# Check whether any Types: line lacks deb-src. A single stanza with
@@ -1288,9 +1293,6 @@ function installAmneziaWG() {
 				chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 			fi
 		fi
-		# Force IPv4 for Launchpad PPA and all APT operations in this block — IPv6 may be resolvable
-		# but unreachable on some VPS providers, causing APT and add-apt-repository to hang.
-		enable_apt_ipv4
 		apt-get update || { echo -e "${RED}ERROR: Failed to refresh APT package index.${NC}"; exit 1; }
 		apt install -y software-properties-common || { echo -e "${RED}ERROR: Failed to install software-properties-common.${NC}"; exit 1; }
 		add-apt-repository -y ppa:amnezia/ppa || { echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
@@ -1314,7 +1316,6 @@ function installAmneziaWG() {
 			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi
 		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
-		disable_apt_ipv4
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
 			# Tag managed file with sentinel so uninstall can verify ownership
@@ -1324,9 +1325,6 @@ function installAmneziaWG() {
 			sed -i -E '/^[[:space:]]*deb-src[[:space:]]/!s/^[[:space:]]*deb[[:space:]]+/deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
 			chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 		fi
-		# Force IPv4 for all APT operations in this block — IPv6 may be resolvable
-		# but unreachable on some VPS providers, causing APT to hang.
-		enable_apt_ipv4
 		# Ensure required tools are available for key download/dearmor on minimal systems
 		if ! command -v gpg &>/dev/null; then
 			apt-get update
@@ -1427,7 +1425,6 @@ function installAmneziaWG() {
 			echo -e "${ORANGE}WARNING: No suitable kernel headers package found. Continuing without installing headers; DKMS module builds may fail.${NC}"
 			apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 		fi
-		disable_apt_ipv4
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
@@ -1451,6 +1448,7 @@ function installAmneziaWG() {
 		fi
 		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	fi
+	disable_apt_ipv4
 
 	# Strip the deprecated REMAKE_INITRD directive from the amneziawg DKMS config
 	# (newer DKMS versions print noisy warnings for it).
