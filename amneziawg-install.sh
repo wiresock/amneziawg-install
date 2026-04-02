@@ -2167,14 +2167,24 @@ function regenerateClients() {
 			fi
 		done
 
-		# Scan candidate config files (including .conf.old, renamed during migration)
+		# Scan candidate config files (including .conf.old, renamed during migration).
+		# For each candidate, verify that the private key derives to the public key
+		# registered in the server config.  This prevents stale or unrelated configs
+		# (e.g. left over from a previous installation in another home directory)
+		# from being incorrectly matched by filename alone.
 		local MATCHED_CONF=""
 		for CANDIDATE in "${CLIENT_CONF_CANDIDATES[@]}"; do
 			if [[ -f "${CANDIDATE}" ]]; then
-				CLIENT_PRIV_KEY=$(grep -E "^PrivateKey = " "${CANDIDATE}" | sed 's/^PrivateKey = //')
-				if [[ -n "${CLIENT_PRIV_KEY}" ]]; then
-					MATCHED_CONF="${CANDIDATE}"
-					break
+				local CANDIDATE_PRIV_KEY
+				CANDIDATE_PRIV_KEY=$(grep -E "^PrivateKey = " "${CANDIDATE}" | sed 's/^PrivateKey = //')
+				if [[ -n "${CANDIDATE_PRIV_KEY}" ]]; then
+					local CANDIDATE_PUB_KEY
+					CANDIDATE_PUB_KEY=$(echo "${CANDIDATE_PRIV_KEY}" | awg pubkey 2>/dev/null || true)
+					if [[ "${CANDIDATE_PUB_KEY}" == "${CLIENT_PUB_KEY}" ]]; then
+						CLIENT_PRIV_KEY="${CANDIDATE_PRIV_KEY}"
+						MATCHED_CONF="${CANDIDATE}"
+						break
+					fi
 				fi
 			fi
 		done
