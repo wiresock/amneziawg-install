@@ -1412,21 +1412,25 @@ function installAmneziaWG() {
 			echo "deb-src [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
 		fi
 		apt update
-		# Try to install appropriate kernel headers, but don't hard-fail if the
-		# exact versioned package is unavailable (e.g., on some Raspberry Pi kernels).
-		HEADER_PKG=""
-		if apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1; then
-			HEADER_PKG="linux-headers-$(uname -r)"
-		elif apt-cache show raspberrypi-kernel-headers >/dev/null 2>&1; then
-			HEADER_PKG="raspberrypi-kernel-headers"
+		# Install kernel headers for the running kernel so DKMS can compile the module.
+		# Try several candidates in order: exact versioned headers, Raspberry Pi headers,
+		# then the architecture-specific meta package (e.g. linux-headers-amd64) as a last
+		# resort.  This mirrors the Ubuntu approach and avoids skipping headers when the
+		# exact versioned package isn't in the local APT cache.
+		HEADER_INSTALLED=0
+		HEADER_CANDIDATES=("linux-headers-$(uname -r)" "raspberrypi-kernel-headers" "linux-headers-$(dpkg --print-architecture 2>/dev/null || echo amd64)")
+		for HEADER_PKG in "${HEADER_CANDIDATES[@]}"; do
+			if apt install -y "${HEADER_PKG}"; then
+				HEADER_INSTALLED=1
+				break
+			else
+				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HEADER_PKG}'. Trying next candidate...${NC}"
+			fi
+		done
+		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
+			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi
-
-		if [[ -n "${HEADER_PKG}" ]]; then
-			apt install -y "${HEADER_PKG}" dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
-		else
-			echo -e "${ORANGE}WARNING: No suitable kernel headers package found. Continuing without installing headers; DKMS module builds may fail.${NC}"
-			apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
-		fi
+		apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 		disable_apt_ipv4
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
@@ -1466,7 +1470,10 @@ function installAmneziaWG() {
 	# The package post-install hook may not trigger if headers were installed in the
 	# same apt transaction, so an explicit autoinstall guarantees the .ko is present.
 	if command -v dkms &>/dev/null; then
-		dkms autoinstall -k "$(uname -r)" || true
+		if ! dkms autoinstall -k "$(uname -r)"; then
+			echo -e "${ORANGE}WARNING: dkms autoinstall failed for kernel $(uname -r).${NC}"
+			echo -e "${ORANGE}The amneziawg kernel module may not be available until headers are installed and the module is rebuilt.${NC}"
+		fi
 	fi
 
 	# Rebuild module dependency cache (required for DKMS + compressed modules, especially on ARM/Ubuntu)
@@ -1477,6 +1484,20 @@ function installAmneziaWG() {
 		fi
 	else
 		echo -e "${ORANGE}WARNING: depmod not found. Skipping module dependency cache rebuild.${NC}"
+	fi
+
+	# Verify the module was actually built. If the .ko file is missing even after
+	# dkms autoinstall, something went wrong during compilation (likely missing
+	# kernel headers).  Print an early, actionable warning so the user doesn't have
+	# to wait until modprobe to discover the problem.
+	if ! find "/lib/modules/$(uname -r)" -name 'amneziawg.ko*' 2>/dev/null | grep -q .; then
+		echo -e "${ORANGE}WARNING: amneziawg kernel module was NOT built for kernel $(uname -r).${NC}"
+		echo -e "${ORANGE}This usually means kernel headers are missing or the DKMS build failed.${NC}"
+		if [[ ${OS} == 'ubuntu' ]] || [[ ${OS} == 'debian' ]]; then
+			echo -e "${ORANGE}Try: apt install -y \"linux-headers-$(uname -r)\" && dkms autoinstall && depmod -a${NC}"
+		elif [[ ${OS} == 'fedora' ]] || [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+			echo -e "${ORANGE}Try: dnf install -y \"kernel-devel-$(uname -r)\" && dkms autoinstall && depmod -a${NC}"
+		fi
 	fi
 
 	# Ensure AmneziaWG kernel module is loaded at boot (before awg-quick service starts)
