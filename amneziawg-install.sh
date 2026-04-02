@@ -3044,9 +3044,9 @@ AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAM
 	client_conf="${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 	chmod 600 "${client_conf}" 2>/dev/null || true
 
-	# Copy (or adjust permissions on) the config in the web panel directory so
-	# the web panel service user can read it.  When HOME_DIR already equals
-	# WEB_PANEL_CONFIG_DIR the cp is a no-op, but chown/chmod still run.
+	# Copy the config to the web panel directory (or adjust permissions in
+	# place when the file is already there) so the web panel service user can
+	# read it.
 	copyToWebPanelDir "${client_conf}"
 
 	# Add peer to server config
