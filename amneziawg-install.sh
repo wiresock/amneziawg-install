@@ -2176,7 +2176,7 @@ function regenerateClients() {
 		for CANDIDATE in "${CLIENT_CONF_CANDIDATES[@]}"; do
 			if [[ -f "${CANDIDATE}" ]]; then
 				local CANDIDATE_PRIV_KEY
-				CANDIDATE_PRIV_KEY=$(grep -E "^PrivateKey = " "${CANDIDATE}" | sed 's/^PrivateKey = //')
+				CANDIDATE_PRIV_KEY=$(grep -m1 -E "^PrivateKey = " "${CANDIDATE}" | sed 's/^PrivateKey = //')
 				if [[ -n "${CANDIDATE_PRIV_KEY}" ]]; then
 					local CANDIDATE_PUB_KEY
 					CANDIDATE_PUB_KEY=$(echo "${CANDIDATE_PRIV_KEY}" | awg pubkey 2>/dev/null || true)
