@@ -1093,17 +1093,15 @@ async fn get_all_usage(
     let since = Utc::now() - chrono::Duration::seconds(secs);
     let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    // Fetch all peers and all snapshots in the period in two queries.
+    // Fetch all peers and baseline snapshots (in-memory, O(peers) each).
     let peers = crate::db::peers::list_all(&state.db.pool).await?;
     let baseline_snapshots =
         crate::db::peers::find_all_baseline_snapshots(&state.db.pool, &since_str).await?;
-    let all_snapshots =
-        crate::db::peers::find_all_snapshots_since(&state.db.pool, &since_str).await?;
 
-    // Single-pass aggregation over the in-memory snapshot Vec: rows are ordered
-    // by (public_key, captured_at ASC). Track previous counters per key and
-    // accumulate deltas directly, storing only an O(peers) summary map in
-    // addition to the O(snapshots) input that `find_all_snapshots_since` returns.
+    // Stream-based aggregation: rows arrive ordered by (public_key,
+    // captured_at ASC, id ASC) via a streaming cursor, so each row is
+    // consumed and discarded immediately instead of being held in a Vec.
+    // Memory stays at O(peers) for the summary + prev_counters maps.
     let mut summaries: std::collections::HashMap<String, HistorySummary> =
         std::collections::HashMap::new();
 
@@ -1119,7 +1117,10 @@ async fn get_all_usage(
     let mut prev_rx: u64 = 0;
     let mut prev_tx: u64 = 0;
 
-    for row in all_snapshots {
+    use futures_util::TryStreamExt;
+    let mut stream =
+        crate::db::peers::stream_all_snapshots_since(&state.db.pool, &since_str);
+    while let Some(row) = stream.try_next().await? {
         let rx = row.rx_bytes as u64;
         let tx = row.tx_bytes as u64;
 
@@ -2727,11 +2728,12 @@ Historical data (snapshots, events) will be preserved.</p>
     buf.push_str(&format!(
         r#"<script>
 (function(){{
+  var K=BigInt(1024),M=BigInt(1048576),G=BigInt(1073741824);
   function fmtBytes(b){{
-    if(b<1024) return b+' B';
-    if(b<1048576) return (b/1024).toFixed(1)+' KiB';
-    if(b<1073741824) return (b/1048576).toFixed(1)+' MiB';
-    return (b/1073741824).toFixed(2)+' GiB';
+    if(b<K) return b.toString()+' B';
+    if(b<M) return (Number(b*BigInt(10)/K)/10).toFixed(1)+' KiB';
+    if(b<G) return (Number(b*BigInt(10)/M)/10).toFixed(1)+' MiB';
+    return (Number(b*BigInt(100)/G)/100).toFixed(2)+' GiB';
   }}
   fetch('/api/peers/{id}/usage/summary',{{credentials:'same-origin'}})
     .then(function(r){{
@@ -2742,8 +2744,7 @@ Historical data (snapshots, events) will be preserved.</p>
       ['day','week','month'].forEach(function(p){{
         var u=d[p];
         if(!u||typeof u.rx_bytes==='undefined'||typeof u.tx_bytes==='undefined') return;
-        var rx=Number(u.rx_bytes),tx=Number(u.tx_bytes);
-        if(isNaN(rx)||isNaN(tx)) return;
+        try{{ var rx=BigInt(u.rx_bytes),tx=BigInt(u.tx_bytes); }}catch(e){{ return; }}
         document.getElementById('usage-rx-'+p).textContent=fmtBytes(rx);
         document.getElementById('usage-tx-'+p).textContent=fmtBytes(tx);
       }});

@@ -143,7 +143,8 @@ pub async fn find_snapshots_since(
 }
 
 /// Return snapshots for **all** peers captured on or after `since_rfc3339`,
-/// ordered by `public_key` then `captured_at` **ascending** (oldest first).
+/// ordered by `public_key` then `captured_at` **ascending** (oldest first),
+/// with `id ASC` as a deterministic tie-breaker for same-timestamp rows.
 ///
 /// Returns the narrower [`UsageSnapshotRow`] (only `public_key`, `rx_bytes`,
 /// `tx_bytes`) to avoid fetching unused columns.  The `ORDER BY captured_at`
@@ -159,11 +160,31 @@ pub async fn find_all_snapshots_since(
         "SELECT public_key, rx_bytes, tx_bytes
          FROM   snapshots
          WHERE  captured_at >= ?
-         ORDER  BY public_key, captured_at ASC",
+         ORDER  BY public_key, captured_at ASC, id ASC",
     )
     .bind(since_rfc3339)
     .fetch_all(pool)
     .await
+}
+
+/// Stream snapshots for **all** peers captured on or after `since_rfc3339`,
+/// ordered by `public_key` then `captured_at ASC`, `id ASC`.
+///
+/// Unlike [`find_all_snapshots_since`] (which materializes the full `Vec`),
+/// this returns a [`futures_util::Stream`] so the caller can process rows
+/// incrementally without holding the entire result set in memory.
+pub fn stream_all_snapshots_since<'a>(
+    pool: &'a SqlitePool,
+    since_rfc3339: &'a str,
+) -> impl futures_util::Stream<Item = Result<UsageSnapshotRow, sqlx::Error>> + 'a {
+    sqlx::query_as::<_, UsageSnapshotRow>(
+        "SELECT public_key, rx_bytes, tx_bytes
+         FROM   snapshots
+         WHERE  captured_at >= ?
+         ORDER  BY public_key, captured_at ASC, id ASC",
+    )
+    .bind(since_rfc3339)
+    .fetch(pool)
 }
 
 /// Return the last snapshot for `public_key` captured **before** `before_rfc3339`.
@@ -190,7 +211,8 @@ pub async fn find_baseline_snapshot(
 }
 
 /// Return the last snapshot before `before_rfc3339` for **every** peer that has
-/// one.  The result contains at most one row per `public_key`.
+/// one.  Uses `MAX(id)` as a deterministic tie-breaker so the result contains
+/// exactly one row per `public_key`.
 ///
 /// Used to seed per-peer baseline counters when computing all-peers usage so
 /// that the delta for the first in-window snapshot of each peer is included.
@@ -201,12 +223,12 @@ pub async fn find_all_baseline_snapshots(
     sqlx::query_as::<_, UsageSnapshotRow>(
         "SELECT s.public_key, s.rx_bytes, s.tx_bytes
          FROM   snapshots s
-         INNER  JOIN (
-             SELECT public_key, MAX(captured_at) AS max_ts
-             FROM   snapshots
-             WHERE  captured_at < ?
-             GROUP  BY public_key
-         ) latest ON s.public_key = latest.public_key AND s.captured_at = latest.max_ts",
+         WHERE  s.id IN (
+             SELECT MAX(s2.id)
+             FROM   snapshots s2
+             WHERE  s2.captured_at < ?
+             GROUP  BY s2.public_key
+         )",
     )
     .bind(before_rfc3339)
     .fetch_all(pool)
