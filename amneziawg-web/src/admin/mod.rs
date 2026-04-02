@@ -93,6 +93,21 @@ pub struct CreateUserResult {
     pub client_name: String,
 }
 
+/// Fetch the next available IP addresses for client creation.
+///
+/// This is a read-only operation that can be used to pre-populate the
+/// "Add user" form with suggested addresses.
+pub async fn execute_suggest_ips(
+) -> Result<client_manager::SuggestedIps, client_manager::CreateClientError> {
+    tokio::task::spawn_blocking(client_manager::suggest_next_ips)
+        .await
+        .map_err(|e| {
+            client_manager::CreateClientError::Internal(format!(
+                "suggest_next_ips task panicked: {e}"
+            ))
+        })?
+}
+
 /// Create a new AmneziaWG user/client directly, without the external script.
 ///
 /// 1. Validates the name.

@@ -403,10 +403,10 @@ pub struct EventDto {
 #[derive(Debug, Deserialize)]
 pub struct CreateUserRequest {
     pub name: String,
-    /// Optional IPv4 host number (last octet, 2–254).
-    pub ipv4_host: Option<u16>,
-    /// Optional IPv6 host segment (1–4 hex characters, e.g. `"2a"`).
-    pub ipv6_host: Option<String>,
+    /// Optional full IPv4 address for the client (e.g. `"10.66.66.100"`).
+    pub ipv4_address: Option<String>,
+    /// Optional full IPv6 address for the client (e.g. `"fd42:42:42::ff"`).
+    pub ipv6_address: Option<String>,
 }
 
 /// HTML form body for `POST /admin/users/add`.
@@ -414,10 +414,10 @@ pub struct CreateUserRequest {
 pub struct AddUserForm {
     pub name: String,
     pub csrf_token: Option<String>,
-    /// Optional IPv4 host number (last octet, 2–254).
-    pub ipv4_host: Option<String>,
-    /// Optional IPv6 host segment (1–4 hex characters).
-    pub ipv6_host: Option<String>,
+    /// Optional full IPv4 address for the client.
+    pub ipv4_address: Option<String>,
+    /// Optional full IPv6 address for the client.
+    pub ipv6_address: Option<String>,
 }
 
 /// HTML form body for `POST /admin/users/:id/remove`.
@@ -590,6 +590,7 @@ pub fn router(
         .route("/api/usage", get(get_all_usage))
         .route("/api/events", get(list_events_handler))
         // ── User lifecycle routes ────────────────────────────────
+        .route("/api/admin/next-ips", get(api_next_ips))
         .route("/api/admin/users", post(api_create_user))
         .route("/api/admin/users/:id/remove", post(api_remove_user))
         .route("/admin/users/add", post(post_add_user_form))
@@ -1752,6 +1753,21 @@ async fn post_peer_edit(
 
 // ── User lifecycle handlers ──────────────────────────────────────────────────
 
+/// `GET /api/admin/next-ips` – suggest the next available IP addresses.
+async fn api_next_ips() -> Result<Response, ApiError> {
+    match crate::admin::execute_suggest_ips().await {
+        Ok(suggested) => Ok(Json(json!({
+            "ipv4": suggested.ipv4,
+            "ipv6": suggested.ipv6,
+        }))
+        .into_response()),
+        Err(_) => {
+            // Gracefully return empty suggestions if we can't read the config.
+            Ok(Json(json!({ "ipv4": null, "ipv6": null })).into_response())
+        }
+    }
+}
+
 /// `POST /api/admin/users` – JSON API to create a new user/client.
 async fn api_create_user(
     State(state): State<AppState>,
@@ -1775,8 +1791,8 @@ async fn api_create_user(
 
     let name = body.name.trim().to_string();
     let ip_override = crate::admin::client_manager::IpOverride {
-        ipv4_host: body.ipv4_host,
-        ipv6_host: trim_optional_string(body.ipv6_host.as_deref()),
+        ipv4_address: trim_optional_string(body.ipv4_address.as_deref()),
+        ipv6_address: trim_optional_string(body.ipv6_address.as_deref()),
     };
     match crate::admin::execute_create_user(
         &state.db,
@@ -1969,33 +1985,11 @@ async fn post_add_user_form(
     }
 
     let name = form.name.trim().to_string();
-    let ipv4_host = form
-        .ipv4_host
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<u16>().map_err(|_| {
-                crate::admin::client_manager::CreateClientError::InvalidIp(
-                    "IPv4 host must be a number between 2 and 254".to_string(),
-                )
-            })
-        })
-        .transpose();
-    let ipv4_host = match ipv4_host {
-        Ok(v) => v,
-        Err(e) => {
-            let rows = crate::db::peers::list_all(&state.db.pool).await?;
-            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
-            let csrf = session_csrf_from_headers(&state, &headers);
-            let message = e.to_string();
-            return Ok(Html(render_peer_list_with_error(&peers, &csrf, &message)).into_response());
-        }
-    };
-    let ipv6_host = trim_optional_string(form.ipv6_host.as_deref());
+    let ipv4_address = trim_optional_string(form.ipv4_address.as_deref());
+    let ipv6_address = trim_optional_string(form.ipv6_address.as_deref());
     let ip_override = crate::admin::client_manager::IpOverride {
-        ipv4_host,
-        ipv6_host,
+        ipv4_address,
+        ipv6_address,
     };
     match crate::admin::execute_create_user(
         &state.db,
@@ -2606,19 +2600,35 @@ fn render_peer_list_inner(
          pattern="[a-zA-Z0-9_-]+" maxlength="15"
          placeholder="e.g. iphone" title="Alphanumeric, underscore, or hyphen (max 15 chars)">
   <p class="meta" style="margin-top:.25rem">Letters, digits, underscore, or hyphen. Max 15 characters.</p>
-  <label for="add_user_ipv4">IPv4 host number <span class="meta">(optional)</span></label>
-  <input type="number" id="add_user_ipv4" name="ipv4_host"
-         min="2" max="254"
-         placeholder="auto" title="Last octet of IPv4 address (2–254)">
-  <p class="meta" style="margin-top:.25rem">Last octet of the client IPv4 address (2–254). Leave empty for auto-assignment.</p>
-  <label for="add_user_ipv6">IPv6 host segment <span class="meta">(optional)</span></label>
-  <input type="text" id="add_user_ipv6" name="ipv6_host"
-         pattern="[a-fA-F0-9]{{1,4}}" maxlength="4"
-         placeholder="auto" title="1–4 hexadecimal characters for the IPv6 host part">
-  <p class="meta" style="margin-top:.25rem">1–4 hex characters for the IPv6 host segment. Leave empty for auto-assignment.</p>
+  <label for="add_user_ipv4">IPv4 address <span class="meta">(optional)</span></label>
+  <input type="text" id="add_user_ipv4" name="ipv4_address"
+         placeholder="loading…" title="Full IPv4 address for this client">
+  <p class="meta" style="margin-top:.25rem">Full IPv4 address. Pre-filled with the next available address; edit as needed.</p>
+  <label for="add_user_ipv6">IPv6 address <span class="meta">(optional)</span></label>
+  <input type="text" id="add_user_ipv6" name="ipv6_address"
+         placeholder="loading…" title="Full IPv6 address for this client">
+  <p class="meta" style="margin-top:.25rem">Full IPv6 address. Pre-filled with the next available address; edit as needed.</p>
   <button type="submit">Add user</button>
 </form>
 </div>
+<script>
+(function(){{
+  fetch('/api/admin/next-ips')
+    .then(function(r){{ return r.json(); }})
+    .then(function(d){{
+      var v4=document.getElementById('add_user_ipv4');
+      var v6=document.getElementById('add_user_ipv6');
+      if(d.ipv4){{ v4.value=d.ipv4; v4.placeholder='auto'; }}
+      else{{ v4.placeholder='auto'; }}
+      if(d.ipv6){{ v6.value=d.ipv6; v6.placeholder='auto'; }}
+      else{{ v6.placeholder='auto'; }}
+    }})
+    .catch(function(){{
+      document.getElementById('add_user_ipv4').placeholder='auto';
+      document.getElementById('add_user_ipv6').placeholder='auto';
+    }});
+}})();
+</script>
 "#,
         csrf = esc(csrf_token)
     ));
@@ -5431,7 +5441,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_create_user_accepts_optional_ip_fields() {
-        // Verify the API accepts the optional ipv4_host and ipv6_host fields
+        // Verify the API accepts the optional ipv4_address and ipv6_address fields
         // without error (actual creation would fail in test because there's no
         // AWG interface, but the name validation runs first).
         let app = test_router(test_db().await);
@@ -5442,7 +5452,7 @@ mod tests {
                     .uri("/api/admin/users")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"name":"../bad","ipv4_host":100,"ipv6_host":"ff"}"#,
+                        r#"{"name":"../bad","ipv4_address":"10.66.66.100","ipv6_address":"fd42:42:42::ff"}"#,
                     ))
                     .unwrap(),
             )
@@ -5504,20 +5514,20 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         assert!(
-            html.contains("ipv4_host"),
-            "add user form should contain ipv4_host field"
+            html.contains("ipv4_address"),
+            "add user form should contain ipv4_address field"
         );
         assert!(
-            html.contains("ipv6_host"),
-            "add user form should contain ipv6_host field"
+            html.contains("ipv6_address"),
+            "add user form should contain ipv6_address field"
         );
         assert!(
-            html.contains("IPv4 host number"),
-            "add user form should contain IPv4 label"
+            html.contains("IPv4 address"),
+            "add user form should contain IPv4 address label"
         );
         assert!(
-            html.contains("IPv6 host segment"),
-            "add user form should contain IPv6 label"
+            html.contains("IPv6 address"),
+            "add user form should contain IPv6 address label"
         );
     }
 
