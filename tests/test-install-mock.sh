@@ -867,18 +867,24 @@ fi
 echo ""
 echo "--- Stale config skipping test ---"
 
-# Create a fake home directory with a stale client config that has a wrong
-# private key.  The stale config appears *before* the real config in the
-# candidate search because /home/* is scanned alphabetically and "aaa_stale"
-# sorts before any other user.
+# To exercise pubkey verification, place the real config in a later-sorting
+# /home/* directory and remove the /root copy; otherwise regenerateClients()
+# may resolve the real config before scanning /home/* and never consider the
+# stale candidate first.
 STALE_HOME="/home/aaa_stale"
-mkdir -p "${STALE_HOME}"
+REAL_HOME="/home/zzz_realuser"
+mkdir -p "${STALE_HOME}" "${REAL_HOME}"
+cp "${CLIENT1_CONF}" "${REAL_HOME}/awg0-client-client.conf"
+CLIENT1_CONF="${REAL_HOME}/awg0-client-client.conf"
+rm -f /root/awg0-client-client.conf
 
 # Capture the correct private key from the real client config
 REAL_CLIENT1_PRIV=$(grep -m1 -E "^PrivateKey = " "${CLIENT1_CONF}" | sed 's/^PrivateKey = //')
 
 # Write a stale config with a DIFFERENT private key (not matching the server's
-# PublicKey for this client).  The key verification logic should skip this.
+# PublicKey for this client).  The key verification logic should skip this
+# earlier-sorting stale candidate and continue searching until it finds the
+# real config under ${REAL_HOME}.
 cat > "${STALE_HOME}/awg0-client-client.conf" <<STALE_EOF
 [Interface]
 PrivateKey = U3RhbGVQcml2YXRlS2V5MTIzNDU2Nzg5MGFiY2RlZg==
@@ -920,8 +926,10 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# Clean up stale home directory
-rm -rf "${STALE_HOME}"
+# Clean up stale/real home directories and restore /root config for subsequent tests
+cp "${CLIENT1_CONF}" /root/awg0-client-client.conf
+CLIENT1_CONF="/root/awg0-client-client.conf"
+rm -rf "${STALE_HOME}" "${REAL_HOME}"
 
 # --- 2c: Key regeneration when client config is missing ---
 echo ""

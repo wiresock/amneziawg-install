@@ -2056,7 +2056,7 @@ function regenerateClients() {
 		PEER_BLOCK=$(sed -n "/^### Client ${CLIENT_NAME}\$/,/^$/p" "${SERVER_AWG_CONF}")
 
 		local CLIENT_PUB_KEY
-		CLIENT_PUB_KEY=$(echo "${PEER_BLOCK}" | grep -E "^PublicKey = " | sed 's/^PublicKey = //')
+		CLIENT_PUB_KEY=$(echo "${PEER_BLOCK}" | grep -m1 -E "^PublicKey = " | sed 's/^PublicKey = //')
 		local CLIENT_PRE_SHARED_KEY
 		CLIENT_PRE_SHARED_KEY=$(echo "${PEER_BLOCK}" | grep -E "^PresharedKey = " | sed 's/^PresharedKey = //')
 		local CLIENT_ALLOWED_IPS
