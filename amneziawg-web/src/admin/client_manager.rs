@@ -549,7 +549,7 @@ fn resolve_client_ips(
             }
             Ok((format!("{base_ipv4}.{ipv4_host}"), ipv6_full))
         }
-        // Only IPv4 override – derive IPv6 from the same decimal host number.
+        // Only IPv4 override – derive IPv6 host segment by reusing the same host value as a string.
         (Some(ipv4_host), None) => {
             validate_ipv4_host(*ipv4_host)?;
 
@@ -1576,7 +1576,7 @@ AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
         let ovr = IpOverride { ipv4_host: Some(100), ipv6_host: None };
         let (ipv4, ipv6) = resolve_client_ips(config, "10.66.66", "fd42:0042:0042:0000", &ovr).unwrap();
         assert_eq!(ipv4, "10.66.66.100");
-        // When only IPv4 is specified, IPv6 derives from the same decimal host.
+        // When only IPv4 is specified, the IPv6 host segment reuses the same host value as a string.
         assert_eq!(ipv6, "fd42:0042:0042:0000::100");
     }
 
