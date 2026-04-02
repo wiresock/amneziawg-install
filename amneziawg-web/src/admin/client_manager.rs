@@ -662,11 +662,12 @@ fn parse_ipv4_address(addr: &str, base_ipv4: &str) -> Result<u16, CreateClientEr
     Ok(host)
 }
 
-/// Parse and validate a full IPv6 address, returning the normalised full form.
+/// Parse and validate a full IPv6 address, returning a canonical form under the given /64 prefix.
 ///
 /// The address must belong to the expected /64 prefix (`base_ipv6`, e.g.
 /// `"fd42:0042:0042:0000"`) and have a non-empty host part.  The input
-/// may use compressed notation (e.g. `"fd42:42:42::ff"`).
+/// may use compressed notation (e.g. `"fd42:42:42::ff"`), but the returned
+/// value is reconstructed as `<base_ipv6>::<host>` to match the server config format.
 fn parse_ipv6_address(addr: &str, base_ipv6: &str) -> Result<String, CreateClientError> {
     // Parse to get the normalised full form, then check the prefix.
     let normalized = normalize_ipv6(addr).map_err(|_| {

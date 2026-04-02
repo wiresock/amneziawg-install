@@ -1761,8 +1761,13 @@ async fn api_next_ips() -> Result<Response, ApiError> {
             "ipv6": suggested.ipv6,
         }))
         .into_response()),
-        Err(_) => {
-            // Gracefully return empty suggestions if we can't read the config.
+        Err(err) => {
+            // Gracefully return empty suggestions if we can't read the config,
+            // but log the underlying error for observability.
+            tracing::warn!(
+                error = ?err,
+                "execute_suggest_ips failed; returning empty IP suggestions"
+            );
             Ok(Json(json!({ "ipv4": null, "ipv6": null })).into_response())
         }
     }
@@ -2613,24 +2618,37 @@ fn render_peer_list_inner(
 </div>
 <script>
 (function() {{
-  fetch('/api/admin/next-ips')
-    .then(function(response) {{ return response.json(); }})
-    .then(function(data) {{
-      var ipv4Input = document.getElementById('add_user_ipv4');
-      var ipv6Input = document.getElementById('add_user_ipv6');
-      if (data.ipv4) {{
-        ipv4Input.value = data.ipv4;
-      }}
-      ipv4Input.placeholder = 'auto';
-      if (data.ipv6) {{
-        ipv6Input.value = data.ipv6;
-      }}
-      ipv6Input.placeholder = 'auto';
-    }})
-    .catch(function() {{
-      document.getElementById('add_user_ipv4').placeholder = 'auto';
-      document.getElementById('add_user_ipv6').placeholder = 'auto';
-    }});
+  var nextIpsRequested = false;
+  var ipv4Input = document.getElementById('add_user_ipv4');
+  var ipv6Input = document.getElementById('add_user_ipv6');
+
+  function applyAutoPlaceholders() {{
+    if (ipv4Input) ipv4Input.placeholder = 'auto';
+    if (ipv6Input) ipv6Input.placeholder = 'auto';
+  }}
+
+  function fetchNextIpsOnce() {{
+    if (nextIpsRequested) return;
+    nextIpsRequested = true;
+
+    fetch('/api/admin/next-ips')
+      .then(function(response) {{ return response.json(); }})
+      .then(function(data) {{
+        if (data.ipv4 && ipv4Input && ipv4Input.value === '') {{
+          ipv4Input.value = data.ipv4;
+        }}
+        if (data.ipv6 && ipv6Input && ipv6Input.value === '') {{
+          ipv6Input.value = data.ipv6;
+        }}
+        applyAutoPlaceholders();
+      }})
+      .catch(function() {{
+        applyAutoPlaceholders();
+      }});
+  }}
+
+  if (ipv4Input) ipv4Input.addEventListener('focus', fetchNextIpsOnce);
+  if (ipv6Input) ipv6Input.addEventListener('focus', fetchNextIpsOnce);
 }})();
 </script>
 "#,
