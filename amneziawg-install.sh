@@ -22,18 +22,23 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	fi
 fi
 
-# Force APT to use IPv4 only.  Some cloud VPS providers resolve Launchpad /
-# Ubuntu keyserver hostnames to both A and AAAA records, but outbound IPv6
-# connectivity is broken, causing apt and add-apt-repository to hang.
-# Dropping a config file into apt.conf.d/ affects every apt-based tool
-# (including add-apt-repository, which uses python-apt internally).
+# Work around broken IPv6 on cloud VPS providers.  Some providers resolve
+# Launchpad / Ubuntu keyserver / COPR hostnames to both A and AAAA records,
+# but outbound IPv6 connectivity is broken, causing apt, dnf,
+# add-apt-repository, and COPR API calls to hang.
 #
-# Additionally, add-apt-repository is a Python script that contacts the
-# Launchpad API via httplib2, which does NOT honour Acquire::ForceIPv4.
-# On Ubuntu 24.04 this causes a Python traceback when IPv6 is broken.
-# We therefore also inject an IPv4-preference rule into /etc/gai.conf so
-# that glibc's getaddrinfo (and thus Python's socket.getaddrinfo) prefers
-# IPv4 addresses.
+# Two complementary mitigations are applied:
+#
+#  1. APT ForceIPv4 (Debian/Ubuntu only) — a config file in apt.conf.d/
+#     forces all apt-based tools (including add-apt-repository, which uses
+#     python-apt internally) to use IPv4.  This file is only written when
+#     apt-get or apt is present to avoid creating /etc/apt on RPM distros.
+#
+#  2. gai.conf IPv4-preference rule (all distros) — an IPv4-preference rule
+#     is injected into /etc/gai.conf so that glibc's getaddrinfo (and thus
+#     Python's socket.getaddrinfo and libcurl used by dnf) *prefers* IPv4.
+#     On Ubuntu 24.04 this also fixes a Python traceback from httplib2
+#     used by add-apt-repository, which does NOT honour Acquire::ForceIPv4.
 APT_FORCE_IPV4_CONF="/etc/apt/apt.conf.d/99amneziawg-force-ipv4"
 APT_FORCE_IPV4_SENTINEL="# Managed by amneziawg-install - safe to remove"
 GAI_CONF="/etc/gai.conf"
@@ -43,12 +48,16 @@ _APT_IPV4_PREV_TRAP_EXIT=""
 _APT_IPV4_PREV_TRAP_INT=""
 _APT_IPV4_PREV_TRAP_TERM=""
 enable_apt_ipv4() {
-	mkdir -p /etc/apt/apt.conf.d
-	printf '%s\n%s\n' "${APT_FORCE_IPV4_SENTINEL}" 'Acquire::ForceIPv4 "true";' \
-		> "${APT_FORCE_IPV4_CONF}"
+	# Only write the APT ForceIPv4 config on distros that actually use APT,
+	# to avoid creating /etc/apt on RPM-based systems.
+	if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1 || [[ -d /etc/apt ]]; then
+		mkdir -p /etc/apt/apt.conf.d
+		printf '%s\n%s\n' "${APT_FORCE_IPV4_SENTINEL}" 'Acquire::ForceIPv4 "true";' \
+			> "${APT_FORCE_IPV4_CONF}"
+	fi
 
-	# Prefer IPv4 in the system resolver so Python (used by
-	# add-apt-repository) also connects over IPv4.
+	# Prefer IPv4 in the system resolver so all glibc consumers (Python,
+	# libcurl/dnf, etc.) connect over IPv4.
 	if ! grep -qF "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" 2>/dev/null; then
 		local _gai_existed=0
 		[[ -f "${GAI_CONF}" ]] && _gai_existed=1
@@ -79,10 +88,10 @@ _remove_ipv4_overrides() {
 	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
 		rm -f "${APT_FORCE_IPV4_CONF}"
 	fi
-	# Remove gai.conf lines we added (if any). This must be idempotent and
-	# based on file contents, not only on whether this process recorded a
-	# modification, so interrupted previous runs are also cleaned up.
-	if [[ -f "${GAI_CONF}" ]] && grep -qF -e "${GAI_CONF_SENTINEL}" -e "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}"; then
+	# Remove gai.conf lines we added (if any).  Only act when our sentinel
+	# is present so pre-existing admin rules are never touched.  This must
+	# be idempotent so interrupted previous runs are also cleaned up.
+	if [[ -f "${GAI_CONF}" ]] && grep -qF "${GAI_CONF_SENTINEL}" "${GAI_CONF}"; then
 		{ grep -vF -e "${GAI_CONF_SENTINEL}" -e "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" || true; } > "${GAI_CONF}.tmp"
 		if ! chmod --reference="${GAI_CONF}" "${GAI_CONF}.tmp" || ! chown --reference="${GAI_CONF}" "${GAI_CONF}.tmp"; then
 			rm -f "${GAI_CONF}.tmp"
@@ -1260,6 +1269,10 @@ function installAmneziaWG() {
 	installQuestions
 
 	# Install AmneziaWG tools and module
+	# Force IPv4 preference for all package-manager operations — IPv6 may be
+	# resolvable but unreachable on some VPS providers, causing apt, dnf,
+	# add-apt-repository, and COPR API calls to hang.
+	enable_apt_ipv4
 	if [[ ${OS} == 'ubuntu' ]]; then
 		if [[ -e /etc/apt/sources.list.d/ubuntu.sources ]]; then
 			# Check whether any Types: line lacks deb-src. A single stanza with
@@ -1288,9 +1301,6 @@ function installAmneziaWG() {
 				chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 			fi
 		fi
-		# Force IPv4 for Launchpad PPA and all APT operations in this block — IPv6 may be resolvable
-		# but unreachable on some VPS providers, causing APT and add-apt-repository to hang.
-		enable_apt_ipv4
 		apt-get update || { echo -e "${RED}ERROR: Failed to refresh APT package index.${NC}"; exit 1; }
 		apt install -y software-properties-common || { echo -e "${RED}ERROR: Failed to install software-properties-common.${NC}"; exit 1; }
 		add-apt-repository -y ppa:amnezia/ppa || { echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
@@ -1314,7 +1324,6 @@ function installAmneziaWG() {
 			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi
 		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
-		disable_apt_ipv4
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
 			# Tag managed file with sentinel so uninstall can verify ownership
@@ -1324,9 +1333,6 @@ function installAmneziaWG() {
 			sed -i -E '/^[[:space:]]*deb-src[[:space:]]/!s/^[[:space:]]*deb[[:space:]]+/deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
 			chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 		fi
-		# Force IPv4 for all APT operations in this block — IPv6 may be resolvable
-		# but unreachable on some VPS providers, causing APT to hang.
-		enable_apt_ipv4
 		# Ensure required tools are available for key download/dearmor on minimal systems
 		if ! command -v gpg &>/dev/null; then
 			apt-get update
@@ -1427,7 +1433,6 @@ function installAmneziaWG() {
 			echo -e "${ORANGE}WARNING: No suitable kernel headers package found. Continuing without installing headers; DKMS module builds may fail.${NC}"
 			apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 		fi
-		disable_apt_ipv4
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
@@ -1451,6 +1456,7 @@ function installAmneziaWG() {
 		fi
 		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	fi
+	disable_apt_ipv4
 
 	# Strip the deprecated REMAKE_INITRD directive from the amneziawg DKMS config
 	# (newer DKMS versions print noisy warnings for it).
