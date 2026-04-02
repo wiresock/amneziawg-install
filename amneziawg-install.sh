@@ -54,6 +54,7 @@ enable_apt_ipv4() {
 	if ! grep -qF "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" 2>/dev/null; then
 		printf '\n%s\n%s\n' "${GAI_CONF_SENTINEL}" "${GAI_CONF_IPV4_RULE}" \
 			>> "${GAI_CONF}"
+		chmod 0644 "${GAI_CONF}"
 		_GAI_CONF_MODIFIED=1
 	fi
 
