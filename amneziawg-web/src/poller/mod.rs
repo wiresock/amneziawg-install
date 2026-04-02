@@ -347,6 +347,14 @@ impl Poller {
     /// panel (e.g. via the install script's `--remove-client` flag).  Disabled
     /// peers are preserved because they were intentionally marked via the UI.
     async fn remove_stale_peers(&self, interfaces: &[awg::AwgInterface]) -> anyhow::Result<()> {
+        // If no interfaces were returned we cannot tell whether all peers are
+        // truly gone or AWG is simply down / not configured.  Skip cleanup to
+        // avoid accidentally deleting every non-disabled peer.
+        if interfaces.is_empty() {
+            warn!("no AWG interfaces found – skipping stale-peer cleanup");
+            return Ok(());
+        }
+
         let active_keys: std::collections::HashSet<String> = interfaces
             .iter()
             .flat_map(|iface| iface.peers.iter().map(|p| p.public_key.0.clone()))

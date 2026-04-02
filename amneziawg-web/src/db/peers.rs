@@ -316,28 +316,35 @@ pub async fn delete_stale_peers(
     pool: &SqlitePool,
     active_keys: &std::collections::HashSet<String>,
 ) -> Result<Vec<(i64, String)>, sqlx::Error> {
-    // Fetch non-disabled peers first, then filter in Rust because SQLite
-    // does not support binding a set parameter.
-    let all: Vec<(i64, String, i64)> =
-        sqlx::query_as("SELECT id, public_key, disabled FROM peers")
+    // Only fetch non-disabled peers; disabled peers are never candidates for
+    // stale-peer cleanup since they were intentionally marked via the UI.
+    let all: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, public_key FROM peers WHERE disabled = 0")
             .fetch_all(pool)
             .await?;
 
     let stale: Vec<(i64, String)> = all
         .into_iter()
-        .filter(|(_, pk, disabled)| *disabled == 0 && !active_keys.contains(pk))
-        .map(|(id, pk, _)| (id, pk))
+        .filter(|(_, pk)| !active_keys.contains(pk))
         .collect();
 
     if !stale.is_empty() {
-        // Build a single DELETE ... WHERE id IN (?, ?, ...) to avoid N round-trips.
-        let placeholders: String = stale.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("DELETE FROM peers WHERE id IN ({placeholders})");
-        let mut query = sqlx::query(&sql);
-        for (id, _) in &stale {
-            query = query.bind(id);
+        // SQLite has a limit on the number of bound parameters (often 999).
+        // Delete in batches to avoid exceeding this limit.
+        const MAX_SQLITE_PARAMS: usize = 900;
+
+        for chunk in stale.chunks(MAX_SQLITE_PARAMS) {
+            let placeholders: String = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("DELETE FROM peers WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for (id, _) in chunk {
+                query = query.bind(id);
+            }
+            query.execute(pool).await?;
         }
-        query.execute(pool).await?;
     }
 
     Ok(stale)
