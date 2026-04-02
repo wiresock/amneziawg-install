@@ -875,7 +875,7 @@ STALE_HOME="/home/aaa_stale"
 mkdir -p "${STALE_HOME}"
 
 # Capture the correct private key from the real client config
-REAL_CLIENT1_PRIV=$(grep -m1 "^PrivateKey = " "${CLIENT1_CONF}" | sed 's/^PrivateKey = //')
+REAL_CLIENT1_PRIV=$(grep -m1 -E "^PrivateKey = " "${CLIENT1_CONF}" | sed 's/^PrivateKey = //')
 
 # Write a stale config with a DIFFERENT private key (not matching the server's
 # PublicKey for this client).  The key verification logic should skip this.
@@ -904,7 +904,7 @@ else
 fi
 
 # Verify the regenerated config still has the correct private key
-REGEN_CLIENT1_PRIV=$(grep -m1 "^PrivateKey = " "${CLIENT1_CONF}" | sed 's/^PrivateKey = //')
+REGEN_CLIENT1_PRIV=$(grep -m1 -E "^PrivateKey = " "${CLIENT1_CONF}" | sed 's/^PrivateKey = //')
 if [[ "${REGEN_CLIENT1_PRIV}" == "${REAL_CLIENT1_PRIV}" ]]; then
 	echo "OK: client1 config still has original private key after stale config test"
 else
