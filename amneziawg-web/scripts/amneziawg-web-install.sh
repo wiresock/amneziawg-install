@@ -427,6 +427,42 @@ generate_hash() {
     return 1
 }
 
+# Ensure at least one Argon2 hashing back-end is available.
+# Tries to auto-install python3-argon2 (apt) or the argon2 CLI package.
+ensure_argon2() {
+    # Already available?
+    if python3 -c "import argon2" &>/dev/null || command -v argon2 &>/dev/null; then
+        return 0
+    fi
+
+    info "No Argon2 hashing tool found; attempting to install one..."
+
+    # Try the Python3 argon2 package via apt (Debian/Ubuntu)
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq 2>/dev/null
+        if apt-get install -y python3-argon2 2>/dev/null; then
+            info "Installed python3-argon2 via apt."
+            return 0
+        fi
+        warn "python3-argon2 not available via apt; trying argon2 CLI..."
+        if apt-get install -y argon2 2>/dev/null; then
+            info "Installed argon2 CLI via apt."
+            return 0
+        fi
+    fi
+
+    # Try pip3 as a fallback
+    if command -v pip3 &>/dev/null; then
+        if pip3 install argon2-cffi 2>/dev/null; then
+            info "Installed argon2-cffi via pip3."
+            return 0
+        fi
+    fi
+
+    warn "Could not auto-install an Argon2 hashing tool."
+    return 1
+}
+
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
 # prompt_default VAR_NAME "Prompt text" "default"
@@ -522,6 +558,7 @@ EOF
     # Password: only prompt if no hash was supplied
     if [[ -z "${PASSWORD_HASH}" ]]; then
         printf "\n"
+        ensure_argon2 || true   # best-effort; generate_hash will fail gracefully
         info "Generating Argon2id password hash..."
         prompt_password
 

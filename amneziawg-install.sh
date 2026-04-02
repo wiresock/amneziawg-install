@@ -22,6 +22,20 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	fi
 fi
 
+# Force APT to use IPv4 only.  Some cloud VPS providers resolve Launchpad /
+# Ubuntu keyserver hostnames to both A and AAAA records, but outbound IPv6
+# connectivity is broken, causing apt and add-apt-repository to hang.
+# Dropping a config file into apt.conf.d/ affects every apt-based tool
+# (including add-apt-repository, which uses python-apt internally).
+APT_FORCE_IPV4_CONF="/etc/apt/apt.conf.d/99force-ipv4"
+enable_apt_ipv4() {
+	mkdir -p /etc/apt/apt.conf.d
+	echo 'Acquire::ForceIPv4 "true";' > "${APT_FORCE_IPV4_CONF}"
+}
+disable_apt_ipv4() {
+	rm -f "${APT_FORCE_IPV4_CONF}"
+}
+
 # For sensitive files (private keys, params, configs), a restrictive umask (077)
 # is applied locally around their creation to avoid them being briefly world-readable.
 # This avoids affecting subprocesses (apt/dnf, dkms, etc.) that expect the default umask.
@@ -1156,8 +1170,11 @@ function installAmneziaWG() {
 		fi
 		apt-get update || { echo -e "${RED}ERROR: Failed to refresh APT package index.${NC}"; exit 1; }
 		apt install -y software-properties-common || { echo -e "${RED}ERROR: Failed to install software-properties-common.${NC}"; exit 1; }
-		add-apt-repository -y ppa:amnezia/ppa || { echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
-		apt-get update || { echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
+		# Force IPv4 for Launchpad PPA operations — IPv6 may be resolvable
+		# but unreachable on some VPS providers, causing add-apt-repository to hang.
+		enable_apt_ipv4
+		add-apt-repository -y ppa:amnezia/ppa || { disable_apt_ipv4; echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
+		apt-get update || { disable_apt_ipv4; echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		# This is critical on Raspberry Pi / ARM where the default headers package
 		# (linux-headers-generic) may not match the actual raspi kernel flavour.
@@ -1176,7 +1193,8 @@ function installAmneziaWG() {
 		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
 			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi
-		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { disable_apt_ipv4; echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		disable_apt_ipv4
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
 			# Tag managed file with sentinel so uninstall can verify ownership
@@ -1205,10 +1223,12 @@ function installAmneziaWG() {
 		local TMP_KEY_ASC
 		TMP_KEY_ASC=$(mktemp /tmp/amneziawg-apt-key.XXXXXX) || { echo -e "${RED}ERROR: Failed to create temporary file for APT signing key.${NC}"; exit 1; }
 		local KEY_FETCH_OK=0
+		# Use -4 to avoid IPv6 timeouts on VPS providers where AAAA records
+		# resolve but outbound IPv6 connectivity to keyservers is broken.
 		if command -v curl &>/dev/null; then
-			curl -fsSL "${KEY_URL}" -o "${TMP_KEY_ASC}" && KEY_FETCH_OK=1
+			curl -4 -fsSL "${KEY_URL}" -o "${TMP_KEY_ASC}" && KEY_FETCH_OK=1
 		elif command -v wget &>/dev/null; then
-			wget -qO "${TMP_KEY_ASC}" "${KEY_URL}" && KEY_FETCH_OK=1
+			wget -4 -qO "${TMP_KEY_ASC}" "${KEY_URL}" && KEY_FETCH_OK=1
 		fi
 		if [[ ${KEY_FETCH_OK} -ne 1 ]] || [[ ! -s "${TMP_KEY_ASC}" ]]; then
 			rm -f "${TMP_KEY_ASC}"
@@ -1268,6 +1288,8 @@ function installAmneziaWG() {
 			echo "deb [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
 			echo "deb-src [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
 		fi
+		# Force IPv4 for Launchpad PPA operations — see Ubuntu block comment.
+		enable_apt_ipv4
 		apt update
 		# Try to install appropriate kernel headers, but don't hard-fail if the
 		# exact versioned package is unavailable (e.g., on some Raspberry Pi kernels).
@@ -1279,11 +1301,12 @@ function installAmneziaWG() {
 		fi
 
 		if [[ -n "${HEADER_PKG}" ]]; then
-			apt install -y "${HEADER_PKG}" dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+			apt install -y "${HEADER_PKG}" dkms amneziawg amneziawg-tools qrencode iptables || { disable_apt_ipv4; echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 		else
 			echo -e "${ORANGE}WARNING: No suitable kernel headers package found. Continuing without installing headers; DKMS module builds may fail.${NC}"
-			apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+			apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { disable_apt_ipv4; echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 		fi
+		disable_apt_ipv4
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
@@ -2185,7 +2208,9 @@ function uninstallAmneziaWG() {
 
 		if [[ ${OS} == 'ubuntu' ]]; then
 			apt remove -y amneziawg amneziawg-tools
+			enable_apt_ipv4
 			add-apt-repository -ry ppa:amnezia/ppa
+			disable_apt_ipv4
 			# Only remove source files that we created (identified by sentinel comment)
 			if [[ -e /etc/apt/sources.list.d/ubuntu.sources ]]; then
 				if [[ -f /etc/apt/sources.list.d/amneziawg.sources ]] && head -1 /etc/apt/sources.list.d/amneziawg.sources | grep -q '# Managed by amneziawg-install'; then
