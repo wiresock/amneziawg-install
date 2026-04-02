@@ -1418,9 +1418,13 @@ function installAmneziaWG() {
 		# resort.  This mirrors the Ubuntu approach and avoids skipping headers when the
 		# exact versioned package isn't in the local APT cache.
 		HEADER_INSTALLED=0
-		HEADER_CANDIDATES=("linux-headers-$(uname -r)" "raspberrypi-kernel-headers" "linux-headers-$(dpkg --print-architecture 2>/dev/null || echo amd64)")
+		HEADER_CANDIDATES=("linux-headers-$(uname -r)" "raspberrypi-kernel-headers")
+		# Add the architecture-specific meta-package (e.g. linux-headers-amd64)
+		# as a last-resort fallback, but only if dpkg can report the arch.
+		local DEB_ARCH
+		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) && HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
 		for HEADER_PKG in "${HEADER_CANDIDATES[@]}"; do
-			if apt install -y "${HEADER_PKG}"; then
+			if apt install -y "${HEADER_PKG}" 2>/dev/null; then
 				HEADER_INSTALLED=1
 				break
 			else
