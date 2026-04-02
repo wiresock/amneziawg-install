@@ -158,7 +158,7 @@ fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateCl
             format!("Failed to create user: {msg}")
         }
         CreateClientError::IpInUse(ip) => {
-            format!("Failed to create user: IP address {ip} is already in use.")
+            format!("Failed to create user: IP address already in use: {ip}")
         }
         // The following variants may contain raw stderr/paths from sudo
         // commands or OS errors; use fixed messages and log details server-side.
@@ -1814,7 +1814,7 @@ async fn api_create_user(
         Err(crate::admin::client_manager::CreateClientError::IpInUse(ip)) => {
             Ok((
                 StatusCode::CONFLICT,
-                Json(json!({ "error": format!("IP address {ip} is already in use") })),
+                Json(json!({ "error": format!("IP address already in use: {ip}") })),
             )
                 .into_response())
         }
@@ -2028,7 +2028,7 @@ async fn post_add_user_form(
             let rows = crate::db::peers::list_all(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
-            let message = format!("IP address {ip} is already in use.");
+            let message = format!("IP address already in use: {ip}");
             Ok(Html(render_peer_list_with_error(&peers, &csrf, &message)).into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::LockBusy) => {
