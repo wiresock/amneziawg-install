@@ -78,6 +78,10 @@ _remove_ipv4_overrides() {
 	# Remove gai.conf lines we added (if any).
 	if [[ -n "${_GAI_CONF_MODIFIED}" ]] && [[ -f "${GAI_CONF}" ]]; then
 		{ grep -vF -e "${GAI_CONF_SENTINEL}" -e "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" || true; } > "${GAI_CONF}.tmp"
+		if ! chmod --reference="${GAI_CONF}" "${GAI_CONF}.tmp" || ! chown --reference="${GAI_CONF}" "${GAI_CONF}.tmp"; then
+			rm -f "${GAI_CONF}.tmp"
+			return 1
+		fi
 		mv "${GAI_CONF}.tmp" "${GAI_CONF}"
 		_GAI_CONF_MODIFIED=""
 	fi
