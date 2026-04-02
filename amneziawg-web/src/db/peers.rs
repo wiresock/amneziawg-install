@@ -329,11 +329,15 @@ pub async fn delete_stale_peers(
         .map(|(id, pk, _)| (id, pk))
         .collect();
 
-    for (id, _) in &stale {
-        sqlx::query("DELETE FROM peers WHERE id = ?")
-            .bind(id)
-            .execute(pool)
-            .await?;
+    if !stale.is_empty() {
+        // Build a single DELETE ... WHERE id IN (?, ?, ...) to avoid N round-trips.
+        let placeholders: String = stale.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM peers WHERE id IN ({placeholders})");
+        let mut query = sqlx::query(&sql);
+        for (id, _) in &stale {
+            query = query.bind(id);
+        }
+        query.execute(pool).await?;
     }
 
     Ok(stale)

@@ -355,13 +355,13 @@ impl Poller {
         let stale = crate::db::peers::delete_stale_peers(&self.db.pool, &active_keys).await?;
 
         if !stale.is_empty() {
-            for (id, ref pk) in &stale {
+            for (id, ref public_key) in &stale {
                 if let Err(e) =
                     crate::db::events::clear_peer_id_references(&self.db.pool, *id).await
                 {
                     warn!(
                         peer_id = id,
-                        public_key = pk,
+                        public_key = public_key,
                         error = %e,
                         "failed to clear event references for stale peer"
                     );
