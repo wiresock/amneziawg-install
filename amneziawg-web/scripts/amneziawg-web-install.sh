@@ -429,10 +429,10 @@ generate_hash() {
 
 # Ensure at least one Argon2 hashing back-end is available.
 # Tries to auto-install python3-argon2-cffi (apt), python3-argon2 (apt),
-# argon2 CLI, or argon2-cffi (pip3).
+# or the argon2 CLI (apt).
 ensure_argon2() {
     # Already available?
-    if python3 -c "import argon2" &>/dev/null || command -v argon2 &>/dev/null; then
+    if python3 -c "from argon2 import PasswordHasher; PasswordHasher()" &>/dev/null || command -v argon2 &>/dev/null; then
         return 0
     fi
 
@@ -456,14 +456,6 @@ ensure_argon2() {
         warn "python3-argon2-cffi/python3-argon2 not available via apt; trying argon2 CLI..."
         if apt-get install -y argon2 2>/dev/null; then
             info "Installed argon2 CLI via apt."
-            return 0
-        fi
-    fi
-
-    # Try pip3 as a fallback
-    if command -v pip3 &>/dev/null; then
-        if pip3 install argon2-cffi 2>/dev/null; then
-            info "Installed argon2-cffi via pip3."
             return 0
         fi
     fi

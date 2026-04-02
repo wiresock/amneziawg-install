@@ -28,7 +28,7 @@ fi
 # Dropping a config file into apt.conf.d/ affects every apt-based tool
 # (including add-apt-repository, which uses python-apt internally).
 APT_FORCE_IPV4_CONF="/etc/apt/apt.conf.d/99amneziawg-force-ipv4"
-APT_FORCE_IPV4_SENTINEL="# Managed by amneziawg-install — safe to remove"
+APT_FORCE_IPV4_SENTINEL="# Managed by amneziawg-install - safe to remove"
 _APT_IPV4_PREV_TRAP_EXIT=""
 _APT_IPV4_PREV_TRAP_INT=""
 _APT_IPV4_PREV_TRAP_TERM=""
@@ -64,12 +64,13 @@ _cleanup_apt_ipv4_and_chain() {
 	if [[ -n "${prev_trap}" ]]; then
 		# Re-install the previous trap (e.g. trap -- 'handler' EXIT).
 		eval "${prev_trap}"
-		# Extract the handler body via eval + array.  trap -p output is
-		# always:  trap -- 'body' SIGNAL  — eval handles the quoting.
-		local _trap_parts
-		eval "_trap_parts=($(trap -p "${sig}" 2>/dev/null || true))"
-		if (( ${#_trap_parts[@]} >= 3 )); then
-			eval "${_trap_parts[2]}"
+		# Extract the handler body from the saved trap specification.
+		# trap -p output is always:  trap -- 'body' SIGNAL
+		local _trap_body
+		_trap_body=${prev_trap#*\'}
+		_trap_body=${_trap_body%\'*}
+		if [[ -n "${_trap_body}" ]]; then
+			eval "${_trap_body}"
 		fi
 	else
 		trap - "${sig}"
@@ -1267,6 +1268,9 @@ function installAmneziaWG() {
 			sed -i -E '/^[[:space:]]*deb-src[[:space:]]/!s/^[[:space:]]*deb[[:space:]]+/deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
 			chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 		fi
+		# Force IPv4 for all APT operations in this block — IPv6 may be resolvable
+		# but unreachable on some VPS providers, causing APT to hang.
+		enable_apt_ipv4
 		# Ensure required tools are available for key download/dearmor on minimal systems
 		if ! command -v gpg &>/dev/null; then
 			apt-get update
@@ -1351,8 +1355,6 @@ function installAmneziaWG() {
 			echo "deb [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
 			echo "deb-src [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
 		fi
-		# Force IPv4 for Launchpad PPA operations — see Ubuntu block comment.
-		enable_apt_ipv4
 		apt update
 		# Try to install appropriate kernel headers, but don't hard-fail if the
 		# exact versioned package is unavailable (e.g., on some Raspberry Pi kernels).
