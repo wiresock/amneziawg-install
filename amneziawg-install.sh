@@ -27,13 +27,43 @@ fi
 # connectivity is broken, causing apt and add-apt-repository to hang.
 # Dropping a config file into apt.conf.d/ affects every apt-based tool
 # (including add-apt-repository, which uses python-apt internally).
-APT_FORCE_IPV4_CONF="/etc/apt/apt.conf.d/99force-ipv4"
+APT_FORCE_IPV4_CONF="/etc/apt/apt.conf.d/99amneziawg-force-ipv4"
+APT_FORCE_IPV4_SENTINEL="# Managed by amneziawg-install — safe to remove"
+_APT_IPV4_PREV_TRAP_EXIT=""
+_APT_IPV4_PREV_TRAP_INT=""
+_APT_IPV4_PREV_TRAP_TERM=""
 enable_apt_ipv4() {
 	mkdir -p /etc/apt/apt.conf.d
-	echo 'Acquire::ForceIPv4 "true";' > "${APT_FORCE_IPV4_CONF}"
+	printf '%s\n%s\n' "${APT_FORCE_IPV4_SENTINEL}" 'Acquire::ForceIPv4 "true";' \
+		> "${APT_FORCE_IPV4_CONF}"
+	# Install traps so the config file is always cleaned up on exit / interruption.
+	_APT_IPV4_PREV_TRAP_EXIT="$(trap -p EXIT || true)"
+	_APT_IPV4_PREV_TRAP_INT="$(trap -p INT || true)"
+	_APT_IPV4_PREV_TRAP_TERM="$(trap -p TERM || true)"
+	trap 'disable_apt_ipv4' EXIT INT TERM
 }
 disable_apt_ipv4() {
-	rm -f "${APT_FORCE_IPV4_CONF}"
+	# Only remove the file if it carries our sentinel (avoid clobbering
+	# an unrelated file that happens to live at the same path).
+	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && head -1 "${APT_FORCE_IPV4_CONF}" | grep -qF "${APT_FORCE_IPV4_SENTINEL}"; then
+		rm -f "${APT_FORCE_IPV4_CONF}"
+	fi
+	# Restore any previously installed traps.
+	if [[ -n "${_APT_IPV4_PREV_TRAP_EXIT}" ]]; then
+		eval "${_APT_IPV4_PREV_TRAP_EXIT}"
+	else
+		trap - EXIT
+	fi
+	if [[ -n "${_APT_IPV4_PREV_TRAP_INT}" ]]; then
+		eval "${_APT_IPV4_PREV_TRAP_INT}"
+	else
+		trap - INT
+	fi
+	if [[ -n "${_APT_IPV4_PREV_TRAP_TERM}" ]]; then
+		eval "${_APT_IPV4_PREV_TRAP_TERM}"
+	else
+		trap - TERM
+	fi
 }
 
 # For sensitive files (private keys, params, configs), a restrictive umask (077)
@@ -1173,8 +1203,8 @@ function installAmneziaWG() {
 		# Force IPv4 for Launchpad PPA operations — IPv6 may be resolvable
 		# but unreachable on some VPS providers, causing add-apt-repository to hang.
 		enable_apt_ipv4
-		add-apt-repository -y ppa:amnezia/ppa || { disable_apt_ipv4; echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
-		apt-get update || { disable_apt_ipv4; echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
+		add-apt-repository -y ppa:amnezia/ppa || { echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
+		apt-get update || { echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		# This is critical on Raspberry Pi / ARM where the default headers package
 		# (linux-headers-generic) may not match the actual raspi kernel flavour.
@@ -1193,7 +1223,7 @@ function installAmneziaWG() {
 		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
 			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi
-		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { disable_apt_ipv4; echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 		disable_apt_ipv4
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
@@ -1301,10 +1331,10 @@ function installAmneziaWG() {
 		fi
 
 		if [[ -n "${HEADER_PKG}" ]]; then
-			apt install -y "${HEADER_PKG}" dkms amneziawg amneziawg-tools qrencode iptables || { disable_apt_ipv4; echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+			apt install -y "${HEADER_PKG}" dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 		else
 			echo -e "${ORANGE}WARNING: No suitable kernel headers package found. Continuing without installing headers; DKMS module builds may fail.${NC}"
-			apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { disable_apt_ipv4; echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+			apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 		fi
 		disable_apt_ipv4
 	elif [[ ${OS} == 'fedora' ]]; then

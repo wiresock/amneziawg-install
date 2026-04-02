@@ -439,7 +439,9 @@ ensure_argon2() {
 
     # Try the Python3 argon2 package via apt (Debian/Ubuntu)
     if command -v apt-get &>/dev/null; then
-        apt-get update -qq 2>/dev/null
+        if ! apt-get update -qq 2>/dev/null; then
+            warn "apt-get update failed; continuing without refreshing package lists."
+        fi
         if apt-get install -y python3-argon2 2>/dev/null; then
             info "Installed python3-argon2 via apt."
             return 0
