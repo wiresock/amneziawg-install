@@ -39,7 +39,6 @@ APT_FORCE_IPV4_SENTINEL="# Managed by amneziawg-install - safe to remove"
 GAI_CONF="/etc/gai.conf"
 GAI_CONF_SENTINEL="# Added by amneziawg-install - safe to remove"
 GAI_CONF_IPV4_RULE="precedence ::ffff:0:0/96  100"
-_GAI_CONF_MODIFIED=""
 _APT_IPV4_PREV_TRAP_EXIT=""
 _APT_IPV4_PREV_TRAP_INT=""
 _APT_IPV4_PREV_TRAP_TERM=""
@@ -50,12 +49,16 @@ enable_apt_ipv4() {
 
 	# Prefer IPv4 in the system resolver so Python (used by
 	# add-apt-repository) also connects over IPv4.
-	_GAI_CONF_MODIFIED=""
 	if ! grep -qF "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" 2>/dev/null; then
+		local _gai_existed=0
+		[[ -f "${GAI_CONF}" ]] && _gai_existed=1
 		printf '\n%s\n%s\n' "${GAI_CONF_SENTINEL}" "${GAI_CONF_IPV4_RULE}" \
 			>> "${GAI_CONF}"
-		chmod 0644 "${GAI_CONF}"
-		_GAI_CONF_MODIFIED=1
+		# Only set permissions when we created the file; leave existing
+		# ownership/mode untouched so the cleanup path can preserve them.
+		if [[ "${_gai_existed}" -eq 0 ]]; then
+			chmod 0644 "${GAI_CONF}"
+		fi
 	fi
 
 	# Save existing trap commands so we can chain them (not just restore).
@@ -76,15 +79,16 @@ _remove_ipv4_overrides() {
 	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
 		rm -f "${APT_FORCE_IPV4_CONF}"
 	fi
-	# Remove gai.conf lines we added (if any).
-	if [[ -n "${_GAI_CONF_MODIFIED}" ]] && [[ -f "${GAI_CONF}" ]]; then
+	# Remove gai.conf lines we added (if any). This must be idempotent and
+	# based on file contents, not only on whether this process recorded a
+	# modification, so interrupted previous runs are also cleaned up.
+	if [[ -f "${GAI_CONF}" ]] && grep -qF -e "${GAI_CONF_SENTINEL}" -e "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}"; then
 		{ grep -vF -e "${GAI_CONF_SENTINEL}" -e "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" || true; } > "${GAI_CONF}.tmp"
 		if ! chmod --reference="${GAI_CONF}" "${GAI_CONF}.tmp" || ! chown --reference="${GAI_CONF}" "${GAI_CONF}.tmp"; then
 			rm -f "${GAI_CONF}.tmp"
 			return 1
 		fi
 		mv "${GAI_CONF}.tmp" "${GAI_CONF}"
-		_GAI_CONF_MODIFIED=""
 	fi
 }
 # Internal: remove the config file, restore the previous trap for the
