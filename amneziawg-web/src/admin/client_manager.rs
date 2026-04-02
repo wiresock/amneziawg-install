@@ -911,10 +911,12 @@ pub fn create_client(
     let client_ipv6_normalized = normalize_ipv6(&client_ipv6_full)?;
     let client_ipv6_display = compress_ipv6(&client_ipv6_full)?;
 
+    let user_specified = ip_override.ipv4_host.is_some() || ip_override.ipv6_host.is_some();
     debug!(
         ipv4 = %client_ipv4,
         ipv6 = %client_ipv6_display,
-        "allocated client IP addresses"
+        user_specified = user_specified,
+        "resolved client IP addresses"
     );
 
     // Step 6: Generate cryptographic keys.

@@ -430,6 +430,13 @@ pub struct RemoveUserForm {
 
 // ── Conversion helpers ───────────────────────────────────────────────────────
 
+/// Trim and filter an optional string, returning `None` for empty/whitespace-only values.
+fn trim_optional_string(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
     ts.and_then(|t| Utc.timestamp_opt(t, 0).single())
 }
@@ -1769,7 +1776,7 @@ async fn api_create_user(
     let name = body.name.trim().to_string();
     let ip_override = crate::admin::client_manager::IpOverride {
         ipv4_host: body.ipv4_host,
-        ipv6_host: body.ipv6_host.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        ipv6_host: trim_optional_string(body.ipv6_host.as_deref()),
     };
     match crate::admin::execute_create_user(
         &state.db,
@@ -1970,7 +1977,7 @@ async fn post_add_user_form(
         .map(|s| {
             s.parse::<u16>().map_err(|_| {
                 crate::admin::client_manager::CreateClientError::InvalidIp(
-                    "IPv4 host number must be between 2 and 254".to_string(),
+                    "IPv4 host must be a number between 2 and 254".to_string(),
                 )
             })
         })
@@ -1985,12 +1992,7 @@ async fn post_add_user_form(
             return Ok(Html(render_peer_list_with_error(&peers, &csrf, &message)).into_response());
         }
     };
-    let ipv6_host = form
-        .ipv6_host
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    let ipv6_host = trim_optional_string(form.ipv6_host.as_deref());
     let ip_override = crate::admin::client_manager::IpOverride {
         ipv4_host,
         ipv6_host,
