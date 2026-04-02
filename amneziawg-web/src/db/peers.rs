@@ -211,9 +211,9 @@ pub async fn find_baseline_snapshot(
 }
 
 /// Return the last snapshot before `before_rfc3339` for **every** peer that has
-/// one.  Uses `MAX(id)` as a deterministic tie-breaker so the result contains
-/// exactly one row per `public_key` using a `ROW_NUMBER()` window function
-/// ordered by `captured_at DESC, id DESC` to handle clock skew or backfills.
+/// one.  Uses a `ROW_NUMBER()` window function partitioned by `public_key` and
+/// ordered by `captured_at DESC, id DESC` to guarantee exactly one row per peer,
+/// correctly handling clock skew or backfilled snapshots.
 ///
 /// Used to seed per-peer baseline counters when computing all-peers usage so
 /// that the delta for the first in-window snapshot of each peer is included.
