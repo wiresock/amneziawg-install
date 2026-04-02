@@ -27,8 +27,19 @@ fi
 # connectivity is broken, causing apt and add-apt-repository to hang.
 # Dropping a config file into apt.conf.d/ affects every apt-based tool
 # (including add-apt-repository, which uses python-apt internally).
+#
+# Additionally, add-apt-repository is a Python script that contacts the
+# Launchpad API via httplib2, which does NOT honour Acquire::ForceIPv4.
+# On Ubuntu 24.04 this causes a Python traceback when IPv6 is broken.
+# We therefore also inject an IPv4-preference rule into /etc/gai.conf so
+# that glibc's getaddrinfo (and thus Python's socket.getaddrinfo) prefers
+# IPv4 addresses.
 APT_FORCE_IPV4_CONF="/etc/apt/apt.conf.d/99amneziawg-force-ipv4"
 APT_FORCE_IPV4_SENTINEL="# Managed by amneziawg-install - safe to remove"
+GAI_CONF="/etc/gai.conf"
+GAI_CONF_SENTINEL="# Added by amneziawg-install - safe to remove"
+GAI_CONF_IPV4_RULE="precedence ::ffff:0:0/96  100"
+_GAI_CONF_MODIFIED=""
 _APT_IPV4_PREV_TRAP_EXIT=""
 _APT_IPV4_PREV_TRAP_INT=""
 _APT_IPV4_PREV_TRAP_TERM=""
@@ -36,6 +47,16 @@ enable_apt_ipv4() {
 	mkdir -p /etc/apt/apt.conf.d
 	printf '%s\n%s\n' "${APT_FORCE_IPV4_SENTINEL}" 'Acquire::ForceIPv4 "true";' \
 		> "${APT_FORCE_IPV4_CONF}"
+
+	# Prefer IPv4 in the system resolver so Python (used by
+	# add-apt-repository) also connects over IPv4.
+	_GAI_CONF_MODIFIED=""
+	if ! grep -qF "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" 2>/dev/null; then
+		printf '\n%s\n%s\n' "${GAI_CONF_SENTINEL}" "${GAI_CONF_IPV4_RULE}" \
+			>> "${GAI_CONF}"
+		_GAI_CONF_MODIFIED=1
+	fi
+
 	# Save existing trap commands so we can chain them (not just restore).
 	# trap -p output is eval-safe by design (bash always emits: trap -- 'body' SIG).
 	_APT_IPV4_PREV_TRAP_EXIT="$(trap -p EXIT || true)"
@@ -48,6 +69,19 @@ enable_apt_ipv4() {
 	trap '_cleanup_apt_ipv4_and_chain INT'  INT
 	trap '_cleanup_apt_ipv4_and_chain TERM' TERM
 }
+# Internal: remove the APT ForceIPv4 config and revert gai.conf changes.
+_remove_ipv4_overrides() {
+	# Only remove the file if it carries our sentinel.
+	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
+		rm -f "${APT_FORCE_IPV4_CONF}"
+	fi
+	# Remove gai.conf lines we added (if any).
+	if [[ -n "${_GAI_CONF_MODIFIED}" ]] && [[ -f "${GAI_CONF}" ]]; then
+		{ grep -vF -e "${GAI_CONF_SENTINEL}" -e "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" || true; } > "${GAI_CONF}.tmp"
+		mv "${GAI_CONF}.tmp" "${GAI_CONF}"
+		_GAI_CONF_MODIFIED=""
+	fi
+}
 # Internal: remove the config file, restore the previous trap for the
 # given signal, then immediately invoke the restored handler so it runs
 # during the same exit / signal delivery.
@@ -55,10 +89,7 @@ _cleanup_apt_ipv4_and_chain() {
 	local sig="$1"
 	# Preserve the original exit status so chained handlers see the real value.
 	local _saved_status=$?
-	# Only remove the file if it carries our sentinel.
-	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
-		rm -f "${APT_FORCE_IPV4_CONF}"
-	fi
+	_remove_ipv4_overrides
 	# Restore + chain: re-install the previous trap (if any), then
 	# re-deliver the signal / exit so bash invokes the restored handler.
 	# This avoids parsing trap -p output entirely (no sed/eval of bodies).
@@ -97,11 +128,7 @@ _cleanup_apt_ipv4_and_chain() {
 	fi
 }
 disable_apt_ipv4() {
-	# Only remove the file if it carries our sentinel (avoid clobbering
-	# an unrelated file that happens to live at the same path).
-	if [[ -f "${APT_FORCE_IPV4_CONF}" ]] && grep -qFm1 "${APT_FORCE_IPV4_SENTINEL}" "${APT_FORCE_IPV4_CONF}"; then
-		rm -f "${APT_FORCE_IPV4_CONF}"
-	fi
+	_remove_ipv4_overrides
 	# Restore any previously installed traps.
 	if [[ -n "${_APT_IPV4_PREV_TRAP_EXIT}" ]]; then
 		eval "${_APT_IPV4_PREV_TRAP_EXIT}"
