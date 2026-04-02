@@ -2631,8 +2631,11 @@ fn render_peer_list_inner(
     if (nextIpsRequested) return;
     nextIpsRequested = true;
 
-    fetch('/api/admin/next-ips')
-      .then(function(response) {{ return response.json(); }})
+    fetch('/api/admin/next-ips', {{ credentials: 'same-origin' }})
+      .then(function(response) {{
+        if (!response.ok) throw new Error('Failed to fetch next IPs');
+        return response.json();
+      }})
       .then(function(data) {{
         if (data.ipv4 && ipv4Input && ipv4Input.value === '') {{
           ipv4Input.value = data.ipv4;
