@@ -13,6 +13,9 @@
 //! 4. Scans the config directory for `*.conf` files.
 //! 5. Applies config-to-peer mapping (sets `has_config`, `config_name`,
 //!    `config_path` on matching peers).
+//! 6. Removes stale peers – DB rows for non-disabled peers whose public
+//!    keys no longer appear on any AWG interface.  This cleans up
+//!    artifacts left when peers are removed outside the web panel.
 //!
 //! Errors within a single cycle step are logged and the cycle continues;
 //! the overall polling loop never stops due to a single-cycle failure.
@@ -134,6 +137,15 @@ impl Poller {
         // ── Step 4–5: Config mapping ─────────────────────────────────────────
         if let Err(e) = self.apply_config_mapping_step().await {
             error!(error = %e, "config mapping step failed – continuing");
+        }
+
+        // ── Step 6: Remove stale peers ───────────────────────────────────────
+        // Delete DB peers that no longer appear on any AWG interface and are
+        // not administratively disabled.  This cleans up artifacts left when
+        // a peer is removed outside the web panel (e.g. via the install
+        // script's --remove-client flag).
+        if let Err(e) = self.remove_stale_peers(&interfaces).await {
+            error!(error = %e, "stale-peer cleanup failed – continuing");
         }
 
         info!(
@@ -324,6 +336,42 @@ impl Poller {
         .bind(tx)
         .execute(&self.db.pool)
         .await?;
+
+        Ok(())
+    }
+
+    /// Delete DB peers that no longer appear on any AWG interface and are not
+    /// administratively disabled.
+    ///
+    /// This cleans up artifacts left when a peer is removed outside the web
+    /// panel (e.g. via the install script's `--remove-client` flag).  Disabled
+    /// peers are preserved because they were intentionally marked via the UI.
+    async fn remove_stale_peers(&self, interfaces: &[awg::AwgInterface]) -> anyhow::Result<()> {
+        let active_keys: std::collections::HashSet<String> = interfaces
+            .iter()
+            .flat_map(|iface| iface.peers.iter().map(|p| p.public_key.0.clone()))
+            .collect();
+
+        let stale = crate::db::peers::delete_stale_peers(&self.db.pool, &active_keys).await?;
+
+        if !stale.is_empty() {
+            for (id, ref pk) in &stale {
+                if let Err(e) =
+                    crate::db::events::clear_peer_id_references(&self.db.pool, *id).await
+                {
+                    warn!(
+                        peer_id = id,
+                        public_key = pk,
+                        error = %e,
+                        "failed to clear event references for stale peer"
+                    );
+                }
+            }
+            info!(
+                removed = stale.len(),
+                "stale peers removed from database"
+            );
+        }
 
         Ok(())
     }

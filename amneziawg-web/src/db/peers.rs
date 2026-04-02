@@ -303,6 +303,42 @@ pub async fn delete_by_id(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Erro
     Ok(result.rows_affected() > 0)
 }
 
+/// Delete non-disabled peers whose public keys are **not** in `active_keys`.
+///
+/// This removes "stale" peers that were deleted outside the web panel (e.g.
+/// via the install script's `--remove-client` flag).  Disabled peers are
+/// preserved because they were intentionally marked via the UI and may be
+/// re-enabled later.
+///
+/// Returns the list of `(id, public_key)` pairs that were deleted so the
+/// caller can perform follow-up cleanup (e.g. clearing event references).
+pub async fn delete_stale_peers(
+    pool: &SqlitePool,
+    active_keys: &std::collections::HashSet<String>,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    // Fetch non-disabled peers first, then filter in Rust because SQLite
+    // does not support binding a set parameter.
+    let all: Vec<(i64, String, i64)> =
+        sqlx::query_as("SELECT id, public_key, disabled FROM peers")
+            .fetch_all(pool)
+            .await?;
+
+    let stale: Vec<(i64, String)> = all
+        .into_iter()
+        .filter(|(_, pk, disabled)| *disabled == 0 && !active_keys.contains(pk))
+        .map(|(id, pk, _)| (id, pk))
+        .collect();
+
+    for (id, _) in &stale {
+        sqlx::query("DELETE FROM peers WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
+
+    Ok(stale)
+}
+
 /// Update the `disabled` flag for a single peer.
 ///
 /// Returns the updated `PeerRow`, or `None` if no peer with the given `id`
@@ -915,5 +951,70 @@ mod tests {
         let keys = list_disabled_public_keys(&db.pool).await.expect("query");
         assert_eq!(keys.len(), 1);
         assert!(keys.contains("KEY_DISABLED_2="));
+    }
+
+    // ── delete_stale_peers ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_stale_peers_removes_non_active() {
+        let db = test_db().await;
+        let id_a = insert_peer(&db.pool, "KEY_A=", None).await;
+        let _id_b = insert_peer(&db.pool, "KEY_B=", None).await;
+
+        // Only KEY_A is active on the interface
+        let active: std::collections::HashSet<String> =
+            ["KEY_A=".to_string()].into_iter().collect();
+
+        let stale = delete_stale_peers(&db.pool, &active).await.expect("delete");
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].1, "KEY_B=");
+
+        // KEY_A should still exist
+        assert!(find_by_id(&db.pool, id_a).await.unwrap().is_some());
+        // KEY_B should be gone
+        assert!(find_by_public_key(&db.pool, "KEY_B=").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_stale_peers_preserves_disabled() {
+        let db = test_db().await;
+        let id_a = insert_peer(&db.pool, "KEY_ACTIVE=", None).await;
+        let id_d = insert_peer(&db.pool, "KEY_DISABLED=", None).await;
+        update_peer_disabled(&db.pool, id_d, true).await.unwrap();
+
+        // Neither peer is on the interface
+        let active: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let stale = delete_stale_peers(&db.pool, &active).await.expect("delete");
+        // Only the non-disabled peer should be removed
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].0, id_a);
+
+        // Disabled peer should still exist
+        assert!(find_by_id(&db.pool, id_d).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_stale_peers_empty_db_is_noop() {
+        let db = test_db().await;
+        let active: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let stale = delete_stale_peers(&db.pool, &active).await.expect("delete");
+        assert!(stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_stale_peers_all_active_is_noop() {
+        let db = test_db().await;
+        insert_peer(&db.pool, "KEY_X=", None).await;
+        insert_peer(&db.pool, "KEY_Y=", None).await;
+
+        let active: std::collections::HashSet<String> =
+            ["KEY_X=".to_string(), "KEY_Y=".to_string()].into_iter().collect();
+
+        let stale = delete_stale_peers(&db.pool, &active).await.expect("delete");
+        assert!(stale.is_empty());
+
+        // Both peers should still exist
+        assert_eq!(list_all(&db.pool).await.unwrap().len(), 2);
     }
 }
