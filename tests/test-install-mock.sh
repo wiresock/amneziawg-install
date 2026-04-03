@@ -3265,7 +3265,8 @@ try:
     payload = json.loads(sys.stdin.read())
     peers = payload.get("peers") or []
     first = peers[0] if isinstance(peers, list) and len(peers) > 0 else {}
-    print("yes" if isinstance(first, dict) and isinstance(first.get("public_key"), str) and len(first.get("public_key")) > 0 else "no")
+    public_key_value = first.get("public_key") if isinstance(first, dict) else None
+    print("yes" if isinstance(public_key_value, str) and len(public_key_value) > 0 else "no")
 except Exception:
     print("no")
 ' <<<"${JSON_PAYLOAD}"
@@ -3325,9 +3326,12 @@ while ($i < $len) {
 		$depth--;
 		if ($depth == 0) {
 			my $first_peer = substr($s, $start, $i - $start + 1);
-			if ($first_peer =~ /"public_key"\s*:\s*"((?:\\.|[^"\\])*)"/s && length($1) > 0) {
+			if ($first_peer =~ /"public_key"\s*:\s*"((?:\\.|[^"\\])*)"/s) {
+				my $public_key_value = $1;
+				if (length($public_key_value) > 0) {
 				print "yes";
 				exit 0;
+				}
 			}
 			print "no";
 			exit 0;
