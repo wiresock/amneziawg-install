@@ -48,6 +48,8 @@ GAI_CONF_IPV4_RULE_REGEX='^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:spa
 _APT_IPV4_PREV_TRAP_EXIT=""
 _APT_IPV4_PREV_TRAP_INT=""
 _APT_IPV4_PREV_TRAP_TERM=""
+# Return success when gai.conf has an active (uncommented) IPv4 precedence
+# rule for ::ffff:0:0/96 with value 100; commented defaults must not match.
 gai_conf_has_active_ipv4_rule() {
 	grep -Eq "${GAI_CONF_IPV4_RULE_REGEX}" "${GAI_CONF}" 2>/dev/null
 }
@@ -97,6 +99,10 @@ _remove_ipv4_overrides() {
 	# be idempotent so interrupted previous runs are also cleaned up.
 	if [[ -f "${GAI_CONF}" ]] && grep -qF "${GAI_CONF_SENTINEL}" "${GAI_CONF}"; then
 		awk -v sent="${GAI_CONF_SENTINEL}" -v regex="${GAI_CONF_IPV4_RULE_REGEX}" '
+			# State machine:
+			# 1) skip our sentinel line
+			# 2) skip the immediately following active IPv4 rule if present
+			# 3) print all other lines unchanged
 			$0 == sent { prev_sent=1; next }
 			prev_sent == 1 && $0 ~ regex { prev_sent=0; next }
 			{ prev_sent=0; print }
