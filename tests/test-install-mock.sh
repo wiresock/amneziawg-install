@@ -3161,15 +3161,90 @@ echo "=== Phase 6: Source-build tests complete ==="
 echo ""
 echo "=== Phase 7: Service startup + health probe ==="
 
-# Check python3 availability (needed for the HTTP stub server)
-if ! command -v python3 &>/dev/null; then
-	echo "SKIP: python3 not available — cannot run HTTP health probe"
-	echo "  (DB path writability is still validated below)"
-	HAVE_PYTHON3=false
-else
+# Check runtime availability for stub HTTP server / API probes
+if command -v python3 &>/dev/null; then
 	echo "OK: python3 available for stub HTTP server"
-	HAVE_PYTHON3=true
+	HAVE_HTTP_RUNTIME=true
+elif command -v perl &>/dev/null; then
+	echo "OK: perl available for stub HTTP server fallback"
+	HAVE_HTTP_RUNTIME=true
+else
+	echo "SKIP: neither python3 nor perl available — cannot run HTTP health/API probes"
+	echo "  (DB path writability is still validated below)"
+	HAVE_HTTP_RUNTIME=false
 fi
+
+http_get_body() {
+	local URL="$1"
+	if command -v python3 &>/dev/null; then
+		python3 -c "
+import urllib.request, sys
+try:
+    resp = urllib.request.urlopen(sys.argv[1], timeout=5)
+    sys.stdout.write(resp.read().decode())
+except Exception:
+    sys.exit(1)
+" "${URL}"
+	else
+		perl -e '
+use IO::Socket::INET;
+my $url = shift @ARGV;
+$url =~ m{^http://([^/:]+)(?::(\d+))?(/.*)?$} or exit 1;
+my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
+my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => 5) or exit 1;
+print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
+local $/;
+my $resp = <$sock>;
+close $sock;
+exit 1 unless defined $resp;
+my ($headers, $body) = split(/\r?\n\r?\n/, $resp, 2);
+exit 1 unless defined $headers && $headers =~ m{^HTTP/\d\.\d\s+2\d\d\b};
+print($body // "");
+' "${URL}"
+	fi
+}
+
+http_probe_url() {
+	local URL="$1"
+	if command -v python3 &>/dev/null; then
+		python3 -c "
+import urllib.request, sys
+try:
+    urllib.request.urlopen(sys.argv[1], timeout=1)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" "${URL}" >/dev/null 2>&1
+	else
+		perl -e '
+use IO::Socket::INET;
+my $url = shift @ARGV;
+$url =~ m{^http://([^/:]+)(?::(\d+))?(/.*)?$} or exit 1;
+my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
+my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => 1) or exit 1;
+print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
+my $status = <$sock>;
+close $sock;
+exit((defined $status && $status =~ m{^HTTP/\d\.\d\s+2\d\d\b}) ? 0 : 1);
+' "${URL}" >/dev/null 2>&1
+	fi
+}
+
+json_raw_has_poll_error() {
+	local JSON_PAYLOAD="$1"
+	echo "${JSON_PAYLOAD}" | grep -qE 'POLL_ERROR|Operation not permitted' && return 1
+	return 0
+}
+
+json_peers_count() {
+	local JSON_PAYLOAD="$1"
+	echo "${JSON_PAYLOAD}" | grep -o '"public_key"[[:space:]]*:[[:space:]]*"[^"]*"' | wc -l | tr -d ' '
+}
+
+json_first_peer_has_pubkey() {
+	local JSON_PAYLOAD="$1"
+	echo "${JSON_PAYLOAD}" | grep -q '"public_key"[[:space:]]*:[[:space:]]*"[^"]\+"' && echo "yes" || echo "no"
+}
 
 # Re-install to a known clean state for this phase.
 # Use a dedicated test port to avoid conflicts.
@@ -3235,8 +3310,8 @@ fi
 echo ""
 echo "--- Phase 7b: Service startup + HTTP health probe ---"
 
-if [[ "${HAVE_PYTHON3}" != "true" ]]; then
-	echo "SKIP: HTTP health probe skipped (python3 not available)"
+if [[ "${HAVE_HTTP_RUNTIME}" != "true" ]]; then
+	echo "SKIP: HTTP health probe skipped (no python3/perl runtime available)"
 else
 	# Create an enhanced stub binary that simulates service startup
 	PHASE7_STUB="${WEB_TEST_INSTALL_DIR}/amneziawg-web"
@@ -3268,7 +3343,8 @@ fi
 LISTEN="${AWG_WEB_LISTEN:-0.0.0.0:8080}"
 PORT="${LISTEN##*:}"
 
-exec python3 -c "
+if command -v python3 >/dev/null 2>&1; then
+	exec python3 -c "
 import http.server, json, socketserver, sys, signal
 signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
 class H(http.server.BaseHTTPRequestHandler):
@@ -3290,6 +3366,41 @@ class H(http.server.BaseHTTPRequestHandler):
 with socketserver.TCPServer(('127.0.0.1', ${PORT}), H) as s:
     s.serve_forever()
 "
+else
+	exec perl -e '
+use strict;
+use warnings;
+use IO::Socket::INET;
+$SIG{TERM} = sub { exit 0 };
+my $port = shift @ARGV;
+my $server = IO::Socket::INET->new(
+  LocalAddr => "127.0.0.1",
+  LocalPort => $port,
+  Listen    => 5,
+  Reuse     => 1,
+  Proto     => "tcp"
+) or die "listen failed: $!";
+while (my $client = $server->accept()) {
+  $client->autoflush(1);
+  my $req = <$client>;
+  next unless defined $req;
+  my $path = "/";
+  if (defined $req && $req =~ m{^\w+\s+(\S+)}) { $path = $1; }
+  while (defined(my $line = <$client>)) { last if $line =~ /^\r?\n$/; }
+  if ($path eq "/api/health") {
+    my $body = "{\"status\":\"ok\"}";
+    print $client "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
+  } elsif ($path eq "/login") {
+    my $body = "<html><body>Login</body></html>";
+    print $client "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
+  } else {
+    my $body = "Not Found";
+    print $client "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
+  }
+  close $client;
+}
+' "${PORT}"
+fi
 PHASE7STUBEOF
 	chmod +x "${PHASE7_STUB}"
 
@@ -3310,14 +3421,7 @@ PHASE7STUBEOF
 	# Poll for the server to come up (max 5 seconds, 100ms intervals)
 	PHASE7_UP=false
 	for _i in $(seq 1 50); do
-		if python3 -c "
-import urllib.request, sys
-try:
-    urllib.request.urlopen('http://127.0.0.1:${WEB_PHASE7_PORT}/api/health', timeout=1)
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null; then
+		if http_probe_url "http://127.0.0.1:${WEB_PHASE7_PORT}/api/health"; then
 			PHASE7_UP=true
 			break
 		fi
@@ -3333,18 +3437,8 @@ except Exception:
 
 	# Probe /api/health and verify JSON response
 	if [[ "${PHASE7_UP}" == "true" ]]; then
-		HEALTH_RESPONSE=$(python3 -c "
-import urllib.request, json, sys
-try:
-    resp = urllib.request.urlopen('http://127.0.0.1:${WEB_PHASE7_PORT}/api/health', timeout=5)
-    data = json.loads(resp.read())
-    print(data.get('status', ''))
-except Exception as e:
-    print(f'error: {e}', file=sys.stderr)
-    sys.exit(1)
-" 2>/dev/null) || true
-
-		if [[ "${HEALTH_RESPONSE}" == "ok" ]]; then
+		HEALTH_RESPONSE="$(http_get_body "http://127.0.0.1:${WEB_PHASE7_PORT}/api/health" 2>/dev/null)" || HEALTH_RESPONSE=""
+		if echo "${HEALTH_RESPONSE}" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'; then
 			echo "OK: /api/health returned {\"status\": \"ok\"}"
 		else
 			echo "FAIL: /api/health did not return expected response"
@@ -3355,19 +3449,7 @@ except Exception as e:
 
 	# Probe /login and verify it responds
 	if [[ "${PHASE7_UP}" == "true" ]]; then
-		LOGIN_RC=0
-		python3 -c "
-import urllib.request, sys
-try:
-    resp = urllib.request.urlopen('http://127.0.0.1:${WEB_PHASE7_PORT}/login', timeout=5)
-    if resp.status == 200:
-        sys.exit(0)
-    sys.exit(1)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null || LOGIN_RC=$?
-
-		if [[ ${LOGIN_RC} -eq 0 ]]; then
+		if http_probe_url "http://127.0.0.1:${WEB_PHASE7_PORT}/login"; then
 			echo "OK: /login endpoint responds with 200"
 		else
 			echo "FAIL: /login endpoint did not respond"
@@ -3411,8 +3493,8 @@ echo "=== Phase 7: Service startup tests complete ==="
 echo ""
 echo "=== Phase 8: Peer visibility via AWG polling ==="
 
-if [[ "${HAVE_PYTHON3}" != "true" ]]; then
-	echo "SKIP: Peer visibility test skipped (python3 not available)"
+if [[ "${HAVE_HTTP_RUNTIME}" != "true" ]]; then
+	echo "SKIP: Peer visibility test skipped (no python3/perl runtime available)"
 else
 	# Create an enhanced stub that simulates the poller calling sudo awg show all dump
 	PHASE8_PORT=18743
@@ -3467,10 +3549,11 @@ AWG_DUMP=$(/usr/bin/sudo -n /usr/bin/awg show all dump 2>&1) || {
 	AWG_DUMP="POLL_ERROR: ${AWG_DUMP}"
 }
 
-# Export for python to read
+# Export for HTTP server runtime to read
 export AWG_DUMP
 
-exec python3 -c "
+if command -v python3 >/dev/null 2>&1; then
+	exec python3 -c "
 import http.server, json, socketserver, sys, signal, os
 signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
 
@@ -3514,6 +3597,65 @@ class H(http.server.BaseHTTPRequestHandler):
 with socketserver.TCPServer(('127.0.0.1', ${PORT}), H) as s:
     s.serve_forever()
 "
+else
+	exec perl -e '
+use strict;
+use warnings;
+use IO::Socket::INET;
+my $awg_dump = $ENV{AWG_DUMP} // "";
+my @peer_json = ();
+for my $line (split /\n/, $awg_dump) {
+  my @f = split /\t/, $line;
+  next unless scalar(@f) >= 9;
+  my $iface = $f[0] // "";
+  my $pub = $f[1] // "";
+  my $ep = $f[3] // "";
+  my $ips = $f[4] // "";
+  my $rx = ($f[6] // "") =~ /^\d+$/ ? $f[6] : 0;
+  my $tx = ($f[7] // "") =~ /^\d+$/ ? $f[7] : 0;
+  $ep = "null" if $ep eq "(none)";
+  if ($ep ne "null") {
+    $ep =~ s/\\/\\\\/g; $ep =~ s/"/\\"/g;
+    $ep = '"' . $ep . '"';
+  }
+  for ($iface, $pub, $ips) { s/\\/\\\\/g; s/"/\\"/g; }
+  push @peer_json, "{\"interface\":\"$iface\",\"public_key\":\"$pub\",\"endpoint\":$ep,\"allowed_ips\":\"$ips\",\"rx_bytes\":$rx,\"tx_bytes\":$tx}";
+}
+$SIG{TERM} = sub { exit 0 };
+my $port = shift @ARGV;
+my $server = IO::Socket::INET->new(
+  LocalAddr => "127.0.0.1",
+  LocalPort => $port,
+  Listen    => 5,
+  Reuse     => 1,
+  Proto     => "tcp"
+) or die "listen failed: $!";
+while (my $client = $server->accept()) {
+  $client->autoflush(1);
+  my $req = <$client>;
+  next unless defined $req;
+  my $path = "/";
+  if (defined $req && $req =~ m{^\w+\s+(\S+)}) { $path = $1; }
+  while (defined(my $line = <$client>)) { last if $line =~ /^\r?\n$/; }
+  if ($path eq "/api/health") {
+    my $body = "{\"status\":\"ok\"}";
+    print $client "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
+  } elsif ($path eq "/api/peers") {
+    my $raw = $awg_dump;
+    $raw =~ s/\\/\\\\/g; $raw =~ s/"/\\"/g; $raw =~ s/\n/\\n/g; $raw =~ s/\r//g;
+    my $body = "{\"peers\":[" . join(",", @peer_json) . "],\"raw\":\"$raw\"}";
+    print $client "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
+  } elsif ($path eq "/login") {
+    my $body = "<html><body>Login</body></html>";
+    print $client "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
+  } else {
+    my $body = "Not Found";
+    print $client "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
+  }
+  close $client;
+}
+' "${PORT}"
+fi
 PHASE8STUBEOF
 	chmod +x "${PHASE8_STUB}"
 
@@ -3529,14 +3671,7 @@ PHASE8STUBEOF
 	# Wait for the server to come up
 	PHASE8_UP=false
 	for _i in $(seq 1 50); do
-		if python3 -c "
-import urllib.request, sys
-try:
-    urllib.request.urlopen('http://127.0.0.1:${PHASE8_PORT}/api/health', timeout=1)
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null; then
+		if http_probe_url "http://127.0.0.1:${PHASE8_PORT}/api/health"; then
 			PHASE8_UP=true
 			break
 		fi
@@ -3552,27 +3687,10 @@ except Exception:
 
 	# Test 1: Verify the sudo→awg chain works (no "Operation not permitted")
 	if [[ "${PHASE8_UP}" == "true" ]]; then
-		PEERS_RESPONSE=$(python3 -c "
-import urllib.request, json, sys
-try:
-    resp = urllib.request.urlopen('http://127.0.0.1:${PHASE8_PORT}/api/peers', timeout=5)
-    data = json.loads(resp.read())
-    print(json.dumps(data))
-except Exception as e:
-    print(json.dumps({'error': str(e)}))
-    sys.exit(1)
-" 2>/dev/null) || true
+		PEERS_RESPONSE="$(http_get_body "http://127.0.0.1:${PHASE8_PORT}/api/peers" 2>/dev/null)" || PEERS_RESPONSE=""
 
 		# Check that the raw dump does NOT contain an error
-		if echo "${PEERS_RESPONSE}" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-raw = data.get('raw', '')
-if 'POLL_ERROR' in raw or 'Operation not permitted' in raw:
-    print('ERROR: AWG poll failed: ' + raw)
-    sys.exit(1)
-sys.exit(0)
-" 2>/dev/null; then
+		if json_raw_has_poll_error "${PEERS_RESPONSE}"; then
 			echo "OK: AWG polling succeeded (no permission error)"
 		else
 			echo "FAIL: AWG polling returned a permission error"
@@ -3582,14 +3700,7 @@ sys.exit(0)
 		fi
 
 		# Test 2: Verify at least one peer is visible
-		PEER_COUNT=$(echo "${PEERS_RESPONSE}" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    print(len(data.get('peers', [])))
-except:
-    print(0)
-" 2>/dev/null) || PEER_COUNT=0
+		PEER_COUNT="$(json_peers_count "${PEERS_RESPONSE}")"
 
 		if [[ "${PEER_COUNT}" -gt 0 ]]; then
 			echo "OK: /api/peers returned ${PEER_COUNT} peer(s) — peer visibility works"
@@ -3601,12 +3712,7 @@ except:
 
 		# Test 3: Verify the peer has expected data (public key, endpoint)
 		if [[ "${PEER_COUNT}" -gt 0 ]]; then
-			HAS_PUBKEY=$(echo "${PEERS_RESPONSE}" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-p = data.get('peers', [{}])[0]
-print('yes' if p.get('public_key') else 'no')
-" 2>/dev/null) || HAS_PUBKEY="no"
+			HAS_PUBKEY="$(json_first_peer_has_pubkey "${PEERS_RESPONSE}")"
 
 			if [[ "${HAS_PUBKEY}" == "yes" ]]; then
 				echo "OK: First peer has a public key"
