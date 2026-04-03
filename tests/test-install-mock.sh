@@ -53,7 +53,15 @@ echo "Setting up mock commands..."
 create_mock "awg" '
 case "$1" in
 	genkey)   echo "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=";;
-	pubkey)   echo "cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A=";;
+	pubkey)
+		read -r _priv_input
+		case "$_priv_input" in
+			YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=)
+				echo "cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A=";;
+			*)
+				echo "bWlzbWF0Y2hlZHB1YmtleTEyMzQ1Njc4OTBhYmNkZWY=";;
+		esac
+		;;
 	genpsk)   echo "cHNrMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnM=";;
 	syncconf) exit 0;;
 	show)
@@ -854,6 +862,74 @@ else
 	echo "  Output: $(echo "${REGEN_OUTPUT}" | grep -i 'regeneration complete')"
 	FAILED=$((FAILED + 1))
 fi
+
+# --- 2b2: Stale config in another home directory ---
+echo ""
+echo "--- Stale config skipping test ---"
+
+# To exercise pubkey verification, place the real config in a later-sorting
+# /home/* directory and remove the /root copy; otherwise regenerateClients()
+# may resolve the real config before scanning /home/* and never consider the
+# stale candidate first.
+STALE_HOME="/home/aaa_stale"
+REAL_HOME="/home/zzz_realuser"
+mkdir -p "${STALE_HOME}" "${REAL_HOME}"
+cp "${CLIENT1_CONF}" "${REAL_HOME}/awg0-client-client.conf"
+CLIENT1_CONF="${REAL_HOME}/awg0-client-client.conf"
+rm -f /root/awg0-client-client.conf
+
+# Capture the correct private key from the real client config
+REAL_CLIENT1_PRIV=$(grep -m1 -E "^PrivateKey = " "${CLIENT1_CONF}" | sed 's/^PrivateKey = //')
+
+# Write a stale config with a DIFFERENT private key (not matching the server's
+# PublicKey for this client).  The key verification logic should skip this
+# earlier-sorting stale candidate and continue searching until it finds the
+# real config under ${REAL_HOME}.
+cat > "${STALE_HOME}/awg0-client-client.conf" <<STALE_EOF
+[Interface]
+PrivateKey = U3RhbGVQcml2YXRlS2V5MTIzNDU2Nzg5MGFiY2RlZg==
+Address = 10.66.66.2/32,fd42:42:42::2/128
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = old_server_pub_key
+PresharedKey = old_psk
+Endpoint = 203.0.113.1:51820
+AllowedIPs = 0.0.0.0/0,::/0
+STALE_EOF
+
+REGEN_STALE_OUTPUT=$(regenerateClients 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+
+# Verify that the stale config's wrong key was NOT used and client1 preserved
+# its correct private key (no "generating new key pair" message).
+if echo "${REGEN_STALE_OUTPUT}" | grep -qE "client:.*no existing private key"; then
+	echo "FAIL: client1 regenerated key despite correct config existing (stale config interfered)"
+	FAILED=$((FAILED + 1))
+else
+	echo "OK: client1 private key preserved (stale config correctly skipped)"
+fi
+
+# Verify the regenerated config still has the correct private key
+REGEN_CLIENT1_PRIV=$(grep -m1 -E "^PrivateKey = " "${CLIENT1_CONF}" | sed 's/^PrivateKey = //')
+if [[ "${REGEN_CLIENT1_PRIV}" == "${REAL_CLIENT1_PRIV}" ]]; then
+	echo "OK: client1 config still has original private key after stale config test"
+else
+	echo "FAIL: client1 private key changed (expected '${REAL_CLIENT1_PRIV}', got '${REGEN_CLIENT1_PRIV}')"
+	FAILED=$((FAILED + 1))
+fi
+
+if echo "${REGEN_STALE_OUTPUT}" | grep -q "2 succeeded, 0 failed"; then
+	echo "OK: Stale config test regeneration summary shows 2 succeeded, 0 failed"
+else
+	echo "FAIL: Unexpected regeneration summary in stale config test"
+	echo "  Output: $(echo "${REGEN_STALE_OUTPUT}" | grep -i 'regeneration complete')"
+	FAILED=$((FAILED + 1))
+fi
+
+# Clean up stale/real home directories and restore /root config for subsequent tests
+cp "${CLIENT1_CONF}" /root/awg0-client-client.conf
+CLIENT1_CONF="/root/awg0-client-client.conf"
+rm -rf "${STALE_HOME}" "${REAL_HOME}"
 
 # --- 2c: Key regeneration when client config is missing ---
 echo ""
