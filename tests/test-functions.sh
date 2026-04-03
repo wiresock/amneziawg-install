@@ -405,6 +405,41 @@ else
 	echo "  FAIL: checkOS unsupported distro should fail (rc=${RC}, output: ${OUTPUT})"
 fi
 
+echo "=== gai_conf_has_active_ipv4_rule ==="
+GAI_TEST_FILE="$(mktemp)"
+ORIG_GAI_CONF="${GAI_CONF}"
+GAI_CONF="${GAI_TEST_FILE}"
+
+printf '%s\n' "# default config" "#precedence ::ffff:0:0/96  100" > "${GAI_TEST_FILE}"
+TESTS_RUN=$((TESTS_RUN + 1))
+if gai_conf_has_active_ipv4_rule; then
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: commented gai.conf rule should not be treated as active"
+else
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+fi
+
+printf '%s\n' "precedence ::ffff:0:0/96 100" > "${GAI_TEST_FILE}"
+TESTS_RUN=$((TESTS_RUN + 1))
+if gai_conf_has_active_ipv4_rule; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: active gai.conf rule with single space should be detected"
+fi
+
+printf '%s\n' "  precedence   ::ffff:0:0/96  100   # keep" > "${GAI_TEST_FILE}"
+TESTS_RUN=$((TESTS_RUN + 1))
+if gai_conf_has_active_ipv4_rule; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: active gai.conf rule with variable spacing/comment should be detected"
+fi
+
+rm -f "${GAI_TEST_FILE}"
+GAI_CONF="${ORIG_GAI_CONF}"
+
 echo ""
 echo "=========================================="
 echo "Results: ${TESTS_PASSED}/${TESTS_RUN} passed, ${TESTS_FAILED} failed"
