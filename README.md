@@ -181,14 +181,14 @@ Supported Linux distributions:
 
 - Debian ≥ 11
 - Ubuntu ≥ 22.04
-- Fedora ≥ 39
 
 Temporarily disabled:
 
+- Fedora (RPM-family)
 - AlmaLinux (EL9-family)
 - Rocky Linux (EL9-family)
 
-Reason: verified AmneziaWG 2.0 packages are not currently available for EL9-based distributions. Support can be re-enabled once updated packages are published.
+Reason: verified AmneziaWG 2.0 packages are not currently available for these RPM-based distributions. Support can be re-enabled once updated packages are published.
 
 2 GB of free space required for temporary build files.
 

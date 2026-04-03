@@ -27,7 +27,6 @@ jobs:
           - "ubuntu:24.04"
           - "debian:11"
           - "debian:12"
-          - "fedora:40"
     steps:
       - uses: actions/checkout@v4
 
