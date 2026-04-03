@@ -3151,11 +3151,11 @@ echo "=== Phase 6: Source-build tests complete ==="
 # - Instead, we use an enhanced stub that simulates the service startup chain:
 #   1. reads the installer-generated env file
 #   2. creates the SQLite database file (simulates create_if_missing)
-#   3. starts a minimal HTTP server via python3
+#   3. starts a minimal HTTP server via python3 (or perl fallback)
 #   4. responds to /api/health and /login
 # - This catches the real-world regression where the service crash-loops
 #   because the database file cannot be created
-# - HTTP probing uses python3's urllib (no curl dependency)
+# - HTTP probing uses python3 urllib or perl IO::Socket::INET (no curl dependency)
 # - systemctl is still mocked; we start the binary directly
 #
 echo ""
@@ -3465,7 +3465,7 @@ PHASE7STUBEOF
 	# Probe /login and verify it responds
 	if [[ "${PHASE7_UP}" == "true" ]]; then
 		if http_probe_url "http://127.0.0.1:${WEB_PHASE7_PORT}/login"; then
-			echo "OK: /login endpoint responds with 200"
+			echo "OK: /login endpoint responds with 2xx/3xx"
 		else
 			echo "FAIL: /login endpoint did not respond"
 			FAILED=$((FAILED + 1))
