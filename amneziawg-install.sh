@@ -625,7 +625,7 @@ function checkOS() {
 }
 
 function getTemporarilyDisabledRpmFamilyMessage() {
-	echo "Fedora, AlmaLinux, and Rocky Linux support is temporarily disabled because verified AmneziaWG 2.0 packages are not currently available for these RPM-based distributions."
+	echo "Fedora, AlmaLinux, and Rocky Linux support is temporarily disabled because verified AmneziaWG 2.0 packages are not currently available for these RPM-based distributions. Please watch this repository's releases and README for support status updates."
 }
 
 function ensureSupportedInstallDistro() {
