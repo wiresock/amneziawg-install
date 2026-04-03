@@ -407,10 +407,15 @@ fi
 
 echo "=== ensureSupportedInstallDistro ==="
 
+assert_temp_disable_message() {
+	local OUTPUT="$1"
+	echo "${OUTPUT}" | grep -Eq "temporarily disabled.*EL9-based distributions"
+}
+
 OUTPUT=$(OS="almalinux"; ensureSupportedInstallDistro 2>&1)
 RC=$?
 TESTS_RUN=$((TESTS_RUN + 1))
-if [[ ${RC} -ne 0 ]] && echo "${OUTPUT}" | grep -q "temporarily disabled" && echo "${OUTPUT}" | grep -q "EL9-based distributions"; then
+if [[ ${RC} -ne 0 ]] && assert_temp_disable_message "${OUTPUT}"; then
 	TESTS_PASSED=$((TESTS_PASSED + 1))
 else
 	TESTS_FAILED=$((TESTS_FAILED + 1))
@@ -420,7 +425,7 @@ fi
 OUTPUT=$(OS="rocky"; ensureSupportedInstallDistro 2>&1)
 RC=$?
 TESTS_RUN=$((TESTS_RUN + 1))
-if [[ ${RC} -ne 0 ]] && echo "${OUTPUT}" | grep -q "temporarily disabled" && echo "${OUTPUT}" | grep -q "EL9-based distributions"; then
+if [[ ${RC} -ne 0 ]] && assert_temp_disable_message "${OUTPUT}"; then
 	TESTS_PASSED=$((TESTS_PASSED + 1))
 else
 	TESTS_FAILED=$((TESTS_FAILED + 1))
