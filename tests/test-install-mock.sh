@@ -3265,7 +3265,7 @@ try:
     payload = json.loads(sys.stdin.read())
     peers = payload.get("peers") or []
     first = peers[0] if isinstance(peers, list) and len(peers) > 0 else {}
-    print("yes" if isinstance(first, dict) and first.get("public_key") else "no")
+    print("yes" if isinstance(first, dict) and isinstance(first.get("public_key"), str) and len(first.get("public_key")) > 0 else "no")
 except Exception:
     print("no")
 ' <<<"${JSON_PAYLOAD}"
