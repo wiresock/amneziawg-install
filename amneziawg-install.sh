@@ -619,7 +619,21 @@ function checkOS() {
 			exit 1
 		fi
 	else
-		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Linux Mint, Fedora, CentOS, AlmaLinux or Rocky Linux system" >&2
+		echo "Looks like you aren't running this installer on a supported system (Debian, Ubuntu, Linux Mint, or CentOS)." >&2
+		exit 1
+	fi
+}
+
+function getTemporarilyDisabledRPMFamilyMessage() {
+	echo "Fedora, AlmaLinux, and Rocky Linux support is temporarily disabled because verified AmneziaWG 2.0 packages are not currently available for these RPM-based distributions. Please watch this repository's releases and README for support status updates."
+}
+
+function ensureSupportedInstallDistro() {
+	# Temporary install block for RPM-family rebuild verification status.
+	# Keep OS detection intact so existing installs on these distros can still
+	# run non-install operations until AWG 2.0 packages are verified.
+	if [[ ${OS} == 'fedora' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+		echo "$(getTemporarilyDisabledRPMFamilyMessage)" >&2
 		exit 1
 	fi
 }
@@ -1279,6 +1293,8 @@ function installQuestions() {
 }
 
 function installAmneziaWG() {
+	ensureSupportedInstallDistro
+
 	# Run setup questions first
 	installQuestions
 
@@ -1470,7 +1486,7 @@ function installAmneziaWG() {
 			fi
 		fi
 		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
-	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+	elif [[ ${OS} == 'centos' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg

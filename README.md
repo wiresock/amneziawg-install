@@ -179,10 +179,16 @@ sudo ./amneziawg-install.sh --list-clients
 
 Supported Linux distributions:
 
-- AlmaLinux ≥ 9
 - Debian ≥ 11
-- Rocky Linux ≥ 9
 - Ubuntu ≥ 22.04
+
+Temporarily disabled:
+
+- Fedora (RPM-based)
+- AlmaLinux (RPM-based)
+- Rocky Linux (RPM-based)
+
+Reason: verified AmneziaWG 2.0 packages are not currently available for these RPM-based distributions. Please watch this repository's releases and README for support status updates.
 
 2 GB of free space required for temporary build files.
 
