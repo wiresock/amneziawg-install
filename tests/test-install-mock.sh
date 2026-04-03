@@ -3258,7 +3258,20 @@ json_peers_count() {
 
 json_first_peer_has_pubkey() {
 	local JSON_PAYLOAD="$1"
-	echo "${JSON_PAYLOAD}" | grep -qE '"public_key"[[:space:]]*:[[:space:]]*"[^"]+"' && echo "yes" || echo "no"
+	perl -0ne '
+		my $json = $_;
+		if ($json =~ /"peers"\s*:\s*\[(.*)\]/s) {
+			my $peers = $1;
+			if ($peers =~ /\{\s*(.*?)\s*\}/s) {
+				my $first_peer = $1;
+				if ($first_peer =~ /"public_key"\s*:\s*"([^"]+)"/s) {
+					print "yes";
+					exit 0;
+				}
+			}
+		}
+		print "no";
+	' <<<"${JSON_PAYLOAD}"
 }
 
 # Re-install to a known clean state for this phase.
