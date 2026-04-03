@@ -43,10 +43,14 @@ APT_FORCE_IPV4_CONF="/etc/apt/apt.conf.d/99amneziawg-force-ipv4"
 APT_FORCE_IPV4_SENTINEL="# Managed by amneziawg-install - safe to remove"
 GAI_CONF="/etc/gai.conf"
 GAI_CONF_SENTINEL="# Added by amneziawg-install - safe to remove"
-GAI_CONF_IPV4_RULE="precedence ::ffff:0:0/96  100"
+GAI_CONF_IPV4_RULE="precedence ::ffff:0:0/96 100"
+GAI_CONF_IPV4_RULE_REGEX='^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]*(#.*)?)?$'
 _APT_IPV4_PREV_TRAP_EXIT=""
 _APT_IPV4_PREV_TRAP_INT=""
 _APT_IPV4_PREV_TRAP_TERM=""
+gai_conf_has_active_ipv4_rule() {
+	grep -Eq "${GAI_CONF_IPV4_RULE_REGEX}" "${GAI_CONF}" 2>/dev/null
+}
 enable_apt_ipv4() {
 	# Only write the APT ForceIPv4 config on distros that actually use APT,
 	# to avoid creating /etc/apt on RPM-based systems.
@@ -58,7 +62,7 @@ enable_apt_ipv4() {
 
 	# Prefer IPv4 in the system resolver so all glibc consumers (Python,
 	# libcurl/dnf, etc.) connect over IPv4.
-	if ! grep -qF "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" 2>/dev/null; then
+	if ! gai_conf_has_active_ipv4_rule; then
 		local _gai_existed=0
 		[[ -f "${GAI_CONF}" ]] && _gai_existed=1
 		printf '\n%s\n%s\n' "${GAI_CONF_SENTINEL}" "${GAI_CONF_IPV4_RULE}" \
@@ -92,7 +96,11 @@ _remove_ipv4_overrides() {
 	# is present so pre-existing admin rules are never touched.  This must
 	# be idempotent so interrupted previous runs are also cleaned up.
 	if [[ -f "${GAI_CONF}" ]] && grep -qF "${GAI_CONF_SENTINEL}" "${GAI_CONF}"; then
-		{ grep -vF -e "${GAI_CONF_SENTINEL}" -e "${GAI_CONF_IPV4_RULE}" "${GAI_CONF}" || true; } > "${GAI_CONF}.tmp"
+		awk -v sent="${GAI_CONF_SENTINEL}" -v regex="${GAI_CONF_IPV4_RULE_REGEX}" '
+			$0 == sent { prev_sent=1; next }
+			prev_sent == 1 && $0 ~ regex { prev_sent=0; next }
+			{ prev_sent=0; print }
+		' "${GAI_CONF}" > "${GAI_CONF}.tmp"
 		if ! chmod --reference="${GAI_CONF}" "${GAI_CONF}.tmp" || ! chown --reference="${GAI_CONF}" "${GAI_CONF}.tmp"; then
 			rm -f "${GAI_CONF}.tmp"
 			return 1
