@@ -89,6 +89,65 @@ cleanup() {
 
 trap cleanup EXIT
 
+# ── Git auto-install ──────────────────────────────────────────────────────────
+
+# Detect the system package manager and set _PKG_MGR to the install command.
+# Returns 1 if no supported package manager is found.
+detect_package_manager() {
+    if command -v apt-get >/dev/null 2>&1; then
+        _PKG_MGR="apt-get"
+    elif command -v dnf >/dev/null 2>&1; then
+        _PKG_MGR="dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        _PKG_MGR="yum"
+    else
+        return 1
+    fi
+    return 0
+}
+
+# Attempt to install git after prompting the user for confirmation.
+# Skips silently (returns 1) when not root or not on a TTY.
+install_git() {
+    if [[ "${_AWG_IS_ROOT}" -eq 0 ]]; then
+        return 1
+    fi
+
+    if ! detect_package_manager; then
+        return 1
+    fi
+
+    # Non-interactive — cannot prompt
+    if [[ ! -t 0 ]]; then
+        return 1
+    fi
+
+    yellow "git is not installed, but is required to fetch the repository."
+    printf 'Would you like to install git now using %s? [y/N] ' "${_PKG_MGR}"
+    local answer
+    read -r answer
+    case "${answer}" in
+        [Yy]|[Yy][Ee][Ss]) ;;
+        *) return 1 ;;
+    esac
+
+    echo "Installing git ..."
+    if [[ "${_PKG_MGR}" == "apt-get" ]]; then
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq git >/dev/null 2>&1
+    else
+        "${_PKG_MGR}" install -y git >/dev/null 2>&1
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        red "ERROR: Failed to install git."
+        return 1
+    fi
+
+    green "git installed successfully."
+    return 0
+}
+
 # ── Bootstrap ────────────────────────────────────────────────────────────────
 
 bootstrap_repo_if_needed() {
@@ -98,9 +157,11 @@ bootstrap_repo_if_needed() {
     fi
 
     if ! command -v git >/dev/null 2>&1; then
-        echo "ERROR: Script not found at: ${target_script}" >&2
-        echo "       Install git and re-run, or clone ${REPO_URL} manually." >&2
-        exit 1
+        if ! install_git; then
+            echo "ERROR: Script not found at: ${target_script}" >&2
+            echo "       Install git and re-run, or clone ${REPO_URL} manually." >&2
+            exit 1
+        fi
     fi
 
     BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/amneziawg-install.XXXXXX")"
