@@ -3264,7 +3264,7 @@ import json, sys
 try:
     payload = json.loads(sys.stdin.read())
     peers = payload.get("peers") or []
-    first = peers[0] if isinstance(peers, list) and peers else {}
+    first = peers[0] if isinstance(peers, list) and len(peers) > 0 else {}
     print("yes" if isinstance(first, dict) and first.get("public_key") else "no")
 except Exception:
     print("no")
@@ -3325,7 +3325,7 @@ while ($i < $len) {
 		$depth--;
 		if ($depth == 0) {
 			my $first_peer = substr($s, $start, $i - $start + 1);
-			if ($first_peer =~ /"public_key"\s*:\s*"((?:\\.|[^"\\])+)"/s) {
+			if ($first_peer =~ /"public_key"\s*:\s*"((?:\\.|[^"\\])*)"/s && length($1) > 0) {
 				print "yes";
 				exit 0;
 			}
