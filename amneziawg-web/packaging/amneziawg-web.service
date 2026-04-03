@@ -46,17 +46,20 @@ Environment=RUST_LOG=amneziawg_web=info
 # and write client config files directly under the config directory.
 ReadWritePaths=/etc/amnezia/amneziawg
 
-# NoNewPrivileges is NOT set because the service invokes
-# `sudo /usr/bin/awg show all dump`, `sudo /usr/bin/awg set … peer … remove`,
-# and `sudo /usr/bin/awg syncconf …` + `sudo /usr/bin/awg-quick strip …`
-# via a tightly-scoped sudoers rule (see /etc/sudoers.d/amneziawg-web).
-# The sudoers rule restricts access to inspection, peer removal, and config sync.
+# The service invokes sudo to run `awg`, `cat`, `tee`, etc. via a
+# tightly-scoped sudoers rule (see /etc/sudoers.d/amneziawg-web).
+# sudo relies on the setuid bit, which requires NoNewPrivileges=no.
+#
+# Do NOT add PrivateDevices=, ProtectKernelTunables=, ProtectKernelModules=,
+# ProtectKernelLogs=, SystemCallFilter=, RestrictAddressFamilies=,
+# RestrictNamespaces=, MemoryDenyWriteExecute=, RestrictRealtime=,
+# RestrictSUIDSGID=, LockPersonality=, or SystemCallArchitectures= here:
+# each of these implicitly enables NoNewPrivileges=yes (systemd ≥232),
+# which strips the setuid bit from /usr/bin/sudo and breaks all privileged
+# operations (awg show, config reads/writes).
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
 ProtectControlGroups=yes
 
 # Allow writing to the database directory only.
