@@ -1431,8 +1431,6 @@ function installAmneziaWG() {
 		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) && HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
 		local HEADER_ERR_FILE
 		HEADER_ERR_FILE=$(mktemp) || { echo -e "${RED}ERROR: Failed to create temporary file for apt errors.${NC}"; exit 1; }
-		# shellcheck disable=SC2064  # intentional: expand HEADER_ERR_FILE now
-		trap "rm -f '${HEADER_ERR_FILE}'" EXIT
 		for HEADER_PKG in "${HEADER_CANDIDATES[@]}"; do
 			: >"${HEADER_ERR_FILE}"
 			if apt-get install -y "${HEADER_PKG}" 2> >(tee "${HEADER_ERR_FILE}" >&2); then
@@ -1443,7 +1441,6 @@ function installAmneziaWG() {
 			fi
 		done
 		rm -f "${HEADER_ERR_FILE}"
-		trap - EXIT
 		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
 			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi
