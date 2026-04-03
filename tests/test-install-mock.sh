@@ -3189,7 +3189,7 @@ except Exception:
 		perl -e '
 use IO::Socket::INET;
 my $url = shift @ARGV;
-$url =~ m{^http://([^/:]+)(?::(\d+))?(/.*)?$} or exit 1;
+$url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => 5) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
@@ -3197,8 +3197,13 @@ local $/;
 my $resp = <$sock>;
 close $sock;
 exit 1 unless defined $resp;
-my ($headers, $body) = split(/\r?\n\r?\n/, $resp, 2);
-exit 1 unless defined $headers && $headers =~ m{^HTTP/\d\.\d\s+2\d\d\b};
+my ($headers, $body);
+if (index($resp, "\r\n\r\n") >= 0) {
+  ($headers, $body) = split(/\r\n\r\n/, $resp, 2);
+} else {
+  ($headers, $body) = split(/\n\n/, $resp, 2);
+}
+exit 1 unless defined $headers && $headers =~ m{^HTTP/\d\.\d\s+[23]\d\d\b};
 print($body // "");
 ' "${URL}"
 	fi
@@ -3208,10 +3213,21 @@ http_probe_url() {
 	local URL="$1"
 	if command -v python3 &>/dev/null; then
 		python3 -c "
-import urllib.request, sys
+import urllib.request, urllib.error, sys
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 try:
-    urllib.request.urlopen(sys.argv[1], timeout=1)
-    sys.exit(0)
+    opener = urllib.request.build_opener(NoRedirect)
+    resp = opener.open(sys.argv[1], timeout=1)
+    code = resp.getcode()
+    sys.exit(0 if (200 <= code < 400) else 1)
+except urllib.error.HTTPError as e:
+    sys.exit(0 if (300 <= e.code < 400) else 1)
+except urllib.error.URLError:
+    sys.exit(1)
+except ValueError:
+    sys.exit(1)
 except Exception:
     sys.exit(1)
 " "${URL}" >/dev/null 2>&1
@@ -3219,13 +3235,13 @@ except Exception:
 		perl -e '
 use IO::Socket::INET;
 my $url = shift @ARGV;
-$url =~ m{^http://([^/:]+)(?::(\d+))?(/.*)?$} or exit 1;
+$url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => 1) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
 my $status = <$sock>;
 close $sock;
-exit((defined $status && $status =~ m{^HTTP/\d\.\d\s+2\d\d\b}) ? 0 : 1);
+exit((defined $status && $status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
 ' "${URL}" >/dev/null 2>&1
 	fi
 }
@@ -3242,7 +3258,7 @@ json_peers_count() {
 
 json_first_peer_has_pubkey() {
 	local JSON_PAYLOAD="$1"
-	echo "${JSON_PAYLOAD}" | grep -q '"public_key"[[:space:]]*:[[:space:]]*"[^"]\+"' && echo "yes" || echo "no"
+	echo "${JSON_PAYLOAD}" | grep -qE '"public_key"[[:space:]]*:[[:space:]]*"[^"]+"' && echo "yes" || echo "no"
 }
 
 # Re-install to a known clean state for this phase.
@@ -3641,7 +3657,7 @@ while (my $client = $server->accept()) {
     print $client "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
   } elsif ($path eq "/api/peers") {
     my $raw = $awg_dump;
-    $raw =~ s/\\/\\\\/g; $raw =~ s/"/\\"/g; $raw =~ s/\n/\\n/g; $raw =~ s/\r//g;
+    $raw =~ s/\\/\\\\/g; $raw =~ s/"/\\"/g; $raw =~ s/\t/\\t/g; $raw =~ s/\n/\\n/g; $raw =~ s/\r//g;
     my $body = "{\"peers\":[" . join(",", @peer_json) . "],\"raw\":\"$raw\"}";
     print $client "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
   } elsif ($path eq "/login") {
