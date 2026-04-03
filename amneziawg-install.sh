@@ -624,7 +624,7 @@ function checkOS() {
 	fi
 }
 
-function getTemporarilyDisabledRpmFamilyMessage() {
+function getTemporarilyDisabledRPMFamilyMessage() {
 	echo "Fedora, AlmaLinux, and Rocky Linux support is temporarily disabled because verified AmneziaWG 2.0 packages are not currently available for these RPM-based distributions. Please watch this repository's releases and README for support status updates."
 }
 
@@ -633,7 +633,7 @@ function ensureSupportedInstallDistro() {
 	# Keep OS detection intact so existing installs on these distros can still
 	# run non-install operations until AWG 2.0 packages are verified.
 	if [[ ${OS} == 'fedora' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
-		echo "$(getTemporarilyDisabledRpmFamilyMessage)" >&2
+		echo "$(getTemporarilyDisabledRPMFamilyMessage)" >&2
 		exit 1
 	fi
 }
