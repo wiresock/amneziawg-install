@@ -3258,20 +3258,88 @@ json_peers_count() {
 
 json_first_peer_has_pubkey() {
 	local JSON_PAYLOAD="$1"
-	perl -0ne '
-		my $json = $_;
-		if ($json =~ /"peers"\s*:\s*\[(.*)\]/s) {
-			my $peers = $1;
-			if ($peers =~ /\{\s*(.*?)\s*\}/s) {
-				my $first_peer = $1;
-				if ($first_peer =~ /"public_key"\s*:\s*"([^"]+)"/s) {
-					print "yes";
-					exit 0;
-				}
+	if command -v python3 &>/dev/null; then
+		python3 -c '
+import json, sys
+try:
+    payload = json.loads(sys.stdin.read())
+    peers = payload.get("peers") or []
+    first = peers[0] if isinstance(peers, list) and peers else {}
+    print("yes" if isinstance(first, dict) and first.get("public_key") else "no")
+except Exception:
+    print("no")
+' <<<"${JSON_PAYLOAD}"
+	elif command -v perl &>/dev/null; then
+		perl -e '
+my $s = do { local $/; <STDIN> };
+
+my $i = 0;
+my $len = length($s);
+my $in_str = 0;
+my $esc = 0;
+my $peers_key_end = -1;
+
+while ($i < $len) {
+	my $c = substr($s, $i, 1);
+	if ($in_str) {
+		if ($esc) { $esc = 0; }
+		elsif ($c eq "\\") { $esc = 1; }
+		elsif ($c eq "\"") { $in_str = 0; }
+		$i++;
+		next;
+	}
+	if ($c eq "\"") {
+		if (substr($s, $i, 7) eq "\"peers\"") { $peers_key_end = $i + 7; last; }
+		$in_str = 1;
+	}
+	$i++;
+}
+if ($peers_key_end < 0) { print "no"; exit 0; }
+
+$i = $peers_key_end;
+while ($i < $len && substr($s, $i, 1) =~ /\s/) { $i++; }
+if ($i >= $len || substr($s, $i, 1) ne ":") { print "no"; exit 0; }
+$i++;
+while ($i < $len && substr($s, $i, 1) =~ /\s/) { $i++; }
+if ($i >= $len || substr($s, $i, 1) ne "[") { print "no"; exit 0; }
+$i++;
+while ($i < $len && substr($s, $i, 1) =~ /\s/) { $i++; }
+if ($i >= $len || substr($s, $i, 1) ne "{") { print "no"; exit 0; }
+
+my $start = $i;
+my $depth = 0;
+$in_str = 0;
+$esc = 0;
+while ($i < $len) {
+	my $c = substr($s, $i, 1);
+	if ($in_str) {
+		if ($esc) { $esc = 0; }
+		elsif ($c eq "\\") { $esc = 1; }
+		elsif ($c eq "\"") { $in_str = 0; }
+		$i++;
+		next;
+	}
+	if ($c eq "\"") { $in_str = 1; $i++; next; }
+	if ($c eq "{") { $depth++; }
+	elsif ($c eq "}") {
+		$depth--;
+		if ($depth == 0) {
+			my $first_peer = substr($s, $start, $i - $start + 1);
+			if ($first_peer =~ /"public_key"\s*:\s*"((?:\\.|[^"\\])+)"/s) {
+				print "yes";
+				exit 0;
 			}
+			print "no";
+			exit 0;
 		}
-		print "no";
-	' <<<"${JSON_PAYLOAD}"
+	}
+	$i++;
+}
+print "no";
+' <<<"${JSON_PAYLOAD}"
+	else
+		echo "no"
+	fi
 }
 
 # Re-install to a known clean state for this phase.
