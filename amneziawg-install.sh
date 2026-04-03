@@ -619,7 +619,7 @@ function checkOS() {
 			exit 1
 		fi
 	else
-		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Linux Mint or CentOS system" >&2
+		echo "Looks like you aren't running this installer on a supported system (Debian, Ubuntu, Linux Mint, or CentOS)." >&2
 		exit 1
 	fi
 }
