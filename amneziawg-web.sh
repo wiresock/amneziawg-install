@@ -132,17 +132,27 @@ install_git() {
     esac
 
     echo "Installing git ..."
+    local install_log
+    install_log="$(mktemp "${TMPDIR:-/tmp}/awg-git-install.XXXXXX")"
+    local install_rc=0
     if [[ "${_PKG_MGR}" == "apt-get" ]]; then
-        apt-get update -qq >/dev/null 2>&1
-        apt-get install -y -qq git >/dev/null 2>&1
+        apt-get update -qq >>"${install_log}" 2>&1
+        apt-get install -y -qq git >>"${install_log}" 2>&1 || install_rc=$?
     else
-        "${_PKG_MGR}" install -y git >/dev/null 2>&1
+        "${_PKG_MGR}" install -y git >>"${install_log}" 2>&1 || install_rc=$?
     fi
 
     if ! command -v git >/dev/null 2>&1; then
-        red "ERROR: Failed to install git."
+        red "ERROR: Failed to install git (exit code ${install_rc})."
+        if [[ -s "${install_log}" ]]; then
+            echo "--- package manager output ---" >&2
+            tail -20 "${install_log}" >&2
+            echo "------------------------------" >&2
+        fi
+        rm -f "${install_log}"
         return 1
     fi
+    rm -f "${install_log}"
 
     green "git installed successfully."
     return 0
