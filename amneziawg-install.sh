@@ -193,6 +193,63 @@ function safeQuoteParam() {
 	printf "'%s'\n" "${ESCAPED}"
 }
 
+# Detect whether the installed awg userspace parser supports AmneziaWG 2.0
+# interface parameters (S3/S4/H1-H4). Older awg-tools (e.g. 1.0.20240201)
+# reject these lines and fail syncconf with "Line unrecognized".
+# Returns 0 when supported, 1 when unsupported/unknown.
+function awgSupportsAwg2Params() {
+	if [[ -n "${_AWG_SUPPORTS_AWG2_PARAMS:-}" ]]; then
+		[[ "${_AWG_SUPPORTS_AWG2_PARAMS}" == "1" ]] && return 0 || return 1
+	fi
+
+	local AWG_VERSION_OUTPUT AWG_VERSION_DATE
+	AWG_VERSION_OUTPUT="$(awg --version 2>/dev/null | head -n 1)"
+	AWG_VERSION_DATE="$(printf '%s' "${AWG_VERSION_OUTPUT}" | grep -Eo '[0-9]{8}' | head -n 1)"
+
+	# awg 2.0 support landed in amneziawg-tools builds from 20250901 onward.
+	if [[ -n "${AWG_VERSION_DATE}" ]] && (( 10#${AWG_VERSION_DATE} >= 20250901 )); then
+		_AWG_SUPPORTS_AWG2_PARAMS="1"
+		return 0
+	fi
+
+	# Fallback heuristic for non-date version formats.
+	if [[ "${AWG_VERSION_OUTPUT}" =~ [Aa][Ww][Gg][[:space:]]*2\.0 ]]; then
+		_AWG_SUPPORTS_AWG2_PARAMS="1"
+		return 0
+	fi
+
+	# Conservative default: unknown parser capability is treated as unsupported
+	# to avoid writing configs that cannot be parsed.
+	_AWG_SUPPORTS_AWG2_PARAMS="0"
+	return 1
+}
+
+function maybeWarnLegacyAwg2Unsupported() {
+	if awgSupportsAwg2Params; then
+		return 0
+	fi
+	if [[ "${_AWG_WARNED_LEGACY_PARAMS_UNSUPPORTED:-0}" == "1" ]]; then
+		return 0
+	fi
+	_AWG_WARNED_LEGACY_PARAMS_UNSUPPORTED="1"
+	echo -e "${ORANGE}WARNING: Installed awg userspace tools do not support AmneziaWG 2.0 parameters (S3/S4/H1-H4).${NC}"
+	echo -e "${ORANGE}Using legacy-compatible configs (Jc/Jmin/Jmax/S1/S2 only) to prevent parser failures.${NC}"
+}
+
+function renderAwg2InterfaceParams() {
+	if ! awgSupportsAwg2Params; then
+		return 0
+	fi
+	cat <<EOF
+S3 = ${SERVER_AWG_S3}
+S4 = ${SERVER_AWG_S4}
+H1 = ${SERVER_AWG_H1}
+H2 = ${SERVER_AWG_H2}
+H3 = ${SERVER_AWG_H3}
+H4 = ${SERVER_AWG_H4}
+EOF
+}
+
 # Optional self-test for safeQuoteParam; run by setting SAFE_QUOTE_PARAM_SELFTEST=1
 if [[ "${SAFE_QUOTE_PARAM_SELFTEST:-0}" == "1" ]]; then
 	TEST_VALUE="O'Reilly"
@@ -1544,6 +1601,7 @@ function installAmneziaWG() {
 
 	SERVER_PRIV_KEY=$(awg genkey)
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | awg pubkey)
+	maybeWarnLegacyAwg2Unsupported
 
 	# Restrict umask for sensitive file creation (private keys, server config)
 	local OLD_UMASK
@@ -1570,12 +1628,7 @@ Jmin = ${SERVER_AWG_JMIN}
 Jmax = ${SERVER_AWG_JMAX}
 S1 = ${SERVER_AWG_S1}
 S2 = ${SERVER_AWG_S2}
-S3 = ${SERVER_AWG_S3}
-S4 = ${SERVER_AWG_S4}
-H1 = ${SERVER_AWG_H1}
-H2 = ${SERVER_AWG_H2}
-H3 = ${SERVER_AWG_H3}
-H4 = ${SERVER_AWG_H4}" >"${SERVER_AWG_CONF}"
+$(renderAwg2InterfaceParams)" >"${SERVER_AWG_CONF}"
 	chmod 600 "${SERVER_AWG_CONF}"
 
 	# Restore default umask before creating system files and running services
@@ -1886,6 +1939,7 @@ function newClient() {
 	# Compress IPv6 to canonical RFC 5952 form for client config display
 	local CLIENT_AWG_IPV6_DISPLAY
 	CLIENT_AWG_IPV6_DISPLAY=$(compressIPv6 "${CLIENT_AWG_IPV6}")
+	maybeWarnLegacyAwg2Unsupported
 
 	# Restrict umask for client config file creation (contains private key)
 	local OLD_UMASK
@@ -1902,12 +1956,7 @@ Jmin = ${SERVER_AWG_JMIN}
 Jmax = ${SERVER_AWG_JMAX}
 S1 = ${SERVER_AWG_S1}
 S2 = ${SERVER_AWG_S2}
-S3 = ${SERVER_AWG_S3}
-S4 = ${SERVER_AWG_S4}
-H1 = ${SERVER_AWG_H1}
-H2 = ${SERVER_AWG_H2}
-H3 = ${SERVER_AWG_H3}
-H4 = ${SERVER_AWG_H4}
+$(renderAwg2InterfaceParams)
 
 [Peer]
 PublicKey = ${SERVER_PUB_KEY}
@@ -2297,12 +2346,7 @@ Jmin = ${SERVER_AWG_JMIN}
 Jmax = ${SERVER_AWG_JMAX}
 S1 = ${SERVER_AWG_S1}
 S2 = ${SERVER_AWG_S2}
-S3 = ${SERVER_AWG_S3}
-S4 = ${SERVER_AWG_S4}
-H1 = ${SERVER_AWG_H1}
-H2 = ${SERVER_AWG_H2}
-H3 = ${SERVER_AWG_H3}
-H4 = ${SERVER_AWG_H4}
+$(renderAwg2InterfaceParams)
 
 [Peer]
 PublicKey = ${SERVER_PUB_KEY}
@@ -2848,88 +2892,96 @@ function persistMigration() {
 	# Update server configuration file with migrated values
 	echo -e "${GREEN}Updating server configuration file...${NC}"
 
-	# Insert or update S3 (try update first, then insert after S2)
-	if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
-		if ! sed -i "s|^S3 = .*|S3 = ${SERVER_AWG_S3}|" "${SERVER_AWG_CONF}"; then
-			_migrationRestoreAndExit "Failed to update S3 in server configuration file."
-		fi
-	else
-		# Verify S2 exists before attempting insertion
-		if ! grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
-			_migrationRestoreAndExit "Cannot insert S3: S2 parameter not found in configuration file."
-		fi
-		if ! sed -i "/^S2 = .*/a S3 = ${SERVER_AWG_S3}" "${SERVER_AWG_CONF}"; then
-			_migrationRestoreAndExit "Failed to insert S3 into server configuration file."
-		fi
-		# Verify insertion succeeded
-		if ! grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
-			_migrationRestoreAndExit "S3 insertion appeared to succeed but S3 not found in configuration file."
-		fi
-	fi
-
-	# Insert or update S4 (try update first, then insert after S3, fallback to after S2)
-	# Note: Backups were created at the start of migration, so any failure will restore
-	# the original files via _migrationRestoreAndExit(). GNU sed -i is atomic (writes to
-	# temp file then renames), so partial modifications within a single sed call are unlikely.
-	if grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
-		if ! sed -i "s|^S4 = .*|S4 = ${SERVER_AWG_S4}|" "${SERVER_AWG_CONF}"; then
-			_migrationRestoreAndExit "Failed to update S4 in server configuration file."
-		fi
-	else
-		local S4_INSERTED=0
-		local S4_ANCHOR=""
-
-		# Determine anchor point for insertion (prefer S3, fallback to S2)
+	if awgSupportsAwg2Params; then
+		# Insert or update S3 (try update first, then insert after S2)
 		if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
-			S4_ANCHOR="S3"
-		elif grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
-			S4_ANCHOR="S2"
+			if ! sed -i "s|^S3 = .*|S3 = ${SERVER_AWG_S3}|" "${SERVER_AWG_CONF}"; then
+				_migrationRestoreAndExit "Failed to update S3 in server configuration file."
+			fi
 		else
-			_migrationRestoreAndExit "Failed to insert S4: neither S3 nor S2 found in configuration file."
+			# Verify S2 exists before attempting insertion
+			if ! grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
+				_migrationRestoreAndExit "Cannot insert S3: S2 parameter not found in configuration file."
+			fi
+			if ! sed -i "/^S2 = .*/a S3 = ${SERVER_AWG_S3}" "${SERVER_AWG_CONF}"; then
+				_migrationRestoreAndExit "Failed to insert S3 into server configuration file."
+			fi
+			# Verify insertion succeeded
+			if ! grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
+				_migrationRestoreAndExit "S3 insertion appeared to succeed but S3 not found in configuration file."
+			fi
 		fi
 
-		# Perform single insertion after determined anchor
-		if sed -i "/^${S4_ANCHOR} = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
-			S4_INSERTED=1
+		# Insert or update S4 (try update first, then insert after S3, fallback to after S2)
+		# Note: Backups were created at the start of migration, so any failure will restore
+		# the original files via _migrationRestoreAndExit(). GNU sed -i is atomic (writes to
+		# temp file then renames), so partial modifications within a single sed call are unlikely.
+		if grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
+			if ! sed -i "s|^S4 = .*|S4 = ${SERVER_AWG_S4}|" "${SERVER_AWG_CONF}"; then
+				_migrationRestoreAndExit "Failed to update S4 in server configuration file."
+			fi
+		else
+			local S4_INSERTED=0
+			local S4_ANCHOR=""
+
+			# Determine anchor point for insertion (prefer S3, fallback to S2)
+			if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
+				S4_ANCHOR="S3"
+			elif grep -q "^S2 = " "${SERVER_AWG_CONF}"; then
+				S4_ANCHOR="S2"
+			else
+				_migrationRestoreAndExit "Failed to insert S4: neither S3 nor S2 found in configuration file."
+			fi
+
+			# Perform single insertion after determined anchor
+			if sed -i "/^${S4_ANCHOR} = .*/a S4 = ${SERVER_AWG_S4}" "${SERVER_AWG_CONF}"; then
+				S4_INSERTED=1
+			fi
+
+			if [[ ${S4_INSERTED} == 0 ]]; then
+				_migrationRestoreAndExit "Failed to insert S4 after ${S4_ANCHOR} in server configuration file."
+			fi
+
+			# Verify insertion succeeded
+			if ! grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
+				_migrationRestoreAndExit "S4 insertion appeared to succeed but S4 not found in configuration file."
+			fi
 		fi
 
-		if [[ ${S4_INSERTED} == 0 ]]; then
-			_migrationRestoreAndExit "Failed to insert S4 after ${S4_ANCHOR} in server configuration file."
-		fi
+		# Update H1-H4 values (verify existence first, insert if missing)
+		# Process in reverse order (H4, H3, H2, H1) so that when inserting after
+		# the same anchor point, the final order is correct (H1, H2, H3, H4)
+		for H_PARAM in H4 H3 H2 H1; do
+			local H_VAR="SERVER_AWG_${H_PARAM}"
+			local H_VALUE="${!H_VAR}"
 
-		# Verify insertion succeeded
-		if ! grep -q "^S4 = " "${SERVER_AWG_CONF}"; then
-			_migrationRestoreAndExit "S4 insertion appeared to succeed but S4 not found in configuration file."
+			if grep -q "^${H_PARAM} = " "${SERVER_AWG_CONF}"; then
+				if ! sed -i "s|^${H_PARAM} = .*|${H_PARAM} = ${H_VALUE}|" "${SERVER_AWG_CONF}"; then
+					_migrationRestoreAndExit "Failed to update ${H_PARAM} in server configuration file."
+				fi
+			else
+				# Parameter doesn't exist, insert after S4 (or S3, S2 as fallback)
+				local INSERTED=0
+				for AFTER_PARAM in S4 S3 S2; do
+					if grep -q "^${AFTER_PARAM} = " "${SERVER_AWG_CONF}"; then
+						if sed -i "/^${AFTER_PARAM} = .*/a ${H_PARAM} = ${H_VALUE}" "${SERVER_AWG_CONF}"; then
+							INSERTED=1
+							break
+						fi
+					fi
+				done
+				if [[ ${INSERTED} == 0 ]]; then
+					_migrationRestoreAndExit "Failed to insert ${H_PARAM} into server configuration file."
+				fi
+			fi
+		done
+	else
+		maybeWarnLegacyAwg2Unsupported
+		# Ensure legacy parser compatibility by removing unsupported params.
+		if ! sed -i '/^S3 = /d; /^S4 = /d; /^H1 = /d; /^H2 = /d; /^H3 = /d; /^H4 = /d' "${SERVER_AWG_CONF}"; then
+			_migrationRestoreAndExit "Failed to remove unsupported S3/S4/H1-H4 parameters from server configuration file."
 		fi
 	fi
-
-	# Update H1-H4 values (verify existence first, insert if missing)
-	# Process in reverse order (H4, H3, H2, H1) so that when inserting after
-	# the same anchor point, the final order is correct (H1, H2, H3, H4)
-	for H_PARAM in H4 H3 H2 H1; do
-		local H_VAR="SERVER_AWG_${H_PARAM}"
-		local H_VALUE="${!H_VAR}"
-
-		if grep -q "^${H_PARAM} = " "${SERVER_AWG_CONF}"; then
-			if ! sed -i "s|^${H_PARAM} = .*|${H_PARAM} = ${H_VALUE}|" "${SERVER_AWG_CONF}"; then
-				_migrationRestoreAndExit "Failed to update ${H_PARAM} in server configuration file."
-			fi
-		else
-			# Parameter doesn't exist, insert after S4 (or S3, S2 as fallback)
-			local INSERTED=0
-			for AFTER_PARAM in S4 S3 S2; do
-				if grep -q "^${AFTER_PARAM} = " "${SERVER_AWG_CONF}"; then
-					if sed -i "/^${AFTER_PARAM} = .*/a ${H_PARAM} = ${H_VALUE}" "${SERVER_AWG_CONF}"; then
-						INSERTED=1
-						break
-					fi
-				fi
-			done
-			if [[ ${INSERTED} == 0 ]]; then
-				_migrationRestoreAndExit "Failed to insert ${H_PARAM} into server configuration file."
-			fi
-		fi
-	done
 
 	# Normalize the Address line IPv6 if it changed (cosmetic, covered by backup)
 	# Scoped to ^Address to avoid touching PostUp/PostDown firewalld rules
@@ -2950,41 +3002,45 @@ function persistMigration() {
 	# to locate each config file. If the expected path does not exist (e.g., because
 	# the installer is being re-run under a different context than when configs were
 	# created), fall back to a bounded search under /home and /root.
-	echo -e "${GREEN}Marking old client configurations as outdated...${NC}"
 	local CLIENT_CONFIGS_RENAMED=0
-	while IFS= read -r MIGRATE_CLIENT_NAME; do
-		if ! [[ ${MIGRATE_CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ ]]; then
-			continue
-		fi
-		local MIGRATE_HOME_DIR
-		MIGRATE_HOME_DIR=$(getHomeDirForClient "${MIGRATE_CLIENT_NAME}")
-		local MIGRATE_CLIENT_CONF_BASE="${SERVER_AWG_NIC}-client-${MIGRATE_CLIENT_NAME}.conf"
-		local MIGRATE_CLIENT_CONF="${MIGRATE_HOME_DIR}/${MIGRATE_CLIENT_CONF_BASE}"
-
-		# If the config is not found at the expected home directory, search common
-		# locations (/home and /root) for a matching filename. This helps when the
-		# installer is re-run under a different user/root context.
-		if [[ ! -f "${MIGRATE_CLIENT_CONF}" ]]; then
-			local FOUND_MIGRATE_CONF
-			FOUND_MIGRATE_CONF=$(find /home /root -xdev -maxdepth 5 -type f -name "${MIGRATE_CLIENT_CONF_BASE}" 2>/dev/null | head -n 1)
-			if [[ -n "${FOUND_MIGRATE_CONF}" ]]; then
-				MIGRATE_CLIENT_CONF="${FOUND_MIGRATE_CONF}"
+	if awgSupportsAwg2Params; then
+		echo -e "${GREEN}Marking old client configurations as outdated...${NC}"
+		while IFS= read -r MIGRATE_CLIENT_NAME; do
+			if ! [[ ${MIGRATE_CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+				continue
 			fi
-		fi
+			local MIGRATE_HOME_DIR
+			MIGRATE_HOME_DIR=$(getHomeDirForClient "${MIGRATE_CLIENT_NAME}")
+			local MIGRATE_CLIENT_CONF_BASE="${SERVER_AWG_NIC}-client-${MIGRATE_CLIENT_NAME}.conf"
+			local MIGRATE_CLIENT_CONF="${MIGRATE_HOME_DIR}/${MIGRATE_CLIENT_CONF_BASE}"
 
-		if [[ -f "${MIGRATE_CLIENT_CONF}" ]]; then
-			# Only rename if the config doesn't already have S3 parameter
-			# (indicating it's a pre-2.0 config that needs regeneration)
-			if ! grep -q "^S3 = " "${MIGRATE_CLIENT_CONF}"; then
-				if mv "${MIGRATE_CLIENT_CONF}" "${MIGRATE_CLIENT_CONF}.old"; then
-					echo -e "${ORANGE}  Renamed: ${MIGRATE_CLIENT_CONF} -> ${MIGRATE_CLIENT_CONF}.old${NC}"
-					CLIENT_CONFIGS_RENAMED=$((CLIENT_CONFIGS_RENAMED + 1))
-				else
-					echo -e "${RED}  WARNING: Failed to rename ${MIGRATE_CLIENT_CONF}${NC}"
+			# If the config is not found at the expected home directory, search common
+			# locations (/home and /root) for a matching filename. This helps when the
+			# installer is re-run under a different user/root context.
+			if [[ ! -f "${MIGRATE_CLIENT_CONF}" ]]; then
+				local FOUND_MIGRATE_CONF
+				FOUND_MIGRATE_CONF=$(find /home /root -xdev -maxdepth 5 -type f -name "${MIGRATE_CLIENT_CONF_BASE}" 2>/dev/null | head -n 1)
+				if [[ -n "${FOUND_MIGRATE_CONF}" ]]; then
+					MIGRATE_CLIENT_CONF="${FOUND_MIGRATE_CONF}"
 				fi
 			fi
-		fi
-	done < <(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
+
+			if [[ -f "${MIGRATE_CLIENT_CONF}" ]]; then
+				# Only rename if the config doesn't already have S3 parameter
+				# (indicating it's a pre-2.0 config that needs regeneration)
+				if ! grep -q "^S3 = " "${MIGRATE_CLIENT_CONF}"; then
+					if mv "${MIGRATE_CLIENT_CONF}" "${MIGRATE_CLIENT_CONF}.old"; then
+						echo -e "${ORANGE}  Renamed: ${MIGRATE_CLIENT_CONF} -> ${MIGRATE_CLIENT_CONF}.old${NC}"
+						CLIENT_CONFIGS_RENAMED=$((CLIENT_CONFIGS_RENAMED + 1))
+					else
+						echo -e "${RED}  WARNING: Failed to rename ${MIGRATE_CLIENT_CONF}${NC}"
+					fi
+				fi
+			fi
+		done < <(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
+	else
+		maybeWarnLegacyAwg2Unsupported
+	fi
 
 	if (( CLIENT_CONFIGS_RENAMED > 0 )); then
 		echo -e "${ORANGE}  ${CLIENT_CONFIGS_RENAMED} client config(s) renamed with .old suffix${NC}"
@@ -3218,6 +3274,7 @@ function nonInteractiveAddClient() {
 
 	local CLIENT_AWG_IPV6_DISPLAY
 	CLIENT_AWG_IPV6_DISPLAY=$(compressIPv6 "${CLIENT_AWG_IPV6}")
+	maybeWarnLegacyAwg2Unsupported
 
 	# If SERVER_PUB_IP is IPv6, normalize brackets
 	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
@@ -3240,12 +3297,7 @@ Jmin = ${SERVER_AWG_JMIN}
 Jmax = ${SERVER_AWG_JMAX}
 S1 = ${SERVER_AWG_S1}
 S2 = ${SERVER_AWG_S2}
-S3 = ${SERVER_AWG_S3}
-S4 = ${SERVER_AWG_S4}
-H1 = ${SERVER_AWG_H1}
-H2 = ${SERVER_AWG_H2}
-H3 = ${SERVER_AWG_H3}
-H4 = ${SERVER_AWG_H4}
+$(renderAwg2InterfaceParams)
 
 [Peer]
 PublicKey = ${SERVER_PUB_KEY}
