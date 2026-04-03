@@ -125,7 +125,7 @@ install_git() {
     yellow "git is not installed, but is required to fetch the repository."
     printf 'Would you like to install git now using %s? [y/N] ' "${_PKG_MGR}"
     local answer
-    read -r answer
+    read -r answer || return 1
     case "${answer}" in
         [Yy]|[Yy][Ee][Ss]) ;;
         *) return 1 ;;
@@ -136,8 +136,10 @@ install_git() {
     install_log="$(mktemp "${TMPDIR:-/tmp}/awg-git-install.XXXXXX")"
     local install_rc=0
     if [[ "${_PKG_MGR}" == "apt-get" ]]; then
-        apt-get update -qq >>"${install_log}" 2>&1
-        apt-get install -y -qq git >>"${install_log}" 2>&1 || install_rc=$?
+        apt-get update -qq >>"${install_log}" 2>&1 || install_rc=$?
+        if [[ "${install_rc}" -eq 0 ]]; then
+            apt-get install -y -qq git >>"${install_log}" 2>&1 || install_rc=$?
+        fi
     else
         "${_PKG_MGR}" install -y git >>"${install_log}" 2>&1 || install_rc=$?
     fi
