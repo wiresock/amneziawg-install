@@ -405,6 +405,38 @@ else
 	echo "  FAIL: checkOS unsupported distro should fail (rc=${RC}, output: ${OUTPUT})"
 fi
 
+echo "=== ensureSupportedInstallDistro ==="
+
+OUTPUT=$(OS="almalinux"; ensureSupportedInstallDistro 2>&1)
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -ne 0 ]] && echo "${OUTPUT}" | grep -q "temporarily disabled" && echo "${OUTPUT}" | grep -q "EL9-based distributions"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureSupportedInstallDistro should block almalinux with temporary disable message (rc=${RC}, output: ${OUTPUT})"
+fi
+
+OUTPUT=$(OS="rocky"; ensureSupportedInstallDistro 2>&1)
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -ne 0 ]] && echo "${OUTPUT}" | grep -q "temporarily disabled" && echo "${OUTPUT}" | grep -q "EL9-based distributions"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureSupportedInstallDistro should block rocky with temporary disable message (rc=${RC}, output: ${OUTPUT})"
+fi
+
+OUTPUT=$(OS="centos"; ensureSupportedInstallDistro 2>&1)
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && [[ -z "${OUTPUT}" ]]; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureSupportedInstallDistro should not block centos (rc=${RC}, output: ${OUTPUT})"
+fi
+
 echo "=== gai_conf_has_active_ipv4_rule ==="
 GAI_TEST_FILE="$(mktemp)"
 ORIG_GAI_CONF="${GAI_CONF}"

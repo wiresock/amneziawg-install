@@ -624,6 +624,20 @@ function checkOS() {
 	fi
 }
 
+function getTemporarilyDisabledEL9Message() {
+	echo "AlmaLinux and Rocky Linux support is temporarily disabled because verified AmneziaWG 2.0 packages are not currently available for EL9-based distributions. Re-enable this path once updated packages are published."
+}
+
+function ensureSupportedInstallDistro() {
+	# Temporary install block for EL9-family rebuild verification status.
+	# Keep OS detection intact so existing installs on these distros can still
+	# run non-install operations until AWG 2.0 packages are verified.
+	if [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+		echo "$(getTemporarilyDisabledEL9Message)" >&2
+		exit 1
+	fi
+}
+
 function getHomeDirForClient() {
 	local CLIENT_NAME=$1
 
@@ -1279,6 +1293,8 @@ function installQuestions() {
 }
 
 function installAmneziaWG() {
+	ensureSupportedInstallDistro
+
 	# Run setup questions first
 	installQuestions
 
@@ -1470,7 +1486,7 @@ function installAmneziaWG() {
 			fi
 		fi
 		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
-	elif [[ ${OS} == 'centos' ]] || [[ ${OS} == 'almalinux' ]] || [[ ${OS} == 'rocky' ]]; then
+	elif [[ ${OS} == 'centos' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
