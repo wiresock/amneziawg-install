@@ -1417,7 +1417,7 @@ function installAmneziaWG() {
 			echo "deb [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
 			echo "deb-src [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
 		fi
-		apt update
+		apt-get update || { echo -e "${RED}Error: Failed to update package index.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		# Try several candidates in order: exact versioned headers, Raspberry Pi headers,
 		# then the architecture-specific meta package (e.g. linux-headers-amd64) as a last
@@ -1430,17 +1430,20 @@ function installAmneziaWG() {
 		local DEB_ARCH
 		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) && HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
 		for HEADER_PKG in "${HEADER_CANDIDATES[@]}"; do
-			if apt install -y "${HEADER_PKG}" 2>/dev/null; then
+			local HEADER_ERR
+			HEADER_ERR=$(apt-get install -y "${HEADER_PKG}" 2>&1)
+			if [[ $? -eq 0 ]]; then
 				HEADER_INSTALLED=1
 				break
 			else
 				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HEADER_PKG}'. Trying next candidate...${NC}"
+				echo -e "${ORANGE}${HEADER_ERR}${NC}"
 			fi
 		done
 		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
 			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi
-		apt install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		apt-get install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
