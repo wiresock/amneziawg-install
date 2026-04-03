@@ -3232,8 +3232,7 @@ exit((defined $status && $status =~ m{^HTTP/\d\.\d\s+2\d\d\b}) ? 0 : 1);
 
 json_raw_has_poll_error() {
 	local JSON_PAYLOAD="$1"
-	echo "${JSON_PAYLOAD}" | grep -qE 'POLL_ERROR|Operation not permitted' && return 1
-	return 0
+	echo "${JSON_PAYLOAD}" | grep -qE 'POLL_ERROR|Operation not permitted'
 }
 
 json_peers_count() {
@@ -3611,14 +3610,14 @@ for my $line (split /\n/, $awg_dump) {
   my $pub = $f[1] // "";
   my $ep = $f[3] // "";
   my $ips = $f[4] // "";
-  my $rx = ($f[6] // "") =~ /^\d+$/ ? $f[6] : 0;
-  my $tx = ($f[7] // "") =~ /^\d+$/ ? $f[7] : 0;
+  my $rx = (($f[6] // "") =~ /^\d+$/) ? $f[6] : 0;
+  my $tx = (($f[7] // "") =~ /^\d+$/) ? $f[7] : 0;
   $ep = "null" if $ep eq "(none)";
   if ($ep ne "null") {
     $ep =~ s/\\/\\\\/g; $ep =~ s/"/\\"/g;
     $ep = '"' . $ep . '"';
   }
-  for ($iface, $pub, $ips) { s/\\/\\\\/g; s/"/\\"/g; }
+  for ($iface, $pub, $ips) { s/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; }
   push @peer_json, "{\"interface\":\"$iface\",\"public_key\":\"$pub\",\"endpoint\":$ep,\"allowed_ips\":\"$ips\",\"rx_bytes\":$rx,\"tx_bytes\":$tx}";
 }
 $SIG{TERM} = sub { exit 0 };
@@ -3691,12 +3690,12 @@ PHASE8STUBEOF
 
 		# Check that the raw dump does NOT contain an error
 		if json_raw_has_poll_error "${PEERS_RESPONSE}"; then
-			echo "OK: AWG polling succeeded (no permission error)"
-		else
 			echo "FAIL: AWG polling returned a permission error"
 			echo "  This is the exact real-box regression: awg-web user cannot access AWG interface"
 			echo "  Response: ${PEERS_RESPONSE}"
 			FAILED=$((FAILED + 1))
+		else
+			echo "OK: AWG polling succeeded (no permission error)"
 		fi
 
 		# Test 2: Verify at least one peer is visible
