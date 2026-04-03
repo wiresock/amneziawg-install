@@ -184,9 +184,9 @@ Supported Linux distributions:
 
 Temporarily disabled:
 
-- Fedora (RPM-family)
-- AlmaLinux (EL9-family)
-- Rocky Linux (EL9-family)
+- Fedora (RPM-based)
+- AlmaLinux (RPM-based)
+- Rocky Linux (RPM-based)
 
 Reason: verified AmneziaWG 2.0 packages are not currently available for these RPM-based distributions. Support can be re-enabled once updated packages are published.
 
