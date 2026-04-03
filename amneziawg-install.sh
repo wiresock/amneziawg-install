@@ -1417,29 +1417,35 @@ function installAmneziaWG() {
 			echo "deb [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
 			echo "deb-src [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
 		fi
-		apt-get update || { echo -e "${RED}Error: Failed to update package index.${NC}"; exit 1; }
+		apt-get update || { echo -e "${RED}ERROR: Failed to update package index.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		# Try several candidates in order: exact versioned headers, Raspberry Pi headers,
 		# then the architecture-specific meta package (e.g. linux-headers-amd64) as a last
 		# resort.  This mirrors the Ubuntu approach and avoids skipping headers when the
 		# exact versioned package isn't in the local APT cache.
-		HEADER_INSTALLED=0
-		HEADER_CANDIDATES=("linux-headers-$(uname -r)" "raspberrypi-kernel-headers")
+		local HEADER_INSTALLED=0
+		local HEADER_CANDIDATES=("linux-headers-$(uname -r)" "raspberrypi-kernel-headers")
 		# Add the architecture-specific meta-package (e.g. linux-headers-amd64)
 		# as a last-resort fallback, but only if dpkg can report the arch.
 		local DEB_ARCH
 		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) && HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
+		local HEADER_ERR_FILE
+		HEADER_ERR_FILE=$(mktemp) || { echo -e "${RED}ERROR: Failed to create temporary file for apt errors.${NC}"; exit 1; }
 		for HEADER_PKG in "${HEADER_CANDIDATES[@]}"; do
-			local HEADER_ERR
-			HEADER_ERR=$(apt-get install -y "${HEADER_PKG}" 2>&1)
-			if [[ $? -eq 0 ]]; then
+			: >"${HEADER_ERR_FILE}"
+			if apt-get install -y "${HEADER_PKG}" 2>"${HEADER_ERR_FILE}"; then
 				HEADER_INSTALLED=1
 				break
 			else
 				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HEADER_PKG}'. Trying next candidate...${NC}"
-				echo -e "${ORANGE}${HEADER_ERR}${NC}"
+				if [[ -s "${HEADER_ERR_FILE}" ]]; then
+					printf '%b' "${ORANGE}"
+					printf '%s\n' "$(cat "${HEADER_ERR_FILE}")"
+					printf '%b' "${NC}"
+				fi
 			fi
 		done
+		rm -f "${HEADER_ERR_FILE}"
 		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
 			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi
