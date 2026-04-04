@@ -3345,7 +3345,7 @@ try:
     if not isinstance(raw, str):
         sys.exit(1)
     sys.exit(0 if re.search(r"POLL_ERROR|Operation not permitted", raw) else 1)
-except Exception:
+except (json.JSONDecodeError, ValueError):
     sys.exit(1)
 ' <<<"${JSON_PAYLOAD}"
 	else
@@ -3361,7 +3361,7 @@ import json, sys
 try:
     payload = json.loads(sys.stdin.read())
     sys.exit(0 if isinstance(payload, dict) and "peers" in payload else 1)
-except Exception:
+except (json.JSONDecodeError, ValueError):
     sys.exit(1)
 ' <<<"${JSON_PAYLOAD}"
 	elif command -v perl &>/dev/null; then
