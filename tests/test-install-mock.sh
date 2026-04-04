@@ -3211,7 +3211,7 @@ my $ok = eval {
     last if !$n;
     $resp .= $chunk;
   }
-  die "read\n" unless defined $n;
+  die "sysread failed\n" unless defined $n;
   alarm 0;
   1;
 };
