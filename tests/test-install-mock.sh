@@ -3163,7 +3163,7 @@ echo "=== Phase 7: Service startup + health probe ==="
 
 # Check runtime availability for stub HTTP server / API probes
 PERL_HTTP_RUNTIME_OK=false
-if command -v perl &>/dev/null && perl -MIO::Socket::INET -e 1 >/dev/null 2>&1; then
+if command -v perl &>/dev/null && perl -MIO::Socket::INET -MIO::Select -MErrno=EINTR -e 1 >/dev/null 2>&1; then
 	PERL_HTTP_RUNTIME_OK=true
 fi
 if command -v python3 &>/dev/null; then
@@ -3173,7 +3173,7 @@ elif [[ "${PERL_HTTP_RUNTIME_OK}" == "true" ]]; then
 	echo "OK: perl available for stub HTTP server fallback"
 	HAVE_HTTP_RUNTIME=true
 elif command -v perl &>/dev/null; then
-	echo "SKIP: perl found but IO::Socket::INET is unavailable — cannot run HTTP health/API probes"
+	echo "SKIP: perl found but required modules (IO::Socket::INET/IO::Select/Errno) are unavailable — cannot run HTTP health/API probes"
 	echo "  (DB path writability is still validated below)"
 	HAVE_HTTP_RUNTIME=false
 else
@@ -3264,17 +3264,84 @@ except Exception:
 		perl -e '
 use IO::Socket::INET;
 use IO::Select;
+use Errno qw(EINTR);
 my $url = shift @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
 my $timeout = 1;
+my $max_status_bytes = 8192;
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
 my $selector = IO::Select->new($sock);
-exit 1 unless $selector->can_read($timeout);
-my $status = <$sock>;
+my $deadline = time() + $timeout;
+my $status = "";
+while (index($status, "\n") < 0) {
+  my $remaining = $deadline - time();
+  last if $remaining <= 0;
+  last unless $selector->can_read($remaining);
+  my $chunk = "";
+  my $bytes = sysread($sock, $chunk, 1);
+  if (!defined $bytes) {
+    next if $!{EINTR};
+    last;
+  }
+  last if $bytes == 0;
+  $status .= $chunk;
+  last if length($status) >= $max_status_bytes;
+}
 close $sock;
-exit((defined $status && $status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
+exit(($status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
+' "${URL}" >/dev/null 2>&1
+	fi
+}
+
+http_probe_url_200() {
+	local URL="$1"
+	if command -v python3 &>/dev/null; then
+		python3 -c "
+import urllib.request, urllib.error, sys
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+try:
+    opener = urllib.request.build_opener(NoRedirect)
+    resp = opener.open(sys.argv[1], timeout=1)
+    code = resp.getcode()
+    sys.exit(0 if code == 200 else 1)
+except Exception:
+    sys.exit(1)
+" "${URL}" >/dev/null 2>&1
+	else
+		perl -e '
+use IO::Socket::INET;
+use IO::Select;
+use Errno qw(EINTR);
+my $url = shift @ARGV;
+$url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
+my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
+my $timeout = 1;
+my $max_status_bytes = 8192;
+my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
+print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
+my $selector = IO::Select->new($sock);
+my $deadline = time() + $timeout;
+my $status = "";
+while (index($status, "\n") < 0) {
+  my $remaining = $deadline - time();
+  last if $remaining <= 0;
+  last unless $selector->can_read($remaining);
+  my $chunk = "";
+  my $bytes = sysread($sock, $chunk, 1);
+  if (!defined $bytes) {
+    next if $!{EINTR};
+    last;
+  }
+  last if $bytes == 0;
+  $status .= $chunk;
+  last if length($status) >= $max_status_bytes;
+}
+close $sock;
+exit(($status =~ m{^HTTP/\d\.\d\s+200\b}) ? 0 : 1);
 ' "${URL}" >/dev/null 2>&1
 	fi
 }
@@ -3286,7 +3353,27 @@ json_raw_has_poll_error() {
 
 json_peers_count() {
 	local JSON_PAYLOAD="$1"
-	echo "${JSON_PAYLOAD}" | grep -o '"public_key"[[:space:]]*:[[:space:]]*"[^"]*"' | wc -l | tr -d ' '
+	if command -v python3 &>/dev/null; then
+		python3 -c '
+import json, sys
+try:
+    payload = json.loads(sys.stdin.read())
+    peers = payload.get("peers") or []
+    if not isinstance(peers, list):
+        print(0)
+    else:
+        print(sum(
+            1 for peer in peers
+            if isinstance(peer, dict)
+            and isinstance(peer.get("public_key"), str)
+            and len(peer.get("public_key")) > 0
+        ))
+except Exception:
+    print(0)
+' <<<"${JSON_PAYLOAD}"
+	else
+		echo "${JSON_PAYLOAD}" | grep -o '"public_key"[[:space:]]*:[[:space:]]*"[^"]*"' | wc -l | tr -d ' '
+	fi
 }
 
 json_first_peer_has_pubkey() {
@@ -3582,8 +3669,8 @@ PHASE7STUBEOF
 
 	# Probe /login and verify it responds
 	if [[ "${PHASE7_UP}" == "true" ]]; then
-		if http_probe_url "http://127.0.0.1:${WEB_PHASE7_PORT}/login"; then
-			echo "OK: /login endpoint responds with 2xx/3xx"
+		if http_probe_url_200 "http://127.0.0.1:${WEB_PHASE7_PORT}/login"; then
+			echo "OK: /login endpoint responds with 200"
 		else
 			echo "FAIL: /login endpoint did not respond"
 			FAILED=$((FAILED + 1))
