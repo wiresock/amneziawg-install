@@ -3368,10 +3368,10 @@ except (json.JSONDecodeError, ValueError):
 	elif command -v perl &>/dev/null; then
 		perl -e '
 my $s = do { local $/; <STDIN> };
-exit(($s =~ /"peers"\s*:/) ? 0 : 1);
+exit(($s =~ /"peers"\s*:\s*\[/) ? 0 : 1);
 ' <<<"${JSON_PAYLOAD}"
 	else
-		echo "${JSON_PAYLOAD}" | grep -qE '"peers"[[:space:]]*:'
+		echo "${JSON_PAYLOAD}" | grep -qE '"peers"[[:space:]]*:[[:space:]]*\['
 	fi
 }
 
