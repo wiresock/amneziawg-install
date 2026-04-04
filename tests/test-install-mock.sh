@@ -3202,11 +3202,13 @@ $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
 my $timeout = 5;
 my $max_resp_bytes = 1048576;
+my $timeout_error = "HTTP request timed out after $timeout seconds\n";
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
 my $resp = "";
+my $resp_bytes = 0;
 my $ok = eval {
-  local $SIG{ALRM} = sub { die "HTTP request timed out after $timeout seconds\n" };
+  local $SIG{ALRM} = sub { die $timeout_error };
   alarm $timeout;
   while (1) {
     my $n = sysread($sock, my $chunk, 4096);
@@ -3215,7 +3217,8 @@ my $ok = eval {
       die "sysread failed: $!\n";
     }
     last if !$n;
-    die "response too large (max ${max_resp_bytes} bytes)\n" if (length($resp) + length($chunk)) > $max_resp_bytes;
+    $resp_bytes += length($chunk);
+    die "response too large (max ${max_resp_bytes} bytes)\n" if $resp_bytes > $max_resp_bytes;
     $resp .= $chunk;
   }
   1;
