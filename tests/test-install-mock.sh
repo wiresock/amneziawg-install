@@ -3162,10 +3162,14 @@ echo ""
 echo "=== Phase 7: Service startup + health probe ==="
 
 # Check runtime availability for stub HTTP server / API probes
+PERL_HTTP_RUNTIME_OK=false
+if command -v perl &>/dev/null && perl -MIO::Socket::INET -e 1 >/dev/null 2>&1; then
+	PERL_HTTP_RUNTIME_OK=true
+fi
 if command -v python3 &>/dev/null; then
 	echo "OK: python3 available for stub HTTP server"
 	HAVE_HTTP_RUNTIME=true
-elif command -v perl &>/dev/null && perl -MIO::Socket::INET -e 1 >/dev/null 2>&1; then
+elif [[ "${PERL_HTTP_RUNTIME_OK}" == "true" ]]; then
 	echo "OK: perl available for stub HTTP server fallback"
 	HAVE_HTTP_RUNTIME=true
 elif command -v perl &>/dev/null; then
@@ -3195,12 +3199,13 @@ use IO::Socket::INET;
 my $url = shift @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
-my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => 5) or exit 1;
+my $timeout = 5;
+my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
 my $resp = "";
 my $ok = eval {
   local $SIG{ALRM} = sub { die "timeout\n" };
-  alarm 5;
+  alarm $timeout;
   while (1) {
     my $chunk = "";
     my $n = sysread($sock, $chunk, 4096);
