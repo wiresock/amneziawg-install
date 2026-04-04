@@ -3206,7 +3206,7 @@ my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => 
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
 my $resp = "";
 my $ok = eval {
-  local $SIG{ALRM} = sub { die "HTTP request timed out after $timeout seconds\n" };
+  local $SIG{ALRM} = sub { die "HTTP request timed out after 5 seconds\n" };
   alarm $timeout;
   while (1) {
     my $n = sysread($sock, my $chunk, 4096);
@@ -3216,7 +3216,7 @@ my $ok = eval {
     }
     last if !$n;
     $resp .= $chunk;
-    die "response too large\n" if length($resp) > $max_resp_bytes;
+    die "response too large (max ${max_resp_bytes} bytes)\n" if length($resp) > $max_resp_bytes;
   }
   1;
 };
