@@ -3269,6 +3269,7 @@ my $url = shift @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
 my $timeout = 1;
+# Keep this bounded to avoid unbounded memory while waiting for the first status line.
 my $max_status_bytes = 8192;
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
@@ -3280,14 +3281,17 @@ while (index($status, "\n") < 0) {
   last if $remaining <= 0;
   last unless $selector->can_read($remaining);
   my $chunk = "";
-  my $bytes = sysread($sock, $chunk, 1);
+  my $bytes = sysread($sock, $chunk, 256);
   if (!defined $bytes) {
     next if $!{EINTR};
     last;
   }
   last if $bytes == 0;
   $status .= $chunk;
-  last if length($status) >= $max_status_bytes;
+  if (length($status) >= $max_status_bytes) {
+    $status = substr($status, 0, $max_status_bytes);
+    last;
+  }
 }
 close $sock;
 exit(($status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
@@ -3320,6 +3324,7 @@ my $url = shift @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
 my $timeout = 1;
+# Keep this bounded to avoid unbounded memory while waiting for the first status line.
 my $max_status_bytes = 8192;
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
@@ -3331,14 +3336,17 @@ while (index($status, "\n") < 0) {
   last if $remaining <= 0;
   last unless $selector->can_read($remaining);
   my $chunk = "";
-  my $bytes = sysread($sock, $chunk, 1);
+  my $bytes = sysread($sock, $chunk, 256);
   if (!defined $bytes) {
     next if $!{EINTR};
     last;
   }
   last if $bytes == 0;
   $status .= $chunk;
-  last if length($status) >= $max_status_bytes;
+  if (length($status) >= $max_status_bytes) {
+    $status = substr($status, 0, $max_status_bytes);
+    last;
+  }
 }
 close $sock;
 exit(($status =~ m{^HTTP/\d\.\d\s+200\b}) ? 0 : 1);
