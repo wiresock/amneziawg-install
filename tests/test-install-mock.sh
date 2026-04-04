@@ -3201,6 +3201,7 @@ my $url = shift @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
 my $timeout = 5;
+my $max_resp_bytes = 1048576;
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
 my $resp = "";
@@ -3215,6 +3216,7 @@ my $ok = eval {
     }
     last if !$n;
     $resp .= $chunk;
+    die "response too large\n" if length($resp) > $max_resp_bytes;
   }
   1;
 };
