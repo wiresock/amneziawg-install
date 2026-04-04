@@ -3584,7 +3584,7 @@ echo "=== Phase 7: Service startup tests complete ==="
 # Test assumptions / harness notes:
 # - The mock awg binary supports `show all dump` (tab-separated format)
 # - The mock sudo delegates to the actual command (we are root in Docker)
-# - The enhanced stub binary runs a python3 HTTP server that also:
+# - The enhanced stub binary runs an HTTP server (python3 preferred, perl fallback) that also:
 #   1. calls `sudo /usr/bin/awg show all dump` (or our mock equivalent)
 #   2. stores the output for retrieval via /api/peers
 # - This validates the full chain: service → sudo → awg → parse → API
