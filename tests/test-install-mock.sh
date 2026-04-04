@@ -3206,13 +3206,12 @@ my $resp = "";
 my $ok = eval {
   local $SIG{ALRM} = sub { die "timeout\n" };
   alarm $timeout;
-  while (1) {
-    my $chunk = "";
-    my $n = sysread($sock, $chunk, 4096);
-    die "read\n" unless defined $n;
-    last if $n == 0;
+  my $n;
+  while (defined($n = sysread($sock, my $chunk, 4096))) {
+    last if !$n;
     $resp .= $chunk;
   }
+  die "read\n" unless defined $n;
   alarm 0;
   1;
 };
