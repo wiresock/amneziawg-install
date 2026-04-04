@@ -3196,6 +3196,7 @@ except Exception:
 	else
 		perl -e '
 use IO::Socket::INET;
+use Errno qw(EINTR);
 my $url = shift @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
@@ -3206,18 +3207,21 @@ my $resp = "";
 my $ok = eval {
   local $SIG{ALRM} = sub { die "timeout\n" };
   alarm $timeout;
-  my $n;
-  while (defined($n = sysread($sock, my $chunk, 4096))) {
+  while (1) {
+    my $n = sysread($sock, my $chunk, 4096);
+    if (!defined $n) {
+      next if $!{EINTR};
+      die "sysread failed\n";
+    }
     last if !$n;
     $resp .= $chunk;
   }
-  die "sysread failed\n" unless defined $n;
   alarm 0;
   1;
 };
 alarm 0;
 close $sock;
-exit 1 unless $ok && defined $resp && length($resp) > 0;
+exit 1 unless $ok && defined $resp;
 my ($headers, $body);
 if (index($resp, "\r\n\r\n") >= 0) {
   ($headers, $body) = split(/\r\n\r\n/, $resp, 2);
