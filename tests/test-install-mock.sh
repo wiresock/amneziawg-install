@@ -3274,6 +3274,7 @@ my $ok = eval {
   local $SIG{ALRM} = sub { die "timeout\n" };
   alarm $timeout;
   $status = <$sock>;
+  alarm 0;
   1;
 };
 alarm 0;
