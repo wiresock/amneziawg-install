@@ -3274,9 +3274,11 @@ my $ok = eval {
   local $SIG{ALRM} = sub { die "timeout\n" };
   alarm $timeout;
   $status = <$sock>;
+  die "read error: $!\n" if !defined $status && $!;
   alarm 0;
   1;
 };
+# Ensure alarm is cleared even if eval exited via timeout/error.
 alarm 0;
 close $sock;
 exit(($ok && defined $status && $status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
