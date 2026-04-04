@@ -3266,11 +3266,20 @@ use IO::Socket::INET;
 my $url = shift @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
-my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => 1) or exit 1;
+my $timeout = 1;
+my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
-my $status = <$sock>;
+my $status;
+my $ok = eval {
+  local $SIG{ALRM} = sub { die "timeout\n" };
+  alarm $timeout;
+  $status = <$sock>;
+  alarm 0;
+  1;
+};
+alarm 0;
 close $sock;
-exit((defined $status && $status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
+exit(($ok && defined $status && $status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
 ' "${URL}" >/dev/null 2>&1
 	fi
 }
