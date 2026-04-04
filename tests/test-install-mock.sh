@@ -3263,25 +3263,18 @@ except Exception:
 	else
 		perl -e '
 use IO::Socket::INET;
+use IO::Select;
 my $url = shift @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
 my $timeout = 1;
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
-my $status;
-my $ok = eval {
-  local $SIG{ALRM} = sub { die "timeout\n" };
-  alarm $timeout;
-  $status = <$sock>;
-  die "read error\n" unless defined $status;
-  alarm 0;
-  1;
-};
-# Ensure alarm is cleared even if eval exited via timeout/error.
-alarm 0;
+my $selector = IO::Select->new($sock);
+exit 1 unless $selector->can_read($timeout);
+my $status = <$sock>;
 close $sock;
-exit(($ok && defined $status && $status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
+exit((defined $status && $status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
 ' "${URL}" >/dev/null 2>&1
 	fi
 }
