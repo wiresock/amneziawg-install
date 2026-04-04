@@ -3169,7 +3169,6 @@ fi
 if command -v python3 &>/dev/null; then
 	echo "OK: python3 available for stub HTTP server"
 	HAVE_HTTP_RUNTIME=true
-	PERL_HTTP_RUNTIME_OK=false
 elif [[ "${PERL_HTTP_RUNTIME_OK}" == "true" ]]; then
 	echo "OK: perl available for stub HTTP server fallback"
 	HAVE_HTTP_RUNTIME=true
