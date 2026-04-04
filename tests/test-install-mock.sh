@@ -3360,7 +3360,8 @@ json_peers_response_is_valid() {
 import json, sys
 try:
     payload = json.loads(sys.stdin.read())
-    sys.exit(0 if isinstance(payload, dict) and "peers" in payload else 1)
+    peers = payload.get("peers") if isinstance(payload, dict) else None
+    sys.exit(0 if isinstance(payload, dict) and isinstance(peers, list) else 1)
 except (json.JSONDecodeError, ValueError):
     sys.exit(1)
 ' <<<"${JSON_PAYLOAD}"
