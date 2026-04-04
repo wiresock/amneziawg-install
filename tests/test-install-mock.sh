@@ -3165,9 +3165,13 @@ echo "=== Phase 7: Service startup + health probe ==="
 if command -v python3 &>/dev/null; then
 	echo "OK: python3 available for stub HTTP server"
 	HAVE_HTTP_RUNTIME=true
-elif command -v perl &>/dev/null; then
+elif command -v perl &>/dev/null && perl -MIO::Socket::INET -e 1 >/dev/null 2>&1; then
 	echo "OK: perl available for stub HTTP server fallback"
 	HAVE_HTTP_RUNTIME=true
+elif command -v perl &>/dev/null; then
+	echo "SKIP: perl found but IO::Socket::INET is unavailable — cannot run HTTP health/API probes"
+	echo "  (DB path writability is still validated below)"
+	HAVE_HTTP_RUNTIME=false
 else
 	echo "SKIP: neither python3 nor perl available — cannot run HTTP health/API probes"
 	echo "  (DB path writability is still validated below)"
@@ -3193,10 +3197,23 @@ $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => 5) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
-local $/;
-my $resp = <$sock>;
+my $resp = "";
+my $ok = eval {
+  local $SIG{ALRM} = sub { die "timeout\n" };
+  alarm 5;
+  while (1) {
+    my $chunk = "";
+    my $n = sysread($sock, $chunk, 4096);
+    die "read\n" unless defined $n;
+    last if $n == 0;
+    $resp .= $chunk;
+  }
+  alarm 0;
+  1;
+};
+alarm 0;
 close $sock;
-exit 1 unless defined $resp;
+exit 1 unless $ok && defined $resp && length($resp) > 0;
 my ($headers, $body);
 if (index($resp, "\r\n\r\n") >= 0) {
   ($headers, $body) = split(/\r\n\r\n/, $resp, 2);
@@ -3716,7 +3733,7 @@ for my $line (split /\n/, $awg_dump) {
   $ep = "null" if $ep eq "(none)";
   if ($ep ne "null") {
     $ep =~ s/\\/\\\\/g; $ep =~ s/"/\\"/g;
-    $ep = '"' . $ep . '"';
+    $ep = "\"$ep\"";
   }
   for ($iface, $pub, $ips) { s/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; }
   push @peer_json, "{\"interface\":\"$iface\",\"public_key\":\"$pub\",\"endpoint\":$ep,\"allowed_ips\":\"$ips\",\"rx_bytes\":$rx,\"tx_bytes\":$tx}";
