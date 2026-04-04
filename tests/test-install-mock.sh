@@ -3360,6 +3360,7 @@ except Exception:
     print(0)
 ' <<<"${JSON_PAYLOAD}"
 	else
+		# public_key values are generated base64 keys and are expected to be non-empty and quote-free.
 		echo "${JSON_PAYLOAD}" | grep -o '"public_key"[[:space:]]*:[[:space:]]*"[^"]\+"' | wc -l | tr -d ' '
 	fi
 }
