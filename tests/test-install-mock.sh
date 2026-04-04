@@ -3336,7 +3336,42 @@ except Exception:
 
 json_raw_has_poll_error() {
 	local JSON_PAYLOAD="$1"
-	echo "${JSON_PAYLOAD}" | grep -qE 'POLL_ERROR|Operation not permitted'
+	if command -v python3 &>/dev/null; then
+		python3 -c '
+import json, re, sys
+try:
+    payload = json.loads(sys.stdin.read())
+    raw = payload.get("raw")
+    if not isinstance(raw, str):
+        sys.exit(1)
+    sys.exit(0 if re.search(r"POLL_ERROR|Operation not permitted", raw) else 1)
+except Exception:
+    sys.exit(1)
+' <<<"${JSON_PAYLOAD}"
+	else
+		echo "${JSON_PAYLOAD}" | grep -qE 'POLL_ERROR|Operation not permitted'
+	fi
+}
+
+json_peers_response_is_valid() {
+	local JSON_PAYLOAD="$1"
+	if command -v python3 &>/dev/null; then
+		python3 -c '
+import json, sys
+try:
+    payload = json.loads(sys.stdin.read())
+    sys.exit(0 if isinstance(payload, dict) and "peers" in payload else 1)
+except Exception:
+    sys.exit(1)
+' <<<"${JSON_PAYLOAD}"
+	elif command -v perl &>/dev/null; then
+		perl -e '
+my $s = do { local $/; <STDIN> };
+exit(($s =~ /"peers"\s*:/) ? 0 : 1);
+' <<<"${JSON_PAYLOAD}"
+	else
+		echo "${JSON_PAYLOAD}" | grep -qE '"peers"[[:space:]]*:'
+	fi
 }
 
 json_peers_count() {
@@ -3361,7 +3396,7 @@ except Exception:
 ' <<<"${JSON_PAYLOAD}"
 	else
 		# public_key values are generated base64 keys and are expected to be non-empty and quote-free.
-		echo "${JSON_PAYLOAD}" | grep -o '"public_key"[[:space:]]*:[[:space:]]*"[^"]\+"' | wc -l | tr -d ' '
+		echo "${JSON_PAYLOAD}" | { grep -o '"public_key"[[:space:]]*:[[:space:]]*"[^"]\+"' || :; } | wc -l | tr -d ' '
 	fi
 }
 
@@ -3897,19 +3932,36 @@ PHASE8STUBEOF
 	# Test 1: Verify the sudo→awg chain works (no "Operation not permitted")
 	if [[ "${PHASE8_UP}" == "true" ]]; then
 		PEERS_RESPONSE="$(http_get_body "http://127.0.0.1:${PHASE8_PORT}/api/peers" 2>/dev/null)" || PEERS_RESPONSE=""
-
-		# Check that the raw dump does NOT contain an error
-		if json_raw_has_poll_error "${PEERS_RESPONSE}"; then
-			echo "FAIL: AWG polling returned a permission error"
-			echo "  This is the exact real-box regression: awg-web user cannot access AWG interface"
+		PHASE8_RESPONSE_VALID=true
+		if [[ -z "${PEERS_RESPONSE}" ]]; then
+			echo "FAIL: /api/peers returned an empty response"
+			FAILED=$((FAILED + 1))
+			PHASE8_RESPONSE_VALID=false
+		elif ! json_peers_response_is_valid "${PEERS_RESPONSE}"; then
+			echo "FAIL: /api/peers did not return valid JSON payload"
 			echo "  Response: ${PEERS_RESPONSE}"
 			FAILED=$((FAILED + 1))
-		else
-			echo "OK: AWG polling succeeded (no permission error)"
+			PHASE8_RESPONSE_VALID=false
+		fi
+
+		# Check that the raw dump does NOT contain an error
+		if [[ "${PHASE8_RESPONSE_VALID}" == "true" ]]; then
+			if json_raw_has_poll_error "${PEERS_RESPONSE}"; then
+				echo "FAIL: AWG polling returned a permission error"
+				echo "  This is the exact real-box regression: awg-web user cannot access AWG interface"
+				echo "  Response: ${PEERS_RESPONSE}"
+				FAILED=$((FAILED + 1))
+			else
+				echo "OK: AWG polling succeeded (no permission error)"
+			fi
 		fi
 
 		# Test 2: Verify at least one peer is visible
-		PEER_COUNT="$(json_peers_count "${PEERS_RESPONSE}")"
+		if [[ "${PHASE8_RESPONSE_VALID}" == "true" ]]; then
+			PEER_COUNT="$(json_peers_count "${PEERS_RESPONSE}")"
+		else
+			PEER_COUNT=0
+		fi
 
 		if [[ "${PEER_COUNT}" -gt 0 ]]; then
 			echo "OK: /api/peers returned ${PEER_COUNT} peer(s) — peer visibility works"
