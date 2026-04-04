@@ -3169,6 +3169,7 @@ fi
 if command -v python3 &>/dev/null; then
 	echo "OK: python3 available for stub HTTP server"
 	HAVE_HTTP_RUNTIME=true
+	PERL_HTTP_RUNTIME_OK=false
 elif [[ "${PERL_HTTP_RUNTIME_OK}" == "true" ]]; then
 	echo "OK: perl available for stub HTTP server fallback"
 	HAVE_HTTP_RUNTIME=true
@@ -3205,7 +3206,7 @@ my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => 
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
 my $resp = "";
 my $ok = eval {
-  local $SIG{ALRM} = sub { die "HTTP request timed out after ${timeout}s\n" };
+  local $SIG{ALRM} = sub { die "HTTP request timed out after $timeout seconds\n" };
   alarm $timeout;
   while (1) {
     my $n = sysread($sock, my $chunk, 4096);
