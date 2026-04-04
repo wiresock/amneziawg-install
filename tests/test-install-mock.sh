@@ -3274,7 +3274,7 @@ my $ok = eval {
   local $SIG{ALRM} = sub { die "timeout\n" };
   alarm $timeout;
   $status = <$sock>;
-  die "read error: $!\n" if !defined $status && $!;
+  die "read error\n" unless defined $status;
   alarm 0;
   1;
 };
