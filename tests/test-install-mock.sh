@@ -3266,11 +3266,18 @@ except Exception:
     sys.exit(1)
 " "${URL}" >/dev/null 2>&1
 	else
-		perl -e '
+		http_probe_url_perl_status "${URL}" "2xx_or_3xx"
+	fi
+}
+
+http_probe_url_perl_status() {
+	local URL="$1"
+	local STATUS_MODE="$2"
+	perl -e '
 use IO::Socket::INET;
 use IO::Select;
 use Errno qw(EINTR);
-my ($url, $timeout, $max_status_bytes, $read_chunk_size) = @ARGV;
+my ($url, $timeout, $max_status_bytes, $read_chunk_size, $status_mode) = @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
@@ -3296,9 +3303,14 @@ while (index($status, "\n") < 0) {
   }
 }
 close $sock;
-exit(($status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
-' "${URL}" "${HTTP_PROBE_TIMEOUT}" "${HTTP_PROBE_MAX_STATUS_BYTES}" "${HTTP_PROBE_READ_CHUNK_SIZE}" >/dev/null 2>&1
-	fi
+my $ok = 0;
+if ($status_mode eq "200_only") {
+  $ok = ($status =~ m{^HTTP/\d\.\d\s+200\b}) ? 1 : 0;
+} else {
+  $ok = ($status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 1 : 0;
+}
+exit($ok ? 0 : 1);
+' "${URL}" "${HTTP_PROBE_TIMEOUT}" "${HTTP_PROBE_MAX_STATUS_BYTES}" "${HTTP_PROBE_READ_CHUNK_SIZE}" "${STATUS_MODE}" >/dev/null 2>&1
 }
 
 http_probe_url_200() {
@@ -3318,38 +3330,7 @@ except Exception:
     sys.exit(1)
 " "${URL}" >/dev/null 2>&1
 	else
-		perl -e '
-use IO::Socket::INET;
-use IO::Select;
-use Errno qw(EINTR);
-my ($url, $timeout, $max_status_bytes, $read_chunk_size) = @ARGV;
-$url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
-my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
-my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
-print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
-my $selector = IO::Select->new($sock);
-my $deadline = time() + $timeout;
-my $status = "";
-while (index($status, "\n") < 0) {
-  my $remaining = $deadline - time();
-  last if $remaining <= 0;
-  last unless $selector->can_read($remaining);
-  my $chunk = "";
-  my $bytes = sysread($sock, $chunk, $read_chunk_size);
-  if (!defined $bytes) {
-    next if $!{EINTR};
-    last;
-  }
-  last if $bytes == 0;
-  $status .= $chunk;
-  if (length($status) >= $max_status_bytes) {
-    $status = substr($status, 0, $max_status_bytes);
-    last;
-  }
-}
-close $sock;
-exit(($status =~ m{^HTTP/\d\.\d\s+200\b}) ? 0 : 1);
-' "${URL}" "${HTTP_PROBE_TIMEOUT}" "${HTTP_PROBE_MAX_STATUS_BYTES}" "${HTTP_PROBE_READ_CHUNK_SIZE}" >/dev/null 2>&1
+		http_probe_url_perl_status "${URL}" "200_only"
 	fi
 }
 
@@ -3379,7 +3360,7 @@ except Exception:
     print(0)
 ' <<<"${JSON_PAYLOAD}"
 	else
-		echo "${JSON_PAYLOAD}" | grep -o '"public_key"[[:space:]]*:[[:space:]]*"[^"]*"' | wc -l | tr -d ' '
+		echo "${JSON_PAYLOAD}" | grep -o '"public_key"[[:space:]]*:[[:space:]]*"[^"]\+"' | wc -l | tr -d ' '
 	fi
 }
 
