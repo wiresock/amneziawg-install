@@ -3182,6 +3182,11 @@ else
 	HAVE_HTTP_RUNTIME=false
 fi
 
+# Shared probe limits for perl fallback paths.
+HTTP_PROBE_TIMEOUT=1
+HTTP_PROBE_MAX_STATUS_BYTES=8192
+HTTP_PROBE_READ_CHUNK_SIZE=256
+
 http_get_body() {
 	local URL="$1"
 	if command -v python3 &>/dev/null; then
@@ -3265,12 +3270,9 @@ except Exception:
 use IO::Socket::INET;
 use IO::Select;
 use Errno qw(EINTR);
-my $url = shift @ARGV;
+my ($url, $timeout, $max_status_bytes, $read_chunk_size) = @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
-my $timeout = 1;
-# Keep this bounded to avoid unbounded memory while waiting for the first status line.
-my $max_status_bytes = 8192;
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
 my $selector = IO::Select->new($sock);
@@ -3281,7 +3283,7 @@ while (index($status, "\n") < 0) {
   last if $remaining <= 0;
   last unless $selector->can_read($remaining);
   my $chunk = "";
-  my $bytes = sysread($sock, $chunk, 256);
+  my $bytes = sysread($sock, $chunk, $read_chunk_size);
   if (!defined $bytes) {
     next if $!{EINTR};
     last;
@@ -3295,7 +3297,7 @@ while (index($status, "\n") < 0) {
 }
 close $sock;
 exit(($status =~ m{^HTTP/\d\.\d\s+[23]\d\d\b}) ? 0 : 1);
-' "${URL}" >/dev/null 2>&1
+' "${URL}" "${HTTP_PROBE_TIMEOUT}" "${HTTP_PROBE_MAX_STATUS_BYTES}" "${HTTP_PROBE_READ_CHUNK_SIZE}" >/dev/null 2>&1
 	fi
 }
 
@@ -3320,12 +3322,9 @@ except Exception:
 use IO::Socket::INET;
 use IO::Select;
 use Errno qw(EINTR);
-my $url = shift @ARGV;
+my ($url, $timeout, $max_status_bytes, $read_chunk_size) = @ARGV;
 $url =~ m{^http://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?(/.*)?$} or exit 1;
 my ($host, $port, $path) = ($1, $2 || 80, $3 || "/");
-my $timeout = 1;
-# Keep this bounded to avoid unbounded memory while waiting for the first status line.
-my $max_status_bytes = 8192;
 my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => "tcp", Timeout => $timeout) or exit 1;
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
 my $selector = IO::Select->new($sock);
@@ -3336,7 +3335,7 @@ while (index($status, "\n") < 0) {
   last if $remaining <= 0;
   last unless $selector->can_read($remaining);
   my $chunk = "";
-  my $bytes = sysread($sock, $chunk, 256);
+  my $bytes = sysread($sock, $chunk, $read_chunk_size);
   if (!defined $bytes) {
     next if $!{EINTR};
     last;
@@ -3350,7 +3349,7 @@ while (index($status, "\n") < 0) {
 }
 close $sock;
 exit(($status =~ m{^HTTP/\d\.\d\s+200\b}) ? 0 : 1);
-' "${URL}" >/dev/null 2>&1
+' "${URL}" "${HTTP_PROBE_TIMEOUT}" "${HTTP_PROBE_MAX_STATUS_BYTES}" "${HTTP_PROBE_READ_CHUNK_SIZE}" >/dev/null 2>&1
 	fi
 }
 
