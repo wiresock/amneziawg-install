@@ -3205,18 +3205,17 @@ my $sock = IO::Socket::INET->new(PeerHost => $host, PeerPort => $port, Proto => 
 print $sock "GET $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
 my $resp = "";
 my $ok = eval {
-  local $SIG{ALRM} = sub { die "timeout\n" };
+  local $SIG{ALRM} = sub { die "HTTP request timed out after ${timeout}s\n" };
   alarm $timeout;
   while (1) {
     my $n = sysread($sock, my $chunk, 4096);
     if (!defined $n) {
       next if $!{EINTR};
-      die "sysread failed\n";
+      die "sysread failed: $!\n";
     }
     last if !$n;
     $resp .= $chunk;
   }
-  alarm 0;
   1;
 };
 alarm 0;
