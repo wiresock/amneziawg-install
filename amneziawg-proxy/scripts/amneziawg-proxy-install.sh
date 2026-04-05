@@ -960,7 +960,8 @@ reconfigure_awg_listen_port() {
 # ── systemd service ────────────────────────────────────────────────────────────
 
 find_unit_template() {
-    local candidate="${SCRIPT_DIR}/../packaging/${SERVICE_NAME}.service"
+    local candidate
+    candidate="$(dirname "${SCRIPT_DIR}")/packaging/${SERVICE_NAME}.service"
     if [[ -f "${candidate}" ]]; then
         printf '%s' "${candidate}"
         return 0
@@ -1023,16 +1024,16 @@ UNITEOF
     # This ensures the packaging template (which contains static defaults) and the inline
     # unit both end up with the user-selected paths.
     if [[ "${unit_installed}" == "true" ]]; then
-        local read_only_paths="/etc/amnezia ${CONFIG_DIR}"
+        local -a read_only_paths=("/etc/amnezia" "${CONFIG_DIR}")
         if [[ "${AWG_DIR}" != "/etc/amnezia" ]]; then
-            read_only_paths="${read_only_paths} ${AWG_DIR}"
+            read_only_paths+=("${AWG_DIR}")
         fi
 
         sed -i "s|^ExecStart=.*|ExecStart=${INSTALL_DIR}/amneziawg-proxy ${CONFIG_FILE}|" \
             "${SYSTEMD_UNIT_DEST}"
         sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${DATA_DIR}|" \
             "${SYSTEMD_UNIT_DEST}"
-        sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${read_only_paths}|" \
+        sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${read_only_paths[*]}|" \
             "${SYSTEMD_UNIT_DEST}"
         sed -i "s|^ReadWritePaths=.*|ReadWritePaths=${DATA_DIR}|" \
             "${SYSTEMD_UNIT_DEST}"
