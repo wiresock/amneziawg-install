@@ -431,11 +431,11 @@ main() {
         fi
         if [[ "${PURGE_DATA}" == "true" ]]; then
             local data_dir_parent
-            data_dir_parent="$(dirname -- "${DATA_DIR}")/"
-            if [[ "${data_dir_parent}" == "//" || "${data_dir_parent}" == "/" ]]; then
+            data_dir_parent="$(dirname -- "${DATA_DIR}")"
+            if [[ "${data_dir_parent}" == "/" ]]; then
                 die "Refusing to purge data directory with unsafe parent: ${DATA_DIR}"
             fi
-            safe_rm_dir "${DATA_DIR}" "${data_dir_parent}"
+            safe_rm_dir "${DATA_DIR}" "${data_dir_parent}/"
         fi
     fi
 

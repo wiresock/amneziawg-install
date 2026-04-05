@@ -1059,7 +1059,7 @@ UNITEOF
         # Escape characters that are special in a sed replacement string: & and \.
         # The | delimiter is also escaped to avoid breaking the sed expression.
         escape_sed_replacement() {
-            printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
+            printf '%s' "$1" | sed 's/[&\\]/\\&/g'
         }
 
         local -a read_only_paths=("/etc/amnezia" "${CONFIG_DIR}")
