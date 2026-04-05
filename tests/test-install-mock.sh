@@ -3372,8 +3372,91 @@ my $s = do { local $/; <STDIN> };
 exit(($s =~ /"peers"\s*:\s*\[/ && $s =~ /"raw"\s*:\s*"/) ? 0 : 1);
 ' <<<"${JSON_PAYLOAD}"
 	else
-		echo "${JSON_PAYLOAD}" | grep -qE '"peers"[[:space:]]*:[[:space:]]*\[.*"raw"[[:space:]]*:[[:space:]]*"'
+		echo "${JSON_PAYLOAD}" | grep -qE '"peers"[[:space:]]*:[[:space:]]*\[' \
+			&& echo "${JSON_PAYLOAD}" | grep -qE '"raw"[[:space:]]*:[[:space:]]*"'
 	fi
+}
+
+json_perl_actual_peer_summary() {
+	local JSON_PAYLOAD="$1"
+	perl -e '
+my $s = do { local $/; <STDIN> };
+my $len = length($s);
+my $i = 0;
+my $in_str = 0;
+my $esc = 0;
+my $peers_key_end = -1;
+
+while ($i < $len) {
+	my $c = substr($s, $i, 1);
+	if ($in_str) {
+		if ($esc) { $esc = 0; }
+		elsif ($c eq "\\") { $esc = 1; }
+		elsif ($c eq "\"") { $in_str = 0; }
+		$i++;
+		next;
+	}
+	if ($c eq "\"") {
+		if (substr($s, $i, 7) eq "\"peers\"") { $peers_key_end = $i + 7; last; }
+		$in_str = 1;
+	}
+	$i++;
+}
+if ($peers_key_end < 0) { print "0 no"; exit 0; }
+
+$i = $peers_key_end;
+while ($i < $len && substr($s, $i, 1) =~ /\s/) { $i++; }
+if ($i >= $len || substr($s, $i, 1) ne ":") { print "0 no"; exit 0; }
+$i++;
+while ($i < $len && substr($s, $i, 1) =~ /\s/) { $i++; }
+if ($i >= $len || substr($s, $i, 1) ne "[") { print "0 no"; exit 0; }
+$i++;
+
+my $count = 0;
+my $first_has_pub = "no";
+while ($i < $len) {
+	while ($i < $len && substr($s, $i, 1) =~ /[\s,]/) { $i++; }
+	last if $i >= $len;
+	my $ch = substr($s, $i, 1);
+	last if $ch eq "]";
+	if ($ch ne "{") { $i++; next; }
+
+	my $start = $i;
+	my $depth = 0;
+	$in_str = 0;
+	$esc = 0;
+	while ($i < $len) {
+		my $c = substr($s, $i, 1);
+		if ($in_str) {
+			if ($esc) { $esc = 0; }
+			elsif ($c eq "\\") { $esc = 1; }
+			elsif ($c eq "\"") { $in_str = 0; }
+			$i++;
+			next;
+		}
+		if ($c eq "\"") { $in_str = 1; $i++; next; }
+		if ($c eq "{") { $depth++; }
+		elsif ($c eq "}") {
+			$depth--;
+			if ($depth == 0) {
+				my $obj = substr($s, $start, $i - $start + 1);
+				my $pub = "";
+				my $ips = "";
+				$pub = $1 if $obj =~ /"public_key"\s*:\s*"((?:\\.|[^"\\])*)"/s;
+				$ips = $1 if $obj =~ /"allowed_ips"\s*:\s*"((?:\\.|[^"\\])*)"/s;
+				if (length($pub) > 0 && index($ips, "/") >= 0) {
+					$count++;
+					if ($first_has_pub eq "no") { $first_has_pub = "yes"; }
+				}
+				$i++;
+				last;
+			}
+		}
+		$i++;
+	}
+}
+print "$count $first_has_pub";
+' <<<"${JSON_PAYLOAD}"
 }
 
 json_peers_count() {
@@ -3399,17 +3482,7 @@ except Exception:
     print(0)
 ' <<<"${JSON_PAYLOAD}"
 	elif command -v perl &>/dev/null; then
-		perl -e '
-my $s = do { local $/; <STDIN> };
-my $count = 0;
-while ($s =~ /\{[^{}]*"public_key"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]*"allowed_ips"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]*\}/sg) {
-	my ($pub, $ips) = ($1 // "", $2 // "");
-	next if $pub eq "";
-	next if index($ips, "/") < 0;
-	$count++;
-}
-print $count;
-' <<<"${JSON_PAYLOAD}"
+		json_perl_actual_peer_summary "${JSON_PAYLOAD}" | awk '{print $1}'
 	else
 		# public_key values are generated base64 keys and are expected to be non-empty and quote-free.
 		echo "${JSON_PAYLOAD}" | { grep -o '"public_key"[[:space:]]*:[[:space:]]*"[^"]\+"' || :; } | wc -l | tr -d ' '
@@ -3436,18 +3509,7 @@ except Exception:
     print("no")
 ' <<<"${JSON_PAYLOAD}"
 	elif command -v perl &>/dev/null; then
-		perl -e '
-my $s = do { local $/; <STDIN> };
-while ($s =~ /\{[^{}]*"public_key"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]*"allowed_ips"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]*\}/sg) {
-	my ($pub, $ips) = ($1 // "", $2 // "");
-	next if index($ips, "/") < 0;
-	if (length($pub) > 0) {
-		print "yes";
-		exit 0;
-	}
-}
-print "no";
-' <<<"${JSON_PAYLOAD}"
+		json_perl_actual_peer_summary "${JSON_PAYLOAD}" | awk '{print $2}'
 	else
 		echo "no"
 	fi
