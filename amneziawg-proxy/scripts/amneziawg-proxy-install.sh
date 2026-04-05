@@ -737,17 +737,19 @@ Re-run with: --listen-port <port>"
     fi
 
     # Validate configurable paths: must be absolute and contain no newlines.
-    local path_var path_val
+    local path_var path_val flag_name
     for path_var in INSTALL_DIR CONFIG_FILE DATA_DIR AWG_DIR; do
         path_val="${!path_var}"
+        flag_name="--${path_var//_/-}"
+        flag_name="${flag_name,,}"
         if [[ -z "${path_val}" ]]; then
-            die "--${path_var,,} must not be empty."
+            die "${flag_name} must not be empty."
         fi
         if [[ "${path_val}" != /* ]]; then
-            die "--${path_var,,} must be an absolute path (got: '${path_val}')."
+            die "${flag_name} must be an absolute path (got: '${path_val}')."
         fi
         if [[ "${path_val}" == *$'\n'* ]]; then
-            die "--${path_var,,} must not contain newline characters."
+            die "${flag_name} must not contain newline characters."
         fi
     done
 }
