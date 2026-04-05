@@ -3379,7 +3379,12 @@ exit(($s =~ /"peers"\s*:\s*\[/ && $s =~ /"raw"\s*:\s*"/) ? 0 : 1);
 
 json_perl_actual_peer_summary() {
 	local JSON_PAYLOAD="$1"
-	perl -e '
+	if [[ "${JSON_PERL_PEER_SUMMARY_CACHE_INPUT-}" == "${JSON_PAYLOAD}" ]]; then
+		echo "${JSON_PERL_PEER_SUMMARY_CACHE_OUTPUT-0 no}"
+		return 0
+	fi
+	local summary_line
+	summary_line="$(perl -e '
 my $s = do { local $/; <STDIN> };
 my $i = 0;
 my $len = length($s);
@@ -3456,7 +3461,10 @@ while ($i < $len) {
 	}
 }
 print "$count $first_has_pub";
-' <<<"${JSON_PAYLOAD}"
+' <<<"${JSON_PAYLOAD}")"
+	JSON_PERL_PEER_SUMMARY_CACHE_INPUT="${JSON_PAYLOAD}"
+	JSON_PERL_PEER_SUMMARY_CACHE_OUTPUT="${summary_line:-0 no}"
+	echo "${JSON_PERL_PEER_SUMMARY_CACHE_OUTPUT}"
 }
 
 json_peers_count() {
@@ -3711,7 +3719,7 @@ PHASE7STUBEOF
 			HEALTH_JSON_STATE="$(printf '%s' "${HEALTH_RESPONSE}" | python3 -c '
 import json, sys
 try:
-    payload = json.load(sys.stdin)
+    payload = json.loads(sys.stdin.read())
 except Exception:
     print("invalid_json")
     sys.exit(0)
