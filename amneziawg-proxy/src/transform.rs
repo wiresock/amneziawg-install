@@ -434,15 +434,15 @@ mod tests {
     #[test]
     fn awg_transform_handshake_init_quic() {
         let params = test_awg_params();
-        // Build a packet: S1 prefix padding + H1-range header + body
+        // Build a packet: S1 prefix padding + H1-range header + 148-byte WG message
         let padding_original = [0xFF; 10]; // S1 = 10 bytes of random prefix padding
         let header = 150u32.to_le_bytes();
-        let body = [0xAA; 30]; // body portion
+        let body = [0xAA; 148 - 4]; // 148 total message size includes 4-byte header
         let mut pkt = Vec::new();
         pkt.extend_from_slice(&padding_original);
         pkt.extend_from_slice(&header);
         pkt.extend_from_slice(&body);
-        assert_eq!(pkt.len(), 44); // 10 + 4 + 30
+        assert_eq!(pkt.len(), 10 + 148); // S1 + WG message size
 
         let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic);
         assert!(result);
@@ -456,7 +456,7 @@ mod tests {
         // Header should be untouched
         assert_eq!(&pkt[10..14], &150u32.to_le_bytes());
         // Body should be untouched
-        assert!(pkt[14..44].iter().all(|&b| b == 0xAA));
+        assert!(pkt[14..10+148].iter().all(|&b| b == 0xAA));
     }
 
     #[test]
@@ -487,14 +487,15 @@ mod tests {
     #[test]
     fn awg_transform_handshake_response_dns() {
         let params = test_awg_params();
-        // S2 = 8 bytes prefix + H2-range header + body
-        let padding_original = [0xFF; 8]; // S2 = 8
+        // Build a packet: S2 prefix padding + H2-range header + 92-byte WG message
+        let padding_original = [0xFF; 8]; // S2 = 8 bytes of random prefix padding
         let header = 350u32.to_le_bytes();
-        let body = [0xDD; 50];
+        let body = [0xDD; 92 - 4]; // 92 total message size includes 4-byte header
         let mut pkt = Vec::new();
         pkt.extend_from_slice(&padding_original);
         pkt.extend_from_slice(&header);
         pkt.extend_from_slice(&body);
+        assert_eq!(pkt.len(), 8 + 92); // S2 + WG message size
 
         let result = apply_awg_transform(&mut pkt, &params, Protocol::Dns);
         assert!(result);
@@ -505,7 +506,7 @@ mod tests {
         // Header should be untouched
         assert_eq!(&pkt[8..12], &350u32.to_le_bytes());
         // Body should be untouched
-        assert!(pkt[12..62].iter().all(|&b| b == 0xDD));
+        assert!(pkt[12..8+92].iter().all(|&b| b == 0xDD));
     }
 
     #[test]

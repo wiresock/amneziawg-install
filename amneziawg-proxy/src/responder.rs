@@ -2,6 +2,14 @@ use bytes::{Bytes, BytesMut, BufMut};
 
 use crate::config::AwgParams;
 
+/// WireGuard message sizes (excluding padding)
+/// These are the standard WireGuard message sizes as defined in the WireGuard specification
+const WG_HANDSHAKE_INIT_SIZE: usize = 148;
+const WG_HANDSHAKE_RESPONSE_SIZE: usize = 92;
+const WG_COOKIE_REPLY_SIZE: usize = 64;
+/// Transport data messages have variable size, so we only validate minimum size
+const WG_TRANSPORT_DATA_MIN_SIZE: usize = 32;
+
 /// Detected imitation protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -34,18 +42,39 @@ impl AwgPacketType {
             AwgPacketType::TransportData => params.s4 as usize,
         }
     }
+
+    /// Return the expected WireGuard message size (excluding padding) for this packet type.
+    /// Returns None for TransportData since it has variable size.
+    pub fn expected_message_size(&self) -> Option<usize> {
+        match self {
+            AwgPacketType::HandshakeInit => Some(WG_HANDSHAKE_INIT_SIZE),
+            AwgPacketType::HandshakeResponse => Some(WG_HANDSHAKE_RESPONSE_SIZE),
+            AwgPacketType::CookieReply => Some(WG_COOKIE_REPLY_SIZE),
+            AwgPacketType::TransportData => None, // Variable size
+        }
+    }
+
+    /// Return the minimum total packet size (padding + message) for this packet type.
+    pub fn min_total_size(&self, params: &AwgParams) -> usize {
+        let padding = self.padding_size(params);
+        match self {
+            AwgPacketType::TransportData => padding + WG_TRANSPORT_DATA_MIN_SIZE,
+            _ => padding + self.expected_message_size().unwrap_or(0),
+        }
+    }
 }
 
 /// Classify an AmneziaWG packet by checking the H-range header that follows
-/// the S-padding prefix.
+/// the S-padding prefix and validating expected packet sizes.
 ///
 /// AmneziaWG prepends S1–S4 random bytes before the obfuscated header, so the
 /// header starts at byte offset S for each packet type.  This function tries
-/// each (S-offset, H-range) pair and returns the first match.
+/// each (S-offset, H-range) pair and validates the total packet size matches
+/// expected WireGuard message sizes.
 ///
-/// Returns `None` if the packet is too short for any candidate offset or the
-/// header value at no offset matches a configured H range (e.g. junk packet or
-/// non-AWG traffic).
+/// Returns `None` if the packet is too short, the header value doesn't match
+/// any configured H range, or the total size doesn't match expected message
+/// sizes (reduces false positives from random data).
 pub fn classify_awg_packet(data: &[u8], params: &AwgParams) -> Option<AwgPacketType> {
     let candidates = [
         (params.s1 as usize, params.h1, AwgPacketType::HandshakeInit),
@@ -55,16 +84,34 @@ pub fn classify_awg_packet(data: &[u8], params: &AwgParams) -> Option<AwgPacketT
     ];
 
     for (offset, range, pkt_type) in candidates {
-        if data.len() >= offset + 4 {
-            let header = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]);
-            if range.contains(header) {
-                return Some(pkt_type);
+        // Check if we have enough bytes to read the header
+        if data.len() < offset + 4 {
+            continue;
+        }
+
+        // Check if total size matches expected message size
+        if let Some(expected_msg_size) = pkt_type.expected_message_size() {
+            let total_expected_size = offset + expected_msg_size;
+            if data.len() != total_expected_size {
+                continue; // Size mismatch, skip this candidate
             }
+        } else {
+            // For TransportData (variable size), check minimum size
+            let min_total_size = pkt_type.min_total_size(params);
+            if data.len() < min_total_size {
+                continue;
+            }
+        }
+
+        // Check if header matches the H-range
+        let header = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        if range.contains(header) {
+            return Some(pkt_type);
         }
     }
     None
@@ -736,10 +783,10 @@ mod tests {
     #[test]
     fn classify_handshake_init() {
         let params = test_awg_params();
-        // S1(42) prefix padding + H1-range header at offset 42 + body
-        let mut pkt = vec![0x00; 42];
-        pkt.extend_from_slice(&150u32.to_le_bytes());
-        pkt.extend_from_slice(&[0u8; 200]);
+        // S1(42) prefix padding + 148-byte WG message total
+        let mut pkt = vec![0x00; 42]; // S1 padding
+        pkt.extend_from_slice(&150u32.to_le_bytes()); // H1 header (replaces message type)
+        pkt.extend_from_slice(&[0u8; 148 - 4]); // Rest of WG message (148 total includes 4-byte header)
         assert_eq!(
             classify_awg_packet(&pkt, &params),
             Some(AwgPacketType::HandshakeInit)
@@ -749,10 +796,10 @@ mod tests {
     #[test]
     fn classify_handshake_response() {
         let params = test_awg_params();
-        // S2(88) prefix padding + H2-range header at offset 88 + body
-        let mut pkt = vec![0x00; 88];
-        pkt.extend_from_slice(&350u32.to_le_bytes());
-        pkt.extend_from_slice(&[0u8; 100]);
+        // S2(88) prefix padding + 92-byte WG message total
+        let mut pkt = vec![0x00; 88]; // S2 padding
+        pkt.extend_from_slice(&350u32.to_le_bytes()); // H2 header (replaces message type)
+        pkt.extend_from_slice(&[0u8; 92 - 4]); // Rest of WG message (92 total includes 4-byte header)
         assert_eq!(
             classify_awg_packet(&pkt, &params),
             Some(AwgPacketType::HandshakeResponse)
@@ -762,10 +809,10 @@ mod tests {
     #[test]
     fn classify_cookie_reply() {
         let params = test_awg_params();
-        // S3(33) prefix padding + H3-range header at offset 33 + body
-        let mut pkt = vec![0x00; 33];
-        pkt.extend_from_slice(&550u32.to_le_bytes());
-        pkt.extend_from_slice(&[0u8; 70]);
+        // S3(33) prefix padding + 64-byte WG message total
+        let mut pkt = vec![0x00; 33]; // S3 padding
+        pkt.extend_from_slice(&550u32.to_le_bytes()); // H3 header (replaces message type)
+        pkt.extend_from_slice(&[0u8; 64 - 4]); // Rest of WG message (64 total includes 4-byte header)
         assert_eq!(
             classify_awg_packet(&pkt, &params),
             Some(AwgPacketType::CookieReply)
@@ -801,26 +848,70 @@ mod tests {
     }
 
     #[test]
+    fn classify_size_mismatch_rejects_false_positive() {
+        let params = test_awg_params();
+        // Handshake Init with correct header but wrong size (should be S1+148=190 bytes)
+        let mut pkt = vec![0x00; 42]; // S1 padding
+        pkt.extend_from_slice(&50u32.to_le_bytes()); // H1 header
+        pkt.extend_from_slice(&[0u8; 100]); // Only 100 bytes payload, total 142 < 190
+        assert_eq!(classify_awg_packet(&pkt, &params), None);
+    }
+
+    #[test]
+    fn classify_exact_size_accepted() {
+        let params = test_awg_params();
+        // Handshake Init with exact correct size: S1(42) + 148 = 190 bytes total
+        let mut pkt = vec![0x00; 42]; // S1 padding
+        pkt.extend_from_slice(&150u32.to_le_bytes()); // H1 header (within range 100-200)
+        pkt.extend_from_slice(&[0u8; 148 - 4]); // Rest of WG message
+        assert_eq!(
+            classify_awg_packet(&pkt, &params),
+            Some(AwgPacketType::HandshakeInit)
+        );
+    }
+
+    #[test]
+    fn classify_transport_data_variable_size() {
+        let params = test_awg_params();
+        // Transport Data with variable size, should accept any size >= minimum
+        let mut pkt = vec![0x00; 120]; // S4 padding
+        pkt.extend_from_slice(&750u32.to_le_bytes()); // H4 header
+        pkt.extend_from_slice(&[0u8; 200]); // 200 bytes payload (>= min 32)
+        assert_eq!(
+            classify_awg_packet(&pkt, &params),
+            Some(AwgPacketType::TransportData)
+        );
+    }
+
+    #[test]
+    fn classify_transport_data_too_small() {
+        let params = test_awg_params();
+        // Transport Data below minimum size: S4(120) + min payload(32) = 152 bytes
+        let mut pkt = vec![0x00; 120]; // S4 padding
+        pkt.extend_from_slice(&750u32.to_le_bytes()); // H4 header
+        pkt.extend_from_slice(&[0u8; 20]); // Only 20 bytes payload < min 32
+        assert_eq!(classify_awg_packet(&pkt, &params), None);
+    }
+
+    #[test]
     fn classify_boundary_values() {
         let params = test_awg_params();
-        // H1 min boundary at offset S1(42)
-        let mut pkt = vec![0x00; 250];
-        pkt[42..46].copy_from_slice(&100u32.to_le_bytes());
+        // H1 min boundary at offset S1(42) with exact size
+        let mut pkt = vec![0x00; 42]; // S1 padding
+        pkt.extend_from_slice(&100u32.to_le_bytes()); // H1 min value
+        pkt.extend_from_slice(&[0u8; 148 - 4]); // Rest of WG message
         assert_eq!(
             classify_awg_packet(&pkt, &params),
             Some(AwgPacketType::HandshakeInit)
         );
-        // H1 max boundary at offset S1(42)
-        let mut pkt = vec![0x00; 250];
-        pkt[42..46].copy_from_slice(&200u32.to_le_bytes());
+        // H1 max boundary at offset S1(42) with exact size
+        let mut pkt = vec![0x00; 42]; // S1 padding
+        pkt.extend_from_slice(&200u32.to_le_bytes()); // H1 max value
+        pkt.extend_from_slice(&[0u8; 148 - 4]); // Rest of WG message
         assert_eq!(
             classify_awg_packet(&pkt, &params),
             Some(AwgPacketType::HandshakeInit)
         );
-        // Just outside H1 at offset S1(42)
-        let mut pkt = vec![0x00; 250];
-        pkt[42..46].copy_from_slice(&201u32.to_le_bytes());
-        assert_eq!(classify_awg_packet(&pkt, &params), None);
     }
 
     #[test]
