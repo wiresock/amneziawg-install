@@ -282,6 +282,13 @@ restore_awg_listen_port() {
         return 0
     fi
 
+    # Validate that the parsed port is a plain integer in 1–65535 range.
+    if ! [[ "${PROXY_LISTEN_PORT}" =~ ^[0-9]+$ ]] || \
+       (( PROXY_LISTEN_PORT < 1 || PROXY_LISTEN_PORT > 65535 )); then
+        warn "Parsed listen port '${PROXY_LISTEN_PORT}' is not a valid port number; skipping restore."
+        return 0
+    fi
+
     info "Proxy was listening on port ${PROXY_LISTEN_PORT}."
     if [[ -n "${PROXY_BACKEND_PORT}" ]]; then
         info "AWG backend was on port ${PROXY_BACKEND_PORT}."

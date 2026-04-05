@@ -30,7 +30,8 @@ readonly SYSTEMD_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-die() { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+die()  { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+warn() { printf '\033[0;33m[WARN] \033[0m %s\n' "$*" >&2; }
 
 require_inner_script() {
     local path="$1"
