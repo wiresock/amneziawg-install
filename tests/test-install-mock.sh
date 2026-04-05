@@ -3381,8 +3381,8 @@ json_perl_actual_peer_summary() {
 	local JSON_PAYLOAD="$1"
 	perl -e '
 my $s = do { local $/; <STDIN> };
-my $len = length($s);
 my $i = 0;
+my $len = length($s);
 my $in_str = 0;
 my $esc = 0;
 my $peers_key_end = -1;
@@ -3463,11 +3463,10 @@ json_peers_count() {
 	local JSON_PAYLOAD="$1"
 	if command -v python3 &>/dev/null; then
 		python3 -c '
-import json, sys
+import json, re, sys
 try:
     payload = json.loads(sys.stdin.read())
     peers = payload.get("peers") or []
-    import re
     if not isinstance(peers, list):
         print(0)
     else:
@@ -3494,11 +3493,10 @@ json_first_peer_has_pubkey() {
 	local JSON_PAYLOAD="$1"
 	if command -v python3 &>/dev/null; then
 		python3 -c '
-import json, sys
+import json, re, sys
 try:
     payload = json.loads(sys.stdin.read())
     peers = payload.get("peers") or []
-    import re
     first = next((
         peer for peer in peers
         if isinstance(peer, dict)
