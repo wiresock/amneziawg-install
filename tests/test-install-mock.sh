@@ -3444,7 +3444,7 @@ while ($i < $len) {
 				my $ips = "";
 				$pub = $1 if $obj =~ /"public_key"\s*:\s*"((?:\\.|[^"\\])*)"/s;
 				$ips = $1 if $obj =~ /"allowed_ips"\s*:\s*"((?:\\.|[^"\\])*)"/s;
-				if (length($pub) > 0 && index($ips, "/") >= 0) {
+				if (length($pub) > 0 && $ips =~ m{/\d+}) {
 					$count++;
 					if ($first_has_pub eq "no") { $first_has_pub = "yes"; }
 				}
@@ -3467,6 +3467,7 @@ import json, sys
 try:
     payload = json.loads(sys.stdin.read())
     peers = payload.get("peers") or []
+    import re
     if not isinstance(peers, list):
         print(0)
     else:
@@ -3476,7 +3477,7 @@ try:
             and isinstance(peer.get("public_key"), str)
             and len(peer.get("public_key")) > 0
             and isinstance(peer.get("allowed_ips"), str)
-            and "/" in peer.get("allowed_ips")
+            and re.search(r"/\d+", peer.get("allowed_ips"))
         ))
 except Exception:
     print(0)
@@ -3497,11 +3498,12 @@ import json, sys
 try:
     payload = json.loads(sys.stdin.read())
     peers = payload.get("peers") or []
+    import re
     first = next((
         peer for peer in peers
         if isinstance(peer, dict)
         and isinstance(peer.get("allowed_ips"), str)
-        and "/" in peer.get("allowed_ips")
+        and re.search(r"/\d+", peer.get("allowed_ips"))
     ), {}) if isinstance(peers, list) else {}
     public_key_value = first.get("public_key") if isinstance(first, dict) else None
     print("yes" if isinstance(public_key_value, str) and len(public_key_value) > 0 else "no")
@@ -3708,10 +3710,23 @@ PHASE7STUBEOF
 	if [[ "${PHASE7_UP}" == "true" ]]; then
 		HEALTH_RESPONSE="$(http_get_body "http://127.0.0.1:${WEB_PHASE7_PORT}/api/health" 2>/dev/null)" || HEALTH_RESPONSE=""
 		if command -v python3 >/dev/null 2>&1; then
-			if printf '%s' "${HEALTH_RESPONSE}" | python3 -c 'import json, sys; sys.exit(0 if json.load(sys.stdin).get("status") == "ok" else 1)' >/dev/null 2>&1; then
+			HEALTH_JSON_STATE="$(printf '%s' "${HEALTH_RESPONSE}" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print("invalid_json")
+    sys.exit(0)
+print("ok" if isinstance(payload, dict) and payload.get("status") == "ok" else "unexpected_status")
+')"
+			if [[ "${HEALTH_JSON_STATE}" == "ok" ]]; then
 				echo "OK: /api/health returned valid JSON with {\"status\": \"ok\"}"
+			elif [[ "${HEALTH_JSON_STATE}" == "invalid_json" ]]; then
+				echo "FAIL: /api/health returned malformed JSON"
+				echo "  Got: ${HEALTH_RESPONSE}"
+				FAILED=$((FAILED + 1))
 			else
-				echo "FAIL: /api/health did not return expected JSON response"
+				echo "FAIL: /api/health JSON missing expected status=ok"
 				echo "  Got: ${HEALTH_RESPONSE}"
 				FAILED=$((FAILED + 1))
 			fi
