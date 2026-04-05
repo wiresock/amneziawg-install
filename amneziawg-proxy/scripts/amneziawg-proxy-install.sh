@@ -735,6 +735,21 @@ Re-run with: --listen-port <port>"
     if ! is_positive_integer "${RATE_LIMIT}"; then
         die "Invalid --rate-limit: '${RATE_LIMIT}'. Must be a positive integer."
     fi
+
+    # Validate configurable paths: must be absolute and contain no newlines.
+    local path_var path_val
+    for path_var in INSTALL_DIR CONFIG_FILE DATA_DIR AWG_DIR; do
+        path_val="${!path_var}"
+        if [[ -z "${path_val}" ]]; then
+            die "--${path_var,,} must not be empty."
+        fi
+        if [[ "${path_val}" != /* ]]; then
+            die "--${path_var,,} must be an absolute path (got: '${path_val}')."
+        fi
+        if [[ "${path_val}" == *$'\n'* ]]; then
+            die "--${path_var,,} must not contain newline characters."
+        fi
+    done
 }
 
 # ── Filesystem setup ───────────────────────────────────────────────────────────
@@ -958,10 +973,9 @@ reconfigure_awg_listen_port() {
         info "Updated ListenPort → ${BACKEND_PORT}"
     fi
 
-    # Update or insert ListenAddr to restrict AWG to loopback
-    # Note: AmneziaWG supports ListenAddr in newer versions; otherwise use
-    # the Address field approach (not needed for proxy topology).
-    # We add a comment regardless so operators know the intent.
+    # Update or insert ListenAddr to restrict AWG to loopback.
+    # Note: AmneziaWG supports ListenAddr in newer versions only. When the
+    # directive is absent the code prints firewall guidance instead.
     if [[ "${needs_addr_change}" == "true" ]]; then
         if grep -qi '^[[:space:]]*ListenAddr[[:space:]]*=' "${AWG_CONF_FILE}"; then
             sed -i "s|^[[:space:]]*ListenAddr[[:space:]]*=.*|ListenAddr = ${BACKEND_HOST}|i" \
@@ -1056,10 +1070,10 @@ UNITEOF
     # This keeps an existing preserved unit in sync with the user-selected paths
     # before any daemon-reload/enable/restart operations.
     if [[ -f "${SYSTEMD_UNIT_DEST}" ]]; then
-        # Escape characters that are special in a sed replacement string: & and \.
-        # The | delimiter is also escaped to avoid breaking the sed expression.
+        # Escape characters that are special in a sed replacement string: &, \,
+        # and | (the sed delimiter used in the commands below).
         escape_sed_replacement() {
-            printf '%s' "$1" | sed 's/[&\\]/\\&/g'
+            printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
         }
 
         local -a read_only_paths=("/etc/amnezia" "${CONFIG_DIR}")

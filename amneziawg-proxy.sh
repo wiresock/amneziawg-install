@@ -67,10 +67,18 @@ manage_menu() {
 
     case "${option}" in
         1)
-            systemctl status "${SERVICE_NAME}" --no-pager || true
+            if ! command -v systemctl &>/dev/null; then
+                warn "systemctl is not available on this system."
+            else
+                systemctl status "${SERVICE_NAME}" --no-pager || true
+            fi
             ;;
         2)
-            journalctl -u "${SERVICE_NAME}" -f --no-pager
+            if ! command -v journalctl &>/dev/null; then
+                warn "journalctl is not available on this system."
+            else
+                journalctl -u "${SERVICE_NAME}" -f --no-pager
+            fi
             ;;
         3)
             require_inner_script "${INSTALLER}"

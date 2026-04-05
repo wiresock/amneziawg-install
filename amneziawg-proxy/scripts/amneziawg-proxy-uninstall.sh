@@ -187,6 +187,12 @@ safe_rm_dir() {
         warn "safe_rm_dir: empty path, skipping"
         return 0
     fi
+    if [[ "${d}" != /* ]]; then
+        die "Refusing to remove non-absolute path: ${d}"
+    fi
+    if [[ "/${d}/" == *"/../"* || "/${d}/" == *"/./"* ]]; then
+        die "Refusing to remove path containing '..' or '.' components: ${d}"
+    fi
     if [[ "${#d}" -lt 5 ]]; then
         die "Refusing to remove suspiciously short path: ${d}"
     fi
@@ -203,9 +209,18 @@ safe_rm_dir() {
 
 # ── systemd helpers ────────────────────────────────────────────────────────────
 
+HAVE_SYSTEMCTL="false"
+if command -v systemctl &>/dev/null; then
+    HAVE_SYSTEMCTL="true"
+fi
+
 systemctl_if_active() {
     local verb="$1"
     local unit="$2"
+    if [[ "${HAVE_SYSTEMCTL}" != "true" ]]; then
+        info "systemctl not available, skipping ${verb}: ${unit}"
+        return 0
+    fi
     if systemctl is-active --quiet "${unit}" 2>/dev/null; then
         systemctl "${verb}" "${unit}" && info "Service ${verb}ped: ${unit}" || \
             warn "Could not ${verb} ${unit} (already stopped?)"
@@ -217,6 +232,10 @@ systemctl_if_active() {
 systemctl_if_enabled() {
     local verb="$1"
     local unit="$2"
+    if [[ "${HAVE_SYSTEMCTL}" != "true" ]]; then
+        info "systemctl not available, skipping ${verb}: ${unit}"
+        return 0
+    fi
     if systemctl is-enabled --quiet "${unit}" 2>/dev/null; then
         systemctl "${verb}" "${unit}" && info "Service ${verb}d: ${unit}" || \
             warn "Could not ${verb} ${unit}"
@@ -302,7 +321,8 @@ restore_awg_listen_port() {
             info "Restored AWG config from: ${latest_backup}"
 
             # Restart the interface
-            if systemctl is-active --quiet "awg-quick@${awg_nic}" 2>/dev/null; then
+            if [[ "${HAVE_SYSTEMCTL}" == "true" ]] && \
+               systemctl is-active --quiet "awg-quick@${awg_nic}" 2>/dev/null; then
                 info "Restarting AWG interface ${awg_nic}..."
                 if ! systemctl restart "awg-quick@${awg_nic}"; then
                     warn "Failed to restart awg-quick@${awg_nic}."
@@ -310,6 +330,8 @@ restore_awg_listen_port() {
                 else
                     info "AWG interface ${awg_nic} restarted with original config."
                 fi
+            elif [[ "${HAVE_SYSTEMCTL}" != "true" ]]; then
+                warn "systemctl not available; restart awg-quick@${awg_nic} manually."
             else
                 warn "AWG interface awg-quick@${awg_nic} is not active."
                 warn "Start it with: sudo systemctl start awg-quick@${awg_nic}"
@@ -329,7 +351,8 @@ restore_awg_listen_port() {
     fi
 
     # Restart the interface
-    if systemctl is-active --quiet "awg-quick@${awg_nic}" 2>/dev/null; then
+    if [[ "${HAVE_SYSTEMCTL}" == "true" ]] && \
+       systemctl is-active --quiet "awg-quick@${awg_nic}" 2>/dev/null; then
         info "Restarting AWG interface ${awg_nic}..."
         if ! systemctl restart "awg-quick@${awg_nic}"; then
             warn "Failed to restart awg-quick@${awg_nic}."
@@ -337,6 +360,8 @@ restore_awg_listen_port() {
         else
             info "AWG interface ${awg_nic} restarted."
         fi
+    elif [[ "${HAVE_SYSTEMCTL}" != "true" ]]; then
+        warn "systemctl not available; restart awg-quick@${awg_nic} manually."
     fi
 }
 
@@ -411,11 +436,20 @@ main() {
         fi
         if [[ "${PURGE_CONFIG}" == "true" ]]; then
             case "${CONFIG_DIR}" in
-                /etc|/etc/*)
-                    safe_rm_dir "${CONFIG_DIR}" "/etc/"
+                "${DEFAULT_CONFIG_DIR}")
+                    safe_rm_dir "${CONFIG_DIR}" "${DEFAULT_CONFIG_DIR}"
+                    ;;
+                "${DEFAULT_CONFIG_DIR}"/*)
+                    safe_rm_dir "${CONFIG_DIR}" "${DEFAULT_CONFIG_DIR}/"
+                    ;;
+                /etc)
+                    die "--purge-config refuses to purge '/etc'; only '${DEFAULT_CONFIG_DIR}' or its subdirectories may be removed"
+                    ;;
+                /etc/*)
+                    die "--purge-config only supports '${DEFAULT_CONFIG_DIR}' or its subdirectories; refusing to purge '${CONFIG_DIR}'"
                     ;;
                 *)
-                    die "--purge-config only supports config directories under /etc; refusing to purge '${CONFIG_DIR}'"
+                    die "--purge-config only supports config directories under '${DEFAULT_CONFIG_DIR}'; refusing to purge '${CONFIG_DIR}'"
                     ;;
             esac
         fi
