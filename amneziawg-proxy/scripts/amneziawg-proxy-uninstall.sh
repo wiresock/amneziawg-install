@@ -406,14 +406,14 @@ main() {
     printf '\n'
     if [[ "${PURGE_CONFIG}" != "true" ]]; then
         info "Config preserved: ${CONFIG_DIR}"
-        info "Re-install with: sudo ./amneziawg-proxy-install.sh --force"
+        info "Re-install with: sudo ./amneziawg-proxy.sh"
     fi
     if [[ "${PURGE_DATA}" != "true" ]]; then
         info "Data preserved: ${DATA_DIR}"
     fi
     if [[ "${RESTORE_AWG}" != "true" ]]; then
         info "Note: AmneziaWG listen port was NOT restored automatically."
-        info "      If needed, run: sudo ./amneziawg-proxy-uninstall.sh --restore-awg"
+        info "      If needed, run: sudo ./amneziawg-proxy.sh (select Uninstall → --restore-awg)"
     fi
 }
 

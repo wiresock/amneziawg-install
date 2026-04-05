@@ -74,7 +74,7 @@ manage_menu() {
             ;;
         3)
             require_inner_script "${INSTALLER}"
-            exec bash "${INSTALLER}" --force "$@"
+            exec bash "${INSTALLER}" "$@"
             ;;
         4)
             require_inner_script "${UNINSTALLER}"

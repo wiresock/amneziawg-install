@@ -14,11 +14,12 @@
 #   4. Builds the proxy binary from source (or accepts a pre-built binary)
 #   5. Installs the binary to /usr/local/bin
 #   6. Writes /etc/amneziawg-proxy/proxy.toml
-#   7. Reconfigures the AWG interface to listen on loopback (127.0.0.1:BACKEND_PORT)
-#      so the proxy becomes the public-facing endpoint
+#   7. Attempts to reconfigure the AWG interface to listen on loopback
+#      (127.0.0.1:BACKEND_PORT) when the AWG config already includes ListenAddr;
+#      otherwise prints guidance for manual firewalling/reconfiguration
 #   8. Installs and optionally enables the systemd service
 #
-# Deployment topology after installation:
+# Intended deployment topology when loopback rebinding is applied:
 #   VPN clients → 0.0.0.0:LISTEN_PORT (proxy) → 127.0.0.1:BACKEND_PORT (AWG)
 #
 # https://github.com/wiresock/amneziawg-install
@@ -321,7 +322,7 @@ detect_awg_config() {
 
     if [[ -z "${AWG_CONF_FILE}" ]]; then
         warn "Could not auto-detect AmneziaWG config file in ${AWG_DIR}."
-        warn "You can specify the interface manually when prompted."
+        warn "Specify the AWG interface/config file manually in the script configuration if needed."
     fi
 
     if [[ -z "${LISTEN_PORT}" ]]; then
@@ -565,7 +566,19 @@ EOF
     fi
 
     prompt_default BACKEND_HOST "AWG backend bind host (loopback)" "${BACKEND_HOST}"
-    prompt_default BACKEND_PORT "AWG backend port (AWG will be moved here)" "${BACKEND_PORT}"
+    while true; do
+        prompt_default BACKEND_PORT "AWG backend port (AWG will be moved here)" "${BACKEND_PORT}"
+        if [[ ! "${BACKEND_PORT}" =~ ^[0-9]+$ ]] || \
+           (( BACKEND_PORT < 1 || BACKEND_PORT > 65535 )); then
+            warn "Backend port must be a number between 1 and 65535."
+            continue
+        fi
+        if [[ "${BACKEND_PORT}" == "${LISTEN_PORT}" ]]; then
+            warn "Backend port must differ from the public listen port (${LISTEN_PORT})."
+            continue
+        fi
+        break
+    done
 
     # Protocol
     printf "\n${BOLD}Protocol imitation:${NC}\n"
@@ -596,8 +609,22 @@ EOF
     fi
 
     printf "\n${BOLD}Advanced settings:${NC}\n"
-    prompt_default SESSION_TTL  "Idle session timeout (seconds)" "${SESSION_TTL}"
-    prompt_default RATE_LIMIT   "Max probe responses per client per second" "${RATE_LIMIT}"
+    while true; do
+        prompt_default SESSION_TTL "Idle session timeout (seconds)" "${SESSION_TTL}"
+        if [[ ! "${SESSION_TTL}" =~ ^[0-9]+$ ]] || (( SESSION_TTL < 1 )); then
+            warn "Session TTL must be a positive integer (seconds)."
+            continue
+        fi
+        break
+    done
+    while true; do
+        prompt_default RATE_LIMIT "Max probe responses per client per second" "${RATE_LIMIT}"
+        if [[ ! "${RATE_LIMIT}" =~ ^[0-9]+$ ]] || (( RATE_LIMIT < 1 )); then
+            warn "Rate limit must be a positive integer."
+            continue
+        fi
+        break
+    done
 
     # Paths
     printf "\n${BOLD}Installation paths:${NC}\n"
@@ -664,6 +691,10 @@ Re-run with: --listen-port <port>"
         die "Invalid --backend-port: ${BACKEND_PORT}. Must be 1–65535."
     fi
 
+    if [[ "${BACKEND_PORT}" == "${LISTEN_PORT}" ]]; then
+        die "Backend port must differ from the public listen port (${LISTEN_PORT})."
+    fi
+
     case "${PROTOCOL}" in
         quic|dns|sip|auto) ;;
         *) die "Invalid --protocol '${PROTOCOL}'. Must be one of: quic, dns, sip, auto." ;;
@@ -700,6 +731,19 @@ setup_filesystem() {
 
 install_binary() {
     step "Installing binary"
+
+    if [[ -e "${INSTALL_DIR}" ]] && [[ ! -d "${INSTALL_DIR}" ]]; then
+        die "Install path exists but is not a directory: ${INSTALL_DIR}"
+    fi
+
+    if [[ ! -d "${INSTALL_DIR}" ]]; then
+        mkdir -p "${INSTALL_DIR}"
+        info "Created install directory: ${INSTALL_DIR}"
+    fi
+
+    if [[ ! -w "${INSTALL_DIR}" ]] || [[ ! -x "${INSTALL_DIR}" ]]; then
+        die "Install directory is not writable/searchable: ${INSTALL_DIR}"
+    fi
 
     local dest="${INSTALL_DIR}/amneziawg-proxy"
     install -m 0755 "${BINARY_SRC}" "${dest}"
@@ -918,7 +962,7 @@ reconfigure_awg_listen_port() {
 find_unit_template() {
     local candidate="${SCRIPT_DIR}/../packaging/${SERVICE_NAME}.service"
     if [[ -f "${candidate}" ]]; then
-        printf '%s' "$(realpath "${candidate}")"
+        printf '%s' "${candidate}"
         return 0
     fi
     return 1
@@ -926,6 +970,8 @@ find_unit_template() {
 
 install_service_unit() {
     step "Installing systemd service"
+
+    local unit_installed=false
 
     local unit_src
     if unit_src="$(find_unit_template)"; then
@@ -937,6 +983,7 @@ install_service_unit() {
         else
             install -m 0644 "${unit_src}" "${SYSTEMD_UNIT_DEST}"
             info "Installed service unit: ${SYSTEMD_UNIT_DEST}"
+            unit_installed=true
         fi
     else
         warn "packaging/${SERVICE_NAME}.service not found; writing minimal inline unit."
@@ -968,14 +1015,28 @@ WantedBy=multi-user.target
 UNITEOF
             chmod 0644 "${SYSTEMD_UNIT_DEST}"
             info "Wrote inline service unit: ${SYSTEMD_UNIT_DEST}"
+            unit_installed=true
         fi
     fi
 
-    # Ensure ExecStart points to the correct config file
-    if grep -q '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null; then
+    # Update all configurable paths in the unit only when it was just installed/overwritten.
+    # This ensures the packaging template (which contains static defaults) and the inline
+    # unit both end up with the user-selected paths.
+    if [[ "${unit_installed}" == "true" ]]; then
+        local read_only_paths="/etc/amnezia ${CONFIG_DIR}"
+        if [[ "${AWG_DIR}" != "/etc/amnezia" ]]; then
+            read_only_paths="${read_only_paths} ${AWG_DIR}"
+        fi
+
         sed -i "s|^ExecStart=.*|ExecStart=${INSTALL_DIR}/amneziawg-proxy ${CONFIG_FILE}|" \
             "${SYSTEMD_UNIT_DEST}"
-        info "Updated ExecStart in service unit."
+        sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${DATA_DIR}|" \
+            "${SYSTEMD_UNIT_DEST}"
+        sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${read_only_paths}|" \
+            "${SYSTEMD_UNIT_DEST}"
+        sed -i "s|^ReadWritePaths=.*|ReadWritePaths=${DATA_DIR}|" \
+            "${SYSTEMD_UNIT_DEST}"
+        info "Updated service unit paths."
     fi
 
     systemctl daemon-reload
@@ -1030,7 +1091,8 @@ print_summary() {
     fi
 
     printf "${BOLD}To uninstall:${NC}\n"
-    printf "  sudo ./amneziawg-proxy-uninstall.sh\n"
+    printf "  sudo ./amneziawg-proxy.sh\n"
+    printf "  (select option 4 – Uninstall)\n"
     printf "\n"
 }
 
