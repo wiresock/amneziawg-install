@@ -490,6 +490,12 @@ preflight_checks() {
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
+# Return 0 if the value is a positive integer (≥ 1), 1 otherwise.
+is_positive_integer() {
+    local val="$1"
+    [[ "${val}" =~ ^[0-9]+$ ]] && (( val >= 1 ))
+}
+
 prompt_default() {
     local var_name="$1"
     local prompt_text="$2"
@@ -637,7 +643,7 @@ EOF
     printf "\n${BOLD}Advanced settings:${NC}\n"
     while true; do
         prompt_default SESSION_TTL "Idle session timeout (seconds)" "${SESSION_TTL}"
-        if [[ ! "${SESSION_TTL}" =~ ^[0-9]+$ ]] || (( SESSION_TTL < 1 )); then
+        if ! is_positive_integer "${SESSION_TTL}"; then
             warn "Session TTL must be a positive integer (seconds)."
             continue
         fi
@@ -645,7 +651,7 @@ EOF
     done
     while true; do
         prompt_default RATE_LIMIT "Max probe responses per client per second" "${RATE_LIMIT}"
-        if [[ ! "${RATE_LIMIT}" =~ ^[0-9]+$ ]] || (( RATE_LIMIT < 1 )); then
+        if ! is_positive_integer "${RATE_LIMIT}"; then
             warn "Rate limit must be a positive integer."
             continue
         fi
@@ -726,11 +732,11 @@ Re-run with: --listen-port <port>"
         *) die "Invalid --protocol '${PROTOCOL}'. Must be one of: quic, dns, sip, auto." ;;
     esac
 
-    if ! [[ "${SESSION_TTL}" =~ ^[0-9]+$ ]] || (( SESSION_TTL < 1 )); then
+    if ! is_positive_integer "${SESSION_TTL}"; then
         die "Invalid --session-ttl: '${SESSION_TTL}'. Must be a positive integer (seconds)."
     fi
 
-    if ! [[ "${RATE_LIMIT}" =~ ^[0-9]+$ ]] || (( RATE_LIMIT < 1 )); then
+    if ! is_positive_integer "${RATE_LIMIT}"; then
         die "Invalid --rate-limit: '${RATE_LIMIT}'. Must be a positive integer."
     fi
 }
