@@ -3361,17 +3361,18 @@ import json, sys
 try:
     payload = json.loads(sys.stdin.read())
     peers = payload.get("peers") if isinstance(payload, dict) else None
-    sys.exit(0 if isinstance(payload, dict) and isinstance(peers, list) else 1)
+    raw = payload.get("raw") if isinstance(payload, dict) else None
+    sys.exit(0 if isinstance(payload, dict) and isinstance(peers, list) and isinstance(raw, str) else 1)
 except (json.JSONDecodeError, ValueError):
     sys.exit(1)
 ' <<<"${JSON_PAYLOAD}"
 	elif command -v perl &>/dev/null; then
 		perl -e '
 my $s = do { local $/; <STDIN> };
-exit(($s =~ /"peers"\s*:\s*\[/) ? 0 : 1);
+exit(($s =~ /"peers"\s*:\s*\[/ && $s =~ /"raw"\s*:\s*"/) ? 0 : 1);
 ' <<<"${JSON_PAYLOAD}"
 	else
-		echo "${JSON_PAYLOAD}" | grep -qE '"peers"[[:space:]]*:[[:space:]]*\['
+		echo "${JSON_PAYLOAD}" | grep -qE '"peers"[[:space:]]*:[[:space:]]*\[.*"raw"[[:space:]]*:[[:space:]]*"'
 	fi
 }
 
@@ -3391,9 +3392,23 @@ try:
             if isinstance(peer, dict)
             and isinstance(peer.get("public_key"), str)
             and len(peer.get("public_key")) > 0
+            and isinstance(peer.get("allowed_ips"), str)
+            and "/" in peer.get("allowed_ips")
         ))
 except Exception:
     print(0)
+' <<<"${JSON_PAYLOAD}"
+	elif command -v perl &>/dev/null; then
+		perl -e '
+my $s = do { local $/; <STDIN> };
+my $count = 0;
+while ($s =~ /\{[^{}]*"public_key"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]*"allowed_ips"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]*\}/sg) {
+	my ($pub, $ips) = ($1 // "", $2 // "");
+	next if $pub eq "";
+	next if index($ips, "/") < 0;
+	$count++;
+}
+print $count;
 ' <<<"${JSON_PAYLOAD}"
 	else
 		# public_key values are generated base64 keys and are expected to be non-empty and quote-free.
@@ -3409,7 +3424,12 @@ import json, sys
 try:
     payload = json.loads(sys.stdin.read())
     peers = payload.get("peers") or []
-    first = peers[0] if isinstance(peers, list) and len(peers) > 0 else {}
+    first = next((
+        peer for peer in peers
+        if isinstance(peer, dict)
+        and isinstance(peer.get("allowed_ips"), str)
+        and "/" in peer.get("allowed_ips")
+    ), {}) if isinstance(peers, list) else {}
     public_key_value = first.get("public_key") if isinstance(first, dict) else None
     print("yes" if isinstance(public_key_value, str) and len(public_key_value) > 0 else "no")
 except Exception:
@@ -3418,71 +3438,13 @@ except Exception:
 	elif command -v perl &>/dev/null; then
 		perl -e '
 my $s = do { local $/; <STDIN> };
-
-my $i = 0;
-my $len = length($s);
-my $in_str = 0;
-my $esc = 0;
-my $peers_key_end = -1;
-
-while ($i < $len) {
-	my $c = substr($s, $i, 1);
-	if ($in_str) {
-		if ($esc) { $esc = 0; }
-		elsif ($c eq "\\") { $esc = 1; }
-		elsif ($c eq "\"") { $in_str = 0; }
-		$i++;
-		next;
+while ($s =~ /\{[^{}]*"public_key"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]*"allowed_ips"\s*:\s*"((?:\\.|[^"\\])*)"[^{}]*\}/sg) {
+	my ($pub, $ips) = ($1 // "", $2 // "");
+	next if index($ips, "/") < 0;
+	if (length($pub) > 0) {
+		print "yes";
+		exit 0;
 	}
-	if ($c eq "\"") {
-		if (substr($s, $i, 7) eq "\"peers\"") { $peers_key_end = $i + 7; last; }
-		$in_str = 1;
-	}
-	$i++;
-}
-if ($peers_key_end < 0) { print "no"; exit 0; }
-
-$i = $peers_key_end;
-while ($i < $len && substr($s, $i, 1) =~ /\s/) { $i++; }
-if ($i >= $len || substr($s, $i, 1) ne ":") { print "no"; exit 0; }
-$i++;
-while ($i < $len && substr($s, $i, 1) =~ /\s/) { $i++; }
-if ($i >= $len || substr($s, $i, 1) ne "[") { print "no"; exit 0; }
-$i++;
-while ($i < $len && substr($s, $i, 1) =~ /\s/) { $i++; }
-if ($i >= $len || substr($s, $i, 1) ne "{") { print "no"; exit 0; }
-
-my $start = $i;
-my $depth = 0;
-$in_str = 0;
-$esc = 0;
-while ($i < $len) {
-	my $c = substr($s, $i, 1);
-	if ($in_str) {
-		if ($esc) { $esc = 0; }
-		elsif ($c eq "\\") { $esc = 1; }
-		elsif ($c eq "\"") { $in_str = 0; }
-		$i++;
-		next;
-	}
-	if ($c eq "\"") { $in_str = 1; $i++; next; }
-	if ($c eq "{") { $depth++; }
-	elsif ($c eq "}") {
-		$depth--;
-		if ($depth == 0) {
-			my $first_peer = substr($s, $start, $i - $start + 1);
-			if ($first_peer =~ /"public_key"\s*:\s*"((?:\\.|[^"\\])*)"/s) {
-				my $public_key_value = $1;
-				if (length($public_key_value) > 0) {
-				print "yes";
-				exit 0;
-				}
-			}
-			print "no";
-			exit 0;
-		}
-	}
-	$i++;
 }
 print "no";
 ' <<<"${JSON_PAYLOAD}"
@@ -3683,7 +3645,15 @@ PHASE7STUBEOF
 	# Probe /api/health and verify JSON response
 	if [[ "${PHASE7_UP}" == "true" ]]; then
 		HEALTH_RESPONSE="$(http_get_body "http://127.0.0.1:${WEB_PHASE7_PORT}/api/health" 2>/dev/null)" || HEALTH_RESPONSE=""
-		if echo "${HEALTH_RESPONSE}" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+		if command -v python3 >/dev/null 2>&1; then
+			if printf '%s' "${HEALTH_RESPONSE}" | python3 -c 'import json, sys; sys.exit(0 if json.load(sys.stdin).get("status") == "ok" else 1)' >/dev/null 2>&1; then
+				echo "OK: /api/health returned valid JSON with {\"status\": \"ok\"}"
+			else
+				echo "FAIL: /api/health did not return expected JSON response"
+				echo "  Got: ${HEALTH_RESPONSE}"
+				FAILED=$((FAILED + 1))
+			fi
+		elif echo "${HEALTH_RESPONSE}" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"'; then
 			echo "OK: /api/health returned {\"status\": \"ok\"}"
 		else
 			echo "FAIL: /api/health did not return expected response"
