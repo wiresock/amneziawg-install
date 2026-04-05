@@ -3369,6 +3369,13 @@ except (json.JSONDecodeError, ValueError):
 	elif command -v perl &>/dev/null; then
 		perl -e '
 my $s = do { local $/; <STDIN> };
+if (eval { require JSON::PP; 1 }) {
+	my $payload = eval { JSON::PP::decode_json($s) };
+	exit(1) if $@ || ref($payload) ne "HASH";
+	my $peers = $payload->{"peers"};
+	my $raw = $payload->{"raw"};
+	exit((ref($peers) eq "ARRAY" && defined($raw) && !ref($raw)) ? 0 : 1);
+}
 exit(($s =~ /"peers"\s*:\s*\[/ && $s =~ /"raw"\s*:\s*"/) ? 0 : 1);
 ' <<<"${JSON_PAYLOAD}"
 	else
@@ -3419,6 +3426,7 @@ $i++;
 
 my $count = 0;
 my $first_has_pub = "no";
+my $first_actual_seen = 0;
 while ($i < $len) {
 	while ($i < $len && substr($s, $i, 1) =~ /[\s,]/) { $i++; }
 	last if $i >= $len;
@@ -3449,9 +3457,14 @@ while ($i < $len) {
 				my $ips = "";
 				$pub = $1 if $obj =~ /"public_key"\s*:\s*"((?:\\.|[^"\\])*)"/s;
 				$ips = $1 if $obj =~ /"allowed_ips"\s*:\s*"((?:\\.|[^"\\])*)"/s;
-				if (length($pub) > 0 && $ips =~ m{/\d+}) {
-					$count++;
-					if ($first_has_pub eq "no") { $first_has_pub = "yes"; }
+				if ($ips =~ m{/\d+}) {
+					if (!$first_actual_seen) {
+						$first_has_pub = (length($pub) > 0) ? "yes" : "no";
+						$first_actual_seen = 1;
+					}
+					if (length($pub) > 0) {
+						$count++;
+					}
 				}
 				$i++;
 				last;
