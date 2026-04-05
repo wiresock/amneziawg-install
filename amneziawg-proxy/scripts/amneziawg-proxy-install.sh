@@ -351,7 +351,7 @@ Or re-run with --install-rust to install automatically."
     fi
 
     info "Installing Rust toolchain via rustup..."
-    if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable 2>&1; then
+    if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable; then
         die "Failed to install Rust toolchain via rustup."
     fi
 
@@ -873,7 +873,7 @@ reconfigure_awg_listen_port() {
                 "${AWG_CONF_FILE}"
         else
             # Insert after [Interface] header
-            sed -i '/^\[Interface\]/a ListenPort = '"${BACKEND_PORT}" "${AWG_CONF_FILE}"
+            sed -i "/^\[Interface\]/a ListenPort = ${BACKEND_PORT}" "${AWG_CONF_FILE}"
         fi
         info "Updated ListenPort → ${BACKEND_PORT}"
     fi
