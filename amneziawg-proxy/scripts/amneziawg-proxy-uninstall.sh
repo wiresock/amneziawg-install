@@ -410,7 +410,14 @@ main() {
             fi
         fi
         if [[ "${PURGE_CONFIG}" == "true" ]]; then
-            safe_rm_dir "${CONFIG_DIR}" "/etc/"
+            case "${CONFIG_DIR}" in
+                /etc|/etc/*)
+                    safe_rm_dir "${CONFIG_DIR}" "/etc/"
+                    ;;
+                *)
+                    die "--purge-config only supports config directories under /etc; refusing to purge '${CONFIG_DIR}'"
+                    ;;
+            esac
         fi
     fi
 
@@ -423,7 +430,12 @@ main() {
             fi
         fi
         if [[ "${PURGE_DATA}" == "true" ]]; then
-            safe_rm_dir "${DATA_DIR}" "/var/"
+            local data_dir_parent
+            data_dir_parent="$(dirname -- "${DATA_DIR}")/"
+            if [[ "${data_dir_parent}" == "//" || "${data_dir_parent}" == "/" ]]; then
+                die "Refusing to purge data directory with unsafe parent: ${DATA_DIR}"
+            fi
+            safe_rm_dir "${DATA_DIR}" "${data_dir_parent}"
         fi
     fi
 

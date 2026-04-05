@@ -584,18 +584,14 @@ EOF
     prompt_default LISTEN_HOST "Proxy public bind host" "${LISTEN_HOST}"
 
     local port_prompt="Public UDP port (clients connect here)"
-    if [[ -n "${LISTEN_PORT}" ]]; then
+    while true; do
         prompt_default LISTEN_PORT "${port_prompt}" "${LISTEN_PORT}"
-    else
-        while true; do
-            prompt_default LISTEN_PORT "${port_prompt}" ""
-            if [[ "${LISTEN_PORT}" =~ ^[0-9]+$ ]] && \
-               (( LISTEN_PORT >= 1 && LISTEN_PORT <= 65535 )); then
-                break
-            fi
-            warn "Port must be a number between 1 and 65535."
-        done
-    fi
+        if [[ "${LISTEN_PORT}" =~ ^[0-9]+$ ]] && \
+           (( LISTEN_PORT >= 1 && LISTEN_PORT <= 65535 )); then
+            break
+        fi
+        warn "Port must be a number between 1 and 65535."
+    done
 
     prompt_default BACKEND_HOST "AWG backend bind host (loopback)" "${BACKEND_HOST}"
     while true; do
@@ -1060,19 +1056,27 @@ UNITEOF
     # This keeps an existing preserved unit in sync with the user-selected paths
     # before any daemon-reload/enable/restart operations.
     if [[ -f "${SYSTEMD_UNIT_DEST}" ]]; then
+        # Escape characters that are special in a sed replacement string: & and \.
+        # The | delimiter is also escaped to avoid breaking the sed expression.
+        escape_sed_replacement() {
+            printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
+        }
+
         local -a read_only_paths=("/etc/amnezia" "${CONFIG_DIR}")
         if [[ "${AWG_DIR}" != "/etc/amnezia" ]]; then
             read_only_paths+=("${AWG_DIR}")
         fi
 
-        sed -i "s|^ExecStart=.*|ExecStart=${INSTALL_DIR}/amneziawg-proxy ${CONFIG_FILE}|" \
-            "${SYSTEMD_UNIT_DEST}"
-        sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${DATA_DIR}|" \
-            "${SYSTEMD_UNIT_DEST}"
-        sed -i "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${read_only_paths[*]}|" \
-            "${SYSTEMD_UNIT_DEST}"
-        sed -i "s|^ReadWritePaths=.*|ReadWritePaths=${DATA_DIR}|" \
-            "${SYSTEMD_UNIT_DEST}"
+        local esc_exec esc_workdir esc_ro esc_rw
+        esc_exec="$(escape_sed_replacement "ExecStart=${INSTALL_DIR}/amneziawg-proxy ${CONFIG_FILE}")"
+        esc_workdir="$(escape_sed_replacement "WorkingDirectory=${DATA_DIR}")"
+        esc_ro="$(escape_sed_replacement "ReadOnlyPaths=${read_only_paths[*]}")"
+        esc_rw="$(escape_sed_replacement "ReadWritePaths=${DATA_DIR}")"
+
+        sed -i "s|^ExecStart=.*|${esc_exec}|" "${SYSTEMD_UNIT_DEST}"
+        sed -i "s|^WorkingDirectory=.*|${esc_workdir}|" "${SYSTEMD_UNIT_DEST}"
+        sed -i "s|^ReadOnlyPaths=.*|${esc_ro}|" "${SYSTEMD_UNIT_DEST}"
+        sed -i "s|^ReadWritePaths=.*|${esc_rw}|" "${SYSTEMD_UNIT_DEST}"
         info "Updated service unit paths."
     fi
 
