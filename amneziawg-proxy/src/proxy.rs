@@ -30,7 +30,8 @@ pub struct Proxy {
     frontend: Arc<UdpSocket>,
     sessions: Arc<SessionTable>,
     metrics: Arc<MetricsStore>,
-    protocol: Protocol,
+    fixed_protocol: Option<Protocol>,
+    client_protocols: Arc<DashMap<SocketAddr, Protocol>>,
     awg_params: Option<Arc<AwgParams>>,
     dns_forward_enabled: bool,
     dns_upstream: Option<SocketAddr>,
@@ -52,10 +53,11 @@ impl Proxy {
         let backend_addr: SocketAddr = config.backend.parse()?;
         let frontend = Arc::new(UdpSocket::bind(listen_addr).await?);
 
-        let protocol = match config.imitate_protocol.as_str() {
-            "quic" => Protocol::Quic,
-            "dns" => Protocol::Dns,
-            "sip" => Protocol::Sip,
+        let fixed_protocol = match config.imitate_protocol.as_str() {
+            "quic" => Some(Protocol::Quic),
+            "dns" => Some(Protocol::Dns),
+            "sip" => Some(Protocol::Sip),
+            "auto" => None,
             _ => anyhow::bail!("unsupported protocol: {}", config.imitate_protocol),
         };
 
@@ -94,7 +96,8 @@ impl Proxy {
             frontend,
             sessions,
             metrics,
-            protocol,
+            fixed_protocol,
+            client_protocols: Arc::new(DashMap::new()),
             awg_params: awg_params.map(Arc::new),
             dns_forward_enabled,
             dns_upstream,
@@ -120,7 +123,8 @@ impl Proxy {
             frontend,
             sessions,
             metrics,
-            protocol,
+            fixed_protocol: Some(protocol),
+            client_protocols: Arc::new(DashMap::new()),
             awg_params: awg_params.map(Arc::new),
             dns_forward_enabled: false,
             dns_upstream: None,
@@ -234,7 +238,13 @@ impl Proxy {
         // proxy does not appear to host multiple services on the same port.
         let mut probe_response: Option<bytes::Bytes> = None;
         if let Some(proto) = responder::detect_protocol(data) {
-            if proto == self.protocol {
+            let selected_proto = match self.fixed_protocol {
+                Some(fixed) if proto == fixed => Some(fixed),
+                Some(_) => None,
+                None => Some(proto),
+            };
+            if let Some(proto) = selected_proto {
+                self.client_protocols.insert(client_addr, proto);
                 if let Some(ref metrics) = metrics_ref {
                     if proto == Protocol::Quic {
                         if let Some(quic) = &self.quic_handshake {
@@ -355,7 +365,8 @@ impl Proxy {
         let frontend = Arc::clone(&self.frontend);
         let metrics = Arc::clone(&self.metrics);
         let sessions = Arc::clone(&self.sessions);
-        let protocol = self.protocol;
+        let fixed_protocol = self.fixed_protocol;
+        let client_protocols = Arc::clone(&self.client_protocols);
         let awg_params = self.awg_params.clone();
         // Per-session relay buffer uses a tighter cap than the frontend recv
         // buffer.  WireGuard packets are at most MTU-sized (~1500 B typical);
@@ -377,6 +388,11 @@ impl Proxy {
                         // When AWG params are available, use per-type S-value
                         // padding based on H-range classification.
                         if let Some(ref params) = awg_params {
+                            let protocol = client_protocols
+                                .get(&client_addr)
+                                .map(|p| *p)
+                                .or(fixed_protocol)
+                                .unwrap_or(Protocol::Quic);
                             transform::apply_awg_transform(
                                 &mut buf[..n],
                                 params,
@@ -404,6 +420,7 @@ impl Proxy {
                         // in the table (is_new=false), no new relay is spawned, and
                         // backend responses are silently black-holed until TTL cleanup.
                         sessions.remove(&client_addr);
+                        client_protocols.remove(&client_addr);
                         metrics.remove(&client_addr);
                         break;
                     }

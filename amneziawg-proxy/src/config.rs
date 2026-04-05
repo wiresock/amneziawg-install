@@ -247,7 +247,7 @@ pub struct ProxyConfig {
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_sec: u32,
 
-    /// Which protocol to imitate: `"quic"`, `"dns"`, or `"sip"`.
+    /// Which protocol to imitate: `"quic"`, `"dns"`, `"sip"`, or `"auto"`.
     #[serde(default = "default_imitate_protocol")]
     pub imitate_protocol: String,
 
@@ -266,7 +266,7 @@ pub struct ProxyConfig {
     /// Forward DNS probe queries to an upstream resolver instead of always
     /// generating a synthetic SERVFAIL response.
     ///
-    /// Only applies when `imitate_protocol = "dns"`.
+    /// Applies when `imitate_protocol = "dns"` or `"auto"`.
     #[serde(default)]
     pub dns_forward_enabled: bool,
 
@@ -369,7 +369,7 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
     config.backend.parse::<std::net::SocketAddr>().map_err(|e| {
         ProxyError::Config(format!("bad backend address '{}': {e}", config.backend))
     })?;
-    let valid_protos = ["quic", "dns", "sip"];
+    let valid_protos = ["quic", "dns", "sip", "auto"];
     if !valid_protos.contains(&config.imitate_protocol.as_str()) {
         return Err(ProxyError::Config(format!(
             "unsupported imitate_protocol '{}'; expected one of: {}",
@@ -377,9 +377,12 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
             valid_protos.join(", ")
         )));
     }
-    if config.quic_handshake_enabled && config.imitate_protocol != "quic" {
+    if config.quic_handshake_enabled
+        && config.imitate_protocol != "quic"
+        && config.imitate_protocol != "auto"
+    {
         return Err(ProxyError::Config(
-            "quic_handshake_enabled requires imitate_protocol = 'quic'".into(),
+            "quic_handshake_enabled requires imitate_protocol = 'quic' or 'auto'".into(),
         ));
     }
     if config.quic_handshake_enabled && config.quic_certificate_domain.trim().is_empty() {
@@ -387,9 +390,12 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
             "quic_certificate_domain must be non-empty when quic_handshake_enabled".into(),
         ));
     }
-    if config.dns_forward_enabled && config.imitate_protocol != "dns" {
+    if config.dns_forward_enabled
+        && config.imitate_protocol != "dns"
+        && config.imitate_protocol != "auto"
+    {
         return Err(ProxyError::Config(
-            "dns_forward_enabled requires imitate_protocol = 'dns'".into(),
+            "dns_forward_enabled requires imitate_protocol = 'dns' or 'auto'".into(),
         ));
     }
     if config.dns_forward_enabled {
