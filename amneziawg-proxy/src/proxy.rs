@@ -5,12 +5,14 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
+use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::backend;
 use crate::config::{AwgParams, ProxyConfig};
 use crate::metrics::MetricsStore;
+use crate::quic_handshake::{QuicHandshakeResponder, QuicResponse};
 use crate::responder::{self, Protocol};
 use crate::session::SessionTable;
 use crate::transform;
@@ -30,6 +32,7 @@ pub struct Proxy {
     metrics: Arc<MetricsStore>,
     protocol: Protocol,
     awg_params: Option<Arc<AwgParams>>,
+    quic_handshake: Option<Arc<Mutex<QuicHandshakeResponder>>>,
     shutdown: Arc<Notify>,
     /// Per-session relay task handles, keyed by client address.
     /// Each task awaits data from the session's backend socket and relays it
@@ -59,6 +62,13 @@ impl Proxy {
             config.max_sessions,
         ));
         let metrics = Arc::new(MetricsStore::new(config.rate_limit_per_sec));
+        let quic_handshake = if config.quic_handshake_enabled {
+            Some(Arc::new(Mutex::new(QuicHandshakeResponder::new(
+                &config.quic_certificate_domain,
+            )?)))
+        } else {
+            None
+        };
 
         info!(
             listen = %listen_addr,
@@ -76,6 +86,7 @@ impl Proxy {
             metrics,
             protocol,
             awg_params: awg_params.map(Arc::new),
+            quic_handshake,
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
@@ -98,9 +109,22 @@ impl Proxy {
             metrics,
             protocol,
             awg_params: awg_params.map(Arc::new),
+            quic_handshake: None,
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
+        }
+    }
+
+    async fn send_quic_responses(&self, responses: Vec<QuicResponse>) {
+        for response in responses {
+            if let Err(e) = self.frontend.send_to(&response.payload, response.destination).await {
+                warn!(
+                    destination = %response.destination,
+                    error = %e,
+                    "failed to send QUIC handshake response"
+                );
+            }
         }
     }
 
@@ -117,6 +141,10 @@ impl Proxy {
     /// Run the proxy until shutdown is signaled.
     pub async fn run(&self) -> anyhow::Result<()> {
         let cleanup_handle = self.spawn_cleanup_task();
+        let mut quic_tick = self
+            .quic_handshake
+            .as_ref()
+            .map(|_| time::interval(Duration::from_millis(50)));
 
         info!("proxy running");
 
@@ -145,6 +173,21 @@ impl Proxy {
                 _ = self.shutdown.notified() => {
                     info!("shutdown signal received, stopping proxy");
                     break;
+                }
+                _ = async {
+                    if let Some(interval) = quic_tick.as_mut() {
+                        interval.tick().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if self.quic_handshake.is_some() => {
+                    if let Some(quic) = &self.quic_handshake {
+                        let responses = {
+                            let mut responder = quic.lock().await;
+                            responder.handle_timeouts()
+                        };
+                        self.send_quic_responses(responses).await;
+                    }
                 }
             }
         }
@@ -177,7 +220,46 @@ impl Proxy {
         if let Some(proto) = responder::detect_protocol(data) {
             if proto == self.protocol {
                 if let Some(ref metrics) = metrics_ref {
-                    if metrics.try_acquire_probe() {
+                    if proto == Protocol::Quic {
+                        if let Some(quic) = &self.quic_handshake {
+                            let (is_continuation, responses) = {
+                                let mut responder = quic.lock().await;
+                                let continuation = responder.has_active_connection(client_addr);
+                                let allowed = continuation || metrics.try_acquire_probe();
+                                if !allowed {
+                                    (continuation, Vec::new())
+                                } else {
+                                    if !continuation {
+                                        metrics.record_probe();
+                                    }
+                                    (continuation, responder.handle_datagram(client_addr, data))
+                                }
+                            };
+
+                            if is_continuation || !responses.is_empty() {
+                                self.send_quic_responses(responses).await;
+                            } else {
+                                debug!(%client_addr, "probe rate limited");
+                            }
+
+                            if !is_continuation {
+                                let fallback_needed = {
+                                    let responder = quic.lock().await;
+                                    !responder.has_active_connection(client_addr)
+                                };
+                                if fallback_needed {
+                                    probe_response = Some(responder::generate_response(proto, data));
+                                }
+                            }
+                        } else {
+                            if metrics.try_acquire_probe() {
+                                metrics.record_probe();
+                                probe_response = Some(responder::generate_response(proto, data));
+                            } else {
+                                debug!(%client_addr, "probe rate limited");
+                            }
+                        }
+                    } else if metrics.try_acquire_probe() {
                         metrics.record_probe();
                         probe_response = Some(responder::generate_response(proto, data));
                     } else {
@@ -347,6 +429,8 @@ mod tests {
             cleanup_interval_secs: 60,
             rate_limit_per_sec: 5,
             imitate_protocol: "quic".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
             buffer_size: 4096,
             max_sessions: 1000,
             awg_config: None,
@@ -388,6 +472,8 @@ mod tests {
             cleanup_interval_secs: 60,
             rate_limit_per_sec: 10,
             imitate_protocol: "quic".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
             buffer_size: 4096,
             max_sessions: 1000,
             awg_config: None,

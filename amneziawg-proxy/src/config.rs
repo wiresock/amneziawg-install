@@ -251,6 +251,18 @@ pub struct ProxyConfig {
     #[serde(default = "default_imitate_protocol")]
     pub imitate_protocol: String,
 
+    /// Enable stateful QUIC handshake continuation responder for QUIC probes.
+    ///
+    /// When `false`, QUIC probes are answered with a stateless Version
+    /// Negotiation packet (legacy behavior).
+    #[serde(default)]
+    pub quic_handshake_enabled: bool,
+
+    /// Domain name to place in the QUIC TLS server certificate when
+    /// `quic_handshake_enabled = true`.
+    #[serde(default = "default_quic_certificate_domain")]
+    pub quic_certificate_domain: String,
+
     /// Buffer size for UDP recv in bytes.
     #[serde(default = "default_buffer_size")]
     pub buffer_size: usize,
@@ -278,6 +290,9 @@ fn default_rate_limit() -> u32 {
 fn default_imitate_protocol() -> String {
     "quic".into()
 }
+fn default_quic_certificate_domain() -> String {
+    "localhost".into()
+}
 fn default_buffer_size() -> usize {
     65535
 }
@@ -294,6 +309,8 @@ impl Default for ProxyConfig {
             cleanup_interval_secs: default_cleanup_interval(),
             rate_limit_per_sec: default_rate_limit(),
             imitate_protocol: default_imitate_protocol(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: default_quic_certificate_domain(),
             buffer_size: default_buffer_size(),
             max_sessions: default_max_sessions(),
             awg_config: None,
@@ -336,6 +353,16 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
             valid_protos.join(", ")
         )));
     }
+    if config.quic_handshake_enabled && config.imitate_protocol != "quic" {
+        return Err(ProxyError::Config(
+            "quic_handshake_enabled requires imitate_protocol = 'quic'".into(),
+        ));
+    }
+    if config.quic_handshake_enabled && config.quic_certificate_domain.trim().is_empty() {
+        return Err(ProxyError::Config(
+            "quic_certificate_domain must be non-empty when quic_handshake_enabled".into(),
+        ));
+    }
     if config.buffer_size == 0 {
         return Err(ProxyError::Config("buffer_size must be > 0".into()));
     }
@@ -376,6 +403,8 @@ backend = "127.0.0.1:51821"
         assert_eq!(cfg.cleanup_interval_secs, 60);
         assert_eq!(cfg.rate_limit_per_sec, 5);
         assert_eq!(cfg.imitate_protocol, "quic");
+        assert!(!cfg.quic_handshake_enabled);
+        assert_eq!(cfg.quic_certificate_domain, "localhost");
         assert_eq!(cfg.buffer_size, 65535);
         assert!(cfg.awg_config.is_none());
     }
@@ -391,14 +420,47 @@ rate_limit_per_sec = 10
 imitate_protocol = "dns"
 buffer_size = 4096
 awg_config = "/etc/awg/awg0.conf"
+quic_handshake_enabled = false
+quic_certificate_domain = "example.org"
 "#;
         let cfg = parse_config(toml).unwrap();
         assert_eq!(cfg.session_ttl_secs, 600);
         assert_eq!(cfg.cleanup_interval_secs, 30);
         assert_eq!(cfg.rate_limit_per_sec, 10);
         assert_eq!(cfg.imitate_protocol, "dns");
+        assert!(!cfg.quic_handshake_enabled);
+        assert_eq!(cfg.quic_certificate_domain, "example.org");
         assert_eq!(cfg.buffer_size, 4096);
         assert_eq!(cfg.awg_config.as_deref(), Some("/etc/awg/awg0.conf"));
+    }
+
+    #[test]
+    fn reject_quic_handshake_with_non_quic_protocol() {
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+imitate_protocol = "dns"
+quic_handshake_enabled = true
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("quic_handshake_enabled requires imitate_protocol = 'quic'"));
+    }
+
+    #[test]
+    fn reject_quic_handshake_with_empty_domain() {
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+imitate_protocol = "quic"
+quic_handshake_enabled = true
+quic_certificate_domain = ""
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("quic_certificate_domain must be non-empty"));
     }
 
     #[test]
