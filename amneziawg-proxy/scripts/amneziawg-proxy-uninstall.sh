@@ -140,6 +140,32 @@ confirm() {
 
 # ── Safe rm helpers ────────────────────────────────────────────────────────────
 
+# Validate a params file is safe to source: must be a regular file (not a
+# symlink), owned by root, and have permissions 600 or 400.
+# Returns 0 if safe, 1 with a warning if not.
+validate_params_file() {
+    local f="$1"
+    if [[ -L "${f}" ]] || [[ -h "${f}" ]]; then
+        warn "Ignoring params file — must not be a symbolic link: ${f}"
+        return 1
+    fi
+    if [[ ! -f "${f}" ]]; then
+        return 1
+    fi
+    local owner perms
+    owner="$(stat -c '%u' "${f}" 2>/dev/null || true)"
+    perms="$(stat -c '%a' "${f}" 2>/dev/null || true)"
+    if [[ "${owner}" != "0" ]]; then
+        warn "Ignoring params file — not owned by root (owner UID: ${owner}): ${f}"
+        return 1
+    fi
+    if [[ "${perms}" != "600" ]] && [[ "${perms}" != "400" ]]; then
+        warn "Ignoring params file — insecure permissions (${perms}); expected 600 or 400: ${f}"
+        return 1
+    fi
+    return 0
+}
+
 safe_rm_file() {
     local f="$1"
     if [[ -z "${f}" ]]; then
@@ -248,7 +274,7 @@ restore_awg_listen_port() {
 
     # Try params file first
     local params_file="${AWG_DIR}/params"
-    if [[ -f "${params_file}" ]]; then
+    if validate_params_file "${params_file}"; then
         awg_nic="$(bash -c ". '${params_file}' 2>/dev/null && printf '%s' \"\${SERVER_AWG_NIC:-}\"")"
     fi
 

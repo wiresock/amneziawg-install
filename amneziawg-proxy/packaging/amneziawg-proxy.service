@@ -10,8 +10,9 @@ RestartSec=5s
 
 # --- Run as root to bind privileged / low-numbered ports ---------------------
 # The proxy may need to bind to ports below 1024 (e.g. 443/UDP for QUIC).
-# If the listen port is ≥ 1024 you can drop root by adding:
+# If the listen port is ≥ 1024 you can drop root by using, for example:
 #   User=nobody
+# For ports below 1024, keep running as root or add:
 #   AmbientCapabilities=CAP_NET_BIND_SERVICE
 User=root
 

@@ -74,11 +74,11 @@ manage_menu() {
             ;;
         3)
             require_inner_script "${INSTALLER}"
-            exec bash "${INSTALLER}" "$@"
+            exec bash "${INSTALLER}"
             ;;
         4)
             require_inner_script "${UNINSTALLER}"
-            exec bash "${UNINSTALLER}" "$@"
+            exec bash "${UNINSTALLER}"
             ;;
         5)
             exit 0

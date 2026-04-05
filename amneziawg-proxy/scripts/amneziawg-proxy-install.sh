@@ -267,6 +267,32 @@ Install AmneziaWG first (https://github.com/wiresock/amneziawg-install)."
 
 # ── AWG configuration detection ───────────────────────────────────────────────
 
+# Validate a params file is safe to source: must be a regular file (not a
+# symlink), owned by root, and have permissions 600 or 400.
+# Returns 0 if safe, 1 with a warning if not.
+validate_params_file() {
+    local f="$1"
+    if [[ -L "${f}" ]] || [[ -h "${f}" ]]; then
+        warn "Ignoring params file — must not be a symbolic link: ${f}"
+        return 1
+    fi
+    if [[ ! -f "${f}" ]]; then
+        return 1
+    fi
+    local owner perms
+    owner="$(stat -c '%u' "${f}" 2>/dev/null || true)"
+    perms="$(stat -c '%a' "${f}" 2>/dev/null || true)"
+    if [[ "${owner}" != "0" ]]; then
+        warn "Ignoring params file — not owned by root (owner UID: ${owner}): ${f}"
+        return 1
+    fi
+    if [[ "${perms}" != "600" ]] && [[ "${perms}" != "400" ]]; then
+        warn "Ignoring params file — insecure permissions (${perms}); expected 600 or 400: ${f}"
+        return 1
+    fi
+    return 0
+}
+
 # Detect the active AmneziaWG interface and its config file.
 # Sets AWG_NIC, AWG_CONF_FILE, and LISTEN_PORT (if not already set).
 detect_awg_config() {
@@ -275,7 +301,7 @@ detect_awg_config() {
     local params_file="${AWG_DIR}/params"
 
     # Try to read the params file saved by amneziawg-install.sh
-    if [[ -f "${params_file}" ]]; then
+    if validate_params_file "${params_file}"; then
         # Source params in a subshell to avoid polluting current environment.
         local nic port
         nic="$(bash -c ". '${params_file}' 2>/dev/null && printf '%s' \"\${SERVER_AWG_NIC:-}\"")"
@@ -699,6 +725,14 @@ Re-run with: --listen-port <port>"
         quic|dns|sip|auto) ;;
         *) die "Invalid --protocol '${PROTOCOL}'. Must be one of: quic, dns, sip, auto." ;;
     esac
+
+    if ! [[ "${SESSION_TTL}" =~ ^[0-9]+$ ]] || (( SESSION_TTL < 1 )); then
+        die "Invalid --session-ttl: '${SESSION_TTL}'. Must be a positive integer (seconds)."
+    fi
+
+    if ! [[ "${RATE_LIMIT}" =~ ^[0-9]+$ ]] || (( RATE_LIMIT < 1 )); then
+        die "Invalid --rate-limit: '${RATE_LIMIT}'. Must be a positive integer."
+    fi
 }
 
 # ── Filesystem setup ───────────────────────────────────────────────────────────
@@ -972,8 +1006,6 @@ find_unit_template() {
 install_service_unit() {
     step "Installing systemd service"
 
-    local unit_installed=false
-
     local unit_src
     if unit_src="$(find_unit_template)"; then
         info "Using service unit: ${unit_src}"
@@ -984,7 +1016,6 @@ install_service_unit() {
         else
             install -m 0644 "${unit_src}" "${SYSTEMD_UNIT_DEST}"
             info "Installed service unit: ${SYSTEMD_UNIT_DEST}"
-            unit_installed=true
         fi
     else
         warn "packaging/${SERVICE_NAME}.service not found; writing minimal inline unit."
@@ -1016,14 +1047,13 @@ WantedBy=multi-user.target
 UNITEOF
             chmod 0644 "${SYSTEMD_UNIT_DEST}"
             info "Wrote inline service unit: ${SYSTEMD_UNIT_DEST}"
-            unit_installed=true
         fi
     fi
 
-    # Update all configurable paths in the unit only when it was just installed/overwritten.
-    # This ensures the packaging template (which contains static defaults) and the inline
-    # unit both end up with the user-selected paths.
-    if [[ "${unit_installed}" == "true" ]]; then
+    # Update all configurable paths in the unit whenever a unit file is present.
+    # This keeps an existing preserved unit in sync with the user-selected paths
+    # before any daemon-reload/enable/restart operations.
+    if [[ -f "${SYSTEMD_UNIT_DEST}" ]]; then
         local -a read_only_paths=("/etc/amnezia" "${CONFIG_DIR}")
         if [[ "${AWG_DIR}" != "/etc/amnezia" ]]; then
             read_only_paths+=("${AWG_DIR}")
