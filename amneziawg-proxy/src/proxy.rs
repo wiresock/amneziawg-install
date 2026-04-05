@@ -32,6 +32,9 @@ pub struct Proxy {
     metrics: Arc<MetricsStore>,
     protocol: Protocol,
     awg_params: Option<Arc<AwgParams>>,
+    dns_forward_enabled: bool,
+    dns_upstream: Option<SocketAddr>,
+    dns_upstream_timeout: Duration,
     quic_handshake: Option<Arc<Mutex<QuicHandshakeResponder>>>,
     shutdown: Arc<Notify>,
     /// Per-session relay task handles, keyed by client address.
@@ -62,6 +65,13 @@ impl Proxy {
             config.max_sessions,
         ));
         let metrics = Arc::new(MetricsStore::new(config.rate_limit_per_sec));
+        let dns_upstream = if config.dns_forward_enabled {
+            Some(config.dns_upstream.parse::<SocketAddr>()?)
+        } else {
+            None
+        };
+        let dns_forward_enabled = config.dns_forward_enabled;
+        let dns_upstream_timeout = Duration::from_millis(config.dns_upstream_timeout_ms);
         let quic_handshake = if config.quic_handshake_enabled {
             Some(Arc::new(Mutex::new(QuicHandshakeResponder::new(
                 &config.quic_certificate_domain,
@@ -86,6 +96,9 @@ impl Proxy {
             metrics,
             protocol,
             awg_params: awg_params.map(Arc::new),
+            dns_forward_enabled,
+            dns_upstream,
+            dns_upstream_timeout,
             quic_handshake,
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
@@ -109,6 +122,9 @@ impl Proxy {
             metrics,
             protocol,
             awg_params: awg_params.map(Arc::new),
+            dns_forward_enabled: false,
+            dns_upstream: None,
+            dns_upstream_timeout: Duration::from_millis(1500),
             quic_handshake: None,
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
@@ -261,7 +277,13 @@ impl Proxy {
                         }
                     } else if metrics.try_acquire_probe() {
                         metrics.record_probe();
-                        probe_response = Some(responder::generate_response(proto, data));
+                        if proto == Protocol::Dns && self.dns_forward_enabled {
+                            probe_response = self.forward_dns_probe(data).await.or_else(|| {
+                                Some(responder::generate_response(proto, data))
+                            });
+                        } else {
+                            probe_response = Some(responder::generate_response(proto, data));
+                        }
                     } else {
                         debug!(%client_addr, "probe rate limited");
                     }
@@ -297,6 +319,31 @@ impl Proxy {
                 self.metrics.remove(&client_addr);
             }
         }
+    }
+
+    async fn forward_dns_probe(&self, query: &[u8]) -> Option<bytes::Bytes> {
+        let upstream = self.dns_upstream?;
+        let bind_addr = if upstream.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+
+        let sock = tokio::net::UdpSocket::bind(bind_addr).await.ok()?;
+        if sock.send_to(query, upstream).await.is_err() {
+            return None;
+        }
+
+        let mut buf = vec![0u8; 4096];
+        let recv = tokio::time::timeout(self.dns_upstream_timeout, sock.recv_from(&mut buf)).await;
+        let Ok(Ok((n, from))) = recv else {
+            return None;
+        };
+        if from != upstream || n == 0 {
+            return None;
+        }
+
+        Some(bytes::Bytes::copy_from_slice(&buf[..n]))
     }
 
     /// Spawn an event-driven relay task for a single session.
@@ -431,6 +478,9 @@ mod tests {
             imitate_protocol: "quic".into(),
             quic_handshake_enabled: false,
             quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
             max_sessions: 1000,
             awg_config: None,
@@ -474,6 +524,9 @@ mod tests {
             imitate_protocol: "quic".into(),
             quic_handshake_enabled: false,
             quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
             max_sessions: 1000,
             awg_config: None,

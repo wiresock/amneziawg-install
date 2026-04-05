@@ -263,6 +263,21 @@ pub struct ProxyConfig {
     #[serde(default = "default_quic_certificate_domain")]
     pub quic_certificate_domain: String,
 
+    /// Forward DNS probe queries to an upstream resolver instead of always
+    /// generating a synthetic SERVFAIL response.
+    ///
+    /// Only applies when `imitate_protocol = "dns"`.
+    #[serde(default)]
+    pub dns_forward_enabled: bool,
+
+    /// Upstream DNS resolver address used when `dns_forward_enabled = true`.
+    #[serde(default = "default_dns_upstream")]
+    pub dns_upstream: String,
+
+    /// Timeout for upstream DNS query forwarding in milliseconds.
+    #[serde(default = "default_dns_upstream_timeout_ms")]
+    pub dns_upstream_timeout_ms: u64,
+
     /// Buffer size for UDP recv in bytes.
     #[serde(default = "default_buffer_size")]
     pub buffer_size: usize,
@@ -293,6 +308,12 @@ fn default_imitate_protocol() -> String {
 fn default_quic_certificate_domain() -> String {
     "localhost".into()
 }
+fn default_dns_upstream() -> String {
+    "127.0.0.1:53".into()
+}
+fn default_dns_upstream_timeout_ms() -> u64 {
+    1500
+}
 fn default_buffer_size() -> usize {
     65535
 }
@@ -311,6 +332,9 @@ impl Default for ProxyConfig {
             imitate_protocol: default_imitate_protocol(),
             quic_handshake_enabled: false,
             quic_certificate_domain: default_quic_certificate_domain(),
+            dns_forward_enabled: false,
+            dns_upstream: default_dns_upstream(),
+            dns_upstream_timeout_ms: default_dns_upstream_timeout_ms(),
             buffer_size: default_buffer_size(),
             max_sessions: default_max_sessions(),
             awg_config: None,
@@ -363,6 +387,24 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
             "quic_certificate_domain must be non-empty when quic_handshake_enabled".into(),
         ));
     }
+    if config.dns_forward_enabled && config.imitate_protocol != "dns" {
+        return Err(ProxyError::Config(
+            "dns_forward_enabled requires imitate_protocol = 'dns'".into(),
+        ));
+    }
+    if config.dns_forward_enabled {
+        config.dns_upstream.parse::<std::net::SocketAddr>().map_err(|e| {
+            ProxyError::Config(format!(
+                "bad dns_upstream address '{}': {e}",
+                config.dns_upstream
+            ))
+        })?;
+    }
+    if config.dns_upstream_timeout_ms == 0 {
+        return Err(ProxyError::Config(
+            "dns_upstream_timeout_ms must be > 0".into(),
+        ));
+    }
     if config.buffer_size == 0 {
         return Err(ProxyError::Config("buffer_size must be > 0".into()));
     }
@@ -405,6 +447,9 @@ backend = "127.0.0.1:51821"
         assert_eq!(cfg.imitate_protocol, "quic");
         assert!(!cfg.quic_handshake_enabled);
         assert_eq!(cfg.quic_certificate_domain, "localhost");
+        assert!(!cfg.dns_forward_enabled);
+        assert_eq!(cfg.dns_upstream, "127.0.0.1:53");
+        assert_eq!(cfg.dns_upstream_timeout_ms, 1500);
         assert_eq!(cfg.buffer_size, 65535);
         assert!(cfg.awg_config.is_none());
     }
@@ -422,6 +467,9 @@ buffer_size = 4096
 awg_config = "/etc/awg/awg0.conf"
 quic_handshake_enabled = false
 quic_certificate_domain = "example.org"
+dns_forward_enabled = true
+dns_upstream = "127.0.0.1:5300"
+dns_upstream_timeout_ms = 700
 "#;
         let cfg = parse_config(toml).unwrap();
         assert_eq!(cfg.session_ttl_secs, 600);
@@ -430,6 +478,9 @@ quic_certificate_domain = "example.org"
         assert_eq!(cfg.imitate_protocol, "dns");
         assert!(!cfg.quic_handshake_enabled);
         assert_eq!(cfg.quic_certificate_domain, "example.org");
+        assert!(cfg.dns_forward_enabled);
+        assert_eq!(cfg.dns_upstream, "127.0.0.1:5300");
+        assert_eq!(cfg.dns_upstream_timeout_ms, 700);
         assert_eq!(cfg.buffer_size, 4096);
         assert_eq!(cfg.awg_config.as_deref(), Some("/etc/awg/awg0.conf"));
     }
@@ -461,6 +512,46 @@ quic_certificate_domain = ""
         assert!(err
             .to_string()
             .contains("quic_certificate_domain must be non-empty"));
+    }
+
+    #[test]
+    fn reject_dns_forward_with_non_dns_protocol() {
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+imitate_protocol = "quic"
+dns_forward_enabled = true
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("dns_forward_enabled requires imitate_protocol = 'dns'"));
+    }
+
+    #[test]
+    fn reject_dns_forward_bad_upstream() {
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+imitate_protocol = "dns"
+dns_forward_enabled = true
+dns_upstream = "not-an-addr"
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err.to_string().contains("bad dns_upstream address"));
+    }
+
+    #[test]
+    fn reject_zero_dns_upstream_timeout() {
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+dns_upstream_timeout_ms = 0
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("dns_upstream_timeout_ms must be > 0"));
     }
 
     #[test]
