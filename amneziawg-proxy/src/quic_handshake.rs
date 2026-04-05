@@ -1,16 +1,90 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
+use quinn_proto::crypto::rustls::QuicServerConfig;
 use quinn_proto::{
     Connection, ConnectionEvent, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig,
     EndpointEvent, ServerConfig,
 };
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use rcgen::generate_simple_self_signed;
+use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
+
+struct DynamicSniResolver {
+    default_domain: String,
+    cache: Mutex<HashMap<String, Arc<CertifiedKey>>>,
+}
+
+impl DynamicSniResolver {
+    fn new(default_domain: &str) -> anyhow::Result<Self> {
+        let mut cache = HashMap::new();
+        let default_key = generate_certified_key(default_domain)?;
+        cache.insert(default_domain.to_string(), default_key);
+        Ok(Self {
+            default_domain: default_domain.to_string(),
+            cache: Mutex::new(cache),
+        })
+    }
+}
+
+impl fmt::Debug for DynamicSniResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DynamicSniResolver")
+            .field("default_domain", &self.default_domain)
+            .finish()
+    }
+}
+
+impl ResolvesServerCert for DynamicSniResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let requested = client_hello
+            .server_name()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.default_domain)
+            .to_ascii_lowercase();
+
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(ck) = cache.get(&requested) {
+                return Some(Arc::clone(ck));
+            }
+        }
+
+        let generated = generate_certified_key(&requested)
+            .or_else(|_| generate_certified_key(&self.default_domain))
+            .ok()?;
+
+        if let Ok(mut cache) = self.cache.lock() {
+            let entry = cache
+                .entry(requested)
+                .or_insert_with(|| Arc::clone(&generated));
+            return Some(Arc::clone(entry));
+        }
+
+        Some(generated)
+    }
+}
+
+fn generate_certified_key(domain: &str) -> anyhow::Result<Arc<CertifiedKey>> {
+    let rcgen::CertifiedKey { cert, key_pair } =
+        generate_simple_self_signed(vec![domain.to_string()])
+            .with_context(|| format!("failed to generate self-signed certificate for '{domain}'"))?;
+
+    let cert_chain: Vec<CertificateDer<'static>> = vec![cert.der().clone()];
+    let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+    let private_key: PrivateKeyDer<'static> = key_der.into();
+    let signing_key = any_supported_type(&private_key)
+        .context("failed to create signing key from generated private key")?;
+
+    Ok(Arc::new(CertifiedKey::new(cert_chain, signing_key)))
+}
 
 /// Minimal stateful QUIC handshake responder.
 ///
@@ -30,17 +104,15 @@ pub struct QuicResponse {
 
 impl QuicHandshakeResponder {
     pub fn new(certificate_domain: &str) -> anyhow::Result<Self> {
-        let CertifiedKey { cert, key_pair } = generate_simple_self_signed(vec![
-            certificate_domain.to_string(),
-        ])
-        .context("failed to generate self-signed certificate")?;
+        let resolver = Arc::new(DynamicSniResolver::new(certificate_domain)?);
+        let mut rustls_server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        rustls_server_cfg.max_early_data_size = u32::MAX;
 
-        let cert_chain: Vec<CertificateDer<'static>> = vec![cert.der().clone()];
-        let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
-        let private_key: PrivateKeyDer<'static> = key_der.into();
-
-        let server_cfg = ServerConfig::with_single_cert(cert_chain, private_key)
-            .context("failed to create QUIC server config")?;
+        let quic_crypto = QuicServerConfig::try_from(rustls_server_cfg)
+            .context("failed to create QUIC rustls server config")?;
+        let server_cfg = ServerConfig::with_crypto(Arc::new(quic_crypto));
 
         let endpoint = Endpoint::new(
             Arc::new(EndpointConfig::default()),
