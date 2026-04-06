@@ -751,6 +751,9 @@ Re-run with: --listen-port <port>"
         if [[ "${path_val}" == *$'\n'* ]]; then
             die "${flag_name} must not contain newline characters."
         fi
+        if [[ "${path_val}" == *[[:space:]]* ]]; then
+            die "${flag_name} must not contain whitespace (got: '${path_val}')."
+        fi
     done
 }
 
@@ -1024,6 +1027,7 @@ find_unit_template() {
 install_service_unit() {
     step "Installing systemd service"
 
+    local unit_installed=false
     local unit_src
     if unit_src="$(find_unit_template)"; then
         info "Using service unit: ${unit_src}"
@@ -1034,6 +1038,7 @@ install_service_unit() {
         else
             install -m 0644 "${unit_src}" "${SYSTEMD_UNIT_DEST}"
             info "Installed service unit: ${SYSTEMD_UNIT_DEST}"
+            unit_installed=true
         fi
     else
         warn "packaging/${SERVICE_NAME}.service not found; writing minimal inline unit."
@@ -1065,13 +1070,14 @@ WantedBy=multi-user.target
 UNITEOF
             chmod 0644 "${SYSTEMD_UNIT_DEST}"
             info "Wrote inline service unit: ${SYSTEMD_UNIT_DEST}"
+            unit_installed=true
         fi
     fi
 
-    # Update all configurable paths in the unit whenever a unit file is present.
-    # This keeps an existing preserved unit in sync with the user-selected paths
-    # before any daemon-reload/enable/restart operations.
-    if [[ -f "${SYSTEMD_UNIT_DEST}" ]]; then
+    # Update configurable paths in the unit only when we just installed or
+    # overwrote it (unit_installed=true). Existing user-managed units are
+    # preserved as-is to avoid removing custom flags or capabilities.
+    if [[ -f "${SYSTEMD_UNIT_DEST}" ]] && [[ "${unit_installed}" == "true" ]]; then
         # Escape characters that are special in a sed replacement string: &, \,
         # and | (the sed delimiter used in the commands below).
         escape_sed_replacement() {
@@ -1173,4 +1179,6 @@ main() {
     print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

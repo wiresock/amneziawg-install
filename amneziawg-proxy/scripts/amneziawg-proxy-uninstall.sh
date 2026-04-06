@@ -471,12 +471,23 @@ main() {
             fi
         fi
         if [[ "${PURGE_DATA}" == "true" ]]; then
-            local data_dir_parent
-            data_dir_parent="$(dirname -- "${DATA_DIR}")"
-            if [[ "${data_dir_parent}" == "/" ]]; then
-                die "Refusing to purge data directory with unsafe parent: ${DATA_DIR}"
-            fi
-            safe_rm_dir "${DATA_DIR}" "${data_dir_parent}/"
+            case "${DATA_DIR}" in
+                "${DEFAULT_DATA_DIR}")
+                    safe_rm_dir "${DATA_DIR}" "$(dirname "${DEFAULT_DATA_DIR}")/"
+                    ;;
+                "${DEFAULT_DATA_DIR}"/*)
+                    safe_rm_dir "${DATA_DIR}" "${DEFAULT_DATA_DIR}/"
+                    ;;
+                /var)
+                    die "--purge-data refuses to purge '/var'; only '${DEFAULT_DATA_DIR}' or its subdirectories may be removed"
+                    ;;
+                /var/*)
+                    die "--purge-data only supports '${DEFAULT_DATA_DIR}' or its subdirectories; refusing to purge '${DATA_DIR}'"
+                    ;;
+                *)
+                    die "--purge-data only supports data directories under '${DEFAULT_DATA_DIR}'; refusing to purge '${DATA_DIR}'"
+                    ;;
+            esac
         fi
     fi
 
@@ -496,4 +507,6 @@ main() {
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
