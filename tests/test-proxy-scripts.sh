@@ -153,12 +153,14 @@ assert_rc 1 safe_rm_dir "/var/lib/amneziawg-proxy" "/etc/"
 assert_rc 0 safe_rm_dir "/var/lib/amneziawg-proxy" "/var/lib/"
 
 # Symlink → die
-TMPLINK="$(mktemp -u /tmp/test-symlink-XXXXX)"
+TMPLINK_DIR="$(mktemp -d)"
 TMPDIR_TARGET="$(mktemp -d)"
+TMPLINK="${TMPLINK_DIR}/test-symlink"
 ln -s "${TMPDIR_TARGET}" "${TMPLINK}"
 assert_rc 1 safe_rm_dir "${TMPLINK}" "/tmp/"
 rm -f "${TMPLINK}"
 rm -rf "${TMPDIR_TARGET}"
+rm -rf "${TMPLINK_DIR}"
 
 # Valid: actually remove a temp directory
 TMPD="$(mktemp -d)"
