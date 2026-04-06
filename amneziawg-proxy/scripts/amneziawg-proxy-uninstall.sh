@@ -208,8 +208,14 @@ safe_rm_dir() {
     if [[ "${#d}" -lt 5 ]]; then
         die "Refusing to remove suspiciously short path: ${d}"
     fi
-    if [[ "${d}" != "${prefix}"* ]]; then
-        die "Refusing to remove '${d}': does not start with expected prefix '${prefix}'"
+    # Canonicalize both paths via realpath -m (resolves symlinked parents) then
+    # compare on path-component boundaries to prevent prefix-name collisions
+    # (e.g. /var/lib/amneziawg-proxy-evil passing a /var/lib/amneziawg-proxy prefix).
+    local d_canon prefix_canon
+    d_canon="$(realpath -m -- "${d}")"
+    prefix_canon="$(realpath -m -- "${prefix%/}")"
+    if [[ "${d_canon}" != "${prefix_canon}" && "${d_canon}" != "${prefix_canon}/"* ]]; then
+        die "Refusing to remove '${d}' (resolved: '${d_canon}'): not under expected prefix '${prefix_canon}'"
     fi
     if [[ -d "${d}" ]]; then
         rm -rf -- "${d}"
@@ -384,6 +390,50 @@ restore_awg_listen_port() {
     fi
 }
 
+# ── Purge restriction validators ──────────────────────────────────────────────
+
+# validate_purge_config_dir: die if CONFIG_DIR is outside DEFAULT_CONFIG_DIR.
+# Extracted so tests can exercise the real restriction logic.
+validate_purge_config_dir() {
+    local config_dir="$1"
+    case "${config_dir}" in
+        "${DEFAULT_CONFIG_DIR}")
+            ;;
+        "${DEFAULT_CONFIG_DIR}"/*)
+            ;;
+        /etc)
+            die "--purge-config refuses to purge '/etc'; only '${DEFAULT_CONFIG_DIR}' or its subdirectories may be removed"
+            ;;
+        /etc/*)
+            die "--purge-config only supports '${DEFAULT_CONFIG_DIR}' or its subdirectories; refusing to purge '${config_dir}'"
+            ;;
+        *)
+            die "--purge-config only supports config directories under '${DEFAULT_CONFIG_DIR}'; refusing to purge '${config_dir}'"
+            ;;
+    esac
+}
+
+# validate_purge_data_dir: die if DATA_DIR is outside DEFAULT_DATA_DIR.
+# Extracted so tests can exercise the real restriction logic.
+validate_purge_data_dir() {
+    local data_dir="$1"
+    case "${data_dir}" in
+        "${DEFAULT_DATA_DIR}")
+            ;;
+        "${DEFAULT_DATA_DIR}"/*)
+            ;;
+        /var)
+            die "--purge-data refuses to purge '/var'; only '${DEFAULT_DATA_DIR}' or its subdirectories may be removed"
+            ;;
+        /var/*)
+            die "--purge-data only supports '${DEFAULT_DATA_DIR}' or its subdirectories; refusing to purge '${data_dir}'"
+            ;;
+        *)
+            die "--purge-data only supports data directories under '${DEFAULT_DATA_DIR}'; refusing to purge '${data_dir}'"
+            ;;
+    esac
+}
+
 # ── Summary / plan ─────────────────────────────────────────────────────────────
 
 print_plan() {
@@ -416,6 +466,23 @@ print_plan() {
 # ── Main uninstall ─────────────────────────────────────────────────────────────
 
 main() {
+    # Validate user-provided paths before performing any destructive operations.
+    # Relative paths or paths containing whitespace/newlines could lead to
+    # removing unintended files or injecting extra arguments.
+    local _pvar _pval
+    for _pvar in INSTALL_DIR CONFIG_FILE DATA_DIR AWG_DIR; do
+        _pval="${!_pvar}"
+        if [[ -z "${_pval}" ]]; then
+            die "--${_pvar,,} must not be empty."
+        fi
+        if [[ "${_pval}" != /* ]]; then
+            die "--${_pvar,,} must be an absolute path (got: '${_pval}')."
+        fi
+        if [[ "${_pval}" == *$'\n'* || "${_pval}" == *$'\r'* || "${_pval}" == *[[:space:]]* ]]; then
+            die "--${_pvar,,} must not contain whitespace or newlines."
+        fi
+    done
+
     print_plan
 
     if ! confirm "Proceed with uninstall?" "false"; then
@@ -436,9 +503,12 @@ main() {
 
     # 3. Remove systemd unit and reload
     safe_rm_file "${SYSTEMD_UNIT_DEST}"
-    if command -v systemctl &>/dev/null; then
-        systemctl daemon-reload
-        info "Reloaded systemd daemon"
+    if [[ "${HAVE_SYSTEMCTL}" == "true" ]]; then
+        if systemctl daemon-reload; then
+            info "Reloaded systemd daemon"
+        else
+            warn "systemctl daemon-reload failed (non-systemd environment?)"
+        fi
     fi
 
     # 4. Remove binary
@@ -454,21 +524,13 @@ main() {
             fi
         fi
         if [[ "${PURGE_CONFIG}" == "true" ]]; then
+            validate_purge_config_dir "${CONFIG_DIR}"
             case "${CONFIG_DIR}" in
                 "${DEFAULT_CONFIG_DIR}")
                     safe_rm_dir "${CONFIG_DIR}" "${DEFAULT_CONFIG_DIR}"
                     ;;
                 "${DEFAULT_CONFIG_DIR}"/*)
                     safe_rm_dir "${CONFIG_DIR}" "${DEFAULT_CONFIG_DIR}/"
-                    ;;
-                /etc)
-                    die "--purge-config refuses to purge '/etc'; only '${DEFAULT_CONFIG_DIR}' or its subdirectories may be removed"
-                    ;;
-                /etc/*)
-                    die "--purge-config only supports '${DEFAULT_CONFIG_DIR}' or its subdirectories; refusing to purge '${CONFIG_DIR}'"
-                    ;;
-                *)
-                    die "--purge-config only supports config directories under '${DEFAULT_CONFIG_DIR}'; refusing to purge '${CONFIG_DIR}'"
                     ;;
             esac
         fi
@@ -483,21 +545,13 @@ main() {
             fi
         fi
         if [[ "${PURGE_DATA}" == "true" ]]; then
+            validate_purge_data_dir "${DATA_DIR}"
             case "${DATA_DIR}" in
                 "${DEFAULT_DATA_DIR}")
                     safe_rm_dir "${DATA_DIR}" "$(dirname "${DEFAULT_DATA_DIR}")/"
                     ;;
                 "${DEFAULT_DATA_DIR}"/*)
                     safe_rm_dir "${DATA_DIR}" "${DEFAULT_DATA_DIR}/"
-                    ;;
-                /var)
-                    die "--purge-data refuses to purge '/var'; only '${DEFAULT_DATA_DIR}' or its subdirectories may be removed"
-                    ;;
-                /var/*)
-                    die "--purge-data only supports '${DEFAULT_DATA_DIR}' or its subdirectories; refusing to purge '${DATA_DIR}'"
-                    ;;
-                *)
-                    die "--purge-data only supports data directories under '${DEFAULT_DATA_DIR}'; refusing to purge '${DATA_DIR}'"
                     ;;
             esac
         fi

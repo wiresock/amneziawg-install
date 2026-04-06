@@ -179,28 +179,13 @@ rm -rf "${TMPD}"
 
 # ── --purge-config case restrictions ─────────────────────────────────────────
 #
-# Test-local helper that mirrors the case statement embedded in do_purge().
-# The real case logic is in do_purge() which has interactive prompts and
-# destructive operations, so we test the restriction pattern here.
+# Exercise the real validate_purge_config_dir() function sourced from the
+# uninstaller so tests catch regressions in the actual restriction logic.
 
 echo "=== purge_config case restrictions ==="
 
-DEFAULT_CONFIG_DIR_TEST="/etc/amneziawg-proxy"
-
 purge_config_check() {
-    local CONFIG_DIR="$1"
-    case "${CONFIG_DIR}" in
-        "${DEFAULT_CONFIG_DIR_TEST}")
-            : ;;
-        "${DEFAULT_CONFIG_DIR_TEST}"/*)
-            : ;;
-        /etc)
-            die "--purge-config refuses to purge '/etc'" ;;
-        /etc/*)
-            die "--purge-config: '${CONFIG_DIR}' not under '${DEFAULT_CONFIG_DIR_TEST}'" ;;
-        *)
-            die "--purge-config: custom paths outside /etc are not supported" ;;
-    esac
+    run_uninstall_helper validate_purge_config_dir "$@"
 }
 
 assert_rc 0 purge_config_check "/etc/amneziawg-proxy"
@@ -214,22 +199,8 @@ assert_rc 1 purge_config_check "/var/lib/something"
 
 echo "=== purge_data case restrictions ==="
 
-DEFAULT_DATA_DIR_TEST="/var/lib/amneziawg-proxy"
-
 purge_data_check() {
-    local DATA_DIR="$1"
-    case "${DATA_DIR}" in
-        "${DEFAULT_DATA_DIR_TEST}")
-            : ;;
-        "${DEFAULT_DATA_DIR_TEST}"/*)
-            : ;;
-        /var)
-            die "--purge-data refuses to purge '/var'" ;;
-        /var/*)
-            die "--purge-data: '${DATA_DIR}' not under '${DEFAULT_DATA_DIR_TEST}'" ;;
-        *)
-            die "--purge-data: custom paths outside default prefix are not supported" ;;
-    esac
+    run_uninstall_helper validate_purge_data_dir "$@"
 }
 
 assert_rc 0 purge_data_check "/var/lib/amneziawg-proxy"

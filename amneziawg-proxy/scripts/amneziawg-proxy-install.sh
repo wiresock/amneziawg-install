@@ -818,7 +818,7 @@ Re-run with: --listen-port <port>"
         if [[ "${path_val}" != /* ]]; then
             die "${flag_name} must be an absolute path (got: '${path_val}')."
         fi
-        if [[ "${path_val}" == *$'\n'* ]]; then
+        if [[ "${path_val}" == *$'\n'* || "${path_val}" == *$'\r'* ]]; then
             die "${flag_name} must not contain newline characters."
         fi
         if [[ "${path_val}" == *[[:space:]]* ]]; then
@@ -1228,6 +1228,19 @@ print_summary() {
 main() {
     parse_args "$@"
     preflight_checks
+
+    # Validate AWG_DIR unconditionally: it can be set via --awg-dir even in
+    # interactive mode and is later interpolated into the systemd unit's
+    # ReadOnlyPaths list where whitespace/newlines corrupt the directive.
+    if [[ "${AWG_DIR}" != /* ]]; then
+        die "--awg-dir must be an absolute path (got: '${AWG_DIR}')."
+    fi
+    if [[ "${AWG_DIR}" == *$'\n'* || "${AWG_DIR}" == *$'\r'* ]]; then
+        die "--awg-dir must not contain newline characters."
+    fi
+    if [[ "${AWG_DIR}" == *[[:space:]]* ]]; then
+        die "--awg-dir must not contain whitespace."
+    fi
 
     if [[ "${NON_INTERACTIVE}" == "true" ]]; then
         non_interactive_validate
