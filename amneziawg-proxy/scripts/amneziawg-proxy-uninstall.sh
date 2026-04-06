@@ -109,12 +109,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── Root check ─────────────────────────────────────────────────────────────────
-
-if [[ "$(id -u)" -ne 0 ]]; then
-    die "This script must be run as root (e.g. sudo $0)"
-fi
-
 # ── Confirmation helper ────────────────────────────────────────────────────────
 
 confirm() {
@@ -187,11 +181,17 @@ safe_rm_dir() {
         warn "safe_rm_dir: empty path, skipping"
         return 0
     fi
+    # Normalize: strip any trailing slash so prefix and length checks are consistent
+    d="${d%/}"
     if [[ "${d}" != /* ]]; then
         die "Refusing to remove non-absolute path: ${d}"
     fi
     if [[ "/${d}/" == *"/../"* || "/${d}/" == *"/./"* ]]; then
         die "Refusing to remove path containing '..' or '.' components: ${d}"
+    fi
+    # Refuse symlinks: rm -rf on a symlink with trailing slash follows into target
+    if [[ -L "${d}" ]]; then
+        die "Refusing to remove symlink: ${d}"
     fi
     if [[ "${#d}" -lt 5 ]]; then
         die "Refusing to remove suspiciously short path: ${d}"
@@ -301,13 +301,13 @@ restore_awg_listen_port() {
     # Try params file first
     local params_file="${AWG_DIR}/params"
     if validate_params_file "${params_file}"; then
-        awg_nic="$(bash -c ". '${params_file}' 2>/dev/null && printf '%s' \"\${SERVER_AWG_NIC:-}\"")"
+        awg_nic="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_AWG_NIC:-}"' _ "${params_file}")"
     fi
 
     if [[ -n "${awg_nic}" ]]; then
         awg_conf="${AWG_DIR}/${awg_nic}.conf"
     else
-        awg_conf="$(find "${AWG_DIR}" -maxdepth 1 -name '*.conf' | sort | head -1 2>/dev/null || true)"
+        awg_conf="$(find "${AWG_DIR}" -maxdepth 1 -name '*.conf' 2>/dev/null | sort | head -1 || true)"
         awg_nic="$(basename "${awg_conf}" .conf 2>/dev/null || true)"
     fi
 
@@ -508,5 +508,8 @@ main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    if [[ "$(id -u)" -ne 0 ]]; then
+        die "This script must be run as root (e.g. sudo $0)"
+    fi
     main "$@"
 fi

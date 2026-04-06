@@ -304,8 +304,8 @@ detect_awg_config() {
     if validate_params_file "${params_file}"; then
         # Source params in a subshell to avoid polluting current environment.
         local nic port
-        nic="$(bash -c ". '${params_file}' 2>/dev/null && printf '%s' \"\${SERVER_AWG_NIC:-}\"")"
-        port="$(bash -c ". '${params_file}' 2>/dev/null && printf '%s' \"\${SERVER_PORT:-}\"")"
+        nic="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_AWG_NIC:-}"' _ "${params_file}")"
+        port="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_PORT:-}"' _ "${params_file}")"
 
         if [[ -n "${nic}" ]]; then
             AWG_NIC="${nic}"
@@ -327,7 +327,7 @@ detect_awg_config() {
     else
         # Fall back: scan for any .conf file in the AWG directory
         local first_conf
-        first_conf="$(find "${AWG_DIR}" -maxdepth 1 -name '*.conf' | sort | head -1 2>/dev/null || true)"
+        first_conf="$(find "${AWG_DIR}" -maxdepth 1 -name '*.conf' 2>/dev/null | sort | head -1 || true)"
         if [[ -n "${first_conf}" ]]; then
             AWG_CONF_FILE="${first_conf}"
             AWG_NIC="$(basename "${first_conf}" .conf)"
@@ -496,6 +496,12 @@ is_positive_integer() {
     [[ "${val}" =~ ^[0-9]+$ ]] && (( val >= 1 ))
 }
 
+# Escape characters that are special in a sed replacement string: &, \, and |
+# (| is the delimiter used by the sed commands in install_service_unit).
+escape_sed_replacement() {
+    printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
+}
+
 prompt_default() {
     local var_name="$1"
     local prompt_text="$2"
@@ -656,10 +662,22 @@ EOF
 
     # Paths
     printf "\n${BOLD}Installation paths:${NC}\n"
-    prompt_default INSTALL_DIR  "Binary install directory" "${INSTALL_DIR}"
-    prompt_default CONFIG_FILE  "Proxy config file path" "${CONFIG_FILE}"
+    while true; do
+        prompt_default INSTALL_DIR "Binary install directory" "${INSTALL_DIR}"
+        [[ "${INSTALL_DIR}" != *[[:space:]]* ]] && break
+        warn "Binary install directory must not contain whitespace."
+    done
+    while true; do
+        prompt_default CONFIG_FILE "Proxy config file path" "${CONFIG_FILE}"
+        [[ "${CONFIG_FILE}" != *[[:space:]]* ]] && break
+        warn "Proxy config file path must not contain whitespace."
+    done
     CONFIG_DIR="$(dirname "${CONFIG_FILE}")"
-    prompt_default DATA_DIR     "Service working directory" "${DATA_DIR}"
+    while true; do
+        prompt_default DATA_DIR "Service working directory" "${DATA_DIR}"
+        [[ "${DATA_DIR}" != *[[:space:]]* ]] && break
+        warn "Service working directory must not contain whitespace."
+    done
 
     printf "\n${BOLD}Service options:${NC}\n"
     prompt_yesno ENABLE_SERVICE "Enable service at boot?" "${ENABLE_SERVICE}"
@@ -1078,12 +1096,6 @@ UNITEOF
     # overwrote it (unit_installed=true). Existing user-managed units are
     # preserved as-is to avoid removing custom flags or capabilities.
     if [[ -f "${SYSTEMD_UNIT_DEST}" ]] && [[ "${unit_installed}" == "true" ]]; then
-        # Escape characters that are special in a sed replacement string: &, \,
-        # and | (the sed delimiter used in the commands below).
-        escape_sed_replacement() {
-            printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
-        }
-
         local -a read_only_paths=("/etc/amnezia" "${CONFIG_DIR}")
         if [[ "${AWG_DIR}" != "/etc/amnezia" ]]; then
             read_only_paths+=("${AWG_DIR}")

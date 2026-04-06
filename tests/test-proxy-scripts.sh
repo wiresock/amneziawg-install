@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Unit tests for amneziawg-proxy install/uninstall helper functions.
 #
-# Tests pure helper functions that do not require root or external tools.
+# Tests helper functions by sourcing the real install/uninstall scripts in
+# isolated subshells, so regressions in the actual implementations are caught.
 # Covers: is_positive_integer, escape_sed_replacement, safe_rm_dir safety
 # guards, and --purge-config / --purge-data path restrictions.
 #
@@ -47,43 +48,46 @@ function assert_eq() {
     fi
 }
 
-# ── Helpers sourced inline (avoid sourcing full scripts which set -e / readonly) ──
+# ── Stub helpers used by test-local functions (purge checks, etc.) ────────────
 
-die() { echo "ERROR: $*" >&2; exit 1; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
 warn() { echo "WARN: $*" >&2; }
 info() { :; }
 
-is_positive_integer() {
-    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+# ── Helpers sourced from the real scripts in isolated subshells ───────────────
+
+run_install_helper() {
+    local helper_name="$1"
+    shift
+    local -a helper_args=("$@")
+    (
+        set --  # Clear $@ so the sourced script's arg parser sees no args
+        source "${INSTALL_SCRIPT}" 2>/dev/null
+        # Suppress logging so test output stays clean
+        info()  { :; }
+        warn()  { :; }
+        step()  { :; }
+        error() { :; }
+        "${helper_name}" "${helper_args[@]}"
+    )
 }
 
-escape_sed_replacement() {
-    printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
+run_uninstall_helper() {
+    local helper_name="$1"
+    shift
+    local -a helper_args=("$@")
+    (
+        set --  # Clear $@ so the sourced script's top-level arg parser sees no args
+        source "${UNINSTALL_SCRIPT}" 2>/dev/null
+        info() { :; }
+        warn() { :; }
+        "${helper_name}" "${helper_args[@]}"
+    )
 }
 
-safe_rm_dir() {
-    local d="$1"
-    local prefix="$2"
-    if [[ -z "${d}" ]]; then
-        warn "safe_rm_dir: empty path, skipping"
-        return 0
-    fi
-    if [[ "${d}" != /* ]]; then
-        die "Refusing to remove non-absolute path: ${d}"
-    fi
-    if [[ "/${d}/" == *"/../"* || "/${d}/" == *"/./"* ]]; then
-        die "Refusing to remove path containing '..' or '.' components: ${d}"
-    fi
-    if [[ "${#d}" -lt 5 ]]; then
-        die "Refusing to remove suspiciously short path: ${d}"
-    fi
-    if [[ "${d}" != "${prefix}"* ]]; then
-        die "Refusing to remove '${d}': does not start with expected prefix '${prefix}'"
-    fi
-    if [[ -d "${d}" ]]; then
-        rm -rf -- "${d}"
-    fi
-}
+is_positive_integer() { run_install_helper  is_positive_integer  "$@"; }
+escape_sed_replacement() { run_install_helper escape_sed_replacement "$@"; }
+safe_rm_dir()           { run_uninstall_helper safe_rm_dir          "$@"; }
 
 # ── is_positive_integer ───────────────────────────────────────────────────────
 
@@ -139,11 +143,22 @@ assert_rc 1 safe_rm_dir "/var/./lib/x" "/var/"
 # Suspiciously short path → die
 assert_rc 1 safe_rm_dir "/etc" "/etc"
 
+# Trailing slash stripped → still short → die
+assert_rc 1 safe_rm_dir "/etc/" "/etc/"
+
 # Prefix mismatch → die
 assert_rc 1 safe_rm_dir "/var/lib/amneziawg-proxy" "/etc/"
 
 # Valid path under expected prefix (directory not present → no-op, exit 0)
 assert_rc 0 safe_rm_dir "/var/lib/amneziawg-proxy" "/var/lib/"
+
+# Symlink → die
+TMPLINK="$(mktemp -u /tmp/test-symlink-XXXXX)"
+TMPDIR_TARGET="$(mktemp -d)"
+ln -s "${TMPDIR_TARGET}" "${TMPLINK}"
+assert_rc 1 safe_rm_dir "${TMPLINK}" "/tmp/"
+rm -f "${TMPLINK}"
+rm -rf "${TMPDIR_TARGET}"
 
 # Valid: actually remove a temp directory
 TMPD="$(mktemp -d)"
@@ -162,7 +177,9 @@ rm -rf "${TMPD}"
 
 # ── --purge-config case restrictions ─────────────────────────────────────────
 #
-# Simulate the case statement used in the uninstaller.
+# Test-local helper that mirrors the case statement embedded in do_purge().
+# The real case logic is in do_purge() which has interactive prompts and
+# destructive operations, so we test the restriction pattern here.
 
 echo "=== purge_config case restrictions ==="
 
