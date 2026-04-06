@@ -184,44 +184,59 @@ parse_args() {
             --non-interactive)
                 NON_INTERACTIVE=true; shift ;;
             --binary-src)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 BINARY_SRC="$2"; shift 2 ;;
             --source-dir)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 SOURCE_DIR="$2"; shift 2 ;;
             --install-rust)
                 INSTALL_RUST=true; shift ;;
             --install-dir)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 INSTALL_DIR="$2"; shift 2 ;;
             --config-file)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 CONFIG_FILE="$2"
                 CONFIG_DIR="$(dirname "${CONFIG_FILE}")"
                 shift 2 ;;
             --data-dir)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 DATA_DIR="$2"; shift 2 ;;
             --awg-dir)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 AWG_DIR="$2"; shift 2 ;;
             --listen-host)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 LISTEN_HOST="$2"; shift 2 ;;
             --listen-port)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 LISTEN_PORT="$2"; shift 2 ;;
             --backend-host)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 BACKEND_HOST="$2"; shift 2 ;;
             --backend-port)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 BACKEND_PORT="$2"; shift 2 ;;
             --protocol)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 PROTOCOL="$2"; shift 2 ;;
             --session-ttl)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 SESSION_TTL="$2"; shift 2 ;;
             --rate-limit)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 RATE_LIMIT="$2"; shift 2 ;;
             --dns-forward)
                 DNS_FORWARD_ENABLED=true; shift ;;
             --dns-upstream)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 DNS_UPSTREAM="$2"
                 DNS_FORWARD_ENABLED=true
                 shift 2 ;;
             --quic-handshake)
                 QUIC_HANDSHAKE_ENABLED=true; shift ;;
             --quic-domain)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 QUIC_DOMAIN="$2"; shift 2 ;;
             --no-enable)
                 ENABLE_SERVICE=false; shift ;;
@@ -282,6 +297,10 @@ validate_params_file() {
     local owner perms
     owner="$(stat -c '%u' "${f}" 2>/dev/null || true)"
     perms="$(stat -c '%a' "${f}" 2>/dev/null || true)"
+    if [[ -z "${owner}" || -z "${perms}" ]]; then
+        warn "Ignoring params file — failed to read file metadata: ${f}"
+        return 1
+    fi
     if [[ "${owner}" != "0" ]]; then
         warn "Ignoring params file — not owned by root (owner UID: ${owner}): ${f}"
         return 1
@@ -664,19 +683,52 @@ EOF
     printf "\n${BOLD}Installation paths:${NC}\n"
     while true; do
         prompt_default INSTALL_DIR "Binary install directory" "${INSTALL_DIR}"
-        [[ "${INSTALL_DIR}" != *[[:space:]]* ]] && break
-        warn "Binary install directory must not contain whitespace."
+        if [[ "${INSTALL_DIR}" != /* ]]; then
+            warn "Binary install directory must be an absolute path."
+            continue
+        fi
+        if [[ "${INSTALL_DIR}" == *$'\n'* || "${INSTALL_DIR}" == *$'\r'* ]]; then
+            warn "Binary install directory must not contain newlines."
+            continue
+        fi
+        if [[ "${INSTALL_DIR}" == *[[:space:]]* ]]; then
+            warn "Binary install directory must not contain whitespace."
+            continue
+        fi
+        break
     done
     while true; do
         prompt_default CONFIG_FILE "Proxy config file path" "${CONFIG_FILE}"
-        [[ "${CONFIG_FILE}" != *[[:space:]]* ]] && break
-        warn "Proxy config file path must not contain whitespace."
+        if [[ "${CONFIG_FILE}" != /* ]]; then
+            warn "Proxy config file path must be an absolute path."
+            continue
+        fi
+        if [[ "${CONFIG_FILE}" == *$'\n'* || "${CONFIG_FILE}" == *$'\r'* ]]; then
+            warn "Proxy config file path must not contain newlines."
+            continue
+        fi
+        if [[ "${CONFIG_FILE}" == *[[:space:]]* ]]; then
+            warn "Proxy config file path must not contain whitespace."
+            continue
+        fi
+        break
     done
     CONFIG_DIR="$(dirname "${CONFIG_FILE}")"
     while true; do
         prompt_default DATA_DIR "Service working directory" "${DATA_DIR}"
-        [[ "${DATA_DIR}" != *[[:space:]]* ]] && break
-        warn "Service working directory must not contain whitespace."
+        if [[ "${DATA_DIR}" != /* ]]; then
+            warn "Service working directory must be an absolute path."
+            continue
+        fi
+        if [[ "${DATA_DIR}" == *$'\n'* || "${DATA_DIR}" == *$'\r'* ]]; then
+            warn "Service working directory must not contain newlines."
+            continue
+        fi
+        if [[ "${DATA_DIR}" == *[[:space:]]* ]]; then
+            warn "Service working directory must not contain whitespace."
+            continue
+        fi
+        break
     done
 
     printf "\n${BOLD}Service options:${NC}\n"

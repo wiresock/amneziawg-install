@@ -95,10 +95,18 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --install-dir)      INSTALL_DIR="$2"; shift 2 ;;
-        --config-file)      CONFIG_FILE="$2"; CONFIG_DIR="$(dirname "${CONFIG_FILE}")"; shift 2 ;;
-        --data-dir)         DATA_DIR="$2"; shift 2 ;;
-        --awg-dir)          AWG_DIR="$2"; shift 2 ;;
+        --install-dir)
+            [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
+            INSTALL_DIR="$2"; shift 2 ;;
+        --config-file)
+            [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
+            CONFIG_FILE="$2"; CONFIG_DIR="$(dirname "${CONFIG_FILE}")"; shift 2 ;;
+        --data-dir)
+            [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
+            DATA_DIR="$2"; shift 2 ;;
+        --awg-dir)
+            [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
+            AWG_DIR="$2"; shift 2 ;;
         --purge-config)     PURGE_CONFIG="true"; shift ;;
         --purge-data)       PURGE_DATA="true"; shift ;;
         --restore-awg)      RESTORE_AWG="true"; shift ;;
@@ -149,6 +157,10 @@ validate_params_file() {
     local owner perms
     owner="$(stat -c '%u' "${f}" 2>/dev/null || true)"
     perms="$(stat -c '%a' "${f}" 2>/dev/null || true)"
+    if [[ -z "${owner}" || -z "${perms}" ]]; then
+        warn "Ignoring params file — failed to read file metadata: ${f}"
+        return 1
+    fi
     if [[ "${owner}" != "0" ]]; then
         warn "Ignoring params file — not owned by root (owner UID: ${owner}): ${f}"
         return 1
@@ -319,7 +331,7 @@ restore_awg_listen_port() {
     # Look for a backup file created by the installer
     local latest_backup
     latest_backup="$(find "${AWG_DIR}" -maxdepth 1 \
-        -name "$(basename "${awg_conf}").bak.*" | sort | tail -1 2>/dev/null || true)"
+        -name "$(basename "${awg_conf}").bak.*" 2>/dev/null | sort | tail -1 || true)"
 
     if [[ -n "${latest_backup}" ]]; then
         info "Found AWG config backup: ${latest_backup}"
