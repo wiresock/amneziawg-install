@@ -469,17 +469,18 @@ main() {
     # Validate user-provided paths before performing any destructive operations.
     # Relative paths or paths containing whitespace/newlines could lead to
     # removing unintended files or injecting extra arguments.
-    local _pvar _pval
+    local _pvar _pval _flag
     for _pvar in INSTALL_DIR CONFIG_FILE DATA_DIR AWG_DIR; do
         _pval="${!_pvar}"
+        _flag="--${_pvar//_/-}"; _flag="${_flag,,}"
         if [[ -z "${_pval}" ]]; then
-            die "--${_pvar,,} must not be empty."
+            die "${_flag} must not be empty."
         fi
         if [[ "${_pval}" != /* ]]; then
-            die "--${_pvar,,} must be an absolute path (got: '${_pval}')."
+            die "${_flag} must be an absolute path (got: '${_pval}')."
         fi
         if [[ "${_pval}" == *$'\n'* || "${_pval}" == *$'\r'* || "${_pval}" == *[[:space:]]* ]]; then
-            die "--${_pvar,,} must not contain whitespace or newlines."
+            die "${_flag} must not contain whitespace or newlines."
         fi
     done
 
