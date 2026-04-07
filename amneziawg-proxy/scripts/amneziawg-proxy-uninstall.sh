@@ -292,6 +292,25 @@ systemctl_if_enabled() {
 
 # ── AWG restore ────────────────────────────────────────────────────────────────
 
+# Extract the numeric port from an endpoint string.
+# Supports:
+#   - host:port          (IPv4 or hostname)
+#   - [ipv6-address]:port
+# Returns the numeric port on stdout, or nothing if it cannot be parsed.
+extract_endpoint_port() {
+    local endpoint="$1"
+    endpoint="$(printf '%s' "${endpoint}" | tr -d '[:space:]"')"
+    if [[ "${endpoint}" =~ ^\[.*\]:([0-9]+)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "${endpoint}" =~ ^.+:([0-9]+)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
 # Read listen and backend ports from the proxy config file.
 read_proxy_config_ports() {
     local cfg="$1"
@@ -299,15 +318,16 @@ read_proxy_config_ports() {
         return 1
     fi
 
-    # Extract listen port from: listen = "host:port"
-    PROXY_LISTEN_PORT="$(grep -E '^[[:space:]]*listen[[:space:]]*=' "${cfg}" \
-        | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '"' | \
-        awk -F: '{print $NF}' | tr -d '[:space:]')" || true
+    local listen_value backend_value
+    # Extract listen port from: listen = "host:port" or listen = "[ipv6]:port"
+    listen_value="$(grep -E '^[[:space:]]*listen[[:space:]]*=' "${cfg}" \
+        | head -1 | sed 's/.*=[[:space:]]*//')" || true
+    PROXY_LISTEN_PORT="$(extract_endpoint_port "${listen_value}")" || true
 
-    # Extract backend port from: backend = "host:port"
-    PROXY_BACKEND_PORT="$(grep -E '^[[:space:]]*backend[[:space:]]*=' "${cfg}" \
-        | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '"' | \
-        awk -F: '{print $NF}' | tr -d '[:space:]')" || true
+    # Extract backend port from: backend = "host:port" or backend = "[ipv6]:port"
+    backend_value="$(grep -E '^[[:space:]]*backend[[:space:]]*=' "${cfg}" \
+        | head -1 | sed 's/.*=[[:space:]]*//')" || true
+    PROXY_BACKEND_PORT="$(extract_endpoint_port "${backend_value}")" || true
 
     [[ -n "${PROXY_LISTEN_PORT}" ]]
 }

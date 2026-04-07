@@ -1053,7 +1053,9 @@ reconfigure_awg_listen_port() {
     # directive is absent the code prints firewall guidance instead.
     if [[ "${needs_addr_change}" == "true" ]]; then
         if grep -qi '^[[:space:]]*ListenAddr[[:space:]]*=' "${AWG_CONF_FILE}"; then
-            sed -i "s|^[[:space:]]*ListenAddr[[:space:]]*=.*|ListenAddr = ${BACKEND_HOST}|i" \
+            local escaped_backend_host
+            escaped_backend_host="$(escape_sed_replacement "${BACKEND_HOST}")"
+            sed -i "s|^[[:space:]]*ListenAddr[[:space:]]*=.*|ListenAddr = ${escaped_backend_host}|i" \
                 "${AWG_CONF_FILE}"
             info "Updated ListenAddr → ${BACKEND_HOST}"
         else
