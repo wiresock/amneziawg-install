@@ -203,10 +203,11 @@ _canon_path() {
         printf '%s' "${result}"; return
     fi
     if command -v python3 &>/dev/null; then
-        result="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "${p}" 2>/dev/null)"
+        # ${p} is passed as a positional argument (sys.argv[1]), not embedded in code.
+        result="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${p}" 2>/dev/null)"
         if [[ -n "${result}" ]]; then printf '%s' "${result}"; return; fi
     fi
-    warn "safe_rm_dir: realpath unavailable; symlinked parent directories will not be detected for '${p}'"
+    warn "path canonicalization unavailable; symlinked parent directories will not be detected for '${p}'"
     printf '%s' "${p}"
 }
 
