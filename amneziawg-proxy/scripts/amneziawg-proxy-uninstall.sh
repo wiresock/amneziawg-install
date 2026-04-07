@@ -214,6 +214,12 @@ _canon_path() {
     printf '%s' "${p}"
 }
 
+# Return 0 (true) when a path contains '.' or '..' path components.
+_path_has_dot_components() {
+    local p="$1"
+    [[ "${p}" == */./* || "${p}" == */../* || "${p}" == */. || "${p}" == */.. ]]
+}
+
 safe_rm_dir() {
     local d="$1"
     local prefix="$2"
@@ -529,6 +535,9 @@ main() {
         fi
         if [[ "${_pval}" == *$'\n'* || "${_pval}" == *$'\r'* || "${_pval}" == *[[:space:]]* ]]; then
             die "${_flag} must not contain whitespace or newlines."
+        fi
+        if _path_has_dot_components "${_pval}"; then
+            die "${_flag} must not contain '.' or '..' path components (got: '${_pval}')."
         fi
     done
 

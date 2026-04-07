@@ -773,6 +773,12 @@ EOF
     fi
 }
 
+# Return 0 (true) when a path contains '.' or '..' path components.
+_path_has_dot_components() {
+    local p="$1"
+    [[ "${p}" == */./* || "${p}" == */../* || "${p}" == */. || "${p}" == */.. ]]
+}
+
 non_interactive_validate() {
     if [[ -z "${LISTEN_PORT}" ]]; then
         die "Non-interactive mode requires --listen-port (could not auto-detect from AWG config).
@@ -823,6 +829,9 @@ Re-run with: --listen-port <port>"
         fi
         if [[ "${path_val}" == *[[:space:]]* ]]; then
             die "${flag_name} must not contain whitespace (got: '${path_val}')."
+        fi
+        if _path_has_dot_components "${path_val}"; then
+            die "${flag_name} must not contain '.' or '..' path components (got: '${path_val}')."
         fi
     done
 }
@@ -1242,6 +1251,9 @@ main() {
     fi
     if [[ "${AWG_DIR}" == *[[:space:]]* ]]; then
         die "--awg-dir must not contain whitespace."
+    fi
+    if _path_has_dot_components "${AWG_DIR}"; then
+        die "--awg-dir must not contain '.' or '..' path components (got: '${AWG_DIR}')."
     fi
 
     preflight_checks
