@@ -304,7 +304,7 @@ extract_endpoint_port() {
         printf '%s\n' "${BASH_REMATCH[1]}"
         return 0
     fi
-    if [[ "${endpoint}" =~ ^.+:([0-9]+)$ ]]; then
+    if [[ "${endpoint}" =~ ^[^:]+:([0-9]+)$ ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
         return 0
     fi
