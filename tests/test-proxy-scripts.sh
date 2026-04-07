@@ -190,6 +190,7 @@ purge_config_check() {
 
 assert_rc 0 purge_config_check "/etc/amneziawg-proxy"
 assert_rc 0 purge_config_check "/etc/amneziawg-proxy/subdir"
+assert_rc 0 purge_config_check "/etc/amneziawg-proxy/"
 assert_rc 1 purge_config_check "/etc"
 assert_rc 1 purge_config_check "/etc/other"
 assert_rc 1 purge_config_check "/custom/path"
@@ -205,6 +206,7 @@ purge_data_check() {
 
 assert_rc 0 purge_data_check "/var/lib/amneziawg-proxy"
 assert_rc 0 purge_data_check "/var/lib/amneziawg-proxy/subdir"
+assert_rc 0 purge_data_check "/var/lib/amneziawg-proxy/"
 assert_rc 1 purge_data_check "/var"
 assert_rc 1 purge_data_check "/var/lib/other"
 assert_rc 1 purge_data_check "/etc/ssl"

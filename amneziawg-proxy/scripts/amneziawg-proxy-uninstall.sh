@@ -132,7 +132,10 @@ confirm() {
         prompt="${msg} [y/N] "
     fi
     local reply
-    read -r -p "${prompt}" reply
+    if ! read -r -p "${prompt}" reply; then
+        warn "No input available (EOF); treating as 'no'."
+        return 1
+    fi
     reply="${reply:-${default}}"
     case "${reply}" in
         [Yy]*|true) return 0 ;;
@@ -420,7 +423,7 @@ restore_awg_listen_port() {
 # validate_purge_config_dir: die if CONFIG_DIR is outside DEFAULT_CONFIG_DIR.
 # Extracted so tests can exercise the real restriction logic.
 validate_purge_config_dir() {
-    local config_dir="$1"
+    local config_dir="${1%/}"
     case "${config_dir}" in
         "${DEFAULT_CONFIG_DIR}")
             ;;
@@ -441,7 +444,7 @@ validate_purge_config_dir() {
 # validate_purge_data_dir: die if DATA_DIR is outside DEFAULT_DATA_DIR.
 # Extracted so tests can exercise the real restriction logic.
 validate_purge_data_dir() {
-    local data_dir="$1"
+    local data_dir="${1%/}"
     case "${data_dir}" in
         "${DEFAULT_DATA_DIR}")
             ;;
