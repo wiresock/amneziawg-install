@@ -1060,8 +1060,9 @@ reconfigure_awg_listen_port() {
             # AmneziaWG may not support ListenAddr; add as a comment note only
             warn "AmneziaWG does not use a ListenAddr directive in all versions."
             warn "To restrict AWG to loopback, use firewall rules or bind via the"
-            warn "awg-quick PostUp hook. Example PostUp firewall rule:"
-            warn "  PostUp = iptables -I INPUT -p udp --dport ${BACKEND_PORT} ! -s ${BACKEND_HOST}/8 -j DROP"
+            warn "awg-quick PostUp hook. Example PostUp firewall rule for loopback:"
+            warn "  PostUp = iptables -I INPUT -p udp --dport ${BACKEND_PORT} ! -s 127.0.0.0/8 -j DROP"
+            warn "If you use a different backend host, adjust the source CIDR accordingly."
         fi
     fi
 

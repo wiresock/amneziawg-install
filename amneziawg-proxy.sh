@@ -80,8 +80,11 @@ manage_menu() {
             if ! command -v journalctl &>/dev/null; then
                 warn "journalctl is not available on this system."
             else
-                journalctl -u "${SERVICE_NAME}" -f --no-pager \
-                    || warn "Failed to read logs for ${SERVICE_NAME} via journalctl."
+                local journalctl_status=0
+                journalctl -u "${SERVICE_NAME}" -f --no-pager || journalctl_status=$?
+                if [[ "${journalctl_status}" -ne 0 && "${journalctl_status}" -ne 130 ]]; then
+                    warn "Failed to read logs for ${SERVICE_NAME} via journalctl."
+                fi
             fi
             ;;
         3)
