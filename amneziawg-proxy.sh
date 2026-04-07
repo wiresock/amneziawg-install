@@ -63,7 +63,9 @@ manage_menu() {
 
     local option=""
     until [[ "${option}" =~ ^[1-5]$ ]]; do
-        read -rp "Select an option [1-5]: " option
+        if ! read -rp "Select an option [1-5]: " option; then
+            die "No input available; cannot read menu selection."
+        fi
     done
 
     case "${option}" in

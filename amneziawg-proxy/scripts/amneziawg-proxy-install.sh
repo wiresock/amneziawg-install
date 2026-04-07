@@ -1227,11 +1227,10 @@ print_summary() {
 
 main() {
     parse_args "$@"
-    preflight_checks
 
-    # Validate AWG_DIR unconditionally: it can be set via --awg-dir even in
-    # interactive mode and is later interpolated into the systemd unit's
-    # ReadOnlyPaths list where whitespace/newlines corrupt the directive.
+    # Validate AWG_DIR unconditionally before preflight_checks: detect_awg_config
+    # (called inside preflight_checks) already uses AWG_DIR in find/glob
+    # expressions, so an unsafe value must be rejected here.
     if [[ "${AWG_DIR}" != /* ]]; then
         die "--awg-dir must be an absolute path (got: '${AWG_DIR}')."
     fi
@@ -1241,6 +1240,8 @@ main() {
     if [[ "${AWG_DIR}" == *[[:space:]]* ]]; then
         die "--awg-dir must not contain whitespace."
     fi
+
+    preflight_checks
 
     if [[ "${NON_INTERACTIVE}" == "true" ]]; then
         non_interactive_validate
