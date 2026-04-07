@@ -186,6 +186,30 @@ safe_rm_file() {
     fi
 }
 
+# _canon_path: canonicalize a path, resolving symlinked parent directories.
+# Attempts in order:
+#   1. realpath -m  (GNU coreutils; path need not exist)
+#   2. realpath     (without -m; path must exist)
+#   3. python3 os.path.realpath  (path need not exist)
+#   4. String identity with a warning (least protection — symlinked parents
+#      will not be detected, but all other safe_rm_dir guards still apply).
+_canon_path() {
+    local p="${1%/}"
+    local result
+    if result="$(realpath -m -- "${p}" 2>/dev/null)" && [[ -n "${result}" ]]; then
+        printf '%s' "${result}"; return
+    fi
+    if [[ -e "${p}" ]] && result="$(realpath -- "${p}" 2>/dev/null)" && [[ -n "${result}" ]]; then
+        printf '%s' "${result}"; return
+    fi
+    if command -v python3 &>/dev/null; then
+        result="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "${p}" 2>/dev/null)"
+        if [[ -n "${result}" ]]; then printf '%s' "${result}"; return; fi
+    fi
+    warn "safe_rm_dir: realpath unavailable; symlinked parent directories will not be detected for '${p}'"
+    printf '%s' "${p}"
+}
+
 safe_rm_dir() {
     local d="$1"
     local prefix="$2"
@@ -208,12 +232,12 @@ safe_rm_dir() {
     if [[ "${#d}" -lt 5 ]]; then
         die "Refusing to remove suspiciously short path: ${d}"
     fi
-    # Canonicalize both paths via realpath -m (resolves symlinked parents) then
-    # compare on path-component boundaries to prevent prefix-name collisions
+    # Canonicalize both paths (resolves symlinked parents) then compare on
+    # path-component boundaries to prevent prefix-name collisions
     # (e.g. /var/lib/amneziawg-proxy-evil passing a /var/lib/amneziawg-proxy prefix).
     local d_canon prefix_canon
-    d_canon="$(realpath -m -- "${d}")"
-    prefix_canon="$(realpath -m -- "${prefix%/}")"
+    d_canon="$(_canon_path "${d}")"
+    prefix_canon="$(_canon_path "${prefix%/}")"
     if [[ "${d_canon}" != "${prefix_canon}" && "${d_canon}" != "${prefix_canon}/"* ]]; then
         die "Refusing to remove '${d}' (resolved: '${d_canon}'): not under expected prefix '${prefix_canon}'"
     fi
