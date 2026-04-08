@@ -695,6 +695,10 @@ EOF
             warn "Binary install directory must not contain whitespace."
             continue
         fi
+        if _path_has_dot_components "${INSTALL_DIR}"; then
+            warn "Binary install directory must not contain '.' or '..' path components."
+            continue
+        fi
         break
     done
     while true; do
@@ -709,6 +713,10 @@ EOF
         fi
         if [[ "${CONFIG_FILE}" == *[[:space:]]* ]]; then
             warn "Proxy config file path must not contain whitespace."
+            continue
+        fi
+        if _path_has_dot_components "${CONFIG_FILE}"; then
+            warn "Proxy config file path must not contain '.' or '..' path components."
             continue
         fi
         break
@@ -726,6 +734,10 @@ EOF
         fi
         if [[ "${DATA_DIR}" == *[[:space:]]* ]]; then
             warn "Service working directory must not contain whitespace."
+            continue
+        fi
+        if _path_has_dot_components "${DATA_DIR}"; then
+            warn "Service working directory must not contain '.' or '..' path components."
             continue
         fi
         break
@@ -1110,6 +1122,7 @@ install_service_unit() {
     step "Installing systemd service"
 
     local unit_installed=false
+    local unit_skipped=false
     local unit_src
     if unit_src="$(find_unit_template)"; then
         info "Using service unit: ${unit_src}"
@@ -1117,6 +1130,7 @@ install_service_unit() {
         if [[ -f "${SYSTEMD_UNIT_DEST}" ]] && [[ "${FORCE}" != "true" ]]; then
             warn "Service unit already exists: ${SYSTEMD_UNIT_DEST}."
             warn "Skipping. Use --force to overwrite."
+            unit_skipped=true
         else
             install -m 0644 "${unit_src}" "${SYSTEMD_UNIT_DEST}"
             info "Installed service unit: ${SYSTEMD_UNIT_DEST}"
@@ -1126,6 +1140,7 @@ install_service_unit() {
         warn "packaging/${SERVICE_NAME}.service not found; writing minimal inline unit."
         if [[ -f "${SYSTEMD_UNIT_DEST}" ]] && [[ "${FORCE}" != "true" ]]; then
             warn "Service unit already exists: ${SYSTEMD_UNIT_DEST}. Skipping."
+            unit_skipped=true
         else
             cat >"${SYSTEMD_UNIT_DEST}" <<UNITEOF
 [Unit]
@@ -1176,6 +1191,23 @@ UNITEOF
         sed -i "s|^ReadOnlyPaths=.*|${esc_ro}|" "${SYSTEMD_UNIT_DEST}"
         sed -i "s|^ReadWritePaths=.*|${esc_rw}|" "${SYSTEMD_UNIT_DEST}"
         info "Updated service unit paths."
+    fi
+
+    # When the unit was skipped (already existed, no --force), warn if path-
+    # affecting options differ from their defaults, and skip enable/restart to
+    # avoid restarting the service against a stale/mismatched unit.
+    if [[ "${unit_skipped}" == "true" ]]; then
+        local path_flags_changed=false
+        [[ "${INSTALL_DIR}" != "${DEFAULT_INSTALL_DIR}" ]] && path_flags_changed=true
+        [[ "${CONFIG_FILE}"  != "${DEFAULT_CONFIG_FILE}"  ]] && path_flags_changed=true
+        [[ "${DATA_DIR}"     != "${DEFAULT_DATA_DIR}"     ]] && path_flags_changed=true
+        if [[ "${path_flags_changed}" == "true" ]]; then
+            warn "Path options (--install-dir, --config-file, --data-dir) will NOT take effect"
+            warn "in the existing service unit. Re-run with --force to update the unit."
+        fi
+        systemctl daemon-reload || true
+        info "systemd daemon reloaded (unit unchanged)."
+        return 0
     fi
 
     systemctl daemon-reload
