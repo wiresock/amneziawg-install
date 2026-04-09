@@ -454,7 +454,7 @@ Ensure build dependencies are installed (gcc, pkg-config, libssl-dev or equivale
 
     BINARY_SRC="${built_binary}"
     if [[ ! -x "${BINARY_SRC}" ]]; then
-        chmod +x "${BINARY_SRC}"
+        chmod +x -- "${BINARY_SRC}"
     fi
     info "Built binary: ${BINARY_SRC}"
 }
@@ -483,7 +483,7 @@ Example:
     fi
 
     if [[ ! -x "${BINARY_SRC}" ]]; then
-        chmod +x "${BINARY_SRC}"
+        chmod +x -- "${BINARY_SRC}"
     fi
 
     info "Proxy binary: ${BINARY_SRC}"
@@ -944,7 +944,7 @@ install_binary() {
     fi
 
     local dest="${INSTALL_DIR}/amneziawg-proxy"
-    install -m 0755 "${BINARY_SRC}" "${dest}"
+    install -m 0755 -- "${BINARY_SRC}" "${dest}"
     info "Installed binary: ${dest}"
 }
 
