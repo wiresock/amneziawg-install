@@ -616,6 +616,10 @@ EOF
             warn "Bind host must not be empty."
             continue
         fi
+        if [[ "${LISTEN_HOST}" == *$'\n'* || "${LISTEN_HOST}" == *$'\r'* ]]; then
+            warn "Bind host must not contain newline characters."
+            continue
+        fi
         if [[ "${LISTEN_HOST}" == *[[:space:]]* ]]; then
             warn "Bind host must not contain whitespace."
             continue
@@ -637,6 +641,10 @@ EOF
         prompt_default BACKEND_HOST "AWG backend bind host (loopback)" "${BACKEND_HOST}"
         if [[ -z "${BACKEND_HOST}" ]]; then
             warn "Backend bind host must not be empty."
+            continue
+        fi
+        if [[ "${BACKEND_HOST}" == *$'\n'* || "${BACKEND_HOST}" == *$'\r'* ]]; then
+            warn "Backend bind host must not contain newline characters."
             continue
         fi
         if [[ "${BACKEND_HOST}" == *[[:space:]]* ]]; then
