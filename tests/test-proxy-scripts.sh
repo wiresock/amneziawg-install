@@ -254,12 +254,10 @@ assert_rc 1 extract_endpoint_port ""
 # Invalid: no port
 assert_rc 1 extract_endpoint_port "hostname-only"
 
-# Invalid: bare IPv6 without brackets (ambiguous)
-result="$(extract_endpoint_port "::1:51820" 2>/dev/null)" || true
-# Bare IPv6 is ambiguous; the helper should either fail or not return a valid port
-# We just check it doesn't crash; the result may be empty or wrong, but no crash
-TESTS_RUN=$((TESTS_RUN + 1))
-TESTS_PASSED=$((TESTS_PASSED + 1))
+# Invalid: bare IPv6 without brackets (ambiguous — contains multiple colons)
+# The regex ^[^:]+:([0-9]+)$ won't match because the host part contains colons,
+# so extract_endpoint_port should return non-zero.
+assert_rc 1 extract_endpoint_port "::1:51820"
 
 # ── --help exits 0 ────────────────────────────────────────────────────────────
 
