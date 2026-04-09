@@ -250,11 +250,11 @@ safe_rm_dir() {
     if [[ "${d_canon}" != "${prefix_canon}" && "${d_canon}" != "${prefix_canon}/"* ]]; then
         die "Refusing to remove '${d}' (resolved: '${d_canon}'): not under expected prefix '${prefix_canon}'"
     fi
-    if [[ -d "${d}" ]]; then
-        rm -rf -- "${d}"
-        info "Removed directory: ${d}"
+    if [[ -d "${d_canon}" ]]; then
+        rm -rf -- "${d_canon}"
+        info "Removed directory: ${d_canon}"
     else
-        info "Already absent: ${d}"
+        info "Already absent: ${d_canon}"
     fi
 }
 

@@ -610,7 +610,18 @@ EOF
     # Network
     printf "${BOLD}Network settings:${NC}\n"
 
-    prompt_default LISTEN_HOST "Proxy public bind host" "${LISTEN_HOST}"
+    while true; do
+        prompt_default LISTEN_HOST "Proxy public bind host" "${LISTEN_HOST}"
+        if [[ -z "${LISTEN_HOST}" ]]; then
+            warn "Bind host must not be empty."
+            continue
+        fi
+        if [[ "${LISTEN_HOST}" == *[[:space:]]* ]]; then
+            warn "Bind host must not contain whitespace."
+            continue
+        fi
+        break
+    done
 
     local port_prompt="Public UDP port (clients connect here)"
     while true; do
@@ -622,7 +633,18 @@ EOF
         warn "Port must be a number between 1 and 65535."
     done
 
-    prompt_default BACKEND_HOST "AWG backend bind host (loopback)" "${BACKEND_HOST}"
+    while true; do
+        prompt_default BACKEND_HOST "AWG backend bind host (loopback)" "${BACKEND_HOST}"
+        if [[ -z "${BACKEND_HOST}" ]]; then
+            warn "Backend bind host must not be empty."
+            continue
+        fi
+        if [[ "${BACKEND_HOST}" == *[[:space:]]* ]]; then
+            warn "Backend bind host must not contain whitespace."
+            continue
+        fi
+        break
+    done
     while true; do
         prompt_default BACKEND_PORT "AWG backend port (AWG will be moved here)" "${BACKEND_PORT}"
         if [[ ! "${BACKEND_PORT}" =~ ^[0-9]+$ ]] || \
@@ -814,6 +836,23 @@ Re-run with: --listen-port <port>"
     if [[ "${BACKEND_PORT}" == "${LISTEN_PORT}" ]]; then
         die "Backend port must differ from the public listen port (${LISTEN_PORT})."
     fi
+
+    # Validate host fields: must be non-empty, no whitespace, no newlines.
+    local host_var host_val host_flag
+    for host_var in LISTEN_HOST BACKEND_HOST; do
+        host_val="${!host_var}"
+        host_flag="--${host_var//_/-}"
+        host_flag="${host_flag,,}"
+        if [[ -z "${host_val}" ]]; then
+            die "${host_flag} must not be empty."
+        fi
+        if [[ "${host_val}" == *$'\n'* || "${host_val}" == *$'\r'* ]]; then
+            die "${host_flag} must not contain newline characters."
+        fi
+        if [[ "${host_val}" == *[[:space:]]* ]]; then
+            die "${host_flag} must not contain whitespace (got: '${host_val}')."
+        fi
+    done
 
     case "${PROTOCOL}" in
         quic|dns|sip|auto) ;;
