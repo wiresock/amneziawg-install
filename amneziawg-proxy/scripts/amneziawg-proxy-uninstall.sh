@@ -194,8 +194,8 @@ safe_rm_file() {
 #   1. realpath -m  (GNU coreutils; path need not exist)
 #   2. realpath     (without -m; path must exist)
 #   3. python3 os.path.realpath  (path need not exist)
-#   4. String identity with a warning (least protection — symlinked parents
-#      will not be detected, but all other safe_rm_dir guards still apply).
+#   4. die — canonicalization is required for safe deletion; if no tool is
+#      available the operation is aborted to prevent bypassing prefix checks.
 _canon_path() {
     local p="${1%/}"
     local result
@@ -210,8 +210,7 @@ _canon_path() {
         result="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${p}" 2>/dev/null)"
         if [[ -n "${result}" ]]; then printf '%s' "${result}"; return; fi
     fi
-    warn "path canonicalization unavailable; symlinked parent directories will not be detected for '${p}'"
-    printf '%s' "${p}"
+    die "path canonicalization unavailable (neither realpath nor python3 found); cannot safely validate '${p}' for deletion"
 }
 
 # Return 0 (true) when a path contains '.' or '..' path components.

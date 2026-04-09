@@ -532,7 +532,9 @@ prompt_default() {
     else
         printf "%s: " "${prompt_text}"
     fi
-    read -r user_input
+    if ! read -r user_input; then
+        die "No input available (EOF); cannot continue installation."
+    fi
     if [[ -z "${user_input}" ]]; then
         printf -v "${var_name}" '%s' "${default_val}"
     else
@@ -554,7 +556,9 @@ prompt_yesno() {
     fi
 
     printf "%s [%s]: " "${prompt_text}" "${hint}"
-    read -r user_input
+    if ! read -r user_input; then
+        die "No input available (EOF); cannot continue installation."
+    fi
     user_input="${user_input,,}"
 
     if [[ -z "${user_input}" ]]; then
