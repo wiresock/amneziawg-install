@@ -587,14 +587,16 @@ prompt_protocol() {
         auto) default_choice="4" ;;
     esac
 
-    prompt_default choice "Protocol choice" "${default_choice}"
-    case "${choice}" in
-        1) PROTOCOL="quic" ;;
-        2) PROTOCOL="dns"  ;;
-        3) PROTOCOL="sip"  ;;
-        4) PROTOCOL="auto" ;;
-        *) PROTOCOL="${choice}" ;; # allow typing the name directly
-    esac
+    while true; do
+        prompt_default choice "Protocol choice" "${default_choice}"
+        case "${choice}" in
+            1|quic) PROTOCOL="quic"; break ;;
+            2|dns)  PROTOCOL="dns";  break ;;
+            3|sip)  PROTOCOL="sip";  break ;;
+            4|auto) PROTOCOL="auto"; break ;;
+            *) warn "Invalid protocol '${choice}'. Enter 1–4 or: quic, dns, sip, auto." ;;
+        esac
+    done
 }
 
 interactive_setup() {
@@ -736,6 +738,12 @@ EOF
                 fi
                 if _has_toml_unsafe_chars "${DNS_UPSTREAM}"; then
                     warn "DNS upstream must not contain quotes or backslashes."
+                    continue
+                fi
+                # Validate as host:port with IP literal and port 1-65535.
+                # _validate_dns_upstream dies on failure, so catch it.
+                if ! ( _validate_dns_upstream "${DNS_UPSTREAM}" ) 2>/dev/null; then
+                    warn "DNS upstream must be ip:port (e.g. 1.1.1.1:53 or [::1]:53)."
                     continue
                 fi
                 break
@@ -925,6 +933,38 @@ _format_host_for_socketaddr() {
     printf '%s' "${host}"
 }
 
+# Validate a DNS upstream value as host:port suitable for SocketAddr.
+# Extracts the host (IPv4 or bracketed IPv6) and port, validates the host as an
+# IP literal and the port as 1–65535.  Dies with a descriptive message on failure.
+_validate_dns_upstream() {
+    local val="$1"
+    local host port
+
+    if [[ -z "${val}" ]]; then
+        die "--dns-upstream must not be empty."
+    fi
+
+    # Bracketed IPv6: [addr]:port
+    if [[ "${val}" =~ ^\[([^\]]+)\]:([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    # IPv4 or hostname: host:port (last colon wins)
+    elif [[ "${val}" == *:* && "${val}" != *:*:* ]]; then
+        host="${val%:*}"
+        port="${val##*:}"
+    else
+        die "--dns-upstream must be host:port (got: '${val}'). Use [ipv6]:port for IPv6."
+    fi
+
+    if ! [[ "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        die "--dns-upstream port must be 1–65535 (got: '${port}')."
+    fi
+
+    if ! _is_valid_ip_literal "${host}"; then
+        die "--dns-upstream host must be a valid IP address, not a hostname (got: '${host}')."
+    fi
+}
+
 non_interactive_validate() {
     if [[ -z "${LISTEN_PORT}" ]]; then
         die "Non-interactive mode requires --listen-port (could not auto-detect from AWG config).
@@ -981,10 +1021,7 @@ Re-run with: --listen-port <port>"
         printf -v "${host_var}" '%s' "$(_format_host_for_socketaddr "${host_val}")"
     done
 
-    case "${PROTOCOL}" in
-        quic|dns|sip|auto) ;;
-        *) die "Invalid --protocol '${PROTOCOL}'. Must be one of: quic, dns, sip, auto." ;;
-    esac
+    # Protocol allowlist is checked in validate_config() (shared path).
 
     if ! is_positive_integer "${SESSION_TTL}"; then
         die "Invalid --session-ttl: '${SESSION_TTL}'. Must be a positive integer (seconds)."
@@ -1022,6 +1059,12 @@ Re-run with: --listen-port <port>"
 # setup.  Catches protocol/flag combinations that the proxy's runtime config
 # validator would reject (e.g. dns_forward with protocol=quic).
 validate_config() {
+    # Protocol must be one of the supported values.
+    case "${PROTOCOL}" in
+        quic|dns|sip|auto) ;;
+        *) die "Invalid protocol '${PROTOCOL}'. Must be one of: quic, dns, sip, auto." ;;
+    esac
+
     # quic_handshake_enabled requires protocol quic or auto
     if [[ "${QUIC_HANDSHAKE_ENABLED}" == "true" ]]; then
         case "${PROTOCOL}" in
@@ -1036,6 +1079,12 @@ validate_config() {
             dns|auto) ;;
             *) die "DNS forwarding requires --protocol dns or auto (got: '${PROTOCOL}')." ;;
         esac
+    fi
+
+    # When DNS forwarding is enabled, DNS_UPSTREAM must be a valid SocketAddr
+    # (ip_literal:port) or the proxy will fail at runtime config validation.
+    if [[ "${DNS_FORWARD_ENABLED}" == "true" ]]; then
+        _validate_dns_upstream "${DNS_UPSTREAM}"
     fi
 }
 

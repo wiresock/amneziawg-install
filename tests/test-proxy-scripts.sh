@@ -358,6 +358,7 @@ assert_eq "[::1]" "$(_format_host_for_socketaddr "[::1]")" "format already brack
 echo "=== validate_config ==="
 run_validate_config() {
     local protocol="$1" quic_hs="$2" dns_fwd="$3"
+    local dns_upstream="${4:-1.1.1.1:53}"
     (
         set --
         source "${INSTALL_SCRIPT}" 2>/dev/null
@@ -368,6 +369,7 @@ run_validate_config() {
         PROTOCOL="${protocol}"
         QUIC_HANDSHAKE_ENABLED="${quic_hs}"
         DNS_FORWARD_ENABLED="${dns_fwd}"
+        DNS_UPSTREAM="${dns_upstream}"
         validate_config
     )
 }
@@ -382,6 +384,38 @@ assert_rc 1 run_validate_config "sip"  "true" "false"
 # Invalid: dns_forward with quic protocol
 assert_rc 1 run_validate_config "quic" "false" "true"
 assert_rc 1 run_validate_config "sip"  "false" "true"
+# Invalid: unsupported protocol name
+assert_rc 1 run_validate_config "invalid" "false" "false"
+assert_rc 1 run_validate_config "udp"     "false" "false"
+assert_rc 1 run_validate_config ""        "false" "false"
+
+# ── _validate_dns_upstream ────────────────────────────────────────────────────
+
+echo "=== _validate_dns_upstream ==="
+_validate_dns_upstream() { run_install_helper _validate_dns_upstream "$@"; }
+# Valid: IPv4 host:port
+assert_rc 0 _validate_dns_upstream "1.1.1.1:53"
+assert_rc 0 _validate_dns_upstream "8.8.8.8:53"
+assert_rc 0 _validate_dns_upstream "192.168.1.1:5353"
+# Valid: bracketed IPv6
+assert_rc 0 _validate_dns_upstream "[::1]:53"
+assert_rc 0 _validate_dns_upstream "[2001:db8::1]:53"
+# Invalid: no port
+assert_rc 1 _validate_dns_upstream "1.1.1.1"
+# Invalid: port out of range
+assert_rc 1 _validate_dns_upstream "1.1.1.1:0"
+assert_rc 1 _validate_dns_upstream "1.1.1.1:99999"
+# Invalid: hostname (not IP literal)
+assert_rc 1 _validate_dns_upstream "localhost:53"
+assert_rc 1 _validate_dns_upstream "dns.google:53"
+# Invalid: empty
+assert_rc 1 _validate_dns_upstream ""
+# Invalid: bare IPv6 without brackets
+assert_rc 1 _validate_dns_upstream "::1:53"
+# Invalid DNS_UPSTREAM in validate_config (dns_forward=true)
+assert_rc 1 run_validate_config "dns" "false" "true" "localhost:53"
+assert_rc 1 run_validate_config "dns" "false" "true" "not-a-host"
+assert_rc 0 run_validate_config "dns" "false" "true" "[::1]:53"
 
 # ── --help exits 0 ────────────────────────────────────────────────────────────
 

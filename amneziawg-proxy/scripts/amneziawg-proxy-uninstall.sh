@@ -540,6 +540,11 @@ main() {
         fi
     done
 
+    # Strip trailing slashes from DATA_DIR and CONFIG_DIR so case-match against
+    # DEFAULT_*_DIR works even when users pass e.g. --data-dir /var/lib/amneziawg-proxy/
+    CONFIG_DIR="${CONFIG_DIR%/}"
+    DATA_DIR="${DATA_DIR%/}"
+
     print_plan
 
     if ! confirm "Proceed with uninstall?" "false"; then
