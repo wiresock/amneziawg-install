@@ -330,6 +330,9 @@ assert_rc 1 _is_valid_ip_literal "example.com"
 assert_rc 1 _is_valid_ip_literal "my-server"
 # Empty → rejected
 assert_rc 1 _is_valid_ip_literal ""
+# Invalid IPv4 octets → rejected
+assert_rc 1 _is_valid_ip_literal "999.999.999.999"
+assert_rc 1 _is_valid_ip_literal "256.0.0.1"
 
 # ── _format_host_for_socketaddr ───────────────────────────────────────────────
 

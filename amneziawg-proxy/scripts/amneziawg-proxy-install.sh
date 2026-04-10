@@ -889,15 +889,26 @@ _is_valid_ip_literal() {
     host="${host%\]}"
     [[ -z "${host}" ]] && return 1
 
-    # Check via Python3 (most portable across distros)
+    # Check via Python3 (most portable across distros).
+    # Pass the value via stdin to avoid shell injection.
     if command -v python3 &>/dev/null; then
-        python3 -c "import ipaddress; ipaddress.ip_address('${host}')" 2>/dev/null && return 0
+        printf '%s' "${host}" | python3 -c "
+import sys, ipaddress
+try:
+    ipaddress.ip_address(sys.stdin.read())
+except ValueError:
+    sys.exit(1)
+" 2>/dev/null && return 0
         return 1
     fi
 
     # Fallback: simple pattern matching
-    # IPv4: digits and dots
-    if [[ "${host}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    # IPv4: four octets 0-255
+    if [[ "${host}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        local i
+        for i in 1 2 3 4; do
+            (( BASH_REMATCH[i] > 255 )) && return 1
+        done
         return 0
     fi
     # IPv6: hex digits and colons (with optional :: shorthand)
