@@ -305,7 +305,7 @@ systemctl_if_enabled() {
 extract_endpoint_port() {
     local endpoint="$1"
     endpoint="$(printf '%s' "${endpoint}" | tr -d '[:space:]"')"
-    if [[ "${endpoint}" =~ ^\[.*\]:([0-9]+)$ ]]; then
+    if [[ "${endpoint}" =~ ^\[[^\]]+\]:([0-9]+)$ ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
         return 0
     fi

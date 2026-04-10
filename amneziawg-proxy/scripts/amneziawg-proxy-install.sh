@@ -628,6 +628,11 @@ EOF
             warn "Bind host must not contain quotes or backslashes."
             continue
         fi
+        if ! _is_valid_ip_literal "${LISTEN_HOST}"; then
+            warn "Bind host must be a valid IP address, not a hostname (got: '${LISTEN_HOST}')."
+            continue
+        fi
+        LISTEN_HOST="$(_format_host_for_socketaddr "${LISTEN_HOST}")"
         break
     done
 
@@ -659,6 +664,11 @@ EOF
             warn "Backend bind host must not contain quotes or backslashes."
             continue
         fi
+        if ! _is_valid_ip_literal "${BACKEND_HOST}"; then
+            warn "Backend bind host must be a valid IP address, not a hostname (got: '${BACKEND_HOST}')."
+            continue
+        fi
+        BACKEND_HOST="$(_format_host_for_socketaddr "${BACKEND_HOST}")"
         break
     done
     while true; do
@@ -869,6 +879,53 @@ _has_toml_unsafe_chars() {
     [[ "$1" == *'"'* || "$1" == *\\* ]]
 }
 
+# Return 0 when the argument is a valid IPv4 or IPv6 address (IP literal).
+# IPv6 addresses may optionally be enclosed in brackets (e.g. [::1]).
+# Hostnames are rejected.
+_is_valid_ip_literal() {
+    local host="$1"
+    # Strip optional brackets for validation
+    host="${host#\[}"
+    host="${host%\]}"
+    [[ -z "${host}" ]] && return 1
+
+    # Check via Python3 (most portable across distros)
+    if command -v python3 &>/dev/null; then
+        python3 -c "import ipaddress; ipaddress.ip_address('${host}')" 2>/dev/null && return 0
+        return 1
+    fi
+
+    # Fallback: simple pattern matching
+    # IPv4: digits and dots
+    if [[ "${host}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 0
+    fi
+    # IPv6: hex digits and colons (with optional :: shorthand)
+    if [[ "${host}" =~ ^[0-9a-fA-F:]+$ ]] && [[ "${host}" == *:* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Format a host for use in a SocketAddr string.
+# Bare IPv6 addresses are wrapped in brackets: ::1 → [::1]
+# IPv4 and already-bracketed values are returned as-is.
+_format_host_for_socketaddr() {
+    local host="$1"
+    # Already bracketed
+    if [[ "${host}" == \[*\] ]]; then
+        printf '%s' "${host}"
+        return
+    fi
+    # Bare IPv6 (contains colons) → bracket it
+    if [[ "${host}" == *:* ]]; then
+        printf '[%s]' "${host}"
+        return
+    fi
+    # IPv4 or other → pass through
+    printf '%s' "${host}"
+}
+
 non_interactive_validate() {
     if [[ -z "${LISTEN_PORT}" ]]; then
         die "Non-interactive mode requires --listen-port (could not auto-detect from AWG config).
@@ -910,6 +967,21 @@ Re-run with: --listen-port <port>"
         fi
     done
 
+    # LISTEN_HOST and BACKEND_HOST must be valid IP literals (not hostnames)
+    # because the proxy config is parsed as std::net::SocketAddr.
+    # Auto-bracket bare IPv6 addresses for SocketAddr formatting.
+    local host_var host_val host_flag
+    for host_var in LISTEN_HOST BACKEND_HOST; do
+        host_val="${!host_var}"
+        host_flag="--${host_var//_/-}"
+        host_flag="${host_flag,,}"
+        if ! _is_valid_ip_literal "${host_val}"; then
+            die "${host_flag} must be a valid IP address, not a hostname (got: '${host_val}')."
+        fi
+        # Auto-bracket bare IPv6 for SocketAddr compatibility
+        printf -v "${host_var}" '%s' "$(_format_host_for_socketaddr "${host_val}")"
+    done
+
     case "${PROTOCOL}" in
         quic|dns|sip|auto) ;;
         *) die "Invalid --protocol '${PROTOCOL}'. Must be one of: quic, dns, sip, auto." ;;
@@ -945,6 +1017,27 @@ Re-run with: --listen-port <port>"
             die "${flag_name} must not contain '.' or '..' path components (got: '${path_val}')."
         fi
     done
+}
+
+# Cross-field config validation run after both interactive and non-interactive
+# setup.  Catches protocol/flag combinations that the proxy's runtime config
+# validator would reject (e.g. dns_forward with protocol=quic).
+validate_config() {
+    # quic_handshake_enabled requires protocol quic or auto
+    if [[ "${QUIC_HANDSHAKE_ENABLED}" == "true" ]]; then
+        case "${PROTOCOL}" in
+            quic|auto) ;;
+            *) die "QUIC handshake requires --protocol quic or auto (got: '${PROTOCOL}')." ;;
+        esac
+    fi
+
+    # dns_forward_enabled requires protocol dns or auto
+    if [[ "${DNS_FORWARD_ENABLED}" == "true" ]]; then
+        case "${PROTOCOL}" in
+            dns|auto) ;;
+            *) die "DNS forwarding requires --protocol dns or auto (got: '${PROTOCOL}')." ;;
+        esac
+    fi
 }
 
 # ── Filesystem setup ───────────────────────────────────────────────────────────
@@ -1394,6 +1487,9 @@ main() {
     else
         interactive_setup
     fi
+
+    # Cross-field validation (protocol constraints) applies to both modes.
+    validate_config
 
     setup_filesystem
     install_binary

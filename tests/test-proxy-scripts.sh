@@ -88,6 +88,8 @@ run_uninstall_helper() {
 is_positive_integer() { run_install_helper  is_positive_integer  "$@"; }
 escape_sed_replacement() { run_install_helper escape_sed_replacement "$@"; }
 safe_rm_dir()           { run_uninstall_helper safe_rm_dir          "$@"; }
+_is_valid_ip_literal()       { run_install_helper _is_valid_ip_literal       "$@"; }
+_format_host_for_socketaddr() { run_install_helper _format_host_for_socketaddr "$@"; }
 
 # ── is_positive_integer ───────────────────────────────────────────────────────
 
@@ -307,6 +309,70 @@ TOML
 result="$(run_read_ports "${tmp_cfg}")"
 assert_eq "51820|51821" "${result}" "read_proxy_config_ports IPv6 with comments"
 rm -f "${tmp_cfg}"
+
+# ── _is_valid_ip_literal ──────────────────────────────────────────────────────
+
+echo "=== _is_valid_ip_literal ==="
+# Valid IPv4
+assert_rc 0 _is_valid_ip_literal "0.0.0.0"
+assert_rc 0 _is_valid_ip_literal "127.0.0.1"
+assert_rc 0 _is_valid_ip_literal "192.168.1.100"
+# Valid IPv6
+assert_rc 0 _is_valid_ip_literal "::1"
+assert_rc 0 _is_valid_ip_literal "::"
+assert_rc 0 _is_valid_ip_literal "2001:db8::1"
+# Bracketed IPv6
+assert_rc 0 _is_valid_ip_literal "[::1]"
+assert_rc 0 _is_valid_ip_literal "[2001:db8::1]"
+# Hostnames → rejected
+assert_rc 1 _is_valid_ip_literal "localhost"
+assert_rc 1 _is_valid_ip_literal "example.com"
+assert_rc 1 _is_valid_ip_literal "my-server"
+# Empty → rejected
+assert_rc 1 _is_valid_ip_literal ""
+
+# ── _format_host_for_socketaddr ───────────────────────────────────────────────
+
+echo "=== _format_host_for_socketaddr ==="
+# IPv4 unchanged
+assert_eq "0.0.0.0" "$(_format_host_for_socketaddr "0.0.0.0")" "format IPv4"
+assert_eq "127.0.0.1" "$(_format_host_for_socketaddr "127.0.0.1")" "format IPv4 loopback"
+# Bare IPv6 → bracketed
+assert_eq "[::1]" "$(_format_host_for_socketaddr "::1")" "format bare IPv6"
+assert_eq "[2001:db8::1]" "$(_format_host_for_socketaddr "2001:db8::1")" "format bare IPv6 full"
+assert_eq "[::]" "$(_format_host_for_socketaddr "::")" "format bare IPv6 wildcard"
+# Already bracketed → unchanged
+assert_eq "[::1]" "$(_format_host_for_socketaddr "[::1]")" "format already bracketed"
+
+# ── validate_config (cross-field) ─────────────────────────────────────────────
+
+echo "=== validate_config ==="
+run_validate_config() {
+    local protocol="$1" quic_hs="$2" dns_fwd="$3"
+    (
+        set --
+        source "${INSTALL_SCRIPT}" 2>/dev/null
+        info()  { :; }
+        warn()  { :; }
+        step()  { :; }
+        error() { :; }
+        PROTOCOL="${protocol}"
+        QUIC_HANDSHAKE_ENABLED="${quic_hs}"
+        DNS_FORWARD_ENABLED="${dns_fwd}"
+        validate_config
+    )
+}
+# Valid combinations
+assert_rc 0 run_validate_config "quic" "true" "false"
+assert_rc 0 run_validate_config "auto" "true" "true"
+assert_rc 0 run_validate_config "dns"  "false" "true"
+assert_rc 0 run_validate_config "sip"  "false" "false"
+# Invalid: quic_handshake with dns protocol
+assert_rc 1 run_validate_config "dns"  "true" "false"
+assert_rc 1 run_validate_config "sip"  "true" "false"
+# Invalid: dns_forward with quic protocol
+assert_rc 1 run_validate_config "quic" "false" "true"
+assert_rc 1 run_validate_config "sip"  "false" "true"
 
 # ── --help exits 0 ────────────────────────────────────────────────────────────
 
