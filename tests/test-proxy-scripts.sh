@@ -259,6 +259,55 @@ assert_rc 1 extract_endpoint_port "hostname-only"
 # so extract_endpoint_port should return non-zero.
 assert_rc 1 extract_endpoint_port "::1:51820"
 
+# ── read_proxy_config_ports (inline comment stripping) ───────────────────────
+
+echo "=== read_proxy_config_ports ==="
+
+# Helper: call read_proxy_config_ports in a subshell and echo the parsed ports
+run_read_ports() {
+    local cfg="$1"
+    (
+        set --
+        source "${UNINSTALL_SCRIPT}" 2>/dev/null
+        info() { :; }
+        warn() { :; }
+        PROXY_LISTEN_PORT=""
+        PROXY_BACKEND_PORT=""
+        read_proxy_config_ports "${cfg}" || true
+        printf '%s|%s\n' "${PROXY_LISTEN_PORT}" "${PROXY_BACKEND_PORT}"
+    )
+}
+
+# Plain values without comments
+tmp_cfg="$(mktemp)"
+cat > "${tmp_cfg}" <<'TOML'
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+TOML
+result="$(run_read_ports "${tmp_cfg}")"
+assert_eq "51820|51821" "${result}" "read_proxy_config_ports plain values"
+rm -f "${tmp_cfg}"
+
+# Values with inline comments
+tmp_cfg="$(mktemp)"
+cat > "${tmp_cfg}" <<'TOML'
+listen = "0.0.0.0:51820" # public listener
+backend = "127.0.0.1:51821"  # loopback backend
+TOML
+result="$(run_read_ports "${tmp_cfg}")"
+assert_eq "51820|51821" "${result}" "read_proxy_config_ports inline comments"
+rm -f "${tmp_cfg}"
+
+# IPv6 bracketed values with inline comment
+tmp_cfg="$(mktemp)"
+cat > "${tmp_cfg}" <<'TOML'
+listen = "[::]:51820"  # bind all IPv6
+backend = "[::1]:51821" # loopback v6
+TOML
+result="$(run_read_ports "${tmp_cfg}")"
+assert_eq "51820|51821" "${result}" "read_proxy_config_ports IPv6 with comments"
+rm -f "${tmp_cfg}"
+
 # ── --help exits 0 ────────────────────────────────────────────────────────────
 
 echo "=== --help exits 0 ==="
