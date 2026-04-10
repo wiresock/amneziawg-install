@@ -333,6 +333,12 @@ assert_rc 1 _is_valid_ip_literal ""
 # Invalid IPv4 octets → rejected
 assert_rc 1 _is_valid_ip_literal "999.999.999.999"
 assert_rc 1 _is_valid_ip_literal "256.0.0.1"
+# Malformed IPv6 → rejected
+assert_rc 1 _is_valid_ip_literal ":::"
+assert_rc 1 _is_valid_ip_literal "2001:db8::1::2"
+assert_rc 1 _is_valid_ip_literal "::gggg"
+assert_rc 1 _is_valid_ip_literal "12345::1"
+assert_rc 1 _is_valid_ip_literal "2001:db8:85a3::8a2e:370:7334:extra:fields"
 
 # ── _format_host_for_socketaddr ───────────────────────────────────────────────
 

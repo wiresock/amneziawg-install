@@ -32,7 +32,7 @@ readonly SERVICE_NAME="amneziawg-proxy"
 readonly SYSTEMD_UNIT_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
 
 # Default paths
-readonly DEFAULT_BINARY_SRC="./target/release/amneziawg-proxy"
+readonly DEFAULT_BINARY_NAME="amneziawg-proxy"
 readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_CONFIG_DIR="/etc/amneziawg-proxy"
 readonly DEFAULT_CONFIG_FILE="/etc/amneziawg-proxy/proxy.toml"
@@ -466,11 +466,11 @@ locate_app_binary() {
     fi
 
     if [[ -z "${BINARY_SRC}" ]]; then
-        local repo_build="${SCRIPT_DIR}/../target/release/amneziawg-proxy"
+        # Only look relative to the script directory (not CWD) to avoid
+        # picking up an unrelated or malicious binary from the working dir.
+        local repo_build="${SCRIPT_DIR}/../target/release/${DEFAULT_BINARY_NAME}"
         if [[ -f "${repo_build}" ]]; then
             BINARY_SRC="${repo_build}"
-        elif [[ -f "${DEFAULT_BINARY_SRC}" ]]; then
-            BINARY_SRC="${DEFAULT_BINARY_SRC}"
         fi
     fi
 
@@ -889,32 +889,20 @@ _is_valid_ip_literal() {
     host="${host%\]}"
     [[ -z "${host}" ]] && return 1
 
-    # Check via Python3 (most portable across distros).
+    # Validate via Python3's ipaddress module (strict, handles all edge cases).
     # Pass the value via stdin to avoid shell injection.
-    if command -v python3 &>/dev/null; then
-        printf '%s' "${host}" | python3 -c "
+    if ! command -v python3 &>/dev/null; then
+        die "python3 is required for IP address validation but was not found.
+Install python3 or provide a known-valid IP address via --listen-host / --backend-host."
+    fi
+
+    printf '%s' "${host}" | python3 -c "
 import sys, ipaddress
 try:
     ipaddress.ip_address(sys.stdin.read())
 except ValueError:
     sys.exit(1)
 " 2>/dev/null && return 0
-        return 1
-    fi
-
-    # Fallback: simple pattern matching
-    # IPv4: four octets 0-255
-    if [[ "${host}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-        local i
-        for i in 1 2 3 4; do
-            (( BASH_REMATCH[i] > 255 )) && return 1
-        done
-        return 0
-    fi
-    # IPv6: hex digits and colons (with optional :: shorthand)
-    if [[ "${host}" =~ ^[0-9a-fA-F:]+$ ]] && [[ "${host}" == *:* ]]; then
-        return 0
-    fi
     return 1
 }
 
