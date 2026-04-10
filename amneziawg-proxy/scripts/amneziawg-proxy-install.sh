@@ -624,6 +624,10 @@ EOF
             warn "Bind host must not contain whitespace."
             continue
         fi
+        if _has_toml_unsafe_chars "${LISTEN_HOST}"; then
+            warn "Bind host must not contain quotes or backslashes."
+            continue
+        fi
         break
     done
 
@@ -649,6 +653,10 @@ EOF
         fi
         if [[ "${BACKEND_HOST}" == *[[:space:]]* ]]; then
             warn "Backend bind host must not contain whitespace."
+            continue
+        fi
+        if _has_toml_unsafe_chars "${BACKEND_HOST}"; then
+            warn "Backend bind host must not contain quotes or backslashes."
             continue
         fi
         break
@@ -677,9 +685,24 @@ EOF
             "Enable stateful QUIC handshake responder? (more realistic, uses more memory)" \
             "${QUIC_HANDSHAKE_ENABLED}"
         if [[ "${QUIC_HANDSHAKE_ENABLED}" == "true" ]]; then
-            prompt_default QUIC_DOMAIN \
-                "TLS SNI domain for QUIC handshake certificate" \
-                "${QUIC_DOMAIN}"
+            while true; do
+                prompt_default QUIC_DOMAIN \
+                    "TLS SNI domain for QUIC handshake certificate" \
+                    "${QUIC_DOMAIN}"
+                if [[ -z "${QUIC_DOMAIN}" ]]; then
+                    warn "QUIC domain must not be empty."
+                    continue
+                fi
+                if [[ "${QUIC_DOMAIN}" == *[[:space:]]* ]]; then
+                    warn "QUIC domain must not contain whitespace."
+                    continue
+                fi
+                if _has_toml_unsafe_chars "${QUIC_DOMAIN}"; then
+                    warn "QUIC domain must not contain quotes or backslashes."
+                    continue
+                fi
+                break
+            done
         fi
     fi
 
@@ -689,9 +712,24 @@ EOF
             "Forward DNS probe queries to an upstream resolver? (instead of SERVFAIL)" \
             "${DNS_FORWARD_ENABLED}"
         if [[ "${DNS_FORWARD_ENABLED}" == "true" ]]; then
-            prompt_default DNS_UPSTREAM \
-                "Upstream DNS resolver (host:port)" \
-                "${DNS_UPSTREAM}"
+            while true; do
+                prompt_default DNS_UPSTREAM \
+                    "Upstream DNS resolver (host:port)" \
+                    "${DNS_UPSTREAM}"
+                if [[ -z "${DNS_UPSTREAM}" ]]; then
+                    warn "DNS upstream must not be empty."
+                    continue
+                fi
+                if [[ "${DNS_UPSTREAM}" == *[[:space:]]* ]]; then
+                    warn "DNS upstream must not contain whitespace."
+                    continue
+                fi
+                if _has_toml_unsafe_chars "${DNS_UPSTREAM}"; then
+                    warn "DNS upstream must not contain quotes or backslashes."
+                    continue
+                fi
+                break
+            done
         fi
     fi
 
@@ -825,6 +863,12 @@ _path_has_dot_components() {
     [[ "${p}" == */./* || "${p}" == */../* || "${p}" == */. || "${p}" == */.. ]]
 }
 
+# Return 0 (true) when a string contains TOML-unsafe characters (" or \)
+# that would break double-quoted TOML values.
+_has_toml_unsafe_chars() {
+    [[ "$1" == *'"'* || "$1" == *\\* ]]
+}
+
 non_interactive_validate() {
     if [[ -z "${LISTEN_PORT}" ]]; then
         die "Non-interactive mode requires --listen-port (could not auto-detect from AWG config).
@@ -845,20 +889,24 @@ Re-run with: --listen-port <port>"
         die "Backend port must differ from the public listen port (${LISTEN_PORT})."
     fi
 
-    # Validate host fields: must be non-empty, no whitespace, no newlines.
-    local host_var host_val host_flag
-    for host_var in LISTEN_HOST BACKEND_HOST; do
-        host_val="${!host_var}"
-        host_flag="--${host_var//_/-}"
-        host_flag="${host_flag,,}"
-        if [[ -z "${host_val}" ]]; then
-            die "${host_flag} must not be empty."
+    # Validate TOML string fields: must be non-empty, no whitespace, no newlines,
+    # no TOML-unsafe characters (" or \).
+    local toml_var toml_val toml_flag
+    for toml_var in LISTEN_HOST BACKEND_HOST QUIC_DOMAIN DNS_UPSTREAM; do
+        toml_val="${!toml_var}"
+        toml_flag="--${toml_var//_/-}"
+        toml_flag="${toml_flag,,}"
+        if [[ -z "${toml_val}" ]]; then
+            die "${toml_flag} must not be empty."
         fi
-        if [[ "${host_val}" == *$'\n'* || "${host_val}" == *$'\r'* ]]; then
-            die "${host_flag} must not contain newline characters."
+        if [[ "${toml_val}" == *$'\n'* || "${toml_val}" == *$'\r'* ]]; then
+            die "${toml_flag} must not contain newline characters."
         fi
-        if [[ "${host_val}" == *[[:space:]]* ]]; then
-            die "${host_flag} must not contain whitespace (got: '${host_val}')."
+        if [[ "${toml_val}" == *[[:space:]]* ]]; then
+            die "${toml_flag} must not contain whitespace (got: '${toml_val}')."
+        fi
+        if _has_toml_unsafe_chars "${toml_val}"; then
+            die "${toml_flag} must not contain quotes or backslashes (got: '${toml_val}')."
         fi
     done
 
