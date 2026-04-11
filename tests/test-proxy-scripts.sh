@@ -339,6 +339,11 @@ assert_rc 1 _is_valid_ip_literal "2001:db8::1::2"
 assert_rc 1 _is_valid_ip_literal "::gggg"
 assert_rc 1 _is_valid_ip_literal "12345::1"
 assert_rc 1 _is_valid_ip_literal "2001:db8:85a3::8a2e:370:7334:extra:fields"
+# Mismatched brackets (only opening or only closing)
+assert_rc 1 _is_valid_ip_literal "[::1"
+assert_rc 1 _is_valid_ip_literal "::1]"
+assert_rc 1 _is_valid_ip_literal "[127.0.0.1"
+assert_rc 1 _is_valid_ip_literal "127.0.0.1]"
 
 # ── _format_host_for_socketaddr ───────────────────────────────────────────────
 

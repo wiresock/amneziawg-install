@@ -892,9 +892,21 @@ _has_toml_unsafe_chars() {
 # Hostnames are rejected.
 _is_valid_ip_literal() {
     local host="$1"
-    # Strip optional brackets for validation
-    host="${host#\[}"
-    host="${host%\]}"
+    [[ -z "${host}" ]] && return 1
+
+    # Validate bracket pairing: both or neither bracket must be present.
+    local has_open=0 has_close=0
+    [[ "${host}" == \[* ]] && has_open=1
+    [[ "${host}" == *\] ]] && has_close=1
+    if (( has_open != has_close )); then
+        return 1
+    fi
+
+    # Strip matched brackets for validation
+    if (( has_open == 1 )); then
+        host="${host#\[}"
+        host="${host%\]}"
+    fi
     [[ -z "${host}" ]] && return 1
 
     # Validate via Python3's ipaddress module (strict, handles all edge cases).
@@ -1146,7 +1158,7 @@ write_proxy_config() {
         if [[ "${NON_INTERACTIVE}" == "true" ]]; then
             warn "Config file already exists: ${CONFIG_FILE}. Use --force to overwrite."
             warn "Skipping config generation; using existing file."
-            return 0
+            return 2
         fi
 
         local overwrite
@@ -1154,7 +1166,7 @@ write_proxy_config() {
             "Config file already exists: ${CONFIG_FILE}. Overwrite?" "false"
         if [[ "${overwrite}" != "true" ]]; then
             warn "Keeping existing config file."
-            return 0
+            return 2
         fi
     fi
 
@@ -1541,7 +1553,20 @@ main() {
 
     setup_filesystem
     install_binary
-    write_proxy_config
+
+    local config_rc=0
+    write_proxy_config || config_rc=$?
+
+    if (( config_rc == 2 )); then
+        warn "Config was not updated — skipping AWG reconfiguration and service"
+        warn "restart to avoid inconsistency with the existing proxy.toml."
+        warn "Re-run with --force to overwrite the config and apply all changes."
+        print_summary
+        return 0
+    elif (( config_rc != 0 )); then
+        die "Failed to write proxy configuration (exit code ${config_rc})."
+    fi
+
     reconfigure_awg_listen_port
     install_service_unit
     print_summary
