@@ -495,6 +495,14 @@ preflight_checks() {
     check_systemd
     check_awg_binary
 
+    # python3 is required for IP address validation (_is_valid_ip_literal).
+    # Check early so non-interactive / CI runs fail fast with a clear error
+    # before expensive work such as building the proxy from source.
+    if ! command -v python3 &>/dev/null; then
+        die "python3 is required for IP address validation but was not found.
+Install python3 (e.g. 'apt install python3') and re-run the installer."
+    fi
+
     # Auto-detect AWG configuration
     detect_awg_config
 
