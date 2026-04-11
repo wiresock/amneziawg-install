@@ -395,7 +395,7 @@ restore_awg_listen_port() {
     if [[ -n "${latest_backup}" ]]; then
         info "Found AWG config backup: ${latest_backup}"
         if confirm "Restore AWG config from backup ${latest_backup}?" "true"; then
-            cp "${latest_backup}" "${awg_conf}"
+            cp -f -- "${latest_backup}" "${awg_conf}"
             info "Restored AWG config from: ${latest_backup}"
 
             # Restart the interface

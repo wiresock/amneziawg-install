@@ -999,8 +999,14 @@ Re-run with: --listen-port <port>"
 
     # Validate TOML string fields: must be non-empty, no whitespace, no newlines,
     # no TOML-unsafe characters (" or \).
+    # QUIC_DOMAIN is only required when quic_handshake is enabled;
+    # DNS_UPSTREAM is only required when dns_forward is enabled.
+    local toml_vars=( LISTEN_HOST BACKEND_HOST )
+    [[ "${QUIC_HANDSHAKE_ENABLED}" == "true" ]] && toml_vars+=( QUIC_DOMAIN )
+    [[ "${DNS_FORWARD_ENABLED}" == "true" ]]    && toml_vars+=( DNS_UPSTREAM )
+
     local toml_var toml_val toml_flag
-    for toml_var in LISTEN_HOST BACKEND_HOST QUIC_DOMAIN DNS_UPSTREAM; do
+    for toml_var in "${toml_vars[@]}"; do
         toml_val="${!toml_var}"
         toml_flag="--${toml_var//_/-}"
         toml_flag="${toml_flag,,}"
@@ -1306,7 +1312,7 @@ reconfigure_awg_listen_port() {
     # Back up the config file before modifying it
     local backup
     backup="${AWG_CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "${AWG_CONF_FILE}" "${backup}"
+    cp -f -- "${AWG_CONF_FILE}" "${backup}"
     info "Backed up AWG config to: ${backup}"
 
     # Update ListenPort in the [Interface] section
