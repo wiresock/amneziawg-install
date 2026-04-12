@@ -1494,9 +1494,8 @@ UNITEOF
         info "Updated service unit paths."
     fi
 
-    # When the unit was skipped (already existed, no --force), warn if path-
-    # affecting options differ from their defaults, and skip enable/restart to
-    # avoid restarting the service against a stale/mismatched unit.
+    # When the unit was skipped (already existed, no --force), check whether
+    # path-affecting options differ from their defaults.
     if [[ "${unit_skipped}" == "true" ]]; then
         local path_flags_changed=false
         [[ "${INSTALL_DIR}" != "${DEFAULT_INSTALL_DIR}" ]] && path_flags_changed=true
@@ -1504,16 +1503,22 @@ UNITEOF
         [[ "${DATA_DIR}"     != "${DEFAULT_DATA_DIR}"     ]] && path_flags_changed=true
         [[ "${AWG_DIR}"      != "${DEFAULT_AWG_DIR}"      ]] && path_flags_changed=true
         if [[ "${path_flags_changed}" == "true" ]]; then
+            # Paths differ — skip enable/restart to avoid running against a
+            # stale unit whose ExecStart / ReadOnlyPaths are wrong.
             warn "Path options (--install-dir, --config-file, --data-dir, --awg-dir) will NOT take effect"
             warn "in the existing service unit. Re-run with --force to update the unit."
+            systemctl daemon-reload || true
+            info "systemd daemon reloaded (unit unchanged, service NOT restarted)."
+            return 0
         fi
+        # Paths match defaults — fall through to enable/restart so that
+        # config changes (new binary, updated proxy.toml) are applied.
         systemctl daemon-reload || true
         info "systemd daemon reloaded (unit unchanged)."
-        return 0
+    else
+        systemctl daemon-reload
+        info "systemd daemon reloaded."
     fi
-
-    systemctl daemon-reload
-    info "systemd daemon reloaded."
 
     if [[ "${ENABLE_SERVICE}" == "true" ]]; then
         systemctl enable "${SERVICE_NAME}"
