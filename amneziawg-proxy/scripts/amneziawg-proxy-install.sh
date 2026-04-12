@@ -1248,19 +1248,25 @@ imitate_protocol = "${PROTOCOL}"
 
 # QUIC handshake continuation responder (stateful; more realistic).
 quic_handshake_enabled = ${quic_hs_toml}
+$(if [[ "${quic_hs_toml}" == "true" ]]; then cat <<QUIC_BLOCK
 
 # TLS SNI domain used in the QUIC handshake certificate.
 quic_certificate_domain = "${QUIC_DOMAIN}"
+QUIC_BLOCK
+fi)
 
 # Forward DNS probe queries to an upstream resolver instead of always
 # returning a synthetic SERVFAIL response.
 dns_forward_enabled = ${dns_fwd_toml}
+$(if [[ "${dns_fwd_toml}" == "true" ]]; then cat <<DNS_BLOCK
 
 # Upstream DNS resolver (host:port) used when dns_forward_enabled = true.
 dns_upstream = "${DNS_UPSTREAM}"
 
 # Timeout for upstream DNS query forwarding in milliseconds.
 dns_upstream_timeout_ms = 1500
+DNS_BLOCK
+fi)
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
 

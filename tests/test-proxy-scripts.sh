@@ -432,6 +432,30 @@ assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
 assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
     --awg-dir '/etc/amnezia/awg\dir'
 
+# ── Conditional TOML emission (quic_certificate_domain / dns_upstream) ────────
+
+echo "=== Conditional TOML emission ==="
+# --quic-domain with TOML-unsafe chars should NOT cause failure when
+# QUIC handshake is disabled (field not emitted into proxy.toml).
+# The installer will fail at preflight (not root) before file I/O, which is
+# expected — we just verify it does NOT die with a TOML-unsafe-chars error.
+_quic_domain_disabled_output=$(bash "${INSTALL_SCRIPT}" --non-interactive \
+    --listen-port 51820 --quic-domain 'bad"domain' 2>&1 || true)
+_quic_domain_has_toml_err=0
+echo "${_quic_domain_disabled_output}" | grep -qi 'quic.*domain.*quotes\|quic.*domain.*toml' \
+    && _quic_domain_has_toml_err=1
+assert_eq "0" "${_quic_domain_has_toml_err}" \
+    "--quic-domain TOML-unsafe chars accepted when QUIC handshake disabled"
+
+# Same for --dns-upstream with invalid value when DNS forwarding is disabled
+_dns_upstream_disabled_output=$(bash "${INSTALL_SCRIPT}" --non-interactive \
+    --listen-port 51820 --dns-upstream 'not-valid' 2>&1 || true)
+_dns_upstream_has_err=0
+echo "${_dns_upstream_disabled_output}" | grep -qi 'dns.*upstream.*host\|dns.*upstream.*ip' \
+    && _dns_upstream_has_err=1
+assert_eq "0" "${_dns_upstream_has_err}" \
+    "--dns-upstream invalid value accepted when DNS forwarding disabled"
+
 # ── --help exits 0 ────────────────────────────────────────────────────────────
 
 echo "=== --help exits 0 ==="
