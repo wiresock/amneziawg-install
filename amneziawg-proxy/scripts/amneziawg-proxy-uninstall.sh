@@ -226,6 +226,16 @@ safe_rm_dir() {
         warn "safe_rm_dir: empty path, skipping"
         return 0
     fi
+    # Validate prefix argument before using it as a safety boundary
+    if [[ -z "${prefix}" ]]; then
+        die "safe_rm_dir: empty prefix — refusing to operate without a safety boundary"
+    fi
+    if [[ "${prefix}" != /* ]]; then
+        die "safe_rm_dir: prefix must be absolute, got '${prefix}'"
+    fi
+    if [[ "/${prefix}/" == *"/../"* || "/${prefix}/" == *"/./"* ]]; then
+        die "safe_rm_dir: prefix must not contain '.' or '..' components: ${prefix}"
+    fi
     # Normalize: strip any trailing slash so prefix and length checks are consistent
     d="${d%/}"
     if [[ "${d}" != /* ]]; then
@@ -272,8 +282,8 @@ systemctl_if_active() {
         info "systemctl not available, skipping ${verb}: ${unit}"
         return 0
     fi
-    if systemctl is-active --quiet "${unit}" 2>/dev/null; then
-        systemctl "${verb}" "${unit}" && info "Service ${verb}ped: ${unit}" || \
+    if systemctl is-active --quiet -- "${unit}" 2>/dev/null; then
+        systemctl "${verb}" -- "${unit}" && info "Service ${verb}ped: ${unit}" || \
             warn "Could not ${verb} ${unit} (already stopped?)"
     else
         info "Service not active, skipping ${verb}: ${unit}"
@@ -287,8 +297,8 @@ systemctl_if_enabled() {
         info "systemctl not available, skipping ${verb}: ${unit}"
         return 0
     fi
-    if systemctl is-enabled --quiet "${unit}" 2>/dev/null; then
-        systemctl "${verb}" "${unit}" && info "Service ${verb}d: ${unit}" || \
+    if systemctl is-enabled --quiet -- "${unit}" 2>/dev/null; then
+        systemctl "${verb}" -- "${unit}" && info "Service ${verb}d: ${unit}" || \
             warn "Could not ${verb} ${unit}"
     else
         info "Service not enabled, skipping ${verb}: ${unit}"
@@ -400,11 +410,11 @@ restore_awg_listen_port() {
 
             # Restart the interface
             if [[ "${HAVE_SYSTEMCTL}" == "true" ]] && \
-               systemctl is-active --quiet "awg-quick@${awg_nic}" 2>/dev/null; then
+               systemctl is-active --quiet -- "awg-quick@${awg_nic}" 2>/dev/null; then
                 info "Restarting AWG interface ${awg_nic}..."
-                if ! systemctl restart "awg-quick@${awg_nic}"; then
+                if ! systemctl restart -- "awg-quick@${awg_nic}"; then
                     warn "Failed to restart awg-quick@${awg_nic}."
-                    warn "Run manually: sudo systemctl restart awg-quick@${awg_nic}"
+                    warn "Run manually: sudo systemctl restart -- awg-quick@${awg_nic}"
                 else
                     info "AWG interface ${awg_nic} restarted with original config."
                 fi
@@ -412,7 +422,7 @@ restore_awg_listen_port() {
                 warn "systemctl not available; restart awg-quick@${awg_nic} manually."
             else
                 warn "AWG interface awg-quick@${awg_nic} is not active."
-                warn "Start it with: sudo systemctl start awg-quick@${awg_nic}"
+                warn "Start it with: sudo systemctl start -- awg-quick@${awg_nic}"
             fi
             return 0
         fi
@@ -430,11 +440,11 @@ restore_awg_listen_port() {
 
     # Restart the interface
     if [[ "${HAVE_SYSTEMCTL}" == "true" ]] && \
-       systemctl is-active --quiet "awg-quick@${awg_nic}" 2>/dev/null; then
+       systemctl is-active --quiet -- "awg-quick@${awg_nic}" 2>/dev/null; then
         info "Restarting AWG interface ${awg_nic}..."
-        if ! systemctl restart "awg-quick@${awg_nic}"; then
+        if ! systemctl restart -- "awg-quick@${awg_nic}"; then
             warn "Failed to restart awg-quick@${awg_nic}."
-            warn "Run manually: sudo systemctl restart awg-quick@${awg_nic}"
+            warn "Run manually: sudo systemctl restart -- awg-quick@${awg_nic}"
         else
             info "AWG interface ${awg_nic} restarted."
         fi

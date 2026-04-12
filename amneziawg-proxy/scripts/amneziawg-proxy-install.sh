@@ -1392,18 +1392,18 @@ reconfigure_awg_listen_port() {
 
     # Restart the AWG interface if it is currently active
     local nic="${AWG_NIC:-awg0}"
-    if systemctl is-active --quiet "awg-quick@${nic}" 2>/dev/null; then
+    if systemctl is-active --quiet -- "awg-quick@${nic}" 2>/dev/null; then
         info "Restarting AWG interface ${nic} to apply new listen port..."
-        if ! systemctl restart "awg-quick@${nic}"; then
+        if ! systemctl restart -- "awg-quick@${nic}"; then
             warn "Failed to restart awg-quick@${nic}. You may need to restart it manually:"
-            warn "  sudo systemctl restart awg-quick@${nic}"
+            warn "  sudo systemctl restart -- awg-quick@${nic}"
         else
             info "AWG interface ${nic} restarted."
         fi
     else
         warn "AWG interface service awg-quick@${nic} is not active."
         warn "After starting the proxy, bring up the interface with:"
-        warn "  sudo systemctl start awg-quick@${nic}"
+        warn "  sudo systemctl start -- awg-quick@${nic}"
     fi
 }
 
@@ -1502,8 +1502,9 @@ UNITEOF
         [[ "${INSTALL_DIR}" != "${DEFAULT_INSTALL_DIR}" ]] && path_flags_changed=true
         [[ "${CONFIG_FILE}"  != "${DEFAULT_CONFIG_FILE}"  ]] && path_flags_changed=true
         [[ "${DATA_DIR}"     != "${DEFAULT_DATA_DIR}"     ]] && path_flags_changed=true
+        [[ "${AWG_DIR}"      != "${DEFAULT_AWG_DIR}"      ]] && path_flags_changed=true
         if [[ "${path_flags_changed}" == "true" ]]; then
-            warn "Path options (--install-dir, --config-file, --data-dir) will NOT take effect"
+            warn "Path options (--install-dir, --config-file, --data-dir, --awg-dir) will NOT take effect"
             warn "in the existing service unit. Re-run with --force to update the unit."
         fi
         systemctl daemon-reload || true
