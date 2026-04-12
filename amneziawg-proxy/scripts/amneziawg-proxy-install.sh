@@ -1575,7 +1575,20 @@ main() {
         warn "Config was not updated — skipping AWG reconfiguration and service"
         warn "restart to avoid inconsistency with the existing proxy.toml."
         warn "Re-run with --force to overwrite the config and apply all changes."
-        print_summary
+        printf "\n${BOLD}${YELLOW}══════════════════════════════════════════════════════${NC}\n"
+        printf "${BOLD}${YELLOW}  amneziawg-proxy: partial install (config unchanged)${NC}\n"
+        printf "${BOLD}${YELLOW}══════════════════════════════════════════════════════${NC}\n\n"
+        printf "${BOLD}What was done:${NC}\n"
+        printf "  Binary installed to: %s/amneziawg-proxy\n" "${INSTALL_DIR}"
+        printf "\n"
+        printf "${BOLD}What was skipped:${NC}\n"
+        printf "  Proxy config:        %s (already exists — kept as-is)\n" "${CONFIG_FILE}"
+        printf "  AWG reconfiguration: skipped (config unchanged)\n"
+        printf "  Service restart:     skipped (config unchanged)\n"
+        printf "\n"
+        printf "${BOLD}To apply new settings, re-run with --force:${NC}\n"
+        printf "  sudo %s --force [options...]\n" "${0}"
+        printf "\n"
         return 0
     elif (( config_rc != 0 )); then
         die "Failed to write proxy configuration (exit code ${config_rc})."

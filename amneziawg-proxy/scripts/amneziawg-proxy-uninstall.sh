@@ -75,8 +75,8 @@ Options:
   --config-file FILE   Proxy config file path    (default: ${DEFAULT_CONFIG_FILE})
   --data-dir DIR       Data directory            (default: ${DEFAULT_DATA_DIR})
   --awg-dir DIR        AmneziaWG config dir      (default: ${DEFAULT_AWG_DIR})
-  --purge-config       Also remove config directory (${DEFAULT_CONFIG_DIR})
-  --purge-data         Also remove data/working directory (${DEFAULT_DATA_DIR})
+  --purge-config       Also remove config directory (only ${DEFAULT_CONFIG_DIR} or subdirs)
+  --purge-data         Also remove data/working directory (only ${DEFAULT_DATA_DIR} or subdirs)
   --restore-awg        Restore AWG listen port from a backup created by the installer
   --force              Skip confirmation prompts
   --non-interactive    Alias for --force; suitable for CI/automation
@@ -502,12 +502,28 @@ print_plan() {
     if [[ "${PURGE_CONFIG}" != "true" ]]; then
         printf '  Config:   %s  [preserved]\n' "${CONFIG_DIR}"
     else
-        printf '  Config:   %s  [WILL BE REMOVED --purge-config]\n' "${CONFIG_DIR}"
+        local _cfg_stripped="${CONFIG_DIR%/}"
+        case "${_cfg_stripped}" in
+            "${DEFAULT_CONFIG_DIR}"|"${DEFAULT_CONFIG_DIR}"/*)
+                printf '  Config:   %s  [WILL BE REMOVED --purge-config]\n' "${CONFIG_DIR}"
+                ;;
+            *)
+                printf '  Config:   %s  [PURGE WILL FAIL — outside %s]\n' "${CONFIG_DIR}" "${DEFAULT_CONFIG_DIR}"
+                ;;
+        esac
     fi
     if [[ "${PURGE_DATA}" != "true" ]]; then
         printf '  Data dir: %s  [preserved]\n' "${DATA_DIR}"
     else
-        printf '  Data dir: %s  [WILL BE REMOVED --purge-data]\n' "${DATA_DIR}"
+        local _data_stripped="${DATA_DIR%/}"
+        case "${_data_stripped}" in
+            "${DEFAULT_DATA_DIR}"|"${DEFAULT_DATA_DIR}"/*)
+                printf '  Data dir: %s  [WILL BE REMOVED --purge-data]\n' "${DATA_DIR}"
+                ;;
+            *)
+                printf '  Data dir: %s  [PURGE WILL FAIL — outside %s]\n' "${DATA_DIR}" "${DEFAULT_DATA_DIR}"
+                ;;
+        esac
     fi
     if [[ "${RESTORE_AWG}" == "true" ]]; then
         printf '\n'
