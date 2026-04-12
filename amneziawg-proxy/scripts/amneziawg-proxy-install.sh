@@ -699,6 +699,23 @@ EOF
     printf "\n${BOLD}Protocol imitation:${NC}\n"
     prompt_protocol
 
+    # Auto-disable flags that are incompatible with the chosen protocol so that
+    # validate_config() (which runs later) won't hard-fail on a cross-field
+    # mismatch when the flag was pre-set via CLI (e.g. --quic-handshake) and
+    # the user then chose a different protocol interactively.
+    if [[ "${PROTOCOL}" != "quic" && "${PROTOCOL}" != "auto" ]]; then
+        if [[ "${QUIC_HANDSHAKE_ENABLED}" == "true" ]]; then
+            warn "Disabling QUIC handshake (incompatible with protocol '${PROTOCOL}')."
+            QUIC_HANDSHAKE_ENABLED="false"
+        fi
+    fi
+    if [[ "${PROTOCOL}" != "dns" && "${PROTOCOL}" != "auto" ]]; then
+        if [[ "${DNS_FORWARD_ENABLED}" == "true" ]]; then
+            warn "Disabling DNS forwarding (incompatible with protocol '${PROTOCOL}')."
+            DNS_FORWARD_ENABLED="false"
+        fi
+    fi
+
     if [[ "${PROTOCOL}" == "quic" || "${PROTOCOL}" == "auto" ]]; then
         printf "\n"
         prompt_yesno QUIC_HANDSHAKE_ENABLED \
@@ -1188,9 +1205,13 @@ write_proxy_config() {
     old_umask="$(umask)"
     umask 077
 
-    # Determine AWG config path line
+    # Determine AWG config path line.  AWG_CONF_FILE is written into a
+    # double-quoted TOML string — reject characters that would break quoting.
     local awg_config_line=""
     if [[ -n "${AWG_CONF_FILE}" ]]; then
+        if _has_toml_unsafe_chars "${AWG_CONF_FILE}"; then
+            die "AWG config path must not contain quotes or backslashes (got: '${AWG_CONF_FILE}')."
+        fi
         awg_config_line="awg_config = \"${AWG_CONF_FILE}\""
     else
         awg_config_line="# awg_config = \"/etc/amnezia/amneziawg/${AWG_NIC:-awg0}.conf\""
@@ -1293,6 +1314,14 @@ reconfigure_awg_listen_port() {
     current_addr="$(grep -i '^[[:space:]]*ListenAddr[[:space:]]*=' "${AWG_CONF_FILE}" \
                    | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]')" || true
 
+    # AWG config uses bare IP addresses for ListenAddr (no brackets for IPv6),
+    # whereas BACKEND_HOST may be SocketAddr-formatted with brackets (e.g.
+    # [::1]).  Derive an unbracketed host for AWG config comparisons / writes.
+    local awg_backend_host="${BACKEND_HOST}"
+    if [[ "${awg_backend_host}" =~ ^\[(.*)\]$ ]]; then
+        awg_backend_host="${BASH_REMATCH[1]}"
+    fi
+
     # Determine if reconfiguration is needed
     local needs_port_change=false
     local needs_addr_change=false
@@ -1305,17 +1334,17 @@ reconfigure_awg_listen_port() {
     # (AWG uses ListenAddr or binds to 0.0.0.0 by default)
     if [[ -z "${current_addr}" ]] || [[ "${current_addr}" == "0.0.0.0" ]]; then
         needs_addr_change=true
-    elif [[ "${current_addr}" != "${BACKEND_HOST}" ]]; then
+    elif [[ "${current_addr}" != "${awg_backend_host}" ]]; then
         needs_addr_change=true
     fi
 
     if [[ "${needs_port_change}" == "false" ]] && [[ "${needs_addr_change}" == "false" ]]; then
-        info "AWG already configured for backend address ${BACKEND_HOST}:${BACKEND_PORT}."
+        info "AWG already configured for backend address ${awg_backend_host}:${BACKEND_PORT}."
         return 0
     fi
 
     info "Current AWG listen: ${current_addr:-0.0.0.0}:${current_listen:-unknown}"
-    info "Reconfiguring AWG to listen on: ${BACKEND_HOST}:${BACKEND_PORT}"
+    info "Reconfiguring AWG to listen on: ${awg_backend_host}:${BACKEND_PORT}"
 
     # Back up the config file before modifying it
     local backup
@@ -1341,10 +1370,10 @@ reconfigure_awg_listen_port() {
     if [[ "${needs_addr_change}" == "true" ]]; then
         if grep -qi '^[[:space:]]*ListenAddr[[:space:]]*=' "${AWG_CONF_FILE}"; then
             local escaped_backend_host
-            escaped_backend_host="$(escape_sed_replacement "${BACKEND_HOST}")"
+            escaped_backend_host="$(escape_sed_replacement "${awg_backend_host}")"
             sed -i "s|^[[:space:]]*ListenAddr[[:space:]]*=.*|ListenAddr = ${escaped_backend_host}|i" \
                 "${AWG_CONF_FILE}"
-            info "Updated ListenAddr → ${BACKEND_HOST}"
+            info "Updated ListenAddr → ${awg_backend_host}"
         else
             # AmneziaWG may not support ListenAddr; add as a comment note only
             warn "AmneziaWG does not use a ListenAddr directive in all versions."
@@ -1519,9 +1548,13 @@ print_summary() {
     printf "\n"
 
     if [[ -n "${AWG_CONF_FILE}" ]]; then
+        local display_host="${BACKEND_HOST}"
+        if [[ "${display_host}" =~ ^\[(.*)\]$ ]]; then
+            display_host="${BASH_REMATCH[1]}"
+        fi
         printf "${BOLD}${YELLOW}Important:${NC}\n"
         printf "  AmneziaWG has been reconfigured to listen on %s:%s.\n" \
-            "${BACKEND_HOST}" "${BACKEND_PORT}"
+            "${display_host}" "${BACKEND_PORT}"
         printf "  VPN clients should continue to connect to port %s.\n" "${LISTEN_PORT}"
         printf "  The proxy handles all public traffic and forwards to AWG.\n"
         printf "\n"
@@ -1552,6 +1585,12 @@ main() {
     fi
     if _path_has_dot_components "${AWG_DIR}"; then
         die "--awg-dir must not contain '.' or '..' path components (got: '${AWG_DIR}')."
+    fi
+    # AWG_DIR (and the AWG_CONF_FILE derived from it) is written into
+    # proxy.toml as a double-quoted TOML string.  Reject characters that
+    # would break TOML quoting.
+    if _has_toml_unsafe_chars "${AWG_DIR}"; then
+        die "--awg-dir must not contain quotes or backslashes (got: '${AWG_DIR}')."
     fi
 
     preflight_checks

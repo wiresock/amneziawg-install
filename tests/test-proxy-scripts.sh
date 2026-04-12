@@ -422,6 +422,16 @@ assert_rc 1 run_validate_config "dns" "false" "true" "localhost:53"
 assert_rc 1 run_validate_config "dns" "false" "true" "not-a-host"
 assert_rc 0 run_validate_config "dns" "false" "true" "[::1]:53"
 
+# ── AWG_DIR TOML-unsafe rejection ─────────────────────────────────────────────
+
+echo "=== AWG_DIR TOML-unsafe rejection ==="
+# AWG_DIR with quotes should be rejected
+assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
+    --awg-dir '/etc/amnezia/"awg'
+# AWG_DIR with backslash should be rejected
+assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
+    --awg-dir '/etc/amnezia/awg\dir'
+
 # ── --help exits 0 ────────────────────────────────────────────────────────────
 
 echo "=== --help exits 0 ==="
