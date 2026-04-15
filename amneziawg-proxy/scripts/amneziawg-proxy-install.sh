@@ -938,7 +938,7 @@ _is_valid_ip_literal() {
     # Pass the value via stdin to avoid shell injection.
     if ! command -v python3 &>/dev/null; then
         die "python3 is required for IP address validation but was not found.
-Install python3 or provide a known-valid IP address via --listen-host / --backend-host."
+Install python3 to proceed."
     fi
 
     printf '%s' "${host}" | python3 -c "
