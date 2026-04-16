@@ -1641,6 +1641,11 @@ main() {
     if _has_toml_unsafe_chars "${AWG_DIR}"; then
         die "--awg-dir must not contain quotes or backslashes (got: '${AWG_DIR}')."
     fi
+    # AWG_DIR is also written into the systemd unit (ReadOnlyPaths).
+    # '%' is a systemd specifier prefix and must be rejected here too.
+    if [[ "${AWG_DIR}" == *%* ]]; then
+        die "--awg-dir must not contain '%' (got: '${AWG_DIR}')."
+    fi
 
     preflight_checks
 
