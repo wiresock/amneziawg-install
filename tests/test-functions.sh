@@ -495,7 +495,6 @@ echo "=== ensureAmneziawgKernelModule ==="
 # Create a temporary mock bin directory for ensureAmneziawgKernelModule tests.
 # Each test overrides PATH in a subshell so the function sees mock commands.
 MOCK_BIN_DIR=$(mktemp -d)
-MOCK_MODULES_DIR=$(mktemp -d)
 
 _make_mock() {
 	local CMD="$1"
@@ -685,7 +684,7 @@ fi
 # Reset systemctl mock to default
 _make_mock "systemctl" 'exit 0'
 
-rm -rf "${MOCK_BIN_DIR}" "${MOCK_MODULES_DIR}"
+rm -rf "${MOCK_BIN_DIR}"
 
 echo ""
 echo "=========================================="

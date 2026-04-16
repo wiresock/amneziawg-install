@@ -745,6 +745,7 @@ function ensureAmneziawgKernelModule() {
 			if [[ -n "${DEB_ARCH}" ]]; then
 				HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
 			fi
+			local HDR_PKG
 			for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
 				if apt-get install -y "${HDR_PKG}"; then
 					HEADER_INSTALLED=1
