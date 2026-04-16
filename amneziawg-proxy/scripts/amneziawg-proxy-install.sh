@@ -914,6 +914,9 @@ _has_toml_unsafe_chars() {
 
 # Return 0 when the argument is a valid IPv4 or IPv6 address (IP literal).
 # IPv6 addresses may optionally be enclosed in brackets (e.g. [::1]).
+# Bracketed IPv4 (e.g. [127.0.0.1]) is rejected: brackets are only valid for
+# IPv6 in SocketAddr format, and passing one through would produce an invalid
+# Rust SocketAddr string like "[127.0.0.1]:51820".
 # Hostnames are rejected.
 _is_valid_ip_literal() {
     local host="$1"
@@ -933,6 +936,13 @@ _is_valid_ip_literal() {
         host="${host%\]}"
     fi
     [[ -z "${host}" ]] && return 1
+
+    # Brackets are only valid around IPv6 addresses (which contain ':').
+    # Reject bracketed IPv4 (no ':') because _format_host_for_socketaddr would
+    # return it unchanged and produce an invalid SocketAddr like [127.0.0.1]:port.
+    if (( has_open == 1 )) && [[ "${host}" != *:* ]]; then
+        return 1
+    fi
 
     # Validate via Python3's ipaddress module (strict, handles all edge cases).
     # Pass the value via stdin to avoid shell injection.
@@ -1094,6 +1104,9 @@ Re-run with: --listen-port <port>"
         fi
         if _path_has_dot_components "${path_val}"; then
             die "${flag_name} must not contain '.' or '..' path components (got: '${path_val}')."
+        fi
+        if [[ "${path_val}" == *'"'* || "${path_val}" == *\\* ]]; then
+            die "${flag_name} must not contain '\"' or '\\' characters (they break systemd unit and sed substitution)."
         fi
     done
 }

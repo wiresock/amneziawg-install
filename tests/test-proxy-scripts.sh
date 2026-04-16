@@ -349,6 +349,10 @@ assert_rc 1 _is_valid_ip_literal "[::1"
 assert_rc 1 _is_valid_ip_literal "::1]"
 assert_rc 1 _is_valid_ip_literal "[127.0.0.1"
 assert_rc 1 _is_valid_ip_literal "127.0.0.1]"
+# Bracketed IPv4 → rejected (brackets are IPv6-only in SocketAddr; [x.x.x.x]:port is invalid)
+assert_rc 1 _is_valid_ip_literal "[127.0.0.1]"
+assert_rc 1 _is_valid_ip_literal "[0.0.0.0]"
+assert_rc 1 _is_valid_ip_literal "[192.168.1.1]"
 
 # ── _format_host_for_socketaddr ───────────────────────────────────────────────
 
@@ -436,6 +440,22 @@ assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
 # AWG_DIR with backslash should be rejected
 assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
     --awg-dir '/etc/amnezia/awg\dir'
+
+# ── Path option quote/backslash rejection ─────────────────────────────────────
+
+echo "=== Path option quote/backslash rejection ==="
+# --install-dir with quote should be rejected
+assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
+    --install-dir '/usr/local/"bin'
+# --install-dir with backslash should be rejected
+assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
+    --install-dir '/usr/local/bi\n'
+# --config-file with quote should be rejected
+assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
+    --config-file '/etc/proxy/"proxy.toml'
+# --data-dir with backslash should be rejected
+assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
+    --data-dir '/var/lib/proxy\data'
 
 # ── Conditional TOML emission (quic_certificate_domain / dns_upstream) ────────
 
