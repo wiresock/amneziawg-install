@@ -1389,6 +1389,35 @@ reconfigure_awg_listen_port() {
     info "Current AWG listen: ${current_addr:-0.0.0.0}:${current_listen:-unknown}"
     info "Reconfiguring AWG to listen on: ${awg_backend_host}:${BACKEND_PORT}"
 
+    # When ListenAddr is absent, changing ListenPort alone leaves the backend
+    # port reachable on all interfaces, bypassing the proxy.  In interactive
+    # mode, ask for confirmation before proceeding.  In non-interactive mode,
+    # emit a prominent warning and continue (the operator is assumed to add
+    # firewall rules themselves).
+    local has_listen_addr_directive=false
+    if grep -qi '^[[:space:]]*ListenAddr[[:space:]]*=' "${AWG_CONF_FILE}"; then
+        has_listen_addr_directive=true
+    fi
+
+    if [[ "${needs_addr_change}" == "true" ]] && \
+       [[ "${has_listen_addr_directive}" != "true" ]]; then
+        warn "WARNING: ${AWG_CONF_FILE} does not contain a ListenAddr directive."
+        warn "AWG will listen on port ${BACKEND_PORT} on ALL interfaces after this change,"
+        warn "making the backend port publicly reachable without going through the proxy."
+        warn "Add firewall rules to restrict access (e.g. via a PostUp rule):"
+        warn "  PostUp = iptables -I INPUT -p udp --dport ${BACKEND_PORT} ! -s 127.0.0.0/8 -j DROP"
+        if [[ "${NON_INTERACTIVE}" != "true" ]]; then
+            local proceed_anyway=false
+            prompt_yesno proceed_anyway \
+                "Continue with ListenPort change? (ListenAddr will remain unrestricted)" \
+                false
+            if [[ "${proceed_anyway}" != "true" ]]; then
+                info "AWG reconfiguration skipped. Apply firewall rules first, then re-run."
+                return 0
+            fi
+        fi
+    fi
+
     # Back up the config file before modifying it
     local backup
     backup="${AWG_CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)"
@@ -1418,12 +1447,9 @@ reconfigure_awg_listen_port() {
                 "${AWG_CONF_FILE}"
             info "Updated ListenAddr → ${awg_backend_host}"
         else
-            # AmneziaWG may not support ListenAddr; add as a comment note only
-            warn "AmneziaWG does not use a ListenAddr directive in all versions."
-            warn "To restrict AWG to loopback, use firewall rules or bind via the"
-            warn "awg-quick PostUp hook. Example PostUp firewall rule for loopback:"
-            warn "  PostUp = iptables -I INPUT -p udp --dport ${BACKEND_PORT} ! -s 127.0.0.0/8 -j DROP"
-            warn "If you use a different backend host, adjust the source CIDR accordingly."
+            # ListenAddr directive is absent; the user was already warned and
+            # confirmed (or accepted the risk in non-interactive mode) above.
+            info "ListenAddr directive not present in AWG config; apply firewall rules to restrict the backend port."
         fi
     fi
 

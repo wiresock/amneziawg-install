@@ -440,6 +440,20 @@ restore_awg_listen_port() {
         warn "ListenPort not found in ${awg_conf}; manual update may be required."
     fi
 
+    # No backup means we cannot safely restore the original ListenAddr.
+    # Warn if the current config still appears loopback-bound so operators
+    # know additional manual changes may be required.
+    local listen_addr_raw
+    listen_addr_raw="$(sed -nE \
+        's/^[[:space:]]*ListenAddr[[:space:]]*=[[:space:]]*"?([^"#;[:space:]]+)"?.*$/\1/ip' \
+        "${awg_conf}" | tail -1)"
+    if [[ -n "${listen_addr_raw}" ]] && \
+       [[ "${listen_addr_raw,,}" =~ ^(127\.[0-9]+\.[0-9]+\.[0-9]+|::1|localhost)$ ]]; then
+        warn "No AWG config backup was found, and ${awg_conf} still sets ListenAddr = ${listen_addr_raw}."
+        warn "This appears to bind AWG to loopback only; public connectivity may remain unavailable."
+        warn "Review/remove/reset ListenAddr manually if AWG should listen on a non-loopback address."
+    fi
+
     # Restart the interface
     if [[ "${HAVE_SYSTEMCTL}" == "true" ]] && \
        systemctl is-active --quiet -- "awg-quick@${awg_nic}" 2>/dev/null; then
