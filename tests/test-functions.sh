@@ -499,10 +499,7 @@ MOCK_BIN_DIR=$(mktemp -d)
 _make_mock() {
 	local CMD="$1"
 	local BODY="$2"
-	cat > "${MOCK_BIN_DIR}/${CMD}" <<MOCKEOF
-#!/bin/bash
-${BODY}
-MOCKEOF
+	printf '%s\n' '#!/bin/bash' "${BODY}" > "${MOCK_BIN_DIR}/${CMD}"
 	chmod +x "${MOCK_BIN_DIR}/${CMD}"
 }
 

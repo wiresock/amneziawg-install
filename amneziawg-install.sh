@@ -786,7 +786,7 @@ function ensureAmneziawgKernelModule() {
 	if command -v dkms &>/dev/null; then
 		echo -e "${ORANGE}Running: dkms autoinstall -k ${KERNEL_VER}${NC}"
 		if ! dkms autoinstall -k "${KERNEL_VER}"; then
-			echo -e "${RED}ERROR: dkms autoinstall failed for kernel ${KERNEL_VER}.${NC}"
+			echo -e "${ORANGE}WARNING: dkms autoinstall failed for kernel ${KERNEL_VER}.${NC}"
 			local DKMS_LOG
 			DKMS_LOG=$(find /var/lib/dkms/amneziawg -name 'make.log' -path "*${KERNEL_VER}*" 2>/dev/null | head -n 1)
 			if [[ -n "${DKMS_LOG}" ]]; then
