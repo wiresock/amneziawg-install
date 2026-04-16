@@ -710,26 +710,42 @@ function ensureAmneziawgKernelModule() {
 	local KERNEL_VER
 	KERNEL_VER="$(uname -r)"
 
-	# Fast-path: module already loaded or .ko file already built for this kernel
-	if lsmod 2>/dev/null | grep -q '^amneziawg ' || \
-	   [ -n "$(find "/lib/modules/${KERNEL_VER}" -name 'amneziawg.ko*' -print -quit 2>/dev/null)" ]; then
+	# Fast-path: return immediately only if the module is already loaded.
+	if lsmod 2>/dev/null | grep -q '^amneziawg '; then
 		return 0
 	fi
 
-	echo -e "${ORANGE}amneziawg kernel module is not built for kernel ${KERNEL_VER}.${NC}"
+	# If the module is already built for this kernel, try loading it before
+	# falling back to the full repair path.
+	if [ -n "$(find "/lib/modules/${KERNEL_VER}" -name 'amneziawg.ko*' -print -quit 2>/dev/null)" ]; then
+		if modprobe amneziawg 2>/dev/null && lsmod 2>/dev/null | grep -q '^amneziawg '; then
+			return 0
+		fi
+	fi
+
+	echo -e "${ORANGE}amneziawg kernel module is not built or loaded for kernel ${KERNEL_VER}.${NC}"
 	echo -e "${ORANGE}Attempting automatic repair...${NC}"
 
 	# Install missing kernel headers so DKMS can compile the module.
 	# Candidates are tried in order: exact versioned headers, Raspberry Pi
 	# headers (ARM boards use a distro-managed package without a version suffix),
-	# then the generic meta-package as a last resort.
+	# then the architecture-specific meta-package (e.g. linux-headers-amd64 on
+	# Debian, linux-headers-generic on Ubuntu) as a last resort.
 	if [[ "${OS}" == 'ubuntu' ]] || [[ "${OS}" == 'debian' ]]; then
 		local HEADERS_PKG="linux-headers-${KERNEL_VER}"
 		if ! dpkg-query -W -f='${Status}' "${HEADERS_PKG}" 2>/dev/null | grep -q 'install ok installed'; then
 			echo -e "${ORANGE}Kernel headers (${HEADERS_PKG}) are not installed. Installing...${NC}"
 			enable_apt_ipv4
 			local HEADER_INSTALLED=0
-			for HDR_PKG in "${HEADERS_PKG}" "raspberrypi-kernel-headers" "linux-headers-generic"; do
+			local HEADER_CANDIDATES=("${HEADERS_PKG}" "raspberrypi-kernel-headers")
+			# Add the architecture-specific meta-package (e.g. linux-headers-amd64)
+			# as a last-resort fallback, but only if dpkg can report the arch.
+			local DEB_ARCH=""
+			DEB_ARCH="$(dpkg --print-architecture 2>/dev/null)" || DEB_ARCH=""
+			if [[ -n "${DEB_ARCH}" ]]; then
+				HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
+			fi
+			for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
 				if apt-get install -y "${HDR_PKG}"; then
 					HEADER_INSTALLED=1
 					break
@@ -746,7 +762,12 @@ function ensureAmneziawgKernelModule() {
 		local HEADERS_PKG="kernel-devel-${KERNEL_VER}"
 		if ! rpm -q "${HEADERS_PKG}" &>/dev/null; then
 			echo -e "${ORANGE}Kernel headers (${HEADERS_PKG}) are not installed. Installing...${NC}"
-			dnf install -y "${HEADERS_PKG}" || echo -e "${ORANGE}WARNING: Could not install kernel headers. DKMS build may fail.${NC}"
+			enable_apt_ipv4
+			if ! dnf install -y "${HEADERS_PKG}"; then
+				echo -e "${ORANGE}WARNING: Failed to install '${HEADERS_PKG}'. Trying 'kernel-devel'...${NC}"
+				dnf install -y kernel-devel || echo -e "${ORANGE}WARNING: Could not install kernel headers. DKMS build may fail.${NC}"
+			fi
+			disable_apt_ipv4
 		fi
 	fi
 
