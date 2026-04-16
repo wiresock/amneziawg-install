@@ -93,29 +93,31 @@ EOF
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --install-dir)
-            [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
-            INSTALL_DIR="$2"; shift 2 ;;
-        --config-file)
-            [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
-            CONFIG_FILE="$2"; CONFIG_DIR="$(dirname "${CONFIG_FILE}")"; shift 2 ;;
-        --data-dir)
-            [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
-            DATA_DIR="$2"; shift 2 ;;
-        --awg-dir)
-            [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
-            AWG_DIR="$2"; shift 2 ;;
-        --purge-config)     PURGE_CONFIG="true"; shift ;;
-        --purge-data)       PURGE_DATA="true"; shift ;;
-        --restore-awg)      RESTORE_AWG="true"; shift ;;
-        --force)            FORCE="true"; shift ;;
-        --non-interactive)  FORCE="true"; shift ;;
-        --help|-h)          usage; exit 0 ;;
-        *) die "Unknown option: $1  (use --help for usage)" ;;
-    esac
-done
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --install-dir)
+                [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
+                INSTALL_DIR="$2"; shift 2 ;;
+            --config-file)
+                [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
+                CONFIG_FILE="$2"; CONFIG_DIR="$(dirname "${CONFIG_FILE}")"; shift 2 ;;
+            --data-dir)
+                [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
+                DATA_DIR="$2"; shift 2 ;;
+            --awg-dir)
+                [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
+                AWG_DIR="$2"; shift 2 ;;
+            --purge-config)     PURGE_CONFIG="true"; shift ;;
+            --purge-data)       PURGE_DATA="true"; shift ;;
+            --restore-awg)      RESTORE_AWG="true"; shift ;;
+            --force)            FORCE="true"; shift ;;
+            --non-interactive)  FORCE="true"; shift ;;
+            --help|-h)          usage; exit 0 ;;
+            *) die "Unknown option: $1  (use --help for usage)" ;;
+        esac
+    done
+fi
 
 # ── Confirmation helper ────────────────────────────────────────────────────────
 
@@ -636,7 +638,7 @@ main() {
             validate_purge_data_dir "${DATA_DIR}"
             case "${DATA_DIR}" in
                 "${DEFAULT_DATA_DIR}")
-                    safe_rm_dir "${DATA_DIR}" "$(dirname "${DEFAULT_DATA_DIR}")/"
+                    safe_rm_dir "${DATA_DIR}" "${DEFAULT_DATA_DIR}/"
                     ;;
                 "${DEFAULT_DATA_DIR}"/*)
                     safe_rm_dir "${DATA_DIR}" "${DEFAULT_DATA_DIR}/"

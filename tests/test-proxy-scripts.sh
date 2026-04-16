@@ -462,7 +462,7 @@ run_niv_with() {
         INSTALL_DIR="/usr/local/bin"
         CONFIG_FILE="/etc/amneziawg-proxy/proxy.toml"
         DATA_DIR="/var/lib/amneziawg-proxy"
-        AWG_DIR="/etc/amnezia/awg"
+        AWG_DIR="/etc/amnezia/amneziawg"
 
         # Apply caller-supplied var=value pairs (positional args after "_").
         # In bash -c "script" name arg1 arg2 ..., $0=name, $1=arg1, $2=arg2.
