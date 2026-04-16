@@ -3453,7 +3453,9 @@ PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6}/128" >>"${SERVER_AWG_CONF}"
 
-	ensureAmneziawgKernelModule
+	# Preserve stdout for the generated client config path expected by callers.
+	# Route any informational/repair output from helper setup to stderr.
+	ensureAmneziawgKernelModule 1>&2
 	if ! awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>/tmp/amneziawg-syncconf.err; then
 		local sync_err
 		sync_err="$(cat /tmp/amneziawg-syncconf.err 2>/dev/null || true)"
@@ -3507,7 +3509,7 @@ function nonInteractiveRemoveClient() {
 
 	local sync_err
 	sync_err=""
-	ensureAmneziawgKernelModule
+	ensureAmneziawgKernelModule >&2
 	if ! sync_err="$(awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>&1)"; then
 		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after removing client '${CLIENT_NAME}'" >&2
 		if [[ -n "${sync_err}" ]]; then
