@@ -558,37 +558,40 @@ else
 fi
 
 # Test 2: .ko exists but module not loaded → modprobe succeeds → returns success
-# The function should try modprobe when find reports a .ko, and lsmod confirms
-# it loaded.  We use inline function overrides in a subshell to handle the
-# stateful lsmod/modprobe interaction cleanly.
+# Uses a flag file to simulate lsmod seeing the module only after modprobe runs.
+# Avoids inline functions with hyphens in names (e.g., apt-get) which is fragile.
+MOCK_MODPROBE_FLAG="$(mktemp)"
+rm -f "${MOCK_MODPROBE_FLAG}"
+# lsmod reports the module only after modprobe has run (flag file exists)
+cat > "${MOCK_BIN_DIR}/lsmod" << EOF
+#!/bin/bash
+if [[ -f "${MOCK_MODPROBE_FLAG}" ]]; then
+	echo "amneziawg 12345 0"
+else
+	echo ""
+fi
+EOF
+chmod +x "${MOCK_BIN_DIR}/lsmod"
+# modprobe creates the flag file to signal success, then exits 0
+cat > "${MOCK_BIN_DIR}/modprobe" << EOF
+#!/bin/bash
+touch "${MOCK_MODPROBE_FLAG}"
+exit 0
+EOF
+chmod +x "${MOCK_BIN_DIR}/modprobe"
+_make_mock "find" 'echo "/lib/modules/6.8.0-110-generic/amneziawg.ko"'
+_make_mock "uname" 'echo "6.8.0-110-generic"'
 OUTPUT=$(
 	set +u
-	# Track whether modprobe has been called
-	_MOCK_MODPROBE_CALLED=0
-	lsmod() {
-		if [[ "${_MOCK_MODPROBE_CALLED}" -eq 1 ]]; then
-			echo "amneziawg 12345 0"
-		else
-			echo ""
-		fi
-	}
-	modprobe() { _MOCK_MODPROBE_CALLED=1; return 0; }
-	find() { echo "/lib/modules/6.8.0-110-generic/amneziawg.ko"; }
-	uname() { echo "6.8.0-110-generic"; }
-	dkms() { return 0; }
-	depmod() { return 0; }
-	systemctl() { return 0; }
-	apt-get() { return 0; }
-	dpkg-query() { echo "unknown ok not-installed"; }
-	dpkg() { echo "amd64"; }
-	enable_apt_ipv4() { :; }
-	disable_apt_ipv4() { :; }
-	export -f lsmod modprobe find uname dkms depmod systemctl apt-get dpkg-query dpkg
+	export PATH="${MOCK_BIN_DIR}:${PATH}"
 	OS="ubuntu"
 	SERVER_AWG_NIC="awg0"
+	enable_apt_ipv4() { :; }
+	disable_apt_ipv4() { :; }
 	ensureAmneziawgKernelModule
 ) 2>&1
 RC=$?
+rm -f "${MOCK_MODPROBE_FLAG}"
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ ${RC} -eq 0 ]] && ! echo "${OUTPUT}" | grep -q "Attempting automatic repair"; then
 	TESTS_PASSED=$((TESTS_PASSED + 1))

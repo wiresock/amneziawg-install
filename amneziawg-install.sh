@@ -719,6 +719,16 @@ function ensureAmneziawgKernelModule() {
 	# falling back to the full repair path.
 	if [ -n "$(find "/lib/modules/${KERNEL_VER}" -name 'amneziawg.ko*' -print -quit 2>/dev/null)" ]; then
 		if modprobe amneziawg 2>/dev/null && lsmod 2>/dev/null | grep -q '^amneziawg '; then
+			# Module loaded successfully; start the VPN service if it was not running.
+			if [[ -n "${SERVER_AWG_NIC:-}" ]] && ! systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
+				echo -e "${ORANGE}Starting awg-quick@${SERVER_AWG_NIC} (was not running)...${NC}"
+				if ! systemctl start "awg-quick@${SERVER_AWG_NIC}"; then
+					echo -e "${RED}ERROR: Failed to start awg-quick@${SERVER_AWG_NIC}.${NC}"
+					echo -e "${ORANGE}Check service status with: systemctl status awg-quick@${SERVER_AWG_NIC}${NC}"
+					exit 1
+				fi
+				echo -e "${GREEN}awg-quick@${SERVER_AWG_NIC} started successfully.${NC}"
+			fi
 			return 0
 		fi
 	fi
