@@ -694,6 +694,62 @@ function initialCheck() {
 	checkOS
 }
 
+# Strip the deprecated REMAKE_INITRD directive from the amneziawg DKMS config
+# (newer DKMS versions print noisy warnings for it).
+function sanitizeAwgDkmsConf() {
+	local AWG_DKMS_CONF
+	for AWG_DKMS_CONF in /var/lib/dkms/amneziawg/*/source/dkms.conf; do
+		[[ -f "${AWG_DKMS_CONF}" ]] && sed -i '/^REMAKE_INITRD=/d' "${AWG_DKMS_CONF}"
+	done
+}
+
+# Install kernel headers for the running kernel so DKMS can compile the module.
+# $1 – kernel version string; defaults to the running kernel (uname -r).
+# For APT-based systems the caller must have already activated enable_apt_ipv4.
+function installKernelHeaders() {
+	local KERNEL_VER="${1:-$(uname -r)}"
+	if [[ "${OS}" == 'ubuntu' ]]; then
+		local HEADER_INSTALLED=0
+		local HEADER_CANDIDATES=("linux-headers-${KERNEL_VER}" "raspberrypi-kernel-headers" "linux-headers-generic")
+		local HDR_PKG
+		for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
+			if apt-get install -y "${HDR_PKG}"; then
+				HEADER_INSTALLED=1
+				break
+			else
+				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HDR_PKG}'. Trying next candidate...${NC}"
+			fi
+		done
+		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
+			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
+		fi
+	elif [[ "${OS}" == 'debian' ]]; then
+		local HEADER_INSTALLED=0
+		local HEADER_CANDIDATES=("linux-headers-${KERNEL_VER}" "raspberrypi-kernel-headers")
+		local DEB_ARCH
+		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) && HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
+		local HDR_PKG
+		for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
+			if apt-get install -y "${HDR_PKG}"; then
+				HEADER_INSTALLED=1
+				break
+			else
+				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HDR_PKG}'. Trying next candidate...${NC}"
+			fi
+		done
+		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
+			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
+		fi
+	elif [[ "${OS}" == 'fedora' ]] || [[ "${OS}" == 'centos' ]] || [[ "${OS}" == 'almalinux' ]] || [[ "${OS}" == 'rocky' ]]; then
+		if ! dnf install -y "kernel-devel-${KERNEL_VER}"; then
+			echo -e "${ORANGE}WARNING: Failed to install kernel-devel for the running kernel (${KERNEL_VER}). Attempting to install the latest kernel-devel instead.${NC}"
+			if ! dnf install -y kernel-devel; then
+				echo -e "${ORANGE}WARNING: Failed to install any kernel-devel package. Continuing without kernel headers; DKMS module builds may fail until headers are installed and the system is rebooted.${NC}"
+			fi
+		fi
+	fi
+}
+
 # Start awg-quick@${SERVER_AWG_NIC} when the service is inactive.
 # Called after any successful module-load path so the interface is available
 # for subsequent awg syncconf calls.  Exits with code 1 on failure.
@@ -746,60 +802,27 @@ function ensureAmneziawgKernelModule() {
 	echo -e "${ORANGE}Attempting automatic repair...${NC}"
 
 	# Install missing kernel headers so DKMS can compile the module.
-	# Candidates are tried in order: exact versioned headers, Raspberry Pi
-	# headers (ARM boards use a distro-managed package without a version suffix),
-	# then a distro-appropriate meta-package (linux-headers-generic on Ubuntu,
-	# linux-headers-<arch> on Debian) as a last resort.
+	# installKernelHeaders() tries candidates in order and warns on failure.
 	if [[ "${OS}" == 'ubuntu' ]] || [[ "${OS}" == 'debian' ]]; then
 		local HEADERS_PKG="linux-headers-${KERNEL_VER}"
 		if ! dpkg-query -W -f='${Status}' "${HEADERS_PKG}" 2>/dev/null | grep -q 'install ok installed'; then
 			echo -e "${ORANGE}Kernel headers (${HEADERS_PKG}) are not installed. Installing...${NC}"
 			enable_apt_ipv4
-			local HEADER_INSTALLED=0
-			local HEADER_CANDIDATES=("${HEADERS_PKG}" "raspberrypi-kernel-headers")
-			# Add a distro-appropriate meta-package as a last-resort fallback:
-			# Ubuntu uses linux-headers-generic; Debian uses linux-headers-${DEB_ARCH}.
-			if [[ "${OS}" == 'ubuntu' ]]; then
-				HEADER_CANDIDATES+=("linux-headers-generic")
-			elif [[ "${OS}" == 'debian' ]]; then
-				local DEB_ARCH=""
-				DEB_ARCH="$(dpkg --print-architecture 2>/dev/null)" || DEB_ARCH=""
-				if [[ -n "${DEB_ARCH}" ]]; then
-					HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
-				fi
-			fi
-			local HDR_PKG
-			for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
-				if apt-get install -y "${HDR_PKG}"; then
-					HEADER_INSTALLED=1
-					break
-				else
-					echo -e "${ORANGE}WARNING: Failed to install '${HDR_PKG}'. Trying next candidate...${NC}"
-				fi
-			done
+			installKernelHeaders "${KERNEL_VER}"
 			disable_apt_ipv4
-			if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
-				echo -e "${ORANGE}WARNING: Could not install kernel headers. DKMS build may fail.${NC}"
-			fi
 		fi
 	elif [[ "${OS}" == 'fedora' ]] || [[ "${OS}" == 'centos' ]] || [[ "${OS}" == 'almalinux' ]] || [[ "${OS}" == 'rocky' ]]; then
 		local HEADERS_PKG="kernel-devel-${KERNEL_VER}"
 		if ! rpm -q "${HEADERS_PKG}" &>/dev/null; then
 			echo -e "${ORANGE}Kernel headers (${HEADERS_PKG}) are not installed. Installing...${NC}"
 			enable_apt_ipv4
-			if ! dnf install -y "${HEADERS_PKG}"; then
-				echo -e "${ORANGE}WARNING: Failed to install '${HEADERS_PKG}'. Trying 'kernel-devel'...${NC}"
-				dnf install -y kernel-devel || echo -e "${ORANGE}WARNING: Could not install kernel headers. DKMS build may fail.${NC}"
-			fi
+			installKernelHeaders "${KERNEL_VER}"
 			disable_apt_ipv4
 		fi
 	fi
 
 	# Strip the deprecated REMAKE_INITRD directive to silence newer DKMS warnings
-	local AWG_DKMS_CONF
-	for AWG_DKMS_CONF in /var/lib/dkms/amneziawg/*/source/dkms.conf; do
-		[[ -f "${AWG_DKMS_CONF}" ]] && sed -i '/^REMAKE_INITRD=/d' "${AWG_DKMS_CONF}"
-	done
+	sanitizeAwgDkmsConf
 
 	# Build the module for the current kernel with DKMS.
 	# Even if this step reports failure we still attempt modprobe below: the
@@ -1499,23 +1522,7 @@ function installAmneziaWG() {
 		add-apt-repository -y ppa:amnezia/ppa || { echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
 		apt-get update || { echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
-		# This is critical on Raspberry Pi / ARM where the default headers package
-		# (linux-headers-generic) may not match the actual raspi kernel flavour.
-		# Try several candidates in order: exact versioned headers, Raspberry Pi headers,
-		# then the generic meta package as a last resort.
-		local HEADER_INSTALLED=0
-		local HEADER_CANDIDATES=("linux-headers-$(uname -r)" "raspberrypi-kernel-headers" "linux-headers-generic")
-		for HEADER_PKG in "${HEADER_CANDIDATES[@]}"; do
-			if apt install -y "${HEADER_PKG}"; then
-				HEADER_INSTALLED=1
-				break
-			else
-				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HEADER_PKG}'. Trying next candidate...${NC}"
-			fi
-		done
-		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
-			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
-		fi
+		installKernelHeaders "$(uname -r)"
 		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
@@ -1612,63 +1619,27 @@ function installAmneziaWG() {
 		fi
 		apt-get update || { echo -e "${RED}ERROR: Failed to update package index.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
-		# Try several candidates in order: exact versioned headers, Raspberry Pi headers,
-		# then the Debian architecture-specific meta package (e.g. linux-headers-amd64)
-		# as a last resort. This avoids skipping headers when the exact versioned
-		# package isn't available in the local APT cache.
-		local HEADER_INSTALLED=0
-		local HEADER_CANDIDATES=("linux-headers-$(uname -r)" "raspberrypi-kernel-headers")
-		# Add the architecture-specific meta-package (e.g. linux-headers-amd64)
-		# as a last-resort fallback, but only if dpkg can report the arch.
-		local DEB_ARCH
-		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) && HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
-		local HEADER_ERR_FILE
-		HEADER_ERR_FILE=$(mktemp) || { echo -e "${RED}ERROR: Failed to create temporary file for apt errors.${NC}"; exit 1; }
-		for HEADER_PKG in "${HEADER_CANDIDATES[@]}"; do
-			: >"${HEADER_ERR_FILE}"
-			if apt-get install -y "${HEADER_PKG}" 2> >(tee "${HEADER_ERR_FILE}" >&2); then
-				HEADER_INSTALLED=1
-				break
-			else
-				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HEADER_PKG}'. Trying next candidate...${NC}"
-			fi
-		done
-		rm -f "${HEADER_ERR_FILE}"
-		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
-			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
-		fi
+		installKernelHeaders "$(uname -r)"
 		apt-get install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
-		if ! dnf install -y "kernel-devel-$(uname -r)"; then
-			echo -e "${ORANGE}WARNING: Failed to install kernel-devel for the running kernel ($(uname -r)). Attempting to install the latest kernel-devel instead.${NC}"
-			if ! dnf install -y kernel-devel; then
-				echo -e "${ORANGE}WARNING: Failed to install any kernel-devel package. Continuing without kernel headers; DKMS module builds may fail until headers are installed and the system is rebooted.${NC}"
-			fi
-		fi
+		# Install kernel headers for the running kernel so DKMS can compile the module.
+		installKernelHeaders "$(uname -r)"
 		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'centos' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
-		if ! dnf install -y "kernel-devel-$(uname -r)"; then
-			echo -e "${ORANGE}WARNING: Failed to install kernel-devel for the running kernel ($(uname -r)). Attempting to install the latest kernel-devel instead.${NC}"
-			if ! dnf install -y kernel-devel; then
-				echo -e "${ORANGE}WARNING: Failed to install any kernel-devel package. Continuing without kernel headers; DKMS module builds may fail until headers are installed and the system is rebooted.${NC}"
-			fi
-		fi
+		# Install kernel headers for the running kernel so DKMS can compile the module.
+		installKernelHeaders "$(uname -r)"
 		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	fi
 	disable_apt_ipv4
 
-	# Strip the deprecated REMAKE_INITRD directive from the amneziawg DKMS config
-	# (newer DKMS versions print noisy warnings for it).
-	local AWG_DKMS_CONF
-	for AWG_DKMS_CONF in /var/lib/dkms/amneziawg/*/source/dkms.conf; do
-		[[ -f "${AWG_DKMS_CONF}" ]] && sed -i '/^REMAKE_INITRD=/d' "${AWG_DKMS_CONF}"
-	done
+	# Strip the deprecated REMAKE_INITRD directive from the amneziawg DKMS config.
+	sanitizeAwgDkmsConf
 
 	# Force DKMS to build the module for the running kernel only.
 	# Using "dkms autoinstall -k" avoids errors from stale kernel directories in
