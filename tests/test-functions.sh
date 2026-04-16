@@ -487,6 +487,232 @@ fi
 rm -f "${GAI_TEST_FILE}"
 GAI_CONF="${ORIG_GAI_CONF}"
 
+# ============================================================
+# ensureAmneziawgKernelModule tests
+# ============================================================
+echo "=== ensureAmneziawgKernelModule ==="
+
+# Create a temporary mock bin directory for ensureAmneziawgKernelModule tests.
+# Each test overrides PATH in a subshell so the function sees mock commands.
+MOCK_BIN_DIR=$(mktemp -d)
+
+_make_mock() {
+	local CMD="$1"
+	local BODY="$2"
+	printf '%s\n' '#!/bin/bash' "${BODY}" > "${MOCK_BIN_DIR}/${CMD}"
+	chmod +x "${MOCK_BIN_DIR}/${CMD}"
+}
+
+# Base mocks shared by all tests
+_make_mock "systemctl" 'exit 0'
+_make_mock "dkms" 'exit 0'
+_make_mock "depmod" 'exit 0'
+_make_mock "apt-get" 'exit 0'
+_make_mock "dpkg-query" 'echo "unknown ok not-installed"'
+_make_mock "dpkg" 'echo "amd64"'
+_make_mock "dnf" 'exit 0'
+_make_mock "rpm" 'exit 1'
+_make_mock "sed" 'exit 0'
+_make_mock "tail" 'exit 0'
+
+# Helper: run ensureAmneziawgKernelModule in a subshell with mocked commands.
+# $1 = lsmod body, $2 = modprobe body, $3 = find body (optional)
+# $4 = OS value (default: ubuntu), $5 = SERVER_AWG_NIC (default: awg0)
+run_ensureModule() {
+	local LSMOD_BODY="$1"
+	local MODPROBE_BODY="$2"
+	local FIND_BODY="${3:-exit 0}"
+	local TEST_OS="${4:-ubuntu}"
+	local TEST_NIC="${5:-awg0}"
+
+	_make_mock "lsmod" "${LSMOD_BODY}"
+	_make_mock "modprobe" "${MODPROBE_BODY}"
+	_make_mock "find" "${FIND_BODY}"
+	# uname mock returns a fixed kernel version
+	_make_mock "uname" 'echo "6.8.0-110-generic"'
+
+	(
+		set +u +o pipefail
+		export PATH="${MOCK_BIN_DIR}:${PATH}"
+		OS="${TEST_OS}"
+		SERVER_AWG_NIC="${TEST_NIC}"
+		# Stub enable_apt_ipv4/disable_apt_ipv4 to avoid touching real system files
+		enable_apt_ipv4() { :; }
+		disable_apt_ipv4() { :; }
+		ensureAmneziawgKernelModule
+	) 2>&1
+}
+
+# Test 1: module already loaded → fast-path returns immediately
+OUTPUT=$(run_ensureModule \
+	'echo "amneziawg 12345 0"' \
+	'exit 1' \
+	'exit 0')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && ! echo "${OUTPUT}" | grep -q "not built"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureAmneziawgKernelModule should fast-path when module loaded (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Test 2: .ko exists but module not loaded → modprobe succeeds → returns success
+# Uses a flag file to simulate lsmod seeing the module only after modprobe runs.
+# Avoids inline functions with hyphens in names (e.g., apt-get) which is fragile.
+MOCK_MODPROBE_FLAG="$(mktemp)"
+rm -f "${MOCK_MODPROBE_FLAG}"
+# lsmod reports the module only after modprobe has run (flag file exists)
+cat > "${MOCK_BIN_DIR}/lsmod" << EOF
+#!/bin/bash
+if [[ -f "${MOCK_MODPROBE_FLAG}" ]]; then
+	echo "amneziawg 12345 0"
+else
+	echo ""
+fi
+EOF
+chmod +x "${MOCK_BIN_DIR}/lsmod"
+# modprobe creates the flag file to signal success, then exits 0
+cat > "${MOCK_BIN_DIR}/modprobe" << EOF
+#!/bin/bash
+touch "${MOCK_MODPROBE_FLAG}"
+exit 0
+EOF
+chmod +x "${MOCK_BIN_DIR}/modprobe"
+_make_mock "find" 'echo "/lib/modules/6.8.0-110-generic/amneziawg.ko"'
+_make_mock "uname" 'echo "6.8.0-110-generic"'
+OUTPUT=$(
+	(
+		set +u +o pipefail
+		export PATH="${MOCK_BIN_DIR}:${PATH}"
+		OS="ubuntu"
+		SERVER_AWG_NIC="awg0"
+		enable_apt_ipv4() { :; }
+		disable_apt_ipv4() { :; }
+		ensureAmneziawgKernelModule
+	) 2>&1)
+RC=$?
+rm -f "${MOCK_MODPROBE_FLAG}"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && ! echo "${OUTPUT}" | grep -q "Attempting automatic repair"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureAmneziawgKernelModule should load via modprobe when .ko exists (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Test 3: module not loaded, no .ko → full repair path → modprobe succeeds → returns success
+OUTPUT=$(run_ensureModule \
+	'echo ""' \
+	'exit 0' \
+	'exit 0')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && echo "${OUTPUT}" | grep -q "Attempting automatic repair"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureAmneziawgKernelModule should attempt repair when module missing (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Test 4: full repair path → modprobe fails → exits with error
+OUTPUT=$(run_ensureModule \
+	'echo ""' \
+	'exit 1' \
+	'exit 0')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -ne 0 ]] && echo "${OUTPUT}" | grep -q "could not be loaded"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureAmneziawgKernelModule should exit with error when modprobe fails (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Test 5: repair path on ubuntu shows apt-based manual recovery
+OUTPUT=$(run_ensureModule \
+	'echo ""' \
+	'exit 1' \
+	'exit 0' \
+	'ubuntu')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "${OUTPUT}" | grep -q 'apt install'; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureAmneziawgKernelModule should show apt recovery on ubuntu (output: ${OUTPUT})"
+fi
+
+# Test 6: repair path on fedora shows dnf-based manual recovery
+OUTPUT=$(run_ensureModule \
+	'echo ""' \
+	'exit 1' \
+	'exit 0' \
+	'fedora')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "${OUTPUT}" | grep -q 'dnf install'; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureAmneziawgKernelModule should show dnf recovery on fedora (output: ${OUTPUT})"
+fi
+
+# Test 7: repair path attempts to start awg-quick when not running
+_make_mock "systemctl" '
+case "$1" in
+	is-active) exit 1;;
+	start)     exit 0;;
+	*)         exit 0;;
+esac
+'
+OUTPUT=$(run_ensureModule \
+	'echo ""' \
+	'exit 0' \
+	'exit 0' \
+	'ubuntu' \
+	'awg0')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && echo "${OUTPUT}" | grep -q "Starting awg-quick@awg0"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureAmneziawgKernelModule should start awg-quick when not running (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Reset systemctl mock to default
+_make_mock "systemctl" 'exit 0'
+
+# Test 8: module already loaded but service inactive → fast-path starts service
+_make_mock "systemctl" '
+case "$1" in
+	is-active) exit 1;;
+	start)     exit 0;;
+	*)         exit 0;;
+esac
+'
+OUTPUT=$(run_ensureModule \
+	'echo "amneziawg 12345 0"' \
+	'exit 1' \
+	'exit 0' \
+	'ubuntu' \
+	'awg0')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && echo "${OUTPUT}" | grep -q "Starting awg-quick@awg0"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureAmneziawgKernelModule should start awg-quick when module loaded but service inactive (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Reset systemctl mock to default
+_make_mock "systemctl" 'exit 0'
+
+rm -rf "${MOCK_BIN_DIR}"
+
 echo ""
 echo "=========================================="
 echo "Results: ${TESTS_PASSED}/${TESTS_RUN} passed, ${TESTS_FAILED} failed"

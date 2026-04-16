@@ -694,6 +694,192 @@ function initialCheck() {
 	checkOS
 }
 
+# Strip the deprecated REMAKE_INITRD directive from the amneziawg DKMS config
+# (newer DKMS versions print noisy warnings for it).
+function sanitizeAwgDkmsConf() {
+	local AWG_DKMS_CONF
+	for AWG_DKMS_CONF in /var/lib/dkms/amneziawg/*/source/dkms.conf; do
+		[[ -f "${AWG_DKMS_CONF}" ]] && sed -i '/^REMAKE_INITRD=/d' "${AWG_DKMS_CONF}"
+	done
+}
+
+# Install kernel headers for the running kernel so DKMS can compile the module.
+# $1 – kernel version string; defaults to the running kernel (uname -r).
+# For APT-based systems the caller must have already activated enable_apt_ipv4.
+function installKernelHeaders() {
+	local KERNEL_VER="${1:-$(uname -r)}"
+	if [[ "${OS}" == 'ubuntu' ]]; then
+		local HEADER_INSTALLED=0
+		local HEADER_CANDIDATES=("linux-headers-${KERNEL_VER}" "raspberrypi-kernel-headers" "linux-headers-generic")
+		local HDR_PKG
+		for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
+			if apt-get install -y "${HDR_PKG}"; then
+				HEADER_INSTALLED=1
+				break
+			else
+				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HDR_PKG}'. Trying next candidate...${NC}"
+			fi
+		done
+		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
+			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
+		fi
+	elif [[ "${OS}" == 'debian' ]]; then
+		local HEADER_INSTALLED=0
+		local HEADER_CANDIDATES=("linux-headers-${KERNEL_VER}" "raspberrypi-kernel-headers")
+		local DEB_ARCH
+		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) && HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
+		local HDR_PKG
+		for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
+			if apt-get install -y "${HDR_PKG}"; then
+				HEADER_INSTALLED=1
+				break
+			else
+				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HDR_PKG}'. Trying next candidate...${NC}"
+			fi
+		done
+		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
+			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
+		fi
+	elif [[ "${OS}" == 'fedora' ]] || [[ "${OS}" == 'centos' ]] || [[ "${OS}" == 'almalinux' ]] || [[ "${OS}" == 'rocky' ]]; then
+		if ! dnf install -y "kernel-devel-${KERNEL_VER}"; then
+			echo -e "${ORANGE}WARNING: Failed to install kernel-devel for the running kernel (${KERNEL_VER}). Attempting to install the latest kernel-devel instead.${NC}"
+			if ! dnf install -y kernel-devel; then
+				echo -e "${ORANGE}WARNING: Failed to install any kernel-devel package. Continuing without kernel headers; DKMS module builds may fail until headers are installed and the system is rebooted.${NC}"
+			fi
+		fi
+	fi
+}
+
+# Start awg-quick@${SERVER_AWG_NIC} when the service is inactive.
+# Called after any successful module-load path so the interface is available
+# for subsequent awg syncconf calls.  Exits with code 1 on failure.
+function ensureAwgQuickRunning() {
+	if [[ -n "${SERVER_AWG_NIC:-}" ]] && ! systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
+		echo -e "${ORANGE}Starting awg-quick@${SERVER_AWG_NIC} (was not running)...${NC}"
+		if ! systemctl start "awg-quick@${SERVER_AWG_NIC}"; then
+			echo -e "${RED}ERROR: Failed to start awg-quick@${SERVER_AWG_NIC}.${NC}"
+			echo -e "${ORANGE}Check service status with: systemctl status awg-quick@${SERVER_AWG_NIC}${NC}"
+			exit 1
+		fi
+		echo -e "${GREEN}awg-quick@${SERVER_AWG_NIC} started successfully.${NC}"
+	fi
+}
+
+# Ensure the amneziawg kernel module is built and loaded for the running kernel.
+#
+# After a kernel upgrade the DKMS module may still be built only for the old
+# kernel.  This function detects that situation and automatically:
+#   1. Installs the matching kernel headers (if missing)
+#   2. Runs dkms autoinstall for the current kernel
+#   3. Rebuilds the module dependency cache (depmod -a)
+#   4. Loads the module with modprobe
+#   5. Starts the awg-quick service if it was not already running
+#
+# If everything is already fine the function returns immediately (idempotent).
+# If repair fails, it prints diagnostic information and exits with code 1.
+function ensureAmneziawgKernelModule() {
+	local KERNEL_VER
+	KERNEL_VER="$(uname -r)"
+
+	# Fast-path: if the module is already loaded, ensure the VPN service is also
+	# running before returning.
+	if lsmod 2>/dev/null | grep -q '^amneziawg '; then
+		ensureAwgQuickRunning
+		return 0
+	fi
+
+	# If the module is already built for this kernel, try loading it before
+	# falling back to the full repair path.
+	if [ -n "$(find "/lib/modules/${KERNEL_VER}" -name 'amneziawg.ko*' -print -quit 2>/dev/null)" ]; then
+		if modprobe amneziawg 2>/dev/null && lsmod 2>/dev/null | grep -q '^amneziawg '; then
+			# Module loaded successfully; start the VPN service if it was not running.
+			ensureAwgQuickRunning
+			return 0
+		fi
+	fi
+
+	echo -e "${ORANGE}amneziawg kernel module is not built or loaded for kernel ${KERNEL_VER}.${NC}"
+	echo -e "${ORANGE}Attempting automatic repair...${NC}"
+
+	# Install missing kernel headers so DKMS can compile the module.
+	# installKernelHeaders() tries candidates in order and warns on failure.
+	if [[ "${OS}" == 'ubuntu' ]] || [[ "${OS}" == 'debian' ]]; then
+		local HEADERS_PKG="linux-headers-${KERNEL_VER}"
+		if ! dpkg-query -W -f='${Status}' "${HEADERS_PKG}" 2>/dev/null | grep -q 'install ok installed'; then
+			echo -e "${ORANGE}Kernel headers (${HEADERS_PKG}) are not installed. Installing...${NC}"
+			enable_apt_ipv4
+			installKernelHeaders "${KERNEL_VER}"
+			disable_apt_ipv4
+		fi
+	elif [[ "${OS}" == 'fedora' ]] || [[ "${OS}" == 'centos' ]] || [[ "${OS}" == 'almalinux' ]] || [[ "${OS}" == 'rocky' ]]; then
+		local HEADERS_PKG="kernel-devel-${KERNEL_VER}"
+		if ! rpm -q "${HEADERS_PKG}" &>/dev/null; then
+			echo -e "${ORANGE}Kernel headers (${HEADERS_PKG}) are not installed. Installing...${NC}"
+			enable_apt_ipv4
+			installKernelHeaders "${KERNEL_VER}"
+			disable_apt_ipv4
+		fi
+	fi
+
+	# Strip the deprecated REMAKE_INITRD directive to silence newer DKMS warnings
+	sanitizeAwgDkmsConf
+
+	# Build the module for the current kernel with DKMS.
+	# Even if this step reports failure we still attempt modprobe below: the
+	# actual success criterion is whether the .ko ends up loadable, and an
+	# earlier partial build can sometimes satisfy that.  modprobe is the
+	# definitive check and will produce a clear error if the build truly failed.
+	if command -v dkms &>/dev/null; then
+		echo -e "${ORANGE}Running: dkms autoinstall -k ${KERNEL_VER}${NC}"
+		if ! dkms autoinstall -k "${KERNEL_VER}"; then
+			echo -e "${ORANGE}WARNING: dkms autoinstall failed for kernel ${KERNEL_VER}.${NC}"
+			local DKMS_LOG
+			DKMS_LOG=$(find /var/lib/dkms/amneziawg -name 'make.log' -path "*${KERNEL_VER}*" 2>/dev/null | head -n 1)
+			if [[ -n "${DKMS_LOG}" ]]; then
+				echo -e "${ORANGE}Last 20 lines of DKMS build log (${DKMS_LOG}):${NC}"
+				tail -20 "${DKMS_LOG}"
+			else
+				echo -e "${ORANGE}Build log not found. Check /var/lib/dkms/amneziawg/ for details.${NC}"
+			fi
+		fi
+	else
+		echo -e "${ORANGE}WARNING: dkms is not installed. Cannot rebuild the kernel module.${NC}"
+	fi
+
+	# Rebuild the module dependency cache (required for DKMS + compressed modules)
+	if command -v depmod &>/dev/null; then
+		depmod -a
+	fi
+
+	# Attempt to load the module
+	if ! modprobe amneziawg; then
+		echo -e "${RED}ERROR: amneziawg kernel module could not be loaded for kernel ${KERNEL_VER}.${NC}"
+		echo -e "${ORANGE}The module is still not available in /lib/modules/${KERNEL_VER}/${NC}"
+		if [[ "${OS}" == 'ubuntu' ]] || [[ "${OS}" == 'debian' ]]; then
+			echo -e "${ORANGE}Manual recovery:${NC}"
+			echo -e "${ORANGE}  1. apt install -y \"linux-headers-${KERNEL_VER}\"${NC}"
+			echo -e "${ORANGE}  2. dkms autoinstall -k \"${KERNEL_VER}\" && depmod -a${NC}"
+			echo -e "${ORANGE}  3. modprobe amneziawg${NC}"
+			echo -e "${ORANGE}  4. systemctl start \"awg-quick@${SERVER_AWG_NIC:-awg0}\"${NC}"
+		elif [[ "${OS}" == 'fedora' ]] || [[ "${OS}" == 'centos' ]] || [[ "${OS}" == 'almalinux' ]] || [[ "${OS}" == 'rocky' ]]; then
+			echo -e "${ORANGE}Manual recovery:${NC}"
+			echo -e "${ORANGE}  1. dnf install -y \"kernel-devel-${KERNEL_VER}\"${NC}"
+			echo -e "${ORANGE}  2. dkms autoinstall -k \"${KERNEL_VER}\" && depmod -a${NC}"
+			echo -e "${ORANGE}  3. modprobe amneziawg${NC}"
+			echo -e "${ORANGE}  4. systemctl start \"awg-quick@${SERVER_AWG_NIC:-awg0}\"${NC}"
+		fi
+		exit 1
+	fi
+
+	echo -e "${GREEN}amneziawg module loaded successfully for kernel ${KERNEL_VER}.${NC}"
+
+	# The module was just loaded — start the VPN service if it was not running.
+	# After a kernel upgrade the service fails at boot because ExecStartPre
+	# (modprobe amneziawg) returns an error; now that the module is available
+	# we restart it so the awg interface exists for subsequent awg syncconf calls.
+	ensureAwgQuickRunning
+}
+
 function readJminAndJmax() {
 	SERVER_AWG_JMIN=0
 	SERVER_AWG_JMAX=0
@@ -1336,23 +1522,7 @@ function installAmneziaWG() {
 		add-apt-repository -y ppa:amnezia/ppa || { echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
 		apt-get update || { echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
-		# This is critical on Raspberry Pi / ARM where the default headers package
-		# (linux-headers-generic) may not match the actual raspi kernel flavour.
-		# Try several candidates in order: exact versioned headers, Raspberry Pi headers,
-		# then the generic meta package as a last resort.
-		local HEADER_INSTALLED=0
-		local HEADER_CANDIDATES=("linux-headers-$(uname -r)" "raspberrypi-kernel-headers" "linux-headers-generic")
-		for HEADER_PKG in "${HEADER_CANDIDATES[@]}"; do
-			if apt install -y "${HEADER_PKG}"; then
-				HEADER_INSTALLED=1
-				break
-			else
-				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HEADER_PKG}'. Trying next candidate...${NC}"
-			fi
-		done
-		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
-			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
-		fi
+		installKernelHeaders "$(uname -r)"
 		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
@@ -1449,63 +1619,27 @@ function installAmneziaWG() {
 		fi
 		apt-get update || { echo -e "${RED}ERROR: Failed to update package index.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
-		# Try several candidates in order: exact versioned headers, Raspberry Pi headers,
-		# then the Debian architecture-specific meta package (e.g. linux-headers-amd64)
-		# as a last resort. This avoids skipping headers when the exact versioned
-		# package isn't available in the local APT cache.
-		local HEADER_INSTALLED=0
-		local HEADER_CANDIDATES=("linux-headers-$(uname -r)" "raspberrypi-kernel-headers")
-		# Add the architecture-specific meta-package (e.g. linux-headers-amd64)
-		# as a last-resort fallback, but only if dpkg can report the arch.
-		local DEB_ARCH
-		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) && HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
-		local HEADER_ERR_FILE
-		HEADER_ERR_FILE=$(mktemp) || { echo -e "${RED}ERROR: Failed to create temporary file for apt errors.${NC}"; exit 1; }
-		for HEADER_PKG in "${HEADER_CANDIDATES[@]}"; do
-			: >"${HEADER_ERR_FILE}"
-			if apt-get install -y "${HEADER_PKG}" 2> >(tee "${HEADER_ERR_FILE}" >&2); then
-				HEADER_INSTALLED=1
-				break
-			else
-				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HEADER_PKG}'. Trying next candidate...${NC}"
-			fi
-		done
-		rm -f "${HEADER_ERR_FILE}"
-		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
-			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing installation, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
-		fi
+		installKernelHeaders "$(uname -r)"
 		apt-get install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
-		if ! dnf install -y "kernel-devel-$(uname -r)"; then
-			echo -e "${ORANGE}WARNING: Failed to install kernel-devel for the running kernel ($(uname -r)). Attempting to install the latest kernel-devel instead.${NC}"
-			if ! dnf install -y kernel-devel; then
-				echo -e "${ORANGE}WARNING: Failed to install any kernel-devel package. Continuing without kernel headers; DKMS module builds may fail until headers are installed and the system is rebooted.${NC}"
-			fi
-		fi
+		# Install kernel headers for the running kernel so DKMS can compile the module.
+		installKernelHeaders "$(uname -r)"
 		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'centos' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
-		if ! dnf install -y "kernel-devel-$(uname -r)"; then
-			echo -e "${ORANGE}WARNING: Failed to install kernel-devel for the running kernel ($(uname -r)). Attempting to install the latest kernel-devel instead.${NC}"
-			if ! dnf install -y kernel-devel; then
-				echo -e "${ORANGE}WARNING: Failed to install any kernel-devel package. Continuing without kernel headers; DKMS module builds may fail until headers are installed and the system is rebooted.${NC}"
-			fi
-		fi
+		# Install kernel headers for the running kernel so DKMS can compile the module.
+		installKernelHeaders "$(uname -r)"
 		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	fi
 	disable_apt_ipv4
 
-	# Strip the deprecated REMAKE_INITRD directive from the amneziawg DKMS config
-	# (newer DKMS versions print noisy warnings for it).
-	local AWG_DKMS_CONF
-	for AWG_DKMS_CONF in /var/lib/dkms/amneziawg/*/source/dkms.conf; do
-		[[ -f "${AWG_DKMS_CONF}" ]] && sed -i '/^REMAKE_INITRD=/d' "${AWG_DKMS_CONF}"
-	done
+	# Strip the deprecated REMAKE_INITRD directive from the amneziawg DKMS config.
+	sanitizeAwgDkmsConf
 
 	# Force DKMS to build the module for the running kernel only.
 	# Using "dkms autoinstall -k" avoids errors from stale kernel directories in
@@ -1722,6 +1856,7 @@ EOF
 }
 
 function newClient() {
+	ensureAmneziawgKernelModule
 	# Reset variables to ensure clean state for each new client
 	local CLIENT_NAME=""
 	local CLIENT_EXISTS=""
@@ -2077,6 +2212,7 @@ function revokeClient() {
 	removeFromWebPanelDir "${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# restart AmneziaWG to apply changes
+	ensureAmneziawgKernelModule
 	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
 }
 
@@ -2365,6 +2501,7 @@ EOF
 
 	# If any server-side peer keys were updated, sync the running config
 	if (( NEWKEYS > 0 )); then
+		ensureAmneziawgKernelModule
 		awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
 	fi
 
@@ -3287,6 +3424,9 @@ PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_AWG_IPV4}/32,${CLIENT_AWG_IPV6}/128" >>"${SERVER_AWG_CONF}"
 
+	# Preserve stdout for the generated client config path expected by callers.
+	# Route any informational/repair output from helper setup to stderr.
+	ensureAmneziawgKernelModule 1>&2
 	if ! awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>/tmp/amneziawg-syncconf.err; then
 		local sync_err
 		sync_err="$(cat /tmp/amneziawg-syncconf.err 2>/dev/null || true)"
@@ -3340,6 +3480,7 @@ function nonInteractiveRemoveClient() {
 
 	local sync_err
 	sync_err=""
+	ensureAmneziawgKernelModule >&2
 	if ! sync_err="$(awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>&1)"; then
 		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after removing client '${CLIENT_NAME}'" >&2
 		if [[ -n "${sync_err}" ]]; then
