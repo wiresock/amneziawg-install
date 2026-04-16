@@ -719,14 +719,17 @@ function ensureAmneziawgKernelModule() {
 	echo -e "${ORANGE}amneziawg kernel module is not built for kernel ${KERNEL_VER}.${NC}"
 	echo -e "${ORANGE}Attempting automatic repair...${NC}"
 
-	# Install missing kernel headers so DKMS can compile the module
+	# Install missing kernel headers so DKMS can compile the module.
+	# Candidates are tried in order: exact versioned headers, Raspberry Pi
+	# headers (ARM boards use a distro-managed package without a version suffix),
+	# then the generic meta-package as a last resort.
 	if [[ "${OS}" == 'ubuntu' ]] || [[ "${OS}" == 'debian' ]]; then
 		local HEADERS_PKG="linux-headers-${KERNEL_VER}"
 		if ! dpkg-query -W -f='${Status}' "${HEADERS_PKG}" 2>/dev/null | grep -q 'install ok installed'; then
 			echo -e "${ORANGE}Kernel headers (${HEADERS_PKG}) are not installed. Installing...${NC}"
 			enable_apt_ipv4
 			local HEADER_INSTALLED=0
-			for HDR_PKG in "${HEADERS_PKG}" "raspberrypi-kernel-headers"; do
+			for HDR_PKG in "${HEADERS_PKG}" "raspberrypi-kernel-headers" "linux-headers-generic"; do
 				if apt-get install -y "${HDR_PKG}"; then
 					HEADER_INSTALLED=1
 					break
@@ -753,7 +756,11 @@ function ensureAmneziawgKernelModule() {
 		[[ -f "${AWG_DKMS_CONF}" ]] && sed -i '/^REMAKE_INITRD=/d' "${AWG_DKMS_CONF}"
 	done
 
-	# Build the module for the current kernel with DKMS
+	# Build the module for the current kernel with DKMS.
+	# Even if this step reports failure we still attempt modprobe below: the
+	# actual success criterion is whether the .ko ends up loadable, and an
+	# earlier partial build can sometimes satisfy that.  modprobe is the
+	# definitive check and will produce a clear error if the build truly failed.
 	if command -v dkms &>/dev/null; then
 		echo -e "${ORANGE}Running: dkms autoinstall -k ${KERNEL_VER}${NC}"
 		if ! dkms autoinstall -k "${KERNEL_VER}"; then
