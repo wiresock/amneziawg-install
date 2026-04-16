@@ -582,14 +582,15 @@ chmod +x "${MOCK_BIN_DIR}/modprobe"
 _make_mock "find" 'echo "/lib/modules/6.8.0-110-generic/amneziawg.ko"'
 _make_mock "uname" 'echo "6.8.0-110-generic"'
 OUTPUT=$(
-	set +u
-	export PATH="${MOCK_BIN_DIR}:${PATH}"
-	OS="ubuntu"
-	SERVER_AWG_NIC="awg0"
-	enable_apt_ipv4() { :; }
-	disable_apt_ipv4() { :; }
-	ensureAmneziawgKernelModule
-) 2>&1
+	(
+		set +u +o pipefail
+		export PATH="${MOCK_BIN_DIR}:${PATH}"
+		OS="ubuntu"
+		SERVER_AWG_NIC="awg0"
+		enable_apt_ipv4() { :; }
+		disable_apt_ipv4() { :; }
+		ensureAmneziawgKernelModule
+	) 2>&1)
 RC=$?
 rm -f "${MOCK_MODPROBE_FLAG}"
 TESTS_RUN=$((TESTS_RUN + 1))

@@ -831,7 +831,7 @@ function ensureAmneziawgKernelModule() {
 	# Attempt to load the module
 	if ! modprobe amneziawg; then
 		echo -e "${RED}ERROR: amneziawg kernel module could not be loaded for kernel ${KERNEL_VER}.${NC}"
-		echo -e "${ORANGE}The module is still not available in /lib/modules/${KERNEL_VER}/.${NC}"
+		echo -e "${ORANGE}The module is still not available in /lib/modules/${KERNEL_VER}/${NC}"
 		if [[ "${OS}" == 'ubuntu' ]] || [[ "${OS}" == 'debian' ]]; then
 			echo -e "${ORANGE}Manual recovery:${NC}"
 			echo -e "${ORANGE}  1. apt install -y \"linux-headers-${KERNEL_VER}\"${NC}"
