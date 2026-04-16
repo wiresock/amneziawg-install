@@ -532,7 +532,7 @@ run_ensureModule() {
 	_make_mock "uname" 'echo "6.8.0-110-generic"'
 
 	(
-		set +u
+		set +u +o pipefail
 		export PATH="${MOCK_BIN_DIR}:${PATH}"
 		OS="${TEST_OS}"
 		SERVER_AWG_NIC="${TEST_NIC}"

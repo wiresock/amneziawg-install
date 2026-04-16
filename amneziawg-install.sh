@@ -694,6 +694,21 @@ function initialCheck() {
 	checkOS
 }
 
+# Start awg-quick@${SERVER_AWG_NIC} when the service is inactive.
+# Called after any successful module-load path so the interface is available
+# for subsequent awg syncconf calls.  Exits with code 1 on failure.
+function ensureAwgQuickRunning() {
+	if [[ -n "${SERVER_AWG_NIC:-}" ]] && ! systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
+		echo -e "${ORANGE}Starting awg-quick@${SERVER_AWG_NIC} (was not running)...${NC}"
+		if ! systemctl start "awg-quick@${SERVER_AWG_NIC}"; then
+			echo -e "${RED}ERROR: Failed to start awg-quick@${SERVER_AWG_NIC}.${NC}"
+			echo -e "${ORANGE}Check service status with: systemctl status awg-quick@${SERVER_AWG_NIC}${NC}"
+			exit 1
+		fi
+		echo -e "${GREEN}awg-quick@${SERVER_AWG_NIC} started successfully.${NC}"
+	fi
+}
+
 # Ensure the amneziawg kernel module is built and loaded for the running kernel.
 #
 # After a kernel upgrade the DKMS module may still be built only for the old
@@ -713,15 +728,7 @@ function ensureAmneziawgKernelModule() {
 	# Fast-path: if the module is already loaded, ensure the VPN service is also
 	# running before returning.
 	if lsmod 2>/dev/null | grep -q '^amneziawg '; then
-		if [[ -n "${SERVER_AWG_NIC:-}" ]] && ! systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
-			echo -e "${ORANGE}Starting awg-quick@${SERVER_AWG_NIC} (was not running)...${NC}"
-			if ! systemctl start "awg-quick@${SERVER_AWG_NIC}"; then
-				echo -e "${RED}ERROR: Failed to start awg-quick@${SERVER_AWG_NIC}.${NC}"
-				echo -e "${ORANGE}Check service status with: systemctl status awg-quick@${SERVER_AWG_NIC}${NC}"
-				exit 1
-			fi
-			echo -e "${GREEN}awg-quick@${SERVER_AWG_NIC} started successfully.${NC}"
-		fi
+		ensureAwgQuickRunning
 		return 0
 	fi
 
@@ -730,15 +737,7 @@ function ensureAmneziawgKernelModule() {
 	if [ -n "$(find "/lib/modules/${KERNEL_VER}" -name 'amneziawg.ko*' -print -quit 2>/dev/null)" ]; then
 		if modprobe amneziawg 2>/dev/null && lsmod 2>/dev/null | grep -q '^amneziawg '; then
 			# Module loaded successfully; start the VPN service if it was not running.
-			if [[ -n "${SERVER_AWG_NIC:-}" ]] && ! systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
-				echo -e "${ORANGE}Starting awg-quick@${SERVER_AWG_NIC} (was not running)...${NC}"
-				if ! systemctl start "awg-quick@${SERVER_AWG_NIC}"; then
-					echo -e "${RED}ERROR: Failed to start awg-quick@${SERVER_AWG_NIC}.${NC}"
-					echo -e "${ORANGE}Check service status with: systemctl status awg-quick@${SERVER_AWG_NIC}${NC}"
-					exit 1
-				fi
-				echo -e "${GREEN}awg-quick@${SERVER_AWG_NIC} started successfully.${NC}"
-			fi
+			ensureAwgQuickRunning
 			return 0
 		fi
 	fi
@@ -855,15 +854,7 @@ function ensureAmneziawgKernelModule() {
 	# After a kernel upgrade the service fails at boot because ExecStartPre
 	# (modprobe amneziawg) returns an error; now that the module is available
 	# we restart it so the awg interface exists for subsequent awg syncconf calls.
-	if [[ -n "${SERVER_AWG_NIC:-}" ]] && ! systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
-		echo -e "${ORANGE}Starting awg-quick@${SERVER_AWG_NIC} (was not running)...${NC}"
-		if ! systemctl start "awg-quick@${SERVER_AWG_NIC}"; then
-			echo -e "${RED}ERROR: Failed to start awg-quick@${SERVER_AWG_NIC}.${NC}"
-			echo -e "${ORANGE}Check service status with: systemctl status awg-quick@${SERVER_AWG_NIC}${NC}"
-			exit 1
-		fi
-		echo -e "${GREEN}awg-quick@${SERVER_AWG_NIC} started successfully.${NC}"
-	fi
+	ensureAwgQuickRunning
 }
 
 function readJminAndJmax() {
