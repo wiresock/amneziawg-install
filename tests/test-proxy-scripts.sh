@@ -152,7 +152,12 @@ assert_rc 1 safe_rm_dir "/etc/" "/etc/"
 assert_rc 1 safe_rm_dir "/var/lib/amneziawg-proxy" "/etc/"
 
 # Valid path under expected prefix (directory not present → no-op, exit 0)
-assert_rc 0 safe_rm_dir "/var/lib/amneziawg-proxy" "/var/lib/"
+TMPPREFIX_ROOT="$(mktemp -d)"
+TMPPREFIX="${TMPPREFIX_ROOT}/var/lib/"
+TMPPATH="${TMPPREFIX}amneziawg-proxy"
+mkdir -p "${TMPPREFIX}"
+assert_rc 0 safe_rm_dir "${TMPPATH}" "${TMPPREFIX}"
+rm -rf "${TMPPREFIX_ROOT}"
 
 # Symlink → die
 TMPLINK_DIR="$(mktemp -d)"

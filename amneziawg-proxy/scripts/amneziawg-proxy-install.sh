@@ -358,7 +358,7 @@ detect_awg_config() {
     if [[ -z "${LISTEN_PORT}" ]] && [[ -f "${AWG_CONF_FILE}" ]]; then
         local conf_port
         conf_port="$(grep -i '^[[:space:]]*ListenPort[[:space:]]*=' "${AWG_CONF_FILE}" \
-                    | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]')"
+                    | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]' || true)"
         if [[ -n "${conf_port}" ]]; then
             LISTEN_PORT="${conf_port}"
             info "Detected AWG listen port from config: ${LISTEN_PORT}"
