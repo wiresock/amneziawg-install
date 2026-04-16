@@ -431,55 +431,128 @@ assert_rc 1 run_validate_config "dns" "false" "true" "localhost:53"
 assert_rc 1 run_validate_config "dns" "false" "true" "not-a-host"
 assert_rc 0 run_validate_config "dns" "false" "true" "[::1]:53"
 
+# ── Helper: call non_interactive_validate in a sourced subshell ───────────────
+#
+# run_niv_with VAR_NAME VAR_VALUE [VAR2 VAL2 ...]
+#   Sources the installer, sets sane defaults, then overrides specific
+#   variables by name using printf -v (avoids eval/quoting issues with
+#   special characters in values). Calls non_interactive_validate().
+#   Returns its exit code; stderr is captured by the caller.
+run_niv_with() {
+    # Build a bash -c script that accepts var-name/value pairs as positional
+    # arguments beyond the script name, using printf -v for safe assignment.
+    local _script
+    _script='
+        set -uo pipefail
+        source "${INSTALL_SCRIPT}"
+
+        # Sane defaults that satisfy all other checks.
+        NON_INTERACTIVE="true"
+        LISTEN_PORT="51820"
+        BACKEND_PORT="51821"
+        LISTEN_HOST="127.0.0.1"
+        BACKEND_HOST="127.0.0.1"
+        PROTOCOL="sip"
+        SESSION_TTL="60"
+        RATE_LIMIT="10"
+        QUIC_HANDSHAKE_ENABLED="false"
+        QUIC_DOMAIN=""
+        DNS_FORWARD_ENABLED="false"
+        DNS_UPSTREAM=""
+        INSTALL_DIR="/usr/local/bin"
+        CONFIG_FILE="/etc/amneziawg-proxy/proxy.toml"
+        DATA_DIR="/var/lib/amneziawg-proxy"
+        AWG_DIR="/etc/amnezia/awg"
+
+        # Apply caller-supplied var=value pairs (positional args after "_").
+        # In bash -c "script" name arg1 arg2 ..., $0=name, $1=arg1, $2=arg2.
+        # So $1/$2 are already the first VAR_NAME/VAR_VALUE pair.
+        while [[ $# -ge 2 ]]; do
+            printf -v "$1" "%s" "$2"
+            shift 2
+        done
+
+        non_interactive_validate
+        validate_config
+    '
+    INSTALL_SCRIPT="${INSTALL_SCRIPT}" bash -c "${_script}" _ "$@" 2>&1
+}
+
+# assert_niv_rejects VAR_NAME VAR_VALUE description
+#   Asserts that run_niv_with with the given override rejects with exit code 1
+#   AND that stderr contains "must not contain".
+assert_niv_rejects() {
+    local var_name="$1"
+    local var_value="$2"
+    local description="$3"
+    shift 3
+    # Any additional VAR VALUE pairs are prepended to the positional list.
+    local _output _rc _has_msg=0
+    _output=$(run_niv_with "${var_name}" "${var_value}" "$@") && _rc=0 || _rc=$?
+    echo "${_output}" | grep -qF 'must not contain' && _has_msg=1
+
+    assert_eq "1" "${_rc}"      "${description}: exit code 1"
+    assert_eq "1" "${_has_msg}" "${description}: 'must not contain' in stderr"
+}
+
+# assert_niv_rc EXPECTED_RC VAR_NAME VAR_VALUE description [extra pairs...]
+#   Asserts that run_niv_with exits with the expected return code.
+assert_niv_rc() {
+    local expected_rc="$1"
+    local var_name="$2"
+    local var_value="$3"
+    local description="$4"
+    shift 4
+    local _rc
+    run_niv_with "${var_name}" "${var_value}" "$@" >/dev/null && _rc=0 || _rc=$?
+    assert_eq "${expected_rc}" "${_rc}" "${description}: exit code ${expected_rc}"
+}
+
+# assert_niv_accepts VAR_NAME VAR_VALUE description
+#   Asserts that run_niv_with accepts the given override (rc 0).
+assert_niv_accepts() {
+    local var_name="$1"
+    local var_value="$2"
+    local description="$3"
+    shift 3
+    local _rc
+    run_niv_with "${var_name}" "${var_value}" "$@" >/dev/null && _rc=0 || _rc=$?
+    assert_eq "0" "${_rc}" "${description}: exit code 0"
+}
+
 # ── AWG_DIR TOML-unsafe rejection ─────────────────────────────────────────────
 
 echo "=== AWG_DIR TOML-unsafe rejection ==="
-# AWG_DIR with quotes should be rejected
-assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
-    --awg-dir '/etc/amnezia/"awg'
-# AWG_DIR with backslash should be rejected
-assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
-    --awg-dir '/etc/amnezia/awg\dir'
+assert_niv_rejects "AWG_DIR" '/etc/amnezia/"awg'      "AWG_DIR with quotes"
+assert_niv_rejects "AWG_DIR" '/etc/amnezia/awg\dir'   "AWG_DIR with backslash"
 
 # ── Path option quote/backslash rejection ─────────────────────────────────────
 
 echo "=== Path option quote/backslash rejection ==="
-# --install-dir with quote should be rejected
-assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
-    --install-dir '/usr/local/"bin'
-# --install-dir with backslash should be rejected
-assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
-    --install-dir '/usr/local/bi\n'
-# --config-file with quote should be rejected
-assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
-    --config-file '/etc/proxy/"proxy.toml'
-# --data-dir with backslash should be rejected
-assert_rc 1 bash "${INSTALL_SCRIPT}" --non-interactive --listen-port 51820 \
-    --data-dir '/var/lib/proxy\data'
+assert_niv_rejects "INSTALL_DIR" '/usr/local/"bin'          "--install-dir with quote"
+assert_niv_rejects "INSTALL_DIR" '/usr/local/bi\n'          "--install-dir with backslash"
+assert_niv_rejects "CONFIG_FILE" '/etc/proxy/"proxy.toml'   "--config-file with quote"
+assert_niv_rejects "DATA_DIR"    '/var/lib/proxy\data'      "--data-dir with backslash"
 
 # ── Conditional TOML emission (quic_certificate_domain / dns_upstream) ────────
 
 echo "=== Conditional TOML emission ==="
 # --quic-domain with TOML-unsafe chars should NOT cause failure when
-# QUIC handshake is disabled (field not emitted into proxy.toml).
-# The installer will fail at preflight (not root) before file I/O, which is
-# expected — we just verify it does NOT die with a TOML-unsafe-chars error.
-_quic_domain_disabled_output=$(bash "${INSTALL_SCRIPT}" --non-interactive \
-    --listen-port 51820 --quic-domain 'bad"domain' 2>&1 || true)
-_quic_domain_has_toml_err=0
-echo "${_quic_domain_disabled_output}" | grep -qiE 'quic.*domain.*quotes|quic.*domain.*toml' \
-    && _quic_domain_has_toml_err=1
-assert_eq "0" "${_quic_domain_has_toml_err}" \
-    "--quic-domain TOML-unsafe chars accepted when QUIC handshake disabled"
+# QUIC handshake is disabled (field is not validated in that case).
+assert_niv_accepts "QUIC_DOMAIN" 'bad"domain' \
+    "--quic-domain TOML-unsafe accepted when QUIC handshake disabled"
+# --quic-domain with TOML-unsafe chars SHOULD be rejected when QUIC handshake enabled.
+assert_niv_rejects "QUIC_DOMAIN" 'bad"domain' \
+    "--quic-domain TOML-unsafe rejected when QUIC handshake enabled" \
+    "QUIC_HANDSHAKE_ENABLED" "true" "PROTOCOL" "quic"
 
-# Same for --dns-upstream with invalid value when DNS forwarding is disabled
-_dns_upstream_disabled_output=$(bash "${INSTALL_SCRIPT}" --non-interactive \
-    --listen-port 51820 --dns-upstream 'not-valid' 2>&1 || true)
-_dns_upstream_has_err=0
-echo "${_dns_upstream_disabled_output}" | grep -qiE 'dns.*upstream.*host|dns.*upstream.*ip' \
-    && _dns_upstream_has_err=1
-assert_eq "0" "${_dns_upstream_has_err}" \
+# --dns-upstream with invalid value should NOT cause failure when DNS forwarding is disabled.
+assert_niv_accepts "DNS_UPSTREAM" 'not-valid' \
     "--dns-upstream invalid value accepted when DNS forwarding disabled"
+# --dns-upstream with invalid value SHOULD be rejected when DNS forwarding enabled.
+assert_niv_rc 1 "DNS_UPSTREAM" 'not-valid' \
+    "--dns-upstream invalid value rejected when DNS forwarding enabled" \
+    "DNS_FORWARD_ENABLED" "true" "PROTOCOL" "dns"
 
 # ── --help exits 0 ────────────────────────────────────────────────────────────
 

@@ -814,6 +814,10 @@ EOF
             warn "Binary install directory must not contain '.' or '..' path components."
             continue
         fi
+        if _has_toml_unsafe_chars "${INSTALL_DIR}"; then
+            warn "Binary install directory must not contain '\"' or '\\' characters."
+            continue
+        fi
         break
     done
     while true; do
@@ -832,6 +836,10 @@ EOF
         fi
         if _path_has_dot_components "${CONFIG_FILE}"; then
             warn "Proxy config file path must not contain '.' or '..' path components."
+            continue
+        fi
+        if _has_toml_unsafe_chars "${CONFIG_FILE}"; then
+            warn "Proxy config file path must not contain '\"' or '\\' characters."
             continue
         fi
         break
@@ -853,6 +861,10 @@ EOF
         fi
         if _path_has_dot_components "${DATA_DIR}"; then
             warn "Service working directory must not contain '.' or '..' path components."
+            continue
+        fi
+        if _has_toml_unsafe_chars "${DATA_DIR}"; then
+            warn "Service working directory must not contain '\"' or '\\' characters."
             continue
         fi
         break
