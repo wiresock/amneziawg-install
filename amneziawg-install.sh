@@ -2188,7 +2188,6 @@ function listClients() {
 }
 
 function revokeClient() {
-	ensureAmneziawgKernelModule
 	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${SERVER_AWG_CONF}")
 	if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
 		echo ""
@@ -2231,11 +2230,11 @@ function revokeClient() {
 	removeFromWebPanelDir "${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# restart AmneziaWG to apply changes
+	ensureAmneziawgKernelModule
 	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
 }
 
 function regenerateClients() {
-	ensureAmneziawgKernelModule
 	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${SERVER_AWG_CONF}")
 	if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
 		echo ""
@@ -2520,6 +2519,7 @@ EOF
 
 	# If any server-side peer keys were updated, sync the running config
 	if (( NEWKEYS > 0 )); then
+		ensureAmneziawgKernelModule
 		awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
 	fi
 
