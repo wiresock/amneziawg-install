@@ -3,8 +3,10 @@
 #
 # Tests helper functions by sourcing the real install/uninstall scripts in
 # isolated subshells, so regressions in the actual implementations are caught.
-# Covers: is_positive_integer, escape_sed_replacement, safe_rm_dir safety
-# guards, and --purge-config / --purge-data path restrictions.
+# Covers: is_positive_integer, escape_sed_replacement, _is_valid_ip_literal,
+# _format_host_for_socketaddr, validate_config, extract_endpoint_port,
+# read_proxy_config_ports, safe_rm_dir safety guards, and --purge-config /
+# --purge-data path restrictions.
 #
 # Usage: bash tests/test-proxy-scripts.sh
 
@@ -525,14 +527,17 @@ assert_niv_accepts() {
 echo "=== AWG_DIR TOML-unsafe rejection ==="
 assert_niv_rejects "AWG_DIR" '/etc/amnezia/"awg'      "AWG_DIR with quotes"
 assert_niv_rejects "AWG_DIR" '/etc/amnezia/awg\dir'   "AWG_DIR with backslash"
+assert_niv_rejects "AWG_DIR" '/etc/amnezia/%awg'      "AWG_DIR with percent"
 
 # ── Path option quote/backslash rejection ─────────────────────────────────────
 
-echo "=== Path option quote/backslash rejection ==="
+echo "=== Path option quote/backslash/percent rejection ==="
 assert_niv_rejects "INSTALL_DIR" '/usr/local/"bin'          "--install-dir with quote"
 assert_niv_rejects "INSTALL_DIR" '/usr/local/bi\n'          "--install-dir with backslash"
+assert_niv_rejects "INSTALL_DIR" '/usr/local/%hbin'         "--install-dir with percent"
 assert_niv_rejects "CONFIG_FILE" '/etc/proxy/"proxy.toml'   "--config-file with quote"
 assert_niv_rejects "DATA_DIR"    '/var/lib/proxy\data'      "--data-dir with backslash"
+assert_niv_rejects "DATA_DIR"    '/var/lib/%proxy'          "--data-dir with percent"
 
 # ── Conditional TOML emission (quic_certificate_domain / dns_upstream) ────────
 

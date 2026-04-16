@@ -818,6 +818,10 @@ EOF
             warn "Binary install directory must not contain '\"' or '\\' characters."
             continue
         fi
+        if [[ "${INSTALL_DIR}" == *%* ]]; then
+            warn "Binary install directory must not contain '%' characters (breaks systemd unit specifier expansion)."
+            continue
+        fi
         break
     done
     while true; do
@@ -840,6 +844,10 @@ EOF
         fi
         if _has_toml_unsafe_chars "${CONFIG_FILE}"; then
             warn "Proxy config file path must not contain '\"' or '\\' characters."
+            continue
+        fi
+        if [[ "${CONFIG_FILE}" == *%* ]]; then
+            warn "Proxy config file path must not contain '%' characters (breaks systemd unit specifier expansion)."
             continue
         fi
         break
@@ -865,6 +873,10 @@ EOF
         fi
         if _has_toml_unsafe_chars "${DATA_DIR}"; then
             warn "Service working directory must not contain '\"' or '\\' characters."
+            continue
+        fi
+        if [[ "${DATA_DIR}" == *%* ]]; then
+            warn "Service working directory must not contain '%' characters (breaks systemd unit specifier expansion)."
             continue
         fi
         break
@@ -1117,8 +1129,8 @@ Re-run with: --listen-port <port>"
         if _path_has_dot_components "${path_val}"; then
             die "${flag_name} must not contain '.' or '..' path components (got: '${path_val}')."
         fi
-        if [[ "${path_val}" == *'"'* || "${path_val}" == *\\* ]]; then
-            die "${flag_name} must not contain '\"' or '\\' characters (they break systemd unit and sed substitution)."
+        if [[ "${path_val}" == *'"'* || "${path_val}" == *\\* || "${path_val}" == *%* ]]; then
+            die "${flag_name} must not contain '\"', '\\', or '%' characters (they break systemd unit parsing/specifiers and sed substitution)."
         fi
     done
 }
