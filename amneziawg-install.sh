@@ -729,8 +729,8 @@ function ensureAmneziawgKernelModule() {
 	# Install missing kernel headers so DKMS can compile the module.
 	# Candidates are tried in order: exact versioned headers, Raspberry Pi
 	# headers (ARM boards use a distro-managed package without a version suffix),
-	# then the architecture-specific meta-package (e.g. linux-headers-amd64 on
-	# Debian, linux-headers-generic on Ubuntu) as a last resort.
+	# then a distro-appropriate meta-package (linux-headers-generic on Ubuntu,
+	# linux-headers-<arch> on Debian) as a last resort.
 	if [[ "${OS}" == 'ubuntu' ]] || [[ "${OS}" == 'debian' ]]; then
 		local HEADERS_PKG="linux-headers-${KERNEL_VER}"
 		if ! dpkg-query -W -f='${Status}' "${HEADERS_PKG}" 2>/dev/null | grep -q 'install ok installed'; then
@@ -738,12 +738,16 @@ function ensureAmneziawgKernelModule() {
 			enable_apt_ipv4
 			local HEADER_INSTALLED=0
 			local HEADER_CANDIDATES=("${HEADERS_PKG}" "raspberrypi-kernel-headers")
-			# Add the architecture-specific meta-package (e.g. linux-headers-amd64)
-			# as a last-resort fallback, but only if dpkg can report the arch.
-			local DEB_ARCH=""
-			DEB_ARCH="$(dpkg --print-architecture 2>/dev/null)" || DEB_ARCH=""
-			if [[ -n "${DEB_ARCH}" ]]; then
-				HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
+			# Add a distro-appropriate meta-package as a last-resort fallback:
+			# Ubuntu uses linux-headers-generic; Debian uses linux-headers-${DEB_ARCH}.
+			if [[ "${OS}" == 'ubuntu' ]]; then
+				HEADER_CANDIDATES+=("linux-headers-generic")
+			elif [[ "${OS}" == 'debian' ]]; then
+				local DEB_ARCH=""
+				DEB_ARCH="$(dpkg --print-architecture 2>/dev/null)" || DEB_ARCH=""
+				if [[ -n "${DEB_ARCH}" ]]; then
+					HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
+				fi
 			fi
 			local HDR_PKG
 			for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
@@ -797,7 +801,7 @@ function ensureAmneziawgKernelModule() {
 			fi
 		fi
 	else
-		echo -e "${RED}ERROR: dkms is not installed. Cannot rebuild the kernel module.${NC}"
+		echo -e "${ORANGE}WARNING: dkms is not installed. Cannot rebuild the kernel module.${NC}"
 	fi
 
 	# Rebuild the module dependency cache (required for DKMS + compressed modules)

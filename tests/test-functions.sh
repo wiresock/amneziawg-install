@@ -521,7 +521,7 @@ _make_mock "tail" 'exit 0'
 run_ensureModule() {
 	local LSMOD_BODY="$1"
 	local MODPROBE_BODY="$2"
-	local FIND_BODY="${3:-echo}"
+	local FIND_BODY="${3:-exit 0}"
 	local TEST_OS="${4:-ubuntu}"
 	local TEST_NIC="${5:-awg0}"
 
@@ -547,7 +547,7 @@ run_ensureModule() {
 OUTPUT=$(run_ensureModule \
 	'echo "amneziawg 12345 0"' \
 	'exit 1' \
-	'echo')
+	'exit 0')
 RC=$?
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ ${RC} -eq 0 ]] && ! echo "${OUTPUT}" | grep -q "not built"; then
@@ -601,7 +601,7 @@ fi
 OUTPUT=$(run_ensureModule \
 	'echo ""' \
 	'exit 0' \
-	'echo')
+	'exit 0')
 RC=$?
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ ${RC} -eq 0 ]] && echo "${OUTPUT}" | grep -q "Attempting automatic repair"; then
@@ -615,7 +615,7 @@ fi
 OUTPUT=$(run_ensureModule \
 	'echo ""' \
 	'exit 1' \
-	'echo')
+	'exit 0')
 RC=$?
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ ${RC} -ne 0 ]] && echo "${OUTPUT}" | grep -q "could not be loaded"; then
@@ -629,7 +629,7 @@ fi
 OUTPUT=$(run_ensureModule \
 	'echo ""' \
 	'exit 1' \
-	'echo' \
+	'exit 0' \
 	'ubuntu')
 RC=$?
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -644,7 +644,7 @@ fi
 OUTPUT=$(run_ensureModule \
 	'echo ""' \
 	'exit 1' \
-	'echo' \
+	'exit 0' \
 	'fedora')
 RC=$?
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -666,7 +666,7 @@ esac
 OUTPUT=$(run_ensureModule \
 	'echo ""' \
 	'exit 0' \
-	'echo' \
+	'exit 0' \
 	'ubuntu' \
 	'awg0')
 RC=$?
