@@ -532,7 +532,7 @@ echo "=== Path option quote/backslash rejection ==="
 assert_niv_rejects "INSTALL_DIR" '/usr/local/"bin'          "--install-dir with quote"
 assert_niv_rejects "INSTALL_DIR" '/usr/local/bi\n'          "--install-dir with backslash"
 assert_niv_rejects "CONFIG_FILE" '/etc/proxy/"proxy.toml'   "--config-file with quote"
-assert_niv_rejects "DATA_DIR"    '/var/lib/proxy\data'       "--data-dir with backslash"
+assert_niv_rejects "DATA_DIR"    '/var/lib/proxy\data'      "--data-dir with backslash"
 
 # ── Conditional TOML emission (quic_certificate_domain / dns_upstream) ────────
 
