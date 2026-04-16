@@ -24,7 +24,7 @@ function assert_rc() {
     local expected_rc="$1"
     shift
     local actual_rc=0
-    ( "$@" ) 2>/dev/null || actual_rc=$?
+    ( "$@" ) >/dev/null 2>&1 || actual_rc=$?
     local msg="$*"
     TESTS_RUN=$((TESTS_RUN + 1))
     if [[ "${expected_rc}" == "${actual_rc}" ]]; then
@@ -442,7 +442,7 @@ echo "=== Conditional TOML emission ==="
 _quic_domain_disabled_output=$(bash "${INSTALL_SCRIPT}" --non-interactive \
     --listen-port 51820 --quic-domain 'bad"domain' 2>&1 || true)
 _quic_domain_has_toml_err=0
-echo "${_quic_domain_disabled_output}" | grep -qi 'quic.*domain.*quotes\|quic.*domain.*toml' \
+echo "${_quic_domain_disabled_output}" | grep -qiE 'quic.*domain.*quotes|quic.*domain.*toml' \
     && _quic_domain_has_toml_err=1
 assert_eq "0" "${_quic_domain_has_toml_err}" \
     "--quic-domain TOML-unsafe chars accepted when QUIC handshake disabled"
@@ -451,7 +451,7 @@ assert_eq "0" "${_quic_domain_has_toml_err}" \
 _dns_upstream_disabled_output=$(bash "${INSTALL_SCRIPT}" --non-interactive \
     --listen-port 51820 --dns-upstream 'not-valid' 2>&1 || true)
 _dns_upstream_has_err=0
-echo "${_dns_upstream_disabled_output}" | grep -qi 'dns.*upstream.*host\|dns.*upstream.*ip' \
+echo "${_dns_upstream_disabled_output}" | grep -qiE 'dns.*upstream.*host|dns.*upstream.*ip' \
     && _dns_upstream_has_err=1
 assert_eq "0" "${_dns_upstream_has_err}" \
     "--dns-upstream invalid value accepted when DNS forwarding disabled"
