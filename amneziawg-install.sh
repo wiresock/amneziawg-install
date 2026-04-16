@@ -710,8 +710,18 @@ function ensureAmneziawgKernelModule() {
 	local KERNEL_VER
 	KERNEL_VER="$(uname -r)"
 
-	# Fast-path: return immediately only if the module is already loaded.
+	# Fast-path: if the module is already loaded, ensure the VPN service is also
+	# running before returning.
 	if lsmod 2>/dev/null | grep -q '^amneziawg '; then
+		if [[ -n "${SERVER_AWG_NIC:-}" ]] && ! systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
+			echo -e "${ORANGE}Starting awg-quick@${SERVER_AWG_NIC} (was not running)...${NC}"
+			if ! systemctl start "awg-quick@${SERVER_AWG_NIC}"; then
+				echo -e "${RED}ERROR: Failed to start awg-quick@${SERVER_AWG_NIC}.${NC}"
+				echo -e "${ORANGE}Check service status with: systemctl status awg-quick@${SERVER_AWG_NIC}${NC}"
+				exit 1
+			fi
+			echo -e "${GREEN}awg-quick@${SERVER_AWG_NIC} started successfully.${NC}"
+		fi
 		return 0
 	fi
 

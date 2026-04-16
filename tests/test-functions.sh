@@ -684,6 +684,32 @@ fi
 # Reset systemctl mock to default
 _make_mock "systemctl" 'exit 0'
 
+# Test 8: module already loaded but service inactive → fast-path starts service
+_make_mock "systemctl" '
+case "$1" in
+	is-active) exit 1;;
+	start)     exit 0;;
+	*)         exit 0;;
+esac
+'
+OUTPUT=$(run_ensureModule \
+	'echo "amneziawg 12345 0"' \
+	'exit 1' \
+	'exit 0' \
+	'ubuntu' \
+	'awg0')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && echo "${OUTPUT}" | grep -q "Starting awg-quick@awg0"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ensureAmneziawgKernelModule should start awg-quick when module loaded but service inactive (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Reset systemctl mock to default
+_make_mock "systemctl" 'exit 0'
+
 rm -rf "${MOCK_BIN_DIR}"
 
 echo ""
