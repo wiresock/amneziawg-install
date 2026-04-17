@@ -101,7 +101,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 INSTALL_DIR="$2"; shift 2 ;;
             --config-file)
                 [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
-                CONFIG_FILE="$2"; CONFIG_DIR="$(dirname "${CONFIG_FILE}")"; shift 2 ;;
+                [[ "$2" != */ ]] || die "--config-file must be a file path, not a directory-style path ending with '/': $2"
+                CONFIG_FILE="$2"; CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"; shift 2 ;;
             --data-dir)
                 [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
                 DATA_DIR="$2"; shift 2 ;;

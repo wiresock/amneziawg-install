@@ -196,7 +196,16 @@ parse_args() {
                 INSTALL_DIR="$2"; shift 2 ;;
             --config-file)
                 [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
-                CONFIG_FILE="$2"
+                RAW_CONFIG_FILE="$2"
+                CONFIG_FILE="${RAW_CONFIG_FILE%/}"
+                if [[ -z "${CONFIG_FILE}" || "${RAW_CONFIG_FILE}" != "${CONFIG_FILE}" ]]; then
+                    error "--config-file must be a file path, not a directory: ${RAW_CONFIG_FILE}"
+                    usage; exit 1
+                fi
+                if [[ -d "${CONFIG_FILE}" ]]; then
+                    error "--config-file must not point to an existing directory: ${CONFIG_FILE}"
+                    usage; exit 1
+                fi
                 CONFIG_DIR="$(dirname "${CONFIG_FILE}")"
                 shift 2 ;;
             --data-dir)
@@ -826,6 +835,14 @@ EOF
     done
     while true; do
         prompt_default CONFIG_FILE "Proxy config file path" "${CONFIG_FILE}"
+        if [[ "${CONFIG_FILE}" == */ ]]; then
+            warn "Proxy config file path must not end with '/' (must be a file path, not a directory)."
+            continue
+        fi
+        if [[ -d "${CONFIG_FILE}" ]]; then
+            warn "Proxy config file path must not point to an existing directory."
+            continue
+        fi
         if [[ "${CONFIG_FILE}" != /* ]]; then
             warn "Proxy config file path must be an absolute path."
             continue
@@ -1133,6 +1150,13 @@ Re-run with: --listen-port <port>"
             die "${flag_name} must not contain '\"', '\\', or '%' characters (they break systemd unit parsing/specifiers and sed substitution)."
         fi
     done
+    # CONFIG_FILE must be a file path, not a directory.
+    if [[ "${CONFIG_FILE}" == */ ]]; then
+        die "--config-file must be a file path, not a directory-style path ending with '/': ${CONFIG_FILE}."
+    fi
+    if [[ -d "${CONFIG_FILE}" ]]; then
+        die "--config-file must not point to an existing directory: ${CONFIG_FILE}."
+    fi
 }
 
 # Cross-field config validation run after both interactive and non-interactive

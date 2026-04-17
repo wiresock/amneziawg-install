@@ -5,8 +5,8 @@
 # isolated subshells, so regressions in the actual implementations are caught.
 # Covers: is_positive_integer, escape_sed_replacement, _is_valid_ip_literal,
 # _format_host_for_socketaddr, validate_config, extract_endpoint_port,
-# read_proxy_config_ports, safe_rm_dir safety guards, and --purge-config /
-# --purge-data path restrictions.
+# read_proxy_config_ports, safe_rm_dir safety guards, --purge-config /
+# --purge-data path restrictions, and --config-file trailing-slash rejection.
 #
 # Usage: bash tests/test-proxy-scripts.sh
 
@@ -538,6 +538,12 @@ assert_niv_rejects "INSTALL_DIR" '/usr/local/%hbin'         "--install-dir with 
 assert_niv_rejects "CONFIG_FILE" '/etc/proxy/"proxy.toml'   "--config-file with quote"
 assert_niv_rejects "DATA_DIR"    '/var/lib/proxy\data'      "--data-dir with backslash"
 assert_niv_rejects "DATA_DIR"    '/var/lib/%proxy'          "--data-dir with percent"
+
+# ── CONFIG_FILE trailing-slash rejection ──────────────────────────────────────
+
+echo "=== CONFIG_FILE trailing-slash rejection ==="
+assert_niv_rc 1 "CONFIG_FILE" '/etc/amneziawg-proxy/'   "--config-file trailing slash rejected"
+assert_niv_rc 1 "CONFIG_FILE" '/etc/amneziawg-proxy//'  "--config-file double trailing slash rejected"
 
 # ── Conditional TOML emission (quic_certificate_domain / dns_upstream) ────────
 
