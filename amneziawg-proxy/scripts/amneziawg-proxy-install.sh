@@ -52,7 +52,7 @@ readonly DEFAULT_DNS_UPSTREAM="1.1.1.1:53"
 readonly DEFAULT_QUIC_DOMAIN="cloudflare.com"
 
 # Script location (for finding the service unit file relative to the repo)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # Source shared helpers (validate_params_file, etc.)
 # shellcheck source=amneziawg-proxy-common.sh
@@ -1451,7 +1451,7 @@ reconfigure_awg_listen_port() {
     if [[ -e "${backup}" ]]; then
         die "Refusing to overwrite existing AWG config backup: ${backup}"
     fi
-    cp --no-clobber -- "${AWG_CONF_FILE}" "${backup}"
+    cp -- "${AWG_CONF_FILE}" "${backup}"
     info "Backed up AWG config to: ${backup}"
 
     # Update ListenPort in the [Interface] section
