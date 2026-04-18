@@ -1765,7 +1765,7 @@ main() {
         _unit_exec="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
                        | sed 's/^ExecStart=//; s/ .*//')" || true
         _unit_cfg="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
-                       | sed -n 's/^ExecStart=[^ ][^ ]* \([^ ][^ ]*\).*/\1/p')" || true
+                       | sed -En 's/^ExecStart=[^ ]+ ([^ ]+).*/\1/p')" || true
         _unit_workdir="$(grep -m1 '^WorkingDirectory=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
                        | sed 's/^WorkingDirectory=//')" || true
         [[ -n "${_unit_exec}"    && "${_unit_exec}"    != "${INSTALL_DIR}/amneziawg-proxy" ]] && _path_conflict=true
