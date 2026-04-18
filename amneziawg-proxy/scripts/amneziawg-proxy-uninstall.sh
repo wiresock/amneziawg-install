@@ -172,7 +172,9 @@ safe_rm_file() {
 #   1. realpath -m  (GNU coreutils; path need not exist)
 #   2. realpath     (without -m; path must exist)
 #   3. python3 os.path.realpath  (path need not exist)
-#   4. die — canonicalization is required for safe deletion; if no tool is
+#   4. pure-bash fallback via cd -P / pwd -P on the parent directory, then
+#      append the basename verbatim
+#   5. die — canonicalization is required for safe deletion; if no method is
 #      available the operation is aborted to prevent bypassing prefix checks.
 _canon_path() {
     local p="${1%/}"
