@@ -1423,8 +1423,14 @@ reconfigure_awg_listen_port() {
         has_listen_addr_directive=true
     fi
 
+    # Only warn about the missing ListenAddr when we are actually going to
+    # change ListenPort (i.e. needs_port_change=true).  When the port already
+    # matches there is nothing actionable to do: we cannot add ListenAddr
+    # when the directive is absent, and no config change will be applied, so
+    # there is no risk to warn about.
     if [[ "${needs_addr_change}" == "true" ]] && \
-       [[ "${has_listen_addr_directive}" != "true" ]]; then
+       [[ "${has_listen_addr_directive}" != "true" ]] && \
+       [[ "${needs_port_change}" == "true" ]]; then
         warn "WARNING: ${AWG_CONF_FILE} does not contain a ListenAddr directive."
         warn "AWG will listen on port ${BACKEND_PORT} on ALL interfaces after this change,"
         warn "making the backend port publicly reachable without going through the proxy."
@@ -1590,13 +1596,18 @@ UNITEOF
         [[ "${DATA_DIR}"     != "${DEFAULT_DATA_DIR}"     ]] && path_flags_changed=true
         [[ "${AWG_DIR}"      != "${DEFAULT_AWG_DIR}"      ]] && path_flags_changed=true
         if [[ "${path_flags_changed}" == "true" ]]; then
-            # Paths differ — skip enable/restart to avoid running against a
-            # stale unit whose ExecStart / ReadOnlyPaths are wrong.
-            warn "Path options (--install-dir, --config-file, --data-dir, --awg-dir) will NOT take effect"
-            warn "in the existing service unit. Re-run with --force to update the unit."
+            # Paths differ — do not enable/restart against a stale unit whose
+            # ExecStart / WorkingDirectory / ReadOnlyPaths are wrong. Fail the
+            # install so callers do not continue after partially applying
+            # config or AWG changes while the running service still uses the
+            # old unit definition.
+            warn "Path options (--install-dir, --config-file, --data-dir, --awg-dir) do not match"
+            warn "the preserved existing service unit. Re-run with --force to update the unit."
             systemctl daemon-reload || true
             info "systemd daemon reloaded (unit unchanged, service NOT restarted)."
-            return 0
+            warn "Aborting: refusing to continue with a preserved service unit that does not"
+            warn "match the requested paths, because this can leave the proxy and AWG out of sync."
+            return 1
         fi
         # Paths match defaults — fall through to enable/restart so that
         # config changes (new binary, updated proxy.toml) are applied.
@@ -1735,6 +1746,22 @@ main() {
         return 0
     elif (( config_rc != 0 )); then
         die "Failed to write proxy configuration (exit code ${config_rc})."
+    fi
+
+    # Abort early if the existing service unit cannot be updated without
+    # --force but path-affecting options differ from the defaults.
+    # Without this guard, reconfigure_awg_listen_port would modify the AWG
+    # config and restart the interface before install_service_unit discovers
+    # the conflict, leaving AWG and the running proxy service out of sync.
+    if [[ -f "${SYSTEMD_UNIT_DEST}" ]] && [[ "${FORCE}" != "true" ]]; then
+        local _early_path_changed=false
+        [[ "${INSTALL_DIR}" != "${DEFAULT_INSTALL_DIR}" ]] && _early_path_changed=true
+        [[ "${CONFIG_FILE}"  != "${DEFAULT_CONFIG_FILE}"  ]] && _early_path_changed=true
+        [[ "${DATA_DIR}"     != "${DEFAULT_DATA_DIR}"     ]] && _early_path_changed=true
+        [[ "${AWG_DIR}"      != "${DEFAULT_AWG_DIR}"      ]] && _early_path_changed=true
+        if [[ "${_early_path_changed}" == "true" ]]; then
+            die "Path options do not match the existing service unit at ${SYSTEMD_UNIT_DEST}. Re-run with --force to update the unit."
+        fi
     fi
 
     reconfigure_awg_listen_port
