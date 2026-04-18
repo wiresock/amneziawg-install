@@ -113,7 +113,6 @@ manage_menu() {
 
             case "${uninstall_option}" in
                 1)
-                    uninstall_args=()
                     ;;
                 2)
                     uninstall_args=(--restore-awg)
@@ -132,7 +131,7 @@ manage_menu() {
                     ;;
             esac
 
-            exec bash "${UNINSTALLER}" "${uninstall_args[@]}"
+            exec bash "${UNINSTALLER}" ${uninstall_args[@]+"${uninstall_args[@]}"}
             ;;
         5)
             exit 0
