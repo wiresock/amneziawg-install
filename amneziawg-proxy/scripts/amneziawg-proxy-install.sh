@@ -1608,36 +1608,14 @@ UNITEOF
         info "Updated service unit paths."
     fi
 
-    # When the unit was skipped (already existed, no --force), check whether
-    # path-affecting options differ from their defaults.
+    # main() has already verified (via ExecStart/WorkingDirectory in the
+    # existing unit) that there is no path conflict before calling here,
+    # so we can always reload without an additional defaults-based guard.
     if [[ "${unit_skipped}" == "true" ]]; then
-        local path_flags_changed=false
-        [[ "${INSTALL_DIR}" != "${DEFAULT_INSTALL_DIR}" ]] && path_flags_changed=true
-        [[ "${CONFIG_FILE}"  != "${DEFAULT_CONFIG_FILE}"  ]] && path_flags_changed=true
-        [[ "${DATA_DIR}"     != "${DEFAULT_DATA_DIR}"     ]] && path_flags_changed=true
-        [[ "${AWG_DIR}"      != "${DEFAULT_AWG_DIR}"      ]] && path_flags_changed=true
-        if [[ "${path_flags_changed}" == "true" ]]; then
-            # Paths differ — do not enable/restart against a stale unit whose
-            # ExecStart / WorkingDirectory / ReadOnlyPaths are wrong. Fail the
-            # install so callers do not continue after partially applying
-            # config or AWG changes while the running service still uses the
-            # old unit definition.
-            warn "Path options (--install-dir, --config-file, --data-dir, --awg-dir) do not match"
-            warn "the preserved existing service unit. Re-run with --force to update the unit."
-            systemctl daemon-reload || true
-            info "systemd daemon reloaded (unit unchanged, service NOT restarted)."
-            warn "Aborting: refusing to continue with a preserved service unit that does not"
-            warn "match the requested paths, because this can leave the proxy and AWG out of sync."
-            return 1
-        fi
-        # Paths match defaults — fall through to enable/restart so that
-        # config changes (new binary, updated proxy.toml) are applied.
-        systemctl daemon-reload || true
-        info "systemd daemon reloaded (unit unchanged)."
-    else
-        systemctl daemon-reload
-        info "systemd daemon reloaded."
+        info "Preserved existing service unit."
     fi
+    systemctl daemon-reload
+    info "systemd daemon reloaded."
 
     if [[ "${ENABLE_SERVICE}" == "true" ]]; then
         systemctl enable "${SERVICE_NAME}"
