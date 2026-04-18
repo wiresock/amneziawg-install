@@ -6,7 +6,8 @@
 # Covers: is_positive_integer, escape_sed_replacement, _is_valid_ip_literal,
 # _format_host_for_socketaddr, validate_config, extract_endpoint_port,
 # read_proxy_config_ports, safe_rm_dir safety guards, --purge-config /
-# --purge-data path restrictions, and --config-file trailing-slash rejection.
+# --purge-data path restrictions, --config-file trailing-slash rejection, and
+# reconfigure_awg_listen_port edit/backup/restart decision logic.
 #
 # Usage: bash tests/test-proxy-scripts.sh
 
@@ -570,6 +571,97 @@ assert_niv_rc 1 "DNS_UPSTREAM" 'not-valid' \
 echo "=== --help exits 0 ==="
 assert_rc 0 bash "${INSTALL_SCRIPT}"   --help
 assert_rc 0 bash "${UNINSTALL_SCRIPT}" --help
+
+# ── reconfigure_awg_listen_port ───────────────────────────────────────────────
+#
+# Run reconfigure_awg_listen_port() in a subshell with a temp AWG conf file.
+# Prints: exit_code|ListenPort_value|ListenAddr_value|backup_file_count
+
+echo "=== reconfigure_awg_listen_port ==="
+
+_run_reconfigure() {
+    local conf_content="$1"
+    local backend_port="${2:-51821}"
+    local backend_host="${3:-127.0.0.1}"
+    local tmpdir conf_file
+    tmpdir="$(mktemp -d)"
+    conf_file="${tmpdir}/awg0.conf"
+    printf '%s\n' "${conf_content}" > "${conf_file}"
+
+    local rc=0
+    (
+        set --
+        # shellcheck disable=SC1090
+        source "${INSTALL_SCRIPT}" 2>/dev/null
+        info()      { :; }
+        warn()      { :; }
+        step()      { :; }
+        error()     { :; }
+        systemctl() { return 1; }  # mock: service not active → skip restart
+        AWG_CONF_FILE="${conf_file}"
+        BACKEND_PORT="${backend_port}"
+        BACKEND_HOST="${backend_host}"
+        AWG_NIC="awg0"
+        NON_INTERACTIVE="true"
+        reconfigure_awg_listen_port
+    ) 2>/dev/null
+    rc=$?
+
+    local result_port result_addr backup_count
+    result_port="$(grep -i '^[[:space:]]*ListenPort[[:space:]]*=' "${conf_file}" 2>/dev/null \
+        | head -1 | sed -E 's/^[^=]*=[[:space:]]*//' | sed 's/[;#].*//' | tr -d '[:space:]')" || true
+    result_addr="$(grep -i '^[[:space:]]*ListenAddr[[:space:]]*=' "${conf_file}" 2>/dev/null \
+        | head -1 | sed -E 's/^[^=]*=[[:space:]]*//' | sed 's/[;#].*//' | tr -d '[:space:]')" || true
+    backup_count="$(find "${tmpdir}" -name 'awg0.conf.bak.*' 2>/dev/null | wc -l | tr -d ' ')"
+
+    printf '%s\n' "${rc}|${result_port}|${result_addr}|${backup_count}"
+    rm -rf "${tmpdir}"
+}
+
+# port already matches, no ListenAddr directive → no edit, no backup (rc 0)
+_result="$(_run_reconfigure $'[Interface]\nListenPort = 51821' 51821 127.0.0.1)"
+_rc="${_result%%|*}"; _port="$(echo "${_result}" | cut -d'|' -f2)"
+_addr="$(echo "${_result}" | cut -d'|' -f3)"; _baks="${_result##*|}"
+assert_eq "0"     "${_rc}"   "reconfigure: port ok, no ListenAddr → rc 0"
+assert_eq "51821" "${_port}" "reconfigure: port ok, no ListenAddr → port unchanged"
+assert_eq ""      "${_addr}" "reconfigure: port ok, no ListenAddr → no addr added"
+assert_eq "0"     "${_baks}" "reconfigure: port ok, no ListenAddr → no backup"
+
+# port needs change, no ListenAddr directive → port updated, backup, no addr added
+_result="$(_run_reconfigure $'[Interface]\nListenPort = 51820' 51821 127.0.0.1)"
+_rc="${_result%%|*}"; _port="$(echo "${_result}" | cut -d'|' -f2)"
+_addr="$(echo "${_result}" | cut -d'|' -f3)"; _baks="${_result##*|}"
+assert_eq "0"     "${_rc}"   "reconfigure: port change, no ListenAddr → rc 0"
+assert_eq "51821" "${_port}" "reconfigure: port change, no ListenAddr → port updated"
+assert_eq ""      "${_addr}" "reconfigure: port change, no ListenAddr → no addr added"
+assert_eq "1"     "${_baks}" "reconfigure: port change, no ListenAddr → backup created"
+
+# port needs change, ListenAddr present → both updated, backup
+_result="$(_run_reconfigure $'[Interface]\nListenPort = 51820\nListenAddr = 0.0.0.0' 51821 127.0.0.1)"
+_rc="${_result%%|*}"; _port="$(echo "${_result}" | cut -d'|' -f2)"
+_addr="$(echo "${_result}" | cut -d'|' -f3)"; _baks="${_result##*|}"
+assert_eq "0"         "${_rc}"   "reconfigure: port+addr change → rc 0"
+assert_eq "51821"     "${_port}" "reconfigure: port+addr change → port updated"
+assert_eq "127.0.0.1" "${_addr}" "reconfigure: port+addr change → addr updated"
+assert_eq "1"         "${_baks}" "reconfigure: port+addr change → backup created"
+
+# port already matches, ListenAddr present but wrong → addr-only update, backup
+_result="$(_run_reconfigure $'[Interface]\nListenPort = 51821\nListenAddr = 0.0.0.0' 51821 127.0.0.1)"
+_rc="${_result%%|*}"; _port="$(echo "${_result}" | cut -d'|' -f2)"
+_addr="$(echo "${_result}" | cut -d'|' -f3)"; _baks="${_result##*|}"
+assert_eq "0"         "${_rc}"   "reconfigure: addr-only change → rc 0"
+assert_eq "51821"     "${_port}" "reconfigure: addr-only change → port unchanged"
+assert_eq "127.0.0.1" "${_addr}" "reconfigure: addr-only change → addr updated"
+assert_eq "1"         "${_baks}" "reconfigure: addr-only change → backup created"
+
+# port and addr already correct → no edit, no backup (early return)
+_result="$(_run_reconfigure $'[Interface]\nListenPort = 51821\nListenAddr = 127.0.0.1' 51821 127.0.0.1)"
+_rc="${_result%%|*}"; _port="$(echo "${_result}" | cut -d'|' -f2)"
+_addr="$(echo "${_result}" | cut -d'|' -f3)"; _baks="${_result##*|}"
+assert_eq "0"         "${_rc}"   "reconfigure: already correct → rc 0"
+assert_eq "51821"     "${_port}" "reconfigure: already correct → port unchanged"
+assert_eq "127.0.0.1" "${_addr}" "reconfigure: already correct → addr unchanged"
+assert_eq "0"         "${_baks}" "reconfigure: already correct → no backup"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 

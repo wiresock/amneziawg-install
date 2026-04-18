@@ -1451,6 +1451,24 @@ reconfigure_awg_listen_port() {
         fi
     fi
 
+    # Pre-compute whether any actual config edit will be performed.
+    # ListenAddr can only be updated when the directive already exists; it
+    # cannot be added when absent, so the restriction cannot be set in that case.
+    local will_edit_port="${needs_port_change}"
+    local will_edit_addr="false"
+    if [[ "${needs_addr_change}" == "true" ]] && [[ "${has_listen_addr_directive}" == "true" ]]; then
+        will_edit_addr=true
+    fi
+
+    if [[ "${will_edit_port}" != "true" ]] && [[ "${will_edit_addr}" != "true" ]]; then
+        # No actual edit can be made (port already matches and ListenAddr is absent).
+        if [[ "${needs_addr_change}" == "true" ]]; then
+            info "ListenAddr directive not present in AWG config; apply firewall rules to restrict the backend port."
+        fi
+        info "No AWG config changes needed."
+        return 0
+    fi
+
     # Back up the config file before modifying it
     local backup
     backup="${AWG_CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)"
@@ -1458,7 +1476,7 @@ reconfigure_awg_listen_port() {
     info "Backed up AWG config to: ${backup}"
 
     # Update ListenPort in the [Interface] section
-    if [[ "${needs_port_change}" == "true" ]]; then
+    if [[ "${will_edit_port}" == "true" ]]; then
         if grep -qi '^[[:space:]]*ListenPort[[:space:]]*=' "${AWG_CONF_FILE}"; then
             sed -i "s|^[[:space:]]*ListenPort[[:space:]]*=.*|ListenPort = ${BACKEND_PORT}|i" \
                 "${AWG_CONF_FILE}"
@@ -1469,27 +1487,31 @@ reconfigure_awg_listen_port() {
         info "Updated ListenPort → ${BACKEND_PORT}"
     fi
 
-    # Update or insert ListenAddr to restrict AWG to loopback.
+    # Update ListenAddr to restrict AWG to the loopback interface.
     # Note: AmneziaWG supports ListenAddr in newer versions only. When the
-    # directive is absent the code prints firewall guidance instead.
-    if [[ "${needs_addr_change}" == "true" ]]; then
-        if grep -qi '^[[:space:]]*ListenAddr[[:space:]]*=' "${AWG_CONF_FILE}"; then
-            local escaped_backend_host
-            escaped_backend_host="$(escape_sed_replacement "${awg_backend_host}")"
-            sed -i "s|^[[:space:]]*ListenAddr[[:space:]]*=.*|ListenAddr = ${escaped_backend_host}|i" \
-                "${AWG_CONF_FILE}"
-            info "Updated ListenAddr → ${awg_backend_host}"
-        else
-            # ListenAddr directive is absent; the user was already warned and
-            # confirmed (or accepted the risk in non-interactive mode) above.
-            info "ListenAddr directive not present in AWG config; apply firewall rules to restrict the backend port."
-        fi
+    # directive is absent will_edit_addr is false and this block is skipped.
+    if [[ "${will_edit_addr}" == "true" ]]; then
+        local escaped_backend_host
+        escaped_backend_host="$(escape_sed_replacement "${awg_backend_host}")"
+        sed -i "s|^[[:space:]]*ListenAddr[[:space:]]*=.*|ListenAddr = ${escaped_backend_host}|i" \
+            "${AWG_CONF_FILE}"
+        info "Updated ListenAddr → ${awg_backend_host}"
+    fi
+
+    # Build a descriptive label for the restart log message
+    local change_desc
+    if [[ "${will_edit_port}" == "true" ]] && [[ "${will_edit_addr}" == "true" ]]; then
+        change_desc="listen port and address"
+    elif [[ "${will_edit_port}" == "true" ]]; then
+        change_desc="listen port"
+    else
+        change_desc="listen address"
     fi
 
     # Restart the AWG interface if it is currently active
     local nic="${AWG_NIC:-awg0}"
     if systemctl is-active --quiet -- "awg-quick@${nic}" 2>/dev/null; then
-        info "Restarting AWG interface ${nic} to apply new listen port..."
+        info "Restarting AWG interface ${nic} to apply new ${change_desc}..."
         if ! systemctl restart -- "awg-quick@${nic}"; then
             warn "Failed to restart awg-quick@${nic}. You may need to restart it manually:"
             warn "  sudo systemctl restart -- awg-quick@${nic}"
