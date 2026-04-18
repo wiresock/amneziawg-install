@@ -367,8 +367,9 @@ detect_awg_config() {
     if [[ -z "${LISTEN_PORT}" ]] && [[ -f "${AWG_CONF_FILE}" ]]; then
         local conf_port
         conf_port="$(grep -i '^[[:space:]]*ListenPort[[:space:]]*=' "${AWG_CONF_FILE}" \
-                    | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]' || true)"
-        if [[ -n "${conf_port}" ]]; then
+                    | head -1 \
+                    | sed -e 's/.*=[[:space:]]*//' -e 's/[;#].*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
+        if [[ -n "${conf_port}" ]] && [[ "${conf_port}" =~ ^[0-9]+$ ]]; then
             LISTEN_PORT="${conf_port}"
             info "Detected AWG listen port from config: ${LISTEN_PORT}"
         fi
@@ -1375,11 +1376,13 @@ reconfigure_awg_listen_port() {
     # Read the current listen port from the config
     local current_listen
     current_listen="$(grep -i '^[[:space:]]*ListenPort[[:space:]]*=' "${AWG_CONF_FILE}" \
-                     | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]')" || true
+                     | head -1 \
+                     | sed -E "s/^[^=]*=[[:space:]]*//; s/[[:space:]]*[#;].*$//; s/^[[:space:]]+//; s/[[:space:]]+$//; s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/")" || true
 
     local current_addr
     current_addr="$(grep -i '^[[:space:]]*ListenAddr[[:space:]]*=' "${AWG_CONF_FILE}" \
-                   | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]')" || true
+                   | head -1 \
+                   | sed -E "s/^[^=]*=[[:space:]]*//; s/[[:space:]]*[#;].*$//; s/^[[:space:]]+//; s/[[:space:]]+$//; s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/")" || true
 
     # AWG config uses bare IP addresses for ListenAddr (no brackets for IPv6),
     # whereas BACKEND_HOST may be SocketAddr-formatted with brackets (e.g.
