@@ -214,8 +214,12 @@ _canon_path() {
         if [[ -n "${result}" ]]; then printf '%s' "${result}"; return; fi
     fi
     # Pure-bash fallback: resolve symlinks in the parent directory (cd -P), then
-    # append the basename.  Works as long as the parent directory exists, which
-    # is always true for any path that safe_rm_dir is about to delete.
+    # append the basename.  By the time this path is reached, callers have
+    # already verified that ${p} is absolute, so dirname always yields an
+    # absolute path.  cd -P resolves any symlink components in the parent;
+    # the basename is appended verbatim so the result may differ from a full
+    # canonical resolution of the target itself (which is fine for a prefix
+    # boundary check on a not-yet-existing path).
     local parent_dir basename_part parent_real
     parent_dir="$(dirname "${p}")"
     basename_part="$(basename "${p}")"
