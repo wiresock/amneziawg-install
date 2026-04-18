@@ -25,8 +25,31 @@ UNINSTALLER="${SCRIPT_DIR}/amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh"
 
 readonly SERVICE_NAME="amneziawg-proxy"
 readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
-readonly BINARY_PATH="${DEFAULT_INSTALL_DIR}/amneziawg-proxy"
 readonly SYSTEMD_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
+
+# Derive the binary path from the installed systemd unit when available.
+# If the unit exists, parse ExecStart to find where the binary actually lives
+# (supports non-default --install-dir deployments).  Fall back to the default
+# path only when the unit is absent.
+_get_binary_path() {
+    if [[ -f "${SYSTEMD_UNIT}" ]]; then
+        local exec_start
+        exec_start="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT}" 2>/dev/null || true)"
+        if [[ -n "${exec_start}" ]]; then
+            # ExecStart=/path/to/amneziawg-proxy /path/to/proxy.toml
+            # Strip "ExecStart=" prefix and take the first token (the binary).
+            local bin_path
+            bin_path="$(printf '%s' "${exec_start#ExecStart=}" | awk '{print $1}')"
+            if [[ -n "${bin_path}" ]]; then
+                printf '%s' "${bin_path}"
+                return
+            fi
+        fi
+    fi
+    printf '%s' "${DEFAULT_INSTALL_DIR}/amneziawg-proxy"
+}
+
+BINARY_PATH="$(_get_binary_path)"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

@@ -382,6 +382,23 @@ Install Rust with:  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | 
 Or re-run with --install-rust to install automatically."
     fi
 
+    if ! command -v curl &>/dev/null; then
+        die "Automatic Rust installation requires curl, but curl was not found.
+Install curl (e.g. apt-get install curl ca-certificates), or install Rust
+manually and re-run."
+    fi
+
+    if [[ -z "${SSL_CERT_FILE:-}" && -z "${SSL_CERT_DIR:-}" ]] \
+        && [[ ! -f /etc/ssl/certs/ca-certificates.crt ]] \
+        && [[ ! -f /etc/pki/tls/certs/ca-bundle.crt ]] \
+        && [[ ! -f /etc/ssl/ca-bundle.pem ]] \
+        && [[ ! -f /etc/pki/tls/cacert.pem ]] \
+        && [[ ! -f /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem ]] \
+        && [[ ! -d /etc/ssl/certs ]]; then
+        die "Automatic Rust installation requires CA certificates for HTTPS downloads, but none were found.
+Install the ca-certificates package, or install Rust manually and re-run."
+    fi
+
     info "Installing Rust toolchain via rustup..."
     if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable; then
         die "Failed to install Rust toolchain via rustup."
@@ -1376,11 +1393,12 @@ reconfigure_awg_listen_port() {
         needs_port_change=true
     fi
 
-    # Check if AWG is already bound to the loopback address
-    # (AWG uses ListenAddr or binds to 0.0.0.0 by default)
-    if [[ -z "${current_addr}" ]] || [[ "${current_addr}" == "0.0.0.0" ]]; then
-        needs_addr_change=true
-    elif [[ "${current_addr}" != "${awg_backend_host}" ]]; then
+    # Treat a missing ListenAddr directive as AWG's default bind address.
+    local effective_current_addr="${current_addr:-0.0.0.0}"
+
+    # Check whether the effective current bind address already matches the
+    # desired backend host.
+    if [[ "${effective_current_addr}" != "${awg_backend_host}" ]]; then
         needs_addr_change=true
     fi
 

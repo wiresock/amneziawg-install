@@ -664,6 +664,25 @@ assert_eq "51821"     "${_port}" "reconfigure: already correct → port unchange
 assert_eq "127.0.0.1" "${_addr}" "reconfigure: already correct → addr unchanged"
 assert_eq "0"         "${_baks}" "reconfigure: already correct → no backup"
 
+# desired host is 0.0.0.0, no ListenAddr directive → treat as already correct,
+# no addr change needed (effective default = 0.0.0.0 == desired 0.0.0.0)
+_result="$(_run_reconfigure $'[Interface]\nListenPort = 51821' 51821 0.0.0.0)"
+_rc="${_result%%|*}"; _port="$(echo "${_result}" | cut -d'|' -f2)"
+_addr="$(echo "${_result}" | cut -d'|' -f3)"; _baks="${_result##*|}"
+assert_eq "0"  "${_rc}"   "reconfigure: desired=0.0.0.0, no ListenAddr → rc 0"
+assert_eq "51821" "${_port}" "reconfigure: desired=0.0.0.0, no ListenAddr → port unchanged"
+assert_eq ""   "${_addr}" "reconfigure: desired=0.0.0.0, no ListenAddr → no addr added"
+assert_eq "0"  "${_baks}" "reconfigure: desired=0.0.0.0, no ListenAddr → no backup"
+
+# desired host is 0.0.0.0, ListenAddr = 0.0.0.0 → addr already matches, no edit
+_result="$(_run_reconfigure $'[Interface]\nListenPort = 51821\nListenAddr = 0.0.0.0' 51821 0.0.0.0)"
+_rc="${_result%%|*}"; _port="$(echo "${_result}" | cut -d'|' -f2)"
+_addr="$(echo "${_result}" | cut -d'|' -f3)"; _baks="${_result##*|}"
+assert_eq "0"     "${_rc}"   "reconfigure: desired=0.0.0.0, addr=0.0.0.0 → rc 0"
+assert_eq "51821" "${_port}" "reconfigure: desired=0.0.0.0, addr=0.0.0.0 → port unchanged"
+assert_eq "0.0.0.0" "${_addr}" "reconfigure: desired=0.0.0.0, addr=0.0.0.0 → addr unchanged"
+assert_eq "0"     "${_baks}" "reconfigure: desired=0.0.0.0, addr=0.0.0.0 → no backup"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 echo ""
