@@ -384,8 +384,7 @@ Or re-run with --install-rust to install automatically."
 
     if ! command -v curl &>/dev/null; then
         die "Automatic Rust installation requires curl, but curl was not found.
-Install curl (e.g. apt-get install curl ca-certificates), or install Rust
-manually and re-run."
+Install curl (e.g. apt-get install curl), or install Rust manually and re-run."
     fi
 
     if [[ -z "${SSL_CERT_FILE:-}" && -z "${SSL_CERT_DIR:-}" ]] \
