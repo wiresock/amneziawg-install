@@ -22,6 +22,7 @@ jobs:
           bash -n amneziawg-web/scripts/amneziawg-web-uninstall.sh
           bash -n amneziawg-web/scripts/amneziawg-web-upgrade.sh
           bash -n amneziawg-proxy.sh
+          bash -n amneziawg-proxy/scripts/amneziawg-proxy-common.sh
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-install.sh
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh
 

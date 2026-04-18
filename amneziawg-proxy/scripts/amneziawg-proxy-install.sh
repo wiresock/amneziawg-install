@@ -54,6 +54,10 @@ readonly DEFAULT_QUIC_DOMAIN="cloudflare.com"
 # Script location (for finding the service unit file relative to the repo)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Source shared helpers (validate_params_file, etc.)
+# shellcheck source=amneziawg-proxy-common.sh
+. "${SCRIPT_DIR}/amneziawg-proxy-common.sh"
+
 # ── Colours ───────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'
@@ -292,36 +296,6 @@ Install AmneziaWG first (https://github.com/wiresock/amneziawg-install)."
 }
 
 # ── AWG configuration detection ───────────────────────────────────────────────
-
-# Validate a params file is safe to source: must be a regular file (not a
-# symlink), owned by root, and have permissions 600 or 400.
-# Returns 0 if safe, 1 with a warning if not.
-validate_params_file() {
-    local f="$1"
-    if [[ -L "${f}" ]] || [[ -h "${f}" ]]; then
-        warn "Ignoring params file — must not be a symbolic link: ${f}"
-        return 1
-    fi
-    if [[ ! -f "${f}" ]]; then
-        return 1
-    fi
-    local owner perms
-    owner="$(stat -c '%u' "${f}" 2>/dev/null || true)"
-    perms="$(stat -c '%a' "${f}" 2>/dev/null || true)"
-    if [[ -z "${owner}" || -z "${perms}" ]]; then
-        warn "Ignoring params file — failed to read file metadata: ${f}"
-        return 1
-    fi
-    if [[ "${owner}" != "0" ]]; then
-        warn "Ignoring params file — not owned by root (owner UID: ${owner}): ${f}"
-        return 1
-    fi
-    if [[ "${perms}" != "600" ]] && [[ "${perms}" != "400" ]]; then
-        warn "Ignoring params file — insecure permissions (${perms}); expected 600 or 400: ${f}"
-        return 1
-    fi
-    return 0
-}
 
 # Detect the active AmneziaWG interface and its config file.
 # Sets AWG_NIC, AWG_CONF_FILE, and LISTEN_PORT (if not already set).
@@ -1473,8 +1447,11 @@ reconfigure_awg_listen_port() {
 
     # Back up the config file before modifying it
     local backup
-    backup="${AWG_CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-    cp -f -- "${AWG_CONF_FILE}" "${backup}"
+    backup="${AWG_CONF_FILE}.bak.$(date +%Y%m%d%H%M%S%N).$$"
+    if [[ -e "${backup}" ]]; then
+        die "Refusing to overwrite existing AWG config backup: ${backup}"
+    fi
+    cp --no-clobber -- "${AWG_CONF_FILE}" "${backup}"
     info "Backed up AWG config to: ${backup}"
 
     # Update ListenPort in the [Interface] section
