@@ -489,7 +489,8 @@ assert_niv_rejects() {
     local var_value="$2"
     local description="$3"
     shift 3
-    # Any additional VAR VALUE pairs are prepended to the positional list.
+    # Any additional VAR VALUE pairs are appended to the positional list, so
+    # later assignments win if the same variable appears more than once.
     local _output _rc _has_msg=0
     _output=$(run_niv_with "${var_name}" "${var_value}" "$@") && _rc=0 || _rc=$?
     echo "${_output}" | grep -qF 'must not contain' && _has_msg=1

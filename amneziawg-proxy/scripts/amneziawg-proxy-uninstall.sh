@@ -213,6 +213,16 @@ _canon_path() {
         result="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${p}" 2>/dev/null)"
         if [[ -n "${result}" ]]; then printf '%s' "${result}"; return; fi
     fi
+    # Pure-bash fallback: resolve symlinks in the parent directory (cd -P), then
+    # append the basename.  Works as long as the parent directory exists, which
+    # is always true for any path that safe_rm_dir is about to delete.
+    local parent_dir basename_part parent_real
+    parent_dir="$(dirname "${p}")"
+    basename_part="$(basename "${p}")"
+    if parent_real="$(cd -P -- "${parent_dir}" 2>/dev/null && pwd -P 2>/dev/null)"; then
+        result="${parent_real}/${basename_part}"
+        if [[ -n "${result}" ]]; then printf '%s' "${result}"; return; fi
+    fi
     die "path canonicalization unavailable (neither realpath nor python3 found); cannot safely validate '${p}' for deletion"
 }
 
