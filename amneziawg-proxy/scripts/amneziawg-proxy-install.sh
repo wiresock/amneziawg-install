@@ -1037,7 +1037,7 @@ _validate_dns_upstream() {
     if [[ "${val}" =~ ^\[([^\]]+)\]:([0-9]+)$ ]]; then
         host="${BASH_REMATCH[1]}"
         port="${BASH_REMATCH[2]}"
-    # IPv4 or hostname: host:port (last colon wins)
+    # Non-bracketed host:port form for IPv4 literals only (last colon wins)
     elif [[ "${val}" == *:* && "${val}" != *:*:* ]]; then
         host="${val%:*}"
         port="${val##*:}"

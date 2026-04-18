@@ -428,6 +428,9 @@ restore_awg_listen_port() {
                 warn "Start it with: sudo systemctl start -- awg-quick@${awg_nic}"
             fi
             return 0
+        else
+            info "Skipping AWG config restore (user declined)."
+            return 0
         fi
     fi
 
