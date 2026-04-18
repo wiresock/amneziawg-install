@@ -14,12 +14,14 @@
 #   4. Builds the proxy binary from source (or accepts a pre-built binary)
 #   5. Installs the binary to /usr/local/bin
 #   6. Writes /etc/amneziawg-proxy/proxy.toml
-#   7. Attempts to reconfigure the AWG interface to listen on loopback
-#      (127.0.0.1:BACKEND_PORT) when the AWG config already includes ListenAddr;
-#      otherwise prints guidance for manual firewalling/reconfiguration
+#   7. Attempts to reconfigure the AWG interface for proxy use:
+#      if the AWG config already includes ListenAddr, it tries to rebind AWG to
+#      127.0.0.1:BACKEND_PORT; otherwise it may still change ListenPort after a
+#      warning/prompt, so operators must ensure AWG is loopback-bound or otherwise
+#      restricted (for example with firewall rules) to avoid unintended exposure
 #   8. Installs and optionally enables the systemd service
 #
-# Intended deployment topology when loopback rebinding is applied:
+# Intended deployment topology when loopback rebinding succeeds:
 #   VPN clients → 0.0.0.0:LISTEN_PORT (proxy) → 127.0.0.1:BACKEND_PORT (AWG)
 #
 # https://github.com/wiresock/amneziawg-install

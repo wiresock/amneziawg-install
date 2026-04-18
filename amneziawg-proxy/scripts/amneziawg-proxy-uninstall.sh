@@ -470,6 +470,9 @@ restore_awg_listen_port() {
         fi
     elif [[ "${HAVE_SYSTEMCTL}" != "true" ]]; then
         warn "systemctl not available; restart awg-quick@${awg_nic} manually."
+    else
+        warn "AWG interface awg-quick@${awg_nic} is not active."
+        warn "Start it with: sudo systemctl start -- awg-quick@${awg_nic}"
     fi
 }
 
