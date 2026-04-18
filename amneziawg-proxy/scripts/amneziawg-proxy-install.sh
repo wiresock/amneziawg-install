@@ -1770,18 +1770,30 @@ main() {
     fi
 
     # Abort early if the existing service unit cannot be updated without
-    # --force but path-affecting options differ from the defaults.
+    # --force but its recorded paths differ from what we would write.
+    # Comparing against the actual unit (not just hardcoded defaults) catches
+    # re-runs after a prior custom-path install, where default-path flags would
+    # silently launch the proxy against wrong ExecStart/WorkingDirectory paths.
     # Without this guard, reconfigure_awg_listen_port would modify the AWG
     # config and restart the interface before install_service_unit discovers
     # the conflict, leaving AWG and the running proxy service out of sync.
     if [[ -f "${SYSTEMD_UNIT_DEST}" ]] && [[ "${FORCE}" != "true" ]]; then
-        local _early_path_changed=false
-        [[ "${INSTALL_DIR}" != "${DEFAULT_INSTALL_DIR}" ]] && _early_path_changed=true
-        [[ "${CONFIG_FILE}"  != "${DEFAULT_CONFIG_FILE}"  ]] && _early_path_changed=true
-        [[ "${DATA_DIR}"     != "${DEFAULT_DATA_DIR}"     ]] && _early_path_changed=true
-        [[ "${AWG_DIR}"      != "${DEFAULT_AWG_DIR}"      ]] && _early_path_changed=true
-        if [[ "${_early_path_changed}" == "true" ]]; then
-            die "Path options do not match the existing service unit at ${SYSTEMD_UNIT_DEST}. Re-run with --force to update the unit."
+        local _unit_exec _unit_cfg _unit_workdir _path_conflict=false
+        _unit_exec="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
+                       | sed 's/^ExecStart=//; s/ .*//')" || true
+        _unit_cfg="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
+                       | sed 's/^ExecStart=[^ ]* *//')" || true
+        _unit_workdir="$(grep -m1 '^WorkingDirectory=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
+                       | sed 's/^WorkingDirectory=//')" || true
+        [[ -n "${_unit_exec}"    && "${_unit_exec}"    != "${INSTALL_DIR}/amneziawg-proxy" ]] && _path_conflict=true
+        [[ -n "${_unit_cfg}"     && "${_unit_cfg}"     != "${CONFIG_FILE}"                 ]] && _path_conflict=true
+        [[ -n "${_unit_workdir}" && "${_unit_workdir}" != "${DATA_DIR}"                    ]] && _path_conflict=true
+        if [[ "${_path_conflict}" == "true" ]]; then
+            die "Existing service unit (${SYSTEMD_UNIT_DEST}) uses different paths from the requested options.
+  Unit ExecStart binary: ${_unit_exec:-unknown}    (requested: ${INSTALL_DIR}/amneziawg-proxy)
+  Unit ExecStart config: ${_unit_cfg:-unknown}    (requested: ${CONFIG_FILE})
+  Unit WorkingDirectory: ${_unit_workdir:-unknown} (requested: ${DATA_DIR})
+Re-run with --force to update the unit, or pass matching path flags."
         fi
     fi
 

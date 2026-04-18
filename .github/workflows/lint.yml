@@ -44,5 +44,6 @@ jobs:
           shellcheck --severity=warning amneziawg-web/scripts/amneziawg-web-uninstall.sh
           shellcheck --severity=warning amneziawg-web/scripts/amneziawg-web-upgrade.sh
           shellcheck --severity=warning amneziawg-proxy.sh
+          shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-common.sh
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-install.sh
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh

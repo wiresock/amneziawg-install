@@ -583,6 +583,16 @@ main() {
     CONFIG_DIR="${CONFIG_DIR%/}"
     DATA_DIR="${DATA_DIR%/}"
 
+    # Validate purge directory restrictions early, before any destructive work,
+    # so invalid --purge-config/--purge-data arguments fail fast and predictably
+    # rather than after service/binary removal.
+    if [[ "${PURGE_CONFIG}" == "true" ]]; then
+        validate_purge_config_dir "${CONFIG_DIR}"
+    fi
+    if [[ "${PURGE_DATA}" == "true" ]]; then
+        validate_purge_data_dir "${DATA_DIR}"
+    fi
+
     print_plan
 
     if ! confirm "Proceed with uninstall?" "false"; then
@@ -624,7 +634,6 @@ main() {
             fi
         fi
         if [[ "${PURGE_CONFIG}" == "true" ]]; then
-            validate_purge_config_dir "${CONFIG_DIR}"
             case "${CONFIG_DIR}" in
                 "${DEFAULT_CONFIG_DIR}")
                     safe_rm_dir "${CONFIG_DIR}" "${DEFAULT_CONFIG_DIR}"
@@ -645,7 +654,6 @@ main() {
             fi
         fi
         if [[ "${PURGE_DATA}" == "true" ]]; then
-            validate_purge_data_dir "${DATA_DIR}"
             case "${DATA_DIR}" in
                 "${DEFAULT_DATA_DIR}")
                     safe_rm_dir "${DATA_DIR}" "${DEFAULT_DATA_DIR}/"
