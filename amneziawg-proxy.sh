@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 INSTALLER="${SCRIPT_DIR}/amneziawg-proxy/scripts/amneziawg-proxy-install.sh"
 UNINSTALLER="${SCRIPT_DIR}/amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh"
 

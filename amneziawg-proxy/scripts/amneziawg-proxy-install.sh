@@ -423,7 +423,7 @@ detect_source_dir() {
     # SCRIPT_DIR = amneziawg-proxy/scripts/ → amneziawg-proxy/ has Cargo.toml
     local candidate="${SCRIPT_DIR}/.."
     if [[ -f "${candidate}/Cargo.toml" ]]; then
-        SOURCE_DIR="$(cd "${candidate}" && pwd)"
+        SOURCE_DIR="$(CDPATH='' cd -- "${candidate}" && pwd -P)"
     fi
 }
 
