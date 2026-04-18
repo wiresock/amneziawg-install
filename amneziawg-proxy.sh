@@ -93,7 +93,46 @@ manage_menu() {
             ;;
         4)
             require_inner_script "${UNINSTALLER}"
-            exec bash "${UNINSTALLER}"
+
+            echo ""
+            echo "Uninstall options:"
+            echo "   1) Uninstall with safe defaults"
+            echo "   2) Uninstall and restore AWG"
+            echo "   3) Uninstall and purge generated config"
+            echo "   4) Uninstall and purge data"
+            echo "   5) Uninstall and purge config + data"
+            echo "   6) Cancel"
+
+            local uninstall_option=""
+            local -a uninstall_args=()
+            until [[ "${uninstall_option}" =~ ^[1-6]$ ]]; do
+                if ! read -rp "Select an uninstall option [1-6]: " uninstall_option; then
+                    die "No input available; cannot read uninstall selection."
+                fi
+            done
+
+            case "${uninstall_option}" in
+                1)
+                    uninstall_args=()
+                    ;;
+                2)
+                    uninstall_args=(--restore-awg)
+                    ;;
+                3)
+                    uninstall_args=(--purge-config)
+                    ;;
+                4)
+                    uninstall_args=(--purge-data)
+                    ;;
+                5)
+                    uninstall_args=(--purge-config --purge-data)
+                    ;;
+                6)
+                    exit 0
+                    ;;
+            esac
+
+            exec bash "${UNINSTALLER}" "${uninstall_args[@]}"
             ;;
         5)
             exit 0

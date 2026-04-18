@@ -674,7 +674,7 @@ main() {
     fi
     if [[ "${RESTORE_AWG}" != "true" ]]; then
         info "Note: AmneziaWG listen port was NOT restored automatically."
-        info "      If needed, run: sudo ./amneziawg-proxy.sh (select Uninstall → --restore-awg)"
+        info "      If needed, run: sudo ./amneziawg-proxy-uninstall.sh --restore-awg"
     fi
 }
 
