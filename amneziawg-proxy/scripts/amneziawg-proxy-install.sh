@@ -652,7 +652,7 @@ EOF
     while true; do
         prompt_default LISTEN_PORT "${port_prompt}" "${LISTEN_PORT}"
         if [[ "${LISTEN_PORT}" =~ ^[0-9]+$ ]] && \
-           (( LISTEN_PORT >= 1 && LISTEN_PORT <= 65535 )); then
+           (( 10#${LISTEN_PORT} >= 1 && 10#${LISTEN_PORT} <= 65535 )); then
             break
         fi
         warn "Port must be a number between 1 and 65535."
@@ -686,7 +686,7 @@ EOF
     while true; do
         prompt_default BACKEND_PORT "AWG backend port (AWG will be moved here)" "${BACKEND_PORT}"
         if [[ ! "${BACKEND_PORT}" =~ ^[0-9]+$ ]] || \
-           (( BACKEND_PORT < 1 || BACKEND_PORT > 65535 )); then
+           (( 10#${BACKEND_PORT} < 1 || 10#${BACKEND_PORT} > 65535 )); then
             warn "Backend port must be a number between 1 and 65535."
             continue
         fi
@@ -1053,12 +1053,12 @@ Re-run with: --listen-port <port>"
     fi
 
     if ! [[ "${LISTEN_PORT}" =~ ^[0-9]+$ ]] || \
-       (( LISTEN_PORT < 1 || LISTEN_PORT > 65535 )); then
+       (( 10#${LISTEN_PORT} < 1 || 10#${LISTEN_PORT} > 65535 )); then
         die "Invalid --listen-port: ${LISTEN_PORT}. Must be 1–65535."
     fi
 
     if ! [[ "${BACKEND_PORT}" =~ ^[0-9]+$ ]] || \
-       (( BACKEND_PORT < 1 || BACKEND_PORT > 65535 )); then
+       (( 10#${BACKEND_PORT} < 1 || 10#${BACKEND_PORT} > 65535 )); then
         die "Invalid --backend-port: ${BACKEND_PORT}. Must be 1–65535."
     fi
 
