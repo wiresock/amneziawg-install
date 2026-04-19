@@ -1822,6 +1822,12 @@ main() {
         _execstart_line="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null)" || true
         if [[ -n "${_execstart_line}" ]]; then
             read -r _unit_exec _unit_cfg _unit_rest <<< "${_execstart_line#ExecStart=}" || true
+            # Strip surrounding double or single quotes that may appear in
+            # manually-edited unit files (e.g. ExecStart="/path/bin" "/path/cfg")
+            _unit_exec="${_unit_exec#\"}"; _unit_exec="${_unit_exec%\"}"
+            _unit_exec="${_unit_exec#\'}"; _unit_exec="${_unit_exec%\'}"
+            _unit_cfg="${_unit_cfg#\"}";   _unit_cfg="${_unit_cfg%\"}"
+            _unit_cfg="${_unit_cfg#\'}";   _unit_cfg="${_unit_cfg%\'}"
         fi
         _unit_workdir="$(grep -m1 '^WorkingDirectory=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
                        | sed 's/^WorkingDirectory=//')" || true
@@ -1833,8 +1839,11 @@ main() {
         _norm_unit_workdir="$(_normalize_path "${_unit_workdir}")"
         _norm_req_exec="$(_normalize_path "${INSTALL_DIR}")/amneziawg-proxy"
         _norm_req_workdir="$(_normalize_path "${DATA_DIR}")"
-        [[ -n "${_unit_exec}"    && "${_norm_unit_exec}"    != "${_norm_req_exec}"    ]] && _path_conflict=true
-        [[ -n "${_unit_cfg}"     && "${_norm_unit_cfg}"     != "${CONFIG_FILE}"       ]] && _path_conflict=true
+        # Only compare tokens that look like absolute paths.  Non-absolute tokens
+        # indicate quoted or flag-style ExecStart formats we cannot reliably
+        # decompose, so skip rather than raising a false-positive conflict.
+        [[ "${_unit_exec}" == /* && "${_norm_unit_exec}"    != "${_norm_req_exec}"    ]] && _path_conflict=true
+        [[ "${_unit_cfg}"  == /* && "${_norm_unit_cfg}"     != "${CONFIG_FILE}"       ]] && _path_conflict=true
         [[ -n "${_unit_workdir}" && "${_norm_unit_workdir}" != "${_norm_req_workdir}" ]] && _path_conflict=true
         if [[ "${_path_conflict}" == "true" ]]; then
             die "Existing service unit (${SYSTEMD_UNIT_DEST}) uses different paths from the requested options.

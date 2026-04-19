@@ -585,18 +585,32 @@ main() {
         _unit_cfg=""
         if [[ -n "${_unit_exec_line}" ]]; then
             read -r _unit_exec _unit_cfg _unit_rest <<< "${_unit_exec_line#ExecStart=}" || true
+            # Strip surrounding double or single quotes that may appear in
+            # manually-edited unit files (e.g. ExecStart="/path/bin" "/path/cfg")
+            _unit_exec="${_unit_exec#\"}"; _unit_exec="${_unit_exec%\"}"
+            _unit_exec="${_unit_exec#\'}"; _unit_exec="${_unit_exec%\'}"
+            _unit_cfg="${_unit_cfg#\"}";   _unit_cfg="${_unit_cfg%\"}"
+            _unit_cfg="${_unit_cfg#\'}";   _unit_cfg="${_unit_cfg%\'}"
         fi
         _unit_workdir="$(grep -m1 '^WorkingDirectory=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
                        | sed 's/^WorkingDirectory=//')" || true
 
-        if [[ "${_FLAG_INSTALL_DIR}" == "false" && -n "${_unit_exec}" ]]; then
-            INSTALL_DIR="$(dirname -- "${_unit_exec}")"
-            info "Auto-derived --install-dir from systemd unit: ${INSTALL_DIR}"
+        if [[ "${_FLAG_INSTALL_DIR}" == "false" ]]; then
+            if [[ "${_unit_exec}" == /* ]]; then
+                INSTALL_DIR="$(dirname -- "${_unit_exec}")"
+                info "Auto-derived --install-dir from systemd unit: ${INSTALL_DIR}"
+            elif [[ -n "${_unit_exec}" ]]; then
+                warn "Could not derive --install-dir from unit ExecStart (unexpected format: '${_unit_exec}'); falling back to default: ${INSTALL_DIR}"
+            fi
         fi
-        if [[ "${_FLAG_CONFIG_FILE}" == "false" && -n "${_unit_cfg}" ]]; then
-            CONFIG_FILE="${_unit_cfg}"
-            CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"
-            info "Auto-derived --config-file from systemd unit: ${CONFIG_FILE}"
+        if [[ "${_FLAG_CONFIG_FILE}" == "false" ]]; then
+            if [[ "${_unit_cfg}" == /* ]]; then
+                CONFIG_FILE="${_unit_cfg}"
+                CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"
+                info "Auto-derived --config-file from systemd unit: ${CONFIG_FILE}"
+            elif [[ -n "${_unit_cfg}" ]]; then
+                warn "Could not derive --config-file from unit ExecStart (unexpected format: '${_unit_cfg}'); falling back to default: ${CONFIG_FILE}"
+            fi
         fi
         if [[ "${_FLAG_DATA_DIR}" == "false" && -n "${_unit_workdir}" ]]; then
             DATA_DIR="${_unit_workdir}"
