@@ -519,6 +519,20 @@ Install python3 (e.g. 'apt install python3') and re-run the installer."
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
+# Normalize a directory path: collapse consecutive slashes and strip trailing
+# slashes so that equivalent paths (e.g. /usr/local/bin/ and /usr/local/bin)
+# compare equal.  Root (/) is returned as-is.
+_normalize_dir_path() {
+    local _p="${1:-}"
+    [[ -z "${_p}" ]] && { printf '%s' ""; return; }
+    _p="$(printf '%s' "${_p}" | sed 's|//*|/|g')"
+    if [[ "${_p}" != "/" ]]; then
+        _p="${_p%/}"
+        [[ -z "${_p}" ]] && _p="/"
+    fi
+    printf '%s' "${_p}"
+}
+
 # Return 0 if the value is a positive integer (≥ 1), 1 otherwise.
 is_positive_integer() {
     local val="$1"
@@ -1685,6 +1699,12 @@ print_summary() {
 main() {
     parse_args "$@"
 
+    # Normalize directory-style flags to strip trailing/duplicate slashes so
+    # that path comparisons and the generated unit file are slash-insensitive.
+    INSTALL_DIR="$(_normalize_dir_path "${INSTALL_DIR}")"
+    DATA_DIR="$(_normalize_dir_path "${DATA_DIR}")"
+    AWG_DIR="$(_normalize_dir_path "${AWG_DIR}")"
+
     # Validate AWG_DIR unconditionally before preflight_checks: detect_awg_config
     # (called inside preflight_checks) already uses AWG_DIR in find/glob
     # expressions, so an unsafe value must be rejected here.
@@ -1768,9 +1788,16 @@ main() {
                        | sed -En 's/^ExecStart=[^ ]+ ([^ ]+).*/\1/p')" || true
         _unit_workdir="$(grep -m1 '^WorkingDirectory=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
                        | sed 's/^WorkingDirectory=//')" || true
-        [[ -n "${_unit_exec}"    && "${_unit_exec}"    != "${INSTALL_DIR}/amneziawg-proxy" ]] && _path_conflict=true
-        [[ -n "${_unit_cfg}"     && "${_unit_cfg}"     != "${CONFIG_FILE}"                 ]] && _path_conflict=true
-        [[ -n "${_unit_workdir}" && "${_unit_workdir}" != "${DATA_DIR}"                    ]] && _path_conflict=true
+        # Normalize both sides so that equivalent paths with different trailing-
+        # or doubled-slashes do not trigger a spurious conflict.
+        local _norm_unit_exec _norm_unit_workdir _norm_req_exec _norm_req_workdir
+        _norm_unit_exec="$(_normalize_dir_path "${_unit_exec}")"
+        _norm_unit_workdir="$(_normalize_dir_path "${_unit_workdir}")"
+        _norm_req_exec="$(_normalize_dir_path "${INSTALL_DIR}")/amneziawg-proxy"
+        _norm_req_workdir="$(_normalize_dir_path "${DATA_DIR}")"
+        [[ -n "${_unit_exec}"    && "${_norm_unit_exec}"    != "${_norm_req_exec}"    ]] && _path_conflict=true
+        [[ -n "${_unit_cfg}"     && "${_unit_cfg}"          != "${CONFIG_FILE}"       ]] && _path_conflict=true
+        [[ -n "${_unit_workdir}" && "${_norm_unit_workdir}" != "${_norm_req_workdir}" ]] && _path_conflict=true
         if [[ "${_path_conflict}" == "true" ]]; then
             die "Existing service unit (${SYSTEMD_UNIT_DEST}) uses different paths from the requested options.
   Unit ExecStart binary: ${_unit_exec:-unknown}    (requested: ${INSTALL_DIR}/amneziawg-proxy)
