@@ -288,11 +288,13 @@ Only systemd-based Linux distributions are supported."
 }
 
 check_awg_binary() {
-    if [[ ! -x "/usr/bin/awg" ]]; then
-        die "AWG binary not found or not executable at: /usr/bin/awg
+    local awg_bin
+    awg_bin="$(command -v awg 2>/dev/null || true)"
+    if [[ -z "${awg_bin}" || ! -x "${awg_bin}" ]]; then
+        die "AWG binary not found in PATH or is not executable.
 Install AmneziaWG first (https://github.com/wiresock/amneziawg-install)."
     fi
-    info "AWG binary: /usr/bin/awg"
+    info "AWG binary: ${awg_bin}"
 }
 
 # ── AWG configuration detection ───────────────────────────────────────────────
@@ -403,10 +405,6 @@ Install the ca-certificates package, or install Rust manually and re-run."
         die "Failed to install Rust toolchain via rustup."
     fi
 
-    if [[ -f "${HOME}/.cargo/env" ]]; then
-        # shellcheck source=/dev/null
-        . "${HOME}/.cargo/env"
-    fi
     export PATH="${HOME}/.cargo/bin:${PATH}"
 
     if ! command -v cargo &>/dev/null; then

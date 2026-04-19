@@ -65,7 +65,7 @@ run_install_helper() {
     local -a helper_args=("$@")
     (
         set --  # Clear $@ so the sourced script's arg parser sees no args
-        source "${INSTALL_SCRIPT}" 2>/dev/null
+        source "${INSTALL_SCRIPT}"
         # Suppress logging so test output stays clean
         info()  { :; }
         warn()  { :; }
@@ -81,7 +81,7 @@ run_uninstall_helper() {
     local -a helper_args=("$@")
     (
         set --  # Clear $@ so the sourced script's top-level arg parser sees no args
-        source "${UNINSTALL_SCRIPT}" 2>/dev/null
+        source "${UNINSTALL_SCRIPT}"
         info() { :; }
         warn() { :; }
         "${helper_name}" "${helper_args[@]}"
