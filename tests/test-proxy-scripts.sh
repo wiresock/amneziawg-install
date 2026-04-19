@@ -100,6 +100,8 @@ echo "=== is_positive_integer ==="
 assert_rc 0 is_positive_integer "1"
 assert_rc 0 is_positive_integer "42"
 assert_rc 0 is_positive_integer "300"
+assert_rc 0 is_positive_integer "010"        # leading-zero: decimal 10 (not octal) with 10# prefix
+assert_rc 0 is_positive_integer "08"         # leading-zero: decimal 8 (not octal error) with 10# prefix
 assert_rc 1 is_positive_integer "0"
 assert_rc 1 is_positive_integer "-1"
 assert_rc 1 is_positive_integer ""

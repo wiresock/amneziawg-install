@@ -43,6 +43,14 @@ CONFIG_FILE="${DEFAULT_CONFIG_FILE}"
 DATA_DIR="${DEFAULT_DATA_DIR}"
 AWG_DIR="${DEFAULT_AWG_DIR}"
 
+# Track which path flags were explicitly provided by the caller.
+# When a flag is absent, main() auto-derives the path from the installed
+# systemd unit (ExecStart / WorkingDirectory) so that custom installs are
+# correctly handled without the caller having to repeat all the path flags.
+_FLAG_INSTALL_DIR=false
+_FLAG_CONFIG_FILE=false
+_FLAG_DATA_DIR=false
+
 PURGE_CONFIG="false"
 PURGE_DATA="false"
 RESTORE_AWG="false"
@@ -103,14 +111,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         case "$1" in
             --install-dir)
                 [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
-                INSTALL_DIR="$2"; shift 2 ;;
+                INSTALL_DIR="$2"; _FLAG_INSTALL_DIR=true; shift 2 ;;
             --config-file)
                 [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
                 [[ "$2" != */ ]] || die "--config-file must be a file path, not a directory-style path ending with '/': $2"
-                CONFIG_FILE="$2"; CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"; shift 2 ;;
+                CONFIG_FILE="$2"; CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"; _FLAG_CONFIG_FILE=true; shift 2 ;;
             --data-dir)
                 [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
-                DATA_DIR="$2"; shift 2 ;;
+                DATA_DIR="$2"; _FLAG_DATA_DIR=true; shift 2 ;;
             --awg-dir)
                 [[ $# -ge 2 ]] || die "Missing value for option: $1  (use --help for usage)"
                 AWG_DIR="$2"; shift 2 ;;
@@ -359,7 +367,7 @@ restore_awg_listen_port() {
 
     # Validate that the parsed port is a plain integer in 1–65535 range.
     if ! [[ "${PROXY_LISTEN_PORT}" =~ ^[0-9]+$ ]] || \
-       (( PROXY_LISTEN_PORT < 1 || PROXY_LISTEN_PORT > 65535 )); then
+       (( 10#${PROXY_LISTEN_PORT} < 1 || 10#${PROXY_LISTEN_PORT} > 65535 )); then
         warn "Parsed listen port '${PROXY_LISTEN_PORT}' is not a valid port number; skipping restore."
         return 0
     fi
@@ -559,6 +567,35 @@ print_plan() {
 # ── Main uninstall ─────────────────────────────────────────────────────────────
 
 main() {
+    # If the systemd unit is installed and a path flag was not explicitly
+    # provided, auto-derive the missing paths from the unit's ExecStart and
+    # WorkingDirectory directives.  This ensures that a custom-path install
+    # (--install-dir / --config-file / --data-dir) is correctly uninstalled
+    # without requiring the caller to repeat every path flag.
+    if [[ -f "${SYSTEMD_UNIT_DEST}" ]]; then
+        local _unit_exec _unit_cfg _unit_workdir
+        _unit_exec="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
+                       | sed 's/^ExecStart=//; s/ .*//')" || true
+        _unit_cfg="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
+                       | sed -En 's/^ExecStart=[^ ]+ ([^ ]+).*/\1/p')" || true
+        _unit_workdir="$(grep -m1 '^WorkingDirectory=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
+                       | sed 's/^WorkingDirectory=//')" || true
+
+        if [[ "${_FLAG_INSTALL_DIR}" == "false" && -n "${_unit_exec}" ]]; then
+            INSTALL_DIR="$(dirname -- "${_unit_exec}")"
+            info "Auto-derived --install-dir from systemd unit: ${INSTALL_DIR}"
+        fi
+        if [[ "${_FLAG_CONFIG_FILE}" == "false" && -n "${_unit_cfg}" ]]; then
+            CONFIG_FILE="${_unit_cfg}"
+            CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"
+            info "Auto-derived --config-file from systemd unit: ${CONFIG_FILE}"
+        fi
+        if [[ "${_FLAG_DATA_DIR}" == "false" && -n "${_unit_workdir}" ]]; then
+            DATA_DIR="${_unit_workdir}"
+            info "Auto-derived --data-dir from systemd unit: ${DATA_DIR}"
+        fi
+    fi
+
     # Validate user-provided paths before performing any destructive operations.
     # Relative paths or paths containing whitespace/newlines could lead to
     # removing unintended files or injecting extra arguments.

@@ -522,7 +522,7 @@ Install python3 (e.g. 'apt install python3') and re-run the installer."
 # Return 0 if the value is a positive integer (≥ 1), 1 otherwise.
 is_positive_integer() {
     local val="$1"
-    [[ "${val}" =~ ^[0-9]+$ ]] && (( val >= 1 ))
+    [[ "${val}" =~ ^[0-9]+$ ]] && (( 10#${val} >= 1 ))
 }
 
 # Escape characters that are special in a sed replacement string: &, \, and |
