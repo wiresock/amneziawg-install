@@ -1481,8 +1481,9 @@ reconfigure_awg_listen_port() {
         warn "WARNING: ${AWG_CONF_FILE} does not contain a ListenAddr directive."
         warn "AWG will listen on port ${BACKEND_PORT} on ALL interfaces after this change,"
         warn "making the backend port publicly reachable without going through the proxy."
-        warn "Add firewall rules to restrict access (e.g. via a PostUp rule):"
+        warn "Add firewall rules to restrict ${BACKEND_PORT}/udp to loopback only (for example via PostUp rules):"
         warn "  PostUp = iptables -I INPUT -p udp --dport ${BACKEND_PORT} ! -s 127.0.0.0/8 -j DROP"
+        warn "  PostUp = ip6tables -I INPUT -p udp --dport ${BACKEND_PORT} ! -s ::1/128 -j DROP"
         if [[ "${NON_INTERACTIVE}" != "true" ]]; then
             local proceed_anyway=false
             prompt_yesno proceed_anyway \
@@ -1819,11 +1820,11 @@ main() {
     # config and restart the interface before install_service_unit discovers
     # the conflict, leaving AWG and the running proxy service out of sync.
     if [[ -f "${SYSTEMD_UNIT_DEST}" ]] && [[ "${FORCE}" != "true" ]]; then
-        local _unit_exec _unit_cfg _unit_workdir _path_conflict=false
-        _unit_exec="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
-                       | sed 's/^ExecStart=//; s/ .*//')" || true
-        _unit_cfg="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
-                       | sed -En 's/^ExecStart=[^ ]+ ([^ ]+).*/\1/p')" || true
+        local _execstart_line _unit_exec="" _unit_cfg="" _unit_rest="" _unit_workdir _path_conflict=false
+        _execstart_line="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null)" || true
+        if [[ -n "${_execstart_line}" ]]; then
+            read -r _unit_exec _unit_cfg _unit_rest <<< "${_execstart_line#ExecStart=}" || true
+        fi
         _unit_workdir="$(grep -m1 '^WorkingDirectory=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
                        | sed 's/^WorkingDirectory=//')" || true
         # Normalize both sides so that equivalent paths with different trailing-

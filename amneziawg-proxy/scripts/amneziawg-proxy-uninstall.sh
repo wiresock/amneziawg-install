@@ -573,10 +573,13 @@ main() {
     # (--install-dir / --config-file / --data-dir) is correctly uninstalled
     # without requiring the caller to repeat every path flag.
     if [[ -f "${SYSTEMD_UNIT_DEST}" ]]; then
-        local _unit_exec_line _unit_exec _unit_cfg _unit_workdir
+        local _unit_exec_line _unit_exec _unit_cfg _unit_workdir _unit_rest
         _unit_exec_line="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null)" || true
-        _unit_exec="$(printf '%s' "${_unit_exec_line}" | sed 's/^ExecStart=//; s/ .*//')" || true
-        _unit_cfg="$(printf '%s' "${_unit_exec_line}" | sed -En 's/^ExecStart=[^ ]+ ([^ ]+).*/\1/p')" || true
+        _unit_exec=""
+        _unit_cfg=""
+        if [[ -n "${_unit_exec_line}" ]]; then
+            read -r _unit_exec _unit_cfg _unit_rest <<< "${_unit_exec_line#ExecStart=}" || true
+        fi
         _unit_workdir="$(grep -m1 '^WorkingDirectory=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
                        | sed 's/^WorkingDirectory=//')" || true
 
