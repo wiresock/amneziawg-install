@@ -185,7 +185,13 @@ safe_rm_file() {
 #   5. die — canonicalization is required for safe deletion; if no method is
 #      available the operation is aborted to prevent bypassing prefix checks.
 _canon_path() {
-    local p="${1%/}"
+    local p
+    if [[ "${1}" == "/" ]]; then
+        p="/"
+    else
+        p="${1%/}"
+        [[ -n "${p}" ]] || p="/"
+    fi
     local result
     if result="$(realpath -m -- "${p}" 2>/dev/null)" && [[ -n "${result}" ]]; then
         printf '%s' "${result}"; return
@@ -338,12 +344,12 @@ read_proxy_config_ports() {
     local listen_value backend_value
     # Extract listen port from: listen = "host:port" or listen = "[ipv6]:port"
     listen_value="$(grep -E '^[[:space:]]*listen[[:space:]]*=' "${cfg}" \
-        | head -1 | sed -e 's/.*=[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//')" || true
+        | head -1 | sed -e 's/^[^=]*=[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//')" || true
     PROXY_LISTEN_PORT="$(extract_endpoint_port "${listen_value}")" || true
 
     # Extract backend port from: backend = "host:port" or backend = "[ipv6]:port"
     backend_value="$(grep -E '^[[:space:]]*backend[[:space:]]*=' "${cfg}" \
-        | head -1 | sed -e 's/.*=[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//')" || true
+        | head -1 | sed -e 's/^[^=]*=[[:space:]]*//' -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//')" || true
     PROXY_BACKEND_PORT="$(extract_endpoint_port "${backend_value}")" || true
 
     [[ -n "${PROXY_LISTEN_PORT}" ]]
