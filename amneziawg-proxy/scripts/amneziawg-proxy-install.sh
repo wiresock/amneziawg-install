@@ -289,7 +289,7 @@ Only systemd-based Linux distributions are supported."
 
 check_awg_binary() {
     local awg_bin
-    awg_bin="$(command -v awg 2>/dev/null || true)"
+    awg_bin="$(command -v awg 2>/dev/null)"
     if [[ -z "${awg_bin}" || ! -x "${awg_bin}" ]]; then
         die "AWG binary not found in PATH or is not executable.
 Install AmneziaWG first (https://github.com/wiresock/amneziawg-install)."
