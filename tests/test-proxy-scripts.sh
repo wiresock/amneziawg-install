@@ -252,9 +252,17 @@ assert_eq "8080" "${result}" "extract_endpoint_port [2001:db8::1]:8080"
 result="$(extract_endpoint_port '"127.0.0.1:51821"')"
 assert_eq "51821" "${result}" "extract_endpoint_port quoted 127.0.0.1:51821"
 
+# Single-quoted endpoint (valid TOML)
+result="$(extract_endpoint_port "'127.0.0.1:51821'")"
+assert_eq "51821" "${result}" "extract_endpoint_port single-quoted 127.0.0.1:51821"
+
 # Quoted bracketed IPv6
 result="$(extract_endpoint_port '"[::1]:9999"')"
 assert_eq "9999" "${result}" "extract_endpoint_port quoted [::1]:9999"
+
+# Single-quoted bracketed IPv6 (valid TOML)
+result="$(extract_endpoint_port "'[::1]:9999'")"
+assert_eq "9999" "${result}" "extract_endpoint_port single-quoted [::1]:9999"
 
 # Whitespace around endpoint
 result="$(extract_endpoint_port "  10.0.0.1:12345  ")"
@@ -318,6 +326,16 @@ backend = "[::1]:51821" # loopback v6
 TOML
 result="$(run_read_ports "${tmp_cfg}")"
 assert_eq "51820|51821" "${result}" "read_proxy_config_ports IPv6 with comments"
+rm -f "${tmp_cfg}"
+
+# Single-quoted TOML values (valid TOML literal strings)
+tmp_cfg="$(mktemp)"
+cat > "${tmp_cfg}" <<'TOML'
+listen = '0.0.0.0:51820'
+backend = '127.0.0.1:51821'
+TOML
+result="$(run_read_ports "${tmp_cfg}")"
+assert_eq "51820|51821" "${result}" "read_proxy_config_ports single-quoted values"
 rm -f "${tmp_cfg}"
 
 # ── _is_valid_ip_literal ──────────────────────────────────────────────────────
@@ -416,6 +434,9 @@ _validate_dns_upstream() { run_install_helper _validate_dns_upstream "$@"; }
 assert_rc 0 _validate_dns_upstream "1.1.1.1:53"
 assert_rc 0 _validate_dns_upstream "8.8.8.8:53"
 assert_rc 0 _validate_dns_upstream "192.168.1.1:5353"
+# Valid: leading-zero decimal ports (regression coverage for bash octal parsing)
+assert_rc 0 _validate_dns_upstream "1.1.1.1:053"
+assert_rc 0 _validate_dns_upstream "1.1.1.1:08"
 # Valid: bracketed IPv6
 assert_rc 0 _validate_dns_upstream "[::1]:53"
 assert_rc 0 _validate_dns_upstream "[2001:db8::1]:53"

@@ -1051,7 +1051,7 @@ _validate_dns_upstream() {
         die "--dns-upstream must be host:port (got: '${val}'). Use [ipv6]:port for IPv6."
     fi
 
-    if ! [[ "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    if ! [[ "${port}" =~ ^[0-9]+$ ]] || (( 10#${port} < 1 || 10#${port} > 65535 )); then
         die "--dns-upstream port must be 1–65535 (got: '${port}')."
     fi
 

@@ -316,7 +316,7 @@ systemctl_if_enabled() {
 # Returns the numeric port on stdout, or nothing if it cannot be parsed.
 extract_endpoint_port() {
     local endpoint="$1"
-    endpoint="$(printf '%s' "${endpoint}" | tr -d '[:space:]"')"
+    endpoint="$(printf '%s' "${endpoint}" | tr -d "[:space:]\"'")"
     if [[ "${endpoint}" =~ ^\[[^\]]+\]:([0-9]+)$ ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
         return 0
