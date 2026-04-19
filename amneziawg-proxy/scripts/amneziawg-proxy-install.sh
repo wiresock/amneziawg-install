@@ -695,6 +695,19 @@ EOF
             continue
         fi
         BACKEND_HOST="$(_format_host_for_socketaddr "${BACKEND_HOST}")"
+        if ! _is_loopback_ip "${BACKEND_HOST}"; then
+            warn "WARNING: '${BACKEND_HOST}' is not a loopback address."
+            warn "AWG may be directly reachable on this address, bypassing the proxy."
+            warn "Ensure firewall rules restrict access to the backend port."
+            local _proceed_nonloop=false
+            prompt_yesno _proceed_nonloop \
+                "Continue with non-loopback backend host '${BACKEND_HOST}'?" \
+                false
+            if [[ "${_proceed_nonloop}" != "true" ]]; then
+                BACKEND_HOST="${DEFAULT_BACKEND_HOST}"
+                continue
+            fi
+        fi
         break
     done
     while true; do
@@ -1028,6 +1041,22 @@ _format_host_for_socketaddr() {
     printf '%s' "${host}"
 }
 
+# Return 0 if the given host is a loopback address (IPv4 127.x.x.x or IPv6 ::1).
+# Accepts bare IPv6 or bracketed-IPv6 (e.g. [::1]).  Requires python3.
+_is_loopback_ip() {
+    local host="$1"
+    # Strip brackets for IPv6 (e.g. [::1] → ::1)
+    [[ "${host}" == \[*\] ]] && host="${host#\[}" && host="${host%\]}"
+    printf '%s' "${host}" | python3 -c "
+import sys, ipaddress
+try:
+    if not ipaddress.ip_address(sys.stdin.read()).is_loopback:
+        sys.exit(1)
+except ValueError:
+    sys.exit(1)
+" 2>/dev/null
+}
+
 # Validate a DNS upstream value as host:port suitable for SocketAddr.
 # Extracts the host (IPv4 or bracketed IPv6) and port, validates the host as an
 # IP literal and the port as 1–65535.  Dies with a descriptive message on failure.
@@ -1121,6 +1150,14 @@ Re-run with: --listen-port <port>"
         # Auto-bracket bare IPv6 for SocketAddr compatibility
         printf -v "${host_var}" '%s' "$(_format_host_for_socketaddr "${host_val}")"
     done
+
+    # Warn (non-interactive) when BACKEND_HOST is not a loopback address: AWG
+    # may remain reachable directly, bypassing the proxy.
+    if ! _is_loopback_ip "${BACKEND_HOST}"; then
+        warn "WARNING: --backend-host '${BACKEND_HOST}' is not a loopback address."
+        warn "AWG may be directly reachable on this address, bypassing the proxy."
+        warn "Ensure firewall rules restrict access to the backend port."
+    fi
 
     # Protocol allowlist is checked in validate_config() (shared path).
 
@@ -1702,6 +1739,7 @@ main() {
     # Normalize directory-style flags to strip trailing/duplicate slashes so
     # that path comparisons and the generated unit file are slash-insensitive.
     INSTALL_DIR="$(_normalize_path "${INSTALL_DIR}")"
+    CONFIG_FILE="$(_normalize_path "${CONFIG_FILE}")"
     DATA_DIR="$(_normalize_path "${DATA_DIR}")"
     AWG_DIR="$(_normalize_path "${AWG_DIR}")"
 
@@ -1790,13 +1828,14 @@ main() {
                        | sed 's/^WorkingDirectory=//')" || true
         # Normalize both sides so that equivalent paths with different trailing-
         # or doubled-slashes do not trigger a spurious conflict.
-        local _norm_unit_exec _norm_unit_workdir _norm_req_exec _norm_req_workdir
+        local _norm_unit_exec _norm_unit_cfg _norm_unit_workdir _norm_req_exec _norm_req_workdir
         _norm_unit_exec="$(_normalize_path "${_unit_exec}")"
+        _norm_unit_cfg="$(_normalize_path "${_unit_cfg}")"
         _norm_unit_workdir="$(_normalize_path "${_unit_workdir}")"
         _norm_req_exec="$(_normalize_path "${INSTALL_DIR}")/amneziawg-proxy"
         _norm_req_workdir="$(_normalize_path "${DATA_DIR}")"
         [[ -n "${_unit_exec}"    && "${_norm_unit_exec}"    != "${_norm_req_exec}"    ]] && _path_conflict=true
-        [[ -n "${_unit_cfg}"     && "${_unit_cfg}"          != "${CONFIG_FILE}"       ]] && _path_conflict=true
+        [[ -n "${_unit_cfg}"     && "${_norm_unit_cfg}"     != "${CONFIG_FILE}"       ]] && _path_conflict=true
         [[ -n "${_unit_workdir}" && "${_norm_unit_workdir}" != "${_norm_req_workdir}" ]] && _path_conflict=true
         if [[ "${_path_conflict}" == "true" ]]; then
             die "Existing service unit (${SYSTEMD_UNIT_DEST}) uses different paths from the requested options.

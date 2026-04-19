@@ -121,9 +121,9 @@ manage_menu() {
             echo "Uninstall options:"
             echo "   1) Uninstall with safe defaults"
             echo "   2) Uninstall and restore AWG"
-            echo "   3) Uninstall and purge generated config"
-            echo "   4) Uninstall and purge data"
-            echo "   5) Uninstall and purge config + data"
+            echo "   3) Uninstall and purge generated config (default path only)"
+            echo "   4) Uninstall and purge data (default path only)"
+            echo "   5) Uninstall and purge config + data (default paths only)"
             echo "   6) Cancel"
 
             local uninstall_option=""
