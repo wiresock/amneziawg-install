@@ -175,6 +175,20 @@ safe_rm_file() {
     fi
 }
 
+# _normalize_path: collapse consecutive slashes and strip trailing slashes so
+# that equivalent paths (e.g. /etc//amneziawg-proxy/ and /etc/amneziawg-proxy)
+# compare equal.  Root (/) is returned as-is.
+_normalize_path() {
+    local _p="${1:-}"
+    [[ -z "${_p}" ]] && { printf '%s' ""; return; }
+    _p="$(printf '%s' "${_p}" | sed 's|//*|/|g')"
+    if [[ "${_p}" != "/" ]]; then
+        _p="${_p%/}"
+        [[ -z "${_p}" ]] && _p="/"
+    fi
+    printf '%s' "${_p}"
+}
+
 # _canon_path: canonicalize a path, resolving symlinked parent directories.
 # Attempts in order:
 #   1. realpath -m  (GNU coreutils; path need not exist)
@@ -639,10 +653,11 @@ main() {
         fi
     done
 
-    # Strip trailing slashes from DATA_DIR and CONFIG_DIR so case-match against
-    # DEFAULT_*_DIR works even when users pass e.g. --data-dir /var/lib/amneziawg-proxy/
-    CONFIG_DIR="${CONFIG_DIR%/}"
-    DATA_DIR="${DATA_DIR%/}"
+    # Normalize CONFIG_DIR and DATA_DIR: collapse consecutive slashes and strip
+    # trailing slashes so that case-matches against DEFAULT_*_DIR are correct
+    # even for paths like /etc//amneziawg-proxy/ or /var/lib/amneziawg-proxy/
+    CONFIG_DIR="$(_normalize_path "${CONFIG_DIR}")"
+    DATA_DIR="$(_normalize_path "${DATA_DIR}")"
 
     # Validate purge directory restrictions early, before any destructive work,
     # so invalid --purge-config/--purge-data arguments fail fast and predictably

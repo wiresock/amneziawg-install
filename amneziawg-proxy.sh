@@ -37,12 +37,23 @@ _get_binary_path() {
         exec_start="$(grep -m1 '^ExecStart=' "${SYSTEMD_UNIT}" 2>/dev/null || true)"
         if [[ -n "${exec_start}" ]]; then
             # ExecStart=/path/to/amneziawg-proxy /path/to/proxy.toml
-            # Strip "ExecStart=" prefix and take the first token (the binary).
-            local bin_path
-            bin_path="$(printf '%s' "${exec_start#ExecStart=}" | awk '{print $1}')"
+            # Split the payload into tokens and strip surrounding quotes from
+            # the first token (the binary path) so quoted unit files are handled.
+            local exec_payload bin_path rest
+            exec_payload="${exec_start#ExecStart=}"
+            read -r bin_path rest <<< "${exec_payload}"
             if [[ -n "${bin_path}" ]]; then
-                printf '%s' "${bin_path}"
-                return
+                if [[ "${bin_path}" == \"*\" ]]; then
+                    bin_path="${bin_path#\"}"
+                    bin_path="${bin_path%\"}"
+                elif [[ "${bin_path}" == \'*\' ]]; then
+                    bin_path="${bin_path#\'}"
+                    bin_path="${bin_path%\'}"
+                fi
+                if [[ -n "${bin_path}" ]]; then
+                    printf '%s' "${bin_path}"
+                    return
+                fi
             fi
         fi
     fi
