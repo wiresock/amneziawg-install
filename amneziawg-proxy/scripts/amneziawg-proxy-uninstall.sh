@@ -613,11 +613,11 @@ main() {
         _unit_workdir="${_unit_workdir#\'}"; _unit_workdir="${_unit_workdir%\'}"
 
         if [[ "${_FLAG_INSTALL_DIR}" == "false" ]]; then
-            if [[ "${_unit_exec}" == /* ]]; then
+            if [[ "${_unit_exec}" == /* && "$(basename -- "${_unit_exec}")" == "${BINARY_NAME}" ]]; then
                 INSTALL_DIR="$(dirname -- "${_unit_exec}")"
                 info "Auto-derived --install-dir from systemd unit: ${INSTALL_DIR}"
             elif [[ -n "${_unit_exec}" ]]; then
-                warn "Could not derive --install-dir from unit ExecStart (unexpected format: '${_unit_exec}'); falling back to default: ${INSTALL_DIR}"
+                warn "Could not safely derive --install-dir from unit ExecStart (first token is not '${BINARY_NAME}': '${_unit_exec}'); keeping current value: ${INSTALL_DIR}. If the service uses a wrapper, pass --install-dir explicitly."
             fi
         fi
         if [[ "${_FLAG_CONFIG_FILE}" == "false" ]]; then

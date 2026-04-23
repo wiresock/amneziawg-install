@@ -50,7 +50,7 @@ _get_binary_path() {
                     bin_path="${bin_path#\'}"
                     bin_path="${bin_path%\'}"
                 fi
-                if [[ -n "${bin_path}" ]]; then
+                if [[ -n "${bin_path}" && "$(basename -- "${bin_path}")" == 'amneziawg-proxy' ]]; then
                     printf '%s' "${bin_path}"
                     return
                 fi
