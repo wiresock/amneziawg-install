@@ -324,6 +324,7 @@ impl Proxy {
                 // Remove orphaned metrics entry — without a session, the
                 // cleanup task will never expire this client's metrics.
                 self.metrics.remove(&client_addr);
+                self.client_protocols.remove(&client_addr);
             }
         }
     }
@@ -452,6 +453,7 @@ impl Proxy {
     fn spawn_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
         let sessions = Arc::clone(&self.sessions);
         let metrics = Arc::clone(&self.metrics);
+        let client_protocols = Arc::clone(&self.client_protocols);
         let relay_handles = Arc::clone(&self.relay_handles);
         let interval = Duration::from_secs(self.config.cleanup_interval_secs);
 
@@ -463,6 +465,7 @@ impl Proxy {
                 let expired = sessions.cleanup_expired();
                 for addr in &expired {
                     metrics.remove(addr);
+                    client_protocols.remove(addr);
                     // Abort the relay task for the expired session
                     if let Some((_, entry)) = relay_handles.remove(addr) {
                         entry.handle.abort();

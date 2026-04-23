@@ -23,6 +23,8 @@ struct DynamicSniResolver {
 }
 
 impl DynamicSniResolver {
+    const MAX_CACHE_ENTRIES: usize = 256;
+
     fn new(default_domain: &str) -> anyhow::Result<Self> {
         let mut cache = HashMap::new();
         let default_key = generate_certified_key(default_domain)?;
@@ -31,6 +33,48 @@ impl DynamicSniResolver {
             default_domain: default_domain.to_string(),
             cache: Mutex::new(cache),
         })
+    }
+
+    fn is_valid_sni_hostname(name: &str) -> bool {
+        if name.is_empty() || name.len() > 253 {
+            return false;
+        }
+        if name.starts_with('.') || name.ends_with('.') {
+            return false;
+        }
+        name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
+    }
+
+    fn cache_get(&self, name: &str) -> Option<Arc<CertifiedKey>> {
+        self.cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(name).cloned())
+    }
+
+    fn cache_insert(&self, name: String, key: Arc<CertifiedKey>) -> Arc<CertifiedKey> {
+        if let Ok(mut cache) = self.cache.lock() {
+            if let Some(existing) = cache.get(&name) {
+                return Arc::clone(existing);
+            }
+            if cache.len() >= Self::MAX_CACHE_ENTRIES {
+                if let Some(evict_key) = cache
+                    .keys()
+                    .find(|k| k.as_str() != self.default_domain.as_str())
+                    .cloned()
+                {
+                    cache.remove(&evict_key);
+                }
+            }
+            cache.insert(name, Arc::clone(&key));
+        }
+        key
     }
 }
 
@@ -48,27 +92,26 @@ impl ResolvesServerCert for DynamicSniResolver {
             .server_name()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or(&self.default_domain)
+            .unwrap_or("")
             .to_ascii_lowercase();
 
-        if let Ok(cache) = self.cache.lock() {
-            if let Some(ck) = cache.get(&requested) {
-                return Some(Arc::clone(ck));
+        if requested == self.default_domain {
+            return self
+                .cache_get(&self.default_domain)
+                .or_else(|| generate_certified_key(&self.default_domain).ok());
+        }
+
+        if Self::is_valid_sni_hostname(&requested) {
+            if let Some(ck) = self.cache_get(&requested) {
+                return Some(ck);
+            }
+            if let Ok(generated) = generate_certified_key(&requested) {
+                return Some(self.cache_insert(requested, generated));
             }
         }
 
-        let generated = generate_certified_key(&requested)
-            .or_else(|_| generate_certified_key(&self.default_domain))
-            .ok()?;
-
-        if let Ok(mut cache) = self.cache.lock() {
-            let entry = cache
-                .entry(requested)
-                .or_insert_with(|| Arc::clone(&generated));
-            return Some(Arc::clone(entry));
-        }
-
-        Some(generated)
+        self.cache_get(&self.default_domain)
+            .or_else(|| generate_certified_key(&self.default_domain).ok())
     }
 }
 
