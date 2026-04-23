@@ -984,7 +984,7 @@ _is_valid_ip_literal() {
     # Validate bracket pairing: both or neither bracket must be present.
     local has_open=0 has_close=0
     [[ "${host}" == \[* ]] && has_open=1
-    [[ "${host}" == *\] ]] && has_close=1
+    [[ "${host}" == *']' ]] && has_close=1
     if (( has_open != has_close )); then
         return 1
     fi
