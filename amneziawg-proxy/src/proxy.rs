@@ -564,6 +564,10 @@ mod tests {
         // readiness signal — the proxy responds to QUIC probes directly, so we
         // retry until we get a version-negotiation response.
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Minimal QUIC Initial-like probe:
+        // - long header first byte + version (1)
+        // - DCID length (4) + DCID bytes
+        // - SCID length (0)
         let mut quic_pkt = vec![0xC3u8, 0x00, 0x00, 0x00, 0x01];
         quic_pkt.push(4);
         quic_pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
