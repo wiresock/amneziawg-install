@@ -1831,6 +1831,9 @@ main() {
         fi
         _unit_workdir="$(grep -m1 '^WorkingDirectory=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
                        | sed 's/^WorkingDirectory=//')" || true
+        # Strip surrounding double or single quotes (e.g. WorkingDirectory="/path")
+        _unit_workdir="${_unit_workdir#\"}"; _unit_workdir="${_unit_workdir%\"}"
+        _unit_workdir="${_unit_workdir#\'}"; _unit_workdir="${_unit_workdir%\'}"
         # Normalize both sides so that equivalent paths with different trailing-
         # or doubled-slashes do not trigger a spurious conflict.
         local _norm_unit_exec _norm_unit_cfg _norm_unit_workdir _norm_req_exec _norm_req_workdir

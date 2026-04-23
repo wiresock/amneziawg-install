@@ -608,6 +608,9 @@ main() {
         fi
         _unit_workdir="$(grep -m1 '^WorkingDirectory=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null \
                        | sed 's/^WorkingDirectory=//')" || true
+        # Strip surrounding double or single quotes (e.g. WorkingDirectory="/path")
+        _unit_workdir="${_unit_workdir#\"}"; _unit_workdir="${_unit_workdir%\"}"
+        _unit_workdir="${_unit_workdir#\'}"; _unit_workdir="${_unit_workdir%\'}"
 
         if [[ "${_FLAG_INSTALL_DIR}" == "false" ]]; then
             if [[ "${_unit_exec}" == /* ]]; then
