@@ -248,17 +248,21 @@ impl Proxy {
                 if let Some(ref metrics) = metrics_ref {
                     if proto == Protocol::Quic {
                         if let Some(quic) = &self.quic_handshake {
-                            let (is_continuation, responses) = {
+                            let (is_continuation, responses, probe_allowed) = {
                                 let mut responder = quic.lock().await;
                                 let continuation = responder.has_active_connection(client_addr);
                                 let allowed = continuation || metrics.try_acquire_probe();
                                 if !allowed {
-                                    (continuation, Vec::new())
+                                    (continuation, Vec::new(), false)
                                 } else {
                                     if !continuation {
                                         metrics.record_probe();
                                     }
-                                    (continuation, responder.handle_datagram(client_addr, data))
+                                    (
+                                        continuation,
+                                        responder.handle_datagram(client_addr, data),
+                                        true,
+                                    )
                                 }
                             };
 
@@ -268,7 +272,7 @@ impl Proxy {
                                 debug!(%client_addr, "probe rate limited");
                             }
 
-                            if !is_continuation {
+                            if probe_allowed && !is_continuation {
                                 let fallback_needed = {
                                     let responder = quic.lock().await;
                                     !responder.has_active_connection(client_addr)
@@ -609,5 +613,60 @@ mod tests {
             .await
             .expect("proxy should shut down within 5s")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn quic_fallback_probe_respects_rate_limit() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec: 1,
+            imitate_protocol: "quic".into(),
+            quic_handshake_enabled: true,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            awg_config: None,
+        };
+
+        let proxy = Proxy::bind(config, None).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let mut quic_pkt = vec![0xC3u8, 0x00, 0x00, 0x00, 0x01];
+        quic_pkt.push(4);
+        quic_pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        quic_pkt.push(0);
+
+        let mut buf = [0u8; 4096];
+
+        proxy.handle_client_packet(&quic_pkt, client_addr).await;
+        let (n, from) = tokio::time::timeout(
+            Duration::from_millis(200),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("first probe should receive a response")
+        .unwrap();
+        assert!(n > 0);
+        assert_eq!(from, proxy_addr);
+
+        proxy.handle_client_packet(&quic_pkt, client_addr).await;
+        let second = tokio::time::timeout(
+            Duration::from_millis(200),
+            client.recv_from(&mut buf),
+        )
+        .await;
+        assert!(second.is_err(), "second probe should be rate limited");
     }
 }
