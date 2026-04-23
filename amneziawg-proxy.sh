@@ -154,7 +154,7 @@ manage_menu() {
                     ;;
             esac
 
-            exec bash "${UNINSTALLER}" ${uninstall_args[@]+"${uninstall_args[@]}"}
+            exec bash "${UNINSTALLER}" "${uninstall_args[@]}"
             ;;
         5)
             exit 0
