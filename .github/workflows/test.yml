@@ -14,7 +14,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run unit tests
-        run: bash tests/test-functions.sh
+        run: |
+          bash tests/test-functions.sh
+          bash tests/test-proxy-scripts.sh
 
   integration-tests:
     name: Integration (${{ matrix.distro }})
