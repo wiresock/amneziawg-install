@@ -224,9 +224,9 @@ impl Proxy {
 
     /// Handle a packet received from a client.
     async fn handle_client_packet(&self, data: &[u8], client_addr: SocketAddr) {
-        // Perform a single metrics lookup per client packet and reuse it for
-        // both general accounting and probe-related rate limiting, then drop
-        // before any await points.
+        // Perform a single metrics lookup per client packet and reuse the
+        // owned metrics handle for both accounting and probe-related rate
+        // limiting across async boundaries.
         let metrics_ref = self.metrics.get_or_create(client_addr);
 
         if let Some(ref metrics) = metrics_ref {
@@ -301,10 +301,7 @@ impl Proxy {
             }
         }
 
-        // Drop metrics reference before any await points.
-        drop(metrics_ref);
-
-        // Send probe response (if any) outside the metrics borrow.
+        // Send probe response (if any).
         if let Some(response) = probe_response {
             if let Err(e) = self.frontend.send_to(&response, client_addr).await {
                 warn!(%client_addr, error = %e, "failed to send probe response");
@@ -402,7 +399,6 @@ impl Proxy {
 
                         if let Some(m) = metrics.get_or_create(client_addr) {
                             m.record_out();
-                            drop(m);
                         }
 
                         sessions.touch(&client_addr);

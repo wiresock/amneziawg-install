@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 
@@ -120,7 +121,7 @@ impl ClientMetrics {
 
 /// Global metrics store keyed by client address.
 pub struct MetricsStore {
-    clients: DashMap<SocketAddr, ClientMetrics>,
+    clients: DashMap<SocketAddr, Arc<ClientMetrics>>,
     rate_limit_per_sec: u32,
     max_clients: usize,
     /// Atomic counter for the number of tracked clients, kept in sync with
@@ -140,10 +141,10 @@ impl MetricsStore {
 
     /// Get or create metrics for a client.
     /// Returns `None` if the client limit has been reached and this is a new client.
-    pub fn get_or_create(&self, addr: SocketAddr) -> Option<dashmap::mapref::one::Ref<'_, SocketAddr, ClientMetrics>> {
+    pub fn get_or_create(&self, addr: SocketAddr) -> Option<Arc<ClientMetrics>> {
         // Fast path: already exists
         if let Some(r) = self.clients.get(&addr) {
-            return Some(r);
+            return Some(Arc::clone(r.value()));
         }
         // Atomically reserve a slot before inserting. If the counter is at or
         // above the limit, reject the new client without inserting.
@@ -164,19 +165,19 @@ impl MetricsStore {
         }
         // We've reserved a slot — insert if still absent, or undo if another
         // call already inserted the same addr concurrently.
-        {
-            let entry = self.clients.entry(addr);
-            match entry {
-                dashmap::mapref::entry::Entry::Occupied(_) => {
-                    // Another task beat us to it; undo the counter bump.
-                    self.client_count.fetch_sub(1, Ordering::AcqRel);
-                }
-                dashmap::mapref::entry::Entry::Vacant(v) => {
-                    v.insert(ClientMetrics::new(self.rate_limit_per_sec));
-                }
+        let entry = self.clients.entry(addr);
+        match entry {
+            dashmap::mapref::entry::Entry::Occupied(o) => {
+                // Another task beat us to it; undo the counter bump.
+                self.client_count.fetch_sub(1, Ordering::AcqRel);
+                Some(Arc::clone(o.get()))
+            }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let metrics = Arc::new(ClientMetrics::new(self.rate_limit_per_sec));
+                v.insert(Arc::clone(&metrics));
+                Some(metrics)
             }
         }
-        self.clients.get(&addr)
     }
 
     /// Remove metrics for a client (called on session expiry).

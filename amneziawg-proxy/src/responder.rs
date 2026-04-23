@@ -852,8 +852,8 @@ mod tests {
         let params = test_awg_params();
         // Handshake Init with correct header but wrong size (should be S1+148=190 bytes)
         let mut pkt = vec![0x00; 42]; // S1 padding
-        pkt.extend_from_slice(&50u32.to_le_bytes()); // H1 header
-        pkt.extend_from_slice(&[0u8; 100]); // Only 100 bytes payload, total 142 < 190
+        pkt.extend_from_slice(&150u32.to_le_bytes()); // H1 header (within range 100-200)
+        pkt.extend_from_slice(&[0u8; 100]); // Only 100 bytes payload, total 146 < 190
         assert_eq!(classify_awg_packet(&pkt, &params), None);
     }
 

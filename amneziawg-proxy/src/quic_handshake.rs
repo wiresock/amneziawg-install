@@ -103,6 +103,8 @@ pub struct QuicResponse {
 }
 
 impl QuicHandshakeResponder {
+    const MAX_TRACKED_CONNECTIONS: usize = 2_048;
+
     pub fn new(certificate_domain: &str) -> anyhow::Result<Self> {
         let resolver = Arc::new(DynamicSniResolver::new(certificate_domain)?);
         let mut rustls_server_cfg = rustls::ServerConfig::builder()
@@ -179,8 +181,10 @@ impl QuicHandshakeResponder {
             }
             DatagramEvent::NewConnection(incoming) => {
                 let remote = incoming.remote_address();
-                if let Ok((ch, conn)) = self.endpoint.accept(incoming, now, buf, None) {
-                    self.connections.insert(ch, conn);
+                if self.connections.len() < Self::MAX_TRACKED_CONNECTIONS {
+                    if let Ok((ch, conn)) = self.endpoint.accept(incoming, now, buf, None) {
+                        self.connections.insert(ch, conn);
+                    }
                 }
                 if !buf.is_empty() {
                     out.push(QuicResponse {
@@ -199,6 +203,7 @@ impl QuicHandshakeResponder {
     fn drive(&mut self, now: Instant, buf: &mut Vec<u8>, out: &mut Vec<QuicResponse>) {
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = Vec::new();
+            let mut drained_connections: Vec<ConnectionHandle> = Vec::new();
             let mut made_progress = false;
 
             let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
@@ -234,6 +239,10 @@ impl QuicHandshakeResponder {
                         made_progress = true;
                     }
                 }
+
+                if conn.is_drained() {
+                    drained_connections.push(ch);
+                }
             }
 
             for (ch, event) in endpoint_events {
@@ -241,6 +250,13 @@ impl QuicHandshakeResponder {
                     self.conn_events.entry(ch).or_default().push_back(conn_event);
                     made_progress = true;
                 }
+            }
+
+            for ch in drained_connections {
+                if self.connections.remove(&ch).is_some() {
+                    made_progress = true;
+                }
+                self.conn_events.remove(&ch);
             }
 
             if !made_progress {
