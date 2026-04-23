@@ -70,6 +70,10 @@ impl DynamicSniResolver {
                     .cloned()
                 {
                     cache.remove(&evict_key);
+                } else {
+                    // Cache is full and only contains the default entry;
+                    // return the generated key without caching.
+                    return key;
                 }
             }
             cache.insert(name, Arc::clone(&key));
