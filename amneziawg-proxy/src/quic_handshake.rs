@@ -26,11 +26,12 @@ impl DynamicSniResolver {
     const MAX_CACHE_ENTRIES: usize = 256;
 
     fn new(default_domain: &str) -> anyhow::Result<Self> {
+        let default_domain = default_domain.to_ascii_lowercase();
         let mut cache = HashMap::new();
-        let default_key = generate_certified_key(default_domain)?;
-        cache.insert(default_domain.to_string(), default_key);
+        let default_key = generate_certified_key(&default_domain)?;
+        cache.insert(default_domain.clone(), default_key);
         Ok(Self {
-            default_domain: default_domain.to_string(),
+            default_domain,
             cache: Mutex::new(cache),
         })
     }
