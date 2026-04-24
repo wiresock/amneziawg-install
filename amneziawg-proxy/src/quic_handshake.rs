@@ -85,6 +85,9 @@ impl ResolvesServerCert for DynamicSniResolver {
             if let Some(ck) = self.cache_get(&requested) {
                 return Some(ck);
             }
+            // Intentionally do not generate per-SNI certificates for cache misses.
+            // Falling back to the default cert bounds CPU/memory work under
+            // adversarial traffic with many unique SNI values.
         }
 
         self.cache_get(&self.default_domain)
