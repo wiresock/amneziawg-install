@@ -33,18 +33,44 @@ async fn spawn_echo_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 async fn wait_for_proxy_ready(proxy_addr: SocketAddr, max_retries: u32, interval: Duration) {
     let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     for i in 0..max_retries {
-        // Send a benign non-protocol payload — the proxy will forward it to
-        // the echo backend, and we'll get an echo back once the recv loop is
-        // live.
-        let _ = probe.send_to(b"\x00", proxy_addr).await;
+        // Send a unique non-protocol payload so we can distinguish readiness
+        // probes from any stale queued echoes.
+        let probe_payload = [0xA5, 0x5A, (i & 0xFF) as u8, ((i >> 8) & 0xFF) as u8];
+        let _ = probe.send_to(&probe_payload, proxy_addr).await;
         let mut buf = [0u8; 64];
-        match tokio::time::timeout(interval, probe.recv_from(&mut buf)).await {
-            Ok(Ok(_)) => return,
-            _ => {
-                if i + 1 == max_retries {
-                    panic!("proxy did not become ready after {max_retries} retries");
-                }
+        let deadline = tokio::time::Instant::now() + interval;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
             }
+            match tokio::time::timeout(deadline - now, probe.recv_from(&mut buf)).await {
+                Ok(Ok((n, _)))
+                    if n == probe_payload.len() + 2
+                        && buf[..2] == [0xEC, 0x00]
+                        && buf[2..n] == probe_payload =>
+                {
+                    // Drain any additional queued echoes so later assertions
+                    // read only responses from the packets they send.
+                    loop {
+                        match tokio::time::timeout(
+                            Duration::from_millis(10),
+                            probe.recv_from(&mut buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => continue,
+                            _ => break,
+                        }
+                    }
+                    return;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        if i + 1 == max_retries {
+            panic!("proxy did not become ready after {max_retries} retries");
         }
     }
 }
@@ -132,11 +158,22 @@ buffer_size = 4096
     let has_version_neg = responses.iter().any(|r| !r.is_empty() && r[0] == 0xC3);
     assert!(has_version_neg, "should have a QUIC version negotiation response");
 
-    // The other must be the backend echo (prefixed with [0xEC, 0x00]).
-    let has_backend_echo = responses
+    // The other must be the backend echo (prefixed with [0xEC, 0x00]) and
+    // must contain the exact QUIC payload we just sent.
+    let backend_echo = responses
         .iter()
-        .any(|r| r.len() >= 2 && r[0] == 0xEC && r[1] == 0x00);
-    assert!(has_backend_echo, "should have a backend echo response");
+        .find(|r| r.len() >= 2 && r[0] == 0xEC && r[1] == 0x00)
+        .expect("should have a backend echo response");
+    assert_eq!(
+        backend_echo.len(),
+        quic_pkt.len() + 2,
+        "backend echo should contain prefix plus the original QUIC packet"
+    );
+    assert_eq!(
+        &backend_echo[2..],
+        quic_pkt.as_slice(),
+        "backend echo payload should match the QUIC packet that was sent"
+    );
 
     // 6. Shutdown
     shutdown.notify_one();

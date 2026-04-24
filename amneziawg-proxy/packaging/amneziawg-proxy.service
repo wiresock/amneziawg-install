@@ -7,6 +7,7 @@ Documentation=https://github.com/wiresock/amneziawg-install
 Type=simple
 Restart=on-failure
 RestartSec=5s
+LimitNOFILE=16384
 
 # --- Run as root to bind privileged / low-numbered ports ---------------------
 # The proxy may need to bind to ports below 1024 (e.g. 443/UDP for QUIC).
