@@ -23,8 +23,6 @@ struct DynamicSniResolver {
 }
 
 impl DynamicSniResolver {
-    const MAX_CACHE_ENTRIES: usize = 256;
-
     fn new(default_domain: &str) -> anyhow::Result<Self> {
         let default_domain = default_domain.to_ascii_lowercase();
         let mut cache = HashMap::new();
@@ -58,29 +56,6 @@ impl DynamicSniResolver {
             .ok()
             .and_then(|cache| cache.get(name).cloned())
     }
-
-    fn cache_insert(&self, name: String, key: Arc<CertifiedKey>) -> Arc<CertifiedKey> {
-        if let Ok(mut cache) = self.cache.lock() {
-            if let Some(existing) = cache.get(&name) {
-                return Arc::clone(existing);
-            }
-            if cache.len() >= Self::MAX_CACHE_ENTRIES {
-                if let Some(evict_key) = cache
-                    .keys()
-                    .find(|k| k.as_str() != self.default_domain.as_str())
-                    .cloned()
-                {
-                    cache.remove(&evict_key);
-                } else {
-                    // Cache is full and only contains the default entry;
-                    // return the generated key without caching.
-                    return key;
-                }
-            }
-            cache.insert(name, Arc::clone(&key));
-        }
-        key
-    }
 }
 
 impl fmt::Debug for DynamicSniResolver {
@@ -109,9 +84,6 @@ impl ResolvesServerCert for DynamicSniResolver {
         if Self::is_valid_sni_hostname(&requested) {
             if let Some(ck) = self.cache_get(&requested) {
                 return Some(ck);
-            }
-            if let Ok(generated) = generate_certified_key(&requested) {
-                return Some(self.cache_insert(requested, generated));
             }
         }
 

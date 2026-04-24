@@ -516,7 +516,7 @@ assert_niv_rejects() {
     # later assignments win if the same variable appears more than once.
     local _output _rc _has_msg=0
     _output=$(run_niv_with "${var_name}" "${var_value}" "$@") && _rc=0 || _rc=$?
-    echo "${_output}" | grep -qF 'must not contain' && _has_msg=1
+    printf '%s\n' "${_output}" | grep -qF 'must not contain' && _has_msg=1
 
     assert_eq "1" "${_rc}"      "${description}: exit code 1"
     assert_eq "1" "${_has_msg}" "${description}: 'must not contain' in stderr"

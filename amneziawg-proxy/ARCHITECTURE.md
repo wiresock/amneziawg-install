@@ -602,7 +602,7 @@ listen = "0.0.0.0:51820"
 # Backend AmneziaWG address (required)
 backend = "127.0.0.1:51821"
 
-# Which protocol to imitate: "quic", "dns", or "sip" (default: "quic")
+# Which protocol to imitate: "auto", "quic", "dns", or "sip" (default: "quic")
 imitate_protocol = "quic"
 
 # Session TTL in seconds (default: 300)
