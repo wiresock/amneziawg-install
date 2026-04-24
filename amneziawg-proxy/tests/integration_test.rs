@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use tokio::net::UdpSocket;
 
+const READY_PROBE_PAYLOAD_PREFIX: [u8; 2] = [0xA5, 0x5A];
+const READY_DRAIN_TIMEOUT_MS: u64 = 25;
+
 /// Spawn a mock backend that echoes every packet back with a 2-byte prefix `[0xEC, 0x00]`.
 async fn spawn_echo_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -34,8 +37,14 @@ async fn wait_for_proxy_ready(proxy_addr: SocketAddr, max_retries: u32, interval
     let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     for i in 0..max_retries {
         // Send a unique non-protocol payload so we can distinguish readiness
-        // probes from any stale queued echoes.
-        let probe_payload = [0xA5, 0x5A, (i & 0xFF) as u8, ((i >> 8) & 0xFF) as u8];
+        // probes from any stale queued echoes. The 0xA5/0x5A prefix is a
+        // distinctive alternating bit-pattern marker for easy matching.
+        let probe_payload = [
+            READY_PROBE_PAYLOAD_PREFIX[0],
+            READY_PROBE_PAYLOAD_PREFIX[1],
+            (i & 0xFF) as u8,
+            ((i >> 8) & 0xFF) as u8,
+        ];
         let _ = probe.send_to(&probe_payload, proxy_addr).await;
         let mut buf = [0u8; 64];
         let deadline = tokio::time::Instant::now() + interval;
@@ -54,7 +63,7 @@ async fn wait_for_proxy_ready(proxy_addr: SocketAddr, max_retries: u32, interval
                     // read only responses from the packets they send.
                     loop {
                         match tokio::time::timeout(
-                            Duration::from_millis(10),
+                            Duration::from_millis(READY_DRAIN_TIMEOUT_MS),
                             probe.recv_from(&mut buf),
                         )
                         .await
