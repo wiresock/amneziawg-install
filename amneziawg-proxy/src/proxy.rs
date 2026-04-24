@@ -268,8 +268,10 @@ impl Proxy {
 
                             if is_continuation || !responses.is_empty() {
                                 self.send_quic_responses(responses).await;
-                            } else {
+                            } else if !probe_allowed {
                                 debug!(%client_addr, "probe rate limited");
+                            } else {
+                                debug!(%client_addr, "probe allowed but no QUIC response generated");
                             }
 
                             if probe_allowed && !is_continuation {
