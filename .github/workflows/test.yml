@@ -29,15 +29,15 @@ jobs:
         run: cargo test
 
   proxy-rust-msrv:
-    name: Proxy Rust Tests (MSRV 1.75)
+    name: Proxy Rust Tests (Stable)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Rust (MSRV)
-        uses: dtolnay/rust-toolchain@1.75.0
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Run proxy Rust tests (MSRV)
+      - name: Run proxy Rust tests
         working-directory: amneziawg-proxy
         run: cargo test
 
