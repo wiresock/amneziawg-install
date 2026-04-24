@@ -231,7 +231,6 @@ impl QuicHandshakeResponder {
                 let remote = incoming.remote_address();
                 if self.connections.len() < Self::MAX_TRACKED_CONNECTIONS {
                     if let Ok((ch, conn)) = self.endpoint.accept(incoming, now, buf, None) {
-                        let remote = conn.remote_address();
                         self.connections.insert(ch, conn);
                         *self.active_remotes.entry(remote).or_insert(0) += 1;
                     }
@@ -305,15 +304,13 @@ impl QuicHandshakeResponder {
             for ch in drained_connections {
                 if let Some(conn) = self.connections.remove(&ch) {
                     let remote = conn.remote_address();
-                    let mut remove_remote = false;
-                    if let Some(count) = self.active_remotes.get_mut(&remote) {
-                        *count -= 1;
-                        if *count == 0 {
-                            remove_remote = true;
+                    if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                        self.active_remotes.entry(remote)
+                    {
+                        *entry.get_mut() -= 1;
+                        if *entry.get() == 0 {
+                            entry.remove();
                         }
-                    }
-                    if remove_remote {
-                        self.active_remotes.remove(&remote);
                     }
                     made_progress = true;
                 }
