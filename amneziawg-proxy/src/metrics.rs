@@ -187,6 +187,11 @@ impl MetricsStore {
         }
     }
 
+    /// Get existing metrics for a client without creating a new entry.
+    pub fn get(&self, addr: &SocketAddr) -> Option<Arc<ClientMetrics>> {
+        self.clients.get(addr).map(|r| Arc::clone(r.value()))
+    }
+
     /// Number of tracked clients.
     pub fn len(&self) -> usize {
         self.clients.len()

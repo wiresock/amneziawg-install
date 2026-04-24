@@ -143,6 +143,7 @@ pub struct QuicHandshakeResponder {
     endpoint: Endpoint,
     connections: HashMap<ConnectionHandle, Connection>,
     conn_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
+    active_remotes: HashMap<SocketAddr, usize>,
 }
 
 pub struct QuicResponse {
@@ -158,7 +159,7 @@ impl QuicHandshakeResponder {
         let mut rustls_server_cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(resolver);
-        rustls_server_cfg.max_early_data_size = u32::MAX;
+        rustls_server_cfg.max_early_data_size = 0;
 
         let quic_crypto = QuicServerConfig::try_from(rustls_server_cfg)
             .context("failed to create QUIC rustls server config")?;
@@ -175,13 +176,12 @@ impl QuicHandshakeResponder {
             endpoint,
             connections: HashMap::new(),
             conn_events: HashMap::new(),
+            active_remotes: HashMap::new(),
         })
     }
 
     pub fn has_active_connection(&self, remote: SocketAddr) -> bool {
-        self.connections
-            .values()
-            .any(|conn| conn.remote_address() == remote)
+        self.active_remotes.contains_key(&remote)
     }
 
     pub fn handle_datagram(&mut self, remote: SocketAddr, packet: &[u8]) -> Vec<QuicResponse> {
@@ -231,7 +231,9 @@ impl QuicHandshakeResponder {
                 let remote = incoming.remote_address();
                 if self.connections.len() < Self::MAX_TRACKED_CONNECTIONS {
                     if let Ok((ch, conn)) = self.endpoint.accept(incoming, now, buf, None) {
+                        let remote = conn.remote_address();
                         self.connections.insert(ch, conn);
+                        *self.active_remotes.entry(remote).or_insert(0) += 1;
                     }
                 }
                 if !buf.is_empty() {
@@ -301,7 +303,18 @@ impl QuicHandshakeResponder {
             }
 
             for ch in drained_connections {
-                if self.connections.remove(&ch).is_some() {
+                if let Some(conn) = self.connections.remove(&ch) {
+                    let remote = conn.remote_address();
+                    let mut remove_remote = false;
+                    if let Some(count) = self.active_remotes.get_mut(&remote) {
+                        *count -= 1;
+                        if *count == 0 {
+                            remove_remote = true;
+                        }
+                    }
+                    if remove_remote {
+                        self.active_remotes.remove(&remote);
+                    }
                     made_progress = true;
                 }
                 self.conn_events.remove(&ch);

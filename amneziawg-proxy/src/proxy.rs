@@ -144,6 +144,8 @@ impl Proxy {
                     error = %e,
                     "failed to send QUIC handshake response"
                 );
+            } else if let Some(metrics) = self.metrics.get(&response.destination) {
+                metrics.record_probe();
             }
         }
     }
@@ -255,9 +257,6 @@ impl Proxy {
                                 if !allowed {
                                     (continuation, Vec::new(), false)
                                 } else {
-                                    if !continuation {
-                                        metrics.record_probe();
-                                    }
                                     (
                                         continuation,
                                         responder.handle_datagram(client_addr, data),
@@ -285,14 +284,12 @@ impl Proxy {
                             }
                         } else {
                             if metrics.try_acquire_probe() {
-                                metrics.record_probe();
                                 probe_response = Some(responder::generate_response(proto, data));
                             } else {
                                 debug!(%client_addr, "probe rate limited");
                             }
                         }
                     } else if metrics.try_acquire_probe() {
-                        metrics.record_probe();
                         if proto == Protocol::Dns && self.dns_forward_enabled {
                             probe_response = self.forward_dns_probe(data).await.or_else(|| {
                                 Some(responder::generate_response(proto, data))
@@ -311,6 +308,8 @@ impl Proxy {
         if let Some(response) = probe_response {
             if let Err(e) = self.frontend.send_to(&response, client_addr).await {
                 warn!(%client_addr, error = %e, "failed to send probe response");
+            } else if let Some(ref metrics) = metrics_ref {
+                metrics.record_probe();
             }
             debug!(%client_addr, "probe response sent");
         }
@@ -372,14 +371,10 @@ impl Proxy {
         let fixed_protocol = self.fixed_protocol;
         let client_protocols = Arc::clone(&self.client_protocols);
         let awg_params = self.awg_params.clone();
-        // Per-session relay buffer uses a tighter cap than the frontend recv
-        // buffer.  WireGuard packets are at most MTU-sized (~1500 B typical);
-        // using a small per-relay buffer keeps total memory bounded even when
-        // max_sessions is high (e.g. 10 000 × 4 KiB ≈ 40 MiB vs 640 MiB at
-        // 64 KiB each).  The configured `buffer_size` is still honoured but
-        // is clamped to a safe relay-specific ceiling.
-        const RELAY_BUF_CAP: usize = 4_096;
-        let relay_buf_size = std::cmp::min(self.config.buffer_size, RELAY_BUF_CAP);
+        // Size the per-session relay buffer from configured `buffer_size` so
+        // backend datagrams are not silently truncated by `recv()`.
+        const MAX_UDP_PAYLOAD_SIZE: usize = 65_535;
+        let relay_buf_size = std::cmp::min(self.config.buffer_size, MAX_UDP_PAYLOAD_SIZE);
         let relay_handles = Arc::clone(&self.relay_handles);
         let generation = self.relay_generation.fetch_add(1, Ordering::Relaxed);
 
