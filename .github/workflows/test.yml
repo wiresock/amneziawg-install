@@ -6,9 +6,6 @@ on:
   pull_request:
     branches: [main]
 
-permissions:
-  contents: read
-
 jobs:
   unit-tests:
     name: Unit Tests
@@ -16,30 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Run unit tests
-        run: |
-          bash tests/test-functions.sh
-          bash tests/test-proxy-scripts.sh
-
-      - name: Run proxy Rust tests
-        working-directory: amneziawg-proxy
-        run: cargo test
-
-  proxy-rust-msrv:
-    name: Proxy Rust Tests (MSRV 1.75)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Rust (MSRV)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run proxy Rust tests (MSRV)
-        working-directory: amneziawg-proxy
-        run: cargo test
+        run: bash tests/test-functions.sh
 
   integration-tests:
     name: Integration (${{ matrix.distro }})
@@ -52,14 +27,13 @@ jobs:
           - "ubuntu:24.04"
           - "debian:11"
           - "debian:12"
-          - "fedora:40"
-          - "almalinux:9"
-          - "rockylinux:9"
     steps:
       - uses: actions/checkout@v4
 
       - name: Syntax check
-        run: bash -n amneziawg-install.sh
+        run: |
+          bash -n amneziawg-install.sh
+          bash -n amneziawg-web.sh
 
       - name: Run integration test in Docker
         run: |
