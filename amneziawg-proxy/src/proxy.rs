@@ -665,6 +665,17 @@ mod tests {
         assert!(n > 0);
         assert_eq!(from, proxy_addr);
 
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), client.recv_from(&mut buf)).await {
+                Ok(Ok((extra_n, extra_from))) => {
+                    assert!(extra_n > 0);
+                    assert_eq!(extra_from, proxy_addr);
+                }
+                Ok(Err(e)) => panic!("unexpected recv_from error while draining responses: {e}"),
+                Err(_) => break,
+            }
+        }
+
         proxy.handle_client_packet(&quic_pkt, client_addr).await;
         let second = tokio::time::timeout(
             Duration::from_millis(200),
