@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   unit-tests:
     name: Unit Tests
@@ -22,6 +25,19 @@ jobs:
           bash tests/test-proxy-scripts.sh
 
       - name: Run proxy Rust tests
+        working-directory: amneziawg-proxy
+        run: cargo test
+
+  proxy-rust-msrv:
+    name: Proxy Rust Tests (MSRV 1.75)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust (MSRV)
+        uses: dtolnay/rust-toolchain@1.75.0
+
+      - name: Run proxy Rust tests (MSRV)
         working-directory: amneziawg-proxy
         run: cargo test
 
