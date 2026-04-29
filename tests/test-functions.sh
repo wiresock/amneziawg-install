@@ -157,13 +157,12 @@ assert_eq "192.168.1.5" "$(_run_detect)" "detectPublicIPv4 falls back when wget 
 
 # Case 6b: multi-homed host with a private interface listed first and a
 # public one listed second -> pick the public one, no external lookup.
+# (Re-stub curl since Case 5 removed it.)
 _stub curl "SHOULD_NOT_BE_CALLED" 0
 _stub wget "SHOULD_NOT_BE_CALLED" 0
 _stub ip "$(printf '%s\n' \
 	"3: ens5    inet 172.31.4.10/20 scope global ens5" \
 	"4: eth1    inet 198.51.100.25/24 scope global eth1")"
-# Restore curl for this case (we removed it in Case 5).
-_stub curl "SHOULD_NOT_BE_CALLED" 0
 assert_eq "198.51.100.25" "$(_run_detect)" "detectPublicIPv4 prefers public over private on multi-homed host"
 
 # Case 6c: multi-homed host where all global IPv4s are private -> external
