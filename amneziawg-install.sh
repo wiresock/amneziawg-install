@@ -238,7 +238,9 @@ function isPrivateIPv4() {
 	if (( A == 100 )) && (( B >= 64 && B <= 127 )); then return 0; fi
 	# 169.254.0.0/16 (link-local, also AWS instance metadata)
 	if (( A == 169 && B == 254 )); then return 0; fi
-	# 0.0.0.0/8 (unspecified / current network)
+	# 0.0.0.0/8 — the script treats the entire "this network"/software block
+	# (RFC 1122 §3.2.1.3) as non-public, not just the single unspecified
+	# address 0.0.0.0, since none of these are routable on the public internet.
 	if (( A == 0 )); then return 0; fi
 
 	return 1
@@ -258,6 +260,13 @@ function isPrivateIPv4() {
 #      original locally-detected address (which may still be private but is
 #      better than empty; the user can override interactively or via env).
 #
+# Privacy / opt-out:
+#   Set AWG_SKIP_PUBLIC_IP_LOOKUP=y (or =1/=true) to disable the external
+#   IP-echo step entirely. When disabled, the function only returns the
+#   locally-detected address (or empty), avoiding any outbound HTTPS request
+#   to third-party services. Useful for air-gapped installs or when the
+#   operator wants to set SERVER_PUB_IP explicitly.
+#
 # Prints the detected address on stdout. Always returns 0; callers should
 # check whether the output is empty.
 function detectPublicIPv4() {
@@ -266,6 +275,14 @@ function detectPublicIPv4() {
 	local URL
 
 	LOCAL_IP="$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | head -1)"
+
+	# Honour an explicit opt-out so the installer never makes an unsolicited
+	# request to a third-party IP-echo service. Accept y/yes/1/true (any case).
+	local SKIP="${AWG_SKIP_PUBLIC_IP_LOOKUP:-}"
+	if [[ "${SKIP,,}" == "y" || "${SKIP,,}" == "yes" || "${SKIP}" == "1" || "${SKIP,,}" == "true" ]]; then
+		printf '%s\n' "${LOCAL_IP}"
+		return 0
+	fi
 
 	if [[ -z "${LOCAL_IP}" ]] || isPrivateIPv4 "${LOCAL_IP}"; then
 		if command -v curl >/dev/null 2>&1; then
@@ -1339,7 +1356,18 @@ function installQuestions() {
 	# Non-interactive mode: use environment variable overrides or sensible defaults
 	# Set AUTO_INSTALL=y to skip all prompts
 	if [[ "${AUTO_INSTALL,,}" == "y" ]]; then
-		SERVER_PUB_IP=${SERVER_PUB_IP:-$(detectPublicIPv4)}
+		# Only auto-detect if the operator did not provide an explicit override.
+		# An explicit SERVER_PUB_IP (even if private, e.g. for an internal-only
+		# deployment) is honoured as-is.
+		if [[ -z "${SERVER_PUB_IP:-}" ]]; then
+			SERVER_PUB_IP=$(detectPublicIPv4)
+			# If auto-detection only yielded a non-routable IPv4 (external
+			# lookup disabled or blocked), prefer IPv6 over baking a private
+			# address into client configs.
+			if [[ -n "${SERVER_PUB_IP}" ]] && isPrivateIPv4 "${SERVER_PUB_IP}"; then
+				SERVER_PUB_IP=""
+			fi
+		fi
 		if [[ -z "${SERVER_PUB_IP}" ]]; then
 			SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
 		fi

@@ -79,6 +79,101 @@ assert_rc 1 isPrivateIPv4 "08.0.0.1"        # 8.0.0.1 — public, invalid octal
 assert_rc 1 isPrivateIPv4 "09.0.0.1"        # 9.0.0.1 — public, invalid octal
 assert_rc 0 isPrivateIPv4 "172.016.0.1"    # 172.16.0.1 — private (boundary)
 
+echo "=== detectPublicIPv4 ==="
+# Helper: run detectPublicIPv4 with stubbed `ip`, `curl`, and `wget`
+# binaries on PATH. This exercises every branch (local public IP, local
+# private IP + curl success/failure, wget fallback, opt-out) without making
+# real network requests.
+DPI_TMP="$(mktemp -d)"
+trap 'rm -rf "${DPI_TMP}"' EXIT
+mkdir -p "${DPI_TMP}/bin" "${DPI_TMP}/realbin"
+# Build an isolated PATH containing only the coreutils detectPublicIPv4 needs
+# plus our stubs. Any tool not symlinked here (notably curl/wget) will be
+# absent unless we stub it explicitly, which is exactly what we want to
+# exercise branches like "curl missing -> use wget".
+for _cmd in head sed tr awk cat bash printf; do
+	if _real="$(command -v "${_cmd}" 2>/dev/null)"; then
+		ln -sf "${_real}" "${DPI_TMP}/realbin/${_cmd}"
+	fi
+done
+unset _cmd _real
+
+# stub creates an executable shell stub at "${DPI_TMP}/bin/<name>" that
+# prints $2 to stdout and exits with $3 (default 0).
+function _stub() {
+	local NAME="$1"
+	local OUT="${2:-}"
+	local RC="${3:-0}"
+	cat > "${DPI_TMP}/bin/${NAME}" <<EOF
+#!/bin/bash
+printf '%s' "${OUT}"
+exit ${RC}
+EOF
+	chmod +x "${DPI_TMP}/bin/${NAME}"
+}
+
+# Run detectPublicIPv4 with only our stubs and the symlinked coreutils on PATH.
+function _run_detect() {
+	(
+		PATH="${DPI_TMP}/bin:${DPI_TMP}/realbin"
+		export PATH
+		unset AWG_SKIP_PUBLIC_IP_LOOKUP
+		detectPublicIPv4
+	)
+}
+
+# Case 1: local interface has a public IPv4 -> return it, no external lookup.
+_stub ip "5: eth0    inet 203.0.113.10/24 scope global eth0"
+_stub curl "SHOULD_NOT_BE_CALLED" 0
+_stub wget "SHOULD_NOT_BE_CALLED" 0
+assert_eq "203.0.113.10" "$(_run_detect)" "detectPublicIPv4 returns local public IPv4"
+
+# Case 2: local interface is private, curl returns a public IPv4.
+_stub ip "5: eth0    inet 172.31.4.10/20 scope global eth0"
+_stub curl "203.0.113.42" 0
+_stub wget "SHOULD_NOT_BE_CALLED" 0
+assert_eq "203.0.113.42" "$(_run_detect)" "detectPublicIPv4 falls back to curl on private local IP"
+
+# Case 3: local interface empty, curl returns a public IPv4 (with whitespace).
+_stub ip ""
+_stub curl $'  198.51.100.7  \n' 0
+assert_eq "198.51.100.7" "$(_run_detect)" "detectPublicIPv4 trims whitespace from external response"
+
+# Case 4: local is private, curl returns a private IP -> rejected, fall back to local.
+_stub ip "5: eth0    inet 10.0.0.5/24 scope global eth0"
+_stub curl "10.1.2.3" 0
+assert_eq "10.0.0.5" "$(_run_detect)" "detectPublicIPv4 rejects private IP from external service"
+
+# Case 5: curl absent, wget present and returns a public IPv4.
+rm -f "${DPI_TMP}/bin/curl"
+_stub ip "5: eth0    inet 192.168.1.5/24 scope global eth0"
+_stub wget "203.0.113.99" 0
+assert_eq "203.0.113.99" "$(_run_detect)" "detectPublicIPv4 uses wget when curl is absent"
+
+# Case 6: curl absent, wget returns garbage -> fall back to local private IP.
+_stub ip "5: eth0    inet 192.168.1.5/24 scope global eth0"
+_stub wget "not-an-ip" 0
+assert_eq "192.168.1.5" "$(_run_detect)" "detectPublicIPv4 falls back when wget returns invalid"
+
+# Case 7: opt-out via AWG_SKIP_PUBLIC_IP_LOOKUP=y suppresses external lookups.
+_stub ip "5: eth0    inet 172.31.4.10/20 scope global eth0"
+_stub curl "203.0.113.42" 0   # would be used if not opted out
+_stub wget "203.0.113.99" 0
+assert_eq "172.31.4.10" "$(
+	PATH="${DPI_TMP}/bin:${DPI_TMP}/realbin" AWG_SKIP_PUBLIC_IP_LOOKUP=y \
+		bash -c "$(declare -f detectPublicIPv4 isPrivateIPv4); detectPublicIPv4"
+)" "detectPublicIPv4 honours AWG_SKIP_PUBLIC_IP_LOOKUP=y"
+
+# Case 8: opt-out via AWG_SKIP_PUBLIC_IP_LOOKUP=1 also accepted.
+assert_eq "172.31.4.10" "$(
+	PATH="${DPI_TMP}/bin:${DPI_TMP}/realbin" AWG_SKIP_PUBLIC_IP_LOOKUP=1 \
+		bash -c "$(declare -f detectPublicIPv4 isPrivateIPv4); detectPublicIPv4"
+)" "detectPublicIPv4 honours AWG_SKIP_PUBLIC_IP_LOOKUP=1"
+
+trap - EXIT
+rm -rf "${DPI_TMP}"
+unset DPI_TMP
+
 echo "=== isValidIPv6 ==="
 assert_rc 0 isValidIPv6 "::1"
 assert_rc 0 isValidIPv6 "fd42:42:42::1"
