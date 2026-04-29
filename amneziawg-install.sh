@@ -249,15 +249,19 @@ function isPrivateIPv4() {
 # Detect the server's public IPv4 address.
 #
 # Strategy:
-#   1. Read the first global-scope IPv4 from `ip -4 addr`.
-#   2. If empty or the address is private/CGNAT/link-local (e.g. AWS EC2,
-#      GCP, LXC/Docker hosts), query an external echo service over IPv4
-#      (`curl -4 ifconfig.me`, with a fallback) to discover the NAT-mapped
-#      public address. This is required because cloud providers like AWS
-#      assign the public/Elastic IP via 1:1 NAT and it never appears on the
-#      host's interfaces.
+#   1. Iterate all global-scope IPv4 addresses from `ip -4 addr` and pick
+#      the first one that is not private/CGNAT/link-local. This handles
+#      multi-homed hosts where a private interface is enumerated before a
+#      public one, and avoids a needless external request when a public
+#      IPv4 is already bound locally.
+#   2. If no public IPv4 is found locally (empty list, or all addresses
+#      are private — e.g. AWS EC2, GCP, LXC/Docker hosts), query an
+#      external echo service over IPv4 (`curl -4 ifconfig.me`, with a
+#      fallback) to discover the NAT-mapped public address. This is
+#      required because cloud providers like AWS assign the public/Elastic
+#      IP via 1:1 NAT and it never appears on the host's interfaces.
 #   3. If external lookup fails or returns nothing usable, fall back to the
-#      original locally-detected address (which may still be private but is
+#      first locally-detected address (which may still be private but is
 #      better than empty; the user can override interactively or via env).
 #
 # Privacy / opt-out:
@@ -271,10 +275,31 @@ function isPrivateIPv4() {
 # check whether the output is empty.
 function detectPublicIPv4() {
 	local LOCAL_IP=""
+	local FIRST_LOCAL_IP=""
+	local CANDIDATE
 	local PUBLIC_IP=""
 	local URL
 
-	LOCAL_IP="$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | head -1)"
+	# Collect all global-scope IPv4 addresses (multi-homed hosts may have
+	# both a private and a public interface). Prefer the first public one
+	# so we don't make an unnecessary external request — and don't
+	# accidentally return the NAT-mapped egress IP when a directly-bound
+	# public IPv4 already exists locally.
+	while IFS= read -r CANDIDATE; do
+		[[ -z "${CANDIDATE}" ]] && continue
+		[[ -z "${FIRST_LOCAL_IP}" ]] && FIRST_LOCAL_IP="${CANDIDATE}"
+		if ! isPrivateIPv4 "${CANDIDATE}"; then
+			LOCAL_IP="${CANDIDATE}"
+			break
+		fi
+	done < <(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p')
+
+	# If we didn't find a public one, keep the first (private) address as a
+	# fall-back so the function still returns something usable when the
+	# external lookup fails or is opted out.
+	if [[ -z "${LOCAL_IP}" ]]; then
+		LOCAL_IP="${FIRST_LOCAL_IP}"
+	fi
 
 	# Honour an explicit opt-out so the installer never makes an unsolicited
 	# request to a third-party IP-echo service. Accept y/yes/1/true (any case).
