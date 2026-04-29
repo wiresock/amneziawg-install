@@ -105,7 +105,7 @@ function _stub() {
 	local OUT="${2:-}"
 	local RC="${3:-0}"
 	cat > "${DPI_TMP}/bin/${NAME}" <<EOF
-#!/bin/bash
+#!/usr/bin/env bash
 printf '%s' "${OUT}"
 exit ${RC}
 EOF

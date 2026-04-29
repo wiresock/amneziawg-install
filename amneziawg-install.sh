@@ -279,7 +279,8 @@ function detectPublicIPv4() {
 	# Honour an explicit opt-out so the installer never makes an unsolicited
 	# request to a third-party IP-echo service. Accept y/yes/1/true (any case).
 	local SKIP="${AWG_SKIP_PUBLIC_IP_LOOKUP:-}"
-	if [[ "${SKIP,,}" == "y" || "${SKIP,,}" == "yes" || "${SKIP}" == "1" || "${SKIP,,}" == "true" ]]; then
+	SKIP="${SKIP,,}"
+	if [[ "${SKIP}" == "y" || "${SKIP}" == "yes" || "${SKIP}" == "1" || "${SKIP}" == "true" ]]; then
 		printf '%s\n' "${LOCAL_IP}"
 		return 0
 	fi
