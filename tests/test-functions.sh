@@ -71,6 +71,13 @@ assert_rc 1 isPrivateIPv4 ""
 assert_rc 1 isPrivateIPv4 "not-an-ip"
 assert_rc 1 isPrivateIPv4 "::1"
 assert_rc 1 isPrivateIPv4 "256.0.0.1"
+# Leading-zero inputs must not trigger bash octal parsing or arithmetic errors.
+# These are accepted by the IPv4 regex; they should be classified consistently
+# without producing stderr noise.
+assert_rc 0 isPrivateIPv4 "010.0.0.1"       # 10.0.0.1 — private, octal-looking
+assert_rc 1 isPrivateIPv4 "08.0.0.1"        # 8.0.0.1 — public, invalid octal
+assert_rc 1 isPrivateIPv4 "09.0.0.1"        # 9.0.0.1 — public, invalid octal
+assert_rc 0 isPrivateIPv4 "172.016.0.1"    # 172.16.0.1 — private (boundary)
 
 echo "=== isValidIPv6 ==="
 assert_rc 0 isValidIPv6 "::1"

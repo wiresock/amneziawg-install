@@ -218,10 +218,13 @@ function isPrivateIPv4() {
 		return 1
 	fi
 
+	# Force base-10 interpretation: the IPv4 regex above accepts leading
+	# zeros (e.g. "08.0.0.1"), which would otherwise trigger bash octal
+	# parsing and noisy "value too great for base" errors in (( ... )).
 	local A B
-	A="${ADDR%%.*}"
+	A=$((10#${ADDR%%.*}))
 	B="${ADDR#*.}"
-	B="${B%%.*}"
+	B=$((10#${B%%.*}))
 
 	# 10.0.0.0/8
 	if (( A == 10 )); then return 0; fi
@@ -262,12 +265,22 @@ function detectPublicIPv4() {
 	local PUBLIC_IP=""
 	local URL
 
-	LOCAL_IP="$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)"
+	LOCAL_IP="$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | head -1)"
 
 	if [[ -z "${LOCAL_IP}" ]] || isPrivateIPv4 "${LOCAL_IP}"; then
 		if command -v curl >/dev/null 2>&1; then
 			for URL in "https://ifconfig.me" "https://api.ipify.org" "https://ipv4.icanhazip.com"; do
 				PUBLIC_IP="$(curl -4 -fsS --max-time 5 "${URL}" 2>/dev/null | tr -d '[:space:]')"
+				if [[ "${PUBLIC_IP}" =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]] \
+					&& ! isPrivateIPv4 "${PUBLIC_IP}"; then
+					printf '%s\n' "${PUBLIC_IP}"
+					return 0
+				fi
+				PUBLIC_IP=""
+			done
+		elif command -v wget >/dev/null 2>&1; then
+			for URL in "https://ifconfig.me" "https://api.ipify.org" "https://ipv4.icanhazip.com"; do
+				PUBLIC_IP="$(wget -4 -qO- --timeout=5 --tries=1 "${URL}" 2>/dev/null | tr -d '[:space:]')"
 				if [[ "${PUBLIC_IP}" =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]] \
 					&& ! isPrivateIPv4 "${PUBLIC_IP}"; then
 					printf '%s\n' "${PUBLIC_IP}"
