@@ -1388,14 +1388,23 @@ function installQuestions() {
 		if [[ -z "${SERVER_PUB_IP:-}" ]]; then
 			SERVER_PUB_IP=$(detectPublicIPv4)
 			# If auto-detection only yielded a non-routable IPv4 (external
-			# lookup disabled or blocked), prefer IPv6 over baking a private
-			# address into client configs.
+			# lookup disabled or blocked), prefer a global IPv6 over baking
+			# a private address into client configs. Keep the private value
+			# as a last-resort fallback so the install does not hard-fail
+			# on hosts with neither egress to IP-echo services nor a global
+			# IPv6 (e.g. AWG_SKIP_PUBLIC_IP_LOOKUP set on an IPv4-only LAN).
+			local AUTO_PRIVATE_IPV4=""
 			if [[ -n "${SERVER_PUB_IP}" ]] && isPrivateIPv4 "${SERVER_PUB_IP}"; then
+				AUTO_PRIVATE_IPV4="${SERVER_PUB_IP}"
 				SERVER_PUB_IP=""
 			fi
-		fi
-		if [[ -z "${SERVER_PUB_IP}" ]]; then
-			SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+			if [[ -z "${SERVER_PUB_IP}" ]]; then
+				SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+			fi
+			if [[ -z "${SERVER_PUB_IP}" && -n "${AUTO_PRIVATE_IPV4}" ]]; then
+				echo -e "${ORANGE}WARNING: No public IPv4 or global IPv6 detected; falling back to private IPv4 ${AUTO_PRIVATE_IPV4}. Generated client configs will only work from networks that can reach this address. Set SERVER_PUB_IP to override.${NC}"
+				SERVER_PUB_IP="${AUTO_PRIVATE_IPV4}"
+			fi
 		fi
 		if [[ -z "${SERVER_PUB_IP}" ]]; then
 			echo -e "${RED}ERROR: Could not detect public IP address. Set SERVER_PUB_IP and rerun.${NC}"
