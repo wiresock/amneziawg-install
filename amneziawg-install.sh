@@ -205,6 +205,83 @@ if [[ "${SAFE_QUOTE_PARAM_SELFTEST:-0}" == "1" ]]; then
 	fi
 fi
 
+# Determine whether an IPv4 address is in a private / non-routable range.
+# Returns 0 (true) for RFC1918, CGNAT (100.64/10), link-local (169.254/16),
+# loopback (127/8) and the unspecified address; returns 1 otherwise.
+# Inputs that aren't a dotted-quad IPv4 literal also return 1 (treated as
+# "not known to be private") so callers can pass through hostnames or IPv6
+# untouched.
+function isPrivateIPv4() {
+	local ADDR="${1:-}"
+	# Must be a dotted-quad of 0-255 octets to evaluate; otherwise not-private.
+	if ! [[ "${ADDR}" =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; then
+		return 1
+	fi
+
+	local A B
+	A="${ADDR%%.*}"
+	B="${ADDR#*.}"
+	B="${B%%.*}"
+
+	# 10.0.0.0/8
+	if (( A == 10 )); then return 0; fi
+	# 127.0.0.0/8 (loopback)
+	if (( A == 127 )); then return 0; fi
+	# 172.16.0.0/12
+	if (( A == 172 )) && (( B >= 16 && B <= 31 )); then return 0; fi
+	# 192.168.0.0/16
+	if (( A == 192 && B == 168 )); then return 0; fi
+	# 100.64.0.0/10 (CGNAT - used by AWS, some ISPs, etc.)
+	if (( A == 100 )) && (( B >= 64 && B <= 127 )); then return 0; fi
+	# 169.254.0.0/16 (link-local, also AWS instance metadata)
+	if (( A == 169 && B == 254 )); then return 0; fi
+	# 0.0.0.0/8 (unspecified / current network)
+	if (( A == 0 )); then return 0; fi
+
+	return 1
+}
+
+# Detect the server's public IPv4 address.
+#
+# Strategy:
+#   1. Read the first global-scope IPv4 from `ip -4 addr`.
+#   2. If empty or the address is private/CGNAT/link-local (e.g. AWS EC2,
+#      GCP, LXC/Docker hosts), query an external echo service over IPv4
+#      (`curl -4 ifconfig.me`, with a fallback) to discover the NAT-mapped
+#      public address. This is required because cloud providers like AWS
+#      assign the public/Elastic IP via 1:1 NAT and it never appears on the
+#      host's interfaces.
+#   3. If external lookup fails or returns nothing usable, fall back to the
+#      original locally-detected address (which may still be private but is
+#      better than empty; the user can override interactively or via env).
+#
+# Prints the detected address on stdout. Always returns 0; callers should
+# check whether the output is empty.
+function detectPublicIPv4() {
+	local LOCAL_IP=""
+	local PUBLIC_IP=""
+	local URL
+
+	LOCAL_IP="$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)"
+
+	if [[ -z "${LOCAL_IP}" ]] || isPrivateIPv4 "${LOCAL_IP}"; then
+		if command -v curl >/dev/null 2>&1; then
+			for URL in "https://ifconfig.me" "https://api.ipify.org" "https://ipv4.icanhazip.com"; do
+				PUBLIC_IP="$(curl -4 -fsS --max-time 5 "${URL}" 2>/dev/null | tr -d '[:space:]')"
+				if [[ "${PUBLIC_IP}" =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]] \
+					&& ! isPrivateIPv4 "${PUBLIC_IP}"; then
+					printf '%s\n' "${PUBLIC_IP}"
+					return 0
+				fi
+				PUBLIC_IP=""
+			done
+		fi
+	fi
+
+	printf '%s\n' "${LOCAL_IP}"
+	return 0
+}
+
 # Copy a client config file to the web panel config directory so the panel
 # can discover and display it.  This is a best-effort operation: if the web
 # panel is not installed (directory absent), the copy is silently skipped.
@@ -1249,7 +1326,7 @@ function installQuestions() {
 	# Non-interactive mode: use environment variable overrides or sensible defaults
 	# Set AUTO_INSTALL=y to skip all prompts
 	if [[ "${AUTO_INSTALL,,}" == "y" ]]; then
-		SERVER_PUB_IP=${SERVER_PUB_IP:-$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)}
+		SERVER_PUB_IP=${SERVER_PUB_IP:-$(detectPublicIPv4)}
 		if [[ -z "${SERVER_PUB_IP}" ]]; then
 			SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
 		fi
@@ -1365,7 +1442,7 @@ function installQuestions() {
 	echo ""
 
 	# Detect public IPv4 or IPv6 address and pre-fill for the user
-	SERVER_PUB_IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)
+	SERVER_PUB_IP=$(detectPublicIPv4)
 	if [[ -z "${SERVER_PUB_IP}" ]]; then
 		# Detect public IPv6 address
 		SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)

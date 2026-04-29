@@ -44,6 +44,34 @@ function assert_rc() {
 	fi
 }
 
+echo "=== isPrivateIPv4 ==="
+# Private/non-routable ranges
+assert_rc 0 isPrivateIPv4 "10.0.0.1"
+assert_rc 0 isPrivateIPv4 "10.255.255.255"
+assert_rc 0 isPrivateIPv4 "172.16.0.1"
+assert_rc 0 isPrivateIPv4 "172.31.0.1"        # AWS default VPC range
+assert_rc 0 isPrivateIPv4 "172.31.255.254"
+assert_rc 0 isPrivateIPv4 "192.168.1.1"
+assert_rc 0 isPrivateIPv4 "127.0.0.1"
+assert_rc 0 isPrivateIPv4 "169.254.169.254"   # AWS metadata / link-local
+assert_rc 0 isPrivateIPv4 "100.64.0.1"        # CGNAT lower bound
+assert_rc 0 isPrivateIPv4 "100.127.255.255"   # CGNAT upper bound
+assert_rc 0 isPrivateIPv4 "0.0.0.0"
+# Public addresses
+assert_rc 1 isPrivateIPv4 "8.8.8.8"
+assert_rc 1 isPrivateIPv4 "1.1.1.1"
+assert_rc 1 isPrivateIPv4 "172.15.0.1"        # just outside 172.16/12
+assert_rc 1 isPrivateIPv4 "172.32.0.1"        # just outside 172.16/12
+assert_rc 1 isPrivateIPv4 "192.169.0.1"       # just outside 192.168/16
+assert_rc 1 isPrivateIPv4 "100.63.255.255"    # just outside CGNAT
+assert_rc 1 isPrivateIPv4 "100.128.0.0"       # just outside CGNAT
+assert_rc 1 isPrivateIPv4 "169.253.0.1"       # just outside link-local
+# Non-IPv4 inputs
+assert_rc 1 isPrivateIPv4 ""
+assert_rc 1 isPrivateIPv4 "not-an-ip"
+assert_rc 1 isPrivateIPv4 "::1"
+assert_rc 1 isPrivateIPv4 "256.0.0.1"
+
 echo "=== isValidIPv6 ==="
 assert_rc 0 isValidIPv6 "::1"
 assert_rc 0 isValidIPv6 "fd42:42:42::1"
