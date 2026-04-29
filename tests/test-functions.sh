@@ -104,9 +104,13 @@ function _stub() {
 	local NAME="$1"
 	local OUT="${2:-}"
 	local RC="${3:-0}"
+	# Write OUT to a sibling data file so arbitrary bytes (newlines, quotes,
+	# shell metacharacters) cannot break the generated stub script.
+	local OUT_FILE="${DPI_TMP}/bin/${NAME}.out"
+	printf '%s\n' "${OUT}" > "${OUT_FILE}"
 	cat > "${DPI_TMP}/bin/${NAME}" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' "${OUT}"
+cat "${OUT_FILE}"
 exit ${RC}
 EOF
 	chmod +x "${DPI_TMP}/bin/${NAME}"
