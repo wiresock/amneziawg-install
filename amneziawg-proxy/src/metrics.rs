@@ -130,11 +130,11 @@ pub struct MetricsStore {
 }
 
 impl MetricsStore {
-    pub fn new(rate_limit_per_sec: u32) -> Self {
+    pub fn new(rate_limit_per_sec: u32, max_clients: usize) -> Self {
         Self {
             clients: DashMap::new(),
             rate_limit_per_sec,
-            max_clients: 10000,
+            max_clients,
             client_count: AtomicUsize::new(0),
         }
     }
@@ -200,12 +200,6 @@ impl MetricsStore {
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
     }
-
-    /// Override the maximum client count (for testing).
-    #[cfg(test)]
-    pub fn set_max_clients(&mut self, max: usize) {
-        self.max_clients = max;
-    }
 }
 
 #[cfg(test)]
@@ -253,7 +247,7 @@ mod tests {
 
     #[test]
     fn metrics_store_get_or_create() {
-        let store = MetricsStore::new(5);
+        let store = MetricsStore::new(5, 1000);
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         assert!(store.is_empty());
 
@@ -268,7 +262,7 @@ mod tests {
 
     #[test]
     fn metrics_store_remove() {
-        let store = MetricsStore::new(5);
+        let store = MetricsStore::new(5, 1000);
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
         store.get_or_create(addr);
         assert_eq!(store.len(), 1);
@@ -278,8 +272,7 @@ mod tests {
 
     #[test]
     fn metrics_store_max_clients() {
-        let mut store = MetricsStore::new(5);
-        store.set_max_clients(2);
+        let store = MetricsStore::new(5, 2);
 
         let a1: SocketAddr = "127.0.0.1:1001".parse().unwrap();
         let a2: SocketAddr = "127.0.0.1:1002".parse().unwrap();

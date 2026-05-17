@@ -15,6 +15,9 @@ pub async fn forward_to_backend(
 
 /// Receive a response from the backend on the session's dedicated socket.
 /// Awaits until data is available and returns the number of bytes read.
+///
+/// Note: the proxy runtime drives relay tasks via `backend_sock.recv()` directly;
+/// this helper is provided for external callers and tests.
 pub async fn recv_from_backend(
     backend_sock: &UdpSocket,
     buf: &mut [u8],
@@ -37,6 +40,9 @@ pub async fn send_to_client(
 
 /// Try to receive from the backend with a timeout.
 /// Returns `Ok(Some(n))` if data was received, `Ok(None)` on timeout.
+///
+/// Note: the proxy runtime drives relay tasks via `backend_sock.recv()` directly;
+/// this helper is provided for external callers and tests.
 pub async fn try_recv_from_backend(
     backend_sock: &UdpSocket,
     buf: &mut [u8],

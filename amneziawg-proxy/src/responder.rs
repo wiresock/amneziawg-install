@@ -1,3 +1,5 @@
+use std::fmt;
+
 use bytes::{Bytes, BytesMut, BufMut};
 
 use crate::config::AwgParams;
@@ -16,6 +18,16 @@ pub enum Protocol {
     Quic,
     Dns,
     Sip,
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Protocol::Quic => write!(f, "quic"),
+            Protocol::Dns => write!(f, "dns"),
+            Protocol::Sip => write!(f, "sip"),
+        }
+    }
 }
 
 /// AmneziaWG packet type, identified by matching the first 4 bytes (header)
@@ -410,6 +422,15 @@ fn generate_sip_trying(incoming: &[u8]) -> Bytes {
 mod tests {
     use super::*;
     use crate::config::HRange;
+
+    // -- Protocol Display tests --
+
+    #[test]
+    fn protocol_display() {
+        assert_eq!(Protocol::Quic.to_string(), "quic");
+        assert_eq!(Protocol::Dns.to_string(), "dns");
+        assert_eq!(Protocol::Sip.to_string(), "sip");
+    }
 
     // -- imitation protocol detection tests --
 

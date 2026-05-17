@@ -66,7 +66,7 @@ impl Proxy {
             Duration::from_secs(config.session_ttl_secs),
             config.max_sessions,
         ));
-        let metrics = Arc::new(MetricsStore::new(config.rate_limit_per_sec));
+        let metrics = Arc::new(MetricsStore::new(config.rate_limit_per_sec, config.max_sessions));
         let dns_upstream = if config.dns_forward_enabled {
             Some(config.dns_upstream.parse::<SocketAddr>()?)
         } else {
@@ -438,16 +438,8 @@ impl Proxy {
             old_entry.handle.abort();
         }
         self.relay_handles.insert(client_addr, RelayEntry { handle, generation });
-
-        // If the task has already completed (e.g., due to an immediate recv error)
-        // by the time we insert its handle, remove the stale entry to avoid
-        // leaving a finished JoinHandle in the map.
-        if let Some(entry_ref) = self.relay_handles.get(&client_addr) {
-            if entry_ref.handle.is_finished() {
-                drop(entry_ref);
-                self.relay_handles.remove_if(&client_addr, |_, entry| entry.generation == generation);
-            }
-        }
+        // The relay task cleans itself up via remove_if when it exits, so no
+        // post-insert is_finished() check is needed here.
     }
 
     /// Spawn a task that periodically cleans up expired sessions.

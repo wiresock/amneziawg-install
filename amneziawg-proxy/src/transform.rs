@@ -140,7 +140,8 @@ fn apply_quic_padding(data: &mut [u8], pad_size: usize) {
 ///
 /// Creates a plausible DNS response structure:
 /// - Transaction ID derived from the packet payload (which follows the padding)
-/// - Standard response flags (QR=1, RD=1, RA=1, RCODE=NOERROR)
+/// - Standard response flags (QR=1, RA=1, RCODE=NOERROR); RD is left clear
+///   because this is padding filler, not an echo of a real client query.
 /// - Remaining bytes are zero-filled for generic padding
 fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
     let (padding, payload) = data.split_at_mut(pad_size);
@@ -155,7 +156,7 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
     // DNS response header (12 bytes)
     let header: [u8; 12] = [
         tx_hi, tx_lo,   // Transaction ID
-        0x81, 0x80,     // Flags: QR=1, RD=1, RA=1, RCODE=NOERROR
+        0x80, 0x80,     // Flags: QR=1, RA=1, RCODE=NOERROR (RD not set — no query to echo)
         0x00, 0x00,     // QDCOUNT = 0 (no question section emitted)
         0x00, 0x00,     // ANCOUNT = 0
         0x00, 0x00,     // NSCOUNT = 0
@@ -273,7 +274,7 @@ mod tests {
         assert_eq!(data[1], 0xBB); // tx_lo from payload[1]
         // Flags: QR=1 (high bit of flags byte)
         assert_eq!(data[2] & 0x80, 0x80, "DNS QR bit should be set");
-        assert_eq!(data[2], 0x81); // RD=1
+        assert_eq!(data[2], 0x80); // QR=1, RD=0 (no query to echo)
         assert_eq!(data[3], 0x80); // RA=1
         // QDCOUNT = 0
         assert_eq!(data[4], 0x00);
@@ -294,8 +295,8 @@ mod tests {
 
         assert_eq!(data[0], 0xCC); // tx_hi from payload[0]
         assert_eq!(data[1], 0xCC); // tx_lo from payload[1]
-        assert_eq!(data[2], 0x81); // flags high
-        assert_eq!(data[3], 0x80); // flags low
+        assert_eq!(data[2], 0x80); // flags high: QR=1, RD=0
+        assert_eq!(data[3], 0x80); // flags low: RA=1
         assert_eq!(data[4], 0x00); // QDCOUNT high
         // Payload untouched
         assert!(data[5..10].iter().all(|&b| b == 0xCC));
@@ -409,8 +410,9 @@ mod tests {
         // DNS header: TX ID from payload bytes 0-1
         assert_eq!(result[0], 0x42); // tx_hi
         assert_eq!(result[1], 0x43); // tx_lo
-        // Flags: QR=1
+        // Flags: QR=1, RD=0
         assert_eq!(result[2] & 0x80, 0x80);
+        assert_eq!(result[2] & 0x01, 0x00, "RD must not be set in padding filler");
     }
 
     // -- AWG-aware transform tests --
