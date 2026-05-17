@@ -151,6 +151,13 @@ impl MetricsStore {
         loop {
             let current = self.client_count.load(Ordering::Acquire);
             if current >= self.max_clients {
+                // At capacity: another task may be concurrently inserting an
+                // entry for the same addr (it has reserved a slot but not yet
+                // populated `clients`). Re-check the map so we don't spuriously
+                // reject a client whose metrics entry is about to exist.
+                if let Some(r) = self.clients.get(&addr) {
+                    return Some(Arc::clone(r.value()));
+                }
                 return None;
             }
             // Try to increment; if another thread won the race, retry.
