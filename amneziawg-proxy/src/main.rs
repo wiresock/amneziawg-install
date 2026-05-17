@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use amneziawg_proxy::config;
 use amneziawg_proxy::proxy;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -34,30 +34,43 @@ async fn main() -> anyhow::Result<()> {
         "configuration loaded"
     );
 
-    // Load AWG config if specified
+    // Load AWG config if specified. If loading fails (missing or unreadable
+    // file, malformed contents), log a warning and continue without padding
+    // transformation, matching the behavior documented in doc/USAGE.md.
     let awg_params = if let Some(ref awg_path) = cfg.awg_config {
         let path = PathBuf::from(awg_path);
         info!(path = %path.display(), "loading AmneziaWG configuration");
-        let params = config::load_awg_config(&path)?;
-        info!(
-            jc = params.jc,
-            jmin = params.jmin,
-            jmax = params.jmax,
-            s1 = params.s1,
-            s2 = params.s2,
-            s3 = params.s3,
-            s4 = params.s4,
-            h1_min = params.h1.min,
-            h1_max = params.h1.max,
-            h2_min = params.h2.min,
-            h2_max = params.h2.max,
-            h3_min = params.h3.min,
-            h3_max = params.h3.max,
-            h4_min = params.h4.min,
-            h4_max = params.h4.max,
-            "AWG parameters loaded"
-        );
-        Some(params)
+        match config::load_awg_config(&path) {
+            Ok(params) => {
+                info!(
+                    jc = params.jc,
+                    jmin = params.jmin,
+                    jmax = params.jmax,
+                    s1 = params.s1,
+                    s2 = params.s2,
+                    s3 = params.s3,
+                    s4 = params.s4,
+                    h1_min = params.h1.min,
+                    h1_max = params.h1.max,
+                    h2_min = params.h2.min,
+                    h2_max = params.h2.max,
+                    h3_min = params.h3.min,
+                    h3_max = params.h3.max,
+                    h4_min = params.h4.min,
+                    h4_max = params.h4.max,
+                    "AWG parameters loaded"
+                );
+                Some(params)
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to load AmneziaWG configuration; continuing without padding transformation"
+                );
+                None
+            }
+        }
     } else {
         info!("no AWG config specified, running without packet classification");
         None
