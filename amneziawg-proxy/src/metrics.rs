@@ -142,44 +142,34 @@ impl MetricsStore {
     /// Get or create metrics for a client.
     /// Returns `None` if the client limit has been reached and this is a new client.
     pub fn get_or_create(&self, addr: SocketAddr) -> Option<Arc<ClientMetrics>> {
-        // Fast path: already exists
+        // Fast path: already exists (avoids acquiring the entry shard guard).
         if let Some(r) = self.clients.get(&addr) {
             return Some(Arc::clone(r.value()));
         }
-        // Atomically reserve a slot before inserting. If the counter is at or
-        // above the limit, reject the new client without inserting.
-        loop {
-            let current = self.client_count.load(Ordering::Acquire);
-            if current >= self.max_clients {
-                // At capacity: another task may be concurrently inserting an
-                // entry for the same addr (it has reserved a slot but not yet
-                // populated `clients`). Re-check the map so we don't spuriously
-                // reject a client whose metrics entry is about to exist.
-                if let Some(r) = self.clients.get(&addr) {
-                    return Some(Arc::clone(r.value()));
-                }
-                return None;
-            }
-            // Try to increment; if another thread won the race, retry.
-            if self.client_count.compare_exchange(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ).is_ok() {
-                break;
-            }
-        }
-        // We've reserved a slot — insert if still absent, or undo if another
-        // call already inserted the same addr concurrently.
-        let entry = self.clients.entry(addr);
-        match entry {
-            dashmap::mapref::entry::Entry::Occupied(o) => {
-                // Another task beat us to it; undo the counter bump.
-                self.client_count.fetch_sub(1, Ordering::AcqRel);
-                Some(Arc::clone(o.get()))
-            }
+        // Acquire the entry shard guard for `addr` *before* reserving a slot,
+        // so concurrent callers for the same addr can never observe a
+        // "count incremented, key absent" intermediate state for this addr.
+        // Capacity reservation happens inside the Vacant arm while the shard
+        // guard is held, ensuring the increment and the insert are atomic
+        // with respect to other lookups of the same key.
+        match self.clients.entry(addr) {
+            dashmap::mapref::entry::Entry::Occupied(o) => Some(Arc::clone(o.get())),
             dashmap::mapref::entry::Entry::Vacant(v) => {
+                // Atomically reserve a slot; reject if at capacity.
+                loop {
+                    let current = self.client_count.load(Ordering::Acquire);
+                    if current >= self.max_clients {
+                        return None;
+                    }
+                    if self.client_count.compare_exchange(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ).is_ok() {
+                        break;
+                    }
+                }
                 let metrics = Arc::new(ClientMetrics::new(self.rate_limit_per_sec));
                 v.insert(Arc::clone(&metrics));
                 Some(metrics)
