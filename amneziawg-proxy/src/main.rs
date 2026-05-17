@@ -120,7 +120,6 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => {
                     error!(error = %e, "failed to listen for ctrl-c");
                     // Do not trigger shutdown on handler registration failure.
-                    return;
                 }
             }
         }

@@ -282,12 +282,10 @@ impl Proxy {
                                     probe_response = Some(responder::generate_response(proto, data));
                                 }
                             }
+                        } else if metrics.try_acquire_probe() {
+                            probe_response = Some(responder::generate_response(proto, data));
                         } else {
-                            if metrics.try_acquire_probe() {
-                                probe_response = Some(responder::generate_response(proto, data));
-                            } else {
-                                debug!(%client_addr, "probe rate limited");
-                            }
+                            debug!(%client_addr, "probe rate limited");
                         }
                     } else if metrics.try_acquire_probe() {
                         if proto == Protocol::Dns && self.dns_forward_enabled {
