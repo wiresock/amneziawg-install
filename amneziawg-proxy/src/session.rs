@@ -157,7 +157,6 @@ impl SessionTable {
 
         self.sessions.retain(|addr, session| {
             if now.duration_since(session.last_active) > self.ttl {
-                info!(%addr, "session expired");
                 expired.push(*addr);
                 self.session_count.fetch_sub(1, Ordering::AcqRel);
                 false
@@ -165,6 +164,12 @@ impl SessionTable {
                 true
             }
         });
+
+        // Log outside the retain closure to avoid holding DashMap shard locks
+        // during formatting/IO under contention.
+        for addr in &expired {
+            info!(%addr, "session expired");
+        }
 
         expired
     }

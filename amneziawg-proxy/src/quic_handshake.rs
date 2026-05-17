@@ -51,10 +51,15 @@ impl DynamicSniResolver {
     }
 
     fn cache_get(&self, name: &str) -> Option<Arc<CertifiedKey>> {
-        self.cache
+        // Recover from a poisoned mutex instead of permanently disabling the
+        // cache. Losing the cache would force regenerating self-signed certs
+        // on every handshake, which is exactly the CPU-spike behavior we want
+        // to avoid under adversarial traffic.
+        let cache = self
+            .cache
             .lock()
-            .ok()
-            .and_then(|cache| cache.get(name).cloned())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.get(name).cloned()
     }
 }
 

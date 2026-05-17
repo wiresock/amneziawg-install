@@ -441,8 +441,17 @@ impl Proxy {
             old_entry.handle.abort();
         }
         self.relay_handles.insert(client_addr, RelayEntry { handle, generation });
-        // The relay task cleans itself up via remove_if when it exits, so no
-        // post-insert is_finished() check is needed here.
+        // If the spawned task already finished before we inserted (e.g. the
+        // backend socket immediately errored with ECONNREFUSED), its
+        // `remove_if` cleanup ran before our insert, leaving a finished
+        // handle in the map. Clean it up here so we don't leak the entry.
+        if let Some(entry) = self.relay_handles.get(&client_addr) {
+            if entry.handle.is_finished() {
+                drop(entry);
+                self.relay_handles
+                    .remove_if(&client_addr, |_, e| e.generation == generation && e.handle.is_finished());
+            }
+        }
     }
 
     /// Spawn a task that periodically cleans up expired sessions.
