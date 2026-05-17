@@ -384,17 +384,22 @@ impl Proxy {
                         // Apply padding transformation to outgoing packets.
                         // When AWG params are available, use per-type S-value
                         // padding based on H-range classification.
+                        // In "auto" mode (fixed_protocol is None) only transform
+                        // when the client's protocol has actually been detected;
+                        // without a detected protocol there is no basis for choosing
+                        // a padding strategy, so the packet is forwarded as-is.
                         if let Some(ref params) = awg_params {
                             let protocol = client_protocols
                                 .get(&client_addr)
                                 .map(|p| *p)
-                                .or(fixed_protocol)
-                                .unwrap_or(Protocol::Quic);
-                            transform::apply_awg_transform(
-                                &mut buf[..n],
-                                params,
-                                protocol,
-                            );
+                                .or(fixed_protocol);
+                            if let Some(protocol) = protocol {
+                                transform::apply_awg_transform(
+                                    &mut buf[..n],
+                                    params,
+                                    protocol,
+                                );
+                            }
                         }
 
                         if let Some(m) = metrics.get_or_create(client_addr) {

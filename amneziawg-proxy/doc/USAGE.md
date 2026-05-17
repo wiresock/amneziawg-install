@@ -170,8 +170,9 @@ backend = "127.0.0.1:51821"
 #   "sip"   — SIP header-style padding; responds to SIP requests with a valid
 #             100 Trying reply (RFC 3261).
 #   "auto"  — Detect the protocol from each incoming packet; use the detected
-#             protocol for that packet. No padding transformation is applied in
-#             auto mode because no single protocol can be assumed.
+#             protocol for that packet. Padding transformation is applied only
+#             after a protocol has been detected for the client; packets
+#             received before any probe is seen are forwarded as-is.
 imitate_protocol = "quic"
 
 # ── Session management ────────────────────────────────────────────────────────
@@ -268,7 +269,7 @@ applied and AWG packets are forwarded unmodified.
 | `quic` | High-entropy PRNG bytes (QUIC short-header format) | QUIC Version Negotiation (RFC 9000 §17.2.1) | Ports 443/UDP; QUIC-heavy networks |
 | `dns` | DNS response header + zero fill | DNS SERVFAIL (RFC 1035) | Port 53/UDP; DNS-filtered networks |
 | `sip` | Cycling SIP header text | SIP 100 Trying (RFC 3261) | Port 5060/UDP; VoIP infrastructure |
-| `auto` | None | Matches detected protocol | Mixed-probe environments |
+| `auto` | Per-client, once protocol is detected (none until first probe) | Matches detected protocol | Mixed-probe environments |
 
 **Choosing a mode:**
 
@@ -280,7 +281,8 @@ applied and AWG packets are forwarded unmodified.
 - Use `sip` for VoIP-permissive networks or when a SIP service already runs
   on the same host.
 - Use `auto` when probe type varies and no single protocol is dominant.
-  Note: no padding transformation is applied in auto mode.
+  Padding is applied per-client once the first probe is detected; packets
+  forwarded before any probe has been seen are not transformed.
 
 ### Advanced options
 
