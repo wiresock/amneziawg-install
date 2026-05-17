@@ -1,16 +1,5 @@
 # amneziawg-proxy — Architecture & Packet Flows
 
-> **This file has moved.**
-> The documentation now lives in the [`doc/`](doc/) directory:
->
-> - [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) — internal design, packet flows, and worked examples
-> - [doc/USAGE.md](doc/USAGE.md) — installation, configuration, and troubleshooting
->
-> The content below is retained for reference but will not be updated.
-
----
-
-
 ## Overview
 
 `amneziawg-proxy` is an async UDP proxy that sits in front of an AmneziaWG
@@ -89,17 +78,18 @@ passes through the proxy, which adds the imitation layer.
 
 ## Module Map
 
-| Module         | Responsibility |
-|----------------|----------------|
-| `main.rs`      | CLI entry point: loads TOML config, optionally loads AWG config, sets up logging and signal handling, runs the proxy. |
-| `config.rs`    | Parses `proxy.toml` (TOML) and AWG INI-style config files. Validates addresses, protocol names, H-range non-overlap, Jmin≤Jmax. |
-| `proxy.rs`     | Core runtime: binds frontend socket, runs the main `recv_from` loop, spawns per-session relay tasks and cleanup task, orchestrates all other modules. |
-| `responder.rs` | Probe detection (`detect_protocol`) and response generation (`generate_response`). Also contains AWG packet classification (`classify_awg_packet`). |
-| `transform.rs` | Padding transformation: overwrites the S1–S4 padding prefix with protocol-conformant filler (QUIC PRNG, DNS header, SIP text). |
-| `session.rs`   | Per-client session table backed by `DashMap`. Each session owns a dedicated ephemeral UDP socket connected to the backend. TTL-based expiry. |
-| `backend.rs`   | Low-level backend I/O: `forward_to_backend`, `recv_from_backend`, `send_to_client`, `try_recv_from_backend` (with timeout). |
-| `metrics.rs`   | Per-client counters (packets in/out, probes) and token-bucket rate limiter for probe responses. |
-| `errors.rs`    | `ProxyError` enum with `thiserror` derives: Config, Io, SessionNotFound, RateLimited, BackendUnreachable, Shutdown. |
+| Module             | Responsibility |
+|--------------------|----------------|
+| `main.rs`          | CLI entry point: loads TOML config, optionally loads AWG config, sets up logging and signal handling, runs the proxy. |
+| `config.rs`        | Parses `proxy.toml` (TOML) and AWG INI-style config files. Validates addresses, protocol names, H-range non-overlap, Jmin≤Jmax. |
+| `proxy.rs`         | Core runtime: binds frontend socket, runs the main `recv_from` loop, spawns per-session relay tasks and cleanup task, orchestrates all other modules. |
+| `responder.rs`     | Probe detection (`detect_protocol`) and response generation (`generate_response`). Also contains AWG packet classification (`classify_awg_packet`). |
+| `transform.rs`     | Padding transformation: overwrites the S1–S4 padding prefix with protocol-conformant filler (QUIC PRNG, DNS header, SIP text). |
+| `session.rs`       | Per-client session table backed by `DashMap`. Each session owns a dedicated ephemeral UDP socket connected to the backend. TTL-based expiry. |
+| `backend.rs`       | Low-level backend I/O: `forward_to_backend`, `recv_from_backend`, `send_to_client`, `try_recv_from_backend` (with timeout). |
+| `metrics.rs`       | Per-client counters (packets in/out, probes) and token-bucket rate limiter for probe responses. |
+| `errors.rs`        | `ProxyError` enum with `thiserror` derives: Config, Io, SessionNotFound, RateLimited, BackendUnreachable, Shutdown. |
+| `quic_handshake.rs`| Stateful QUIC handshake responder backed by `quinn-proto`. Handles TLS ClientHello and generates server Initial/Handshake flight packets. |
 
 ---
 
@@ -254,19 +244,19 @@ Byte  Field
 12+   Question section    Echoed when fully parsed (optional)
 ```
 The RD (Recursion Desired) bit is copied from the incoming query per
-RFC 1035 §4.1.1 rather than being hard-coded.  The question section is
-parsed by walking the QNAME labels (each prefixed with a length byte,
-terminated by a zero root label; individual labels ≤ 63, total QNAME
-≤ 255 including root) then appending 4 bytes for QTYPE and QCLASS.
-If the question section cannot be fully parsed (truncated query,
-compression pointers, or RFC 1035 label/name length violations), the
-response is returned header-only with QDCOUNT = 0.  The total echoed
-response is capped at 512 bytes per RFC 1035 §2.3.4.
+RFC 1035 §4.1.1. The question section is parsed by walking the QNAME labels
+(each prefixed with a length byte, terminated by a zero root label; individual
+labels ≤ 63, total QNAME ≤ 255 including root) then appending 4 bytes for
+QTYPE and QCLASS. If the question section cannot be fully parsed (truncated
+query, compression pointers, or RFC 1035 label/name length violations), the
+response is returned header-only with QDCOUNT = 0. The total echoed response
+is capped at 512 bytes per RFC 1035 §2.3.4.
 
 **Padding fill** (`apply_dns_padding`):
 - Bytes 0-1: Transaction ID derived from the first two payload bytes
   (H header bytes) that follow the padding prefix
-- Bytes 2-3: `0x81 0x80` (QR=1, RD=1, RA=1, RCODE=NOERROR)
+- Bytes 2-3: `0x80 0x80` (QR=1, RA=1, RCODE=NOERROR; RD left clear —
+  no client query to echo in outgoing padding filler)
 - Bytes 4-11: Section counts (QDCOUNT=0, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0)
 - Bytes 12+: Zero-filled (EDNS OPT padding per RFC 7830)
 
@@ -282,7 +272,7 @@ AWG packet (backend → client):
 ┌──────────────────────────┐
 │ TX_ID │ flags │ counts   │
 │ (2B)  │ (2B)  │ (8B)     │
-│ 0x81 0x80     │          │
+│ 0x80 0x80     │          │
 ├──────────────────────────┤
 │ 0x00 ... (EDNS padding)  │
 └──────────────────────────┘
@@ -362,7 +352,7 @@ otherwise → unclassified (no transform applied)
 ```
 
 The S-padding precedes the H header, so the classifier tries each S offset
-to find the header.  The H ranges are validated to be non-overlapping during
+to find the header. The H ranges are validated to be non-overlapping during
 config parsing so classification is unambiguous.
 
 ---
@@ -572,8 +562,8 @@ ephemeral UDP socket `connect()`ed to the backend. This provides:
   sessions idle longer than `session_ttl_secs` (default: 300 s) and removes
   associated metrics.
 - **Resource limits** — `max_sessions` (default: 10,000) prevents resource
-  exhaustion. Excess clients receive an error log and their packets are
-  dropped.
+  exhaustion. Both the session table and the metrics store enforce this limit.
+  Excess clients receive an error log and their packets are dropped.
 
 ```
 SessionTable (DashMap<SocketAddr, Session>)
@@ -595,67 +585,10 @@ algorithm:
 - Each probe response costs 1 token
 - If no tokens available, the probe response is silently skipped (the
   packet is still forwarded to the backend)
-- The `MetricsStore` also enforces a maximum of 10,000 tracked clients
+- The `MetricsStore` enforces the same `max_sessions` cap as the session table
 
 This prevents a DPI system from using the probe response mechanism to amplify
 traffic or exhaust proxy resources.
-
----
-
-## Configuration Reference
-
-### proxy.toml
-
-```toml
-# Address the proxy listens on (required)
-listen = "0.0.0.0:51820"
-
-# Backend AmneziaWG address (required)
-backend = "127.0.0.1:51821"
-
-# Which protocol to imitate: "auto", "quic", "dns", or "sip" (default: "quic")
-imitate_protocol = "quic"
-
-# Session TTL in seconds (default: 300)
-session_ttl_secs = 300
-
-# Cleanup sweep interval in seconds (default: 60)
-cleanup_interval_secs = 60
-
-# Max probe responses per client per second (default: 5)
-rate_limit_per_sec = 5
-
-# UDP recv buffer size in bytes (default: 65535)
-buffer_size = 65535
-
-# Max concurrent sessions (default: 10000)
-max_sessions = 10000
-
-# Optional: path to AWG config file for packet classification
-# When set, the proxy reads S1-S4 and H1-H4 for per-type padding.
-# Without this, no padding transformation is applied.
-awg_config = "/etc/amnezia/amneziawg/awg0.conf"
-```
-
-### AWG Config (INI-style, `[Interface]` section)
-
-```ini
-[Interface]
-Jc = 5
-Jmin = 50
-Jmax = 1000
-S1 = 42
-S2 = 88
-S3 = 33
-S4 = 120
-H1 = 5-100000004
-H2 = 100000005-200000004
-H3 = 200000005-300000004
-H4 = 300000005-400000004
-```
-
-Only the `[Interface]` section is parsed; `[Peer]` sections and unknown keys
-(Address, PrivateKey, etc.) are ignored.
 
 ---
 
