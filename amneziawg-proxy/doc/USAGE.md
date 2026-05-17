@@ -211,11 +211,11 @@ awg_config = "/etc/amnezia/amneziawg/awg0.conf"
 
 # Forward detected DNS queries to a real upstream resolver before (or instead
 # of) generating the SERVFAIL probe response.
-# Only valid when imitate_protocol = "dns".
+# Only valid when imitate_protocol = "dns" or "auto".
 dns_forward_enabled = false
 
 # Upstream DNS resolver to forward queries to when dns_forward_enabled = true.
-dns_upstream = "127.0.0.1:53"
+dns_upstream = "1.1.1.1:53"
 
 # Timeout (milliseconds) waiting for a response from the upstream DNS resolver.
 dns_upstream_timeout_ms = 1500
@@ -225,7 +225,7 @@ dns_upstream_timeout_ms = 1500
 # Enable the stateful QUIC TLS handshake responder (quinn-proto based).
 # When enabled, the proxy completes a real QUIC handshake with probing clients
 # instead of sending a simple Version Negotiation packet.
-# Only valid when imitate_protocol = "quic".
+# Only valid when imitate_protocol = "quic" or "auto".
 quic_handshake_enabled = false
 
 # TLS SNI domain used to generate the self-signed certificate for the QUIC

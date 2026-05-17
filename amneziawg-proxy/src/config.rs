@@ -309,7 +309,7 @@ fn default_quic_certificate_domain() -> String {
     "localhost".into()
 }
 fn default_dns_upstream() -> String {
-    "127.0.0.1:53".into()
+    "1.1.1.1:53".into()
 }
 fn default_dns_upstream_timeout_ms() -> u64 {
     1500
@@ -454,7 +454,7 @@ backend = "127.0.0.1:51821"
         assert!(!cfg.quic_handshake_enabled);
         assert_eq!(cfg.quic_certificate_domain, "localhost");
         assert!(!cfg.dns_forward_enabled);
-        assert_eq!(cfg.dns_upstream, "127.0.0.1:53");
+        assert_eq!(cfg.dns_upstream, "1.1.1.1:53");
         assert_eq!(cfg.dns_upstream_timeout_ms, 1500);
         assert_eq!(cfg.buffer_size, 65535);
         assert!(cfg.awg_config.is_none());
