@@ -136,7 +136,7 @@ Network options:
   --backend-port PORT       New AWG listening port after rebind (default: ${DEFAULT_BACKEND_PORT})
 
 Proxy behaviour:
-  --protocol PROTO          Protocol to imitate: quic, dns, sip, auto
+  --protocol PROTO          Protocol to imitate: quic, dns, stun, sip, auto
                             (default: ${DEFAULT_PROTOCOL})
   --session-ttl SECS        Idle session timeout in seconds (default: ${DEFAULT_SESSION_TTL})
   --rate-limit N            Max probe responses per client per second (default: ${DEFAULT_RATE_LIMIT})
@@ -596,8 +596,9 @@ prompt_protocol() {
     printf "\nProtocol to imitate:\n"
     printf "  1) quic  — QUIC/UDP (recommended; best DPI evasion)\n"
     printf "  2) dns   — DNS/UDP (works where only DNS is allowed)\n"
-    printf "  3) sip   — SIP/UDP (VoIP-heavy networks)\n"
-    printf "  4) auto  — auto-detect from incoming probe\n"
+    printf "  3) stun  — STUN/UDP (WebRTC/NAT traversal networks)\n"
+    printf "  4) sip   — SIP/UDP (VoIP-heavy networks)\n"
+    printf "  5) auto  — auto-detect from incoming probe\n"
     printf "\n"
 
     local choice
@@ -605,8 +606,9 @@ prompt_protocol() {
     case "${PROTOCOL}" in
         quic) default_choice="1" ;;
         dns)  default_choice="2" ;;
-        sip)  default_choice="3" ;;
-        auto) default_choice="4" ;;
+        stun) default_choice="3" ;;
+        sip)  default_choice="4" ;;
+        auto) default_choice="5" ;;
     esac
 
     while true; do
@@ -614,9 +616,10 @@ prompt_protocol() {
         case "${choice}" in
             1|quic) PROTOCOL="quic"; break ;;
             2|dns)  PROTOCOL="dns";  break ;;
-            3|sip)  PROTOCOL="sip";  break ;;
-            4|auto) PROTOCOL="auto"; break ;;
-            *) warn "Invalid protocol '${choice}'. Enter 1–4 or: quic, dns, sip, auto." ;;
+            3|stun) PROTOCOL="stun"; break ;;
+            4|sip)  PROTOCOL="sip";  break ;;
+            5|auto) PROTOCOL="auto"; break ;;
+            *) warn "Invalid protocol '${choice}'. Enter 1–5 or: quic, dns, stun, sip, auto." ;;
         esac
     done
 }
@@ -1207,8 +1210,8 @@ Re-run with: --listen-port <port>"
 validate_config() {
     # Protocol must be one of the supported values.
     case "${PROTOCOL}" in
-        quic|dns|sip|auto) ;;
-        *) die "Invalid protocol '${PROTOCOL}'. Must be one of: quic, dns, sip, auto." ;;
+        quic|dns|stun|sip|auto) ;;
+        *) die "Invalid protocol '${PROTOCOL}'. Must be one of: quic, dns, stun, sip, auto." ;;
     esac
 
     # quic_handshake_enabled requires protocol quic or auto
@@ -1346,7 +1349,7 @@ backend = "${BACKEND_HOST}:${BACKEND_PORT}"
 
 # ── Protocol imitation ────────────────────────────────────────────────────────
 
-# Protocol to imitate: "quic", "dns", "sip", or "auto"
+# Protocol to imitate: "quic", "dns", "stun", "sip", or "auto"
 imitate_protocol = "${PROTOCOL}"
 
 # QUIC handshake continuation responder (stateful; more realistic).

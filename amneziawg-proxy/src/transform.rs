@@ -1,8 +1,8 @@
 #[cfg(test)]
-use bytes::{BytesMut, BufMut};
+use bytes::{BufMut, BytesMut};
 
 use crate::config::AwgParams;
-use crate::responder::{Protocol, classify_awg_packet};
+use crate::responder::{classify_awg_packet, Protocol};
 
 /// Apply protocol-conformant padding transformation to an outgoing packet.
 ///
@@ -23,6 +23,8 @@ use crate::responder::{Protocol, classify_awg_packet};
 ///   entropy), with a QUIC short-header form byte at the start.
 /// - **DNS**: DNS response header structure (transaction ID, flags, section
 ///   counts) followed by zero-fill for EDNS OPT padding (RFC 7830).
+/// - **STUN**: STUN Binding Indication header with the RFC 5389 magic cookie
+///   and a deterministic transaction ID derived from the payload.
 /// - **SIP**: SIP header continuation text (`Via:`, `Content-Length:`)
 ///   ending with CRLF.
 pub fn apply_padding(data: &mut [u8], pad_size: usize, proto: Protocol) {
@@ -33,6 +35,7 @@ pub fn apply_padding(data: &mut [u8], pad_size: usize, proto: Protocol) {
     match proto {
         Protocol::Quic => apply_quic_padding(data, pad_size),
         Protocol::Dns => apply_dns_padding(data, pad_size),
+        Protocol::Stun => apply_stun_padding(data, pad_size),
         Protocol::Sip => apply_sip_padding(data, pad_size),
     }
 }
@@ -46,11 +49,7 @@ pub fn apply_padding(data: &mut [u8], pad_size: usize, proto: Protocol) {
 /// Returns `true` if the packet was classified and transformed, `false` if the
 /// packet type could not be identified (e.g. junk packet) and was left
 /// unchanged.
-pub fn apply_awg_transform(
-    data: &mut [u8],
-    params: &AwgParams,
-    proto: Protocol,
-) -> bool {
+pub fn apply_awg_transform(data: &mut [u8], params: &AwgParams, proto: Protocol) -> bool {
     let pkt_type = match classify_awg_packet(data, params) {
         Some(t) => t,
         None => return false,
@@ -155,18 +154,54 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
 
     // DNS response header (12 bytes)
     let header: [u8; 12] = [
-        tx_hi, tx_lo,   // Transaction ID
-        0x80, 0x80,     // Flags: QR=1, RA=1, RCODE=NOERROR (RD not set — no query to echo)
-        0x00, 0x00,     // QDCOUNT = 0 (no question section emitted)
-        0x00, 0x00,     // ANCOUNT = 0
-        0x00, 0x00,     // NSCOUNT = 0
-        0x00, 0x00,     // ARCOUNT = 0 (no additional records emitted)
+        tx_hi, tx_lo, // Transaction ID
+        0x80, 0x80, // Flags: QR=1, RA=1, RCODE=NOERROR (RD not set — no query to echo)
+        0x00, 0x00, // QDCOUNT = 0 (no question section emitted)
+        0x00, 0x00, // ANCOUNT = 0
+        0x00, 0x00, // NSCOUNT = 0
+        0x00, 0x00, // ARCOUNT = 0 (no additional records emitted)
     ];
 
     let copy_len = std::cmp::min(padding.len(), header.len());
     padding[..copy_len].copy_from_slice(&header[..copy_len]);
 
     // Rest: zero-fill (generic padding content)
+    for byte in padding[copy_len..].iter_mut() {
+        *byte = 0x00;
+    }
+}
+
+/// STUN-style padding: Binding Indication header with deterministic transaction ID.
+///
+/// A strict STUN parser validates the whole UDP datagram length, while the proxy
+/// can only rewrite the AWG padding prefix and must leave the encrypted payload
+/// untouched. The leading bytes therefore mimic the STUN header shape that DPI
+/// heuristics look for: message type, zero length, magic cookie, and 96-bit
+/// transaction ID.
+fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
+    let (padding, payload) = data.split_at_mut(pad_size);
+    if padding.is_empty() {
+        return;
+    }
+
+    let mut state: u32 = 0x811c_9dc5;
+    for &b in payload.iter().take(64) {
+        state ^= b as u32;
+        state = state.wrapping_mul(0x0100_0193);
+    }
+
+    let mut header = [0u8; 20];
+    header[0..2].copy_from_slice(&0x0011u16.to_be_bytes()); // Binding Indication
+    header[2..4].copy_from_slice(&0u16.to_be_bytes()); // no attributes in the header
+    header[4..8].copy_from_slice(&0x2112_A442u32.to_be_bytes());
+    for chunk in header[8..20].chunks_mut(4) {
+        chunk.copy_from_slice(&state.to_be_bytes());
+        state = lcg_step(state);
+    }
+
+    let copy_len = std::cmp::min(padding.len(), header.len());
+    padding[..copy_len].copy_from_slice(&header[..copy_len]);
+
     for byte in padding[copy_len..].iter_mut() {
         *byte = 0x00;
     }
@@ -272,11 +307,11 @@ mod tests {
         // DNS response header: TX ID derived from payload bytes
         assert_eq!(data[0], 0xBB); // tx_hi from payload[0]
         assert_eq!(data[1], 0xBB); // tx_lo from payload[1]
-        // Flags: QR=1 (high bit of flags byte)
+                                   // Flags: QR=1 (high bit of flags byte)
         assert_eq!(data[2] & 0x80, 0x80, "DNS QR bit should be set");
         assert_eq!(data[2], 0x80); // QR=1, RD=0 (no query to echo)
         assert_eq!(data[3], 0x80); // RA=1
-        // QDCOUNT = 0
+                                   // QDCOUNT = 0
         assert_eq!(data[4], 0x00);
         assert_eq!(data[5], 0x00);
         // After header (12 bytes), rest of padding should be zeros
@@ -298,8 +333,35 @@ mod tests {
         assert_eq!(data[2], 0x80); // flags high: QR=1, RD=0
         assert_eq!(data[3], 0x80); // flags low: RA=1
         assert_eq!(data[4], 0x00); // QDCOUNT high
-        // Payload untouched
+                                   // Payload untouched
         assert!(data[5..10].iter().all(|&b| b == 0xCC));
+    }
+
+    // -- STUN padding tests --
+
+    #[test]
+    fn stun_padding_has_binding_indication_header() {
+        let mut data = vec![0x00; 28];
+        data[20..28].copy_from_slice(&[0xAB; 8]);
+        apply_padding(&mut data, 20, Protocol::Stun);
+
+        assert_eq!(&data[0..2], &0x0011u16.to_be_bytes());
+        assert_eq!(&data[2..4], &0u16.to_be_bytes());
+        assert_eq!(&data[4..8], &0x2112_A442u32.to_be_bytes());
+        assert!(data[8..20].iter().any(|&b| b != 0x00));
+        assert!(data[20..28].iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn stun_padding_short_fills_partial_header() {
+        let mut data = vec![0x00; 10];
+        data[7..10].fill(0xCC);
+        apply_padding(&mut data, 7, Protocol::Stun);
+
+        assert_eq!(&data[0..2], &0x0011u16.to_be_bytes());
+        assert_eq!(&data[2..4], &0u16.to_be_bytes());
+        assert_eq!(&data[4..7], &0x2112_A442u32.to_be_bytes()[..3]);
+        assert!(data[7..10].iter().all(|&b| b == 0xCC));
     }
 
     // -- SIP padding tests --
@@ -410,9 +472,23 @@ mod tests {
         // DNS header: TX ID from payload bytes 0-1
         assert_eq!(result[0], 0x42); // tx_hi
         assert_eq!(result[1], 0x43); // tx_lo
-        // Flags: QR=1, RD=0
+                                     // Flags: QR=1, RD=0
         assert_eq!(result[2] & 0x80, 0x80);
-        assert_eq!(result[2] & 0x01, 0x00, "RD must not be set in padding filler");
+        assert_eq!(
+            result[2] & 0x01,
+            0x00,
+            "RD must not be set in padding filler"
+        );
+    }
+
+    #[test]
+    fn build_padded_packet_stun() {
+        let payload = vec![0x42, 0x43, 0x44, 0x45];
+        let result = build_padded_packet(&payload, 20, Protocol::Stun);
+        assert_eq!(result.len(), 24);
+        assert_eq!(&result[20..24], &[0x42, 0x43, 0x44, 0x45]);
+        assert_eq!(&result[0..2], &0x0011u16.to_be_bytes());
+        assert_eq!(&result[4..8], &0x2112_A442u32.to_be_bytes());
     }
 
     // -- AWG-aware transform tests --
@@ -458,7 +534,7 @@ mod tests {
         // Header should be untouched
         assert_eq!(&pkt[10..14], &150u32.to_le_bytes());
         // Body should be untouched
-        assert!(pkt[14..10+148].iter().all(|&b| b == 0xAA));
+        assert!(pkt[14..10 + 148].iter().all(|&b| b == 0xAA));
     }
 
     #[test]
@@ -508,7 +584,27 @@ mod tests {
         // Header should be untouched
         assert_eq!(&pkt[8..12], &350u32.to_le_bytes());
         // Body should be untouched
-        assert!(pkt[12..8+92].iter().all(|&b| b == 0xDD));
+        assert!(pkt[12..8 + 92].iter().all(|&b| b == 0xDD));
+    }
+
+    #[test]
+    fn awg_transform_transport_data_stun() {
+        let params = test_awg_params();
+        let padding_original = [0xFF; 20];
+        let header = 750u32.to_le_bytes();
+        let body = [0xBB; 100];
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&padding_original);
+        pkt.extend_from_slice(&header);
+        pkt.extend_from_slice(&body);
+
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Stun);
+        assert!(result);
+
+        assert_eq!(&pkt[0..2], &0x0011u16.to_be_bytes());
+        assert_eq!(&pkt[4..8], &0x2112_A442u32.to_be_bytes());
+        assert_eq!(&pkt[20..24], &750u32.to_le_bytes());
+        assert!(pkt[24..124].iter().all(|&b| b == 0xBB));
     }
 
     #[test]

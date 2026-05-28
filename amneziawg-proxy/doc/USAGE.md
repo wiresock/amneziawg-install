@@ -70,6 +70,12 @@ sudo ./amneziawg-proxy/scripts/amneziawg-proxy-install.sh \
   --dns-forward \
   --dns-upstream 1.1.1.1:53
 
+# STUN imitation, useful for WebRTC/NAT-traversal-permissive networks
+sudo ./amneziawg-proxy/scripts/amneziawg-proxy-install.sh \
+  --non-interactive \
+  --listen-port 3478 \
+  --protocol stun
+
 # SIP imitation with stateful QUIC handshake disabled
 sudo ./amneziawg-proxy/scripts/amneziawg-proxy-install.sh \
   --non-interactive \
@@ -88,7 +94,7 @@ sudo ./amneziawg-proxy/scripts/amneziawg-proxy-install.sh \
 | `--listen-port PORT` | auto from AWG | Public-facing UDP port. |
 | `--backend-host HOST` | `127.0.0.1` | Loopback host for the AWG backend. |
 | `--backend-port PORT` | `51821` | Port AWG is rebound to after install. |
-| `--protocol PROTO` | `quic` | Protocol to imitate: `quic`, `dns`, `sip`, or `auto`. |
+| `--protocol PROTO` | `quic` | Protocol to imitate: `quic`, `dns`, `stun`, `sip`, or `auto`. |
 | `--session-ttl SECS` | `300` | Idle session timeout in seconds. |
 | `--rate-limit N` | `5` | Max probe responses per client per second. |
 | `--dns-forward` | off | Enable DNS query forwarding to an upstream resolver. |
@@ -167,6 +173,8 @@ backend = "127.0.0.1:51821"
 #             with a valid Version Negotiation packet (RFC 9000).
 #   "dns"   — DNS response header padding; responds to DNS queries with a valid
 #             SERVFAIL reply (RFC 1035).
+#   "stun"  — STUN Binding Indication padding; responds to STUN Binding
+#             Requests with a valid Binding Success reply (RFC 5389/8489).
 #   "sip"   — SIP header-style padding; responds to SIP requests with a valid
 #             100 Trying reply (RFC 3261).
 #   "auto"  — Detect the protocol from each incoming packet; use the detected
@@ -268,6 +276,7 @@ applied and AWG packets are forwarded unmodified.
 |------|-------------------|----------------|----------|
 | `quic` | High-entropy PRNG bytes (QUIC short-header format) | QUIC Version Negotiation (RFC 9000 §17.2.1) | Ports 443/UDP; QUIC-heavy networks |
 | `dns` | DNS response header + zero fill | DNS SERVFAIL (RFC 1035) | Port 53/UDP; DNS-filtered networks |
+| `stun` | STUN Binding Indication header | STUN Binding Success with XOR-MAPPED-ADDRESS (RFC 5389/8489) | Port 3478/UDP; WebRTC/NAT traversal networks |
 | `sip` | Cycling SIP header text | SIP 100 Trying (RFC 3261) | Port 5060/UDP; VoIP infrastructure |
 | `auto` | Per-client, once protocol is detected (none until first probe) | Matches detected protocol | Mixed-probe environments |
 
@@ -278,6 +287,8 @@ applied and AWG packets are forwarded unmodified.
   encrypted payloads that are hard to distinguish from AWG traffic.
 - Use `dns` when the VPN must run on port 53 to bypass DNS-based firewalls.
   Pair with `dns_forward_enabled = true` to handle legitimate DNS queries.
+- Use `stun` when UDP/3478 or WebRTC/NAT-traversal traffic is allowed and
+  probers expect a STUN Binding response.
 - Use `sip` for VoIP-permissive networks or when a SIP service already runs
   on the same host.
 - Use `auto` when probe type varies and no single protocol is dominant.

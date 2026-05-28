@@ -153,7 +153,11 @@ pub fn parse_awg_config(text: &str) -> Result<AwgParams, ProxyError> {
 /// Load AWG parameters from a config file on disk.
 pub fn load_awg_config(path: &Path) -> Result<AwgParams, ProxyError> {
     let contents = std::fs::read_to_string(path).map_err(|e| {
-        ProxyError::Config(format!("failed to read AWG config {}: {}", path.display(), e))
+        ProxyError::Config(format!(
+            "failed to read AWG config {}: {}",
+            path.display(),
+            e
+        ))
     })?;
     parse_awg_config(&contents)
 }
@@ -200,12 +204,7 @@ fn validate_awg_params(p: &AwgParams) -> Result<(), ProxyError> {
     }
 
     // H ranges must not overlap
-    let ranges = [
-        ("H1", p.h1),
-        ("H2", p.h2),
-        ("H3", p.h3),
-        ("H4", p.h4),
-    ];
+    let ranges = [("H1", p.h1), ("H2", p.h2), ("H3", p.h3), ("H4", p.h4)];
     for i in 0..ranges.len() {
         for j in (i + 1)..ranges.len() {
             let (name_a, a) = ranges[i];
@@ -247,7 +246,7 @@ pub struct ProxyConfig {
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_sec: u32,
 
-    /// Which protocol to imitate: `"quic"`, `"dns"`, `"sip"`, or `"auto"`.
+    /// Which protocol to imitate: `"quic"`, `"dns"`, `"stun"`, `"sip"`, or `"auto"`.
     #[serde(default = "default_imitate_protocol")]
     pub imitate_protocol: String,
 
@@ -344,11 +343,10 @@ impl Default for ProxyConfig {
 
 /// Load configuration from a TOML file at the given path.
 pub fn load_config(path: &Path) -> Result<ProxyConfig, ProxyError> {
-    let contents = std::fs::read_to_string(path).map_err(|e| {
-        ProxyError::Config(format!("failed to read {}: {}", path.display(), e))
-    })?;
-    let config: ProxyConfig = toml::from_str(&contents)
-        .map_err(|e| ProxyError::Config(format!("invalid TOML: {e}")))?;
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| ProxyError::Config(format!("failed to read {}: {}", path.display(), e)))?;
+    let config: ProxyConfig =
+        toml::from_str(&contents).map_err(|e| ProxyError::Config(format!("invalid TOML: {e}")))?;
     validate(&config)?;
     Ok(config)
 }
@@ -366,10 +364,13 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
         .listen
         .parse::<std::net::SocketAddr>()
         .map_err(|e| ProxyError::Config(format!("bad listen address '{}': {e}", config.listen)))?;
-    config.backend.parse::<std::net::SocketAddr>().map_err(|e| {
-        ProxyError::Config(format!("bad backend address '{}': {e}", config.backend))
-    })?;
-    let valid_protos = ["quic", "dns", "sip", "auto"];
+    config
+        .backend
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| {
+            ProxyError::Config(format!("bad backend address '{}': {e}", config.backend))
+        })?;
+    let valid_protos = ["quic", "dns", "stun", "sip", "auto"];
     if !valid_protos.contains(&config.imitate_protocol.as_str()) {
         return Err(ProxyError::Config(format!(
             "unsupported imitate_protocol '{}'; expected one of: {}",
@@ -399,12 +400,15 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
         ));
     }
     if config.dns_forward_enabled {
-        config.dns_upstream.parse::<std::net::SocketAddr>().map_err(|e| {
-            ProxyError::Config(format!(
-                "bad dns_upstream address '{}': {e}",
-                config.dns_upstream
-            ))
-        })?;
+        config
+            .dns_upstream
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| {
+                ProxyError::Config(format!(
+                    "bad dns_upstream address '{}': {e}",
+                    config.dns_upstream
+                ))
+            })?;
     }
     if config.dns_upstream_timeout_ms == 0 {
         return Err(ProxyError::Config(
@@ -420,14 +424,10 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
         ));
     }
     if config.session_ttl_secs == 0 {
-        return Err(ProxyError::Config(
-            "session_ttl_secs must be > 0".into(),
-        ));
+        return Err(ProxyError::Config("session_ttl_secs must be > 0".into()));
     }
     if config.max_sessions == 0 {
-        return Err(ProxyError::Config(
-            "max_sessions must be > 0".into(),
-        ));
+        return Err(ProxyError::Config("max_sessions must be > 0".into()));
     }
     Ok(())
 }
@@ -582,6 +582,17 @@ imitate_protocol = "http"
     }
 
     #[test]
+    fn accept_stun_protocol() {
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+imitate_protocol = "stun"
+"#;
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.imitate_protocol, "stun");
+    }
+
+    #[test]
     fn reject_zero_buffer_size() {
         let toml = r#"
 listen = "0.0.0.0:51820"
@@ -600,7 +611,9 @@ backend = "127.0.0.1:51821"
 cleanup_interval_secs = 0
 "#;
         let err = parse_config(toml).unwrap_err();
-        assert!(err.to_string().contains("cleanup_interval_secs must be > 0"));
+        assert!(err
+            .to_string()
+            .contains("cleanup_interval_secs must be > 0"));
     }
 
     #[test]

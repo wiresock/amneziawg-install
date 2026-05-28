@@ -7,6 +7,16 @@ use tokio::net::UdpSocket;
 
 const READY_PROBE_PAYLOAD_PREFIX: [u8; 2] = [0xA5, 0x5A];
 const READY_DRAIN_TIMEOUT_MS: u64 = 25;
+const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+
+fn stun_binding_request() -> Vec<u8> {
+    let mut pkt = Vec::new();
+    pkt.extend_from_slice(&0x0001u16.to_be_bytes());
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    pkt.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    pkt
+}
 
 /// Spawn a mock backend that echoes every packet back with a 2-byte prefix `[0xEC, 0x00]`.
 async fn spawn_echo_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -109,7 +119,9 @@ buffer_size = 4096
     // Parse config to get a ProxyConfig using the same validation as production
     let cfg = amneziawg_proxy::config::parse_config(&config_toml).unwrap();
 
-    let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg, None).await.unwrap();
+    let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg, None)
+        .await
+        .unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
     let shutdown = proxy.shutdown_handle();
 
@@ -128,7 +140,10 @@ buffer_size = 4096
     // 4. We should receive the echo from backend (with 0xEC 0x00 prefix)
     let mut buf = [0u8; 4096];
     let result = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf)).await;
-    assert!(result.is_ok(), "should receive echoed response from backend");
+    assert!(
+        result.is_ok(),
+        "should receive echoed response from backend"
+    );
     let (n, from) = result.unwrap().unwrap();
     assert_eq!(from, proxy_addr);
 
@@ -165,7 +180,10 @@ buffer_size = 4096
 
     // One response must be the QUIC Version Negotiation (first byte 0xC3).
     let has_version_neg = responses.iter().any(|r| !r.is_empty() && r[0] == 0xC3);
-    assert!(has_version_neg, "should have a QUIC version negotiation response");
+    assert!(
+        has_version_neg,
+        "should have a QUIC version negotiation response"
+    );
 
     // The other must be the backend echo (prefixed with [0xEC, 0x00]) and
     // must contain the exact QUIC payload we just sent.
@@ -214,7 +232,9 @@ buffer_size = 4096
     // Parse config using the same validation as production
     let cfg = amneziawg_proxy::config::parse_config(&config_toml).unwrap();
 
-    let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg, None).await.unwrap();
+    let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg, None)
+        .await
+        .unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
     let shutdown = proxy.shutdown_handle();
 
@@ -252,11 +272,7 @@ buffer_size = 4096
         &[0xEC, 0x00],
         "client A response missing [0xEC, 0x00] prefix"
     );
-    assert_eq!(
-        &buf_a[2..n_a],
-        b"msg-from-a",
-        "client A payload mismatch"
-    );
+    assert_eq!(&buf_a[2..n_a], b"msg-from-a", "client A payload mismatch");
 
     // Validate client B response
     let (n_b, src_b) = res_b
@@ -269,11 +285,105 @@ buffer_size = 4096
         &[0xEC, 0x00],
         "client B response missing [0xEC, 0x00] prefix"
     );
-    assert_eq!(
-        &buf_b[2..n_b],
-        b"msg-from-b",
-        "client B payload mismatch"
+    assert_eq!(&buf_b[2..n_b], b"msg-from-b", "client B payload mismatch");
+
+    shutdown.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), proxy_handle)
+        .await
+        .expect("proxy did not shut down in time")
+        .unwrap();
+    backend_handle.abort();
+}
+
+#[tokio::test]
+async fn stun_probe_gets_binding_success_and_backend_echo() {
+    let (backend_addr, backend_handle) = spawn_echo_backend().await;
+
+    let config_toml = format!(
+        r#"
+listen = "127.0.0.1:0"
+backend = "{}"
+session_ttl_secs = 60
+cleanup_interval_secs = 60
+rate_limit_per_sec = 10
+imitate_protocol = "stun"
+buffer_size = 4096
+"#,
+        backend_addr
     );
+
+    let cfg = amneziawg_proxy::config::parse_config(&config_toml).unwrap();
+    let proxy = amneziawg_proxy::proxy::Proxy::bind(cfg, None)
+        .await
+        .unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let shutdown = proxy.shutdown_handle();
+
+    let proxy_handle = tokio::spawn(async move {
+        proxy.run().await.unwrap();
+    });
+
+    wait_for_proxy_ready(proxy_addr, 20, Duration::from_millis(100)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client.local_addr().unwrap();
+    let stun_pkt = stun_binding_request();
+    client.send_to(&stun_pkt, proxy_addr).await.unwrap();
+
+    let mut buf = [0u8; 4096];
+    let mut responses = Vec::new();
+    for _ in 0..2 {
+        match tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) => {
+                assert_eq!(from, proxy_addr);
+                responses.push(buf[..n].to_vec());
+            }
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        responses.len(),
+        2,
+        "expected STUN probe response and backend echo, got {}",
+        responses.len()
+    );
+
+    let stun_response = responses
+        .iter()
+        .find(|r| r.len() == 32 && r.starts_with(&[0x01, 0x01]))
+        .expect("should have a STUN Binding Success response");
+    assert_eq!(u16::from_be_bytes([stun_response[2], stun_response[3]]), 12);
+    assert_eq!(
+        u32::from_be_bytes([
+            stun_response[4],
+            stun_response[5],
+            stun_response[6],
+            stun_response[7],
+        ]),
+        STUN_MAGIC_COOKIE
+    );
+    assert_eq!(&stun_response[8..20], &stun_pkt[8..20]);
+    assert_eq!(
+        u16::from_be_bytes([stun_response[20], stun_response[21]]),
+        0x0020
+    );
+    assert_eq!(
+        u16::from_be_bytes([stun_response[22], stun_response[23]]),
+        8
+    );
+    assert_eq!(stun_response[25], 0x01);
+    assert_eq!(
+        u16::from_be_bytes([stun_response[26], stun_response[27]]),
+        client_addr.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16)
+    );
+
+    let backend_echo = responses
+        .iter()
+        .find(|r| r.len() >= 2 && r[0] == 0xEC && r[1] == 0x00)
+        .expect("should have a backend echo response");
+    assert_eq!(backend_echo.len(), stun_pkt.len() + 2);
+    assert_eq!(&backend_echo[2..], stun_pkt.as_slice());
 
     shutdown.notify_one();
     tokio::time::timeout(Duration::from_secs(2), proxy_handle)

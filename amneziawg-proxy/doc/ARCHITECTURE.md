@@ -4,7 +4,7 @@
 
 `amneziawg-proxy` is an async UDP proxy that sits in front of an AmneziaWG
 server and makes the traffic look like a legitimate application protocol
-(QUIC, DNS, or SIP) to defeat Deep Packet Inspection (DPI).
+(QUIC, DNS, STUN, or SIP) to defeat Deep Packet Inspection (DPI).
 
 It performs two complementary functions:
 
@@ -84,7 +84,7 @@ passes through the proxy, which adds the imitation layer.
 | `config.rs`        | Parses `proxy.toml` (TOML) and AWG INI-style config files. Validates addresses, protocol names, H-range non-overlap, Jmin≤Jmax. |
 | `proxy.rs`         | Core runtime: binds frontend socket, runs the main `recv_from` loop, spawns per-session relay tasks and cleanup task, orchestrates all other modules. |
 | `responder.rs`     | Probe detection (`detect_protocol`) and response generation (`generate_response`). Also contains AWG packet classification (`classify_awg_packet`). |
-| `transform.rs`     | Padding transformation: overwrites the S1–S4 padding prefix with protocol-conformant filler (QUIC PRNG, DNS header, SIP text). |
+| `transform.rs`     | Padding transformation: overwrites the S1–S4 padding prefix with protocol-conformant filler (QUIC PRNG, DNS header, STUN header, SIP text). |
 | `session.rs`       | Per-client session table backed by `DashMap`. Each session owns a dedicated ephemeral UDP socket connected to the backend. TTL-based expiry. |
 | `backend.rs`       | Low-level backend I/O: `forward_to_backend`, `recv_from_backend`, `send_to_client`, `try_recv_from_backend` (with timeout). |
 | `metrics.rs`       | Per-client counters (packets in/out, probes) and token-bucket rate limiter for probe responses. |
@@ -277,6 +277,49 @@ AWG packet (backend → client):
 │ 0x00 ... (EDNS padding)  │
 └──────────────────────────┘
 ```
+
+### STUN Imitation
+
+**Probe detection** (`detect_protocol`):
+```
+data.len() >= 20
+  AND (message_type & 0xC000) == 0
+  AND message_type == 0x0001       (Binding Request)
+  AND message_length % 4 == 0
+  AND data.len() == 20 + message_length
+  AND magic_cookie == 0x2112A442
+```
+The STUN magic cookie is bytes 4-7, and the 96-bit transaction ID is bytes
+8-19. STUN detection runs before DNS detection because a Binding Request with
+zero attributes can otherwise look like a DNS query to the simpler DNS
+heuristic.
+
+**Probe response** (`generate_stun_binding_success`):
+A valid STUN Binding Success response (RFC 5389/RFC 8489):
+```
+Byte  Field
+----  -----
+ 0-1  0x0101                  Binding Success Response
+ 2-3  Attribute length        12 for IPv4, 24 for IPv6
+ 4-7  0x2112A442              Magic cookie
+ 8-19 Transaction ID          Echoed from incoming request
+20+   XOR-MAPPED-ADDRESS      Encoded from the observed client address
+```
+For IPv4 clients the attribute value contains the reserved byte, family
+`0x01`, the client port XORed with the high 16 bits of the magic cookie, and
+the IPv4 address XORed with the magic cookie. IPv6 uses the magic cookie plus
+transaction ID as the 128-bit XOR key.
+
+**Padding fill** (`apply_stun_padding`):
+- Bytes 0-1: `0x0011` (STUN Binding Indication)
+- Bytes 2-3: `0x0000` (no attributes in the advertised header)
+- Bytes 4-7: `0x2112A442` magic cookie
+- Bytes 8-19: deterministic transaction ID derived from the WG payload
+- Bytes 20+: zero-filled
+
+Because outbound AWG payload bytes must remain untouched, the transform makes
+the padding prefix STUN-like rather than turning the entire UDP datagram into a
+strictly parseable STUN message.
 
 ### SIP Imitation
 

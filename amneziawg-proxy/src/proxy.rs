@@ -56,6 +56,7 @@ impl Proxy {
         let fixed_protocol = match config.imitate_protocol.as_str() {
             "quic" => Some(Protocol::Quic),
             "dns" => Some(Protocol::Dns),
+            "stun" => Some(Protocol::Stun),
             "sip" => Some(Protocol::Sip),
             "auto" => None,
             _ => anyhow::bail!("unsupported protocol: {}", config.imitate_protocol),
@@ -66,7 +67,10 @@ impl Proxy {
             Duration::from_secs(config.session_ttl_secs),
             config.max_sessions,
         ));
-        let metrics = Arc::new(MetricsStore::new(config.rate_limit_per_sec, config.max_sessions));
+        let metrics = Arc::new(MetricsStore::new(
+            config.rate_limit_per_sec,
+            config.max_sessions,
+        ));
         let dns_upstream = if config.dns_forward_enabled {
             Some(config.dns_upstream.parse::<SocketAddr>()?)
         } else {
@@ -138,7 +142,11 @@ impl Proxy {
 
     async fn send_quic_responses(&self, responses: Vec<QuicResponse>) {
         for response in responses {
-            if let Err(e) = self.frontend.send_to(&response.payload, response.destination).await {
+            if let Err(e) = self
+                .frontend
+                .send_to(&response.payload, response.destination)
+                .await
+            {
                 warn!(
                     destination = %response.destination,
                     error = %e,
@@ -279,21 +287,37 @@ impl Proxy {
                                     !responder.has_active_connection(client_addr)
                                 };
                                 if fallback_needed {
-                                    probe_response = Some(responder::generate_response(proto, data));
+                                    probe_response = Some(responder::generate_response_for_client(
+                                        proto,
+                                        data,
+                                        client_addr,
+                                    ));
                                 }
                             }
                         } else if metrics.try_acquire_probe() {
-                            probe_response = Some(responder::generate_response(proto, data));
+                            probe_response = Some(responder::generate_response_for_client(
+                                proto,
+                                data,
+                                client_addr,
+                            ));
                         } else {
                             debug!(%client_addr, "probe rate limited");
                         }
                     } else if metrics.try_acquire_probe() {
                         if proto == Protocol::Dns && self.dns_forward_enabled {
                             probe_response = self.forward_dns_probe(data).await.or_else(|| {
-                                Some(responder::generate_response(proto, data))
+                                Some(responder::generate_response_for_client(
+                                    proto,
+                                    data,
+                                    client_addr,
+                                ))
                             });
                         } else {
-                            probe_response = Some(responder::generate_response(proto, data));
+                            probe_response = Some(responder::generate_response_for_client(
+                                proto,
+                                data,
+                                client_addr,
+                            ));
                         }
                     } else {
                         debug!(%client_addr, "probe rate limited");
@@ -394,11 +418,7 @@ impl Proxy {
                                 .map(|p| *p)
                                 .or(fixed_protocol);
                             if let Some(protocol) = protocol {
-                                transform::apply_awg_transform(
-                                    &mut buf[..n],
-                                    params,
-                                    protocol,
-                                );
+                                transform::apply_awg_transform(&mut buf[..n], params, protocol);
                             }
                         }
 
@@ -440,7 +460,8 @@ impl Proxy {
         if let Some((_, old_entry)) = self.relay_handles.remove(&client_addr) {
             old_entry.handle.abort();
         }
-        self.relay_handles.insert(client_addr, RelayEntry { handle, generation });
+        self.relay_handles
+            .insert(client_addr, RelayEntry { handle, generation });
         // If the spawned task already finished before we inserted (e.g. the
         // backend socket immediately errored with ECONNREFUSED), its
         // `remove_if` cleanup ran before our insert, leaving a finished
@@ -448,8 +469,9 @@ impl Proxy {
         if let Some(entry) = self.relay_handles.get(&client_addr) {
             if entry.handle.is_finished() {
                 drop(entry);
-                self.relay_handles
-                    .remove_if(&client_addr, |_, e| e.generation == generation && e.handle.is_finished());
+                self.relay_handles.remove_if(&client_addr, |_, e| {
+                    e.generation == generation && e.handle.is_finished()
+                });
             }
         }
     }
@@ -579,10 +601,8 @@ mod tests {
         const MAX_RETRIES: u32 = 10;
         for attempt in 0..MAX_RETRIES {
             let _ = client.send_to(&quic_pkt, proxy_addr).await;
-            match tokio::time::timeout(
-                Duration::from_millis(200),
-                client.recv_from(&mut buf),
-            ).await {
+            match tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await
+            {
                 Ok(Ok((_n, from))) => {
                     assert_eq!(from, proxy_addr);
                     // Version negotiation starts with 0xC3 (preserving incoming type bits)
@@ -603,12 +623,12 @@ mod tests {
         // (may have received multiple copies from readiness retries — drain the
         // first one which matches our probe).
         let mut backend_buf = [0u8; 4096];
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            backend.recv_from(&mut backend_buf),
-        )
-        .await;
-        assert!(result.is_ok(), "backend should receive the forwarded packet");
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), backend.recv_from(&mut backend_buf)).await;
+        assert!(
+            result.is_ok(),
+            "backend should receive the forwarded packet"
+        );
         let (n, _) = result.unwrap().unwrap();
         assert_eq!(&backend_buf[..n], &quic_pkt);
 
@@ -656,18 +676,17 @@ mod tests {
         let mut buf = [0u8; 4096];
 
         proxy.handle_client_packet(&quic_pkt, client_addr).await;
-        let (n, from) = tokio::time::timeout(
-            Duration::from_millis(200),
-            client.recv_from(&mut buf),
-        )
-        .await
-        .expect("first probe should receive a response")
-        .unwrap();
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("first probe should receive a response")
+                .unwrap();
         assert!(n > 0);
         assert_eq!(from, proxy_addr);
 
         loop {
-            match tokio::time::timeout(Duration::from_millis(20), client.recv_from(&mut buf)).await {
+            match tokio::time::timeout(Duration::from_millis(20), client.recv_from(&mut buf)).await
+            {
                 Ok(Ok((extra_n, extra_from))) => {
                     assert!(extra_n > 0);
                     assert_eq!(extra_from, proxy_addr);
@@ -678,11 +697,8 @@ mod tests {
         }
 
         proxy.handle_client_packet(&quic_pkt, client_addr).await;
-        let second = tokio::time::timeout(
-            Duration::from_millis(200),
-            client.recv_from(&mut buf),
-        )
-        .await;
+        let second =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await;
         assert!(second.is_err(), "second probe should be rate limited");
     }
 }

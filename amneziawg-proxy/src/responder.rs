@@ -1,6 +1,7 @@
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::config::AwgParams;
 
@@ -17,6 +18,7 @@ const WG_TRANSPORT_DATA_MIN_SIZE: usize = 32;
 pub enum Protocol {
     Quic,
     Dns,
+    Stun,
     Sip,
 }
 
@@ -25,6 +27,7 @@ impl fmt::Display for Protocol {
         match self {
             Protocol::Quic => write!(f, "quic"),
             Protocol::Dns => write!(f, "dns"),
+            Protocol::Stun => write!(f, "stun"),
             Protocol::Sip => write!(f, "sip"),
         }
     }
@@ -90,7 +93,11 @@ impl AwgPacketType {
 pub fn classify_awg_packet(data: &[u8], params: &AwgParams) -> Option<AwgPacketType> {
     let candidates = [
         (params.s1 as usize, params.h1, AwgPacketType::HandshakeInit),
-        (params.s2 as usize, params.h2, AwgPacketType::HandshakeResponse),
+        (
+            params.s2 as usize,
+            params.h2,
+            AwgPacketType::HandshakeResponse,
+        ),
         (params.s3 as usize, params.h3, AwgPacketType::CookieReply),
         (params.s4 as usize, params.h4, AwgPacketType::TransportData),
     ];
@@ -129,12 +136,20 @@ pub fn classify_awg_packet(data: &[u8], params: &AwgParams) -> Option<AwgPacketT
     None
 }
 
-/// Detect whether an incoming packet looks like a QUIC, DNS, or SIP initiation.
+const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+const STUN_BINDING_REQUEST: u16 = 0x0001;
+const STUN_BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
+const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+
+/// Detect whether an incoming packet looks like a QUIC, DNS, STUN, or SIP initiation.
 ///
 /// Heuristics:
 /// - **QUIC**: First byte has the long-header form bit set (0x80) and the
 ///   fixed bit set (0x40), i.e. `(byte & 0xC0) == 0xC0`, which matches
 ///   QUIC Initial packets (RFC 9000 §17.2).
+/// - **STUN**: RFC 5389/8489 header with the top two message-type bits clear,
+///   4-byte-aligned length, magic cookie `0x2112A442`, exact datagram length,
+///   and Binding Request type.
 /// - **DNS**: At least 12 bytes, bytes 2-3 encode flags with QR=0 (query)
 ///   and a standard query opcode, i.e. `(flags & 0xF800) == 0x0000`, plus
 ///   QDCOUNT >= 1 in bytes 4-5 (RFC 1035 §4.1.1).
@@ -166,8 +181,25 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
         }
     }
 
+    // STUN Binding Request (RFC 5389 / RFC 8489): 20-byte header, first two
+    // message-type bits clear, length aligned to 32 bits, magic cookie at
+    // bytes 4..8, and a 96-bit transaction ID at bytes 8..20.
+    let has_stun_cookie = data.len() >= 8
+        && u32::from_be_bytes([data[4], data[5], data[6], data[7]]) == STUN_MAGIC_COOKIE;
+    if data.len() >= 20 && has_stun_cookie {
+        let msg_type = u16::from_be_bytes([data[0], data[1]]);
+        let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+        if msg_type & 0xC000 == 0
+            && msg_type == STUN_BINDING_REQUEST
+            && msg_len % 4 == 0
+            && data.len() == 20 + msg_len
+        {
+            return Some(Protocol::Stun);
+        }
+    }
+
     // DNS query: >= 12 bytes, QR=0, standard opcode, QDCOUNT >= 1
-    if data.len() >= 12 {
+    if data.len() >= 12 && !has_stun_cookie {
         let flags = u16::from_be_bytes([data[2], data[3]]);
         let qdcount = u16::from_be_bytes([data[4], data[5]]);
         if flags & 0xF800 == 0x0000 && qdcount >= 1 {
@@ -180,10 +212,18 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
     if data.len() >= 4 {
         let prefix = &data[..std::cmp::min(data.len(), 10)];
         if let Ok(text) = std::str::from_utf8(prefix) {
-            let is_sip = text.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("SIP/"))
-                || text.get(..9).is_some_and(|s| s.eq_ignore_ascii_case("REGISTER "))
-                || text.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("INVITE "))
-                || text.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("OPTIONS "));
+            let is_sip = text
+                .get(..4)
+                .is_some_and(|s| s.eq_ignore_ascii_case("SIP/"))
+                || text
+                    .get(..9)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("REGISTER "))
+                || text
+                    .get(..7)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("INVITE "))
+                || text
+                    .get(..8)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("OPTIONS "));
             if is_sip {
                 return Some(Protocol::Sip);
             }
@@ -198,11 +238,27 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
 /// - **QUIC**: Builds a minimal QUIC Version Negotiation packet
 ///   (long header, zero version, echoes the incoming DCID/SCID).
 /// - **DNS**: Builds a standard SERVFAIL response echoing the query ID.
+/// - **STUN**: Builds a Binding Success response. Without a client address,
+///   the XOR-MAPPED-ADDRESS falls back to `0.0.0.0:0`.
 /// - **SIP**: Builds a `SIP/2.0 100 Trying` response.
 pub fn generate_response(proto: Protocol, incoming: &[u8]) -> Bytes {
+    let fallback_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+    generate_response_for_client(proto, incoming, fallback_addr)
+}
+
+/// Generate a response packet that can include client-address-specific fields.
+///
+/// STUN uses the client address for `XOR-MAPPED-ADDRESS`; other protocols
+/// ignore it and preserve the legacy response behavior.
+pub fn generate_response_for_client(
+    proto: Protocol,
+    incoming: &[u8],
+    client_addr: SocketAddr,
+) -> Bytes {
     match proto {
         Protocol::Quic => generate_quic_version_negotiation(incoming),
         Protocol::Dns => generate_dns_servfail(incoming),
+        Protocol::Stun => generate_stun_binding_success(incoming, client_addr),
         Protocol::Sip => generate_sip_trying(incoming),
     }
 }
@@ -282,6 +338,56 @@ fn generate_quic_version_negotiation(incoming: &[u8]) -> Bytes {
     buf.freeze()
 }
 
+/// STUN Binding Success response (RFC 5389 / RFC 8489).
+///
+/// The response echoes the 96-bit transaction ID from the request and includes
+/// a single XOR-MAPPED-ADDRESS attribute for the observed client address.
+fn generate_stun_binding_success(incoming: &[u8], client_addr: SocketAddr) -> Bytes {
+    let attr_value_len = match client_addr.ip() {
+        IpAddr::V4(_) => 8,
+        IpAddr::V6(_) => 20,
+    };
+    let attr_total_len = 4 + attr_value_len;
+    let mut buf = BytesMut::with_capacity(20 + attr_total_len);
+
+    buf.put_u16(STUN_BINDING_SUCCESS_RESPONSE);
+    buf.put_u16(attr_total_len as u16);
+    buf.put_u32(STUN_MAGIC_COOKIE);
+
+    let mut transaction_id = [0u8; 12];
+    if incoming.len() >= 20 {
+        transaction_id.copy_from_slice(&incoming[8..20]);
+    }
+    buf.put_slice(&transaction_id);
+
+    buf.put_u16(STUN_ATTR_XOR_MAPPED_ADDRESS);
+    buf.put_u16(attr_value_len as u16);
+    buf.put_u8(0); // reserved
+
+    let xor_port = client_addr.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+    match client_addr.ip() {
+        IpAddr::V4(ip) => {
+            buf.put_u8(0x01);
+            buf.put_u16(xor_port);
+            let xor_addr = u32::from(ip) ^ STUN_MAGIC_COOKIE;
+            buf.put_u32(xor_addr);
+        }
+        IpAddr::V6(ip) => {
+            buf.put_u8(0x02);
+            buf.put_u16(xor_port);
+            let mut xor_key = [0u8; 16];
+            xor_key[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+            xor_key[4..].copy_from_slice(&transaction_id);
+            let octets = ip.octets();
+            for (addr_byte, key_byte) in octets.iter().zip(xor_key.iter()) {
+                buf.put_u8(*addr_byte ^ *key_byte);
+            }
+        }
+    }
+
+    buf.freeze()
+}
+
 /// DNS SERVFAIL response (RFC 1035 §4.1):
 /// Echoes the transaction ID and question section, sets QR=1, RCODE=2
 /// (SERVFAIL).
@@ -343,8 +449,7 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
             if label_len == 0 {
                 // Ensure we have root label (0) + QTYPE (2) + QCLASS (2) = 5 bytes
                 let question_end = pos + 5;
-                if question_end <= incoming.len()
-                    && buf.len() + (question_end - 12) <= MAX_RESPONSE
+                if question_end <= incoming.len() && buf.len() + (question_end - 12) <= MAX_RESPONSE
                 {
                     buf.put_slice(&incoming[12..question_end]);
                     // Patch QDCOUNT to 1 since we successfully echoed the question
@@ -397,7 +502,9 @@ fn generate_sip_trying(incoming: &[u8]) -> Bytes {
         for line in text.lines() {
             let trimmed = line.trim();
             for &prefix in &echo_prefixes {
-                if trimmed.get(..prefix.len()).is_some_and(|s| s.eq_ignore_ascii_case(prefix))
+                if trimmed
+                    .get(..prefix.len())
+                    .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
                 {
                     // Stop echoing if adding this line would exceed the cap
                     let line_len = trimmed.len() + 2; // +2 for \r\n
@@ -429,10 +536,20 @@ mod tests {
     fn protocol_display() {
         assert_eq!(Protocol::Quic.to_string(), "quic");
         assert_eq!(Protocol::Dns.to_string(), "dns");
+        assert_eq!(Protocol::Stun.to_string(), "stun");
         assert_eq!(Protocol::Sip.to_string(), "sip");
     }
 
     // -- imitation protocol detection tests --
+
+    fn stun_binding_request() -> Vec<u8> {
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
+        pkt.extend_from_slice(&0u16.to_be_bytes());
+        pkt.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        pkt.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        pkt
+    }
 
     #[test]
     fn detect_quic_initial() {
@@ -455,6 +572,33 @@ mod tests {
         pkt[4] = 0x00; // QDCOUNT = 1
         pkt[5] = 0x01;
         assert_eq!(detect_protocol(&pkt), Some(Protocol::Dns));
+    }
+
+    #[test]
+    fn detect_stun_binding_request() {
+        let pkt = stun_binding_request();
+        assert_eq!(detect_protocol(&pkt), Some(Protocol::Stun));
+    }
+
+    #[test]
+    fn detect_stun_rejects_bad_magic_cookie() {
+        let mut pkt = stun_binding_request();
+        pkt[4..8].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(detect_protocol(&pkt), None);
+    }
+
+    #[test]
+    fn detect_stun_rejects_bad_length() {
+        let mut pkt = stun_binding_request();
+        pkt[2..4].copy_from_slice(&4u16.to_be_bytes());
+        assert_eq!(detect_protocol(&pkt), None);
+    }
+
+    #[test]
+    fn detect_stun_rejects_response_as_probe() {
+        let mut pkt = stun_binding_request();
+        pkt[0..2].copy_from_slice(&STUN_BINDING_SUCCESS_RESPONSE.to_be_bytes());
+        assert_eq!(detect_protocol(&pkt), None);
     }
 
     #[test]
@@ -593,6 +737,70 @@ mod tests {
     }
 
     #[test]
+    fn generate_stun_response_ipv4_echoes_transaction_and_xor_address() {
+        let req = stun_binding_request();
+        let client_addr = SocketAddr::from(([192, 0, 2, 1], 3478));
+        let resp = generate_response_for_client(Protocol::Stun, &req, client_addr);
+
+        assert_eq!(resp.len(), 32);
+        assert_eq!(
+            u16::from_be_bytes([resp[0], resp[1]]),
+            STUN_BINDING_SUCCESS_RESPONSE
+        );
+        assert_eq!(u16::from_be_bytes([resp[2], resp[3]]), 12);
+        assert_eq!(
+            u32::from_be_bytes([resp[4], resp[5], resp[6], resp[7]]),
+            STUN_MAGIC_COOKIE
+        );
+        assert_eq!(&resp[8..20], &req[8..20]);
+        assert_eq!(
+            u16::from_be_bytes([resp[20], resp[21]]),
+            STUN_ATTR_XOR_MAPPED_ADDRESS
+        );
+        assert_eq!(u16::from_be_bytes([resp[22], resp[23]]), 8);
+        assert_eq!(resp[24], 0);
+        assert_eq!(resp[25], 0x01);
+        assert_eq!(
+            u16::from_be_bytes([resp[26], resp[27]]),
+            3478 ^ ((STUN_MAGIC_COOKIE >> 16) as u16)
+        );
+        assert_eq!(
+            u32::from_be_bytes([resp[28], resp[29], resp[30], resp[31]]),
+            u32::from_be_bytes([192, 0, 2, 1]) ^ STUN_MAGIC_COOKIE
+        );
+    }
+
+    #[test]
+    fn generate_stun_response_ipv6_uses_transaction_id_xor_key() {
+        let req = stun_binding_request();
+        let client_addr: SocketAddr = "[2001:db8::1]:5349".parse().unwrap();
+        let resp = generate_response_for_client(Protocol::Stun, &req, client_addr);
+
+        assert_eq!(resp.len(), 44);
+        assert_eq!(u16::from_be_bytes([resp[2], resp[3]]), 24);
+        assert_eq!(u16::from_be_bytes([resp[22], resp[23]]), 20);
+        assert_eq!(resp[25], 0x02);
+        assert_eq!(
+            u16::from_be_bytes([resp[26], resp[27]]),
+            5349 ^ ((STUN_MAGIC_COOKIE >> 16) as u16)
+        );
+
+        let mut xor_key = [0u8; 16];
+        xor_key[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        xor_key[4..].copy_from_slice(&req[8..20]);
+        let ip = match client_addr.ip() {
+            IpAddr::V6(ip) => ip.octets(),
+            _ => unreachable!(),
+        };
+        let expected: Vec<u8> = ip
+            .iter()
+            .zip(xor_key.iter())
+            .map(|(addr_byte, key_byte)| *addr_byte ^ *key_byte)
+            .collect();
+        assert_eq!(&resp[28..44], expected.as_slice());
+    }
+
+    #[test]
     fn generate_sip_response() {
         let resp = generate_response(Protocol::Sip, b"INVITE sip:user@example.com SIP/2.0\r\n");
         let text = std::str::from_utf8(&resp).unwrap();
@@ -622,7 +830,7 @@ mod tests {
         query.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
         query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
         query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
-        // QNAME: 7example3com0
+                                                // QNAME: 7example3com0
         query.push(7);
         query.extend_from_slice(b"example");
         query.push(3);
@@ -640,7 +848,10 @@ mod tests {
         // RD=1 should be copied from the query
         assert!(resp[2] & 0x01 != 0, "RD bit should be copied from query");
         // Response should include the question section
-        assert!(resp.len() > 12, "DNS response should include question section");
+        assert!(
+            resp.len() > 12,
+            "DNS response should include question section"
+        );
         // QNAME echoed: starts at byte 12 with label length 7 ("example")
         assert_eq!(resp[12], 7);
         // QDCOUNT should be 1 since the question was echoed
@@ -657,7 +868,7 @@ mod tests {
         query.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
         query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
         query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
-        // QNAME: 3foo0
+                                                // QNAME: 3foo0
         query.push(3);
         query.extend_from_slice(b"foo");
         query.push(0); // root label
@@ -679,8 +890,9 @@ mod tests {
         let mut query = vec![0x00u8; 12];
         query[0] = 0x12; // TX ID
         query[1] = 0x34;
-        query[4] = 0x00; query[5] = 0x01; // QDCOUNT=1
-        // QNAME: 3foo0 but missing QTYPE/QCLASS
+        query[4] = 0x00;
+        query[5] = 0x01; // QDCOUNT=1
+                         // QNAME: 3foo0 but missing QTYPE/QCLASS
         query.push(3);
         query.extend_from_slice(b"foo");
         query.push(0); // root label — but no QTYPE/QCLASS follows
@@ -701,8 +913,9 @@ mod tests {
         let mut query = vec![0x00u8; 12];
         query[0] = 0x56; // TX ID
         query[1] = 0x78;
-        query[4] = 0x00; query[5] = 0x01; // QDCOUNT=1
-        // QNAME starting with a compression pointer (0xC0 0x00)
+        query[4] = 0x00;
+        query[5] = 0x01; // QDCOUNT=1
+                         // QNAME starting with a compression pointer (0xC0 0x00)
         query.push(0xC0);
         query.push(0x00);
 
@@ -719,8 +932,9 @@ mod tests {
         let mut query = vec![0x00u8; 12];
         query[0] = 0xAA;
         query[1] = 0xBB;
-        query[4] = 0x00; query[5] = 0x01; // QDCOUNT=1
-        // Label length = 64 (exceeds the 63-octet limit)
+        query[4] = 0x00;
+        query[5] = 0x01; // QDCOUNT=1
+                         // Label length = 64 (exceeds the 63-octet limit)
         query.push(64);
         query.extend_from_slice(&[b'x'; 64]);
         query.push(0); // root label
@@ -739,9 +953,10 @@ mod tests {
         let mut query = vec![0x00u8; 12];
         query[0] = 0xCC;
         query[1] = 0xDD;
-        query[4] = 0x00; query[5] = 0x01; // QDCOUNT=1
-        // Build a QNAME with many 63-byte labels to exceed 255 total
-        // 4 labels of 63 bytes = 4*(1+63) = 256 > 255
+        query[4] = 0x00;
+        query[5] = 0x01; // QDCOUNT=1
+                         // Build a QNAME with many 63-byte labels to exceed 255 total
+                         // 4 labels of 63 bytes = 4*(1+63) = 256 > 255
         for _ in 0..4 {
             query.push(63);
             query.extend_from_slice(&[b'a'; 63]);
@@ -766,7 +981,8 @@ mod tests {
         let mut query = vec![0x00u8; 12];
         query[0] = 0xEE;
         query[1] = 0xFF;
-        query[4] = 0x00; query[5] = 0x01; // QDCOUNT=1
+        query[4] = 0x00;
+        query[5] = 0x01; // QDCOUNT=1
         for _ in 0..3 {
             query.push(63);
             query.extend_from_slice(&[b'b'; 63]);
@@ -780,7 +996,10 @@ mod tests {
         let resp = generate_response(Protocol::Dns, &query);
         // QDCOUNT should be 1 — the name is exactly at the boundary
         assert_eq!(u16::from_be_bytes([resp[4], resp[5]]), 1);
-        assert!(resp.len() > 12, "response should include the echoed question");
+        assert!(
+            resp.len() > 12,
+            "response should include the echoed question"
+        );
     }
 
     // -- AWG packet classification tests --
