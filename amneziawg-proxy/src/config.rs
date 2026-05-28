@@ -252,9 +252,12 @@ pub struct ProxyConfig {
 
     /// Enable stateful QUIC handshake continuation responder for QUIC probes.
     ///
-    /// When `false`, QUIC probes are answered with a stateless Version
-    /// Negotiation packet (legacy behavior).
-    #[serde(default)]
+    /// When `true` (the default), incoming QUIC Initial packets are answered
+    /// with a real TLS 1.3 server flight using a self-signed certificate,
+    /// making the server indistinguishable from a real QUIC endpoint to DPI.
+    /// When `false`, a stateless Version Negotiation packet is sent instead
+    /// (legacy behavior — detectable by RFC-aware scanners).
+    #[serde(default = "default_quic_handshake_enabled")]
     pub quic_handshake_enabled: bool,
 
     /// Domain name to place in the QUIC TLS server certificate when
@@ -299,7 +302,13 @@ fn default_cleanup_interval() -> u64 {
     60
 }
 fn default_rate_limit() -> u32 {
-    5
+    // High enough to respond to a full Jc junk-packet burst (AWG default Jc
+    // is typically 3–10) plus a few real protocol probes per second without
+    // opening the proxy to meaningful amplification.
+    16
+}
+fn default_quic_handshake_enabled() -> bool {
+    true
 }
 fn default_imitate_protocol() -> String {
     "quic".into()
@@ -329,7 +338,7 @@ impl Default for ProxyConfig {
             cleanup_interval_secs: default_cleanup_interval(),
             rate_limit_per_sec: default_rate_limit(),
             imitate_protocol: default_imitate_protocol(),
-            quic_handshake_enabled: false,
+            quic_handshake_enabled: default_quic_handshake_enabled(),
             quic_certificate_domain: default_quic_certificate_domain(),
             dns_forward_enabled: false,
             dns_upstream: default_dns_upstream(),
@@ -378,14 +387,9 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
             valid_protos.join(", ")
         )));
     }
-    if config.quic_handshake_enabled
-        && config.imitate_protocol != "quic"
-        && config.imitate_protocol != "auto"
-    {
-        return Err(ProxyError::Config(
-            "quic_handshake_enabled requires imitate_protocol = 'quic' or 'auto'".into(),
-        ));
-    }
+    // quic_handshake_enabled is silently ignored when imitate_protocol is not
+    // 'quic' or 'auto' — the QUIC responder is simply not instantiated in that
+    // case, consistent with how dns_forward_enabled is ignored for non-DNS modes.
     if config.quic_handshake_enabled && config.quic_certificate_domain.trim().is_empty() {
         return Err(ProxyError::Config(
             "quic_certificate_domain must be non-empty when quic_handshake_enabled".into(),
@@ -449,9 +453,9 @@ backend = "127.0.0.1:51821"
         assert_eq!(cfg.backend, "127.0.0.1:51821");
         assert_eq!(cfg.session_ttl_secs, 300);
         assert_eq!(cfg.cleanup_interval_secs, 60);
-        assert_eq!(cfg.rate_limit_per_sec, 5);
+        assert_eq!(cfg.rate_limit_per_sec, 16);
         assert_eq!(cfg.imitate_protocol, "quic");
-        assert!(!cfg.quic_handshake_enabled);
+        assert!(cfg.quic_handshake_enabled);
         assert_eq!(cfg.quic_certificate_domain, "localhost");
         assert!(!cfg.dns_forward_enabled);
         assert_eq!(cfg.dns_upstream, "1.1.1.1:53");
@@ -492,17 +496,18 @@ dns_upstream_timeout_ms = 700
     }
 
     #[test]
-    fn reject_quic_handshake_with_non_quic_protocol() {
+    fn quic_handshake_with_non_quic_protocol_is_silently_ignored() {
+        // quic_handshake_enabled is ignored (not rejected) when imitate_protocol
+        // is not 'quic' or 'auto'. The QUIC responder is simply not instantiated.
         let toml = r#"
 listen = "0.0.0.0:51820"
 backend = "127.0.0.1:51821"
 imitate_protocol = "dns"
 quic_handshake_enabled = true
 "#;
-        let err = parse_config(toml).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("quic_handshake_enabled requires imitate_protocol = 'quic'"));
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.imitate_protocol, "dns");
+        assert!(cfg.quic_handshake_enabled); // stored but ignored by proxy
     }
 
     #[test]

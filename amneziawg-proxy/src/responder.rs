@@ -154,8 +154,9 @@ const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 ///   and a standard query opcode, i.e. `(flags & 0xF800) == 0x0000`, plus
 ///   QDCOUNT >= 1 in bytes 4-5 (RFC 1035 §4.1.1).
 /// - **SIP**: Starts with ASCII `SIP/` or a SIP method keyword followed by a
-///   space (RFC 3261 §7). We check for `REGISTER `, `INVITE `, `OPTIONS `,
-///   and `SIP/` prefixes.
+///   space (RFC 3261 §7). We check for `INVITE `, `CANCEL `, `NOTIFY `,
+///   `OPTIONS `, `REGISTER `, `SUBSCRIBE `, and `SIP/` prefixes — covering
+///   every method the WireSock client may emit as junk traffic.
 pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
     if data.is_empty() {
         return None;
@@ -209,6 +210,13 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
 
     // SIP: starts with known SIP method or version prefix.
     // Allocation-free ASCII case-insensitive prefix checks.
+    //
+    // The method list mirrors what the WireSock client may emit:
+    //   - INVITE, CANCEL: simulate_sip_request (INVITE + matching CANCEL burst)
+    //   - REGISTER, OPTIONS, SUBSCRIBE, NOTIFY: generate_protocol_packet
+    //     (pre-handshake junk packets in `send_random_packets`)
+    // SIP/ matches a response line, kept for symmetry though clients do not
+    // normally emit responses.
     if data.len() >= 4 {
         let prefix = &data[..std::cmp::min(data.len(), 10)];
         if let Ok(text) = std::str::from_utf8(prefix) {
@@ -216,14 +224,23 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
                 .get(..4)
                 .is_some_and(|s| s.eq_ignore_ascii_case("SIP/"))
                 || text
-                    .get(..9)
-                    .is_some_and(|s| s.eq_ignore_ascii_case("REGISTER "))
-                || text
                     .get(..7)
                     .is_some_and(|s| s.eq_ignore_ascii_case("INVITE "))
                 || text
+                    .get(..7)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("CANCEL "))
+                || text
+                    .get(..7)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("NOTIFY "))
+                || text
                     .get(..8)
-                    .is_some_and(|s| s.eq_ignore_ascii_case("OPTIONS "));
+                    .is_some_and(|s| s.eq_ignore_ascii_case("OPTIONS "))
+                || text
+                    .get(..9)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("REGISTER "))
+                || text
+                    .get(..10)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("SUBSCRIBE "));
             if is_sip {
                 return Some(Protocol::Sip);
             }
@@ -332,8 +349,13 @@ fn generate_quic_version_negotiation(incoming: &[u8]) -> Bytes {
         buf.put_u8(0);
     }
 
-    // Supported version: QUIC v1 (0x00000001)
-    buf.put_u32(0x00000001);
+    // Supported version: GREASE value (RFC 9000 §Appendix A).
+    // We must NOT list 0x00000001 here: per RFC 9000 §6.2, a server MUST NOT
+    // send a Version Negotiation packet when the client already sent the same
+    // version the server supports. Listing v1 in the VN response for a v1
+    // client is therefore both an RFC violation and a detectable fingerprint.
+    // A GREASE value signals "no version in common" without claiming v1 support.
+    buf.put_u32(0x0a0a_0a0a);
 
     buf.freeze()
 }
@@ -614,6 +636,36 @@ mod tests {
     }
 
     #[test]
+    fn detect_sip_cancel_register_options_notify_subscribe() {
+        // All SIP methods the WireSock client may emit must be classified as SIP
+        // so the proxy produces a matching response and primes its protocol
+        // state for the client.
+        for line in [
+            "CANCEL sip:bob@example.com SIP/2.0\r\n".as_bytes(),
+            "REGISTER sip:registrar.example.com SIP/2.0\r\n".as_bytes(),
+            "OPTIONS sip:bob@example.com SIP/2.0\r\n".as_bytes(),
+            "NOTIFY sip:bob@example.com SIP/2.0\r\n".as_bytes(),
+            "SUBSCRIBE sip:bob@example.com SIP/2.0\r\n".as_bytes(),
+        ] {
+            assert_eq!(
+                detect_protocol(line),
+                Some(Protocol::Sip),
+                "method should be classified as SIP: {:?}",
+                std::str::from_utf8(line).unwrap_or("?")
+            );
+        }
+    }
+
+    #[test]
+    fn detect_sip_methods_are_case_insensitive() {
+        // RFC 3261 §7.1 method names are case-sensitive at the parser level,
+        // but our heuristic uses case-insensitive matching to be robust to
+        // junk/probing traffic that may not normalize casing.
+        let pkt = b"invite sip:bob@example.com SIP/2.0\r\n";
+        assert_eq!(detect_protocol(pkt), Some(Protocol::Sip));
+    }
+
+    #[test]
     fn detect_unknown() {
         let pkt = [0x01, 0x02, 0x03];
         assert_eq!(detect_protocol(&pkt), None);
@@ -688,8 +740,15 @@ mod tests {
         let resp = generate_response(Protocol::Quic, &pkt);
         // Should start with 0xC3 (version negotiation, preserving incoming type bits)
         assert_eq!(resp[0], 0xC3);
-        // Version = 0
+        // Version field = 0 (Version Negotiation indicator per RFC 9000 §17.2.1)
         assert_eq!(&resp[1..5], &[0, 0, 0, 0]);
+        // Supported-version field must be a GREASE value, not 0x00000001.
+        // Advertising v1 as "supported" in a VN response to a v1 client violates
+        // RFC 9000 §6.2 and is a detectable fingerprint.
+        let supported_version =
+            u32::from_be_bytes([resp[resp.len() - 4], resp[resp.len() - 3], resp[resp.len() - 2], resp[resp.len() - 1]]);
+        assert_ne!(supported_version, 0x00000001, "must not advertise QUIC v1 in VN response to a v1 client");
+        assert_eq!(supported_version, 0x0a0a_0a0a, "should use GREASE version");
     }
 
     #[test]
