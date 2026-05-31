@@ -114,6 +114,15 @@ fn generate_certified_key(domain: &str) -> anyhow::Result<Arc<CertifiedKey>> {
     Ok(Arc::new(CertifiedKey::new(cert_chain, signing_key)))
 }
 
+/// Minimum byte total that distinguishes a server Certificate flight from a
+/// bare `CONNECTION_CLOSE`-only response.  A successful TLS 1.3 Handshake
+/// flight (Certificate + CertificateVerify + Finished) always exceeds this
+/// threshold; a `CONNECTION_CLOSE` with a TLS alert is typically < 200 bytes.
+///
+/// Used both in `drive()` to guard flush-and-forget eviction and in the test
+/// suite to assert a full flight was produced.
+const MIN_CERT_FLIGHT_BYTES: usize = 500;
+
 /// Minimal stateful QUIC handshake responder.
 ///
 /// This responder uses `quinn-proto` as the QUIC/TLS state machine, which handles
@@ -375,7 +384,6 @@ impl QuicHandshakeResponder {
             // Certificate) across separate drive() iterations.
             // The quinn-proto dependency is pinned in Cargo.lock; the regression
             // test also asserts the full flight is present before eviction.
-            const MIN_CERT_FLIGHT_BYTES: usize = 500;
             for (ch, out_start, out_end) in transmitted_this_iter {
                 let burst_bytes: usize = out[out_start..out_end]
                     .iter()
@@ -498,8 +506,6 @@ mod tests {
     /// flight includes Certificate + CertificateVerify + Finished and is always
     /// much larger — in practice 1–4 KB. We use 500 bytes as a conservative
     /// threshold: anything above that cannot be a CONNECTION_CLOSE-only response.
-    const MIN_CERTIFICATE_FLIGHT_BYTES: usize = 500;
-
     fn total_response_bytes(responses: &[QuicResponse]) -> usize {
         responses.iter().map(|r| r.payload.len()).sum()
     }
@@ -511,7 +517,7 @@ mod tests {
     /// with `no_application_protocol` (TLS alert 120). That flight is tiny
     /// (< 200 bytes). With the fix the server proceeds through the full TLS 1.3
     /// Handshake flight (Certificate + CertificateVerify + Finished) which
-    /// always exceeds MIN_CERTIFICATE_FLIGHT_BYTES.
+    /// always exceeds MIN_CERT_FLIGHT_BYTES.
     #[test]
     fn h3_clienthello_produces_certificate_flight() {
         let mut responder = QuicHandshakeResponder::new("example.com").unwrap();
@@ -526,8 +532,8 @@ mod tests {
         );
         let total = total_response_bytes(&responses);
         assert!(
-            total >= MIN_CERTIFICATE_FLIGHT_BYTES,
-            "server flight must be >= {MIN_CERTIFICATE_FLIGHT_BYTES} bytes to contain \
+            total >= MIN_CERT_FLIGHT_BYTES,
+            "server flight must be >= {MIN_CERT_FLIGHT_BYTES} bytes to contain \
              a Certificate (got {total} bytes across {} datagram(s)); \
              a tiny response indicates a CONNECTION_CLOSE abort (missing ALPN)",
             responses.len(),
@@ -550,8 +556,8 @@ mod tests {
         );
         let total = total_response_bytes(&responses);
         assert!(
-            total >= MIN_CERTIFICATE_FLIGHT_BYTES,
-            "server flight must be >= {MIN_CERTIFICATE_FLIGHT_BYTES} bytes to contain \
+            total >= MIN_CERT_FLIGHT_BYTES,
+            "server flight must be >= {MIN_CERT_FLIGHT_BYTES} bytes to contain \
              a Certificate for h3-29 (got {total} bytes across {} datagram(s)); \
              a tiny response indicates a CONNECTION_CLOSE abort (missing ALPN)",
             responses.len(),
@@ -584,7 +590,7 @@ mod tests {
             "must produce Certificate flight on first datagram"
         );
         assert!(
-            total_response_bytes(&first_responses) >= MIN_CERTIFICATE_FLIGHT_BYTES,
+            total_response_bytes(&first_responses) >= MIN_CERT_FLIGHT_BYTES,
             "first response must be a Certificate flight, not a CONNECTION_CLOSE"
         );
 
