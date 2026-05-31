@@ -43,9 +43,9 @@ pub fn apply_padding(data: &mut [u8], pad_size: usize, proto: Protocol) {
 /// AWG packet type.
 ///
 /// Real QUIC uses different header forms at each phase of the connection:
-/// - **1-RTT** (S1 HandshakeInit, S4 TransportData): short-header 1-RTT (`0x40..0x7F`)
 /// - **Handshake** (S2/S3, Handshake Response / Cookie Reply): long-header
 ///   Handshake (`0xE0..`)
+/// - **1-RTT** (S1 HandshakeInit, S4 TransportData): short-header 1-RTT (`0x40..0x7F`)
 ///
 /// S1 uses 1-RTT rather than Initial because QUIC Initial datagrams carry a
 /// mandatory >=1200-byte minimum (RFC 9000 §14.1) that cannot be met within

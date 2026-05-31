@@ -299,6 +299,13 @@ impl QuicHandshakeResponder {
     /// Certificate flight.  This is bounded by the existing `active_remotes` cap
     /// and the probe rate-limiter in the outer `Proxy`.
     fn force_evict_connection(&mut self, ch: ConnectionHandle) {
+        // `connections.remove` returns None if the handle was already cleaned
+        // up by `drain_connection` earlier in the same `drive()` iteration
+        // (i.e. the connection both transmitted AND reached is_drained() in the
+        // same loop pass).  In that case the `EndpointEvent::drained()` send is
+        // correctly skipped — `drain_connection` does not send it because the
+        // endpoint already received it via `poll_endpoint_events`.  The
+        // `conn_events` and `flush_and_forget` removes below are harmless no-ops.
         if let Some(conn) = self.connections.remove(&ch) {
             self.release_remote(conn.remote_address());
             // Notify the endpoint so it releases CID/routing state without
