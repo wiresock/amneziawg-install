@@ -284,6 +284,13 @@ impl QuicHandshakeResponder {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = Vec::new();
             let mut drained_connections: Vec<ConnectionHandle> = Vec::new();
             let mut made_progress = false;
+            // Track which flush-and-forget handles produced at least one transmit
+            // *in this iteration* by recording out.len() before each poll_transmit
+            // call.  Using out.len() rather than destination address is the only
+            // correct guard: destination-based checks fail when multiple connections
+            // share a remote or when out already contains responses from a prior
+            // drive() iteration.
+            let mut transmitted_this_iter: HashSet<ConnectionHandle> = HashSet::new();
 
             let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
             for ch in handles {
@@ -303,6 +310,7 @@ impl QuicHandshakeResponder {
                     made_progress = true;
                 }
 
+                let out_before = out.len();
                 while let Some(transmit) = conn.poll_transmit(now, 1, buf) {
                     out.push(QuicResponse {
                         destination: transmit.destination,
@@ -310,6 +318,9 @@ impl QuicHandshakeResponder {
                     });
                     buf.clear();
                     made_progress = true;
+                }
+                if out.len() > out_before && self.flush_and_forget.contains(&ch) {
+                    transmitted_this_iter.insert(ch);
                 }
 
                 if let Some(timeout) = conn.poll_timeout() {
@@ -336,25 +347,9 @@ impl QuicHandshakeResponder {
                 made_progress = true;
             }
 
-            // Evict flush-and-forget connections once they have actually produced
-            // a transmit destined for their own remote address in this iteration.
-            // Checking per-connection output (rather than the global made_progress
-            // flag) prevents a connection from being dropped before its own
-            // Certificate flight is collected when other connections are active.
-            let forget: Vec<ConnectionHandle> = self
-                .flush_and_forget
-                .iter()
-                .copied()
-                .filter(|ch| {
-                    self.connections
-                        .get(ch)
-                        .is_some_and(|conn| {
-                            let remote = conn.remote_address();
-                            out.iter().any(|r| r.destination == remote)
-                        })
-                })
-                .collect();
-            for ch in forget {
+            // Evict only flush-and-forget connections that produced at least one
+            // transmit in this specific drive() iteration, as tracked above.
+            for ch in transmitted_this_iter {
                 self.evict_connection(ch);
             }
 
@@ -536,5 +531,52 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let responses = r.handle_datagram(addr, &[]);
         assert!(responses.is_empty(), "empty datagram must produce no response");
+    }
+
+    /// Regression: after the Certificate flight is emitted the connection must
+    /// be silently evicted so that quinn-proto's retransmit timers never fire.
+    ///
+    /// Failure mode before the fix: connections stayed alive → poll_transmit
+    /// would re-emit the Handshake epoch at ~1s/2s/5s intervals.
+    #[test]
+    fn flush_and_forget_evicts_after_certificate_flight() {
+        let mut responder = QuicHandshakeResponder::new("example.com").unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:22222".parse().unwrap();
+
+        // Feed a real h3 ClientHello — this triggers NewConnection + Certificate flight.
+        let initial = make_h3_initial(&["h3"]);
+        let first_responses = responder.handle_datagram(client_addr, &initial);
+        assert!(
+            !first_responses.is_empty(),
+            "must produce Certificate flight on first datagram"
+        );
+        assert!(
+            total_response_bytes(&first_responses) >= MIN_CERTIFICATE_FLIGHT_BYTES,
+            "first response must be a Certificate flight, not a CONNECTION_CLOSE"
+        );
+
+        // After the burst the connection must have been evicted.
+        assert!(
+            responder.connections.is_empty(),
+            "connection must be evicted after Certificate flight"
+        );
+        assert!(
+            responder.flush_and_forget.is_empty(),
+            "flush_and_forget set must be empty after eviction"
+        );
+        assert!(
+            responder.active_remotes.is_empty(),
+            "active_remotes refcount must be zero after eviction"
+        );
+
+        // Call handle_timeouts — since the connection was evicted there are no
+        // quinn-proto retransmit timers left to fire, so no packets should be
+        // emitted regardless of wall-clock time.
+        let retransmit_responses = responder.handle_timeouts();
+        assert!(
+            retransmit_responses.is_empty(),
+            "no retransmissions must be emitted after eviction (got {} packets)",
+            retransmit_responses.len()
+        );
     }
 }
