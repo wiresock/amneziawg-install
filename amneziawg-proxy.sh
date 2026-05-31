@@ -19,9 +19,142 @@
 
 set -euo pipefail
 
+# To avoid privilege-escalation via environment injection, overrides are ignored when EUID=0.
+readonly DEFAULT_REPO_URL="https://github.com/wiresock/amneziawg-install.git"
+readonly DEFAULT_REPO_REF="main"
+
+_AWG_IS_ROOT=1
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    _AWG_IS_ROOT=0
+fi
+
+if [[ "${_AWG_IS_ROOT}" -eq 0 ]]; then
+    # Non-root: honor environment overrides for pinning.
+    readonly REPO_URL="${REPO_URL:-${DEFAULT_REPO_URL}}"
+    readonly REPO_REF="${REPO_REF:-${DEFAULT_REPO_REF}}"
+else
+    # Root: ignore environment overrides to avoid cloning arbitrary code as root.
+    readonly REPO_URL="${DEFAULT_REPO_URL}"
+    readonly REPO_REF="${DEFAULT_REPO_REF}"
+fi
+
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-INSTALLER="${SCRIPT_DIR}/amneziawg-proxy/scripts/amneziawg-proxy-install.sh"
-UNINSTALLER="${SCRIPT_DIR}/amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh"
+SCRIPTS_DIR="${SCRIPT_DIR}/amneziawg-proxy/scripts"
+BOOTSTRAP_DIR=""
+
+INSTALLER="${SCRIPTS_DIR}/amneziawg-proxy-install.sh"
+UNINSTALLER="${SCRIPTS_DIR}/amneziawg-proxy-uninstall.sh"
+
+# ── Clean-up ─────────────────────────────────────────────────────────────────
+
+cleanup() {
+    if [[ -n "${BOOTSTRAP_DIR}" ]] && [[ -d "${BOOTSTRAP_DIR}" ]]; then
+        rm -rf "${BOOTSTRAP_DIR}"
+    fi
+}
+
+trap cleanup EXIT
+
+# ── Git auto-install ──────────────────────────────────────────────────────────
+
+# Detect the system package manager and set _PKG_MGR to the install command.
+# Returns 1 if no supported package manager is found.
+detect_package_manager() {
+    if command -v apt-get >/dev/null 2>&1; then
+        _PKG_MGR="apt-get"
+    elif command -v dnf >/dev/null 2>&1; then
+        _PKG_MGR="dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        _PKG_MGR="yum"
+    else
+        return 1
+    fi
+    return 0
+}
+
+# Attempt to install git after prompting the user for confirmation.
+# Skips silently (returns 1) when not root or not on a TTY.
+install_git() {
+    if [[ "${_AWG_IS_ROOT}" -eq 0 ]]; then
+        return 1
+    fi
+
+    if ! detect_package_manager; then
+        return 1
+    fi
+
+    # Non-interactive — cannot prompt
+    if [[ ! -t 0 ]]; then
+        return 1
+    fi
+
+    warn "git is not installed, but is required to fetch the repository."
+    printf 'Would you like to install git now using %s? [y/N] ' "${_PKG_MGR}"
+    local answer
+    read -r answer || return 1
+    case "${answer}" in
+        [Yy]|[Yy][Ee][Ss]) ;;
+        *) return 1 ;;
+    esac
+
+    echo "Installing git ..."
+    local install_log
+    install_log="$(mktemp "${TMPDIR:-/tmp}/awg-git-install.XXXXXX")"
+    local install_rc=0
+    if [[ "${_PKG_MGR}" == "apt-get" ]]; then
+        apt-get update -qq >>"${install_log}" 2>&1 || install_rc=$?
+        if [[ "${install_rc}" -eq 0 ]]; then
+            apt-get install -y -qq git >>"${install_log}" 2>&1 || install_rc=$?
+        fi
+    else
+        "${_PKG_MGR}" install -y git >>"${install_log}" 2>&1 || install_rc=$?
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        printf '\033[0;31mERROR: Failed to install git (exit code %s).\033[0m\n' "${install_rc}" >&2
+        if [[ -s "${install_log}" ]]; then
+            echo "--- package manager output ---" >&2
+            tail -20 "${install_log}" >&2
+            echo "------------------------------" >&2
+        fi
+        rm -f "${install_log}"
+        return 1
+    fi
+    rm -f "${install_log}"
+
+    printf '\033[0;32mgit installed successfully.\033[0m\n'
+    return 0
+}
+
+# ── Bootstrap ────────────────────────────────────────────────────────────────
+
+bootstrap_repo_if_needed() {
+    local target_script="$1"
+    if [[ -f "${target_script}" ]]; then
+        return 0
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        if ! install_git; then
+            echo "ERROR: Script not found at: ${target_script}" >&2
+            echo "       Install git and re-run, or clone ${REPO_URL} manually." >&2
+            exit 1
+        fi
+    fi
+
+    BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/amneziawg-install.XXXXXX")"
+
+    echo "Required scripts not found locally. Cloning ${REPO_URL} (${REPO_REF}) into ${BOOTSTRAP_DIR} ..." >&2
+    if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" "${BOOTSTRAP_DIR}" >&2; then
+        echo "ERROR: Failed to clone ${REPO_URL}" >&2
+        echo "       Clone the repository manually and re-run." >&2
+        exit 1
+    fi
+
+    SCRIPTS_DIR="${BOOTSTRAP_DIR}/amneziawg-proxy/scripts"
+    INSTALLER="${SCRIPTS_DIR}/amneziawg-proxy-install.sh"
+    UNINSTALLER="${SCRIPTS_DIR}/amneziawg-proxy-uninstall.sh"
+}
 
 readonly SERVICE_NAME="amneziawg-proxy"
 readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
@@ -66,14 +199,6 @@ BINARY_PATH="$(_get_binary_path)"
 
 die()  { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 warn() { printf '\033[0;33m[WARN] \033[0m %s\n' "$*" >&2; }
-
-require_inner_script() {
-    local path="$1"
-    if [[ ! -f "${path}" ]]; then
-        die "Script not found at: ${path}
-Make sure you cloned the full repository."
-    fi
-}
 
 # ── Installation detection ────────────────────────────────────────────────────
 
@@ -122,11 +247,11 @@ manage_menu() {
             fi
             ;;
         3)
-            require_inner_script "${INSTALLER}"
+            bootstrap_repo_if_needed "${INSTALLER}"
             exec bash "${INSTALLER}"
             ;;
         4)
-            require_inner_script "${UNINSTALLER}"
+            bootstrap_repo_if_needed "${UNINSTALLER}"
 
             echo ""
             echo "Uninstall options:"
@@ -182,6 +307,6 @@ fi
 if is_proxy_installed; then
     manage_menu "$@"
 else
-    require_inner_script "${INSTALLER}"
+    bootstrap_repo_if_needed "${INSTALLER}"
     exec bash "${INSTALLER}" "$@"
 fi
