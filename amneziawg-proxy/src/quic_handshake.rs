@@ -139,7 +139,7 @@ impl QuicHandshakeResponder {
         let mut rustls_server_cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(resolver);
-        rustls_server_cfg.alpn_protocols = vec![b"h3".to_vec()];
+        rustls_server_cfg.alpn_protocols = vec![b"h3".to_vec(), b"h3-29".to_vec()];
         rustls_server_cfg.max_early_data_size = 0;
 
         let quic_crypto = QuicServerConfig::try_from(rustls_server_cfg)
