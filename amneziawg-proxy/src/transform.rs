@@ -2,7 +2,7 @@
 use bytes::{BufMut, BytesMut};
 
 use crate::config::AwgParams;
-use crate::responder::{classify_awg_packet, Protocol};
+use crate::responder::{classify_awg_packet, AwgPacketType, Protocol};
 
 /// Apply protocol-conformant padding transformation to an outgoing packet.
 ///
@@ -19,8 +19,7 @@ use crate::responder::{classify_awg_packet, Protocol};
 /// applied.
 ///
 /// Protocol-specific padding strategies:
-/// - **QUIC**: Pseudo-random bytes resembling encrypted QUIC payload (high
-///   entropy), with a QUIC short-header form byte at the start.
+/// - **QUIC**: Packet-type-aware header form (see `apply_quic_padding_typed`).
 /// - **DNS**: DNS response header structure (transaction ID, flags, section
 ///   counts) followed by zero-fill for EDNS OPT padding (RFC 7830).
 /// - **STUN**: STUN Binding Indication header with the RFC 5389 magic cookie
@@ -33,10 +32,39 @@ pub fn apply_padding(data: &mut [u8], pad_size: usize, proto: Protocol) {
     }
 
     match proto {
-        Protocol::Quic => apply_quic_padding(data, pad_size),
+        Protocol::Quic => apply_quic_padding_initial(data, pad_size),
         Protocol::Dns => apply_dns_padding(data, pad_size),
         Protocol::Stun => apply_stun_padding(data, pad_size),
         Protocol::Sip => apply_sip_padding(data, pad_size),
+    }
+}
+
+/// Apply QUIC-style padding with the header form appropriate for the given
+/// AWG packet type.
+///
+/// Real QUIC uses different header forms at each phase of the connection:
+/// - **Initial** (S1, Handshake Initiation): long-header Initial (`0xC0..`)
+/// - **Handshake** (S2/S3, Handshake Response / Cookie Reply): long-header
+///   Handshake (`0xE0..`)
+/// - **1-RTT** (S4, Transport Data): short-header 1-RTT (`0x40..0x7F`)
+///
+/// Using the correct header form for each phase prevents DPI systems from
+/// detecting the anomaly of seeing Initial-epoch long-headers throughout the
+/// lifetime of a connection.
+pub fn apply_quic_padding_typed(
+    data: &mut [u8],
+    pad_size: usize,
+    pkt_type: AwgPacketType,
+) {
+    if pad_size == 0 || pad_size >= data.len() {
+        return;
+    }
+    match pkt_type {
+        AwgPacketType::HandshakeInit => apply_quic_padding_initial(data, pad_size),
+        AwgPacketType::HandshakeResponse | AwgPacketType::CookieReply => {
+            apply_quic_padding_handshake(data, pad_size)
+        }
+        AwgPacketType::TransportData => apply_quic_padding_short(data, pad_size),
     }
 }
 
@@ -44,7 +72,9 @@ pub fn apply_padding(data: &mut [u8], pad_size: usize, proto: Protocol) {
 ///
 /// Classifies the packet using the S-offset / H-range pairs to determine its
 /// type, then overwrites the leading S-padding prefix with protocol-conformant
-/// filler.
+/// filler. For QUIC, uses the packet-type-aware header form so that the
+/// correct QUIC epoch (Initial / Handshake / 1-RTT) is emitted for each AWG
+/// message type.
 ///
 /// Returns `true` if the packet was classified and transformed, `false` if the
 /// packet type could not be identified (e.g. junk packet) and was left
@@ -62,7 +92,11 @@ pub fn apply_awg_transform(data: &mut [u8], params: &AwgParams, proto: Protocol)
         return false;
     }
 
-    apply_padding(data, pad_size, proto);
+    if proto == Protocol::Quic {
+        apply_quic_padding_typed(data, pad_size, pkt_type);
+    } else {
+        apply_padding(data, pad_size, proto);
+    }
     true
 }
 
@@ -97,64 +131,120 @@ pub(crate) fn build_padded_packet(payload: &[u8], pad_len: usize, proto: Protoco
 // Protocol-specific padding implementations
 // ---------------------------------------------------------------------------
 
-/// QUIC-style padding: long-header Initial bytes followed by pseudo-random
-/// "encrypted" payload.
+/// QUIC long-header Initial padding (S1 — Handshake Initiation).
 ///
-/// The padding region is overwritten with a QUIC v1 long-header Initial
-/// prologue (RFC 9000 §17.2.2):
-///   - byte 0:    `0xC0 | PN_len` — long-header form, fixed bit, Initial type,
+/// Emits a QUIC v1 long-header Initial prologue (RFC 9000 §17.2.2):
+///   - byte 0:    `0xC0 | PN_len` — form=1, fixed=1, type=00 (Initial),
 ///                  reserved bits cleared, random 2-bit Packet Number length.
-///   - bytes 1-4: `0x00000001`     — QUIC v1 (Draft 29 and earlier are obsolete
-///                  and would be a detectable fingerprint).
-///   - byte 5:    DCID length in `4..=20` (RFC 9000 §17.2 caps at 20; real
-///                  client Initials always carry a non-empty DCID).
-///   - bytes 6+:  pseudo-random, seeded from the encrypted WG payload that
-///                  follows the padding — high-entropy bytes resembling
-///                  encrypted QUIC CRYPTO/PADDING frames.
-///
-/// This aligns the proxy with the WireSock client's `protocol_aware_padding_generator`
-/// (`amnezia.h`), which also emits a long-header Initial prologue. A short-header
-/// 1-RTT form would be more realistic for `S4` transport-phase padding, but
-/// emitting *different* QUIC header forms on the two ends of the same conversation
-/// is itself a stronger fingerprint than picking one form and using it consistently.
-fn apply_quic_padding(data: &mut [u8], pad_size: usize) {
+///   - bytes 1-4: `0x00000001` — QUIC v1.
+///   - byte 5:    DCID length in `4..=20`.
+///   - bytes 6+:  pseudo-random high-entropy fill.
+fn apply_quic_padding_initial(data: &mut [u8], pad_size: usize) {
     let (padding, payload) = data.split_at_mut(pad_size);
     if padding.is_empty() {
         return;
     }
 
-    // Seed PRNG from payload bytes (after the padding) using FNV-1a hash
+    let mut state = fnv1a_seed(payload);
+
+    let pn_len_bits = (state as u8) & 0x03;
+    state = lcg_step(state);
+    let dcid_len = ((state as u8) % 17) + 4; // 4..=20
+    state = lcg_step(state);
+
+    let header: [u8; 6] = [
+        0xC0 | pn_len_bits, // long-header, fixed, Initial, pn_len
+        0x00, 0x00, 0x00, 0x01, // QUIC v1
+        dcid_len,
+    ];
+
+    let copy_len = padding.len().min(header.len());
+    padding[..copy_len].copy_from_slice(&header[..copy_len]);
+    for byte in padding[copy_len..].iter_mut() {
+        *byte = (state >> 16) as u8;
+        state = lcg_step(state);
+    }
+}
+
+/// QUIC long-header Handshake padding (S2/S3 — Handshake Response / Cookie Reply).
+///
+/// Emits a QUIC v1 long-header Handshake prologue (RFC 9000 §17.2.4):
+///   - byte 0:    `0xE0 | PN_len` — form=1, fixed=1, type=10 (Handshake),
+///                  reserved bits cleared, random PN length.
+///   - bytes 1-4: `0x00000001` — QUIC v1.
+///   - byte 5:    DCID length in `0..=20` (server may use 0-length DCID).
+///   - bytes 6+:  pseudo-random high-entropy fill.
+fn apply_quic_padding_handshake(data: &mut [u8], pad_size: usize) {
+    let (padding, payload) = data.split_at_mut(pad_size);
+    if padding.is_empty() {
+        return;
+    }
+
+    let mut state = fnv1a_seed(payload);
+
+    let pn_len_bits = (state as u8) & 0x03;
+    state = lcg_step(state);
+    let dcid_len = (state as u8) % 21; // 0..=20
+    state = lcg_step(state);
+
+    let header: [u8; 6] = [
+        0xE0 | pn_len_bits, // long-header, fixed, Handshake, pn_len
+        0x00, 0x00, 0x00, 0x01, // QUIC v1
+        dcid_len,
+    ];
+
+    let copy_len = padding.len().min(header.len());
+    padding[..copy_len].copy_from_slice(&header[..copy_len]);
+    for byte in padding[copy_len..].iter_mut() {
+        *byte = (state >> 16) as u8;
+        state = lcg_step(state);
+    }
+}
+
+/// QUIC short-header 1-RTT padding (S4 — Transport Data).
+///
+/// Emits a QUIC 1-RTT short-header byte (RFC 9000 §17.3.1) followed by
+/// pseudo-random bytes simulating an encrypted QUIC 1-RTT payload:
+///   - byte 0: `0x40 | (spin<<5) | (reserved=00) | (key_phase<<2) | pn_len`
+///     — form=0, fixed=1, random spin bit, random key-phase bit, random PN len.
+///   - bytes 1+: pseudo-random (simulating DCID + encrypted payload).
+///
+/// Note: the short header has no version field or length field — the
+/// remaining bytes after byte 0 are indistinguishable from random data,
+/// which is the correct appearance for 1-RTT QUIC ciphertext.
+fn apply_quic_padding_short(data: &mut [u8], pad_size: usize) {
+    let (padding, payload) = data.split_at_mut(pad_size);
+    if padding.is_empty() {
+        return;
+    }
+
+    let mut state = fnv1a_seed(payload);
+
+    // Short header first byte: 0 1 S R R K P P
+    //   form=0, fixed=1, spin=random, reserved=00, key_phase=random, pn_len=random
+    let spin = ((state >> 8) as u8) & 0x01;
+    state = lcg_step(state);
+    let key_phase = ((state >> 8) as u8) & 0x01;
+    state = lcg_step(state);
+    let pn_len_bits = (state as u8) & 0x03;
+    state = lcg_step(state);
+
+    padding[0] = 0x40 | (spin << 5) | (key_phase << 2) | pn_len_bits;
+
+    for byte in padding[1..].iter_mut() {
+        *byte = (state >> 16) as u8;
+        state = lcg_step(state);
+    }
+}
+
+/// FNV-1a seed from first 64 bytes of payload for PRNG initialisation.
+fn fnv1a_seed(payload: &[u8]) -> u32 {
     let mut state: u32 = 0x811c_9dc5;
     for &b in payload.iter().take(64) {
         state ^= b as u32;
         state = state.wrapping_mul(0x0100_0193);
     }
-
-    // QUIC long-header Initial first byte: 1-1-0-0-0-0-PN-PN
-    let pn_len_bits = (state as u8) & 0x03;
-    state = lcg_step(state);
-    // DCID length in [4, 20] — typical client Initial range. Real clients
-    // never send DCID length 0 in their first Initial.
-    let dcid_len = ((state as u8) % 17) + 4;
-    state = lcg_step(state);
-
-    let header: [u8; 6] = [
-        0xC0 | pn_len_bits,
-        0x00,
-        0x00,
-        0x00,
-        0x01, // QUIC v1
-        dcid_len,
-    ];
-
-    let copy_len = std::cmp::min(padding.len(), header.len());
-    padding[..copy_len].copy_from_slice(&header[..copy_len]);
-
-    // Remaining bytes: pseudo-random, simulating encrypted QUIC payload
-    for byte in padding[copy_len..].iter_mut() {
-        *byte = (state >> 16) as u8;
-        state = lcg_step(state);
-    }
+    state
 }
 
 /// DNS-style padding: minimal DNS response header followed by zero padding.
@@ -287,48 +377,56 @@ mod tests {
 
     #[test]
     fn quic_padding_has_header_and_entropy() {
-        // 10 bytes padding prefix + 10 bytes payload
+        // apply_padding with QUIC routes to the Initial variant
         let mut data = vec![0xAA; 20];
         let pad_size = 10;
         apply_padding(&mut data, pad_size, Protocol::Quic);
 
-        // First padding byte has QUIC long-header form bit (0x80) + fixed bit (0x40)
-        assert_eq!(
-            data[0] & 0xC0,
-            0xC0,
-            "QUIC padding first byte should have long-header form + fixed bit"
-        );
-        // Packet type bits (0x30) must indicate Initial (00)
-        assert_eq!(
-            data[0] & 0x30,
-            0x00,
-            "QUIC padding first byte should encode the Initial packet type"
-        );
-        // Reserved bits (0x0C) must be cleared per RFC 9000 §17.2
-        assert_eq!(
-            data[0] & 0x0C,
-            0x00,
-            "QUIC padding first byte must have reserved bits cleared"
-        );
-        // Bytes 1..5 must be QUIC v1 version field (0x00000001)
-        assert_eq!(&data[1..5], &[0x00, 0x00, 0x00, 0x01]);
-        // Byte 5 is DCID length, expected to be in the realistic 4..=20 range
-        assert!((4..=20).contains(&data[5]));
-        // Payload (last 10 bytes) untouched
-        assert!(data[10..].iter().all(|&b| b == 0xAA));
+        // form=1, fixed=1 (0xC0)
+        assert_eq!(data[0] & 0xC0, 0xC0, "Initial: long-header + fixed bit");
+        // type=00 (Initial)
+        assert_eq!(data[0] & 0x30, 0x00, "Initial: type bits must be 00");
+        // reserved bits cleared
+        assert_eq!(data[0] & 0x0C, 0x00, "Initial: reserved bits cleared");
+        assert_eq!(&data[1..5], &[0x00, 0x00, 0x00, 0x01], "QUIC v1");
+        assert!((4..=20).contains(&data[5]), "DCID len 4..=20");
+        assert!(data[10..].iter().all(|&b| b == 0xAA), "payload untouched");
+    }
+
+    #[test]
+    fn quic_padding_handshake_has_correct_header() {
+        let mut data = vec![0xAA; 20];
+        apply_quic_padding_handshake(&mut data, 10);
+
+        // form=1, fixed=1, type=10 (Handshake) => byte & 0xF0 == 0xE0
+        assert_eq!(data[0] & 0xF0, 0xE0, "Handshake: type bits must be E0..EF");
+        // reserved bits cleared
+        assert_eq!(data[0] & 0x0C, 0x00, "Handshake: reserved bits cleared");
+        assert_eq!(&data[1..5], &[0x00, 0x00, 0x00, 0x01], "QUIC v1");
+        assert!((0..=20).contains(&data[5]), "DCID len 0..=20");
+        assert!(data[10..].iter().all(|&b| b == 0xAA), "payload untouched");
+    }
+
+    #[test]
+    fn quic_padding_short_has_correct_header() {
+        let mut data = vec![0xAA; 20];
+        apply_quic_padding_short(&mut data, 10);
+
+        // form=0, fixed=1 => byte & 0xC0 == 0x40
+        assert_eq!(data[0] & 0xC0, 0x40, "1-RTT: form=0, fixed=1");
+        // reserved bits (0x18) must be cleared per RFC 9000 §17.3
+        assert_eq!(data[0] & 0x18, 0x00, "1-RTT: reserved bits cleared");
+        assert!(data[10..].iter().all(|&b| b == 0xAA), "payload untouched");
     }
 
     #[test]
     fn quic_padding_varies_with_payload() {
-        // Two different payloads should produce different padding
         let mut data_a = [0u8; 20];
         let mut data_b = [0u8; 20];
-        // Set different payload content (bytes 10..20)
         data_a[10..].fill(0xAA);
         data_b[10..].fill(0xBB);
         apply_padding(&mut data_a, 10, Protocol::Quic);
         apply_padding(&mut data_b, 10, Protocol::Quic);
-        // Padding regions (first 10 bytes) should differ (different seeds)
         assert_ne!(&data_a[..10], &data_b[..10]);
     }
 
@@ -609,26 +707,60 @@ mod tests {
     #[test]
     fn awg_transform_handshake_response_dns() {
         let params = test_awg_params();
-        // Build a packet: S2 prefix padding + H2-range header + 92-byte WG message
-        let padding_original = [0xFF; 8]; // S2 = 8 bytes of random prefix padding
+        let padding_original = [0xFF; 8]; // S2 = 8
         let header = 350u32.to_le_bytes();
-        let body = [0xDD; 92 - 4]; // 92 total message size includes 4-byte header
+        let body = [0xDD; 92 - 4];
         let mut pkt = Vec::new();
         pkt.extend_from_slice(&padding_original);
         pkt.extend_from_slice(&header);
         pkt.extend_from_slice(&body);
-        assert_eq!(pkt.len(), 8 + 92); // S2 + WG message size
+        assert_eq!(pkt.len(), 8 + 92);
 
         let result = apply_awg_transform(&mut pkt, &params, Protocol::Dns);
         assert!(result);
 
-        // Prefix padding (first 8 bytes): DNS header structure
-        // Flags byte at offset 2 should have QR=1
-        assert_eq!(pkt[2] & 0x80, 0x80);
-        // Header should be untouched
+        assert_eq!(pkt[2] & 0x80, 0x80, "DNS QR=1");
         assert_eq!(&pkt[8..12], &350u32.to_le_bytes());
-        // Body should be untouched
         assert!(pkt[12..8 + 92].iter().all(|&b| b == 0xDD));
+    }
+
+    #[test]
+    fn awg_transform_handshake_response_quic_uses_handshake_header() {
+        let params = test_awg_params();
+        // S2 = 8 bytes padding + H2-range header (350) + 92-byte WG Handshake Response
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&[0xFF; 8]);
+        pkt.extend_from_slice(&350u32.to_le_bytes());
+        pkt.extend_from_slice(&[0xDD; 88]);
+        assert_eq!(pkt.len(), 8 + 92);
+
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic);
+        assert!(result);
+
+        // S2 padding must use Handshake long-header (0xE0..), NOT Initial (0xC0..)
+        assert_eq!(pkt[0] & 0xF0, 0xE0, "HandshakeResponse must use QUIC Handshake header (0xE0..)");
+        assert_eq!(pkt[0] & 0x0C, 0x00, "reserved bits cleared");
+        assert_eq!(&pkt[1..5], &[0x00, 0x00, 0x00, 0x01], "QUIC v1");
+        assert_eq!(&pkt[8..12], &350u32.to_le_bytes(), "AWG header untouched");
+    }
+
+    #[test]
+    fn awg_transform_transport_data_quic_uses_short_header() {
+        let params = test_awg_params();
+        // S4 = 20 bytes padding + H4-range header (750) + 100-byte body
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&[0xFF; 20]);
+        pkt.extend_from_slice(&750u32.to_le_bytes());
+        pkt.extend_from_slice(&[0xBB; 100]);
+
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic);
+        assert!(result);
+
+        // S4 padding must use 1-RTT short-header (form=0, fixed=1 => 0x40..0x7F)
+        assert_eq!(pkt[0] & 0xC0, 0x40, "TransportData must use QUIC 1-RTT short-header (0x40..)");
+        assert_eq!(pkt[0] & 0x18, 0x00, "reserved bits cleared");
+        assert_eq!(&pkt[20..24], &750u32.to_le_bytes(), "AWG header untouched");
+        assert!(pkt[24..124].iter().all(|&b| b == 0xBB), "body untouched");
     }
 
     #[test]

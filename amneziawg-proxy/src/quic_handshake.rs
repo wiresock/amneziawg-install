@@ -211,11 +211,19 @@ impl QuicHandshakeResponder {
                 let remote = incoming.remote_address();
                 if self.connections.len() < Self::MAX_TRACKED_CONNECTIONS {
                     if let Ok((ch, conn)) = self.endpoint.accept(incoming, now, buf, None) {
+                        // Flush any immediate post-accept datagram (e.g. stateless
+                        // reset or early server Initial ACK) produced by accept().
+                        if !buf.is_empty() {
+                            out.push(QuicResponse {
+                                destination: remote,
+                                payload: Bytes::copy_from_slice(buf),
+                            });
+                            buf.clear();
+                        }
                         self.connections.insert(ch, conn);
                         *self.active_remotes.entry(remote).or_insert(0) += 1;
                     }
-                }
-                if !buf.is_empty() {
+                } else if !buf.is_empty() {
                     out.push(QuicResponse {
                         destination: remote,
                         payload: Bytes::copy_from_slice(buf),
