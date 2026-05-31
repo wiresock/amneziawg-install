@@ -316,17 +316,172 @@ impl QuicHandshakeResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quinn_proto::crypto::rustls::QuicClientConfig;
+    use quinn_proto::{ClientConfig, Endpoint as ClientEndpoint, EndpointConfig, TransportConfig};
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{ServerName, UnixTime};
+    use rustls::{ClientConfig as RustlsClientConfig, DigitallySignedStruct, Error as TlsError,
+                 SignatureScheme};
 
+    /// A no-op TLS certificate verifier that accepts any server certificate.
+    /// Used only in tests so we can connect to a self-signed test cert without
+    /// needing a trust store.
+    #[derive(Debug)]
+    struct AcceptAnyCert;
+
+    impl ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+            ]
+        }
+    }
+
+    /// Build a quinn-proto client endpoint and return the raw bytes of the
+    /// first QUIC Initial packet it produces, ready to feed into the responder.
+    fn make_h3_initial(alpn: &[&str]) -> Vec<u8> {
+        let mut tls = RustlsClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+            .with_no_client_auth();
+        tls.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+
+        let quic_tls = QuicClientConfig::try_from(tls)
+            .expect("QuicClientConfig from h3 ClientConfig must succeed");
+
+        let mut transport = TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            std::time::Duration::from_secs(5).try_into().unwrap(),
+        ));
+        let mut client_cfg = ClientConfig::new(Arc::new(quic_tls));
+        client_cfg.transport_config(Arc::new(transport));
+
+        let mut endpoint = ClientEndpoint::new(
+            Arc::new(EndpointConfig::default()),
+            None,
+            false,
+            None,
+        );
+        let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let (_handle, mut conn) = endpoint
+            .connect(
+                Instant::now(),
+                client_cfg,
+                server_addr,
+                "example.com",
+            )
+            .expect("client connect must succeed");
+
+        let mut buf = Vec::new();
+        let tx = conn
+            .poll_transmit(Instant::now(), 16, &mut buf)
+            .expect("client must produce an Initial packet");
+        buf[..tx.size].to_vec()
+    }
+
+    /// A CONNECTION_CLOSE-only server flight (produced when ALPN is missing) is
+    /// small: one Initial packet with a single CRYPTO frame containing the TLS
+    /// alert, typically well under 200 bytes. A successful server Handshake
+    /// flight includes Certificate + CertificateVerify + Finished and is always
+    /// much larger — in practice 1–4 KB. We use 500 bytes as a conservative
+    /// threshold: anything above that cannot be a CONNECTION_CLOSE-only response.
+    const MIN_CERTIFICATE_FLIGHT_BYTES: usize = 500;
+
+    fn total_response_bytes(responses: &[QuicResponse]) -> usize {
+        responses.iter().map(|r| r.payload.len()).sum()
+    }
+
+    /// Regression test: the responder must produce a large server flight
+    /// (containing the Certificate) when the client offers h3.
+    ///
+    /// Before the fix, `alpn_protocols` was empty → rustls sent `CONNECTION_CLOSE`
+    /// with `no_application_protocol` (TLS alert 120). That flight is tiny
+    /// (< 200 bytes). With the fix the server proceeds through the full TLS 1.3
+    /// Handshake flight (Certificate + CertificateVerify + Finished) which
+    /// always exceeds MIN_CERTIFICATE_FLIGHT_BYTES.
     #[test]
-    fn new_responder_accepts_h3_alpn_without_error() {
-        QuicHandshakeResponder::new("example.com")
-            .expect("QuicHandshakeResponder::new must succeed with h3 ALPN configured");
+    fn h3_clienthello_produces_certificate_flight() {
+        let mut responder = QuicHandshakeResponder::new("example.com").unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:11111".parse().unwrap();
+
+        let initial = make_h3_initial(&["h3"]);
+        let responses = responder.handle_datagram(client_addr, &initial);
+
+        assert!(
+            !responses.is_empty(),
+            "responder must reply to a valid h3 ClientHello Initial"
+        );
+        let total = total_response_bytes(&responses);
+        assert!(
+            total >= MIN_CERTIFICATE_FLIGHT_BYTES,
+            "server flight must be >= {MIN_CERTIFICATE_FLIGHT_BYTES} bytes to contain \
+             a Certificate (got {total} bytes across {} datagram(s)); \
+             a tiny response indicates a CONNECTION_CLOSE abort (missing ALPN)",
+            responses.len(),
+        );
+    }
+
+    /// Verify h3-29 (draft-29 ALPN) is also accepted — a DPI probe using an
+    /// older QUIC stack must receive a full Certificate flight, not a close.
+    #[test]
+    fn h3_29_clienthello_produces_certificate_flight() {
+        let mut responder = QuicHandshakeResponder::new("example.com").unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:11112".parse().unwrap();
+
+        let initial = make_h3_initial(&["h3-29"]);
+        let responses = responder.handle_datagram(client_addr, &initial);
+
+        assert!(
+            !responses.is_empty(),
+            "responder must reply to a valid h3-29 ClientHello Initial"
+        );
+        let total = total_response_bytes(&responses);
+        assert!(
+            total >= MIN_CERTIFICATE_FLIGHT_BYTES,
+            "server flight must be >= {MIN_CERTIFICATE_FLIGHT_BYTES} bytes to contain \
+             a Certificate for h3-29 (got {total} bytes across {} datagram(s)); \
+             a tiny response indicates a CONNECTION_CLOSE abort (missing ALPN)",
+            responses.len(),
+        );
     }
 
     #[test]
     fn empty_datagram_produces_no_response() {
         let mut r = QuicHandshakeResponder::new("example.com").unwrap();
-        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let responses = r.handle_datagram(addr, &[]);
         assert!(responses.is_empty(), "empty datagram must produce no response");
     }
