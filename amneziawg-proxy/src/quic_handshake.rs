@@ -264,15 +264,36 @@ impl QuicHandshakeResponder {
         }
     }
 
-    /// Silently evict a flush-and-forget connection after notifying the
-    /// endpoint so it can release its internal CID table entry.
-    fn evict_connection(&mut self, ch: ConnectionHandle) {
+    /// Remove a naturally-drained connection (conn.is_drained() == true).
+    ///
+    /// For naturally drained connections quinn-proto has already emitted
+    /// `EndpointEvent::drained()` via `poll_endpoint_events()` and the endpoint
+    /// has already processed it.  We must NOT send it a second time.
+    fn drain_connection(&mut self, ch: ConnectionHandle) {
         if let Some(conn) = self.connections.remove(&ch) {
             self.release_remote(conn.remote_address());
-            // Notify the endpoint that this connection has drained so
-            // quinn-proto can release its internal CID / routing state.
-            // Without this the endpoint's slab leaks one entry per accepted
-            // handshake for the lifetime of the responder.
+        }
+        self.conn_events.remove(&ch);
+        self.flush_and_forget.remove(&ch);
+    }
+
+    /// Forcibly evict a flush-and-forget connection that has not gone through
+    /// the normal quinn-proto drain sequence.
+    ///
+    /// Because the connection was never closed or drained normally, the endpoint
+    /// still holds internal CID / routing state for it.  Sending
+    /// `EndpointEvent::drained()` here is the correct way to release that state
+    /// without emitting a CONNECTION_CLOSE datagram on the wire.
+    ///
+    /// Note: after eviction a replayed Initial from the same peer will be treated
+    /// as a brand-new connection by the endpoint and will regenerate the
+    /// Certificate flight.  This is bounded by the existing `active_remotes` cap
+    /// and the probe rate-limiter in the outer `Proxy`.
+    fn force_evict_connection(&mut self, ch: ConnectionHandle) {
+        if let Some(conn) = self.connections.remove(&ch) {
+            self.release_remote(conn.remote_address());
+            // Notify the endpoint so it releases CID/routing state without
+            // sending CONNECTION_CLOSE on the wire.
             self.endpoint.handle_event(ch, EndpointEvent::drained());
         }
         self.conn_events.remove(&ch);
@@ -284,13 +305,12 @@ impl QuicHandshakeResponder {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = Vec::new();
             let mut drained_connections: Vec<ConnectionHandle> = Vec::new();
             let mut made_progress = false;
-            // Track which flush-and-forget handles produced at least one transmit
-            // *in this iteration* by recording out.len() before each poll_transmit
-            // call.  Using out.len() rather than destination address is the only
-            // correct guard: destination-based checks fail when multiple connections
-            // share a remote or when out already contains responses from a prior
-            // drive() iteration.
-            let mut transmitted_this_iter: HashSet<ConnectionHandle> = HashSet::new();
+            // Track which flush-and-forget handles produced transmits *in this
+            // iteration* and how many bytes they emitted.  We store the out.len()
+            // snapshot taken just before each connection's poll_transmit so we
+            // can compute the burst size and guard against evicting before the
+            // full Certificate flight has been collected.
+            let mut transmitted_this_iter: Vec<(ConnectionHandle, usize)> = Vec::new();
 
             let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
             for ch in handles {
@@ -320,7 +340,7 @@ impl QuicHandshakeResponder {
                     made_progress = true;
                 }
                 if out.len() > out_before && self.flush_and_forget.contains(&ch) {
-                    transmitted_this_iter.insert(ch);
+                    transmitted_this_iter.push((ch, out_before));
                 }
 
                 if let Some(timeout) = conn.poll_timeout() {
@@ -343,14 +363,26 @@ impl QuicHandshakeResponder {
             }
 
             for ch in drained_connections {
-                self.evict_connection(ch);
+                self.drain_connection(ch);
                 made_progress = true;
             }
 
-            // Evict only flush-and-forget connections that produced at least one
-            // transmit in this specific drive() iteration, as tracked above.
-            for ch in transmitted_this_iter {
-                self.evict_connection(ch);
+            // Evict flush-and-forget connections whose burst in this iteration
+            // was large enough to contain a Certificate flight.  The threshold
+            // guards against premature eviction if a future quinn-proto version
+            // splits the server flight (e.g. bare Initial ACK first, then
+            // Certificate) across separate drive() iterations.
+            // The quinn-proto dependency is pinned in Cargo.lock; the regression
+            // test also asserts the full flight is present before eviction.
+            const MIN_CERT_FLIGHT_BYTES: usize = 500;
+            for (ch, out_start) in transmitted_this_iter {
+                let burst_bytes: usize = out[out_start..]
+                    .iter()
+                    .map(|r| r.payload.len())
+                    .sum();
+                if burst_bytes >= MIN_CERT_FLIGHT_BYTES {
+                    self.force_evict_connection(ch);
+                }
             }
 
             if !made_progress {
