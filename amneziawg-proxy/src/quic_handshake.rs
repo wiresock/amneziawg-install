@@ -305,12 +305,12 @@ impl QuicHandshakeResponder {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = Vec::new();
             let mut drained_connections: Vec<ConnectionHandle> = Vec::new();
             let mut made_progress = false;
-            // Track which flush-and-forget handles produced transmits *in this
-            // iteration* and how many bytes they emitted.  We store the out.len()
-            // snapshot taken just before each connection's poll_transmit so we
-            // can compute the burst size and guard against evicting before the
-            // full Certificate flight has been collected.
-            let mut transmitted_this_iter: Vec<(ConnectionHandle, usize)> = Vec::new();
+            // Track flush-and-forget handles that produced transmits in this
+            // iteration.  We record (ch, out_start, out_end) — the slice of `out`
+            // that belongs exclusively to this connection — so the burst-size
+            // check sums only this connection's bytes, not those of later
+            // connections processed in the same drive() iteration.
+            let mut transmitted_this_iter: Vec<(ConnectionHandle, usize, usize)> = Vec::new();
 
             let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
             for ch in handles {
@@ -330,7 +330,7 @@ impl QuicHandshakeResponder {
                     made_progress = true;
                 }
 
-                let out_before = out.len();
+                let out_start = out.len();
                 while let Some(transmit) = conn.poll_transmit(now, 1, buf) {
                     out.push(QuicResponse {
                         destination: transmit.destination,
@@ -339,8 +339,9 @@ impl QuicHandshakeResponder {
                     buf.clear();
                     made_progress = true;
                 }
-                if out.len() > out_before && self.flush_and_forget.contains(&ch) {
-                    transmitted_this_iter.push((ch, out_before));
+                let out_end = out.len();
+                if out_end > out_start && self.flush_and_forget.contains(&ch) {
+                    transmitted_this_iter.push((ch, out_start, out_end));
                 }
 
                 if let Some(timeout) = conn.poll_timeout() {
@@ -375,8 +376,8 @@ impl QuicHandshakeResponder {
             // The quinn-proto dependency is pinned in Cargo.lock; the regression
             // test also asserts the full flight is present before eviction.
             const MIN_CERT_FLIGHT_BYTES: usize = 500;
-            for (ch, out_start) in transmitted_this_iter {
-                let burst_bytes: usize = out[out_start..]
+            for (ch, out_start, out_end) in transmitted_this_iter {
+                let burst_bytes: usize = out[out_start..out_end]
                     .iter()
                     .map(|r| r.payload.len())
                     .sum();
