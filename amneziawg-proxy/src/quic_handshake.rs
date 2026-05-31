@@ -251,6 +251,34 @@ impl QuicHandshakeResponder {
         }
     }
 
+    /// Decrement the active-remote refcount for `remote`, removing the entry
+    /// when it reaches zero.
+    fn release_remote(&mut self, remote: SocketAddr) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.active_remotes.entry(remote)
+        {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+
+    /// Silently evict a flush-and-forget connection after notifying the
+    /// endpoint so it can release its internal CID table entry.
+    fn evict_connection(&mut self, ch: ConnectionHandle) {
+        if let Some(conn) = self.connections.remove(&ch) {
+            self.release_remote(conn.remote_address());
+            // Notify the endpoint that this connection has drained so
+            // quinn-proto can release its internal CID / routing state.
+            // Without this the endpoint's slab leaks one entry per accepted
+            // handshake for the lifetime of the responder.
+            self.endpoint.handle_event(ch, EndpointEvent::drained());
+        }
+        self.conn_events.remove(&ch);
+        self.flush_and_forget.remove(&ch);
+    }
+
     fn drive(&mut self, now: Instant, buf: &mut Vec<u8>, out: &mut Vec<QuicResponse>) {
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = Vec::new();
@@ -304,51 +332,30 @@ impl QuicHandshakeResponder {
             }
 
             for ch in drained_connections {
-                if let Some(conn) = self.connections.remove(&ch) {
-                    let remote = conn.remote_address();
-                    if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                        self.active_remotes.entry(remote)
-                    {
-                        *entry.get_mut() -= 1;
-                        if *entry.get() == 0 {
-                            entry.remove();
-                        }
-                    }
-                    made_progress = true;
-                }
-                self.conn_events.remove(&ch);
-                self.flush_and_forget.remove(&ch);
+                self.evict_connection(ch);
+                made_progress = true;
             }
 
-            // Silently evict flush-and-forget connections once they have
-            // produced at least one transmit in this drive() iteration.
-            // We check after processing all events so the full Initial +
-            // Handshake coalesced flight is included in `out` before removal.
+            // Evict flush-and-forget connections once they have actually produced
+            // a transmit destined for their own remote address in this iteration.
+            // Checking per-connection output (rather than the global made_progress
+            // flag) prevents a connection from being dropped before its own
+            // Certificate flight is collected when other connections are active.
             let forget: Vec<ConnectionHandle> = self
                 .flush_and_forget
                 .iter()
                 .copied()
-                .filter(|ch| self.connections.contains_key(ch))
+                .filter(|ch| {
+                    self.connections
+                        .get(ch)
+                        .is_some_and(|conn| {
+                            let remote = conn.remote_address();
+                            out.iter().any(|r| r.destination == remote)
+                        })
+                })
                 .collect();
             for ch in forget {
-                // Only evict once the connection has actually transmitted something
-                // (i.e., out grew since we entered drive). Evicting too early would
-                // drop the Certificate flight entirely.
-                if made_progress {
-                    if let Some(conn) = self.connections.remove(&ch) {
-                        let remote = conn.remote_address();
-                        if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                            self.active_remotes.entry(remote)
-                        {
-                            *entry.get_mut() -= 1;
-                            if *entry.get() == 0 {
-                                entry.remove();
-                            }
-                        }
-                    }
-                    self.conn_events.remove(&ch);
-                    self.flush_and_forget.remove(&ch);
-                }
+                self.evict_connection(ch);
             }
 
             if !made_progress {
