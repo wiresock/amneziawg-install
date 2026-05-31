@@ -246,7 +246,21 @@ impl Proxy {
         // Check if this is a probe packet and respond if rate allows.
         // Only respond to probes that match the configured protocol so the
         // proxy does not appear to host multiple services on the same port.
+        //
+        // When AWG params are available, check first whether the incoming
+        // packet is actually AWG data whose S-padding prefix happens to look
+        // like the imitated protocol (e.g. WireSock `Ip=quic` rewrites the
+        // leading S-bytes with a QUIC long-header prologue).  Such packets
+        // must be forwarded as-is and never treated as external probes,
+        // otherwise the QUIC handshake responder fires and sends back real
+        // QUIC frames that the client tries — and fails — to decrypt as AWG.
+        let is_awg_packet = self
+            .awg_params
+            .as_deref()
+            .is_some_and(|p| responder::classify_awg_packet(data, p).is_some());
+
         let mut probe_response: Option<bytes::Bytes> = None;
+        if !is_awg_packet {
         if let Some(proto) = responder::detect_protocol(data) {
             let selected_proto = match self.fixed_protocol {
                 Some(fixed) if proto == fixed => Some(fixed),
@@ -335,6 +349,7 @@ impl Proxy {
             }
             debug!(%client_addr, "probe response sent");
         }
+        } // end !is_awg_packet
 
         // Forward to backend (and spawn relay task for new sessions)
         match self.sessions.get_or_create(client_addr).await {
