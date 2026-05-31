@@ -43,14 +43,17 @@ pub fn apply_padding(data: &mut [u8], pad_size: usize, proto: Protocol) {
 /// AWG packet type.
 ///
 /// Real QUIC uses different header forms at each phase of the connection:
-/// - **Initial** (S1, Handshake Initiation): long-header Initial (`0xC0..`)
+/// - **1-RTT** (S1, Handshake Initiation): short-header 1-RTT (`0x40..0x7F`)
 /// - **Handshake** (S2/S3, Handshake Response / Cookie Reply): long-header
 ///   Handshake (`0xE0..`)
 /// - **1-RTT** (S4, Transport Data): short-header 1-RTT (`0x40..0x7F`)
 ///
-/// Using the correct header form for each phase prevents DPI systems from
-/// detecting the anomaly of seeing Initial-epoch long-headers throughout the
-/// lifetime of a connection.
+/// S1 uses 1-RTT rather than Initial because QUIC Initial datagrams carry a
+/// mandatory >=1200-byte minimum (RFC 9000 §14.1) that cannot be met within
+/// the fixed `S1+148` AWG wire size without changing the shared framing
+/// contract.  1-RTT short headers have no size minimum and are the dominant
+/// packet type in any established QUIC session, so they are indistinguishable
+/// from normal data traffic.
 pub fn apply_quic_padding_typed(
     data: &mut [u8],
     pad_size: usize,
@@ -60,11 +63,16 @@ pub fn apply_quic_padding_typed(
         return;
     }
     match pkt_type {
-        AwgPacketType::HandshakeInit => apply_quic_padding_initial(data, pad_size),
+        // S1 (HandshakeInit) uses 1-RTT short header, not Initial long-header.
+        // QUIC Initial requires >=1200-byte datagrams (RFC 9000 §14.1) which
+        // cannot be satisfied within the fixed S1+148 AWG wire size.  1-RTT
+        // short headers carry no size minimum and dominate real QUIC sessions.
+        AwgPacketType::HandshakeInit | AwgPacketType::TransportData => {
+            apply_quic_padding_short(data, pad_size)
+        }
         AwgPacketType::HandshakeResponse | AwgPacketType::CookieReply => {
             apply_quic_padding_handshake(data, pad_size)
         }
-        AwgPacketType::TransportData => apply_quic_padding_short(data, pad_size),
     }
 }
 
@@ -664,15 +672,10 @@ mod tests {
         let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic);
         assert!(result);
 
-        // Prefix padding (first 10 bytes): long-header Initial first byte
-        assert_eq!(pkt[0] & 0xC0, 0xC0);
-        assert_eq!(pkt[0] & 0x30, 0x00);
-        // Reserved bits must be cleared
-        assert_eq!(pkt[0] & 0x0C, 0x00);
-        // Bytes 1..5 must be QUIC v1
-        assert_eq!(&pkt[1..5], &[0x00, 0x00, 0x00, 0x01]);
-        // Byte 5 carries DCID length in the realistic range
-        assert!((4..=20).contains(&pkt[5]));
+        // Prefix padding (first 10 bytes): 1-RTT short header (form=0, fixed=1)
+        assert_eq!(pkt[0] & 0xC0, 0x40, "HandshakeInit must use 1-RTT short header");
+        // Reserved bits must be cleared (RFC 9000 §17.3)
+        assert_eq!(pkt[0] & 0x18, 0x00, "reserved bits cleared");
         // Header should be untouched
         assert_eq!(&pkt[10..14], &150u32.to_le_bytes());
         // Body should be untouched
