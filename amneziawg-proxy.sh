@@ -19,24 +19,10 @@
 
 set -euo pipefail
 
-# To avoid privilege-escalation via environment injection, overrides are ignored when EUID=0.
-readonly DEFAULT_REPO_URL="https://github.com/wiresock/amneziawg-install.git"
-readonly DEFAULT_REPO_REF="main"
-
-_AWG_IS_ROOT=1
-if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    _AWG_IS_ROOT=0
-fi
-
-if [[ "${_AWG_IS_ROOT}" -eq 0 ]]; then
-    # Non-root: honor environment overrides for pinning.
-    readonly REPO_URL="${REPO_URL:-${DEFAULT_REPO_URL}}"
-    readonly REPO_REF="${REPO_REF:-${DEFAULT_REPO_REF}}"
-else
-    # Root: ignore environment overrides to avoid cloning arbitrary code as root.
-    readonly REPO_URL="${DEFAULT_REPO_URL}"
-    readonly REPO_REF="${DEFAULT_REPO_REF}"
-fi
+# This script always requires root; env overrides are never honored to prevent
+# privilege-escalation via environment injection.
+readonly REPO_URL="https://github.com/wiresock/amneziawg-install.git"
+readonly REPO_REF="main"
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SCRIPTS_DIR="${SCRIPT_DIR}/amneziawg-proxy/scripts"
@@ -75,10 +61,6 @@ detect_package_manager() {
 # Attempt to install git after prompting the user for confirmation.
 # Skips silently (returns 1) when not root or not on a TTY.
 install_git() {
-    if [[ "${_AWG_IS_ROOT}" -eq 0 ]]; then
-        return 1
-    fi
-
     if ! detect_package_manager; then
         return 1
     fi
@@ -154,6 +136,12 @@ bootstrap_repo_if_needed() {
     SCRIPTS_DIR="${BOOTSTRAP_DIR}/amneziawg-proxy/scripts"
     INSTALLER="${SCRIPTS_DIR}/amneziawg-proxy-install.sh"
     UNINSTALLER="${SCRIPTS_DIR}/amneziawg-proxy-uninstall.sh"
+
+    if [[ ! -f "${INSTALLER}" ]] || [[ ! -f "${UNINSTALLER}" ]]; then
+        echo "ERROR: Cloned repository is missing required scripts in ${SCRIPTS_DIR}" >&2
+        echo "       The repository layout may have changed. Clone ${REPO_URL} manually." >&2
+        exit 1
+    fi
 }
 
 readonly SERVICE_NAME="amneziawg-proxy"
@@ -248,7 +236,9 @@ manage_menu() {
             ;;
         3)
             bootstrap_repo_if_needed "${INSTALLER}"
-            exec bash "${INSTALLER}"
+            local rc=0
+            bash "${INSTALLER}" || rc=$?
+            exit "${rc}"
             ;;
         4)
             bootstrap_repo_if_needed "${UNINSTALLER}"
@@ -290,7 +280,9 @@ manage_menu() {
                     ;;
             esac
 
-            exec bash "${UNINSTALLER}" "${uninstall_args[@]}"
+            local rc=0
+            bash "${UNINSTALLER}" "${uninstall_args[@]}" || rc=$?
+            exit "${rc}"
             ;;
         5)
             exit 0
@@ -308,5 +300,7 @@ if is_proxy_installed; then
     manage_menu "$@"
 else
     bootstrap_repo_if_needed "${INSTALLER}"
-    exec bash "${INSTALLER}" "$@"
+    rc=0
+    bash "${INSTALLER}" "$@" || rc=$?
+    exit "${rc}"
 fi
