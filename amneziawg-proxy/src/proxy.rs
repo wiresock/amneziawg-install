@@ -243,24 +243,55 @@ impl Proxy {
             metrics.record_in();
         }
 
-        // Check if this is a probe packet and respond if rate allows.
-        // Only respond to probes that match the configured protocol so the
-        // proxy does not appear to host multiple services on the same port.
-        //
-        // When AWG params are available, check first whether the incoming
-        // packet is actually AWG data whose S-padding prefix happens to look
-        // like the imitated protocol (e.g. WireSock `Ip=quic` rewrites the
-        // leading S-bytes with a QUIC long-header prologue).  Such packets
-        // must be forwarded as-is and never treated as external probes,
-        // otherwise the QUIC handshake responder fires and sends back real
-        // QUIC frames that the client tries — and fails — to decrypt as AWG.
+        // When AWG params are available, check whether the incoming packet is
+        // actually AWG data whose S-padding prefix happens to look like the
+        // imitated protocol (e.g. WireSock `Ip=quic` rewrites the leading
+        // S-bytes with a QUIC long-header prologue).  Such packets must be
+        // forwarded as-is and never treated as external probes, otherwise the
+        // QUIC handshake responder fires and sends back real QUIC frames that
+        // the client tries — and fails — to decrypt as AWG.
         let is_awg_packet = self
             .awg_params
             .as_deref()
             .is_some_and(|p| responder::classify_awg_packet(data, p).is_some());
 
-        let mut probe_response: Option<bytes::Bytes> = None;
         if !is_awg_packet {
+            self.handle_probe(data, client_addr, &metrics_ref).await;
+        }
+
+        // Forward to backend (and spawn relay task for new sessions)
+        match self.sessions.get_or_create(client_addr).await {
+            Ok((backend_sock, is_new)) => {
+                if is_new {
+                    self.spawn_session_relay(client_addr, Arc::clone(&backend_sock));
+                }
+                if let Err(e) = backend::forward_to_backend(&backend_sock, data).await {
+                    warn!(%client_addr, error = %e, "failed to forward to backend");
+                }
+            }
+            Err(e) => {
+                error!(%client_addr, error = %e, "failed to create session");
+                // Remove orphaned metrics entry — without a session, the
+                // cleanup task will never expire this client's metrics.
+                self.metrics.remove(&client_addr);
+                self.client_protocols.remove(&client_addr);
+            }
+        }
+    }
+
+    /// Check whether `data` is an external probe and send an appropriate
+    /// response if rate limits allow.
+    ///
+    /// Only responds to probes that match the configured protocol so the
+    /// proxy does not appear to host multiple services on the same port.
+    async fn handle_probe(
+        &self,
+        data: &[u8],
+        client_addr: SocketAddr,
+        metrics_ref: &Option<Arc<crate::metrics::ClientMetrics>>,
+    ) {
+        let mut probe_response: Option<bytes::Bytes> = None;
+
         if let Some(proto) = responder::detect_protocol(data) {
             let selected_proto = match self.fixed_protocol {
                 Some(fixed) if proto == fixed => Some(fixed),
@@ -340,7 +371,6 @@ impl Proxy {
             }
         }
 
-        // Send probe response (if any).
         if let Some(response) = probe_response {
             if let Err(e) = self.frontend.send_to(&response, client_addr).await {
                 warn!(%client_addr, error = %e, "failed to send probe response");
@@ -348,26 +378,6 @@ impl Proxy {
                 metrics.record_probe();
             }
             debug!(%client_addr, "probe response sent");
-        }
-        } // end !is_awg_packet
-
-        // Forward to backend (and spawn relay task for new sessions)
-        match self.sessions.get_or_create(client_addr).await {
-            Ok((backend_sock, is_new)) => {
-                if is_new {
-                    self.spawn_session_relay(client_addr, Arc::clone(&backend_sock));
-                }
-                if let Err(e) = backend::forward_to_backend(&backend_sock, data).await {
-                    warn!(%client_addr, error = %e, "failed to forward to backend");
-                }
-            }
-            Err(e) => {
-                error!(%client_addr, error = %e, "failed to create session");
-                // Remove orphaned metrics entry — without a session, the
-                // cleanup task will never expire this client's metrics.
-                self.metrics.remove(&client_addr);
-                self.client_protocols.remove(&client_addr);
-            }
         }
     }
 
@@ -653,6 +663,119 @@ mod tests {
             .await
             .expect("proxy should shut down within 5s")
             .unwrap();
+    }
+
+    /// Build an AWG transport-data packet whose S4-padding prefix looks like a
+    /// QUIC long-header Initial (mirroring what WireSock emits with `Ip=quic`).
+    ///
+    /// Layout: [S4 bytes of QUIC-like padding] ++ [H4 header LE u32] ++ [body]
+    fn awg_quic_masked_transport_packet(params: &crate::config::AwgParams) -> Vec<u8> {
+        let s4 = params.s4 as usize;
+        let h4_value = params.h4.min; // any value in range
+        // S4 padding that passes detect_protocol's QUIC heuristic:
+        //   byte 0: 0xC0 (long-header form + fixed bit, Initial type, PN len 0)
+        //   bytes 1-4: 0x00000001 (QUIC v1)
+        //   byte 5: DCID length = 8 (valid: 4..=20)
+        //   bytes 6..14: DCID bytes
+        //   byte 14: SCID length = 0
+        //   bytes 15..: fill to reach s4
+        let mut pkt = vec![0u8; s4];
+        if s4 >= 1 { pkt[0] = 0xC0; }
+        if s4 >= 5 { pkt[1] = 0x00; pkt[2] = 0x00; pkt[3] = 0x00; pkt[4] = 0x01; }
+        if s4 >= 6 { pkt[5] = 8; } // DCID len
+        // bytes 6..14: DCID (arbitrary non-zero)
+        for i in 6..std::cmp::min(14, s4) { pkt[i] = 0xAB; }
+        if s4 > 14 { pkt[14] = 0; } // SCID len = 0
+        // Append H4 header (LE u32) then body to meet TransportData minimum size.
+        pkt.extend_from_slice(&h4_value.to_le_bytes());
+        // Body: needs at least WG_TRANSPORT_DATA_MIN_SIZE (32) bytes after s4.
+        pkt.extend(std::iter::repeat(0xBBu8).take(32));
+        pkt
+    }
+
+    #[tokio::test]
+    async fn awg_packet_not_treated_as_probe() {
+        use crate::config::HRange;
+
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        // AWG params matching the user's config: S4=40, H4 range such that the
+        // H4 header at offset 40 is unmistakably classified as TransportData.
+        let awg_params = crate::config::AwgParams {
+            jc: 8,
+            jmin: 50,
+            jmax: 1000,
+            s1: 72,
+            s2: 142,
+            s3: 59,
+            s4: 40,
+            h1: HRange { min: 102_875_432, max: 202_875_431 },
+            h2: HRange { min: 728_639_326, max: 828_639_325 },
+            h3: HRange { min: 1_469_276_895, max: 1_569_276_894 },
+            h4: HRange { min: 2_037_058_179, max: 2_137_058_178 },
+        };
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec: 16,
+            imitate_protocol: "auto".into(),
+            quic_handshake_enabled: true,
+            quic_certificate_domain: "cloudflare.com".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            awg_config: None,
+        };
+
+        let proxy = Proxy::bind(config, Some(awg_params.clone())).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        // Build a transport-data packet whose S4 prefix looks like QUIC.
+        let pkt = awg_quic_masked_transport_packet(&awg_params);
+
+        // Verify the packet is classified as AWG (precondition for the test).
+        assert!(
+            responder::classify_awg_packet(&pkt, &awg_params).is_some(),
+            "test packet must be classified as AWG"
+        );
+        // And that it would fool detect_protocol into thinking it's QUIC
+        // (this is exactly the bug scenario).
+        assert_eq!(
+            responder::detect_protocol(&pkt),
+            Some(responder::Protocol::Quic),
+            "test packet S4-prefix must look like QUIC to detect_protocol"
+        );
+
+        // Send the packet through handle_client_packet.
+        proxy.handle_client_packet(&pkt, client_addr).await;
+
+        // No probe response should arrive at the client socket.
+        let mut buf = [0u8; 4096];
+        let probe_response =
+            tokio::time::timeout(Duration::from_millis(150), client.recv_from(&mut buf)).await;
+        assert!(
+            probe_response.is_err(),
+            "AWG-classified packet must not produce a probe response (got one from {proxy_addr})"
+        );
+
+        // The packet must still be forwarded to the backend.
+        let backend_recv =
+            tokio::time::timeout(Duration::from_millis(500), backend.recv_from(&mut buf)).await;
+        assert!(
+            backend_recv.is_ok(),
+            "AWG-classified packet must be forwarded to the backend"
+        );
+        let (n, _) = backend_recv.unwrap().unwrap();
+        assert_eq!(&buf[..n], &pkt, "forwarded packet must be byte-identical");
     }
 
     #[tokio::test]
