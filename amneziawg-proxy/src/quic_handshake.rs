@@ -139,6 +139,7 @@ impl QuicHandshakeResponder {
         let mut rustls_server_cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(resolver);
+        rustls_server_cfg.alpn_protocols = vec![b"h3".to_vec()];
         rustls_server_cfg.max_early_data_size = 0;
 
         let quic_crypto = QuicServerConfig::try_from(rustls_server_cfg)
@@ -309,5 +310,24 @@ impl QuicHandshakeResponder {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_responder_accepts_h3_alpn_without_error() {
+        QuicHandshakeResponder::new("example.com")
+            .expect("QuicHandshakeResponder::new must succeed with h3 ALPN configured");
+    }
+
+    #[test]
+    fn empty_datagram_produces_no_response() {
+        let mut r = QuicHandshakeResponder::new("example.com").unwrap();
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let responses = r.handle_datagram(addr, &[]);
+        assert!(responses.is_empty(), "empty datagram must produce no response");
     }
 }
