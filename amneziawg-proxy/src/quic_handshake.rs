@@ -500,12 +500,7 @@ mod tests {
         buf[..tx.size].to_vec()
     }
 
-    /// A CONNECTION_CLOSE-only server flight (produced when ALPN is missing) is
-    /// small: one Initial packet with a single CRYPTO frame containing the TLS
-    /// alert, typically well under 200 bytes. A successful server Handshake
-    /// flight includes Certificate + CertificateVerify + Finished and is always
-    /// much larger — in practice 1–4 KB. We use 500 bytes as a conservative
-    /// threshold: anything above that cannot be a CONNECTION_CLOSE-only response.
+    /// Sum the payload bytes across all responses in a server flight.
     fn total_response_bytes(responses: &[QuicResponse]) -> usize {
         responses.iter().map(|r| r.payload.len()).sum()
     }
