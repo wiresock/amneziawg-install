@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -124,6 +124,11 @@ pub struct QuicHandshakeResponder {
     connections: HashMap<ConnectionHandle, Connection>,
     conn_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
     active_remotes: HashMap<SocketAddr, usize>,
+    /// Connections that should be silently dropped after their first transmit
+    /// burst is collected.  Prevents quinn-proto loss-recovery timers from
+    /// retransmitting the Handshake flight mid-session — the proxy only needs
+    /// to emit the server Certificate flight; it never completes the handshake.
+    flush_and_forget: HashSet<ConnectionHandle>,
 }
 
 pub struct QuicResponse {
@@ -158,6 +163,7 @@ impl QuicHandshakeResponder {
             connections: HashMap::new(),
             conn_events: HashMap::new(),
             active_remotes: HashMap::new(),
+            flush_and_forget: HashSet::new(),
         })
     }
 
@@ -223,6 +229,13 @@ impl QuicHandshakeResponder {
                         }
                         self.connections.insert(ch, conn);
                         *self.active_remotes.entry(remote).or_insert(0) += 1;
+                        // Mark for silent eviction after the first transmit burst.
+                        // The proxy only needs to emit the Certificate flight; it
+                        // never receives a client Finished, so leaving the connection
+                        // alive would cause quinn-proto to retransmit the Handshake
+                        // epoch at ~1s/2s/5s intervals — visible as spurious
+                        // mid-session Initial/Handshake packets on the wire.
+                        self.flush_and_forget.insert(ch);
                     }
                 } else if !buf.is_empty() {
                     out.push(QuicResponse {
@@ -304,6 +317,38 @@ impl QuicHandshakeResponder {
                     made_progress = true;
                 }
                 self.conn_events.remove(&ch);
+                self.flush_and_forget.remove(&ch);
+            }
+
+            // Silently evict flush-and-forget connections once they have
+            // produced at least one transmit in this drive() iteration.
+            // We check after processing all events so the full Initial +
+            // Handshake coalesced flight is included in `out` before removal.
+            let forget: Vec<ConnectionHandle> = self
+                .flush_and_forget
+                .iter()
+                .copied()
+                .filter(|ch| self.connections.contains_key(ch))
+                .collect();
+            for ch in forget {
+                // Only evict once the connection has actually transmitted something
+                // (i.e., out grew since we entered drive). Evicting too early would
+                // drop the Certificate flight entirely.
+                if made_progress {
+                    if let Some(conn) = self.connections.remove(&ch) {
+                        let remote = conn.remote_address();
+                        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                            self.active_remotes.entry(remote)
+                        {
+                            *entry.get_mut() -= 1;
+                            if *entry.get() == 0 {
+                                entry.remove();
+                            }
+                        }
+                    }
+                    self.conn_events.remove(&ch);
+                    self.flush_and_forget.remove(&ch);
+                }
             }
 
             if !made_progress {
