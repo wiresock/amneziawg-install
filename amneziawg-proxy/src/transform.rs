@@ -254,37 +254,103 @@ fn fnv1a_seed(payload: &[u8]) -> u32 {
     state
 }
 
-/// DNS-style padding: minimal DNS response header followed by zero padding.
+/// DNS-style padding: a realistic DNS response where a `TYPE NULL` answer RR
+/// accounts for every byte of the UDP datagram after the 28-byte fixed prefix.
+/// When `pad_size >= 28` the full structure is written and no bytes fall outside
+/// the DNS message.  For smaller `pad_size`, only the leading bytes that fit are
+/// written (header requires 12 B; question 17 B total; answer prefix 28 B total);
+/// bytes beyond the last complete section are zero-filled.
 ///
-/// Creates a plausible DNS response structure:
-/// - Transaction ID derived from the packet payload (which follows the padding)
-/// - Standard response flags (QR=1, RA=1, RCODE=NOERROR); RD is left clear
-///   because this is padding filler, not an echo of a real client query.
-/// - Remaining bytes are zero-filled for generic padding
+/// Layout:
+///
+/// ```text
+/// Bytes 0..pad_size (rewritten):  [ Header 12 B ][ Question 5 B ][ Ans prefix 11 B ][ zero-fill ]
+/// Bytes pad_size..total (intact): [ encrypted AWG payload ]
+///                                  ^--- all covered by NULL RR RDLENGTH = total_len - 28
+/// ```
+///
+/// - **Header** (12 B): TXID derived from payload bytes 0-1; flags `QR=1, RA=1, RCODE=NOERROR`.
+///   `QDCOUNT`/`ANCOUNT` are set to 1 only when the corresponding section fully fits within `pad_size`.
+/// - **Question** (5 B): root-label QNAME `0x00` + `QTYPE A (1)` + `QCLASS IN (1)`.
+/// - **Answer fixed prefix** (11 B): root-label NAME + `TYPE NULL (10)` +
+///   `CLASS IN` + `TTL 60` + `RDLENGTH` = `data.len() - 28` (big-endian u16).
+///   `TYPE NULL` (RFC 1035 §3.3.10) carries opaque RDATA of any length, so
+///   the entire remainder of the UDP datagram — padding zero-fill *and* the
+///   untouched AWG payload — is accounted for as RDATA with no trailing bytes
+///   outside the DNS message.
+///
+/// Only sections that physically fit within `pad_size` are advertised:
+/// - `QDCOUNT=1` only when `pad_size >= 17` (header 12 B + question 5 B)
+/// - `ANCOUNT=1` only when `pad_size >= 28` (+ answer prefix 11 B)
+///
+/// This prevents parsers from being told about a section whose bytes are
+/// absent, which would cause them to interpret AWG payload as DNS data.
+/// Returns immediately when `pad_size == 0`.
 fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
+    let total_len = data.len();
     let (padding, payload) = data.split_at_mut(pad_size);
     if padding.is_empty() {
         return;
     }
 
-    // Derive transaction ID from first two payload bytes (H header)
+    // Transaction ID derived from first two payload bytes.
     let tx_hi = payload.first().copied().unwrap_or(0);
     let tx_lo = payload.get(1).copied().unwrap_or(0);
 
-    // DNS response header (12 bytes)
-    let header: [u8; 12] = [
-        tx_hi, tx_lo, // Transaction ID
-        0x80, 0x80, // Flags: QR=1, RA=1, RCODE=NOERROR (RD not set — no query to echo)
-        0x00, 0x00, // QDCOUNT = 0 (no question section emitted)
-        0x00, 0x00, // ANCOUNT = 0
-        0x00, 0x00, // NSCOUNT = 0
-        0x00, 0x00, // ARCOUNT = 0 (no additional records emitted)
+    // Only advertise sections that actually fit within pad_size.
+    let qdcount: u8 = if pad_size >= 17 { 1 } else { 0 };
+    let ancount: u8 = if pad_size >= 28 { 1 } else { 0 };
+
+    // RDLENGTH spans the rest of the *entire* datagram after the 28-byte fixed
+    // prefix — covering both the zero-filled padding tail (bytes 28..pad_size)
+    // and the untouched AWG payload (bytes pad_size..total_len).  This ensures
+    // every byte in the UDP packet is inside the NULL RR's RDATA field so no
+    // trailing bytes are left for a DNS dissector to flag as extraneous.
+    // Saturates to 0 when total_len < 28; in that case ANCOUNT is also 0
+    // so the RDLENGTH field is never reached by a parser anyway.
+    let rdlength: u16 = total_len.saturating_sub(28).min(u16::MAX as usize) as u16;
+    let [rl_hi, rl_lo] = rdlength.to_be_bytes();
+
+    // Fixed DNS structure: 28 bytes (header 12 + question 5 + answer-prefix 11).
+    // Any byte beyond index 27 is RDATA (zero-filled below) and is consumed by
+    // the parser as part of the NULL RR — no trailing extraneous bytes.
+    #[rustfmt::skip]
+    let fixed: [u8; 28] = [
+        // Header (12 bytes)
+        tx_hi, tx_lo,           // Transaction ID
+        0x80, 0x80,             // Flags: QR=1, opcode=0, RA=1, RCODE=NOERROR
+        0x00, qdcount,          // QDCOUNT: 1 iff pad_size >= 17
+        0x00, ancount,          // ANCOUNT: 1 iff pad_size >= 28
+        0x00, 0x00,             // NSCOUNT = 0
+        0x00, 0x00,             // ARCOUNT = 0
+        // Question section (5 bytes; present only when pad_size >= 17)
+        0x00,                   // QNAME: root label (empty = ".")
+        0x00, 0x01,             // QTYPE  = A (1)
+        0x00, 0x01,             // QCLASS = IN (1)
+        // Answer fixed prefix (11 bytes; present only when pad_size >= 28)
+        0x00,                   // NAME: root label
+        0x00, 0x0a,             // TYPE  = NULL (10) — opaque RDATA, any length
+        0x00, 0x01,             // CLASS = IN
+        0x00, 0x00, 0x00, 0x3c, // TTL = 60 seconds
+        rl_hi, rl_lo,           // RDLENGTH = total_len - 28 (covers padding tail + AWG payload)
     ];
 
-    let copy_len = std::cmp::min(padding.len(), header.len());
-    padding[..copy_len].copy_from_slice(&header[..copy_len]);
+    // Only copy the bytes that belong to advertised sections; zero-fill the rest
+    // so no partial-section bytes appear beyond the last advertised boundary.
+    // This prevents dissectors from finding Question/Answer bytes when the
+    // corresponding count field is 0.
+    let advertised_len: usize = if pad_size >= 28 {
+        28 // full fixed structure
+    } else if pad_size >= 17 {
+        17 // header + question only
+    } else {
+        12 // header only
+    };
+    let copy_len = std::cmp::min(padding.len(), advertised_len);
+    padding[..copy_len].copy_from_slice(&fixed[..copy_len]);
 
-    // Rest: zero-fill (generic padding content)
+    // Zero-fill bytes beyond the last advertised section boundary.
+    // Bytes 28..pad_size are NULL RR RDATA (covered by RDLENGTH).
     for byte in padding[copy_len..].iter_mut() {
         *byte = 0x00;
     }
@@ -441,43 +507,85 @@ mod tests {
 
     #[test]
     fn dns_padding_has_response_header() {
-        // 20 bytes padding prefix + 4 bytes payload
-        let mut data = vec![0x00; 24];
-        data[20..24].copy_from_slice(&[0xBB, 0xBB, 0xBB, 0xBB]);
-        let pad_size = 20;
+        // pad_size=40, data.len()=46: RDLENGTH = data.len()-28 = 18 (0x12),
+        // covering the zero-fill tail (bytes 28..40) + payload (bytes 40..46).
+        let mut data = vec![0x00; 46];
+        data[40..46].copy_from_slice(&[0xBB, 0xCC, 0x01, 0x02, 0x03, 0x04]);
+        let pad_size = 40;
         apply_padding(&mut data, pad_size, Protocol::Dns);
 
-        // DNS response header: TX ID derived from payload bytes
-        assert_eq!(data[0], 0xBB); // tx_hi from payload[0]
-        assert_eq!(data[1], 0xBB); // tx_lo from payload[1]
-                                   // Flags: QR=1 (high bit of flags byte)
+        // Header: TX ID derived from payload bytes 0-1
+        assert_eq!(data[0], 0xBB, "tx_hi from payload[0]");
+        assert_eq!(data[1], 0xCC, "tx_lo from payload[1]");
+        // Flags: QR=1, RA=1, RCODE=NOERROR
         assert_eq!(data[2] & 0x80, 0x80, "DNS QR bit should be set");
-        assert_eq!(data[2], 0x80); // QR=1, RD=0 (no query to echo)
-        assert_eq!(data[3], 0x80); // RA=1
-                                   // QDCOUNT = 0
-        assert_eq!(data[4], 0x00);
-        assert_eq!(data[5], 0x00);
-        // After header (12 bytes), rest of padding should be zeros
-        assert!(data[12..20].iter().all(|&b| b == 0x00));
+        assert_eq!(data[2], 0x80);
+        assert_eq!(data[3], 0x80, "RA=1");
+        // QDCOUNT=1, ANCOUNT=1
+        assert_eq!(&data[4..6], &[0x00, 0x01], "QDCOUNT should be 1");
+        assert_eq!(&data[6..8], &[0x00, 0x01], "ANCOUNT should be 1");
+        // Question section: root label + QTYPE A + QCLASS IN
+        assert_eq!(data[12], 0x00, "QNAME root label");
+        assert_eq!(&data[13..15], &[0x00, 0x01], "QTYPE A");
+        assert_eq!(&data[15..17], &[0x00, 0x01], "QCLASS IN");
+        // Answer fixed prefix: root label + TYPE NULL(10) + CLASS IN + TTL 60
+        assert_eq!(data[17], 0x00, "answer NAME root label");
+        assert_eq!(&data[18..20], &[0x00, 0x0a], "answer TYPE NULL(10)");
+        assert_eq!(&data[20..22], &[0x00, 0x01], "answer CLASS IN");
+        assert_eq!(&data[22..26], &[0x00, 0x00, 0x00, 0x3c], "TTL 60s");
+        // RDLENGTH = data.len() - 28 = 46 - 28 = 18, covers zero-fill tail + payload
+        assert_eq!(&data[26..28], &[0x00, 0x12], "RDLENGTH = 18");
+        // RDATA (bytes 28..40): zero-filled — inside NULL RR, not extraneous
+        assert!(data[28..40].iter().all(|&b| b == 0x00), "RDATA zero-filled");
         // Payload untouched
-        assert!(data[20..24].iter().all(|&b| b == 0xBB));
+        assert_eq!(&data[40..46], &[0xBB, 0xCC, 0x01, 0x02, 0x03, 0x04]);
     }
 
     #[test]
     fn dns_padding_short_fills_partial_header() {
-        // Only 5 bytes of padding prefix — should fill what fits from DNS header
+        // Only 5 bytes of padding prefix — partial DNS header (header is 12 bytes).
+        // data.len()=10 so total_len < 28; RDLENGTH saturates to 0.
         let mut data = vec![0x00; 10];
         data[5..10].copy_from_slice(&[0xCC, 0xCC, 0xCC, 0xCC, 0xCC]);
         let pad_size = 5;
         apply_padding(&mut data, pad_size, Protocol::Dns);
 
-        assert_eq!(data[0], 0xCC); // tx_hi from payload[0]
-        assert_eq!(data[1], 0xCC); // tx_lo from payload[1]
-        assert_eq!(data[2], 0x80); // flags high: QR=1, RD=0
-        assert_eq!(data[3], 0x80); // flags low: RA=1
-        assert_eq!(data[4], 0x00); // QDCOUNT high
-                                   // Payload untouched
+        assert_eq!(data[0], 0xCC, "tx_hi from payload[0]");
+        assert_eq!(data[1], 0xCC, "tx_lo from payload[1]");
+        assert_eq!(data[2], 0x80, "flags high: QR=1");
+        assert_eq!(data[3], 0x80, "flags low: RA=1");
+        assert_eq!(data[4], 0x00, "QDCOUNT high byte (partial — only 5 bytes fit)");
+        // Payload untouched
         assert!(data[5..10].iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
+    fn dns_padding_question_only_no_answer() {
+        // pad_size=20: fits header (12 B) + question (5 B) = 17 B, but not the
+        // full answer prefix (28 B). Expect QDCOUNT=1, ANCOUNT=0, bytes 17..20
+        // zero-filled (no partial answer bytes), payload untouched.
+        let mut data = vec![0x00; 26]; // pad_size=20, payload=6 bytes
+        data[20..26].copy_from_slice(&[0xAA, 0xBB, 0x01, 0x02, 0x03, 0x04]);
+        let pad_size = 20;
+        apply_padding(&mut data, pad_size, Protocol::Dns);
+
+        // TXID from payload
+        assert_eq!(data[0], 0xAA, "tx_hi");
+        assert_eq!(data[1], 0xBB, "tx_lo");
+        // Flags
+        assert_eq!(data[2], 0x80, "QR=1");
+        assert_eq!(data[3], 0x80, "RA=1");
+        // QDCOUNT=1 (question fits), ANCOUNT=0 (answer prefix does not fit)
+        assert_eq!(&data[4..6], &[0x00, 0x01], "QDCOUNT=1");
+        assert_eq!(&data[6..8], &[0x00, 0x00], "ANCOUNT=0");
+        // Question section present
+        assert_eq!(data[12], 0x00, "QNAME root label");
+        assert_eq!(&data[13..15], &[0x00, 0x01], "QTYPE A");
+        assert_eq!(&data[15..17], &[0x00, 0x01], "QCLASS IN");
+        // Bytes 17..20: zero-filled (no partial answer bytes written)
+        assert!(data[17..20].iter().all(|&b| b == 0x00), "no partial answer bytes");
+        // Payload untouched
+        assert_eq!(&data[20..26], &[0xAA, 0xBB, 0x01, 0x02, 0x03, 0x04]);
     }
 
     // -- STUN padding tests --
@@ -708,22 +816,31 @@ mod tests {
 
     #[test]
     fn awg_transform_handshake_response_dns() {
-        let params = test_awg_params();
-        let padding_original = [0xFF; 8]; // S2 = 8
+        // Use S2=40 (>= 28) so the full DNS structure fits without overlapping
+        // the AWG header that starts at offset 40.
+        let params = AwgParams { s2: 40, ..test_awg_params() };
+        let padding_original = [0xFF; 40]; // S2 = 40
         let header = 350u32.to_le_bytes();
         let body = [0xDD; 92 - 4];
         let mut pkt = Vec::new();
         pkt.extend_from_slice(&padding_original);
         pkt.extend_from_slice(&header);
         pkt.extend_from_slice(&body);
-        assert_eq!(pkt.len(), 8 + 92);
+        assert_eq!(pkt.len(), 40 + 92);
 
         let result = apply_awg_transform(&mut pkt, &params, Protocol::Dns);
         assert!(result);
 
+        // DNS header
         assert_eq!(pkt[2] & 0x80, 0x80, "DNS QR=1");
-        assert_eq!(&pkt[8..12], &350u32.to_le_bytes());
-        assert!(pkt[12..8 + 92].iter().all(|&b| b == 0xDD));
+        assert_eq!(&pkt[4..6], &[0x00, 0x01], "DNS QDCOUNT=1");
+        assert_eq!(&pkt[6..8], &[0x00, 0x01], "DNS ANCOUNT=1");
+        // Answer TYPE=NULL(10) and RDLENGTH = data.len()-28 = 132-28 = 104 (0x68)
+        assert_eq!(&pkt[18..20], &[0x00, 0x0a], "DNS TYPE=NULL");
+        assert_eq!(&pkt[26..28], &[0x00, 0x68], "DNS RDLENGTH=104");
+        // AWG header and body start at offset 40, untouched
+        assert_eq!(&pkt[40..44], &350u32.to_le_bytes());
+        assert!(pkt[44..40 + 92].iter().all(|&b| b == 0xDD));
     }
 
     #[test]
