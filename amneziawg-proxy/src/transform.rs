@@ -257,11 +257,12 @@ fn fnv1a_seed(payload: &[u8]) -> u32 {
 /// DNS-style padding: a realistic DNS response that consumes the entire padding
 /// prefix with no bytes left outside the DNS message structure.
 ///
-/// Layout (total = `pad_size` bytes):
+/// Layout:
 ///
 /// ```text
-/// [ Header 12 B ][ Question 5 B ][ Answer fixed 11 B ][ RDATA (data.len()-28) B ]
-///  <-------------- pad_size bytes (rewritten) ----------->< AWG payload (untouched) >
+/// Bytes 0..pad_size (rewritten):  [ Header 12 B ][ Question 5 B ][ Ans prefix 11 B ][ zero-fill ]
+/// Bytes pad_size..total (intact): [ encrypted AWG payload ]
+///                                  ^--- all covered by NULL RR RDLENGTH = total_len - 28
 /// ```
 ///
 /// - **Header** (12 B): `QR=1, RA=1, RCODE=NOERROR, QDCOUNT=1, ANCOUNT=1`.
@@ -326,14 +327,25 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
         0x00, 0x0a,             // TYPE  = NULL (10) — opaque RDATA, any length
         0x00, 0x01,             // CLASS = IN
         0x00, 0x00, 0x00, 0x3c, // TTL = 60 seconds
-        rl_hi, rl_lo,           // RDLENGTH = pad_size - 28 (consumes rest of padding)
+        rl_hi, rl_lo,           // RDLENGTH = total_len - 28 (covers padding tail + AWG payload)
     ];
 
-    let copy_len = std::cmp::min(padding.len(), fixed.len());
+    // Only copy the bytes that belong to advertised sections; zero-fill the rest
+    // so no partial-section bytes appear beyond the last advertised boundary.
+    // This prevents dissectors from finding Question/Answer bytes when the
+    // corresponding count field is 0.
+    let advertised_len: usize = if pad_size >= 28 {
+        28 // full fixed structure
+    } else if pad_size >= 17 {
+        17 // header + question only
+    } else {
+        12 // header only
+    };
+    let copy_len = std::cmp::min(padding.len(), advertised_len);
     padding[..copy_len].copy_from_slice(&fixed[..copy_len]);
 
-    // RDATA: zero-fill the rest of the padding (bytes 28..pad_size).
-    // These bytes are inside the NULL RR's RDATA field — not extraneous.
+    // Zero-fill bytes beyond the last advertised section boundary.
+    // Bytes 28..pad_size are NULL RR RDATA (covered by RDLENGTH).
     for byte in padding[copy_len..].iter_mut() {
         *byte = 0x00;
     }
@@ -515,7 +527,7 @@ mod tests {
         assert_eq!(&data[18..20], &[0x00, 0x0a], "answer TYPE NULL(10)");
         assert_eq!(&data[20..22], &[0x00, 0x01], "answer CLASS IN");
         assert_eq!(&data[22..26], &[0x00, 0x00, 0x00, 0x3c], "TTL 60s");
-        // RDLENGTH = data.len() - 28 = 46 - 28 = 18, covering padding tail + payload
+        // RDLENGTH = data.len() - 28 = 46 - 28 = 18, covers zero-fill tail + payload
         assert_eq!(&data[26..28], &[0x00, 0x12], "RDLENGTH = 18");
         // RDATA (bytes 28..40): zero-filled — inside NULL RR, not extraneous
         assert!(data[28..40].iter().all(|&b| b == 0x00), "RDATA zero-filled");
