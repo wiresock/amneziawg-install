@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn dns_padding_short_fills_partial_header() {
         // Only 5 bytes of padding prefix — partial DNS header (header is 12 bytes).
-        // RDLENGTH saturates to 0 (pad_size 5 < 28).
+        // data.len()=10 so total_len < 28; RDLENGTH saturates to 0.
         let mut data = vec![0x00; 10];
         data[5..10].copy_from_slice(&[0xCC, 0xCC, 0xCC, 0xCC, 0xCC]);
         let pad_size = 5;
@@ -557,6 +557,35 @@ mod tests {
         assert_eq!(data[4], 0x00, "QDCOUNT high byte (partial — only 5 bytes fit)");
         // Payload untouched
         assert!(data[5..10].iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
+    fn dns_padding_question_only_no_answer() {
+        // pad_size=20: fits header (12 B) + question (5 B) = 17 B, but not the
+        // full answer prefix (28 B). Expect QDCOUNT=1, ANCOUNT=0, bytes 17..20
+        // zero-filled (no partial answer bytes), payload untouched.
+        let mut data = vec![0x00; 26]; // pad_size=20, payload=6 bytes
+        data[20..26].copy_from_slice(&[0xAA, 0xBB, 0x01, 0x02, 0x03, 0x04]);
+        let pad_size = 20;
+        apply_padding(&mut data, pad_size, Protocol::Dns);
+
+        // TXID from payload
+        assert_eq!(data[0], 0xAA, "tx_hi");
+        assert_eq!(data[1], 0xBB, "tx_lo");
+        // Flags
+        assert_eq!(data[2], 0x80, "QR=1");
+        assert_eq!(data[3], 0x80, "RA=1");
+        // QDCOUNT=1 (question fits), ANCOUNT=0 (answer prefix does not fit)
+        assert_eq!(&data[4..6], &[0x00, 0x01], "QDCOUNT=1");
+        assert_eq!(&data[6..8], &[0x00, 0x00], "ANCOUNT=0");
+        // Question section present
+        assert_eq!(data[12], 0x00, "QNAME root label");
+        assert_eq!(&data[13..15], &[0x00, 0x01], "QTYPE A");
+        assert_eq!(&data[15..17], &[0x00, 0x01], "QCLASS IN");
+        // Bytes 17..20: zero-filled (no partial answer bytes written)
+        assert!(data[17..20].iter().all(|&b| b == 0x00), "no partial answer bytes");
+        // Payload untouched
+        assert_eq!(&data[20..26], &[0xAA, 0xBB, 0x01, 0x02, 0x03, 0x04]);
     }
 
     // -- STUN padding tests --
