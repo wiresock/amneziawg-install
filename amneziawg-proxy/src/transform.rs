@@ -257,8 +257,9 @@ fn fnv1a_seed(payload: &[u8]) -> u32 {
 /// DNS-style padding: a realistic DNS response where a `TYPE NULL` answer RR
 /// accounts for every byte of the UDP datagram after the 28-byte fixed prefix.
 /// When `pad_size >= 28` the full structure is written and no bytes fall outside
-/// the DNS message.  For smaller `pad_size` only the header (and optionally the
-/// question) is emitted; those sections are still individually well-formed.
+/// the DNS message.  For smaller `pad_size`, only the leading bytes that fit are
+/// written (header requires 12 B; question 17 B total; answer prefix 28 B total);
+/// bytes beyond the last complete section are zero-filled.
 ///
 /// Layout:
 ///
@@ -268,8 +269,8 @@ fn fnv1a_seed(payload: &[u8]) -> u32 {
 ///                                  ^--- all covered by NULL RR RDLENGTH = total_len - 28
 /// ```
 ///
-/// - **Header** (12 B): `QR=1, RA=1, RCODE=NOERROR, QDCOUNT=1, ANCOUNT=1`.
-///   Transaction ID derived from the first two payload bytes.
+/// - **Header** (12 B): TXID derived from payload bytes 0-1; flags `QR=1, RA=1, RCODE=NOERROR`.
+///   `QDCOUNT`/`ANCOUNT` are set to 1 only when the corresponding section fully fits within `pad_size`.
 /// - **Question** (5 B): root-label QNAME `0x00` + `QTYPE A (1)` + `QCLASS IN (1)`.
 /// - **Answer fixed prefix** (11 B): root-label NAME + `TYPE NULL (10)` +
 ///   `CLASS IN` + `TTL 60` + `RDLENGTH` = `data.len() - 28` (big-endian u16).
