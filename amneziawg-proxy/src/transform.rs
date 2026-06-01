@@ -260,16 +260,19 @@ fn fnv1a_seed(payload: &[u8]) -> u32 {
 /// Layout (total = `pad_size` bytes):
 ///
 /// ```text
-/// [ Header 12 B ][ Question 5 B ][ Answer fixed 11 B ][ RDATA (pad_size-28) B ]
+/// [ Header 12 B ][ Question 5 B ][ Answer fixed 11 B ][ RDATA (data.len()-28) B ]
+///  <-------------- pad_size bytes (rewritten) ----------->< AWG payload (untouched) >
 /// ```
 ///
 /// - **Header** (12 B): `QR=1, RA=1, RCODE=NOERROR, QDCOUNT=1, ANCOUNT=1`.
 ///   Transaction ID derived from the first two payload bytes.
 /// - **Question** (5 B): root-label QNAME `0x00` + `QTYPE A (1)` + `QCLASS IN (1)`.
 /// - **Answer fixed prefix** (11 B): root-label NAME + `TYPE NULL (10)` +
-///   `CLASS IN` + `TTL 60` + `RDLENGTH` = `pad_size - 28` (big-endian u16).
+///   `CLASS IN` + `TTL 60` + `RDLENGTH` = `data.len() - 28` (big-endian u16).
 ///   `TYPE NULL` (RFC 1035 §3.3.10) carries opaque RDATA of any length, so
-///   the remaining `pad_size - 28` zero bytes are fully accounted for as RDATA.
+///   the entire remainder of the UDP datagram — padding zero-fill *and* the
+///   untouched AWG payload — is accounted for as RDATA with no trailing bytes
+///   outside the DNS message.
 ///
 /// Only sections that physically fit within `pad_size` are advertised:
 /// - `QDCOUNT=1` only when `pad_size >= 17` (header 12 B + question 5 B)
@@ -279,6 +282,7 @@ fn fnv1a_seed(payload: &[u8]) -> u32 {
 /// absent, which would cause them to interpret AWG payload as DNS data.
 /// Returns immediately when `pad_size == 0`.
 fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
+    let total_len = data.len();
     let (padding, payload) = data.split_at_mut(pad_size);
     if padding.is_empty() {
         return;
@@ -292,9 +296,13 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
     let qdcount: u8 = if pad_size >= 17 { 1 } else { 0 };
     let ancount: u8 = if pad_size >= 28 { 1 } else { 0 };
 
-    // RDLENGTH = bytes remaining after the 28-byte fixed prefix.
-    // Saturates to 0 when pad_size < 28 (ANCOUNT is 0 in that case).
-    let rdlength: u16 = pad_size.saturating_sub(28).min(u16::MAX as usize) as u16;
+    // RDLENGTH spans the rest of the *entire* datagram after the 28-byte fixed
+    // prefix — covering both the zero-filled padding tail (bytes 28..pad_size)
+    // and the untouched AWG payload (bytes pad_size..total_len).  This ensures
+    // every byte in the UDP packet is inside the NULL RR's RDATA field so no
+    // trailing bytes are left for a DNS dissector to flag as extraneous.
+    // Saturates to 0 when total_len < 28 (ANCOUNT is 0 in that case).
+    let rdlength: u16 = total_len.saturating_sub(28).min(u16::MAX as usize) as u16;
     let [rl_hi, rl_lo] = rdlength.to_be_bytes();
 
     // Fixed DNS structure: 28 bytes (header 12 + question 5 + answer-prefix 11).
@@ -507,8 +515,8 @@ mod tests {
         assert_eq!(&data[18..20], &[0x00, 0x0a], "answer TYPE NULL(10)");
         assert_eq!(&data[20..22], &[0x00, 0x01], "answer CLASS IN");
         assert_eq!(&data[22..26], &[0x00, 0x00, 0x00, 0x3c], "TTL 60s");
-        // RDLENGTH = pad_size - 28 = 12, consuming remaining padding as RDATA
-        assert_eq!(&data[26..28], &[0x00, 0x0c], "RDLENGTH = 12");
+        // RDLENGTH = data.len() - 28 = 46 - 28 = 18, covering padding tail + payload
+        assert_eq!(&data[26..28], &[0x00, 0x12], "RDLENGTH = 18");
         // RDATA (bytes 28..40): zero-filled — inside NULL RR, not extraneous
         assert!(data[28..40].iter().all(|&b| b == 0x00), "RDATA zero-filled");
         // Payload untouched
@@ -780,9 +788,9 @@ mod tests {
         assert_eq!(pkt[2] & 0x80, 0x80, "DNS QR=1");
         assert_eq!(&pkt[4..6], &[0x00, 0x01], "DNS QDCOUNT=1");
         assert_eq!(&pkt[6..8], &[0x00, 0x01], "DNS ANCOUNT=1");
-        // Answer TYPE=NULL(10) and RDLENGTH=12 (40-28)
+        // Answer TYPE=NULL(10) and RDLENGTH = data.len()-28 = 132-28 = 104 (0x68)
         assert_eq!(&pkt[18..20], &[0x00, 0x0a], "DNS TYPE=NULL");
-        assert_eq!(&pkt[26..28], &[0x00, 0x0c], "DNS RDLENGTH=12");
+        assert_eq!(&pkt[26..28], &[0x00, 0x68], "DNS RDLENGTH=104");
         // AWG header and body start at offset 40, untouched
         assert_eq!(&pkt[40..44], &350u32.to_le_bytes());
         assert!(pkt[44..40 + 92].iter().all(|&b| b == 0xDD));
