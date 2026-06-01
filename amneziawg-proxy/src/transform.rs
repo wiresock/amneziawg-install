@@ -254,8 +254,11 @@ fn fnv1a_seed(payload: &[u8]) -> u32 {
     state
 }
 
-/// DNS-style padding: a realistic DNS response that consumes the entire padding
-/// prefix with no bytes left outside the DNS message structure.
+/// DNS-style padding: a realistic DNS response where a `TYPE NULL` answer RR
+/// accounts for every byte of the UDP datagram after the 28-byte fixed prefix.
+/// When `pad_size >= 28` the full structure is written and no bytes fall outside
+/// the DNS message.  For smaller `pad_size` only the header (and optionally the
+/// question) is emitted; those sections are still individually well-formed.
 ///
 /// Layout:
 ///
@@ -302,7 +305,8 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
     // and the untouched AWG payload (bytes pad_size..total_len).  This ensures
     // every byte in the UDP packet is inside the NULL RR's RDATA field so no
     // trailing bytes are left for a DNS dissector to flag as extraneous.
-    // Saturates to 0 when total_len < 28 (ANCOUNT is 0 in that case).
+    // Saturates to 0 when total_len < 28; in that case ANCOUNT is also 0
+    // so the RDLENGTH field is never reached by a parser anyway.
     let rdlength: u16 = total_len.saturating_sub(28).min(u16::MAX as usize) as u16;
     let [rl_hi, rl_lo] = rdlength.to_be_bytes();
 
@@ -502,7 +506,8 @@ mod tests {
 
     #[test]
     fn dns_padding_has_response_header() {
-        // pad_size=40: RDLENGTH = 40-28 = 12, so entire padding is consumed as RDATA.
+        // pad_size=40, data.len()=46: RDLENGTH = data.len()-28 = 18 (0x12),
+        // covering the zero-fill tail (bytes 28..40) + payload (bytes 40..46).
         let mut data = vec![0x00; 46];
         data[40..46].copy_from_slice(&[0xBB, 0xCC, 0x01, 0x02, 0x03, 0x04]);
         let pad_size = 40;
