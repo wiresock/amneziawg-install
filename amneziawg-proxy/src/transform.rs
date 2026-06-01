@@ -275,9 +275,11 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
     // Derive transaction ID and a fake answer IP from the payload bytes.
     let tx_hi = payload.first().copied().unwrap_or(0);
     let tx_lo = payload.get(1).copied().unwrap_or(0);
-    // Use payload bytes 2-5 as the IPv4 address in the answer record,
-    // forcing the first octet into 1.0.0.0/8 to avoid reserved ranges.
-    let ip0 = payload.get(2).copied().unwrap_or(1) | 0x01;
+    // Use payload bytes 3-5 as the last three octets of the answer IP.
+    // The first octet is fixed to 1 to guarantee the address is in the
+    // publicly routable 1.0.0.0/8 range and never loopback (127.*),
+    // multicast (224+), or any other reserved prefix.
+    let ip0: u8 = 1;
     let ip1 = payload.get(3).copied().unwrap_or(1);
     let ip2 = payload.get(4).copied().unwrap_or(1);
     let ip3 = payload.get(5).copied().unwrap_or(1);
@@ -296,7 +298,7 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
         0x00,           // QNAME: root label (empty = ".")
         0x00, 0x01,     // QTYPE  = A (1)
         0x00, 0x01,     // QCLASS = IN (1)
-        // Answer section (16 bytes)
+        // Answer section (15 bytes)
         0x00,           // NAME: root label
         0x00, 0x01,     // TYPE  = A
         0x00, 0x01,     // CLASS = IN
@@ -308,7 +310,7 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
     let copy_len = std::cmp::min(padding.len(), dns.len());
     padding[..copy_len].copy_from_slice(&dns[..copy_len]);
 
-    // Any remaining padding beyond the 33-byte DNS structure: zero-fill.
+    // Any remaining padding beyond the 32-byte DNS structure: zero-fill.
     for byte in padding[copy_len..].iter_mut() {
         *byte = 0x00;
     }
@@ -465,7 +467,7 @@ mod tests {
 
     #[test]
     fn dns_padding_has_response_header() {
-        // 40 bytes padding prefix + 6 bytes payload (enough for full 33-byte DNS structure)
+        // 40 bytes padding prefix + 6 bytes payload (enough for full 32-byte DNS structure)
         let mut data = vec![0x00; 46];
         data[40..46].copy_from_slice(&[0xBB, 0xCC, 0x01, 0x02, 0x03, 0x04]);
         let pad_size = 40;
@@ -491,8 +493,8 @@ mod tests {
         assert_eq!(&data[20..22], &[0x00, 0x01], "answer CLASS IN");
         assert_eq!(&data[22..26], &[0x00, 0x00, 0x00, 0x3c], "TTL 60s");
         assert_eq!(&data[26..28], &[0x00, 0x04], "RDLENGTH 4");
-        // IP derived from payload bytes 2-5 with first octet |= 0x01
-        assert_eq!(data[28], 0x01 | 0x01); // ip0 = payload[2] | 0x01
+        // ip0 is always 1 (fixed to 1.0.0.0/8); ip1-ip3 from payload bytes 3-5
+        assert_eq!(data[28], 1); // ip0 = 1 (fixed)
         assert_eq!(data[29], 0x02); // ip1 = payload[3]
         assert_eq!(data[30], 0x03); // ip2 = payload[4]
         assert_eq!(data[31], 0x04); // ip3 = payload[5]
