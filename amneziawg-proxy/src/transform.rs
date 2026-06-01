@@ -254,61 +254,37 @@ fn fnv1a_seed(payload: &[u8]) -> u32 {
     state
 }
 
-/// DNS-style padding: a realistic DNS response with question + answer sections.
+/// DNS-style padding: minimal DNS response header followed by zero padding.
 ///
-/// Writes a syntactically valid DNS response that a strict DNS parser will
-/// accept without emitting "Extraneous Data" or "Malformed Packet" warnings:
-///
-/// - **Header** (12 bytes): QR=1, RA=1, RCODE=NOERROR, QDCOUNT=1, ANCOUNT=1.
-///   Transaction ID is derived from the first two payload bytes.
-/// - **Question section** (5 bytes): root-label QNAME (`0x00`) + QTYPE A
-///   (`0x0001`) + QCLASS IN (`0x0001`).  Matches the query the client sends.
-/// - **Answer section** (15 bytes): root-label (`0x00`) + TYPE A + CLASS IN +
-///   TTL 60s + RDLENGTH 4 + a plausible IPv4 address derived from the payload.
-///   Total structured bytes: 32.  Any remaining padding is zero-filled.
+/// Creates a plausible DNS response structure:
+/// - Transaction ID derived from the packet payload (which follows the padding)
+/// - Standard response flags (QR=1, RA=1, RCODE=NOERROR); RD is left clear
+///   because this is padding filler, not an echo of a real client query.
+/// - Remaining bytes are zero-filled for generic padding
 fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
     let (padding, payload) = data.split_at_mut(pad_size);
     if padding.is_empty() {
         return;
     }
 
-    // Derive transaction ID and a fake answer IP from the payload bytes.
+    // Derive transaction ID from first two payload bytes (H header)
     let tx_hi = payload.first().copied().unwrap_or(0);
     let tx_lo = payload.get(1).copied().unwrap_or(0);
-    // Use payload bytes 2-5 as the IPv4 address in the answer record,
-    // forcing the first octet into 1.0.0.0/8 to avoid reserved ranges.
-    let ip0 = payload.get(2).copied().unwrap_or(1) | 0x01;
-    let ip1 = payload.get(3).copied().unwrap_or(1);
-    let ip2 = payload.get(4).copied().unwrap_or(1);
-    let ip3 = payload.get(5).copied().unwrap_or(1);
 
-    // DNS response with question + answer (32 bytes of valid DNS structure)
-    #[rustfmt::skip]
-    let dns: [u8; 32] = [
-        // Header (12 bytes)
-        tx_hi, tx_lo,   // Transaction ID
-        0x80, 0x80,     // Flags: QR=1, opcode=0, RA=1, RCODE=NOERROR
-        0x00, 0x01,     // QDCOUNT = 1
-        0x00, 0x01,     // ANCOUNT = 1
-        0x00, 0x00,     // NSCOUNT = 0
-        0x00, 0x00,     // ARCOUNT = 0
-        // Question section (5 bytes)
-        0x00,           // QNAME: root label (empty = ".")
-        0x00, 0x01,     // QTYPE  = A (1)
-        0x00, 0x01,     // QCLASS = IN (1)
-        // Answer section (16 bytes)
-        0x00,           // NAME: root label
-        0x00, 0x01,     // TYPE  = A
-        0x00, 0x01,     // CLASS = IN
-        0x00, 0x00, 0x00, 0x3c, // TTL = 60 seconds
-        0x00, 0x04,     // RDLENGTH = 4
-        ip0, ip1, ip2, ip3,     // RDATA: IPv4 address
+    // DNS response header (12 bytes)
+    let header: [u8; 12] = [
+        tx_hi, tx_lo, // Transaction ID
+        0x80, 0x80, // Flags: QR=1, RA=1, RCODE=NOERROR (RD not set — no query to echo)
+        0x00, 0x00, // QDCOUNT = 0 (no question section emitted)
+        0x00, 0x00, // ANCOUNT = 0
+        0x00, 0x00, // NSCOUNT = 0
+        0x00, 0x00, // ARCOUNT = 0 (no additional records emitted)
     ];
 
-    let copy_len = std::cmp::min(padding.len(), dns.len());
-    padding[..copy_len].copy_from_slice(&dns[..copy_len]);
+    let copy_len = std::cmp::min(padding.len(), header.len());
+    padding[..copy_len].copy_from_slice(&header[..copy_len]);
 
-    // Any remaining padding beyond the 33-byte DNS structure: zero-fill.
+    // Rest: zero-fill (generic padding content)
     for byte in padding[copy_len..].iter_mut() {
         *byte = 0x00;
     }
@@ -465,46 +441,31 @@ mod tests {
 
     #[test]
     fn dns_padding_has_response_header() {
-        // 40 bytes padding prefix + 6 bytes payload (enough for full 33-byte DNS structure)
-        let mut data = vec![0x00; 46];
-        data[40..46].copy_from_slice(&[0xBB, 0xCC, 0x01, 0x02, 0x03, 0x04]);
-        let pad_size = 40;
+        // 20 bytes padding prefix + 4 bytes payload
+        let mut data = vec![0x00; 24];
+        data[20..24].copy_from_slice(&[0xBB, 0xBB, 0xBB, 0xBB]);
+        let pad_size = 20;
         apply_padding(&mut data, pad_size, Protocol::Dns);
 
-        // Header: TX ID derived from payload bytes 0-1
+        // DNS response header: TX ID derived from payload bytes
         assert_eq!(data[0], 0xBB); // tx_hi from payload[0]
-        assert_eq!(data[1], 0xCC); // tx_lo from payload[1]
-        // Flags: QR=1, RA=1, RCODE=NOERROR
+        assert_eq!(data[1], 0xBB); // tx_lo from payload[1]
+                                   // Flags: QR=1 (high bit of flags byte)
         assert_eq!(data[2] & 0x80, 0x80, "DNS QR bit should be set");
-        assert_eq!(data[2], 0x80);
+        assert_eq!(data[2], 0x80); // QR=1, RD=0 (no query to echo)
         assert_eq!(data[3], 0x80); // RA=1
-        // QDCOUNT=1, ANCOUNT=1
-        assert_eq!(&data[4..6], &[0x00, 0x01], "QDCOUNT should be 1");
-        assert_eq!(&data[6..8], &[0x00, 0x01], "ANCOUNT should be 1");
-        // Question section: root label + QTYPE A + QCLASS IN
-        assert_eq!(data[12], 0x00, "QNAME root label");
-        assert_eq!(&data[13..15], &[0x00, 0x01], "QTYPE A");
-        assert_eq!(&data[15..17], &[0x00, 0x01], "QCLASS IN");
-        // Answer section: root label + TYPE A + CLASS IN + TTL 60 + RDLENGTH 4 + IP
-        assert_eq!(data[17], 0x00, "answer NAME root label");
-        assert_eq!(&data[18..20], &[0x00, 0x01], "answer TYPE A");
-        assert_eq!(&data[20..22], &[0x00, 0x01], "answer CLASS IN");
-        assert_eq!(&data[22..26], &[0x00, 0x00, 0x00, 0x3c], "TTL 60s");
-        assert_eq!(&data[26..28], &[0x00, 0x04], "RDLENGTH 4");
-        // IP derived from payload bytes 2-5 with first octet |= 0x01
-        assert_eq!(data[28], 0x01 | 0x01); // ip0 = payload[2] | 0x01
-        assert_eq!(data[29], 0x02); // ip1 = payload[3]
-        assert_eq!(data[30], 0x03); // ip2 = payload[4]
-        assert_eq!(data[31], 0x04); // ip3 = payload[5]
-        // Bytes 32-39: zero-fill
-        assert!(data[32..40].iter().all(|&b| b == 0x00));
+                                   // QDCOUNT = 0
+        assert_eq!(data[4], 0x00);
+        assert_eq!(data[5], 0x00);
+        // After header (12 bytes), rest of padding should be zeros
+        assert!(data[12..20].iter().all(|&b| b == 0x00));
         // Payload untouched
-        assert_eq!(&data[40..46], &[0xBB, 0xCC, 0x01, 0x02, 0x03, 0x04]);
+        assert!(data[20..24].iter().all(|&b| b == 0xBB));
     }
 
     #[test]
     fn dns_padding_short_fills_partial_header() {
-        // Only 5 bytes of padding prefix — partial DNS header (header is 12 bytes)
+        // Only 5 bytes of padding prefix — should fill what fits from DNS header
         let mut data = vec![0x00; 10];
         data[5..10].copy_from_slice(&[0xCC, 0xCC, 0xCC, 0xCC, 0xCC]);
         let pad_size = 5;
@@ -512,10 +473,10 @@ mod tests {
 
         assert_eq!(data[0], 0xCC); // tx_hi from payload[0]
         assert_eq!(data[1], 0xCC); // tx_lo from payload[1]
-        assert_eq!(data[2], 0x80); // flags high: QR=1
+        assert_eq!(data[2], 0x80); // flags high: QR=1, RD=0
         assert_eq!(data[3], 0x80); // flags low: RA=1
-        assert_eq!(data[4], 0x00); // QDCOUNT high byte (partial — only 5 bytes fit)
-        // Payload untouched
+        assert_eq!(data[4], 0x00); // QDCOUNT high
+                                   // Payload untouched
         assert!(data[5..10].iter().all(|&b| b == 0xCC));
     }
 
@@ -761,8 +722,6 @@ mod tests {
         assert!(result);
 
         assert_eq!(pkt[2] & 0x80, 0x80, "DNS QR=1");
-        assert_eq!(&pkt[4..6], &[0x00, 0x01], "DNS QDCOUNT=1");
-        assert_eq!(&pkt[6..8], &[0x00, 0x01], "DNS ANCOUNT=1");
         assert_eq!(&pkt[8..12], &350u32.to_le_bytes());
         assert!(pkt[12..8 + 92].iter().all(|&b| b == 0xDD));
     }
