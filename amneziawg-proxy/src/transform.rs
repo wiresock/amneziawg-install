@@ -271,9 +271,13 @@ fn fnv1a_seed(payload: &[u8]) -> u32 {
 ///   `TYPE NULL` (RFC 1035 §3.3.10) carries opaque RDATA of any length, so
 ///   the remaining `pad_size - 28` zero bytes are fully accounted for as RDATA.
 ///
-/// If `pad_size < 28` the answer section is truncated to whatever fits;
-/// the header and question are still written if `pad_size >= 17`.
-/// If `pad_size < 2` the function returns immediately.
+/// Only sections that physically fit within `pad_size` are advertised:
+/// - `QDCOUNT=1` only when `pad_size >= 17` (header 12 B + question 5 B)
+/// - `ANCOUNT=1` only when `pad_size >= 28` (+ answer prefix 11 B)
+///
+/// This prevents parsers from being told about a section whose bytes are
+/// absent, which would cause them to interpret AWG payload as DNS data.
+/// Returns immediately when `pad_size == 0`.
 fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
     let (padding, payload) = data.split_at_mut(pad_size);
     if padding.is_empty() {
@@ -284,8 +288,12 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
     let tx_hi = payload.first().copied().unwrap_or(0);
     let tx_lo = payload.get(1).copied().unwrap_or(0);
 
-    // RDLENGTH = everything in the padding after the 28-byte fixed prefix.
-    // Saturates to 0 when pad_size < 28 (answer section truncated anyway).
+    // Only advertise sections that actually fit within pad_size.
+    let qdcount: u8 = if pad_size >= 17 { 1 } else { 0 };
+    let ancount: u8 = if pad_size >= 28 { 1 } else { 0 };
+
+    // RDLENGTH = bytes remaining after the 28-byte fixed prefix.
+    // Saturates to 0 when pad_size < 28 (ANCOUNT is 0 in that case).
     let rdlength: u16 = pad_size.saturating_sub(28).min(u16::MAX as usize) as u16;
     let [rl_hi, rl_lo] = rdlength.to_be_bytes();
 
@@ -295,22 +303,22 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
     #[rustfmt::skip]
     let fixed: [u8; 28] = [
         // Header (12 bytes)
-        tx_hi, tx_lo,       // Transaction ID
-        0x80, 0x80,         // Flags: QR=1, opcode=0, RA=1, RCODE=NOERROR
-        0x00, 0x01,         // QDCOUNT = 1
-        0x00, 0x01,         // ANCOUNT = 1
-        0x00, 0x00,         // NSCOUNT = 0
-        0x00, 0x00,         // ARCOUNT = 0
-        // Question section (5 bytes)
-        0x00,               // QNAME: root label (empty = ".")
-        0x00, 0x01,         // QTYPE  = A (1)
-        0x00, 0x01,         // QCLASS = IN (1)
-        // Answer fixed prefix (11 bytes; RDATA follows at offset 28)
-        0x00,               // NAME: root label
-        0x00, 0x0a,         // TYPE  = NULL (10) — opaque RDATA, any length
-        0x00, 0x01,         // CLASS = IN
+        tx_hi, tx_lo,           // Transaction ID
+        0x80, 0x80,             // Flags: QR=1, opcode=0, RA=1, RCODE=NOERROR
+        0x00, qdcount,          // QDCOUNT: 1 iff pad_size >= 17
+        0x00, ancount,          // ANCOUNT: 1 iff pad_size >= 28
+        0x00, 0x00,             // NSCOUNT = 0
+        0x00, 0x00,             // ARCOUNT = 0
+        // Question section (5 bytes; present only when pad_size >= 17)
+        0x00,                   // QNAME: root label (empty = ".")
+        0x00, 0x01,             // QTYPE  = A (1)
+        0x00, 0x01,             // QCLASS = IN (1)
+        // Answer fixed prefix (11 bytes; present only when pad_size >= 28)
+        0x00,                   // NAME: root label
+        0x00, 0x0a,             // TYPE  = NULL (10) — opaque RDATA, any length
+        0x00, 0x01,             // CLASS = IN
         0x00, 0x00, 0x00, 0x3c, // TTL = 60 seconds
-        rl_hi, rl_lo,       // RDLENGTH = pad_size - 28 (consumes rest of padding)
+        rl_hi, rl_lo,           // RDLENGTH = pad_size - 28 (consumes rest of padding)
     ];
 
     let copy_len = std::cmp::min(padding.len(), fixed.len());
@@ -753,24 +761,31 @@ mod tests {
 
     #[test]
     fn awg_transform_handshake_response_dns() {
-        let params = test_awg_params();
-        let padding_original = [0xFF; 8]; // S2 = 8
+        // Use S2=40 (>= 28) so the full DNS structure fits without overlapping
+        // the AWG header that starts at offset 40.
+        let params = AwgParams { s2: 40, ..test_awg_params() };
+        let padding_original = [0xFF; 40]; // S2 = 40
         let header = 350u32.to_le_bytes();
         let body = [0xDD; 92 - 4];
         let mut pkt = Vec::new();
         pkt.extend_from_slice(&padding_original);
         pkt.extend_from_slice(&header);
         pkt.extend_from_slice(&body);
-        assert_eq!(pkt.len(), 8 + 92);
+        assert_eq!(pkt.len(), 40 + 92);
 
         let result = apply_awg_transform(&mut pkt, &params, Protocol::Dns);
         assert!(result);
 
+        // DNS header
         assert_eq!(pkt[2] & 0x80, 0x80, "DNS QR=1");
         assert_eq!(&pkt[4..6], &[0x00, 0x01], "DNS QDCOUNT=1");
         assert_eq!(&pkt[6..8], &[0x00, 0x01], "DNS ANCOUNT=1");
-        assert_eq!(&pkt[8..12], &350u32.to_le_bytes());
-        assert!(pkt[12..8 + 92].iter().all(|&b| b == 0xDD));
+        // Answer TYPE=NULL(10) and RDLENGTH=12 (40-28)
+        assert_eq!(&pkt[18..20], &[0x00, 0x0a], "DNS TYPE=NULL");
+        assert_eq!(&pkt[26..28], &[0x00, 0x0c], "DNS RDLENGTH=12");
+        // AWG header and body start at offset 40, untouched
+        assert_eq!(&pkt[40..44], &350u32.to_le_bytes());
+        assert!(pkt[44..40 + 92].iter().all(|&b| b == 0xDD));
     }
 
     #[test]
