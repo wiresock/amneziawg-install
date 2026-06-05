@@ -412,21 +412,23 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
 
     let len = padding.len();
 
-    // SIP 100 Trying response with generic Via and Content-Length headers.
+    // SIP 100 Trying response with a realistic Via sent-by and Content-Length.
     // Starts with the response status line so the directionality (server →
     // client) matches what a DPI engine expects for traffic emitted by the
     // proxy. `100 Trying` is the most common provisional response, never
     // contains a body, and elicits no client retransmission.
-    static SIP_FILL: &[u8] = b"SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP proxy\r\nContent-Length: 0\r\n";
+    //
+    // The sent-by uses a plausible hostname:port instead of the literal string
+    // "proxy", which would look obviously synthetic to any deep inspector.
+    static SIP_FILL: &[u8] =
+        b"SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP sip.example.com:5060;branch=z9hG4bK\r\nContent-Length: 0\r\n";
 
-    // Fill padding by cycling through the SIP text
-    let fill_len = SIP_FILL.len();
-    let mut pos = 0;
-    while pos < len {
-        let remaining = len - pos;
-        let chunk = std::cmp::min(remaining, fill_len);
-        padding[pos..pos + chunk].copy_from_slice(&SIP_FILL[..chunk]);
-        pos += chunk;
+    // Copy at most one full pass; do not cycle — a real SIP response never
+    // repeats its own headers.  If pad_size exceeds the fill, zero-pad the rest.
+    let copy_len = std::cmp::min(len, SIP_FILL.len());
+    padding[..copy_len].copy_from_slice(&SIP_FILL[..copy_len]);
+    for b in padding[copy_len..].iter_mut() {
+        *b = 0x00;
     }
 
     // Ensure the padding ends with \r\n if at least 2 bytes

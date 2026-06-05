@@ -13,7 +13,7 @@ use crate::backend;
 use crate::config::{AwgParams, ProxyConfig};
 use crate::metrics::MetricsStore;
 use crate::quic_handshake::{QuicHandshakeResponder, QuicResponse};
-use crate::responder::{self, Protocol};
+use crate::responder::{self, Protocol, SipDialog, SipDialogStage};
 use crate::session::SessionTable;
 use crate::transform;
 
@@ -37,6 +37,8 @@ pub struct Proxy {
     dns_upstream: Option<SocketAddr>,
     dns_upstream_timeout: Duration,
     quic_handshake: Option<Arc<Mutex<QuicHandshakeResponder>>>,
+    /// Per-client SIP dialog state, maintained across INVITE/ACK/BYE.
+    sip_dialogs: Arc<DashMap<SocketAddr, SipDialog>>,
     shutdown: Arc<Notify>,
     /// Per-session relay task handles, keyed by client address.
     /// Each task awaits data from the session's backend socket and relays it
@@ -107,6 +109,7 @@ impl Proxy {
             dns_upstream,
             dns_upstream_timeout,
             quic_handshake,
+            sip_dialogs: Arc::new(DashMap::new()),
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
@@ -134,6 +137,7 @@ impl Proxy {
             dns_upstream: None,
             dns_upstream_timeout: Duration::from_millis(1500),
             quic_handshake: None,
+            sip_dialogs: Arc::new(DashMap::new()),
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
@@ -275,6 +279,7 @@ impl Proxy {
                 // cleanup task will never expire this client's metrics.
                 self.metrics.remove(&client_addr);
                 self.client_protocols.remove(&client_addr);
+                self.sip_dialogs.remove(&client_addr);
             }
         }
     }
@@ -357,6 +362,8 @@ impl Proxy {
                                     client_addr,
                                 ))
                             });
+                        } else if proto == Protocol::Sip {
+                            self.handle_sip_probe(data, client_addr).await;
                         } else {
                             probe_response = Some(responder::generate_response_for_client(
                                 proto,
@@ -378,6 +385,118 @@ impl Proxy {
                 metrics.record_probe();
             }
             debug!(%client_addr, "probe response sent");
+        }
+    }
+
+    /// Handle a SIP probe using a per-client stateful dialog.
+    ///
+    /// Sequence for a well-behaved client:
+    /// 1. `INVITE`  → `100 Trying` immediately; `180 Ringing` after ~200 ms;
+    ///                `200 OK` after ~1 s (simulates answer).
+    /// 2. `ACK`     → no response (call established).
+    /// 3. `BYE`     → `200 OK` immediately.
+    /// 4. `CANCEL`  → `200 OK` + `487 Request Terminated`.
+    ///
+    /// REGISTER / OPTIONS / NOTIFY / SUBSCRIBE / MESSAGE / INFO each get a
+    /// plain `200 OK` using whatever dialog state is available (or a fallback
+    /// stateless response if no INVITE has been seen yet).
+    async fn handle_sip_probe(&self, data: &[u8], client_addr: SocketAddr) {
+        let method = match responder::sip_method(data) {
+            Some(m) => m.to_ascii_uppercase(),
+            None => return,
+        };
+
+        // For a fresh INVITE, create (or reset) the dialog from the request.
+        if method == "INVITE" {
+            let is_new_dialog = self
+                .sip_dialogs
+                .get(&client_addr)
+                .map(|d| {
+                    d.stage == SipDialogStage::Terminated || d.stage == SipDialogStage::Idle
+                })
+                .unwrap_or(true);
+
+            if is_new_dialog {
+                if let Some(dialog) = SipDialog::from_invite(data) {
+                    self.sip_dialogs.insert(client_addr, dialog);
+                }
+            } else {
+                // Retransmit — update CSeq in place
+                if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
+                    d.update_cseq(data);
+                }
+            }
+        } else {
+            // For non-INVITE methods update the CSeq if a dialog exists
+            if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
+                d.update_cseq(data);
+            }
+        }
+
+        // Build and send immediate response(s)
+        let responses: Vec<bytes::Bytes> = {
+            if let Some(d) = self.sip_dialogs.get(&client_addr) {
+                responder::generate_sip_responses(&d, &method)
+            } else {
+                // No dialog state yet (e.g. OPTIONS before any INVITE) — stateless fallback
+                vec![responder::generate_response_for_client(
+                    Protocol::Sip,
+                    data,
+                    client_addr,
+                )]
+            }
+        };
+
+        for pkt in &responses {
+            if let Err(e) = self.frontend.send_to(pkt, client_addr).await {
+                warn!(%client_addr, error = %e, "failed to send SIP response");
+            }
+        }
+
+        // Advance the dialog stage
+        if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
+            d.stage = responder::sip_next_stage(d.stage, &method);
+        }
+
+        // For a fresh INVITE (stage just moved to Invited), schedule deferred
+        // 180 Ringing (~200 ms) and 200 OK (~1 s) to simulate a real call answer.
+        let is_fresh_invite = method == "INVITE"
+            && self
+                .sip_dialogs
+                .get(&client_addr)
+                .map(|d| d.stage == SipDialogStage::Invited)
+                .unwrap_or(false);
+
+        if is_fresh_invite {
+            let frontend = Arc::clone(&self.frontend);
+            let dialogs = Arc::clone(&self.sip_dialogs);
+
+            tokio::spawn(async move {
+                // 180 Ringing after 200 ms
+                time::sleep(Duration::from_millis(200)).await;
+                if let Some(d) = dialogs.get(&client_addr) {
+                    if d.stage == SipDialogStage::Invited {
+                        let ringing = responder::generate_sip_ringing(&d);
+                        let _ = frontend.send_to(&ringing, client_addr).await;
+                    }
+                }
+
+                // 200 OK after another 800 ms (total ~1 s)
+                time::sleep(Duration::from_millis(800)).await;
+                if let Some(d) = dialogs.get(&client_addr) {
+                    if d.stage == SipDialogStage::Invited {
+                        let ok = responder::generate_sip_ok(&d);
+                        let _ = frontend.send_to(&ok, client_addr).await;
+                        // Advance to Established
+                        drop(d);
+                        if let Some(mut d) = dialogs.get_mut(&client_addr) {
+                            if d.stage == SipDialogStage::Invited {
+                                d.stage = SipDialogStage::Established;
+                            }
+                        }
+                    }
+                }
+            });
         }
     }
 
