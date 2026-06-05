@@ -296,7 +296,16 @@ impl Proxy {
             let selected_proto = match self.fixed_protocol {
                 Some(fixed) if proto == fixed => Some(fixed),
                 Some(_) => None,
-                None => Some(proto),
+                // Auto mode: lock each client to the first protocol detected for
+                // it.  Once a client's protocol is established, ignore probes
+                // that detect as a *different* protocol so a single mis-detected
+                // packet cannot switch an established session (e.g. answer a DNS
+                // client with QUIC).  This is defense-in-depth alongside the
+                // version validation in `detect_protocol`.
+                None => match self.client_protocols.get(&client_addr).map(|p| *p) {
+                    Some(locked) if locked != proto => None,
+                    _ => Some(proto),
+                },
             };
             if let Some(proto) = selected_proto {
                 self.client_protocols.insert(client_addr, proto);
