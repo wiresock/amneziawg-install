@@ -141,12 +141,43 @@ const STUN_BINDING_REQUEST: u16 = 0x0001;
 const STUN_BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
 const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
+/// Returns `true` if `version` is a QUIC version a client would put in a real
+/// long-header (Initial) packet.
+///
+/// Validating the version field is what distinguishes a genuine QUIC long
+/// header from other protocols whose leading byte happens to have the
+/// long-header form bits (`0xC0`) set — most notably DNS queries whose
+/// transaction-ID high byte falls in `0xC0..=0xFF`.  A well-formed DNS query's
+/// bytes 1..5 (TX ID low byte, 2-byte flags, QDCOUNT high byte) do not
+/// correspond to a recognised QUIC version in practice, so this check rejects
+/// them.  Note this is a heuristic, not a
+/// guarantee: a crafted or malformed datagram could still place a matching
+/// version here — the per-client protocol lock in `handle_probe` is the
+/// defense-in-depth backstop for that case.
+///
+/// Accepted versions:
+/// - `0x0000_0001` — QUIC v1 (RFC 9000)
+/// - `0x6b33_43cf` — QUIC v2 (RFC 9369)
+/// - `0xff00_00xx` — IETF draft versions (draft-ietf-quic-transport), `xx` ≥ 1
+/// - `0x?a?a_?a?a` — GREASE / forced-version-negotiation values (RFC 9000 §15)
+fn is_quic_version(version: u32) -> bool {
+    match version {
+        0x0000_0001 => true,
+        0x6b33_43cf => true,
+        v if v & 0xffff_ff00 == 0xff00_0000 && v & 0xff != 0 => true,
+        v if v & 0x0f0f_0f0f == 0x0a0a_0a0a => true,
+        _ => false,
+    }
+}
+
 /// Detect whether an incoming packet looks like a QUIC, DNS, STUN, or SIP initiation.
 ///
 /// Heuristics:
 /// - **QUIC**: First byte has the long-header form bit set (0x80) and the
-///   fixed bit set (0x40), i.e. `(byte & 0xC0) == 0xC0`, which matches
-///   QUIC Initial packets (RFC 9000 §17.2).
+///   fixed bit set (0x40), i.e. `(byte & 0xC0) == 0xC0`, AND the 32-bit
+///   version field (bytes 1..5) is a recognised QUIC version
+///   (see `is_quic_version`).  The version check prevents DNS queries with a
+///   high transaction-ID byte from being misclassified as QUIC.
 /// - **STUN**: RFC 5389/8489 header with the top two message-type bits clear,
 ///   4-byte-aligned length, magic cookie `0x2112A442`, exact datagram length,
 ///   and Binding Request type.
@@ -166,12 +197,15 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
     // plus additional invariants to avoid false positives on AWG packets
     // whose random H-range headers happen to have those bits set.
     //   - Minimum 7 bytes (1 header + 4 version + 1 DCID len + 1 SCID len)
+    //   - Version field (bytes 1..5) is a recognised QUIC version — this is
+    //     what rejects DNS queries whose transaction-ID high byte is 0xC0..=0xFF
     //   - DCID length ≤ 20 (RFC 9000 §17.2)
     //   - Packet contains SCID length field
     //   - SCID length ≤ 20
     if data.len() >= 7 && data[0] & 0xC0 == 0xC0 {
+        let version = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
         let dcid_len = data[5] as usize;
-        if dcid_len <= 20 {
+        if is_quic_version(version) && dcid_len <= 20 {
             let scid_len_offset = 6 + dcid_len;
             if data.len() > scid_len_offset {
                 let scid_len = data[scid_len_offset] as usize;
@@ -593,6 +627,85 @@ mod tests {
         pkt[3] = 0x00;
         pkt[4] = 0x00; // QDCOUNT = 1
         pkt[5] = 0x01;
+        assert_eq!(detect_protocol(&pkt), Some(Protocol::Dns));
+    }
+
+    #[test]
+    fn detect_dns_query_with_high_txid_not_quic() {
+        // Regression: a DNS query whose transaction-ID high byte is in
+        // 0xC0..=0xFF sets the QUIC long-header form bits (data[0] & 0xC0 ==
+        // 0xC0).  Without version validation this was misclassified as QUIC,
+        // causing the proxy to emit QUIC Version Negotiation / handshake
+        // packets into a DNS session (observed as non-DNS server frames).
+        // It must now be detected as DNS.
+        let pkt = vec![
+            0xe1, 0x6b, // TX ID 0xe16b (high byte trips the 0xC0 form bits)
+            0x01, 0x00, // flags: standard query, RD=1
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT = 0
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+            0x00, // root-label QNAME
+            0x00, 0x01, // QTYPE = A
+            0x00, 0x01, // QCLASS = IN
+        ];
+        assert_eq!(detect_protocol(&pkt), Some(Protocol::Dns));
+    }
+
+    #[test]
+    fn detect_quic_rejects_invalid_version() {
+        // Long-header form bits set but the version field is not a recognised
+        // QUIC version -> must NOT be classified as QUIC.
+        let mut pkt = vec![0xC3u8, 0x12, 0x34, 0x56, 0x78]; // bogus version
+        pkt.push(4); // DCID len
+        pkt.extend_from_slice(&[1, 2, 3, 4]);
+        pkt.push(0); // SCID len
+        assert_eq!(detect_protocol(&pkt), None);
+    }
+
+    #[test]
+    fn detect_quic_accepts_v2_and_grease() {
+        for version in [0x6b33_43cfu32, 0x0a0a_0a0a, 0xff00_001d] {
+            let mut pkt = vec![0xC3u8];
+            pkt.extend_from_slice(&version.to_be_bytes());
+            pkt.push(4); // DCID len
+            pkt.extend_from_slice(&[1, 2, 3, 4]);
+            pkt.push(0); // SCID len
+            assert_eq!(
+                detect_protocol(&pkt),
+                Some(Protocol::Quic),
+                "version {version:#010x} should be accepted as QUIC"
+            );
+        }
+    }
+
+    #[test]
+    fn quic_version_predicate() {
+        assert!(is_quic_version(0x0000_0001)); // v1
+        assert!(is_quic_version(0x6b33_43cf)); // v2
+        assert!(is_quic_version(0xff00_001d)); // draft-29
+        assert!(is_quic_version(0x1a2a_3a4a)); // GREASE pattern
+        assert!(!is_quic_version(0x0000_0000)); // VN sentinel, not a client version
+        assert!(!is_quic_version(0x6b01_0000)); // DNS-query-shaped bytes
+        assert!(!is_quic_version(0xff00_0000)); // draft-0 is not a real draft; also reachable from DNS
+    }
+
+    #[test]
+    fn detect_dns_query_that_would_form_draft0_version_not_quic() {
+        // Regression: DNS query with TXID_lo=0xFF, flags=0x0000, QDCOUNT_hi=0x00
+        // produces version bytes 0xff00_0000 (QUIC draft-0).  This must be
+        // rejected as QUIC (draft-0 is excluded) and detected as DNS.
+        let pkt = vec![
+            0xC0, 0xFF, // TXID: high byte 0xC0 sets long-header bits; low byte 0xFF
+            0x00, 0x00, // flags = 0x0000 (standard query)
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT = 0
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+            0x00,       // root-label QNAME
+            0x00, 0x01, // QTYPE = A
+            0x00, 0x01, // QCLASS = IN
+        ];
         assert_eq!(detect_protocol(&pkt), Some(Protocol::Dns));
     }
 
