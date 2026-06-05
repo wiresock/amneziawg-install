@@ -148,8 +148,9 @@ const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 /// header from other protocols whose leading byte happens to have the
 /// long-header form bits (`0xC0`) set — most notably DNS queries whose
 /// transaction-ID high byte falls in `0xC0..=0xFF`.  A well-formed DNS query's
-/// bytes 1..5 (flags + counts) do not correspond to a recognised QUIC version
-/// in practice, so this check rejects them.  Note this is a heuristic, not a
+/// bytes 1..5 (TX ID low byte, 2-byte flags, QDCOUNT high byte) do not
+/// correspond to a recognised QUIC version in practice, so this check rejects
+/// them.  Note this is a heuristic, not a
 /// guarantee: a crafted or malformed datagram could still place a matching
 /// version here — the per-client protocol lock in `handle_probe` is the
 /// defense-in-depth backstop for that case.
