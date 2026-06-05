@@ -363,7 +363,7 @@ impl Proxy {
                                 ))
                             });
                         } else if proto == Protocol::Sip {
-                            self.handle_sip_probe(data, client_addr).await;
+                            self.handle_sip_probe(data, client_addr, metrics_ref).await;
                         } else {
                             probe_response = Some(responder::generate_response_for_client(
                                 proto,
@@ -400,7 +400,12 @@ impl Proxy {
     /// REGISTER / OPTIONS / NOTIFY / SUBSCRIBE / MESSAGE / INFO each get a
     /// plain `200 OK` using whatever dialog state is available, or a bounded
     /// lightweight parse if no INVITE has been seen yet.
-    async fn handle_sip_probe(&self, data: &[u8], client_addr: SocketAddr) {
+    async fn handle_sip_probe(
+        &self,
+        data: &[u8],
+        client_addr: SocketAddr,
+        metrics_ref: &Option<Arc<crate::metrics::ClientMetrics>>,
+    ) {
         let method = match responder::sip_method(data) {
             Some(m) => m.to_ascii_uppercase(),
             None => return,
@@ -470,6 +475,8 @@ impl Proxy {
         for pkt in &responses {
             if let Err(e) = self.frontend.send_to(pkt, client_addr).await {
                 warn!(%client_addr, error = %e, "failed to send SIP response");
+            } else if let Some(metrics) = metrics_ref {
+                metrics.record_probe();
             }
         }
 
@@ -481,6 +488,7 @@ impl Proxy {
         if is_fresh_invite {
             let frontend = Arc::clone(&self.frontend);
             let dialogs = Arc::clone(&self.sip_dialogs);
+            let metrics = metrics_ref.as_ref().map(Arc::clone);
             let expected_call_id = match fresh_call_id {
                 Some(call_id) => call_id,
                 None => return,
@@ -494,7 +502,11 @@ impl Proxy {
                     .filter(|d| d.stage == SipDialogStage::Invited && d.call_id == expected_call_id)
                     .map(|d| responder::generate_sip_ringing(&d));
                 if let Some(pkt) = ringing {
-                    let _ = frontend.send_to(&pkt, client_addr).await;
+                    if frontend.send_to(&pkt, client_addr).await.is_ok() {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_probe();
+                        }
+                    }
                 }
 
                 // 200 OK after another 800 ms (total ~1 s) — drop guard before await.
@@ -504,10 +516,17 @@ impl Proxy {
                     .filter(|d| d.stage == SipDialogStage::Invited && d.call_id == expected_call_id)
                     .map(|d| responder::generate_sip_ok(&d));
                 if let Some(pkt) = ok {
-                    let _ = frontend.send_to(&pkt, client_addr).await;
-                    if let Some(mut d) = dialogs.get_mut(&client_addr) {
-                        if d.stage == SipDialogStage::Invited && d.call_id == expected_call_id {
-                            d.stage = SipDialogStage::Established;
+                    let sent = frontend.send_to(&pkt, client_addr).await.is_ok();
+                    if sent {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_probe();
+                        }
+                    }
+                    if sent {
+                        if let Some(mut d) = dialogs.get_mut(&client_addr) {
+                            if d.stage == SipDialogStage::Invited && d.call_id == expected_call_id {
+                                d.stage = SipDialogStage::Established;
+                            }
                         }
                     }
                 }
@@ -809,7 +828,8 @@ mod tests {
     /// Layout: [S4 bytes of QUIC-like padding] ++ [H4 header LE u32] ++ [body]
     fn awg_quic_masked_transport_packet(params: &crate::config::AwgParams) -> Vec<u8> {
         let s4 = params.s4 as usize;
-        let h4_value = params.h4.min; // any value in range
+        let h4_value = params.h4.min;
+
         // S4 padding that passes detect_protocol's QUIC heuristic:
         //   byte 0: 0xC0 (long-header form + fixed bit, Initial type, PN len 0)
         //   bytes 1-4: 0x00000001 (QUIC v1)
@@ -1029,6 +1049,7 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
         let options = b"OPTIONS sip:olivia@profi.ru SIP/2.0\r\n\
 Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
 From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
@@ -1037,7 +1058,9 @@ Call-ID: options-call@192.168.224.194\r\n\
 CSeq: 95930 OPTIONS\r\n\
 Content-Length: 0\r\n\r\n";
 
-        proxy.handle_sip_probe(options, client_addr).await;
+        proxy
+            .handle_sip_probe(options, client_addr, &metrics_ref)
+            .await;
 
         let mut buf = [0u8; 1024];
         let (n, from) =
@@ -1049,5 +1072,12 @@ Content-Length: 0\r\n\r\n";
         let text = std::str::from_utf8(&buf[..n]).unwrap();
         assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
         assert!(text.contains("CSeq: 95930 OPTIONS"));
+        assert_eq!(
+            metrics_ref
+                .unwrap()
+                .probes_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }
