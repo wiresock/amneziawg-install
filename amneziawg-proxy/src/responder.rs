@@ -815,7 +815,8 @@ pub(crate) fn sip_next_stage(current: SipDialogStage, method: &str) -> SipDialog
             SipDialogStage::Invited | SipDialogStage::Established => current,
         },
         "ACK" => match current {
-            SipDialogStage::Invited | SipDialogStage::Established => SipDialogStage::Established,
+            SipDialogStage::Established => SipDialogStage::Established,
+            SipDialogStage::Invited => SipDialogStage::Invited,
             SipDialogStage::Idle | SipDialogStage::Terminated => current,
         },
         "BYE" => match current {
@@ -1760,7 +1761,7 @@ Content-Length: 0\r\n\r\n";
     fn sip_dialog_ack_returns_no_response() {
         let invite = sample_invite();
         let mut dialog = SipDialog::from_invite(&invite).unwrap();
-        dialog.stage = SipDialogStage::Invited;
+        dialog.stage = SipDialogStage::Established;
         let responses = generate_sip_responses(&dialog, "ACK");
         assert!(responses.is_empty());
         dialog.stage = sip_next_stage(dialog.stage, "ACK");
@@ -1892,7 +1893,7 @@ Content-Length: 0\r\n\r\n";
         );
         assert_eq!(
             sip_next_stage(SipDialogStage::Invited, "ACK"),
-            SipDialogStage::Established
+            SipDialogStage::Invited
         );
         assert_eq!(
             sip_next_stage(SipDialogStage::Established, "INVITE"),

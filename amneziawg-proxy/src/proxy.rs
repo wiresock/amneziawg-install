@@ -427,6 +427,8 @@ impl Proxy {
                     fresh_call_id = Some(dialog.call_id.clone());
                     self.sip_dialogs.insert(client_addr, dialog);
                     is_fresh_invite = true;
+                } else {
+                    self.sip_dialogs.remove(&client_addr);
                 }
             } else {
                 // Retransmit — update CSeq in place
@@ -1079,5 +1081,68 @@ Content-Length: 0\r\n\r\n";
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_fresh_invite_drops_stale_dialog_state() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec: 16,
+            imitate_protocol: "sip".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            awg_config: None,
+        };
+
+        let proxy = Proxy::bind(config, None).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let old_invite = b"INVITE sip:old@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKold;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=old\r\n\
+To: Olivia <sip:old@profi.ru>\r\n\
+Call-ID: old-call@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut old_dialog = SipDialog::from_invite(old_invite).unwrap();
+        old_dialog.stage = SipDialogStage::Terminated;
+        proxy.sip_dialogs.insert(client_addr, old_dialog);
+
+        let malformed_invite = b"INVITE sip:new@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKnew;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=new\r\n\
+Call-ID: new-call@192.168.224.194\r\n\
+CSeq: 95930 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(malformed_invite, client_addr, &metrics_ref)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("malformed INVITE should receive stateless SIP response")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.starts_with("SIP/2.0 100 Trying\r\n"));
+        assert!(text.contains("Call-ID: new-call@192.168.224.194"));
+        assert!(!text.contains("old-call@192.168.224.194"));
+        assert!(!proxy.sip_dialogs.contains_key(&client_addr));
     }
 }
