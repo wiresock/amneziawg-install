@@ -392,33 +392,36 @@ impl Proxy {
     ///
     /// Sequence for a well-behaved client:
     /// 1. `INVITE`  → `100 Trying` immediately; `180 Ringing` after ~200 ms;
-    ///                `200 OK` after ~1 s (simulates answer).
+    ///    `200 OK` after ~1 s (simulates answer).
     /// 2. `ACK`     → no response (call established).
     /// 3. `BYE`     → `200 OK` immediately.
     /// 4. `CANCEL`  → `200 OK` + `487 Request Terminated`.
     ///
     /// REGISTER / OPTIONS / NOTIFY / SUBSCRIBE / MESSAGE / INFO each get a
-    /// plain `200 OK` using whatever dialog state is available (or a fallback
-    /// stateless response if no INVITE has been seen yet).
+    /// plain `200 OK` using whatever dialog state is available, or a bounded
+    /// lightweight parse if no INVITE has been seen yet.
     async fn handle_sip_probe(&self, data: &[u8], client_addr: SocketAddr) {
         let method = match responder::sip_method(data) {
             Some(m) => m.to_ascii_uppercase(),
             None => return,
         };
 
+        let mut is_fresh_invite = false;
+        let mut fresh_call_id: Option<String> = None;
+
         // For a fresh INVITE, create (or reset) the dialog from the request.
         if method == "INVITE" {
             let is_new_dialog = self
                 .sip_dialogs
                 .get(&client_addr)
-                .map(|d| {
-                    d.stage == SipDialogStage::Terminated || d.stage == SipDialogStage::Idle
-                })
+                .map(|d| d.stage == SipDialogStage::Terminated || d.stage == SipDialogStage::Idle)
                 .unwrap_or(true);
 
             if is_new_dialog {
                 if let Some(dialog) = SipDialog::from_invite(data) {
+                    fresh_call_id = Some(dialog.call_id.clone());
                     self.sip_dialogs.insert(client_addr, dialog);
+                    is_fresh_invite = true;
                 }
             } else {
                 // Retransmit — update CSeq in place
@@ -438,12 +441,29 @@ impl Proxy {
             if let Some(d) = self.sip_dialogs.get(&client_addr) {
                 responder::generate_sip_responses(&d, &method)
             } else {
-                // No dialog state yet (e.g. OPTIONS before any INVITE) — stateless fallback
-                vec![responder::generate_response_for_client(
-                    Protocol::Sip,
-                    data,
-                    client_addr,
-                )]
+                // No dialog state yet (e.g. OPTIONS before any INVITE).  Try a
+                // bounded header parse for standalone SIP methods that can receive
+                // a 200 OK without dialog state; fall back to the legacy 100 Trying
+                // path if the request is malformed or missing mandatory headers.
+                match method.as_str() {
+                    "ACK" => Vec::new(),
+                    "REGISTER" | "OPTIONS" | "NOTIFY" | "SUBSCRIBE" | "MESSAGE" | "INFO" => {
+                        SipDialog::from_request(data)
+                            .map(|dialog| responder::generate_sip_responses(&dialog, &method))
+                            .unwrap_or_else(|| {
+                                vec![responder::generate_response_for_client(
+                                    Protocol::Sip,
+                                    data,
+                                    client_addr,
+                                )]
+                            })
+                    }
+                    _ => vec![responder::generate_response_for_client(
+                        Protocol::Sip,
+                        data,
+                        client_addr,
+                    )],
+                }
             }
         };
 
@@ -458,24 +478,20 @@ impl Proxy {
             d.stage = responder::sip_next_stage(d.stage, &method);
         }
 
-        // Schedule deferred 180 Ringing + 200 OK only for a *fresh* INVITE
-        // (responses contained only the initial 100 Trying, meaning we just
-        // moved from Idle/Terminated → Invited for the first time).  A retransmit
-        // INVITE returns [100 Trying, 180 Ringing] immediately and must NOT spawn
-        // a second deferred task, which would cause duplicate 180/200 responses
-        // and unbounded task amplification under retransmit bursts.
-        let is_fresh_invite = method == "INVITE" && responses.len() == 1;
-
         if is_fresh_invite {
             let frontend = Arc::clone(&self.frontend);
             let dialogs = Arc::clone(&self.sip_dialogs);
+            let expected_call_id = match fresh_call_id {
+                Some(call_id) => call_id,
+                None => return,
+            };
 
             tokio::spawn(async move {
                 // 180 Ringing after 200 ms — drop the guard before awaiting.
                 time::sleep(Duration::from_millis(200)).await;
                 let ringing = dialogs
                     .get(&client_addr)
-                    .filter(|d| d.stage == SipDialogStage::Invited)
+                    .filter(|d| d.stage == SipDialogStage::Invited && d.call_id == expected_call_id)
                     .map(|d| responder::generate_sip_ringing(&d));
                 if let Some(pkt) = ringing {
                     let _ = frontend.send_to(&pkt, client_addr).await;
@@ -485,12 +501,12 @@ impl Proxy {
                 time::sleep(Duration::from_millis(800)).await;
                 let ok = dialogs
                     .get(&client_addr)
-                    .filter(|d| d.stage == SipDialogStage::Invited)
+                    .filter(|d| d.stage == SipDialogStage::Invited && d.call_id == expected_call_id)
                     .map(|d| responder::generate_sip_ok(&d));
                 if let Some(pkt) = ok {
                     let _ = frontend.send_to(&pkt, client_addr).await;
                     if let Some(mut d) = dialogs.get_mut(&client_addr) {
-                        if d.stage == SipDialogStage::Invited {
+                        if d.stage == SipDialogStage::Invited && d.call_id == expected_call_id {
                             d.stage = SipDialogStage::Established;
                         }
                     }
@@ -802,12 +818,25 @@ mod tests {
         //   byte 14: SCID length = 0
         //   bytes 15..: fill to reach s4
         let mut pkt = vec![0u8; s4];
-        if s4 >= 1 { pkt[0] = 0xC0; }
-        if s4 >= 5 { pkt[1] = 0x00; pkt[2] = 0x00; pkt[3] = 0x00; pkt[4] = 0x01; }
-        if s4 >= 6 { pkt[5] = 8; } // DCID len
+        if s4 >= 1 {
+            pkt[0] = 0xC0;
+        }
+        if s4 >= 5 {
+            pkt[1] = 0x00;
+            pkt[2] = 0x00;
+            pkt[3] = 0x00;
+            pkt[4] = 0x01;
+        }
+        if s4 >= 6 {
+            pkt[5] = 8;
+        }
         // bytes 6..14: DCID (arbitrary non-zero)
-        for i in 6..std::cmp::min(14, s4) { pkt[i] = 0xAB; }
-        if s4 > 14 { pkt[14] = 0; } // SCID len = 0
+        for i in 6..std::cmp::min(14, s4) {
+            pkt[i] = 0xAB;
+        }
+        if s4 > 14 {
+            pkt[14] = 0;
+        }
         // Append H4 header (LE u32) then body to meet TransportData minimum size.
         pkt.extend_from_slice(&h4_value.to_le_bytes());
         // Body: needs at least WG_TRANSPORT_DATA_MIN_SIZE (32) bytes after s4.
@@ -832,10 +861,22 @@ mod tests {
             s2: 142,
             s3: 59,
             s4: 40,
-            h1: HRange { min: 102_875_432, max: 202_875_431 },
-            h2: HRange { min: 728_639_326, max: 828_639_325 },
-            h3: HRange { min: 1_469_276_895, max: 1_569_276_894 },
-            h4: HRange { min: 2_037_058_179, max: 2_137_058_178 },
+            h1: HRange {
+                min: 102_875_432,
+                max: 202_875_431,
+            },
+            h2: HRange {
+                min: 728_639_326,
+                max: 828_639_325,
+            },
+            h3: HRange {
+                min: 1_469_276_895,
+                max: 1_569_276_894,
+            },
+            h4: HRange {
+                min: 2_037_058_179,
+                max: 2_137_058_178,
+            },
         };
 
         let config = ProxyConfig {
@@ -960,5 +1001,53 @@ mod tests {
         let second =
             tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await;
         assert!(second.is_err(), "second probe should be rate limited");
+    }
+
+    #[tokio::test]
+    async fn sip_options_without_dialog_returns_200_ok() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec: 16,
+            imitate_protocol: "sip".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            awg_config: None,
+        };
+
+        let proxy = Proxy::bind(config, None).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let options = b"OPTIONS sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: options-call@192.168.224.194\r\n\
+CSeq: 95930 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy.handle_sip_probe(options, client_addr).await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("OPTIONS should receive a SIP response")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(text.contains("CSeq: 95930 OPTIONS"));
     }
 }

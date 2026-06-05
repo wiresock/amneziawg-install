@@ -142,7 +142,7 @@ pub(crate) fn build_padded_packet(payload: &[u8], pad_len: usize, proto: Protoco
 ///
 /// Emits a QUIC v1 long-header Initial prologue (RFC 9000 §17.2.2):
 ///   - byte 0:    `0xC0 | PN_len` — form=1, fixed=1, type=00 (Initial),
-///                  reserved bits cleared, random 2-bit Packet Number length.
+///     reserved bits cleared, random 2-bit Packet Number length.
 ///   - bytes 1-4: `0x00000001` — QUIC v1.
 ///   - byte 5:    DCID length in `4..=20`.
 ///   - bytes 6+:  pseudo-random high-entropy fill.
@@ -177,7 +177,7 @@ fn apply_quic_padding_initial(data: &mut [u8], pad_size: usize) {
 ///
 /// Emits a QUIC v1 long-header Handshake prologue (RFC 9000 §17.2.4):
 ///   - byte 0:    `0xE0 | PN_len` — form=1, fixed=1, type=10 (Handshake),
-///                  reserved bits cleared, random PN length.
+///     reserved bits cleared, random PN length.
 ///   - bytes 1-4: `0x00000001` — QUIC v1.
 ///   - byte 5:    DCID length in `0..=20` (server may use 0-length DCID).
 ///   - bytes 6+:  pseudo-random high-entropy fill.
