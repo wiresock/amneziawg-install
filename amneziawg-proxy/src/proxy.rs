@@ -458,41 +458,40 @@ impl Proxy {
             d.stage = responder::sip_next_stage(d.stage, &method);
         }
 
-        // For a fresh INVITE (stage just moved to Invited), schedule deferred
-        // 180 Ringing (~200 ms) and 200 OK (~1 s) to simulate a real call answer.
-        let is_fresh_invite = method == "INVITE"
-            && self
-                .sip_dialogs
-                .get(&client_addr)
-                .map(|d| d.stage == SipDialogStage::Invited)
-                .unwrap_or(false);
+        // Schedule deferred 180 Ringing + 200 OK only for a *fresh* INVITE
+        // (responses contained only the initial 100 Trying, meaning we just
+        // moved from Idle/Terminated → Invited for the first time).  A retransmit
+        // INVITE returns [100 Trying, 180 Ringing] immediately and must NOT spawn
+        // a second deferred task, which would cause duplicate 180/200 responses
+        // and unbounded task amplification under retransmit bursts.
+        let is_fresh_invite = method == "INVITE" && responses.len() == 1;
 
         if is_fresh_invite {
             let frontend = Arc::clone(&self.frontend);
             let dialogs = Arc::clone(&self.sip_dialogs);
 
             tokio::spawn(async move {
-                // 180 Ringing after 200 ms
+                // 180 Ringing after 200 ms — drop the guard before awaiting.
                 time::sleep(Duration::from_millis(200)).await;
-                if let Some(d) = dialogs.get(&client_addr) {
-                    if d.stage == SipDialogStage::Invited {
-                        let ringing = responder::generate_sip_ringing(&d);
-                        let _ = frontend.send_to(&ringing, client_addr).await;
-                    }
+                let ringing = dialogs
+                    .get(&client_addr)
+                    .filter(|d| d.stage == SipDialogStage::Invited)
+                    .map(|d| responder::generate_sip_ringing(&d));
+                if let Some(pkt) = ringing {
+                    let _ = frontend.send_to(&pkt, client_addr).await;
                 }
 
-                // 200 OK after another 800 ms (total ~1 s)
+                // 200 OK after another 800 ms (total ~1 s) — drop guard before await.
                 time::sleep(Duration::from_millis(800)).await;
-                if let Some(d) = dialogs.get(&client_addr) {
-                    if d.stage == SipDialogStage::Invited {
-                        let ok = responder::generate_sip_ok(&d);
-                        let _ = frontend.send_to(&ok, client_addr).await;
-                        // Advance to Established
-                        drop(d);
-                        if let Some(mut d) = dialogs.get_mut(&client_addr) {
-                            if d.stage == SipDialogStage::Invited {
-                                d.stage = SipDialogStage::Established;
-                            }
+                let ok = dialogs
+                    .get(&client_addr)
+                    .filter(|d| d.stage == SipDialogStage::Invited)
+                    .map(|d| responder::generate_sip_ok(&d));
+                if let Some(pkt) = ok {
+                    let _ = frontend.send_to(&pkt, client_addr).await;
+                    if let Some(mut d) = dialogs.get_mut(&client_addr) {
+                        if d.stage == SipDialogStage::Invited {
+                            d.stage = SipDialogStage::Established;
                         }
                     }
                 }
@@ -536,6 +535,7 @@ impl Proxy {
         let sessions = Arc::clone(&self.sessions);
         let fixed_protocol = self.fixed_protocol;
         let client_protocols = Arc::clone(&self.client_protocols);
+        let sip_dialogs = Arc::clone(&self.sip_dialogs);
         let awg_params = self.awg_params.clone();
         // Size the per-session relay buffer from configured `buffer_size` so
         // backend datagrams are not silently truncated by `recv()`.
@@ -587,6 +587,7 @@ impl Proxy {
                         sessions.remove(&client_addr);
                         client_protocols.remove(&client_addr);
                         metrics.remove(&client_addr);
+                        sip_dialogs.remove(&client_addr);
                         break;
                     }
                 }
@@ -625,6 +626,7 @@ impl Proxy {
         let sessions = Arc::clone(&self.sessions);
         let metrics = Arc::clone(&self.metrics);
         let client_protocols = Arc::clone(&self.client_protocols);
+        let sip_dialogs = Arc::clone(&self.sip_dialogs);
         let relay_handles = Arc::clone(&self.relay_handles);
         let interval = Duration::from_secs(self.config.cleanup_interval_secs);
 
@@ -637,6 +639,7 @@ impl Proxy {
                 for addr in &expired {
                     metrics.remove(addr);
                     client_protocols.remove(addr);
+                    sip_dialogs.remove(addr);
                     // Abort the relay task for the expired session
                     if let Some((_, entry)) = relay_handles.remove(addr) {
                         entry.handle.abort();

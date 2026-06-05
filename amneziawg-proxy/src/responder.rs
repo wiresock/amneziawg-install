@@ -528,7 +528,7 @@ pub enum SipDialogStage {
     Idle,
     /// INVITE received; `100 Trying` + `180 Ringing` sent, awaiting ACK.
     Invited,
-    /// ACK received; call is established, awaiting BYE.
+    /// `200 OK` sent; awaiting ACK or BYE.
     Established,
     /// BYE (or CANCEL) received; `200 OK` sent.  Next INVITE starts fresh.
     Terminated,
@@ -541,8 +541,8 @@ pub enum SipDialogStage {
 #[derive(Debug, Clone)]
 pub struct SipDialog {
     pub stage: SipDialogStage,
-    /// `Via:` header line(s), echoed from the original INVITE.
-    pub via: String,
+    /// All `Via:` header lines, echoed from the original INVITE (one per hop).
+    pub via: Vec<String>,
     /// `From:` header line, echoed from the original INVITE.
     pub from: String,
     /// `To:` header line from the INVITE (no tag yet — added on 200 OK).
@@ -562,7 +562,7 @@ impl SipDialog {
         let scan_limit = std::cmp::min(incoming.len(), 4096);
         let text = std::str::from_utf8(&incoming[..scan_limit]).ok()?;
 
-        let mut via = String::new();
+        let mut via: Vec<String> = Vec::new();
         let mut from = String::new();
         let mut to = String::new();
         let mut call_id = String::new();
@@ -570,8 +570,8 @@ impl SipDialog {
 
         for line in text.lines() {
             let t = line.trim();
-            if via.is_empty() && t.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("via:")) {
-                via = t.to_string();
+            if t.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("via:")) {
+                via.push(t.to_string());
             } else if from.is_empty()
                 && t.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("from:"))
             {
@@ -591,7 +591,9 @@ impl SipDialog {
             }
         }
 
-        if call_id.is_empty() {
+        // Require all RFC 3261 §8.1.1 mandatory headers so responses are never
+        // malformed.  Fall back to the stateless path if any are absent.
+        if via.is_empty() || from.is_empty() || to.is_empty() || call_id.is_empty() || cseq.is_empty() {
             return None;
         }
 
@@ -650,8 +652,8 @@ fn build_sip_response(dialog: &SipDialog, status_line: &str, add_to_tag: bool) -
     buf.put_slice(status_line.as_bytes());
     buf.put_slice(b"\r\n");
 
-    if !dialog.via.is_empty() {
-        buf.put_slice(dialog.via.as_bytes());
+    for v in &dialog.via {
+        buf.put_slice(v.as_bytes());
         buf.put_slice(b"\r\n");
     }
     if !dialog.from.is_empty() {
@@ -718,7 +720,10 @@ pub fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<Bytes> {
                     build_sip_response(dialog, "SIP/2.0 180 Ringing", true),
                 ]
             }
-            SipDialogStage::Established => vec![],
+            SipDialogStage::Established => {
+                // Retransmit after 200 OK sent — re-send 200 OK until ACK arrives.
+                vec![build_sip_response(dialog, "SIP/2.0 200 OK", true)]
+            }
         },
         "ACK" => vec![],
         "BYE" => {
@@ -1513,7 +1518,8 @@ Content-Length: 0\r\n\r\n"
         let invite = sample_invite();
         let dialog = SipDialog::from_invite(&invite).expect("should parse");
         assert_eq!(dialog.stage, SipDialogStage::Idle);
-        assert!(dialog.via.starts_with("Via:"));
+        assert!(!dialog.via.is_empty());
+        assert!(dialog.via[0].starts_with("Via:"));
         assert!(dialog.from.starts_with("From:"));
         assert!(dialog.to.starts_with("To:"));
         assert!(dialog.call_id.starts_with("Call-ID:"));
