@@ -147,8 +147,12 @@ const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 /// Validating the version field is what distinguishes a genuine QUIC long
 /// header from other protocols whose leading byte happens to have the
 /// long-header form bits (`0xC0`) set — most notably DNS queries whose
-/// transaction-ID high byte falls in `0xC0..=0xFF`.  A DNS query's bytes 1..5
-/// never form a recognised QUIC version, so this check rejects them.
+/// transaction-ID high byte falls in `0xC0..=0xFF`.  A well-formed DNS query's
+/// bytes 1..5 (flags + counts) do not correspond to a recognised QUIC version
+/// in practice, so this check rejects them.  Note this is a heuristic, not a
+/// guarantee: a crafted or malformed datagram could still place a matching
+/// version here — the per-client protocol lock in `handle_probe` is the
+/// defense-in-depth backstop for that case.
 ///
 /// Accepted versions:
 /// - `0x0000_0001` — QUIC v1 (RFC 9000)

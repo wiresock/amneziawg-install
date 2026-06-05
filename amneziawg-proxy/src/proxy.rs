@@ -800,6 +800,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_mode_locks_client_to_first_detected_protocol() {
+        // Regression: in auto mode the proxy must lock a client to the first
+        // protocol detected for it.  A later packet that detects as a different
+        // protocol must neither switch the stored protocol nor elicit a
+        // mismatched probe response (e.g. a DNS client being answered with a
+        // QUIC Version Negotiation packet).
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec: 16,
+            imitate_protocol: "auto".into(),
+            // QUIC would use the easily-identifiable VN fallback if it fired.
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            // DNS probes get a locally-generated SERVFAIL response.
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            awg_config: None,
+        };
+
+        let proxy = Proxy::bind(config, None).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        // (1) DNS probe locks the client to DNS and yields a SERVFAIL response.
+        let dns_query = vec![
+            0xAB, 0xCD, // transaction ID
+            0x01, 0x00, // flags: standard query, RD=1
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT = 0
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+            0x00, // root-label QNAME
+            0x00, 0x01, // QTYPE = A
+            0x00, 0x01, // QCLASS = IN
+        ];
+        assert_eq!(
+            responder::detect_protocol(&dns_query),
+            Some(responder::Protocol::Dns),
+            "precondition: first probe is detected as DNS"
+        );
+        proxy.handle_client_packet(&dns_query, client_addr).await;
+
+        let mut buf = [0u8; 4096];
+        let (n, from) = tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+            .await
+            .expect("DNS probe should receive a response")
+            .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(n >= 12, "DNS response must contain a header");
+        assert_eq!(&buf[..2], &dns_query[..2], "must echo DNS transaction ID");
+        assert_eq!(buf[2] & 0x80, 0x80, "DNS response must have QR=1");
+
+        // The client is now locked to DNS.
+        assert_eq!(
+            proxy.client_protocols.get(&client_addr).map(|p| *p),
+            Some(responder::Protocol::Dns),
+            "client must be locked to DNS after the first probe"
+        );
+
+        // Drain the forwarded DNS probe from the backend.
+        let _ = tokio::time::timeout(Duration::from_millis(200), backend.recv_from(&mut buf)).await;
+
+        // (2) A QUIC-like probe from the SAME client must be ignored by the
+        // probe responder and must not switch the stored protocol.
+        let mut quic_pkt = vec![0xC3u8, 0x00, 0x00, 0x00, 0x01];
+        quic_pkt.push(4);
+        quic_pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        quic_pkt.push(0);
+        assert_eq!(
+            responder::detect_protocol(&quic_pkt),
+            Some(responder::Protocol::Quic),
+            "precondition: second probe is detected as QUIC"
+        );
+        proxy.handle_client_packet(&quic_pkt, client_addr).await;
+
+        let mismatched = tokio::time::timeout(Duration::from_millis(150), client.recv_from(&mut buf))
+            .await;
+        assert!(
+            mismatched.is_err(),
+            "a DNS-locked client must not receive a QUIC probe response"
+        );
+        assert_eq!(
+            proxy.client_protocols.get(&client_addr).map(|p| *p),
+            Some(responder::Protocol::Dns),
+            "mis-detected QUIC probe must not switch the locked protocol"
+        );
+    }
+
+    #[tokio::test]
     async fn quic_fallback_probe_respects_rate_limit() {
         let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend.local_addr().unwrap();
