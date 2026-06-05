@@ -293,6 +293,12 @@ impl Proxy {
         let mut probe_response: Option<bytes::Bytes> = None;
 
         if let Some(proto) = responder::detect_protocol(data) {
+            // Whether this is the first detection for an auto-mode client and we
+            // therefore need to record (write-lock) its protocol.  Avoided on
+            // the hot path: established clients only take a shared read lock via
+            // `get`, and fixed-protocol mode never writes the map at all (the
+            // relay falls back to `fixed_protocol`).
+            let mut insert_needed = false;
             let selected_proto = match self.fixed_protocol {
                 Some(fixed) if proto == fixed => Some(fixed),
                 Some(_) => None,
@@ -304,11 +310,17 @@ impl Proxy {
                 // version validation in `detect_protocol`.
                 None => match self.client_protocols.get(&client_addr).map(|p| *p) {
                     Some(locked) if locked != proto => None,
-                    _ => Some(proto),
+                    Some(_) => Some(proto),
+                    None => {
+                        insert_needed = true;
+                        Some(proto)
+                    }
                 },
             };
             if let Some(proto) = selected_proto {
-                self.client_protocols.insert(client_addr, proto);
+                if insert_needed {
+                    self.client_protocols.insert(client_addr, proto);
+                }
                 if let Some(ref metrics) = metrics_ref {
                     if proto == Protocol::Quic {
                         if let Some(quic) = &self.quic_handshake {
