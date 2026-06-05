@@ -158,13 +158,13 @@ const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 /// Accepted versions:
 /// - `0x0000_0001` — QUIC v1 (RFC 9000)
 /// - `0x6b33_43cf` — QUIC v2 (RFC 9369)
-/// - `0xff00_00xx` — IETF draft versions (draft-ietf-quic-transport)
+/// - `0xff00_00xx` — IETF draft versions (draft-ietf-quic-transport), `xx` ≥ 1
 /// - `0x?a?a_?a?a` — GREASE / forced-version-negotiation values (RFC 9000 §15)
 fn is_quic_version(version: u32) -> bool {
     match version {
         0x0000_0001 => true,
         0x6b33_43cf => true,
-        v if v & 0xffff_ff00 == 0xff00_0000 => true,
+        v if v & 0xffff_ff00 == 0xff00_0000 && v & 0xff != 0 => true,
         v if v & 0x0f0f_0f0f == 0x0a0a_0a0a => true,
         _ => false,
     }
@@ -687,6 +687,26 @@ mod tests {
         assert!(is_quic_version(0x1a2a_3a4a)); // GREASE pattern
         assert!(!is_quic_version(0x0000_0000)); // VN sentinel, not a client version
         assert!(!is_quic_version(0x6b01_0000)); // DNS-query-shaped bytes
+        assert!(!is_quic_version(0xff00_0000)); // draft-0 is not a real draft; also reachable from DNS
+    }
+
+    #[test]
+    fn detect_dns_query_that_would_form_draft0_version_not_quic() {
+        // Regression: DNS query with TXID_lo=0xFF, flags=0x0000, QDCOUNT_hi=0x00
+        // produces version bytes 0xff00_0000 (QUIC draft-0).  This must be
+        // rejected as QUIC (draft-0 is excluded) and detected as DNS.
+        let pkt = vec![
+            0xC0, 0xFF, // TXID: high byte 0xC0 sets long-header bits; low byte 0xFF
+            0x00, 0x00, // flags = 0x0000 (standard query)
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT = 0
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+            0x00,       // root-label QNAME
+            0x00, 0x01, // QTYPE = A
+            0x00, 0x01, // QCLASS = IN
+        ];
+        assert_eq!(detect_protocol(&pkt), Some(Protocol::Dns));
     }
 
     #[test]
