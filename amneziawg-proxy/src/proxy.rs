@@ -50,11 +50,7 @@ fn sip_stage_after_immediate_response(
             _ => current,
         }
     } else if method == "CANCEL" {
-        if sent_any_response {
-            responder::sip_next_stage(current, method)
-        } else {
-            current
-        }
+        responder::sip_next_stage(current, method)
     } else {
         let sent_all_responses = responses_len != 0 && sent_response_count == responses_len;
         if sent_all_responses || method == "ACK" {
@@ -956,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn sip_cancel_stage_update_advances_after_any_response() {
+    fn sip_cancel_stage_update_advances_on_cancel_receipt() {
         assert_eq!(
             sip_stage_after_immediate_response(
                 SipDialogStage::Invited,
@@ -991,7 +987,7 @@ mod tests {
                 false,
                 false,
             ),
-            SipDialogStage::Invited
+            SipDialogStage::Terminated
         );
     }
 
