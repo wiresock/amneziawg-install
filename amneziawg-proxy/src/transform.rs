@@ -406,10 +406,11 @@ fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
 /// `SIP/2.0 ...` response line.
 ///
 /// The padding uses a complete SIP header block when it fits.  Mid-sized
-/// padding uses the smallest complete SIP response (`SIP/2.0 100 \r\n\r\n`,
-/// with an empty reason phrase) plus zero fill so it never exposes a partial
-/// header line. Padding shorter than that cannot contain a complete SIP
-/// response, so it falls back to a status-line fragment with a CRLF suffix.
+/// padding uses a small complete response with a reason phrase (`100 Trying`,
+/// `180 Ringing`, or `200 OK`) plus space fill so it never exposes a partial
+/// header line. Padding shorter than the smallest natural response cannot
+/// contain a complete SIP response, so it falls back to a status-line fragment
+/// with a CRLF suffix.
 fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     let padding = &mut data[..pad_size];
     if padding.is_empty() {
@@ -417,7 +418,12 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     }
 
     let len = padding.len();
-    const SIP_MIN_FILL: &[u8] = b"SIP/2.0 100 \r\n\r\n";
+    const SIP_TINY_FILL: &[u8] = b"SIP/2.0 100\r\n\r\n";
+    const SIP_SMALL_FILLS: [&[u8]; 3] = [
+        b"SIP/2.0 100 Trying\r\n\r\n",
+        b"SIP/2.0 180 Ringing\r\n\r\n",
+        b"SIP/2.0 200 OK\r\n\r\n",
+    ];
 
     // SIP 100 Trying response with a realistic Via sent-by and Content-Length.
     // Starts with the response status line so the directionality (server →
@@ -427,26 +433,33 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     //
     // The sent-by uses a plausible hostname:port instead of the literal string
     // "proxy", which would look obviously synthetic to any deep inspector.
-    static SIP_FILL: &[u8] =
-        b"SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP sip.example.com:5060;branch=z9hG4bK\r\nContent-Length: 0\r\n\r\n";
+    static SIP_FILLS: [&[u8]; 3] = [
+        b"SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP sip.example.com:5060;branch=z9hG4bK\r\nContent-Length: 0\r\n\r\n",
+        b"SIP/2.0 180 Ringing\r\nVia: SIP/2.0/UDP pbx.example.net:5060;branch=z9hG4bK\r\nContent-Length: 0\r\n\r\n",
+        b"SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP voip.example.org:5060;branch=z9hG4bK\r\nContent-Length: 0\r\n\r\n",
+    ];
 
-    let fill = if len >= SIP_FILL.len() {
-        SIP_FILL
-    } else if len >= SIP_MIN_FILL.len() {
-        SIP_MIN_FILL
+    let variant = len % SIP_SMALL_FILLS.len();
+
+    let fill = if len >= SIP_FILLS[variant].len() {
+        SIP_FILLS[variant]
+    } else if len >= SIP_SMALL_FILLS[variant].len() {
+        SIP_SMALL_FILLS[variant]
+    } else if len >= SIP_TINY_FILL.len() {
+        SIP_TINY_FILL
     } else {
-        &SIP_FILL[..std::cmp::min(len, SIP_FILL.len())]
+        &SIP_SMALL_FILLS[variant][..std::cmp::min(len, SIP_SMALL_FILLS[variant].len())]
     };
 
     padding[..fill.len()].copy_from_slice(fill);
     for b in padding[fill.len()..].iter_mut() {
-        *b = 0x00;
+        *b = b' ';
     }
 
     // Tiny padding cannot carry a complete SIP response (the smallest useful
-    // form is 16 bytes). Keep a CRLF suffix so it at least looks like a
+    // natural form is 19 bytes). Keep a CRLF suffix so it at least looks like a
     // status-line fragment rather than a broken header block.
-    if len < SIP_MIN_FILL.len() && len >= 2 {
+    if len < SIP_TINY_FILL.len() && len >= 2 {
         padding[len - 2] = b'\r';
         padding[len - 1] = b'\n';
     }
@@ -692,9 +705,8 @@ mod tests {
 
         // Padding starts with the SIP/2.0 response status line
         let padding = &data[..50];
-        assert!(padding.starts_with(b"SIP/2.0 100 "));
-        assert_eq!(&padding[..16], b"SIP/2.0 100 \r\n\r\n");
-        assert!(padding[16..].iter().all(|&b| b == 0x00));
+        assert!(padding.starts_with(b"SIP/2.0 200 OK\r\n\r\n"));
+        assert!(padding[19..].iter().all(|&b| b == b' '));
         assert!(!padding.windows(4).any(|w| w == b"\r\nVi"));
         // Payload untouched
         assert!(data[50..60].iter().all(|&b| b == 0xCC));
@@ -979,8 +991,8 @@ mod tests {
         assert!(result);
 
         // Prefix padding should contain a complete minimal SIP response.
-        assert!(pkt[..20].starts_with(b"SIP/2.0 100 \r\n\r\n"));
-        assert!(pkt[16..20].iter().all(|&b| b == 0x00));
+        assert!(pkt[..20].starts_with(b"SIP/2.0 200 OK\r\n\r\n"));
+        assert_eq!(pkt[19], b' ');
         // Header + body should be untouched
         assert_eq!(&pkt[20..24], &750u32.to_le_bytes());
         assert!(pkt[24..124].iter().all(|&b| b == 0xBB));
