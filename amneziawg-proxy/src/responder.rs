@@ -594,7 +594,7 @@ impl SipDialog {
                 if reflected_via_bytes.saturating_add(line_len) > SIP_MAX_RESPONSE_SIZE {
                     return None;
                 }
-                reflected_via_bytes += line_len;
+                reflected_via_bytes = reflected_via_bytes.saturating_add(line_len);
                 via.push(t.to_string());
             } else if from.is_empty() && t.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("from:"))
             {
