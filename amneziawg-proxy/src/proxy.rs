@@ -551,13 +551,7 @@ impl Proxy {
                     "REGISTER" | "OPTIONS" | "NOTIFY" | "SUBSCRIBE" | "MESSAGE" | "INFO" => {
                         SipDialog::from_request(data)
                             .map(|dialog| responder::generate_sip_responses(&dialog, &method))
-                            .unwrap_or_else(|| {
-                                vec![responder::generate_response_for_client(
-                                    Protocol::Sip,
-                                    data,
-                                    client_addr,
-                                )]
-                            })
+                            .unwrap_or_default()
                     }
                     _ => vec![responder::generate_response_for_client(
                         Protocol::Sip,
@@ -1785,6 +1779,33 @@ Content-Length: 0\r\n\r\n";
             assert!(
                 response.is_err(),
                 "malformed standalone BYE/CANCEL must not receive stateless 100 Trying"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_standalone_methods_do_not_fallback_to_trying() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 2), None)
+            .await
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let mut buf = [0u8; 1024];
+
+        for request in [
+            b"OPTIONS sip:olivia@profi.ru SIP/2.0\r\nCall-ID: missing-headers\r\n\r\n".as_slice(),
+            b"REGISTER sip:olivia@profi.ru SIP/2.0\r\nCall-ID: missing-headers\r\n\r\n".as_slice(),
+        ] {
+            proxy.handle_probe(request, client_addr, &metrics_ref).await;
+            let response =
+                tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+            assert!(
+                response.is_err(),
+                "malformed standalone requests must not receive stateless 100 Trying"
             );
         }
     }

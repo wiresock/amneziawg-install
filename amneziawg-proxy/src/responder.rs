@@ -578,6 +578,7 @@ impl SipDialog {
         let text = std::str::from_utf8(&incoming[..scan_limit]).ok()?;
 
         let mut via: Vec<String> = Vec::new();
+        let mut reflected_via_bytes = 0usize;
         let mut from = String::new();
         let mut to = String::new();
         let mut call_id = String::new();
@@ -589,6 +590,11 @@ impl SipDialog {
                 break;
             }
             if t.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("via:")) {
+                let line_len = t.len() + 2; // CRLF
+                if reflected_via_bytes.saturating_add(line_len) > SIP_MAX_RESPONSE_SIZE {
+                    return None;
+                }
+                reflected_via_bytes += line_len;
                 via.push(t.to_string());
             } else if from.is_empty() && t.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("from:"))
             {
