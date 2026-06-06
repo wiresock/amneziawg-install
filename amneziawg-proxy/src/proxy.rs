@@ -538,8 +538,8 @@ impl Proxy {
             };
 
             tokio::spawn(async move {
-                // 180 Ringing after 200 ms. Mark it before awaiting so an
-                // INVITE retransmit cannot also emit the first 180.
+                // 180 Ringing after 200 ms. Check the current stage at send
+                // time so retransmits that already emitted 180 suppress this.
                 time::sleep(Duration::from_millis(200)).await;
                 let ringing_allowed = metrics
                     .as_ref()

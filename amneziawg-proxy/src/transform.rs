@@ -403,8 +403,9 @@ fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
 /// emits a `METHOD sip:...` request line, and proxy-side padding emits a
 /// `SIP/2.0 ...` response line.
 ///
-/// The padding ends with CRLFCRLF when a minimal terminated SIP status block
-/// fits, or CRLF for shorter padding when at least two bytes are available.
+/// The padding uses a complete SIP header block when it fits.  Mid-sized
+/// padding uses only the minimal terminated status line plus zero fill so it
+/// never exposes a partial header line.
 fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     let padding = &mut data[..pad_size];
     if padding.is_empty() {
@@ -412,7 +413,7 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     }
 
     let len = padding.len();
-    const SIP_MIN_TERMINATED_RESPONSE_LEN: usize = b"SIP/2.0 100 Trying\r\n\r\n".len();
+    const SIP_MIN_FILL: &[u8] = b"SIP/2.0 100 Trying\r\n\r\n";
 
     // SIP 100 Trying response with a realistic Via sent-by and Content-Length.
     // Starts with the response status line so the directionality (server →
@@ -425,22 +426,22 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     static SIP_FILL: &[u8] =
         b"SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP sip.example.com:5060;branch=z9hG4bK\r\nContent-Length: 0\r\n\r\n";
 
-    // Copy at most one full pass; do not cycle — a real SIP response never
-    // repeats its own headers.  If pad_size exceeds the fill, zero-pad the rest.
-    let copy_len = std::cmp::min(len, SIP_FILL.len());
-    padding[..copy_len].copy_from_slice(&SIP_FILL[..copy_len]);
-    for b in padding[copy_len..].iter_mut() {
+    let fill = if len >= SIP_FILL.len() {
+        SIP_FILL
+    } else if len >= SIP_MIN_FILL.len() {
+        SIP_MIN_FILL
+    } else {
+        &SIP_FILL[..std::cmp::min(len, SIP_FILL.len())]
+    };
+
+    padding[..fill.len()].copy_from_slice(fill);
+    for b in padding[fill.len()..].iter_mut() {
         *b = 0x00;
     }
 
-    // Ensure the padding ends with a complete SIP header terminator when there
-    // is room, otherwise keep the legacy CRLF suffix for tiny padding.
-    if len >= SIP_MIN_TERMINATED_RESPONSE_LEN {
-        padding[len - 4] = b'\r';
-        padding[len - 3] = b'\n';
-        padding[len - 2] = b'\r';
-        padding[len - 1] = b'\n';
-    } else if len >= 2 {
+    // Tiny padding cannot carry a complete SIP message; keep the legacy CRLF
+    // suffix so it at least looks like a line fragment.
+    if len < SIP_MIN_FILL.len() && len >= 2 {
         padding[len - 2] = b'\r';
         padding[len - 1] = b'\n';
     }
@@ -638,10 +639,25 @@ mod tests {
         // Padding starts with the SIP/2.0 response status line
         let padding = &data[..50];
         assert!(padding.starts_with(b"SIP/2.0 100 Trying"));
-        // Padding ends with a complete SIP header terminator.
-        assert_eq!(&data[46..50], b"\r\n\r\n");
+        assert_eq!(&padding[..22], b"SIP/2.0 100 Trying\r\n\r\n");
+        assert!(padding[22..].iter().all(|&b| b == 0x00));
+        assert!(!padding.windows(4).any(|w| w == b"\r\nVi"));
         // Payload untouched
         assert!(data[50..60].iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
+    fn sip_padding_full_header_block_when_it_fits() {
+        let mut data = vec![0x00; 140];
+        data[120..140].fill(0xCC);
+        apply_padding(&mut data, 120, Protocol::Sip);
+
+        let padding = &data[..120];
+        let text = std::str::from_utf8(padding).unwrap();
+        assert!(text.starts_with("SIP/2.0 100 Trying\r\n"));
+        assert!(text.contains("\r\nVia: SIP/2.0/UDP sip.example.com:5060;branch=z9hG4bK\r\n"));
+        assert!(text.contains("\r\nContent-Length: 0\r\n\r\n"));
+        assert!(data[120..140].iter().all(|&b| b == 0xCC));
     }
 
     #[test]

@@ -600,8 +600,8 @@ impl SipDialog {
             }
         }
 
-        // Require all RFC 3261 §8.1.1 mandatory headers so responses are never
-        // malformed.  Fall back to the stateless path if any are absent.
+        // Require the request headers we must reflect to build well-formed
+        // responses. Fall back to the stateless path if any are absent.
         if via.is_empty()
             || from.is_empty()
             || to.is_empty()
