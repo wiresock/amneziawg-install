@@ -362,7 +362,9 @@ fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
 /// can only rewrite the AWG padding prefix and must leave the encrypted payload
 /// untouched. The leading bytes therefore mimic the STUN header shape that DPI
 /// heuristics look for: message type, zero length, magic cookie, and 96-bit
-/// transaction ID.
+/// transaction ID. Padding shorter than the 20-byte STUN header copies the
+/// longest available header prefix; 15-byte install-script padding still carries
+/// the type, length, magic cookie, and partial transaction ID.
 fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
     let (padding, payload) = data.split_at_mut(pad_size);
     if padding.is_empty() {
