@@ -897,7 +897,10 @@ pub(crate) fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<By
             invite_dialog.via = invite_dialog.invite_via.clone();
             invite_dialog.cseq = invite_dialog.invite_cseq.clone();
             let mut responses = vec![build_sip_response(dialog, "SIP/2.0 200 OK", false)];
-            if sip_cseq_method(&invite_dialog.cseq)
+            let invite_in_progress =
+                matches!(dialog.stage, SipDialogStage::Invited | SipDialogStage::Ringing);
+            if invite_in_progress
+                && sip_cseq_method(&invite_dialog.cseq)
                 .is_some_and(|method| method.eq_ignore_ascii_case("INVITE"))
             {
                 responses.push(build_sip_response(
@@ -1973,6 +1976,7 @@ CSeq: 95930 BYE\r\n\r\n",
     fn sip_dialog_cancel_returns_200_and_487() {
         let invite = sample_invite();
         let mut dialog = SipDialog::from_invite(&invite).unwrap();
+        dialog.stage = SipDialogStage::Invited;
         dialog.update_request_headers(
             b"CANCEL sip:olivia@profi.ru SIP/2.0\r\n\
 Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcancel;rport\r\n\
@@ -1999,6 +2003,25 @@ CSeq: 95931 CANCEL\r\n\r\n",
             !t0.contains(to_tag.as_str()),
             "200 OK for CANCEL must not add To tag"
         );
+    }
+
+    #[test]
+    fn sip_dialog_established_cancel_returns_only_200_ok() {
+        let invite = sample_invite();
+        let mut dialog = SipDialog::from_invite(&invite).unwrap();
+        dialog.stage = SipDialogStage::Established;
+        dialog.update_request_headers(
+            b"CANCEL sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcancel;rport\r\n\
+CSeq: 95931 CANCEL\r\n\r\n",
+        );
+
+        let responses = generate_sip_responses(&dialog, "CANCEL");
+        assert_eq!(responses.len(), 1);
+        let text = std::str::from_utf8(&responses[0]).unwrap();
+        assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(text.contains("CSeq: 95931 CANCEL"));
+        assert!(!text.contains("487 Request Terminated"));
     }
 
     #[test]
