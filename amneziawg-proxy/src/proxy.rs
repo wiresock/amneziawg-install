@@ -524,7 +524,11 @@ impl Proxy {
                     current => current,
                 }
             } else {
-                responder::sip_next_stage(d.stage, &method)
+                if sent_any_response || method == "ACK" {
+                    responder::sip_next_stage(d.stage, &method)
+                } else {
+                    d.stage
+                }
             };
         }
 
@@ -1479,6 +1483,49 @@ Content-Length: 0\r\n\r\n";
         assert!(std::str::from_utf8(&buf[..n])
             .unwrap()
             .starts_with("SIP/2.0 100 Trying\r\n"));
+    }
+
+    #[tokio::test]
+    async fn sip_non_invite_does_not_advance_when_response_suppressed() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 0), None)
+            .await
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinvite;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: rate-limited-bye@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let bye = b"BYE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKbye;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: rate-limited-bye@192.168.224.194\r\n\
+CSeq: 95930 BYE\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut dialog = SipDialog::from_invite(invite).unwrap();
+        dialog.stage = SipDialogStage::Established;
+        proxy.sip_dialogs.insert(client_addr, dialog);
+
+        proxy
+            .handle_sip_probe(bye, client_addr, &metrics_ref, false)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let response =
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+        assert!(response.is_err(), "rate-limited BYE should not emit 200 OK");
+        assert_eq!(
+            proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
+            Some(SipDialogStage::Established)
+        );
     }
 
     #[tokio::test]
