@@ -772,7 +772,11 @@ fn build_sip_response(dialog: &SipDialog, status_line: &str, add_to_tag: bool) -
 
 fn sip_to_has_tag(to: &str) -> bool {
     let bytes = to.as_bytes();
-    let mut i = 0;
+    let mut i = if let Some(close) = bytes.iter().position(|&b| b == b'>') {
+        close + 1
+    } else {
+        0
+    };
     while i < bytes.len() {
         if bytes[i] != b';' {
             i += 1;
@@ -2089,6 +2093,23 @@ Content-Length: 0\r\n\r\n";
         let to_line = text.lines().find(|line| line.starts_with("To:")).unwrap();
         assert!(to_line.contains("; tag = remote-tag"));
         assert!(!to_line.contains(dialog.to_tag.as_str()));
+    }
+
+    #[test]
+    fn sip_dialog_response_ignores_uri_tag_parameter() {
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia;tag=uri-param@profi.ru>\r\n\
+Call-ID: uri-tagged-to@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let dialog = SipDialog::from_invite(invite).unwrap();
+        let ok = generate_sip_ok(&dialog);
+        let text = std::str::from_utf8(&ok).unwrap();
+        let to_line = text.lines().find(|line| line.starts_with("To:")).unwrap();
+        assert!(to_line.contains("<sip:olivia;tag=uri-param@profi.ru>"));
+        assert!(to_line.contains(dialog.to_tag.as_str()));
     }
 
     #[test]
