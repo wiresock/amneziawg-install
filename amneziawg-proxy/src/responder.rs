@@ -520,14 +520,14 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
 /// Stage of a per-client SIP dialog.
 ///
 /// The proxy advances through these stages as methods arrive:
-/// `Idle` → (INVITE) → `Invited` → (180 sent) → `Ringing` → (ACK) → `Established` → (BYE) → `Terminated`
+/// `Idle` → (INVITE) → `Invited` → (180 sent) → `Ringing` → (200 OK sent) → `Established` → (BYE) → `Terminated`
 ///
 /// Once `Terminated` the dialog may be reused for a new INVITE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SipDialogStage {
     /// No dialog in progress; proxy will respond to INVITE to start one.
     Idle,
-    /// INVITE received; initial response sent, awaiting final answer or ACK.
+    /// INVITE received; initial response sent, awaiting provisional/final answer.
     Invited,
     /// `180 Ringing` sent; final `200 OK` is still pending.
     Ringing,
@@ -613,6 +613,11 @@ impl SipDialog {
             || to.is_empty()
             || call_id.is_empty()
             || cseq.is_empty()
+            || via.iter().any(|line| sip_header_value(line).is_empty())
+            || sip_header_value(&from).is_empty()
+            || sip_header_value(&to).is_empty()
+            || sip_header_value(&call_id).is_empty()
+            || sip_header_value(&cseq).is_empty()
         {
             return None;
         }
@@ -886,10 +891,11 @@ pub(crate) fn sip_next_stage(current: SipDialogStage, method: &str) -> SipDialog
             SipDialogStage::Ringing | SipDialogStage::Established => current,
         },
         "ACK" => match current {
-            SipDialogStage::Invited | SipDialogStage::Ringing | SipDialogStage::Established => {
-                SipDialogStage::Established
-            }
-            SipDialogStage::Idle | SipDialogStage::Terminated => current,
+            SipDialogStage::Established => SipDialogStage::Established,
+            SipDialogStage::Idle
+            | SipDialogStage::Invited
+            | SipDialogStage::Ringing
+            | SipDialogStage::Terminated => current,
         },
         "BYE" => match current {
             SipDialogStage::Idle => SipDialogStage::Idle,
@@ -1712,6 +1718,27 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[test]
+    fn sip_dialog_rejects_empty_required_header_values() {
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bK\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID:     \r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        assert!(SipDialog::from_invite(invite).is_none());
+
+        let options = b"OPTIONS sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bK\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: options-call@192.168.224.194\r\n\
+CSeq:   \r\n\
+Content-Length: 0\r\n\r\n";
+        assert!(SipDialog::from_request(options).is_none());
+    }
+
+    #[test]
     fn sip_dialog_ignores_body_lines_after_header_terminator() {
         let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
 From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
@@ -2040,7 +2067,11 @@ Content-Length: 0\r\n\r\n";
         );
         assert_eq!(
             sip_next_stage(SipDialogStage::Invited, "ACK"),
-            SipDialogStage::Established
+            SipDialogStage::Invited
+        );
+        assert_eq!(
+            sip_next_stage(SipDialogStage::Ringing, "ACK"),
+            SipDialogStage::Ringing
         );
         assert_eq!(
             sip_next_stage(SipDialogStage::Invited, "INVITE"),
