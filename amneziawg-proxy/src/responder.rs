@@ -866,7 +866,7 @@ pub(crate) fn sip_method(data: &[u8]) -> Option<&str> {
 /// The caller is responsible for advancing `dialog.stage` after calling this
 /// (use the `SipDialogStage` variant returned by [`sip_next_stage`]).
 pub(crate) fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<Bytes> {
-    match method.to_ascii_uppercase().as_str() {
+    match method {
         "INVITE" => match dialog.stage {
             SipDialogStage::Idle | SipDialogStage::Terminated => {
                 // Fresh call: 100 Trying immediately; 180 Ringing follows
@@ -924,7 +924,7 @@ pub(crate) fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<By
 
 /// Return the next `SipDialogStage` after handling `method` in the current dialog.
 pub(crate) fn sip_next_stage(current: SipDialogStage, method: &str) -> SipDialogStage {
-    match method.to_ascii_uppercase().as_str() {
+    match method {
         "INVITE" => match current {
             SipDialogStage::Idle | SipDialogStage::Terminated => SipDialogStage::Invited,
             SipDialogStage::Invited => SipDialogStage::Ringing,
