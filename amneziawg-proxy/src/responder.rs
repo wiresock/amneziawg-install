@@ -698,7 +698,7 @@ impl SipDialog {
 }
 
 fn sip_header_line(line: &str) -> &str {
-    line.strip_suffix('\r').unwrap_or(line)
+    line.split('\r').next().unwrap_or("")
 }
 
 fn sip_header_value(line: &str) -> &str {
@@ -977,7 +977,7 @@ fn generate_sip_trying(incoming: &[u8]) -> Bytes {
     if let Ok(text) = std::str::from_utf8(&incoming[..scan_limit]) {
         let echo_prefixes = ["via:", "from:", "to:", "call-id:", "cseq:"];
         for line in text.lines() {
-            let trimmed = line.trim();
+            let trimmed = sip_header_line(line).trim();
             for &prefix in &echo_prefixes {
                 if trimmed
                     .get(..prefix.len())
@@ -1337,6 +1337,15 @@ mod tests {
         assert!(text.contains("To:"));
         assert!(text.contains("Call-ID:"));
         assert!(text.contains("CSeq:"));
+    }
+
+    #[test]
+    fn generate_sip_response_ignores_embedded_cr_in_header_lines() {
+        let incoming = b"INVITE sip:user@example.com SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK776\r\nFrom: <sip:caller@example.com>;tag=1234\rINJECTED: bad\r\nTo: <sip:user@example.com>\r\nCall-ID: a84b4c76e66710@pc33.example.com\r\nCSeq: 314159 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let resp = generate_response(Protocol::Sip, incoming);
+        let text = std::str::from_utf8(&resp).unwrap();
+        assert!(!text.contains("INJECTED: bad"));
+        assert!(text.contains("From: <sip:caller@example.com>;tag=1234"));
     }
 
     #[test]
