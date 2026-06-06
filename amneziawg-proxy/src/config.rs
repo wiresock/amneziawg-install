@@ -713,6 +713,51 @@ AllowedIPs = 10.66.66.2/32
     }
 
     #[test]
+    fn parse_awg_config_accepts_install_script_s_range_boundaries() {
+        for s in [15, 64, 150] {
+            let conf = format!(
+                r#"[Interface]
+Jc = 1
+Jmin = 10
+Jmax = 100
+S1 = {s}
+S2 = {s}
+S3 = {s}
+S4 = {s}
+H1 = 100-200
+H2 = 300-400
+H3 = 500-600
+H4 = 700-800
+"#
+            );
+            let p = parse_awg_config(&conf).unwrap();
+            assert_eq!(p.s1, s);
+            assert_eq!(p.s2, s);
+            assert_eq!(p.s3, s);
+            assert_eq!(p.s4, s);
+        }
+    }
+
+    #[test]
+    fn parse_awg_config_does_not_reject_below_install_script_s_range() {
+        let conf = r#"[Interface]
+Jc = 1
+Jmin = 10
+Jmax = 100
+S1 = 0
+S2 = 1
+S3 = 14
+S4 = 14
+H1 = 100-200
+H2 = 300-400
+H3 = 500-600
+H4 = 700-800
+"#;
+        let p = parse_awg_config(conf).unwrap();
+        assert_eq!((p.s1, p.s2, p.s3, p.s4), (0, 1, 14, 14));
+    }
+
+    #[test]
     fn parse_awg_config_single_h_value() {
         let conf = r#"[Interface]
 Jc = 1

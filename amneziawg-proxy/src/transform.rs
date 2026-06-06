@@ -138,7 +138,7 @@ pub(crate) fn build_padded_packet(payload: &[u8], pad_len: usize, proto: Protoco
 // Protocol-specific padding implementations
 // ---------------------------------------------------------------------------
 
-/// QUIC long-header Initial padding (S1 — Handshake Initiation).
+/// QUIC long-header Initial padding for generic, packet-type-unaware padding.
 ///
 /// Emits a QUIC v1 long-header Initial prologue (RFC 9000 §17.2.2):
 ///   - byte 0:    `0xC0 | PN_len` — form=1, fixed=1, type=00 (Initial),
@@ -208,7 +208,7 @@ fn apply_quic_padding_handshake(data: &mut [u8], pad_size: usize) {
     }
 }
 
-/// QUIC short-header 1-RTT padding (S4 — Transport Data).
+/// QUIC short-header 1-RTT padding (S1/S4 — HandshakeInit / TransportData).
 ///
 /// Emits a QUIC 1-RTT short-header byte (RFC 9000 §17.3.1) followed by
 /// pseudo-random bytes simulating an encrypted QUIC 1-RTT payload:
@@ -404,8 +404,10 @@ fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
 /// `SIP/2.0 ...` response line.
 ///
 /// The padding uses a complete SIP header block when it fits.  Mid-sized
-/// padding uses only the minimal terminated status line plus zero fill so it
-/// never exposes a partial header line.
+/// padding uses the smallest complete SIP response (`SIP/2.0 100 \r\n\r\n`,
+/// with an empty reason phrase) plus zero fill so it never exposes a partial
+/// header line. Padding shorter than that cannot contain a complete SIP
+/// response, so it falls back to a status-line fragment with a CRLF suffix.
 fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     let padding = &mut data[..pad_size];
     if padding.is_empty() {
@@ -413,7 +415,7 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     }
 
     let len = padding.len();
-    const SIP_MIN_FILL: &[u8] = b"SIP/2.0 100 Trying\r\n\r\n";
+    const SIP_MIN_FILL: &[u8] = b"SIP/2.0 100 \r\n\r\n";
 
     // SIP 100 Trying response with a realistic Via sent-by and Content-Length.
     // Starts with the response status line so the directionality (server →
@@ -439,8 +441,9 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
         *b = 0x00;
     }
 
-    // Tiny padding cannot carry a complete SIP message; keep the legacy CRLF
-    // suffix so it at least looks like a line fragment.
+    // Tiny padding cannot carry a complete SIP response (the smallest useful
+    // form is 16 bytes). Keep a CRLF suffix so it at least looks like a
+    // status-line fragment rather than a broken header block.
     if len < SIP_MIN_FILL.len() && len >= 2 {
         padding[len - 2] = b'\r';
         padding[len - 1] = b'\n';
@@ -512,6 +515,55 @@ mod tests {
         apply_padding(&mut data_a, 10, Protocol::Quic);
         apply_padding(&mut data_b, 10, Protocol::Quic);
         assert_ne!(&data_a[..10], &data_b[..10]);
+    }
+
+    #[test]
+    fn protocol_padding_generates_boundaries_15_64_150() {
+        for proto in [Protocol::Quic, Protocol::Dns, Protocol::Stun, Protocol::Sip] {
+            for pad_size in [15usize, 64, 150] {
+                let mut data = vec![0x00; pad_size + 32];
+                data[pad_size..].fill(0xCC);
+
+                apply_padding(&mut data, pad_size, proto);
+
+                assert!(
+                    data[..pad_size].iter().any(|&b| b != 0x00),
+                    "{proto:?} padding should write a protocol-shaped prefix at {pad_size} bytes"
+                );
+                assert!(
+                    data[pad_size..].iter().all(|&b| b == 0xCC),
+                    "{proto:?} padding must not touch payload at {pad_size} bytes"
+                );
+
+                match proto {
+                    Protocol::Quic => {
+                        assert_ne!(
+                            data[0] & 0x40,
+                            0,
+                            "QUIC fixed bit should be set at {pad_size} bytes"
+                        );
+                    }
+                    Protocol::Dns => {
+                        assert_eq!(data[2], 0x80, "DNS QR flag at {pad_size} bytes");
+                        assert_eq!(data[3], 0x80, "DNS RA flag at {pad_size} bytes");
+                    }
+                    Protocol::Stun => {
+                        assert_eq!(&data[0..2], &0x0011u16.to_be_bytes());
+                        if pad_size >= 8 {
+                            assert_eq!(&data[4..8], &0x2112_A442u32.to_be_bytes());
+                        }
+                    }
+                    Protocol::Sip => {
+                        assert!(data[..pad_size].starts_with(b"SIP/2.0"));
+                        if pad_size >= 16 {
+                            assert!(data[..pad_size].windows(4).any(|w| w == b"\r\n\r\n"));
+                        } else {
+                            assert_eq!(&data[pad_size - 2..pad_size], b"\r\n");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // -- DNS padding tests --
@@ -638,9 +690,9 @@ mod tests {
 
         // Padding starts with the SIP/2.0 response status line
         let padding = &data[..50];
-        assert!(padding.starts_with(b"SIP/2.0 100 Trying"));
-        assert_eq!(&padding[..22], b"SIP/2.0 100 Trying\r\n\r\n");
-        assert!(padding[22..].iter().all(|&b| b == 0x00));
+        assert!(padding.starts_with(b"SIP/2.0 100 "));
+        assert_eq!(&padding[..16], b"SIP/2.0 100 \r\n\r\n");
+        assert!(padding[16..].iter().all(|&b| b == 0x00));
         assert!(!padding.windows(4).any(|w| w == b"\r\nVi"));
         // Payload untouched
         assert!(data[50..60].iter().all(|&b| b == 0xCC));
@@ -797,6 +849,92 @@ mod tests {
         }
     }
 
+    fn awg_params_with_s(s: u32) -> AwgParams {
+        AwgParams {
+            s1: s,
+            s2: s,
+            s3: s,
+            s4: s,
+            ..test_awg_params()
+        }
+    }
+
+    fn build_awg_packet(pkt_type: AwgPacketType, params: &AwgParams) -> (Vec<u8>, usize, u32) {
+        let (pad_size, header, body_len) = match pkt_type {
+            AwgPacketType::HandshakeInit => (params.s1 as usize, 150u32, 148 - 4),
+            AwgPacketType::HandshakeResponse => (params.s2 as usize, 350u32, 92 - 4),
+            AwgPacketType::CookieReply => (params.s3 as usize, 550u32, 64 - 4),
+            AwgPacketType::TransportData => (params.s4 as usize, 750u32, 32 - 4),
+        };
+
+        let mut pkt = vec![0xFF; pad_size];
+        pkt.extend_from_slice(&header.to_le_bytes());
+        pkt.extend(std::iter::repeat(0xAB).take(body_len));
+        (pkt, pad_size, header)
+    }
+
+    fn assert_protocol_prefix(proto: Protocol, pkt_type: AwgPacketType, data: &[u8], pad_size: usize) {
+        match proto {
+            Protocol::Quic => match pkt_type {
+                AwgPacketType::HandshakeInit | AwgPacketType::TransportData => {
+                    assert_eq!(data[0] & 0xC0, 0x40, "QUIC S1/S4 must use 1-RTT");
+                    assert_eq!(data[0] & 0x18, 0x00, "QUIC short reserved bits cleared");
+                }
+                AwgPacketType::HandshakeResponse | AwgPacketType::CookieReply => {
+                    assert_eq!(data[0] & 0xF0, 0xE0, "QUIC S2/S3 must use Handshake");
+                    assert_eq!(&data[1..5], &[0x00, 0x00, 0x00, 0x01], "QUIC v1");
+                }
+            },
+            Protocol::Dns => {
+                assert_eq!(data[2], 0x80, "DNS QR flag");
+                assert_eq!(data[3], 0x80, "DNS RA flag");
+            }
+            Protocol::Stun => {
+                assert_eq!(&data[0..2], &0x0011u16.to_be_bytes());
+                assert_eq!(&data[4..8], &0x2112_A442u32.to_be_bytes());
+            }
+            Protocol::Sip => {
+                assert!(data[..pad_size].starts_with(b"SIP/2.0"));
+                if pad_size >= 16 {
+                    assert!(data[..pad_size].windows(4).any(|w| w == b"\r\n\r\n"));
+                } else {
+                    assert_eq!(&data[pad_size - 2..pad_size], b"\r\n");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn awg_transform_supports_s1_s2_s3_s4_boundaries_for_all_protocols() {
+        for s in [15u32, 64, 150] {
+            let params = awg_params_with_s(s);
+            for pkt_type in [
+                AwgPacketType::HandshakeInit,
+                AwgPacketType::HandshakeResponse,
+                AwgPacketType::CookieReply,
+                AwgPacketType::TransportData,
+            ] {
+                for proto in [Protocol::Quic, Protocol::Dns, Protocol::Stun, Protocol::Sip] {
+                    let (mut pkt, pad_size, header) = build_awg_packet(pkt_type, &params);
+
+                    assert_eq!(classify_awg_packet(&pkt, &params), Some(pkt_type));
+                    assert!(apply_awg_transform(&mut pkt, &params, proto));
+
+                    assert_protocol_prefix(proto, pkt_type, &pkt, pad_size);
+                    assert_eq!(
+                        &pkt[pad_size..pad_size + 4],
+                        &header.to_le_bytes(),
+                        "AWG header must stay untouched for {pkt_type:?} {proto:?} S={s}"
+                    );
+                    assert!(
+                        pkt[pad_size + 4..].iter().all(|&b| b == 0xAB),
+                        "AWG payload must stay untouched for {pkt_type:?} {proto:?} S={s}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn awg_transform_handshake_init_quic() {
         let params = test_awg_params();
@@ -838,11 +976,9 @@ mod tests {
         let result = apply_awg_transform(&mut pkt, &params, Protocol::Sip);
         assert!(result);
 
-        // Prefix padding should start with the SIP response status line
-        assert!(pkt[..20].starts_with(b"SIP/2.0 100 Trying"));
-        // Too short for a complete SIP header block; padding still ends with CRLF.
-        assert_eq!(pkt[18], b'\r');
-        assert_eq!(pkt[19], b'\n');
+        // Prefix padding should contain a complete minimal SIP response.
+        assert!(pkt[..20].starts_with(b"SIP/2.0 100 \r\n\r\n"));
+        assert!(pkt[16..20].iter().all(|&b| b == 0x00));
         // Header + body should be untouched
         assert_eq!(&pkt[20..24], &750u32.to_le_bytes());
         assert!(pkt[24..124].iter().all(|&b| b == 0xBB));
