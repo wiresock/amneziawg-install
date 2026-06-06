@@ -423,17 +423,17 @@ impl Proxy {
                 let existing = self
                     .sip_dialogs
                     .get(&client_addr)
-                    .map(|d| (d.stage, d.call_id.clone()));
+                    .map(|d| (d.stage, d.call_id_value.clone()));
                 let is_new_dialog = existing
                     .as_ref()
-                    .map(|(stage, call_id)| {
+                    .map(|(stage, call_id_value)| {
                         matches!(stage, SipDialogStage::Terminated | SipDialogStage::Idle)
-                            || call_id != &dialog.call_id
+                            || call_id_value != &dialog.call_id_value
                     })
                     .unwrap_or(true);
 
                 if is_new_dialog {
-                    fresh_call_id = Some(dialog.call_id.clone());
+                    fresh_call_id = Some(dialog.call_id_value.clone());
                     self.sip_dialogs.insert(client_addr, dialog);
                     is_fresh_invite = true;
                 } else {
@@ -546,7 +546,9 @@ impl Proxy {
                     .map_or(true, |metrics| metrics.try_acquire_probe());
                 let ringing = if ringing_allowed {
                     dialogs.get_mut(&client_addr).and_then(|mut d| {
-                        if d.stage == SipDialogStage::Invited && d.call_id == expected_call_id {
+                        if d.stage == SipDialogStage::Invited
+                            && d.call_id_value == expected_call_id
+                        {
                             d.stage = SipDialogStage::Ringing;
                             Some(responder::generate_sip_ringing(&d))
                         } else {
@@ -557,9 +559,21 @@ impl Proxy {
                     None
                 };
                 if let Some(pkt) = ringing {
-                    if frontend.send_to(&pkt, client_addr).await.is_ok() {
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_probe();
+                    match frontend.send_to(&pkt, client_addr).await {
+                        Ok(_) => {
+                            if let Some(metrics) = metrics.as_ref() {
+                                metrics.record_probe();
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%client_addr, error = %e, "failed to send deferred SIP 180 Ringing");
+                            if let Some(mut d) = dialogs.get_mut(&client_addr) {
+                                if d.stage == SipDialogStage::Ringing
+                                    && d.call_id_value == expected_call_id
+                                {
+                                    d.stage = SipDialogStage::Invited;
+                                }
+                            }
                         }
                     }
                 } else if !ringing_allowed {
@@ -576,7 +590,7 @@ impl Proxy {
                         .get(&client_addr)
                         .filter(|d| {
                             matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
-                                && d.call_id == expected_call_id
+                                && d.call_id_value == expected_call_id
                         })
                         .map(|d| responder::generate_sip_ok(&d))
                 } else {
@@ -592,7 +606,7 @@ impl Proxy {
                     if sent {
                         if let Some(mut d) = dialogs.get_mut(&client_addr) {
                             if matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
-                                && d.call_id == expected_call_id
+                                && d.call_id_value == expected_call_id
                             {
                                 d.stage = SipDialogStage::Established;
                             }
@@ -1289,6 +1303,81 @@ Content-Length: 0\r\n\r\n";
                 .map(|d| d.call_id.clone())
                 .as_deref(),
             Some("Call-ID: new-active-call@192.168.224.194")
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_invite_same_call_id_value_is_retransmit() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKfirst;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=first\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: same-active-call@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let retransmit = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKretransmit;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=first\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+CALL-ID:    same-active-call@192.168.224.194   \r\n\
+CSeq: 95930 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("fresh INVITE should receive response")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        proxy
+            .handle_sip_probe(retransmit, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut statuses = Vec::new();
+        let mut saw_retransmit_via = false;
+        for _ in 0..2 {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                    .await
+                    .expect("same Call-ID value should be treated as retransmit")
+                    .unwrap();
+            assert_eq!(from, proxy_addr);
+            let text = std::str::from_utf8(&buf[..n]).unwrap();
+            statuses.push(text.lines().next().unwrap().to_string());
+            saw_retransmit_via |= text.contains("branch=z9hG4bKretransmit");
+            assert!(text.contains("Call-ID: same-active-call@192.168.224.194"));
+            assert!(!text.contains("CALL-ID:"));
+        }
+
+        assert!(statuses.iter().any(|s| s == "SIP/2.0 100 Trying"));
+        assert!(statuses.iter().any(|s| s == "SIP/2.0 180 Ringing"));
+        assert!(saw_retransmit_via);
+        assert_eq!(
+            proxy
+                .sip_dialogs
+                .get(&client_addr)
+                .map(|d| d.call_id_value.clone())
+                .as_deref(),
+            Some("same-active-call@192.168.224.194")
         );
     }
 

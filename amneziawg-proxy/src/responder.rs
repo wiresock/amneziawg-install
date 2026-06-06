@@ -557,6 +557,8 @@ pub(crate) struct SipDialog {
     pub(crate) to_tag: String,
     /// `Call-ID:` header line, echoed from the original INVITE.
     pub(crate) call_id: String,
+    /// Normalized Call-ID value, used for dialog identity comparisons.
+    pub(crate) call_id_value: String,
     /// Original INVITE `CSeq:` header, used for final responses to the INVITE
     /// transaction (for example `487 Request Terminated` after CANCEL).
     pub(crate) invite_cseq: String,
@@ -617,7 +619,8 @@ impl SipDialog {
 
         // Derive a stable To-tag from the Call-ID so it is deterministic across
         // retransmits but distinct per dialog.
-        let to_tag = sip_dialog_tag(sip_header_value(&call_id));
+        let call_id_value = sip_header_value(&call_id).to_string();
+        let to_tag = sip_dialog_tag(&call_id_value);
 
         let dialog = SipDialog {
             stage: SipDialogStage::Idle,
@@ -627,6 +630,7 @@ impl SipDialog {
             to,
             to_tag,
             call_id,
+            call_id_value,
             invite_cseq: cseq.clone(),
             cseq,
         };
