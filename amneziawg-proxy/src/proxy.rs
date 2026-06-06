@@ -49,6 +49,12 @@ fn sip_stage_after_immediate_response(
             }
             _ => current,
         }
+    } else if method == "CANCEL" {
+        if sent_any_response {
+            responder::sip_next_stage(current, method)
+        } else {
+            current
+        }
     } else {
         let sent_all_responses = responses_len != 0 && sent_response_count == responses_len;
         if sent_all_responses || method == "ACK" {
@@ -947,6 +953,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sip_cancel_stage_update_advances_after_any_response() {
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Invited,
+                Some(SipDialogStage::Invited),
+                "CANCEL",
+                2,
+                1,
+                true,
+                false,
+            ),
+            SipDialogStage::Terminated
+        );
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Ringing,
+                Some(SipDialogStage::Ringing),
+                "CANCEL",
+                2,
+                1,
+                true,
+                false,
+            ),
+            SipDialogStage::Terminated
+        );
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Invited,
+                Some(SipDialogStage::Invited),
+                "CANCEL",
+                2,
+                0,
+                false,
+                false,
+            ),
+            SipDialogStage::Invited
+        );
+    }
+
     #[tokio::test]
     async fn proxy_bind_and_shutdown() {
         let config = ProxyConfig {
@@ -1779,7 +1825,7 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
-    async fn sip_cancel_does_not_advance_when_only_partially_emitted() {
+    async fn sip_cancel_advances_when_487_is_rate_limited() {
         let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend.local_addr().unwrap();
 
@@ -1828,7 +1874,7 @@ Content-Length: 0\r\n\r\n";
         assert!(second.is_err(), "487 should be suppressed by rate limit");
         assert_eq!(
             proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
-            Some(SipDialogStage::Invited)
+            Some(SipDialogStage::Terminated)
         );
     }
 
