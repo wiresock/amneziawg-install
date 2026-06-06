@@ -24,6 +24,11 @@ struct RelayEntry {
     generation: u64,
 }
 
+struct SipDeferredEntry {
+    handle: tokio::task::JoinHandle<()>,
+    generation: u64,
+}
+
 fn sip_stage_after_immediate_response(
     current: SipDialogStage,
     stage_before_response: Option<SipDialogStage>,
@@ -75,9 +80,11 @@ pub struct Proxy {
     /// back to the client — fully event-driven, no polling.
     relay_handles: Arc<DashMap<SocketAddr, RelayEntry>>,
     /// Deferred SIP dialog response tasks, keyed by client address.
-    sip_deferred_handles: Arc<DashMap<SocketAddr, tokio::task::JoinHandle<()>>>,
+    sip_deferred_handles: Arc<DashMap<SocketAddr, SipDeferredEntry>>,
     /// Monotonically increasing generation counter for relay tasks.
     relay_generation: AtomicU64,
+    /// Monotonically increasing generation counter for deferred SIP tasks.
+    sip_deferred_generation: AtomicU64,
 }
 
 impl Proxy {
@@ -146,6 +153,7 @@ impl Proxy {
             relay_handles: Arc::new(DashMap::new()),
             sip_deferred_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
+            sip_deferred_generation: AtomicU64::new(0),
         })
     }
 
@@ -175,6 +183,7 @@ impl Proxy {
             relay_handles: Arc::new(DashMap::new()),
             sip_deferred_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
+            sip_deferred_generation: AtomicU64::new(0),
         }
     }
 
@@ -267,7 +276,7 @@ impl Proxy {
         });
         self.relay_handles.clear();
         self.sip_deferred_handles.iter().for_each(|entry| {
-            entry.value().abort();
+            entry.value().handle.abort();
         });
         self.sip_deferred_handles.clear();
         info!("proxy stopped");
@@ -318,8 +327,8 @@ impl Proxy {
                 self.metrics.remove(&client_addr);
                 self.client_protocols.remove(&client_addr);
                 self.sip_dialogs.remove(&client_addr);
-                if let Some((_, handle)) = self.sip_deferred_handles.remove(&client_addr) {
-                    handle.abort();
+                if let Some((_, entry)) = self.sip_deferred_handles.remove(&client_addr) {
+                    entry.handle.abort();
                 }
             }
         }
@@ -603,6 +612,8 @@ impl Proxy {
             let dialogs = Arc::clone(&self.sip_dialogs);
             let metrics = metrics_ref.as_ref().map(Arc::clone);
             let shutdown = Arc::clone(&self.shutdown);
+            let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
+            let generation = self.sip_deferred_generation.fetch_add(1, Ordering::Relaxed);
             let expected_call_id = match fresh_call_id {
                 Some(call_id) => call_id,
                 None => return,
@@ -618,39 +629,32 @@ impl Proxy {
                 let ringing_allowed = metrics
                     .as_ref()
                     .map_or(true, |metrics| metrics.try_acquire_probe());
-                let ringing = if ringing_allowed {
-                    dialogs.get_mut(&client_addr).and_then(|mut d| {
+                if ringing_allowed {
+                    let sent = dialogs.get_mut(&client_addr).is_some_and(|mut d| {
                         if d.stage == SipDialogStage::Invited
                             && d.call_id_value == expected_call_id
                         {
-                            d.stage = SipDialogStage::Ringing;
-                            Some(responder::generate_sip_ringing(&d))
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                };
-                if let Some(pkt) = ringing {
-                    match frontend.send_to(&pkt, client_addr).await {
-                        Ok(_) => {
-                            if let Some(metrics) = metrics.as_ref() {
-                                metrics.record_probe();
-                            }
-                        }
-                        Err(e) => {
-                            warn!(%client_addr, error = %e, "failed to send deferred SIP 180 Ringing");
-                            if let Some(mut d) = dialogs.get_mut(&client_addr) {
-                                if d.stage == SipDialogStage::Ringing
-                                    && d.call_id_value == expected_call_id
-                                {
-                                    d.stage = SipDialogStage::Invited;
+                            let pkt = responder::generate_sip_ringing(&d);
+                            match frontend.try_send_to(&pkt, client_addr) {
+                                Ok(_) => {
+                                    d.stage = SipDialogStage::Ringing;
+                                    true
+                                }
+                                Err(e) => {
+                                    warn!(%client_addr, error = %e, "failed to send deferred SIP 180 Ringing");
+                                    false
                                 }
                             }
+                        } else {
+                            false
+                        }
+                    });
+                    if sent {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_probe();
                         }
                     }
-                } else if !ringing_allowed {
+                } else {
                     debug!(%client_addr, "deferred SIP 180 Ringing rate limited");
                 }
 
@@ -693,11 +697,23 @@ impl Proxy {
                 } else {
                     debug!(%client_addr, "deferred SIP 200 OK rate limited");
                 }
+                sip_deferred_handles.remove_if(&client_addr, |_, entry| {
+                    entry.generation == generation
+                });
             });
-            if let Some((_, old_handle)) = self.sip_deferred_handles.remove(&client_addr) {
-                old_handle.abort();
+            if let Some((_, old_entry)) = self.sip_deferred_handles.remove(&client_addr) {
+                old_entry.handle.abort();
             }
-            self.sip_deferred_handles.insert(client_addr, handle);
+            self.sip_deferred_handles
+                .insert(client_addr, SipDeferredEntry { handle, generation });
+            if let Some(entry) = self.sip_deferred_handles.get(&client_addr) {
+                if entry.handle.is_finished() {
+                    drop(entry);
+                    self.sip_deferred_handles.remove_if(&client_addr, |_, e| {
+                        e.generation == generation && e.handle.is_finished()
+                    });
+                }
+            }
         }
     }
 
@@ -738,6 +754,7 @@ impl Proxy {
         let fixed_protocol = self.fixed_protocol;
         let client_protocols = Arc::clone(&self.client_protocols);
         let sip_dialogs = Arc::clone(&self.sip_dialogs);
+        let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
         let awg_params = self.awg_params.clone();
         // Size the per-session relay buffer from configured `buffer_size` so
         // backend datagrams are not silently truncated by `recv()`.
@@ -790,6 +807,9 @@ impl Proxy {
                         client_protocols.remove(&client_addr);
                         metrics.remove(&client_addr);
                         sip_dialogs.remove(&client_addr);
+                        if let Some((_, entry)) = sip_deferred_handles.remove(&client_addr) {
+                            entry.handle.abort();
+                        }
                         break;
                     }
                 }
@@ -843,8 +863,8 @@ impl Proxy {
                     metrics.remove(addr);
                     client_protocols.remove(addr);
                     sip_dialogs.remove(addr);
-                    if let Some((_, handle)) = sip_deferred_handles.remove(addr) {
-                        handle.abort();
+                    if let Some((_, entry)) = sip_deferred_handles.remove(addr) {
+                        entry.handle.abort();
                     }
                     // Abort the relay task for the expired session
                     if let Some((_, entry)) = relay_handles.remove(addr) {
@@ -865,7 +885,7 @@ impl Drop for Proxy {
             entry.value().handle.abort();
         });
         self.sip_deferred_handles.iter().for_each(|entry| {
-            entry.value().abort();
+            entry.value().handle.abort();
         });
     }
 }
@@ -1866,6 +1886,118 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(
             proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
             Some(SipDialogStage::Terminated)
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_cancel_before_ringing_suppresses_deferred_ringing() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinvite;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: cancel-before-ringing@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let cancel = b"CANCEL sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcancel;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: cancel-before-ringing@192.168.224.194\r\n\
+CSeq: 95930 CANCEL\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("INVITE should receive immediate 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        proxy
+            .handle_sip_probe(cancel, client_addr, &metrics_ref, false)
+            .await;
+
+        let mut cancel_responses = Vec::new();
+        for _ in 0..2 {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                    .await
+                    .expect("CANCEL should receive both immediate responses")
+                    .unwrap();
+            assert_eq!(from, proxy_addr);
+            cancel_responses.push(std::str::from_utf8(&buf[..n]).unwrap().to_string());
+        }
+        assert!(cancel_responses
+            .iter()
+            .all(|s| !s.starts_with("SIP/2.0 180 Ringing\r\n")));
+
+        let late =
+            tokio::time::timeout(Duration::from_millis(350), client.recv_from(&mut buf)).await;
+        assert!(
+            late.is_err(),
+            "deferred 180/200 must not be sent after early CANCEL"
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_deferred_task_removes_finished_handle() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcleanup;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: cleanup-deferred@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        for expected in [
+            "SIP/2.0 100 Trying\r\n",
+            "SIP/2.0 180 Ringing\r\n",
+            "SIP/2.0 200 OK\r\n",
+        ] {
+            let (n, _) =
+                tokio::time::timeout(Duration::from_millis(1200), client.recv_from(&mut buf))
+                    .await
+                    .expect("expected SIP response")
+                    .unwrap();
+            assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with(expected));
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !proxy.sip_deferred_handles.contains_key(&client_addr),
+            "finished deferred SIP task should remove its handle"
         );
     }
 
