@@ -707,6 +707,13 @@ fn sip_header_value(line: &str) -> &str {
         .unwrap_or_else(|| line.trim())
 }
 
+fn sip_cseq_method(line: &str) -> Option<&str> {
+    let value = sip_header_value(line);
+    let mut parts = value.split_ascii_whitespace();
+    parts.next()?;
+    parts.next()
+}
+
 /// Derive a short deterministic tag string from a Call-ID.
 fn sip_dialog_tag(call_id: &str) -> String {
     // Simple non-cryptographic hash; just needs to be stable and look hex-like.
@@ -874,10 +881,17 @@ pub(crate) fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<By
             let mut invite_dialog = dialog.clone();
             invite_dialog.via = invite_dialog.invite_via.clone();
             invite_dialog.cseq = invite_dialog.invite_cseq.clone();
-            vec![
-                build_sip_response(dialog, "SIP/2.0 200 OK", false),
-                build_sip_response(&invite_dialog, "SIP/2.0 487 Request Terminated", true),
-            ]
+            let mut responses = vec![build_sip_response(dialog, "SIP/2.0 200 OK", false)];
+            if sip_cseq_method(&invite_dialog.cseq)
+                .is_some_and(|method| method.eq_ignore_ascii_case("INVITE"))
+            {
+                responses.push(build_sip_response(
+                    &invite_dialog,
+                    "SIP/2.0 487 Request Terminated",
+                    true,
+                ));
+            }
+            responses
         }
         _ => {
             // REGISTER / OPTIONS / NOTIFY / SUBSCRIBE / MESSAGE / INFO — 200 OK
@@ -1970,6 +1984,25 @@ CSeq: 95931 CANCEL\r\n\r\n",
             !t0.contains(to_tag.as_str()),
             "200 OK for CANCEL must not add To tag"
         );
+    }
+
+    #[test]
+    fn sip_dialog_request_scoped_cancel_returns_only_200_ok() {
+        let cancel = b"CANCEL sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcancel;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: request-scoped-cancel@192.168.224.194\r\n\
+CSeq: 95931 CANCEL\r\n\
+Content-Length: 0\r\n\r\n";
+
+        let dialog = SipDialog::from_request(cancel).unwrap();
+        let responses = generate_sip_responses(&dialog, "CANCEL");
+        assert_eq!(responses.len(), 1);
+        let text = std::str::from_utf8(&responses[0]).unwrap();
+        assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(text.contains("CSeq: 95931 CANCEL"));
+        assert!(!text.contains("487 Request Terminated"));
     }
 
     #[test]
