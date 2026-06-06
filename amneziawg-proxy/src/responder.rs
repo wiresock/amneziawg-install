@@ -676,10 +676,16 @@ impl SipDialog {
                     break;
                 }
                 if t.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("via:")) {
+                    if sip_header_value(t).is_empty() {
+                        return;
+                    }
                     via.push(t.to_string());
                 } else if cseq.is_none()
                     && t.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("cseq:"))
                 {
+                    if sip_header_value(t).is_empty() {
+                        return;
+                    }
                     cseq = Some(t.to_string());
                 }
             }
@@ -2184,6 +2190,30 @@ Content-Length: 0\r\n\r\n";
 
         dialog.update_request_headers(oversized.as_bytes());
 
+        assert_eq!(dialog.cseq, original_cseq);
+    }
+
+    #[test]
+    fn sip_dialog_empty_header_update_is_ignored() {
+        let invite = sample_invite();
+        let mut dialog = SipDialog::from_invite(&invite).unwrap();
+        let original_via = dialog.via.clone();
+        let original_cseq = dialog.cseq.clone();
+
+        dialog.update_request_headers(
+            b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via:\r\n\
+CSeq: 95930 INVITE\r\n\r\n",
+        );
+        assert_eq!(dialog.via, original_via);
+        assert_eq!(dialog.cseq, original_cseq);
+
+        dialog.update_request_headers(
+            b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKvalid;rport\r\n\
+CSeq:\r\n\r\n",
+        );
+        assert_eq!(dialog.via, original_via);
         assert_eq!(dialog.cseq, original_cseq);
     }
 

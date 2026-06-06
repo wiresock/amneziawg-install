@@ -621,7 +621,12 @@ impl Proxy {
                 // time so retransmits that already emitted 180 suppress this.
                 tokio::select! {
                     _ = time::sleep(Duration::from_millis(200)) => {}
-                    _ = shutdown.notified() => return,
+                    _ = shutdown.notified() => {
+                        sip_deferred_handles.remove_if(&client_addr, |_, entry| {
+                            entry.generation == generation
+                        });
+                        return;
+                    }
                 }
                 let ringing_allowed = metrics
                     .as_ref()
@@ -665,7 +670,12 @@ impl Proxy {
                 // where a CANCEL/BYE could terminate the dialog.
                 tokio::select! {
                     _ = time::sleep(Duration::from_millis(800)) => {}
-                    _ = shutdown.notified() => return,
+                    _ = shutdown.notified() => {
+                        sip_deferred_handles.remove_if(&client_addr, |_, entry| {
+                            entry.generation == generation
+                        });
+                        return;
+                    }
                 }
                 let ok_allowed = metrics
                     .as_ref()
@@ -2143,6 +2153,57 @@ Content-Length: 0\r\n\r\n";
             deferred.is_err(),
             "shutdown should suppress deferred SIP 180/200 responses"
         );
+        assert!(
+            !proxy.sip_deferred_handles.contains_key(&client_addr),
+            "shutdown before 180 should remove the deferred SIP task handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_deferred_task_removes_handle_on_shutdown_after_ringing() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKshutdown-after-ringing;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: shutdown-after-ringing@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        for expected in ["SIP/2.0 100 Trying\r\n", "SIP/2.0 180 Ringing\r\n"] {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                    .await
+                    .expect("expected SIP response before shutdown")
+                    .unwrap();
+            assert_eq!(from, proxy_addr);
+            assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with(expected));
+        }
+
+        proxy.shutdown_handle().notify_one();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !proxy.sip_deferred_handles.contains_key(&client_addr),
+            "shutdown before 200 should remove the deferred SIP task handle"
+        );
+        let final_ok =
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+        assert!(final_ok.is_err(), "shutdown should suppress deferred SIP 200 OK");
     }
 
     #[tokio::test]
