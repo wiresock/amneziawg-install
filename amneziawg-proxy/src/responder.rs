@@ -858,6 +858,8 @@ pub(crate) fn sip_method(data: &[u8]) -> Option<&str> {
 
 /// Generate the appropriate SIP response(s) for a given dialog stage + method.
 ///
+/// `method` **must** be uppercase (e.g. `"INVITE"`, `"ACK"`, `"BYE"`).
+///
 /// Returns a list because an INVITE retransmit may need to replay the latest
 /// provisional response, or a CANCEL needs
 /// both `200 OK` (for CANCEL itself) and `487 Request Terminated` (for the
@@ -923,6 +925,8 @@ pub(crate) fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<By
 }
 
 /// Return the next `SipDialogStage` after handling `method` in the current dialog.
+///
+/// `method` **must** be uppercase (e.g. `"INVITE"`, `"ACK"`, `"BYE"`).
 pub(crate) fn sip_next_stage(current: SipDialogStage, method: &str) -> SipDialogStage {
     match method {
         "INVITE" => match current {
