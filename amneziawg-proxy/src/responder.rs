@@ -904,9 +904,15 @@ pub(crate) fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<By
             }
         },
         "ACK" => vec![],
-        "BYE" => {
-            vec![build_sip_response(dialog, "SIP/2.0 200 OK", true)]
-        }
+        "BYE" => match dialog.stage {
+            SipDialogStage::Established => {
+                vec![build_sip_response(dialog, "SIP/2.0 200 OK", true)]
+            }
+            SipDialogStage::Idle
+            | SipDialogStage::Invited
+            | SipDialogStage::Ringing
+            | SipDialogStage::Terminated => Vec::new(),
+        },
         "CANCEL" => {
             let mut invite_dialog = dialog.clone();
             invite_dialog.via = invite_dialog.invite_via.clone();
@@ -2019,6 +2025,29 @@ CSeq: 95930 BYE\r\n\r\n",
         assert!(text.contains(";tag="), "200 OK for BYE must carry To tag");
         dialog.stage = sip_next_stage(dialog.stage, "BYE");
         assert_eq!(dialog.stage, SipDialogStage::Terminated);
+    }
+
+    #[test]
+    fn sip_dialog_bye_outside_established_returns_no_response() {
+        let invite = sample_invite();
+        for stage in [
+            SipDialogStage::Idle,
+            SipDialogStage::Invited,
+            SipDialogStage::Ringing,
+            SipDialogStage::Terminated,
+        ] {
+            let mut dialog = SipDialog::from_invite(&invite).unwrap();
+            dialog.stage = stage;
+            dialog.update_request_headers(
+                b"BYE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKbye;rport\r\n\
+CSeq: 95930 BYE\r\n\r\n",
+            );
+            assert!(
+                generate_sip_responses(&dialog, "BYE").is_empty(),
+                "BYE in stage {stage:?} must not receive 200 OK"
+            );
+        }
     }
 
     #[test]

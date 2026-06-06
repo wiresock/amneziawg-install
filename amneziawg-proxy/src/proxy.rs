@@ -447,7 +447,7 @@ impl Proxy {
     /// 1. `INVITE`  → `100 Trying` immediately; `180 Ringing` after ~200 ms;
     ///    `200 OK` after ~1 s (simulates answer).
     /// 2. `ACK`     → no response (call established).
-    /// 3. `BYE`     → `200 OK` immediately.
+    /// 3. `BYE`     → `200 OK` only once the dialog is established.
     /// 4. `CANCEL`  → `200 OK` immediately; plus `487 Request Terminated` when an INVITE is still in progress.
     /// REGISTER / OPTIONS / NOTIFY / SUBSCRIBE / MESSAGE / INFO each get a
     /// plain `200 OK` using whatever dialog state is available, or a bounded
