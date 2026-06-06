@@ -575,7 +575,11 @@ impl SipDialog {
     /// missing/too large to reflect safely.
     pub(crate) fn from_request(incoming: &[u8]) -> Option<Self> {
         let scan_limit = std::cmp::min(incoming.len(), SIP_SCAN_LIMIT);
-        let text = std::str::from_utf8(&incoming[..scan_limit]).ok()?;
+        let scanned = &incoming[..scan_limit];
+        if !sip_uses_crlf_line_endings(scanned) {
+            return None;
+        }
+        let text = std::str::from_utf8(scanned).ok()?;
 
         let mut via: Vec<String> = Vec::new();
         let mut reflected_via_bytes = 0usize;
@@ -666,7 +670,11 @@ impl SipDialog {
     /// Update transaction-specific reflected headers from the latest request.
     pub(crate) fn update_request_headers(&mut self, incoming: &[u8]) {
         let scan_limit = std::cmp::min(incoming.len(), SIP_SCAN_LIMIT);
-        if let Ok(text) = std::str::from_utf8(&incoming[..scan_limit]) {
+        let scanned = &incoming[..scan_limit];
+        if !sip_uses_crlf_line_endings(scanned) {
+            return;
+        }
+        if let Ok(text) = std::str::from_utf8(scanned) {
             let mut via: Vec<String> = Vec::new();
             let mut cseq: Option<String> = None;
 
@@ -712,6 +720,12 @@ impl SipDialog {
 
 fn sip_header_line(line: &str) -> &str {
     line.split('\r').next().unwrap_or("")
+}
+
+fn sip_uses_crlf_line_endings(data: &[u8]) -> bool {
+    data.iter()
+        .enumerate()
+        .all(|(i, &b)| b != b'\n' || i > 0 && data[i - 1] == b'\r')
 }
 
 fn sip_header_value(line: &str) -> &str {
@@ -997,26 +1011,29 @@ fn generate_sip_trying(incoming: &[u8]) -> Bytes {
 
     let suffix = b"Content-Length: 0\r\n\r\n";
     let scan_limit = std::cmp::min(incoming.len(), SIP_SCAN_LIMIT);
-    if let Ok(text) = std::str::from_utf8(&incoming[..scan_limit]) {
-        let echo_prefixes = ["via:", "from:", "to:", "call-id:", "cseq:"];
-        for line in text.lines() {
-            let trimmed = sip_header_line(line).trim();
-            if trimmed.is_empty() {
-                break;
-            }
-            for &prefix in &echo_prefixes {
-                if trimmed
-                    .get(..prefix.len())
-                    .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
-                {
-                    let line_len = trimmed.len() + 2;
-                    if buf.len() + line_len + suffix.len() > SIP_MAX_RESPONSE_SIZE {
-                        buf.put_slice(suffix);
-                        return buf.freeze();
-                    }
-                    buf.put_slice(trimmed.as_bytes());
-                    buf.put_slice(b"\r\n");
+    let scanned = &incoming[..scan_limit];
+    if sip_uses_crlf_line_endings(scanned) {
+        if let Ok(text) = std::str::from_utf8(scanned) {
+            let echo_prefixes = ["via:", "from:", "to:", "call-id:", "cseq:"];
+            for line in text.lines() {
+                let trimmed = sip_header_line(line).trim();
+                if trimmed.is_empty() {
                     break;
+                }
+                for &prefix in &echo_prefixes {
+                    if trimmed
+                        .get(..prefix.len())
+                        .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
+                    {
+                        let line_len = trimmed.len() + 2;
+                        if buf.len() + line_len + suffix.len() > SIP_MAX_RESPONSE_SIZE {
+                            buf.put_slice(suffix);
+                            return buf.freeze();
+                        }
+                        buf.put_slice(trimmed.as_bytes());
+                        buf.put_slice(b"\r\n");
+                        break;
+                    }
                 }
             }
         }
@@ -1383,6 +1400,24 @@ CSeq: 1 BYE\r\n";
         assert!(text.contains("CSeq: 314159 INVITE"));
         assert!(!text.contains("attacker.example.com"));
         assert!(!text.contains("CSeq: 1 BYE"));
+    }
+
+    #[test]
+    fn generate_sip_response_rejects_lf_only_reflection() {
+        let incoming = b"INVITE sip:user@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK776\n\
+Via: SIP/2.0/UDP attacker.example.com;branch=injected\r\n\
+From: <sip:caller@example.com>;tag=1234\r\n\
+To: <sip:user@example.com>\r\n\
+Call-ID: a84b4c76e66710@pc33.example.com\r\n\
+CSeq: 314159 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let resp = generate_response(Protocol::Sip, incoming);
+        let text = std::str::from_utf8(&resp).unwrap();
+        assert!(text.starts_with("SIP/2.0 100 Trying"));
+        assert!(!text.contains("Via:"));
+        assert!(!text.contains("attacker.example.com"));
+        assert!(text.contains("Content-Length: 0"));
     }
 
     #[test]
@@ -1834,6 +1869,19 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[test]
+    fn sip_dialog_rejects_lf_only_line_endings() {
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bK\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\n\
+Via: SIP/2.0/UDP attacker.example.com;branch=injected\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: bare-lf@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        assert!(SipDialog::from_invite(invite).is_none());
+    }
+
+    #[test]
     fn sip_dialog_ignores_body_lines_after_header_terminator() {
         let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
 From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
@@ -2278,6 +2326,24 @@ CSeq: 95930 INVITE\r\n\r\n",
 Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKvalid;rport\r\n\
 CSeq:\r\n\r\n",
         );
+        assert_eq!(dialog.via, original_via);
+        assert_eq!(dialog.cseq, original_cseq);
+    }
+
+    #[test]
+    fn sip_dialog_lf_only_header_update_is_ignored() {
+        let invite = sample_invite();
+        let mut dialog = SipDialog::from_invite(&invite).unwrap();
+        let original_via = dialog.via.clone();
+        let original_cseq = dialog.cseq.clone();
+
+        dialog.update_request_headers(
+            b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKvalid;rport\n\
+Via: SIP/2.0/UDP attacker.example.com;branch=injected\r\n\
+CSeq: 95930 INVITE\r\n\r\n",
+        );
+
         assert_eq!(dialog.via, original_via);
         assert_eq!(dialog.cseq, original_cseq);
     }
