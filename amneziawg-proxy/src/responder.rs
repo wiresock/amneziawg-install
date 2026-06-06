@@ -640,7 +640,7 @@ impl SipDialog {
             cseq,
         };
 
-        if !sip_response_fits(&dialog, "SIP/2.0 487 Request Terminated", true) {
+        if !sip_reflected_responses_fit(&dialog) {
             return None;
         }
 
@@ -689,7 +689,7 @@ impl SipDialog {
                 candidate.cseq = cseq;
             }
 
-            if sip_response_fits(&candidate, "SIP/2.0 200 OK", true) {
+            if sip_reflected_responses_fit(&candidate) {
                 self.via = candidate.via;
                 self.cseq = candidate.cseq;
             }
@@ -803,6 +803,17 @@ fn sip_to_has_tag(to: &str) -> bool {
 
 fn sip_response_fits(dialog: &SipDialog, status_line: &str, add_to_tag: bool) -> bool {
     sip_response_len(dialog, status_line, add_to_tag) <= SIP_MAX_RESPONSE_SIZE
+}
+
+fn sip_reflected_responses_fit(dialog: &SipDialog) -> bool {
+    [
+        ("SIP/2.0 100 Trying", false),
+        ("SIP/2.0 180 Ringing", true),
+        ("SIP/2.0 200 OK", true),
+        ("SIP/2.0 487 Request Terminated", true),
+    ]
+    .into_iter()
+    .all(|(status, add_to_tag)| sip_response_fits(dialog, status, add_to_tag))
 }
 
 fn sip_response_len(dialog: &SipDialog, status_line: &str, add_to_tag: bool) -> usize {
@@ -2109,6 +2120,40 @@ Content-Length: 0\r\n\r\n";
 
         dialog.update_request_headers(oversized.as_bytes());
 
+        assert_eq!(dialog.cseq, original_cseq);
+    }
+
+    #[test]
+    fn sip_dialog_update_rejects_headers_that_make_ringing_too_large() {
+        let invite = sample_invite();
+        let mut dialog = SipDialog::from_invite(&invite).unwrap();
+        let original_via = dialog.via.clone();
+        let original_cseq = dialog.cseq.clone();
+
+        let (via, cseq) = (0..700)
+            .find_map(|n| {
+                let via = format!(
+                    "Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bK{};rport",
+                    "A".repeat(n)
+                );
+                let cseq = "CSeq: 95930 INVITE".to_string();
+                let mut candidate = dialog.clone();
+                candidate.via = vec![via.clone()];
+                candidate.cseq = cseq.clone();
+                if sip_response_fits(&candidate, "SIP/2.0 200 OK", true)
+                    && !sip_response_fits(&candidate, "SIP/2.0 180 Ringing", true)
+                {
+                    Some((via, cseq))
+                } else {
+                    None
+                }
+            })
+            .expect("test should find a Via length where 200 fits but 180 does not");
+        let update = format!("INVITE sip:olivia@profi.ru SIP/2.0\r\n{via}\r\n{cseq}\r\n\r\n");
+
+        dialog.update_request_headers(update.as_bytes());
+
+        assert_eq!(dialog.via, original_via);
         assert_eq!(dialog.cseq, original_cseq);
     }
 

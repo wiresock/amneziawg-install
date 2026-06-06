@@ -535,12 +535,13 @@ impl Proxy {
             } else if let Some(dialog) = request_dialog.as_ref() {
                 responder::generate_sip_responses(dialog, &method)
             } else {
-                // No dialog state yet (e.g. OPTIONS before any INVITE).  Try a
+                // No dialog state yet (e.g. OPTIONS before any INVITE). Try a
                 // bounded header parse for standalone SIP methods that can receive
-                // a 200 OK without dialog state; fall back to the legacy 100 Trying
-                // path if the request is malformed or missing mandatory headers.
+                // a 200 OK without dialog state. Malformed ACK/BYE/CANCEL have no
+                // valid transaction headers to reflect, so stay silent instead of
+                // falling back to the legacy INVITE-like 100 Trying path.
                 match method.as_str() {
-                    "ACK" => Vec::new(),
+                    "ACK" | "BYE" | "CANCEL" => Vec::new(),
                     "REGISTER" | "OPTIONS" | "NOTIFY" | "SUBSCRIBE" | "MESSAGE" | "INFO" => {
                         SipDialog::from_request(data)
                             .map(|dialog| responder::generate_sip_responses(&dialog, &method))
@@ -1705,6 +1706,33 @@ Content-Length: 0\r\n\r\n";
         assert!(std::str::from_utf8(&buf[..n])
             .unwrap()
             .starts_with("SIP/2.0 100 Trying\r\n"));
+    }
+
+    #[tokio::test]
+    async fn malformed_bye_cancel_without_dialog_do_not_fallback_to_trying() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 2), None)
+            .await
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let mut buf = [0u8; 1024];
+
+        for request in [
+            b"BYE sip:olivia@profi.ru SIP/2.0\r\nCall-ID: missing-headers\r\n\r\n".as_slice(),
+            b"CANCEL sip:olivia@profi.ru SIP/2.0\r\nCall-ID: missing-headers\r\n\r\n".as_slice(),
+        ] {
+            proxy.handle_probe(request, client_addr, &metrics_ref).await;
+            let response =
+                tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+            assert!(
+                response.is_err(),
+                "malformed standalone BYE/CANCEL must not receive stateless 100 Trying"
+            );
+        }
     }
 
     #[tokio::test]
