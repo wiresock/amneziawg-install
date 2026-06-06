@@ -526,7 +526,7 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
 pub(crate) enum SipDialogStage {
     /// No dialog in progress; proxy will respond to INVITE to start one.
     Idle,
-    /// INVITE received; `100 Trying` + `180 Ringing` sent, awaiting ACK.
+    /// INVITE received; initial response sent, awaiting final answer or ACK.
     Invited,
     /// `200 OK` sent; awaiting ACK or BYE.
     Established,
@@ -815,8 +815,7 @@ pub(crate) fn sip_next_stage(current: SipDialogStage, method: &str) -> SipDialog
             SipDialogStage::Invited | SipDialogStage::Established => current,
         },
         "ACK" => match current {
-            SipDialogStage::Established => SipDialogStage::Established,
-            SipDialogStage::Invited => SipDialogStage::Invited,
+            SipDialogStage::Invited | SipDialogStage::Established => SipDialogStage::Established,
             SipDialogStage::Idle | SipDialogStage::Terminated => current,
         },
         "BYE" => match current {
@@ -1893,7 +1892,7 @@ Content-Length: 0\r\n\r\n";
         );
         assert_eq!(
             sip_next_stage(SipDialogStage::Invited, "ACK"),
-            SipDialogStage::Invited
+            SipDialogStage::Established
         );
         assert_eq!(
             sip_next_stage(SipDialogStage::Established, "INVITE"),
