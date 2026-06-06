@@ -363,7 +363,8 @@ impl Proxy {
                                 ))
                             });
                         } else if proto == Protocol::Sip {
-                            self.handle_sip_probe(data, client_addr, metrics_ref).await;
+                            self.handle_sip_probe(data, client_addr, metrics_ref, true)
+                                .await;
                         } else {
                             probe_response = Some(responder::generate_response_for_client(
                                 proto,
@@ -405,6 +406,7 @@ impl Proxy {
         data: &[u8],
         client_addr: SocketAddr,
         metrics_ref: &Option<Arc<crate::metrics::ClientMetrics>>,
+        mut pre_acquired_probe_token: bool,
     ) {
         let method = match responder::sip_method(data) {
             Some(m) => m.to_ascii_uppercase(),
@@ -413,28 +415,35 @@ impl Proxy {
 
         let mut is_fresh_invite = false;
         let mut fresh_call_id: Option<String> = None;
+        let mut stage_before_response: Option<SipDialogStage> = None;
 
         // For a fresh INVITE, create (or reset) the dialog from the request.
         if method == "INVITE" {
-            let is_new_dialog = self
-                .sip_dialogs
-                .get(&client_addr)
-                .map(|d| d.stage == SipDialogStage::Terminated || d.stage == SipDialogStage::Idle)
-                .unwrap_or(true);
+            if let Some(dialog) = SipDialog::from_invite(data) {
+                let existing = self
+                    .sip_dialogs
+                    .get(&client_addr)
+                    .map(|d| (d.stage, d.call_id.clone()));
+                let is_new_dialog = existing
+                    .as_ref()
+                    .map(|(stage, call_id)| {
+                        matches!(stage, SipDialogStage::Terminated | SipDialogStage::Idle)
+                            || call_id != &dialog.call_id
+                    })
+                    .unwrap_or(true);
 
-            if is_new_dialog {
-                if let Some(dialog) = SipDialog::from_invite(data) {
+                if is_new_dialog {
                     fresh_call_id = Some(dialog.call_id.clone());
                     self.sip_dialogs.insert(client_addr, dialog);
                     is_fresh_invite = true;
                 } else {
-                    self.sip_dialogs.remove(&client_addr);
+                    // Retransmit for the active dialog — update CSeq in place.
+                    if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
+                        d.update_cseq(data);
+                    }
                 }
             } else {
-                // Retransmit — update CSeq in place
-                if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
-                    d.update_cseq(data);
-                }
+                self.sip_dialogs.remove(&client_addr);
             }
         } else {
             // For non-INVITE methods update the CSeq if a dialog exists
@@ -446,6 +455,7 @@ impl Proxy {
         // Build and send immediate response(s)
         let responses: Vec<bytes::Bytes> = {
             if let Some(d) = self.sip_dialogs.get(&client_addr) {
+                stage_before_response = Some(d.stage);
                 responder::generate_sip_responses(&d, &method)
             } else {
                 // No dialog state yet (e.g. OPTIONS before any INVITE).  Try a
@@ -474,20 +484,51 @@ impl Proxy {
             }
         };
 
+        let mut sent_any_response = false;
+        let mut sent_ringing = false;
         for pkt in &responses {
-            if let Err(e) = self.frontend.send_to(pkt, client_addr).await {
-                warn!(%client_addr, error = %e, "failed to send SIP response");
-            } else if let Some(metrics) = metrics_ref {
-                metrics.record_probe();
+            let allowed = if pre_acquired_probe_token {
+                pre_acquired_probe_token = false;
+                true
+            } else {
+                metrics_ref
+                    .as_ref()
+                    .map_or(true, |metrics| metrics.try_acquire_probe())
+            };
+            if !allowed {
+                debug!(%client_addr, method = %method, "SIP response rate limited");
+                continue;
+            }
+            match self.frontend.send_to(pkt, client_addr).await {
+                Ok(_) => {
+                    if let Some(metrics) = metrics_ref {
+                        metrics.record_probe();
+                    }
+                    sent_any_response = true;
+                    if pkt.starts_with(b"SIP/2.0 180 Ringing") {
+                        sent_ringing = true;
+                    }
+                }
+                Err(e) => warn!(%client_addr, error = %e, "failed to send SIP response"),
             }
         }
 
         // Advance the dialog stage
         if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
-            d.stage = responder::sip_next_stage(d.stage, &method);
+            d.stage = if method == "INVITE" {
+                match stage_before_response.unwrap_or(d.stage) {
+                    SipDialogStage::Idle | SipDialogStage::Terminated if sent_any_response => {
+                        SipDialogStage::Invited
+                    }
+                    SipDialogStage::Invited if sent_ringing => SipDialogStage::Ringing,
+                    current => current,
+                }
+            } else {
+                responder::sip_next_stage(d.stage, &method)
+            };
         }
 
-        if is_fresh_invite {
+        if is_fresh_invite && sent_any_response {
             let frontend = Arc::clone(&self.frontend);
             let dialogs = Arc::clone(&self.sip_dialogs);
             let metrics = metrics_ref.as_ref().map(Arc::clone);
@@ -500,31 +541,47 @@ impl Proxy {
                 // 180 Ringing after 200 ms. Mark it before awaiting so an
                 // INVITE retransmit cannot also emit the first 180.
                 time::sleep(Duration::from_millis(200)).await;
-                let ringing = dialogs.get_mut(&client_addr).and_then(|mut d| {
-                    if d.stage == SipDialogStage::Invited && d.call_id == expected_call_id {
-                        d.stage = SipDialogStage::Ringing;
-                        Some(responder::generate_sip_ringing(&d))
-                    } else {
-                        None
-                    }
-                });
+                let ringing_allowed = metrics
+                    .as_ref()
+                    .map_or(true, |metrics| metrics.try_acquire_probe());
+                let ringing = if ringing_allowed {
+                    dialogs.get_mut(&client_addr).and_then(|mut d| {
+                        if d.stage == SipDialogStage::Invited && d.call_id == expected_call_id {
+                            d.stage = SipDialogStage::Ringing;
+                            Some(responder::generate_sip_ringing(&d))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
                 if let Some(pkt) = ringing {
                     if frontend.send_to(&pkt, client_addr).await.is_ok() {
                         if let Some(metrics) = metrics.as_ref() {
                             metrics.record_probe();
                         }
                     }
+                } else if !ringing_allowed {
+                    debug!(%client_addr, "deferred SIP 180 Ringing rate limited");
                 }
 
                 // 200 OK after another 800 ms (total ~1 s) — drop guard before await.
                 time::sleep(Duration::from_millis(800)).await;
-                let ok = dialogs
-                    .get(&client_addr)
-                    .filter(|d| {
-                        matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
-                            && d.call_id == expected_call_id
-                    })
-                    .map(|d| responder::generate_sip_ok(&d));
+                let ok_allowed = metrics
+                    .as_ref()
+                    .map_or(true, |metrics| metrics.try_acquire_probe());
+                let ok = if ok_allowed {
+                    dialogs
+                        .get(&client_addr)
+                        .filter(|d| {
+                            matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
+                                && d.call_id == expected_call_id
+                        })
+                        .map(|d| responder::generate_sip_ok(&d))
+                } else {
+                    None
+                };
                 if let Some(pkt) = ok {
                     let sent = frontend.send_to(&pkt, client_addr).await.is_ok();
                     if sent {
@@ -541,6 +598,8 @@ impl Proxy {
                             }
                         }
                     }
+                } else if !ok_allowed {
+                    debug!(%client_addr, "deferred SIP 200 OK rate limited");
                 }
             });
         }
@@ -877,12 +936,16 @@ mod tests {
     }
 
     fn sip_test_config(backend_addr: SocketAddr) -> ProxyConfig {
+        sip_test_config_with_rate(backend_addr, 16)
+    }
+
+    fn sip_test_config_with_rate(backend_addr: SocketAddr, rate_limit_per_sec: u32) -> ProxyConfig {
         ProxyConfig {
             listen: "127.0.0.1:0".into(),
             backend: backend_addr.to_string(),
             session_ttl_secs: 60,
             cleanup_interval_secs: 60,
-            rate_limit_per_sec: 16,
+            rate_limit_per_sec,
             imitate_protocol: "sip".into(),
             quic_handshake_enabled: false,
             quic_certificate_domain: "localhost".into(),
@@ -1075,7 +1138,7 @@ CSeq: 95930 OPTIONS\r\n\
 Content-Length: 0\r\n\r\n";
 
         proxy
-            .handle_sip_probe(options, client_addr, &metrics_ref)
+            .handle_sip_probe(options, client_addr, &metrics_ref, true)
             .await;
 
         let mut buf = [0u8; 1024];
@@ -1118,7 +1181,7 @@ CSeq: 95929 INVITE\r\n\
 Content-Length: 0\r\n\r\n";
 
         proxy
-            .handle_sip_probe(invite, client_addr, &metrics_ref)
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
             .await;
 
         let mut buf = [0u8; 1024];
@@ -1133,7 +1196,7 @@ Content-Length: 0\r\n\r\n";
             .starts_with("SIP/2.0 100 Trying\r\n"));
 
         proxy
-            .handle_sip_probe(invite, client_addr, &metrics_ref)
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
             .await;
 
         let mut statuses = Vec::new();
@@ -1161,6 +1224,171 @@ Content-Length: 0\r\n\r\n";
         assert!(
             duplicate.is_err(),
             "deferred timer must not emit a second 180 after retransmit"
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_invite_with_new_call_id_replaces_active_dialog() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let old_invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKold;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=old\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: old-active-call@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let new_invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKnew;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=new\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: new-active-call@192.168.224.194\r\n\
+CSeq: 95930 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(old_invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("old INVITE should receive 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .contains("Call-ID: old-active-call@192.168.224.194"));
+
+        proxy
+            .handle_sip_probe(new_invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("new INVITE should receive response from new dialog")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.contains("Call-ID: new-active-call@192.168.224.194"));
+        assert!(!text.contains("old-active-call@192.168.224.194"));
+        assert_eq!(
+            proxy
+                .sip_dialogs
+                .get(&client_addr)
+                .map(|d| d.call_id.clone())
+                .as_deref(),
+            Some("Call-ID: new-active-call@192.168.224.194")
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_immediate_responses_consume_rate_limit_per_packet() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 1), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let metrics = metrics_ref.as_ref().unwrap();
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: rate-limited-retransmit@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut dialog = SipDialog::from_invite(invite).unwrap();
+        dialog.stage = SipDialogStage::Invited;
+        proxy.sip_dialogs.insert(client_addr, dialog);
+        assert!(
+            metrics.try_acquire_probe(),
+            "pre-acquire inbound probe token"
+        );
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("pre-acquired token should allow first response")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+        let second =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await;
+        assert!(
+            second.is_err(),
+            "second immediate SIP response must require another rate token"
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_deferred_responses_consume_rate_limit_tokens() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 0), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: deferred-rate-limit@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("pre-acquired token should allow initial 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        let extra =
+            tokio::time::timeout(Duration::from_millis(1200), client.recv_from(&mut buf)).await;
+        assert!(
+            extra.is_err(),
+            "deferred SIP responses must require their own rate tokens"
+        );
+        assert_eq!(
+            metrics_ref
+                .unwrap()
+                .probes_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
     }
 
@@ -1195,7 +1423,7 @@ CSeq: 95930 INVITE\r\n\
 Content-Length: 0\r\n\r\n";
 
         proxy
-            .handle_sip_probe(malformed_invite, client_addr, &metrics_ref)
+            .handle_sip_probe(malformed_invite, client_addr, &metrics_ref, true)
             .await;
 
         let mut buf = [0u8; 1024];

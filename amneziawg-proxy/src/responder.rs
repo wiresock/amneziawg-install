@@ -579,6 +579,9 @@ impl SipDialog {
 
         for line in text.lines() {
             let t = sip_header_line(line);
+            if t.is_empty() {
+                break;
+            }
             if t.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("via:")) {
                 via.push(t.to_string());
             } else if from.is_empty() && t.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("from:"))
@@ -645,6 +648,9 @@ impl SipDialog {
         if let Ok(text) = std::str::from_utf8(&incoming[..scan_limit]) {
             for line in text.lines() {
                 let t = sip_header_line(line);
+                if t.is_empty() {
+                    break;
+                }
                 if t.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("cseq:")) {
                     let mut candidate = self.clone();
                     candidate.cseq = t.to_string();
@@ -1667,6 +1673,19 @@ From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
 Call-ID: missing-to@192.168.224.194\r\n\
 CSeq: 95929 INVITE\r\n\
 Content-Length: 0\r\n\r\n";
+        assert!(SipDialog::from_invite(invite).is_none());
+    }
+
+    #[test]
+    fn sip_dialog_ignores_body_lines_after_header_terminator() {
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: body-via@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 52\r\n\r\n\
+Via: SIP/2.0/UDP body.example.com:5060;branch=body\r\n";
+
         assert!(SipDialog::from_invite(invite).is_none());
     }
 
