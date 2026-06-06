@@ -353,6 +353,9 @@ impl Proxy {
                         } else {
                             debug!(%client_addr, "probe rate limited");
                         }
+                    } else if proto == Protocol::Sip {
+                        self.handle_sip_probe(data, client_addr, metrics_ref, false)
+                            .await;
                     } else if metrics.try_acquire_probe() {
                         if proto == Protocol::Dns && self.dns_forward_enabled {
                             probe_response = self.forward_dns_probe(data).await.or_else(|| {
@@ -362,9 +365,6 @@ impl Proxy {
                                     client_addr,
                                 ))
                             });
-                        } else if proto == Protocol::Sip {
-                            self.handle_sip_probe(data, client_addr, metrics_ref, true)
-                                .await;
                         } else {
                             probe_response = Some(responder::generate_response_for_client(
                                 proto,
@@ -1429,6 +1429,56 @@ Content-Length: 0\r\n\r\n";
             second.is_err(),
             "second immediate SIP response must require another rate token"
         );
+    }
+
+    #[tokio::test]
+    async fn sip_ack_without_response_does_not_consume_probe_token() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 1), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let ack = b"ACK sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKack;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: ack-no-response@192.168.224.194\r\n\
+CSeq: 95929 ACK\r\n\
+Content-Length: 0\r\n\r\n";
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinvite;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: ack-no-response@192.168.224.194\r\n\
+CSeq: 95930 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_probe(ack, client_addr, &proxy.metrics.get_or_create(client_addr))
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let ack_response =
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+        assert!(ack_response.is_err(), "ACK without dialog should not emit a response");
+
+        proxy
+            .handle_probe(invite, client_addr, &proxy.metrics.get_or_create(client_addr))
+            .await;
+
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("INVITE should still have the only rate token available")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
     }
 
     #[tokio::test]
