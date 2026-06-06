@@ -995,6 +995,9 @@ fn generate_sip_trying(incoming: &[u8]) -> Bytes {
         let echo_prefixes = ["via:", "from:", "to:", "call-id:", "cseq:"];
         for line in text.lines() {
             let trimmed = sip_header_line(line).trim();
+            if trimmed.is_empty() {
+                break;
+            }
             for &prefix in &echo_prefixes {
                 if trimmed
                     .get(..prefix.len())
@@ -1354,6 +1357,26 @@ mod tests {
         assert!(text.contains("To:"));
         assert!(text.contains("Call-ID:"));
         assert!(text.contains("CSeq:"));
+    }
+
+    #[test]
+    fn generate_sip_response_ignores_body_header_lines() {
+        let incoming = b"INVITE sip:user@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK776\r\n\
+From: <sip:caller@example.com>;tag=1234\r\n\
+To: <sip:user@example.com>\r\n\
+Call-ID: a84b4c76e66710@pc33.example.com\r\n\
+CSeq: 314159 INVITE\r\n\
+Content-Length: 57\r\n\r\n\
+Via: SIP/2.0/UDP attacker.example.com;branch=body\r\n\
+CSeq: 1 BYE\r\n";
+        let resp = generate_response(Protocol::Sip, incoming);
+        let text = std::str::from_utf8(&resp).unwrap();
+        assert!(text.starts_with("SIP/2.0 100 Trying"));
+        assert!(text.contains("branch=z9hG4bK776"));
+        assert!(text.contains("CSeq: 314159 INVITE"));
+        assert!(!text.contains("attacker.example.com"));
+        assert!(!text.contains("CSeq: 1 BYE"));
     }
 
     #[test]

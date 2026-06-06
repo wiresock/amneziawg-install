@@ -462,7 +462,31 @@ impl Proxy {
     ) {
         let method = match responder::sip_method(data) {
             Some(m) => m.to_ascii_uppercase(),
-            None => return,
+            None => {
+                let allowed = if pre_acquired_probe_token {
+                    true
+                } else {
+                    metrics_ref
+                        .as_ref()
+                        .map_or(true, |metrics| metrics.try_acquire_probe())
+                };
+                if !allowed {
+                    debug!(%client_addr, "SIP fallback response rate limited");
+                    return;
+                }
+
+                let response =
+                    responder::generate_response_for_client(Protocol::Sip, data, client_addr);
+                match self.frontend.send_to(&response, client_addr).await {
+                    Ok(_) => {
+                        if let Some(metrics) = metrics_ref {
+                            metrics.record_probe();
+                        }
+                    }
+                    Err(e) => warn!(%client_addr, error = %e, "failed to send SIP fallback response"),
+                }
+                return;
+            }
         };
 
         let mut is_fresh_invite = false;
@@ -1396,6 +1420,46 @@ Content-Length: 0\r\n\r\n";
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn sip_response_line_probe_gets_stateless_response() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let response_probe = b"SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKresponse;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>;tag=remote\r\n\
+Call-ID: response-line-probe@192.168.224.194\r\n\
+CSeq: 95930 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_probe(
+                response_probe,
+                client_addr,
+                &proxy.metrics.get_or_create(client_addr),
+            )
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("SIP response-line probe should receive stateless fallback")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.starts_with("SIP/2.0 100 Trying\r\n"));
+        assert!(text.contains("Call-ID: response-line-probe@192.168.224.194"));
+        assert!(text.contains("CSeq: 95930 INVITE"));
     }
 
     #[tokio::test]
