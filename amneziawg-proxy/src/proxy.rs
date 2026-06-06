@@ -647,6 +647,10 @@ impl Proxy {
                                     d.stage = SipDialogStage::Ringing;
                                     true
                                 }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    debug!(%client_addr, error = %e, "deferred SIP 180 Ringing send would block");
+                                    false
+                                }
                                 Err(e) => {
                                     warn!(%client_addr, error = %e, "failed to send deferred SIP 180 Ringing");
                                     false
@@ -686,6 +690,10 @@ impl Proxy {
                                 Ok(_) => {
                                     d.stage = SipDialogStage::Established;
                                     true
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    debug!(%client_addr, error = %e, "deferred SIP 200 OK send would block");
+                                    false
                                 }
                                 Err(e) => {
                                     warn!(%client_addr, error = %e, "failed to send deferred SIP 200 OK");
