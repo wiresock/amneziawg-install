@@ -74,6 +74,8 @@ pub struct Proxy {
     /// Each task awaits data from the session's backend socket and relays it
     /// back to the client — fully event-driven, no polling.
     relay_handles: Arc<DashMap<SocketAddr, RelayEntry>>,
+    /// Deferred SIP dialog response tasks, keyed by client address.
+    sip_deferred_handles: Arc<DashMap<SocketAddr, tokio::task::JoinHandle<()>>>,
     /// Monotonically increasing generation counter for relay tasks.
     relay_generation: AtomicU64,
 }
@@ -142,6 +144,7 @@ impl Proxy {
             sip_dialogs: Arc::new(DashMap::new()),
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
+            sip_deferred_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
         })
     }
@@ -170,6 +173,7 @@ impl Proxy {
             sip_dialogs: Arc::new(DashMap::new()),
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
+            sip_deferred_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
         }
     }
@@ -262,6 +266,10 @@ impl Proxy {
             entry.value().handle.abort();
         });
         self.relay_handles.clear();
+        self.sip_deferred_handles.iter().for_each(|entry| {
+            entry.value().abort();
+        });
+        self.sip_deferred_handles.clear();
         info!("proxy stopped");
         Ok(())
     }
@@ -310,6 +318,9 @@ impl Proxy {
                 self.metrics.remove(&client_addr);
                 self.client_protocols.remove(&client_addr);
                 self.sip_dialogs.remove(&client_addr);
+                if let Some((_, handle)) = self.sip_deferred_handles.remove(&client_addr) {
+                    handle.abort();
+                }
             }
         }
     }
@@ -591,15 +602,19 @@ impl Proxy {
             let frontend = Arc::clone(&self.frontend);
             let dialogs = Arc::clone(&self.sip_dialogs);
             let metrics = metrics_ref.as_ref().map(Arc::clone);
+            let shutdown = Arc::clone(&self.shutdown);
             let expected_call_id = match fresh_call_id {
                 Some(call_id) => call_id,
                 None => return,
             };
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 // 180 Ringing after 200 ms. Check the current stage at send
                 // time so retransmits that already emitted 180 suppress this.
-                time::sleep(Duration::from_millis(200)).await;
+                tokio::select! {
+                    _ = time::sleep(Duration::from_millis(200)) => {}
+                    _ = shutdown.notified() => return,
+                }
                 let ringing_allowed = metrics
                     .as_ref()
                     .map_or(true, |metrics| metrics.try_acquire_probe());
@@ -639,52 +654,50 @@ impl Proxy {
                     debug!(%client_addr, "deferred SIP 180 Ringing rate limited");
                 }
 
-                // 200 OK after another 800 ms (total ~1 s). Reserve the
-                // transition while holding the dialog guard so a CANCEL/BYE
-                // cannot terminate the same dialog between building the OK and
-                // awaiting the socket send.
-                time::sleep(Duration::from_millis(800)).await;
+                // 200 OK after another 800 ms (total ~1 s). Use try_send_to
+                // while holding the dialog guard so the final state check,
+                // send, and Established transition happen without an await gap
+                // where a CANCEL/BYE could terminate the dialog.
+                tokio::select! {
+                    _ = time::sleep(Duration::from_millis(800)) => {}
+                    _ = shutdown.notified() => return,
+                }
                 let ok_allowed = metrics
                     .as_ref()
                     .map_or(true, |metrics| metrics.try_acquire_probe());
-                let ok = if ok_allowed {
-                    dialogs.get_mut(&client_addr).and_then(|mut d| {
+                if ok_allowed {
+                    let sent = dialogs.get_mut(&client_addr).is_some_and(|mut d| {
                         if matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
                             && d.call_id_value == expected_call_id
                         {
-                            let previous_stage = d.stage;
                             let pkt = responder::generate_sip_ok(&d);
-                            d.stage = SipDialogStage::Established;
-                            Some((pkt, previous_stage))
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                };
-                if let Some((pkt, previous_stage)) = ok {
-                    match frontend.send_to(&pkt, client_addr).await {
-                        Ok(_) => {
-                            if let Some(metrics) = metrics.as_ref() {
-                                metrics.record_probe();
-                            }
-                        }
-                        Err(e) => {
-                            warn!(%client_addr, error = %e, "failed to send deferred SIP 200 OK");
-                            if let Some(mut d) = dialogs.get_mut(&client_addr) {
-                                if d.stage == SipDialogStage::Established
-                                    && d.call_id_value == expected_call_id
-                                {
-                                    d.stage = previous_stage;
+                            match frontend.try_send_to(&pkt, client_addr) {
+                                Ok(_) => {
+                                    d.stage = SipDialogStage::Established;
+                                    true
+                                }
+                                Err(e) => {
+                                    warn!(%client_addr, error = %e, "failed to send deferred SIP 200 OK");
+                                    false
                                 }
                             }
+                        } else {
+                            false
+                        }
+                    });
+                    if sent {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_probe();
                         }
                     }
-                } else if !ok_allowed {
+                } else {
                     debug!(%client_addr, "deferred SIP 200 OK rate limited");
                 }
             });
+            if let Some((_, old_handle)) = self.sip_deferred_handles.remove(&client_addr) {
+                old_handle.abort();
+            }
+            self.sip_deferred_handles.insert(client_addr, handle);
         }
     }
 
@@ -817,6 +830,7 @@ impl Proxy {
         let client_protocols = Arc::clone(&self.client_protocols);
         let sip_dialogs = Arc::clone(&self.sip_dialogs);
         let relay_handles = Arc::clone(&self.relay_handles);
+        let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
         let interval = Duration::from_secs(self.config.cleanup_interval_secs);
 
         tokio::spawn(async move {
@@ -829,6 +843,9 @@ impl Proxy {
                     metrics.remove(addr);
                     client_protocols.remove(addr);
                     sip_dialogs.remove(addr);
+                    if let Some((_, handle)) = sip_deferred_handles.remove(addr) {
+                        handle.abort();
+                    }
                     // Abort the relay task for the expired session
                     if let Some((_, entry)) = relay_handles.remove(addr) {
                         entry.handle.abort();
@@ -839,6 +856,17 @@ impl Proxy {
                 }
             }
         })
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.relay_handles.iter().for_each(|entry| {
+            entry.value().handle.abort();
+        });
+        self.sip_deferred_handles.iter().for_each(|entry| {
+            entry.value().abort();
+        });
     }
 }
 
@@ -1838,6 +1866,51 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(
             proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
             Some(SipDialogStage::Terminated)
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_deferred_task_stops_on_shutdown() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKshutdown;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: shutdown-deferred@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("INVITE should receive immediate 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        proxy.shutdown_handle().notify_one();
+
+        let deferred =
+            tokio::time::timeout(Duration::from_millis(350), client.recv_from(&mut buf)).await;
+        assert!(
+            deferred.is_err(),
+            "shutdown should suppress deferred SIP 180/200 responses"
         );
     }
 
