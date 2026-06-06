@@ -786,6 +786,10 @@ fn sip_to_has_tag(to: &str) -> bool {
                 return true;
             }
         }
+
+        while i < bytes.len() && bytes[i] != b';' {
+            i += 1;
+        }
     }
     false
 }
@@ -2017,6 +2021,23 @@ Content-Length: 0\r\n\r\n";
         let text = std::str::from_utf8(&ok).unwrap();
         let to_line = text.lines().find(|line| line.starts_with("To:")).unwrap();
         assert!(to_line.contains("; tag = remote-tag"));
+        assert!(!to_line.contains(dialog.to_tag.as_str()));
+    }
+
+    #[test]
+    fn sip_dialog_response_skips_non_tag_to_parameters() {
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>;foo=bar; tag = remote-tag\r\n\
+Call-ID: param-tagged-to@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let dialog = SipDialog::from_invite(invite).unwrap();
+        let ok = generate_sip_ok(&dialog);
+        let text = std::str::from_utf8(&ok).unwrap();
+        let to_line = text.lines().find(|line| line.starts_with("To:")).unwrap();
+        assert!(to_line.contains(";foo=bar; tag = remote-tag"));
         assert!(!to_line.contains(dialog.to_tag.as_str()));
     }
 

@@ -485,6 +485,7 @@ impl Proxy {
         };
 
         let mut sent_any_response = false;
+        let mut sent_response_count = 0usize;
         let mut sent_ringing = false;
         for pkt in &responses {
             let allowed = if pre_acquired_probe_token {
@@ -505,6 +506,7 @@ impl Proxy {
                         metrics.record_probe();
                     }
                     sent_any_response = true;
+                    sent_response_count += 1;
                     if pkt.starts_with(b"SIP/2.0 180 Ringing") {
                         sent_ringing = true;
                     }
@@ -524,7 +526,9 @@ impl Proxy {
                     current => current,
                 }
             } else {
-                if sent_any_response || method == "ACK" {
+                let sent_all_responses =
+                    !responses.is_empty() && sent_response_count == responses.len();
+                if sent_all_responses || method == "ACK" {
                     responder::sip_next_stage(d.stage, &method)
                 } else {
                     d.stage
@@ -1525,6 +1529,60 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(
             proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
             Some(SipDialogStage::Established)
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_cancel_does_not_advance_when_only_partially_emitted() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 1), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinvite;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: rate-limited-cancel@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let cancel = b"CANCEL sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcancel;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: rate-limited-cancel@192.168.224.194\r\n\
+CSeq: 95930 CANCEL\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut dialog = SipDialog::from_invite(invite).unwrap();
+        dialog.stage = SipDialogStage::Invited;
+        proxy.sip_dialogs.insert(client_addr, dialog);
+
+        proxy
+            .handle_sip_probe(cancel, client_addr, &metrics_ref, false)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("first CANCEL response should use the only available token")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 200 OK\r\n"));
+
+        let second =
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+        assert!(second.is_err(), "487 should be suppressed by rate limit");
+        assert_eq!(
+            proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
+            Some(SipDialogStage::Invited)
         );
     }
 
