@@ -437,18 +437,18 @@ impl Proxy {
                     self.sip_dialogs.insert(client_addr, dialog);
                     is_fresh_invite = true;
                 } else {
-                    // Retransmit for the active dialog — update CSeq in place.
+                    // Retransmit for the active dialog — update transaction headers.
                     if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
-                        d.update_cseq(data);
+                        d.update_request_headers(data);
                     }
                 }
             } else {
                 self.sip_dialogs.remove(&client_addr);
             }
         } else {
-            // For non-INVITE methods update the CSeq if a dialog exists
+            // For non-INVITE methods update transaction headers if a dialog exists.
             if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
-                d.update_cseq(data);
+                d.update_request_headers(data);
             }
         }
 

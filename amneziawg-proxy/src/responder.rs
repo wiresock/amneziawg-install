@@ -154,9 +154,10 @@ const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 ///   and a standard query opcode, i.e. `(flags & 0xF800) == 0x0000`, plus
 ///   QDCOUNT >= 1 in bytes 4-5 (RFC 1035 §4.1.1).
 /// - **SIP**: Starts with ASCII `SIP/` or a SIP method keyword followed by a
-///   space (RFC 3261 §7). We check for `INVITE `, `CANCEL `, `NOTIFY `,
-///   `OPTIONS `, `REGISTER `, `SUBSCRIBE `, and `SIP/` prefixes — covering
-///   every method the WireSock client may emit as junk traffic.
+///   space (RFC 3261 §7). We check for `INVITE `, `ACK `, `BYE `, `CANCEL `,
+///   `INFO `, `MESSAGE `, `NOTIFY `, `OPTIONS `, `REGISTER `, `SUBSCRIBE `,
+///   and `SIP/` prefixes — covering every method the WireSock client may emit
+///   as junk traffic.
 pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
     if data.is_empty() {
         return None;
@@ -543,8 +544,11 @@ pub(crate) enum SipDialogStage {
 #[derive(Debug, Clone)]
 pub(crate) struct SipDialog {
     pub(crate) stage: SipDialogStage,
-    /// All `Via:` header lines, echoed from the original INVITE (one per hop).
+    /// Current transaction `Via:` header lines (one per hop).
     pub(crate) via: Vec<String>,
+    /// Original INVITE `Via:` header lines, used for final responses to the
+    /// INVITE transaction (for example `487 Request Terminated` after CANCEL).
+    pub(crate) invite_via: Vec<String>,
     /// `From:` header line, echoed from the original INVITE.
     pub(crate) from: String,
     /// `To:` header line from the INVITE (no tag yet — added on 200 OK).
@@ -613,10 +617,11 @@ impl SipDialog {
 
         // Derive a stable To-tag from the Call-ID so it is deterministic across
         // retransmits but distinct per dialog.
-        let to_tag = sip_dialog_tag(&call_id);
+        let to_tag = sip_dialog_tag(sip_header_value(&call_id));
 
         let dialog = SipDialog {
             stage: SipDialogStage::Idle,
+            invite_via: via.clone(),
             via,
             from,
             to,
@@ -642,23 +647,42 @@ impl SipDialog {
         Self::from_request(incoming)
     }
 
-    /// Update `CSeq` from the latest incoming request (for ACK/BYE).
-    pub(crate) fn update_cseq(&mut self, incoming: &[u8]) {
+    /// Update transaction-specific reflected headers from the latest request.
+    pub(crate) fn update_request_headers(&mut self, incoming: &[u8]) {
         let scan_limit = std::cmp::min(incoming.len(), SIP_SCAN_LIMIT);
         if let Ok(text) = std::str::from_utf8(&incoming[..scan_limit]) {
+            let mut via: Vec<String> = Vec::new();
+            let mut cseq: Option<String> = None;
+
             for line in text.lines() {
                 let t = sip_header_line(line);
                 if t.is_empty() {
                     break;
                 }
-                if t.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("cseq:")) {
-                    let mut candidate = self.clone();
-                    candidate.cseq = t.to_string();
-                    if sip_response_fits(&candidate, "SIP/2.0 200 OK", true) {
-                        self.cseq = candidate.cseq;
-                    }
-                    break;
+                if t.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("via:")) {
+                    via.push(t.to_string());
+                } else if cseq.is_none()
+                    && t.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("cseq:"))
+                {
+                    cseq = Some(t.to_string());
                 }
+            }
+
+            if via.is_empty() && cseq.is_none() {
+                return;
+            }
+
+            let mut candidate = self.clone();
+            if !via.is_empty() {
+                candidate.via = via;
+            }
+            if let Some(cseq) = cseq {
+                candidate.cseq = cseq;
+            }
+
+            if sip_response_fits(&candidate, "SIP/2.0 200 OK", true) {
+                self.via = candidate.via;
+                self.cseq = candidate.cseq;
             }
         }
     }
@@ -666,6 +690,12 @@ impl SipDialog {
 
 fn sip_header_line(line: &str) -> &str {
     line.strip_suffix('\r').unwrap_or(line)
+}
+
+fn sip_header_value(line: &str) -> &str {
+    line.split_once(':')
+        .map(|(_, value)| value.trim())
+        .unwrap_or_else(|| line.trim())
 }
 
 /// Derive a short deterministic tag string from a Call-ID.
@@ -829,6 +859,7 @@ pub(crate) fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<By
         }
         "CANCEL" => {
             let mut invite_dialog = dialog.clone();
+            invite_dialog.via = invite_dialog.invite_via.clone();
             invite_dialog.cseq = invite_dialog.invite_cseq.clone();
             vec![
                 build_sip_response(dialog, "SIP/2.0 200 OK", false),
@@ -1772,6 +1803,29 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[test]
+    fn sip_dialog_tag_uses_call_id_value() {
+        let invite_a = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bK\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: same-value@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let invite_b = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bK\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+CALL-ID:    same-value@192.168.224.194   \r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        let dialog_a = SipDialog::from_invite(invite_a).unwrap();
+        let dialog_b = SipDialog::from_invite(invite_b).unwrap();
+
+        assert_eq!(dialog_a.to_tag, dialog_b.to_tag);
+    }
+
+    #[test]
     fn sip_dialog_invite_returns_100_trying_no_to_tag() {
         let invite = sample_invite();
         let dialog = SipDialog::from_invite(&invite).unwrap();
@@ -1829,10 +1883,19 @@ Content-Length: 0\r\n\r\n";
         let invite = sample_invite();
         let mut dialog = SipDialog::from_invite(&invite).unwrap();
         dialog.stage = SipDialogStage::Established;
+        dialog.update_request_headers(
+            b"BYE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKbye;rport\r\n\
+CSeq: 95930 BYE\r\n\r\n",
+        );
         let responses = generate_sip_responses(&dialog, "BYE");
         assert_eq!(responses.len(), 1);
         let text = std::str::from_utf8(&responses[0]).unwrap();
         assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(text.contains(
+            "Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKbye;rport"
+        ));
+        assert!(text.contains("CSeq: 95930 BYE"));
         assert!(text.contains(";tag="), "200 OK for BYE must carry To tag");
         dialog.stage = sip_next_stage(dialog.stage, "BYE");
         assert_eq!(dialog.stage, SipDialogStage::Terminated);
@@ -1842,7 +1905,11 @@ Content-Length: 0\r\n\r\n";
     fn sip_dialog_cancel_returns_200_and_487() {
         let invite = sample_invite();
         let mut dialog = SipDialog::from_invite(&invite).unwrap();
-        dialog.update_cseq(b"CANCEL sip:olivia@profi.ru SIP/2.0\r\nCSeq: 95931 CANCEL\r\n");
+        dialog.update_request_headers(
+            b"CANCEL sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcancel;rport\r\n\
+CSeq: 95931 CANCEL\r\n\r\n",
+        );
         let responses = generate_sip_responses(&dialog, "CANCEL");
         assert_eq!(responses.len(), 2);
         let t0 = std::str::from_utf8(&responses[0]).unwrap();
@@ -1854,6 +1921,9 @@ Content-Length: 0\r\n\r\n";
             "CANCEL → 487"
         );
         assert!(t1.contains("CSeq: 95929 INVITE"));
+        assert!(t0.contains("branch=z9hG4bKcancel"));
+        assert!(t1.contains("branch=z9hG4bKee43689b8812e305"));
+        assert!(!t1.contains("branch=z9hG4bKcancel"));
         // 200 for CANCEL: To header must not carry the proxy-assigned to_tag
         // (the From header legitimately contains the client's own tag).
         let to_tag = &dialog.to_tag;
@@ -1929,7 +1999,7 @@ Content-Length: 0\r\n\r\n";
             "A".repeat(700)
         );
 
-        dialog.update_cseq(oversized.as_bytes());
+        dialog.update_request_headers(oversized.as_bytes());
 
         assert_eq!(dialog.cseq, original_cseq);
     }
