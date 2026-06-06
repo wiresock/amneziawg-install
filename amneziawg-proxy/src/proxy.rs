@@ -24,6 +24,36 @@ struct RelayEntry {
     generation: u64,
 }
 
+fn sip_stage_after_immediate_response(
+    current: SipDialogStage,
+    stage_before_response: Option<SipDialogStage>,
+    method: &str,
+    responses_len: usize,
+    sent_response_count: usize,
+    sent_any_response: bool,
+    sent_ringing: bool,
+) -> SipDialogStage {
+    if method == "INVITE" {
+        match (stage_before_response.unwrap_or(current), current) {
+            (
+                SipDialogStage::Idle | SipDialogStage::Terminated,
+                SipDialogStage::Idle | SipDialogStage::Terminated,
+            ) if sent_any_response => SipDialogStage::Invited,
+            (SipDialogStage::Invited, SipDialogStage::Invited) if sent_ringing => {
+                SipDialogStage::Ringing
+            }
+            _ => current,
+        }
+    } else {
+        let sent_all_responses = responses_len != 0 && sent_response_count == responses_len;
+        if sent_all_responses || method == "ACK" {
+            responder::sip_next_stage(current, method)
+        } else {
+            current
+        }
+    }
+}
+
 /// The main proxy runtime state.
 pub struct Proxy {
     config: ProxyConfig,
@@ -545,23 +575,15 @@ impl Proxy {
         // Advance the dialog stage
         if use_stored_dialog {
             if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
-                d.stage = if method == "INVITE" {
-                    match stage_before_response.unwrap_or(d.stage) {
-                        SipDialogStage::Idle | SipDialogStage::Terminated if sent_any_response => {
-                            SipDialogStage::Invited
-                        }
-                        SipDialogStage::Invited if sent_ringing => SipDialogStage::Ringing,
-                        current => current,
-                    }
-                } else {
-                    let sent_all_responses =
-                        !responses.is_empty() && sent_response_count == responses.len();
-                    if sent_all_responses || method == "ACK" {
-                        responder::sip_next_stage(d.stage, &method)
-                    } else {
-                        d.stage
-                    }
-                };
+                d.stage = sip_stage_after_immediate_response(
+                    d.stage,
+                    stage_before_response,
+                    &method,
+                    responses.len(),
+                    sent_response_count,
+                    sent_any_response,
+                    sent_ringing,
+                );
             }
         }
 
@@ -617,35 +639,45 @@ impl Proxy {
                     debug!(%client_addr, "deferred SIP 180 Ringing rate limited");
                 }
 
-                // 200 OK after another 800 ms (total ~1 s) — drop guard before await.
+                // 200 OK after another 800 ms (total ~1 s). Reserve the
+                // transition while holding the dialog guard so a CANCEL/BYE
+                // cannot terminate the same dialog between building the OK and
+                // awaiting the socket send.
                 time::sleep(Duration::from_millis(800)).await;
                 let ok_allowed = metrics
                     .as_ref()
                     .map_or(true, |metrics| metrics.try_acquire_probe());
                 let ok = if ok_allowed {
-                    dialogs
-                        .get(&client_addr)
-                        .filter(|d| {
-                            matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
-                                && d.call_id_value == expected_call_id
-                        })
-                        .map(|d| responder::generate_sip_ok(&d))
+                    dialogs.get_mut(&client_addr).and_then(|mut d| {
+                        if matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
+                            && d.call_id_value == expected_call_id
+                        {
+                            let previous_stage = d.stage;
+                            let pkt = responder::generate_sip_ok(&d);
+                            d.stage = SipDialogStage::Established;
+                            Some((pkt, previous_stage))
+                        } else {
+                            None
+                        }
+                    })
                 } else {
                     None
                 };
-                if let Some(pkt) = ok {
-                    let sent = frontend.send_to(&pkt, client_addr).await.is_ok();
-                    if sent {
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_probe();
+                if let Some((pkt, previous_stage)) = ok {
+                    match frontend.send_to(&pkt, client_addr).await {
+                        Ok(_) => {
+                            if let Some(metrics) = metrics.as_ref() {
+                                metrics.record_probe();
+                            }
                         }
-                    }
-                    if sent {
-                        if let Some(mut d) = dialogs.get_mut(&client_addr) {
-                            if matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
-                                && d.call_id_value == expected_call_id
-                            {
-                                d.stage = SipDialogStage::Established;
+                        Err(e) => {
+                            warn!(%client_addr, error = %e, "failed to send deferred SIP 200 OK");
+                            if let Some(mut d) = dialogs.get_mut(&client_addr) {
+                                if d.stage == SipDialogStage::Established
+                                    && d.call_id_value == expected_call_id
+                                {
+                                    d.stage = previous_stage;
+                                }
                             }
                         }
                     }
@@ -813,6 +845,58 @@ impl Proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sip_invite_stage_update_does_not_regress_live_stage() {
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Idle,
+                Some(SipDialogStage::Idle),
+                "INVITE",
+                1,
+                1,
+                true,
+                false,
+            ),
+            SipDialogStage::Invited
+        );
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Invited,
+                Some(SipDialogStage::Invited),
+                "INVITE",
+                2,
+                2,
+                true,
+                true,
+            ),
+            SipDialogStage::Ringing
+        );
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Ringing,
+                Some(SipDialogStage::Idle),
+                "INVITE",
+                1,
+                1,
+                true,
+                false,
+            ),
+            SipDialogStage::Ringing
+        );
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Established,
+                Some(SipDialogStage::Invited),
+                "INVITE",
+                2,
+                2,
+                true,
+                true,
+            ),
+            SipDialogStage::Established
+        );
+    }
 
     #[tokio::test]
     async fn proxy_bind_and_shutdown() {
@@ -1669,6 +1753,91 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(
             proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
             Some(SipDialogStage::Invited)
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_cancel_before_answer_suppresses_deferred_invite_ok() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinvite;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: cancel-before-answer@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let cancel = b"CANCEL sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcancel;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: cancel-before-answer@192.168.224.194\r\n\
+CSeq: 95930 CANCEL\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("INVITE should receive immediate 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                .await
+                .expect("INVITE should receive deferred 180 Ringing")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 180 Ringing\r\n"));
+
+        proxy
+            .handle_sip_probe(cancel, client_addr, &metrics_ref, false)
+            .await;
+
+        let mut cancel_responses = Vec::new();
+        for _ in 0..2 {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                    .await
+                    .expect("CANCEL should receive both immediate responses")
+                    .unwrap();
+            assert_eq!(from, proxy_addr);
+            cancel_responses.push(std::str::from_utf8(&buf[..n]).unwrap().to_string());
+        }
+        assert!(cancel_responses
+            .iter()
+            .any(|s| s.starts_with("SIP/2.0 200 OK\r\n") && s.contains("CSeq: 95930 CANCEL")));
+        assert!(cancel_responses
+            .iter()
+            .any(|s| s.starts_with("SIP/2.0 487 Request Terminated\r\n")));
+
+        let late =
+            tokio::time::timeout(Duration::from_millis(900), client.recv_from(&mut buf)).await;
+        assert!(
+            late.is_err(),
+            "deferred INVITE 200 OK must not be sent after CANCEL"
+        );
+        assert_eq!(
+            proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
+            Some(SipDialogStage::Terminated)
         );
     }
 
