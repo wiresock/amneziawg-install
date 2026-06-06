@@ -497,12 +497,17 @@ impl Proxy {
             };
 
             tokio::spawn(async move {
-                // 180 Ringing after 200 ms — drop the guard before awaiting.
+                // 180 Ringing after 200 ms. Mark it before awaiting so an
+                // INVITE retransmit cannot also emit the first 180.
                 time::sleep(Duration::from_millis(200)).await;
-                let ringing = dialogs
-                    .get(&client_addr)
-                    .filter(|d| d.stage == SipDialogStage::Invited && d.call_id == expected_call_id)
-                    .map(|d| responder::generate_sip_ringing(&d));
+                let ringing = dialogs.get_mut(&client_addr).and_then(|mut d| {
+                    if d.stage == SipDialogStage::Invited && d.call_id == expected_call_id {
+                        d.stage = SipDialogStage::Ringing;
+                        Some(responder::generate_sip_ringing(&d))
+                    } else {
+                        None
+                    }
+                });
                 if let Some(pkt) = ringing {
                     if frontend.send_to(&pkt, client_addr).await.is_ok() {
                         if let Some(metrics) = metrics.as_ref() {
@@ -515,7 +520,10 @@ impl Proxy {
                 time::sleep(Duration::from_millis(800)).await;
                 let ok = dialogs
                     .get(&client_addr)
-                    .filter(|d| d.stage == SipDialogStage::Invited && d.call_id == expected_call_id)
+                    .filter(|d| {
+                        matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
+                            && d.call_id == expected_call_id
+                    })
                     .map(|d| responder::generate_sip_ok(&d));
                 if let Some(pkt) = ok {
                     let sent = frontend.send_to(&pkt, client_addr).await.is_ok();
@@ -526,7 +534,9 @@ impl Proxy {
                     }
                     if sent {
                         if let Some(mut d) = dialogs.get_mut(&client_addr) {
-                            if d.stage == SipDialogStage::Invited && d.call_id == expected_call_id {
+                            if matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
+                                && d.call_id == expected_call_id
+                            {
                                 d.stage = SipDialogStage::Established;
                             }
                         }
@@ -866,6 +876,25 @@ mod tests {
         pkt
     }
 
+    fn sip_test_config(backend_addr: SocketAddr) -> ProxyConfig {
+        ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec: 16,
+            imitate_protocol: "sip".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            awg_config: None,
+        }
+    }
+
     #[tokio::test]
     async fn awg_packet_not_treated_as_probe() {
         use crate::config::HRange;
@@ -1030,24 +1059,9 @@ mod tests {
         let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend.local_addr().unwrap();
 
-        let config = ProxyConfig {
-            listen: "127.0.0.1:0".into(),
-            backend: backend_addr.to_string(),
-            session_ttl_secs: 60,
-            cleanup_interval_secs: 60,
-            rate_limit_per_sec: 16,
-            imitate_protocol: "sip".into(),
-            quic_handshake_enabled: false,
-            quic_certificate_domain: "localhost".into(),
-            dns_forward_enabled: false,
-            dns_upstream: "127.0.0.1:53".into(),
-            dns_upstream_timeout_ms: 1500,
-            buffer_size: 4096,
-            max_sessions: 1000,
-            awg_config: None,
-        };
-
-        let proxy = Proxy::bind(config, None).await.unwrap();
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = client.local_addr().unwrap();
@@ -1084,28 +1098,80 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
+    async fn sip_invite_retransmit_suppresses_deferred_duplicate_ringing() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: retransmit-call@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("fresh INVITE should receive 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref)
+            .await;
+
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                    .await
+                    .expect("retransmitted INVITE should receive immediate responses")
+                    .unwrap();
+            assert_eq!(from, proxy_addr);
+            statuses.push(
+                std::str::from_utf8(&buf[..n])
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert!(statuses.iter().any(|s| s == "SIP/2.0 100 Trying"));
+        assert!(statuses.iter().any(|s| s == "SIP/2.0 180 Ringing"));
+
+        let duplicate =
+            tokio::time::timeout(Duration::from_millis(350), client.recv_from(&mut buf)).await;
+        assert!(
+            duplicate.is_err(),
+            "deferred timer must not emit a second 180 after retransmit"
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_fresh_invite_drops_stale_dialog_state() {
         let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend.local_addr().unwrap();
 
-        let config = ProxyConfig {
-            listen: "127.0.0.1:0".into(),
-            backend: backend_addr.to_string(),
-            session_ttl_secs: 60,
-            cleanup_interval_secs: 60,
-            rate_limit_per_sec: 16,
-            imitate_protocol: "sip".into(),
-            quic_handshake_enabled: false,
-            quic_certificate_domain: "localhost".into(),
-            dns_forward_enabled: false,
-            dns_upstream: "127.0.0.1:53".into(),
-            dns_upstream_timeout_ms: 1500,
-            buffer_size: 4096,
-            max_sessions: 1000,
-            awg_config: None,
-        };
-
-        let proxy = Proxy::bind(config, None).await.unwrap();
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = client.local_addr().unwrap();

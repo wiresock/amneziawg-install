@@ -519,7 +519,7 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
 /// Stage of a per-client SIP dialog.
 ///
 /// The proxy advances through these stages as methods arrive:
-/// `Idle` → (INVITE) → `Invited` → (ACK) → `Established` → (BYE) → `Terminated`
+/// `Idle` → (INVITE) → `Invited` → (180 sent) → `Ringing` → (ACK) → `Established` → (BYE) → `Terminated`
 ///
 /// Once `Terminated` the dialog may be reused for a new INVITE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,6 +528,8 @@ pub(crate) enum SipDialogStage {
     Idle,
     /// INVITE received; initial response sent, awaiting final answer or ACK.
     Invited,
+    /// `180 Ringing` sent; final `200 OK` is still pending.
+    Ringing,
     /// `200 OK` sent; awaiting ACK or BYE.
     Established,
     /// BYE (or CANCEL) received; `200 OK` sent.  Next INVITE starts fresh.
@@ -717,7 +719,30 @@ fn build_sip_response(dialog: &SipDialog, status_line: &str, add_to_tag: bool) -
 }
 
 fn sip_to_has_tag(to: &str) -> bool {
-    to.to_ascii_lowercase().contains(";tag=")
+    let bytes = to.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b';' {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+
+        if i + 3 <= bytes.len() && bytes[i..i + 3].eq_ignore_ascii_case(b"tag") {
+            let mut j = i + 3;
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn sip_response_fits(dialog: &SipDialog, status_line: &str, add_to_tag: bool) -> bool {
@@ -762,8 +787,8 @@ pub(crate) fn sip_method(data: &[u8]) -> Option<&str> {
 
 /// Generate the appropriate SIP response(s) for a given dialog stage + method.
 ///
-/// Returns a list because an INVITE in the `Invited` stage may need both a
-/// `100 Trying` and a `180 Ringing` (retransmit scenario), or a CANCEL needs
+/// Returns a list because an INVITE retransmit may need to replay the latest
+/// provisional response, or a CANCEL needs
 /// both `200 OK` (for CANCEL itself) and `487 Request Terminated` (for the
 /// original INVITE transaction).
 ///
@@ -777,11 +802,15 @@ pub(crate) fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<By
                 vec![build_sip_response(dialog, "SIP/2.0 100 Trying", false)]
             }
             SipDialogStage::Invited => {
-                // Retransmit: re-send 100 Trying + add 180 Ringing
+                // First retransmit before the timer: send the first 180 now.
                 vec![
                     build_sip_response(dialog, "SIP/2.0 100 Trying", false),
                     build_sip_response(dialog, "SIP/2.0 180 Ringing", true),
                 ]
+            }
+            SipDialogStage::Ringing => {
+                // Later retransmits replay the latest provisional response.
+                vec![build_sip_response(dialog, "SIP/2.0 180 Ringing", true)]
             }
             SipDialogStage::Established => {
                 // Retransmit after 200 OK sent — re-send 200 OK until ACK arrives.
@@ -812,20 +841,24 @@ pub(crate) fn sip_next_stage(current: SipDialogStage, method: &str) -> SipDialog
     match method.to_ascii_uppercase().as_str() {
         "INVITE" => match current {
             SipDialogStage::Idle | SipDialogStage::Terminated => SipDialogStage::Invited,
-            SipDialogStage::Invited | SipDialogStage::Established => current,
+            SipDialogStage::Invited => SipDialogStage::Ringing,
+            SipDialogStage::Ringing | SipDialogStage::Established => current,
         },
         "ACK" => match current {
-            SipDialogStage::Invited | SipDialogStage::Established => SipDialogStage::Established,
+            SipDialogStage::Invited | SipDialogStage::Ringing | SipDialogStage::Established => {
+                SipDialogStage::Established
+            }
             SipDialogStage::Idle | SipDialogStage::Terminated => current,
         },
         "BYE" => match current {
             SipDialogStage::Idle => SipDialogStage::Idle,
-            SipDialogStage::Invited | SipDialogStage::Established | SipDialogStage::Terminated => {
-                SipDialogStage::Terminated
-            }
+            SipDialogStage::Invited
+            | SipDialogStage::Ringing
+            | SipDialogStage::Established
+            | SipDialogStage::Terminated => SipDialogStage::Terminated,
         },
         "CANCEL" => match current {
-            SipDialogStage::Invited => SipDialogStage::Terminated,
+            SipDialogStage::Invited | SipDialogStage::Ringing => SipDialogStage::Terminated,
             SipDialogStage::Idle | SipDialogStage::Established | SipDialogStage::Terminated => {
                 current
             }
@@ -1753,7 +1786,12 @@ Content-Length: 0\r\n\r\n";
         assert!(t1.contains(";tag="));
         // Advance stage
         dialog.stage = sip_next_stage(dialog.stage, "INVITE");
-        assert_eq!(dialog.stage, SipDialogStage::Invited);
+        assert_eq!(dialog.stage, SipDialogStage::Ringing);
+        let responses = generate_sip_responses(&dialog, "INVITE");
+        assert_eq!(responses.len(), 1);
+        assert!(std::str::from_utf8(&responses[0])
+            .unwrap()
+            .starts_with("SIP/2.0 180 Ringing\r\n"));
     }
 
     #[test]
@@ -1846,6 +1884,23 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[test]
+    fn sip_dialog_response_detects_spaced_to_tag() {
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>; tag = remote-tag\r\n\
+Call-ID: spaced-tagged-to@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let dialog = SipDialog::from_invite(invite).unwrap();
+        let ok = generate_sip_ok(&dialog);
+        let text = std::str::from_utf8(&ok).unwrap();
+        let to_line = text.lines().find(|line| line.starts_with("To:")).unwrap();
+        assert!(to_line.contains("; tag = remote-tag"));
+        assert!(!to_line.contains(dialog.to_tag.as_str()));
+    }
+
+    #[test]
     fn sip_dialog_oversized_cseq_update_is_ignored() {
         let invite = sample_invite();
         let mut dialog = SipDialog::from_invite(&invite).unwrap();
@@ -1893,6 +1948,14 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(
             sip_next_stage(SipDialogStage::Invited, "ACK"),
             SipDialogStage::Established
+        );
+        assert_eq!(
+            sip_next_stage(SipDialogStage::Invited, "INVITE"),
+            SipDialogStage::Ringing
+        );
+        assert_eq!(
+            sip_next_stage(SipDialogStage::Ringing, "INVITE"),
+            SipDialogStage::Ringing
         );
         assert_eq!(
             sip_next_stage(SipDialogStage::Established, "INVITE"),

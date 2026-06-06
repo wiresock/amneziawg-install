@@ -403,7 +403,8 @@ fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
 /// emits a `METHOD sip:...` request line, and proxy-side padding emits a
 /// `SIP/2.0 ...` response line.
 ///
-/// The padding always ends with CRLF when at least two bytes are available.
+/// The padding ends with CRLFCRLF when a minimal terminated SIP status block
+/// fits, or CRLF for shorter padding when at least two bytes are available.
 fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     let padding = &mut data[..pad_size];
     if padding.is_empty() {
@@ -411,6 +412,7 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     }
 
     let len = padding.len();
+    const SIP_MIN_TERMINATED_RESPONSE_LEN: usize = b"SIP/2.0 100 Trying\r\n\r\n".len();
 
     // SIP 100 Trying response with a realistic Via sent-by and Content-Length.
     // Starts with the response status line so the directionality (server →
@@ -421,7 +423,7 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     // The sent-by uses a plausible hostname:port instead of the literal string
     // "proxy", which would look obviously synthetic to any deep inspector.
     static SIP_FILL: &[u8] =
-        b"SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP sip.example.com:5060;branch=z9hG4bK\r\nContent-Length: 0\r\n";
+        b"SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP sip.example.com:5060;branch=z9hG4bK\r\nContent-Length: 0\r\n\r\n";
 
     // Copy at most one full pass; do not cycle — a real SIP response never
     // repeats its own headers.  If pad_size exceeds the fill, zero-pad the rest.
@@ -431,8 +433,14 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
         *b = 0x00;
     }
 
-    // Ensure the padding ends with \r\n if at least 2 bytes
-    if len >= 2 {
+    // Ensure the padding ends with a complete SIP header terminator when there
+    // is room, otherwise keep the legacy CRLF suffix for tiny padding.
+    if len >= SIP_MIN_TERMINATED_RESPONSE_LEN {
+        padding[len - 4] = b'\r';
+        padding[len - 3] = b'\n';
+        padding[len - 2] = b'\r';
+        padding[len - 1] = b'\n';
+    } else if len >= 2 {
         padding[len - 2] = b'\r';
         padding[len - 1] = b'\n';
     }
@@ -630,9 +638,8 @@ mod tests {
         // Padding starts with the SIP/2.0 response status line
         let padding = &data[..50];
         assert!(padding.starts_with(b"SIP/2.0 100 Trying"));
-        // Padding ends with \r\n
-        assert_eq!(data[48], b'\r');
-        assert_eq!(data[49], b'\n');
+        // Padding ends with a complete SIP header terminator.
+        assert_eq!(&data[46..50], b"\r\n\r\n");
         // Payload untouched
         assert!(data[50..60].iter().all(|&b| b == 0xCC));
     }
@@ -653,6 +660,14 @@ mod tests {
         assert_eq!(data[0], b'\r');
         assert_eq!(data[1], b'\n');
         assert_eq!(data[2], 0xAA); // payload untouched
+    }
+
+    #[test]
+    fn sip_padding_four_bytes() {
+        let mut data = [0x00, 0x00, 0x00, 0x00, 0xAA]; // 4 bytes padding + payload
+        apply_padding(&mut data, 4, Protocol::Sip);
+        assert_eq!(&data[..4], b"SI\r\n");
+        assert_eq!(data[4], 0xAA); // payload untouched
     }
 
     // -- General padding tests --
@@ -711,7 +726,8 @@ mod tests {
         assert_eq!(result.len(), 5);
         // Last byte is payload
         assert_eq!(result[4], 0xFF);
-        // SIP response status-line fill, last 2 bytes of padding overridden with \r\n
+        // Too short for a complete SIP header block; keep a recognizable prefix
+        // and the legacy CRLF suffix.
         assert_eq!(result[0], b'S');
         assert_eq!(result[1], b'I');
         assert_eq!(result[2], b'\r');
@@ -808,7 +824,7 @@ mod tests {
 
         // Prefix padding should start with the SIP response status line
         assert!(pkt[..20].starts_with(b"SIP/2.0 100 Trying"));
-        // Padding ends with \r\n
+        // Too short for a complete SIP header block; padding still ends with CRLF.
         assert_eq!(pkt[18], b'\r');
         assert_eq!(pkt[19], b'\n');
         // Header + body should be untouched
