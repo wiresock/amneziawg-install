@@ -911,7 +911,7 @@ pub(crate) fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<By
             let mut invite_dialog = dialog.clone();
             invite_dialog.via = invite_dialog.invite_via.clone();
             invite_dialog.cseq = invite_dialog.invite_cseq.clone();
-            let mut responses = vec![build_sip_response(dialog, "SIP/2.0 200 OK", false)];
+            let mut responses = vec![build_sip_response(dialog, "SIP/2.0 200 OK", true)];
             let invite_in_progress =
                 matches!(dialog.stage, SipDialogStage::Invited | SipDialogStage::Ringing);
             if invite_in_progress
@@ -2045,12 +2045,15 @@ CSeq: 95931 CANCEL\r\n\r\n",
         assert!(t0.contains("branch=z9hG4bKcancel"));
         assert!(t1.contains("branch=z9hG4bKee43689b8812e305"));
         assert!(!t1.contains("branch=z9hG4bKcancel"));
-        // 200 for CANCEL: To header must not carry the proxy-assigned to_tag
-        // (the From header legitimately contains the client's own tag).
-        let to_tag = &dialog.to_tag;
+        let cancel_to = t0.lines().find(|line| line.starts_with("To:")).unwrap();
+        let invite_to = t1.lines().find(|line| line.starts_with("To:")).unwrap();
         assert!(
-            !t0.contains(to_tag.as_str()),
-            "200 OK for CANCEL must not add To tag"
+            cancel_to.contains(dialog.to_tag.as_str()),
+            "200 OK for CANCEL must carry To tag"
+        );
+        assert!(
+            invite_to.contains(dialog.to_tag.as_str()),
+            "487 for INVITE must carry the same To tag"
         );
     }
 
@@ -2070,6 +2073,11 @@ CSeq: 95931 CANCEL\r\n\r\n",
         let text = std::str::from_utf8(&responses[0]).unwrap();
         assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
         assert!(text.contains("CSeq: 95931 CANCEL"));
+        let to = text.lines().find(|line| line.starts_with("To:")).unwrap();
+        assert!(
+            to.contains(dialog.to_tag.as_str()),
+            "200 OK for established CANCEL must carry To tag"
+        );
         assert!(!text.contains("487 Request Terminated"));
     }
 
@@ -2089,6 +2097,11 @@ Content-Length: 0\r\n\r\n";
         let text = std::str::from_utf8(&responses[0]).unwrap();
         assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
         assert!(text.contains("CSeq: 95931 CANCEL"));
+        let to = text.lines().find(|line| line.starts_with("To:")).unwrap();
+        assert!(
+            to.contains(dialog.to_tag.as_str()),
+            "request-scoped CANCEL 200 OK must carry To tag"
+        );
         assert!(!text.contains("487 Request Terminated"));
     }
 
