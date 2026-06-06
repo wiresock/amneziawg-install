@@ -416,6 +416,8 @@ impl Proxy {
         let mut is_fresh_invite = false;
         let mut fresh_call_id: Option<String> = None;
         let mut stage_before_response: Option<SipDialogStage> = None;
+        let mut use_stored_dialog = true;
+        let mut request_dialog: Option<SipDialog> = None;
 
         // For a fresh INVITE, create (or reset) the dialog from the request.
         if method == "INVITE" {
@@ -444,19 +446,44 @@ impl Proxy {
                 }
             } else {
                 self.sip_dialogs.remove(&client_addr);
+                use_stored_dialog = false;
             }
         } else {
-            // For non-INVITE methods update transaction headers if a dialog exists.
+            // For non-INVITE methods, only reuse the active dialog if the
+            // incoming request belongs to the same Call-ID. Otherwise build a
+            // bounded response from the request itself without mutating the
+            // active dialog for a different call.
+            let parsed_request = SipDialog::from_request(data);
             if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
-                d.update_request_headers(data);
+                match parsed_request {
+                    Some(dialog) if dialog.call_id_value == d.call_id_value => {
+                        d.update_request_headers(data);
+                    }
+                    Some(dialog) => {
+                        request_dialog = Some(dialog);
+                        use_stored_dialog = false;
+                    }
+                    None => {
+                        use_stored_dialog = false;
+                    }
+                }
+            } else {
+                request_dialog = parsed_request;
+                use_stored_dialog = false;
             }
         }
 
         // Build and send immediate response(s)
         let responses: Vec<bytes::Bytes> = {
-            if let Some(d) = self.sip_dialogs.get(&client_addr) {
-                stage_before_response = Some(d.stage);
-                responder::generate_sip_responses(&d, &method)
+            if use_stored_dialog {
+                if let Some(d) = self.sip_dialogs.get(&client_addr) {
+                    stage_before_response = Some(d.stage);
+                    responder::generate_sip_responses(&d, &method)
+                } else {
+                    Vec::new()
+                }
+            } else if let Some(dialog) = request_dialog.as_ref() {
+                responder::generate_sip_responses(dialog, &method)
             } else {
                 // No dialog state yet (e.g. OPTIONS before any INVITE).  Try a
                 // bounded header parse for standalone SIP methods that can receive
@@ -516,24 +543,26 @@ impl Proxy {
         }
 
         // Advance the dialog stage
-        if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
-            d.stage = if method == "INVITE" {
-                match stage_before_response.unwrap_or(d.stage) {
-                    SipDialogStage::Idle | SipDialogStage::Terminated if sent_any_response => {
-                        SipDialogStage::Invited
+        if use_stored_dialog {
+            if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
+                d.stage = if method == "INVITE" {
+                    match stage_before_response.unwrap_or(d.stage) {
+                        SipDialogStage::Idle | SipDialogStage::Terminated if sent_any_response => {
+                            SipDialogStage::Invited
+                        }
+                        SipDialogStage::Invited if sent_ringing => SipDialogStage::Ringing,
+                        current => current,
                     }
-                    SipDialogStage::Invited if sent_ringing => SipDialogStage::Ringing,
-                    current => current,
-                }
-            } else {
-                let sent_all_responses =
-                    !responses.is_empty() && sent_response_count == responses.len();
-                if sent_all_responses || method == "ACK" {
-                    responder::sip_next_stage(d.stage, &method)
                 } else {
-                    d.stage
-                }
-            };
+                    let sent_all_responses =
+                        !responses.is_empty() && sent_response_count == responses.len();
+                    if sent_all_responses || method == "ACK" {
+                        responder::sip_next_stage(d.stage, &method)
+                    } else {
+                        d.stage
+                    }
+                };
+            }
         }
 
         if is_fresh_invite && sent_any_response {
@@ -1386,6 +1415,63 @@ Content-Length: 0\r\n\r\n";
                 .map(|d| d.call_id_value.clone())
                 .as_deref(),
             Some("same-active-call@192.168.224.194")
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_non_invite_different_call_id_does_not_reuse_active_dialog() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKactive;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=active\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: active-call@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let options = b"OPTIONS sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKother;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=other\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: other-call@192.168.224.194\r\n\
+CSeq: 95930 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut active_dialog = SipDialog::from_invite(invite).unwrap();
+        active_dialog.stage = SipDialogStage::Established;
+        proxy.sip_dialogs.insert(client_addr, active_dialog);
+
+        proxy
+            .handle_sip_probe(options, client_addr, &metrics_ref, false)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("mismatched OPTIONS should receive request-scoped response")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(text.contains("Call-ID: other-call@192.168.224.194"));
+        assert!(!text.contains("active-call@192.168.224.194"));
+        assert_eq!(
+            proxy
+                .sip_dialogs
+                .get(&client_addr)
+                .map(|d| (d.call_id_value.clone(), d.stage)),
+            Some((
+                "active-call@192.168.224.194".to_string(),
+                SipDialogStage::Established
+            ))
         );
     }
 

@@ -881,7 +881,11 @@ pub(crate) fn generate_sip_responses(dialog: &SipDialog, method: &str) -> Vec<By
         }
         _ => {
             // REGISTER / OPTIONS / NOTIFY / SUBSCRIBE / MESSAGE / INFO — 200 OK
-            vec![build_sip_response(dialog, "SIP/2.0 200 OK", false)]
+            let in_dialog = matches!(
+                dialog.stage,
+                SipDialogStage::Invited | SipDialogStage::Ringing | SipDialogStage::Established
+            );
+            vec![build_sip_response(dialog, "SIP/2.0 200 OK", in_dialog)]
         }
     }
 }
@@ -1988,6 +1992,25 @@ CSeq: 95931 CANCEL\r\n\r\n",
         let text = std::str::from_utf8(&responses[0]).unwrap();
         assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
         assert!(text.contains("CSeq: 95930 OPTIONS"));
+    }
+
+    #[test]
+    fn sip_dialog_in_dialog_generic_request_returns_200_ok_with_to_tag() {
+        let invite = sample_invite();
+        let mut dialog = SipDialog::from_invite(&invite).unwrap();
+        dialog.stage = SipDialogStage::Established;
+        dialog.update_request_headers(
+            b"INFO sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinfo;rport\r\n\
+CSeq: 95930 INFO\r\n\r\n",
+        );
+
+        let responses = generate_sip_responses(&dialog, "INFO");
+        assert_eq!(responses.len(), 1);
+        let text = std::str::from_utf8(&responses[0]).unwrap();
+        let to_line = text.lines().find(|line| line.starts_with("To:")).unwrap();
+        assert!(to_line.contains(dialog.to_tag.as_str()));
+        assert!(text.contains("CSeq: 95930 INFO"));
     }
 
     #[test]
