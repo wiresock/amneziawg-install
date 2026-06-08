@@ -506,11 +506,21 @@ pub struct DnsEcho {
 /// Extract the transaction ID, QNAME, and QTYPE from a DNS query for later reuse
 /// in cover-traffic responses.
 ///
-/// Returns `None` unless the packet is a well-formed query (QR=0, standard
-/// opcode, QDCOUNT >= 1) with a valid uncompressed QNAME followed by QTYPE and
-/// QCLASS. Mirrors the acceptance test in [`detect_protocol`].
+/// Returns `None` unless the packet is a well-formed query (no STUN cookie,
+/// QR=0, standard opcode, QDCOUNT >= 1) with a valid uncompressed QNAME followed
+/// by QTYPE and QCLASS = IN. The STUN-cookie and QR/opcode checks mirror the
+/// acceptance test in [`detect_protocol`]; QCLASS is constrained to IN because
+/// the cover response always emits IN.
 pub fn parse_dns_query_echo(data: &[u8]) -> Option<DnsEcho> {
     if data.len() < 12 {
+        return None;
+    }
+    // Same STUN-cookie exclusion as detect_protocol: a real DNS query never has
+    // the STUN magic cookie at bytes 4-7, so this avoids capturing a STUN packet
+    // as a bogus "DNS query".
+    let has_stun_cookie = data.len() >= 8
+        && u32::from_be_bytes([data[4], data[5], data[6], data[7]]) == STUN_MAGIC_COOKIE;
+    if has_stun_cookie {
         return None;
     }
     let flags = u16::from_be_bytes([data[2], data[3]]);
@@ -523,6 +533,12 @@ pub fn parse_dns_query_echo(data: &[u8]) -> Option<DnsEcho> {
     let qname_end = dns_qname_end(data, QNAME_START)?;
     // Require QTYPE(2) + QCLASS(2) after the QNAME.
     if data.len() < qname_end + 4 {
+        return None;
+    }
+    // Require QCLASS = IN (1). The cover response always emits QCLASS IN, so
+    // restricting capture to IN keeps the echo faithful (no class mismatch) and
+    // rejects more non-DNS data whose bytes at this offset are not 0x0001.
+    if data[qname_end + 2] != 0x00 || data[qname_end + 3] != 0x01 {
         return None;
     }
     Some(DnsEcho {
@@ -1525,6 +1541,28 @@ mod tests {
         q.push(0x00);
         q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
         assert!(parse_dns_query_echo(&q).is_none());
+    }
+
+    #[test]
+    fn parse_dns_query_echo_rejects_stun_cookie() {
+        // A STUN packet has the magic cookie at bytes 4-7; it must not be
+        // captured as a DNS query (mirrors detect_protocol's exclusion).
+        let mut q = dns_query([0x00, 0x01], &["a"], [0x00, 0x01]);
+        q[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        assert!(parse_dns_query_echo(&q).is_none());
+    }
+
+    #[test]
+    fn parse_dns_query_echo_rejects_non_in_qclass() {
+        // QCLASS other than IN (1) is rejected: the cover response always emits
+        // IN, so capturing a non-IN query would produce a class mismatch.
+        let q = dns_query([0x00, 0x01], &["a"], [0x00, 0x01]);
+        let mut chaos = q.clone();
+        let qclass = chaos.len() - 2;
+        chaos[qclass..].copy_from_slice(&[0x00, 0x03]); // CH class
+        assert!(parse_dns_query_echo(&chaos).is_none());
+        // Sanity: the IN original is still accepted.
+        assert!(parse_dns_query_echo(&q).is_some());
     }
 
     #[test]

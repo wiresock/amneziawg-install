@@ -89,7 +89,7 @@ pub fn apply_quic_padding_typed(
 /// `dns_echo`, when present, is the most recent DNS query observed from this
 /// client; for `Protocol::Dns` it lets the response echo the query's QNAME,
 /// QTYPE, and transaction ID (ignored for other protocols).
-pub fn apply_awg_transform(
+pub(crate) fn apply_awg_transform(
     data: &mut [u8],
     params: &AwgParams,
     proto: Protocol,
