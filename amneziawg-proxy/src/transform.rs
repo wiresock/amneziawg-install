@@ -2,7 +2,7 @@
 use bytes::{BufMut, BytesMut};
 
 use crate::config::AwgParams;
-use crate::responder::{classify_awg_packet, AwgPacketType, Protocol};
+use crate::responder::{classify_awg_packet, AwgPacketType, DnsEcho, Protocol};
 
 /// Apply protocol-conformant padding transformation to an outgoing packet.
 ///
@@ -33,7 +33,7 @@ pub fn apply_padding(data: &mut [u8], pad_size: usize, proto: Protocol) {
 
     match proto {
         Protocol::Quic => apply_quic_padding_initial(data, pad_size),
-        Protocol::Dns => apply_dns_padding(data, pad_size),
+        Protocol::Dns => apply_dns_padding(data, pad_size, None),
         Protocol::Stun => apply_stun_padding(data, pad_size),
         Protocol::Sip => apply_sip_padding(data, pad_size),
     }
@@ -86,7 +86,15 @@ pub fn apply_quic_padding_typed(
 /// Returns `true` if the packet was classified and transformed, `false` if the
 /// packet type could not be identified (e.g. junk packet) and was left
 /// unchanged.
-pub fn apply_awg_transform(data: &mut [u8], params: &AwgParams, proto: Protocol) -> bool {
+/// `dns_echo`, when present, is the most recent DNS query observed from this
+/// client; for `Protocol::Dns` it lets the response echo the query's QNAME,
+/// QTYPE, and transaction ID (ignored for other protocols).
+pub fn apply_awg_transform(
+    data: &mut [u8],
+    params: &AwgParams,
+    proto: Protocol,
+    dns_echo: Option<&DnsEcho>,
+) -> bool {
     let pkt_type = match classify_awg_packet(data, params) {
         Some(t) => t,
         None => return false,
@@ -99,10 +107,10 @@ pub fn apply_awg_transform(data: &mut [u8], params: &AwgParams, proto: Protocol)
         return false;
     }
 
-    if proto == Protocol::Quic {
-        apply_quic_padding_typed(data, pad_size, pkt_type);
-    } else {
-        apply_padding(data, pad_size, proto);
+    match proto {
+        Protocol::Quic => apply_quic_padding_typed(data, pad_size, pkt_type),
+        Protocol::Dns => apply_dns_padding(data, pad_size, dns_echo),
+        _ => apply_padding(data, pad_size, proto),
     }
     true
 }
@@ -307,22 +315,46 @@ const DNS_OPT_COVER_CODE: u16 = 0xFDE9;
 /// back to [`apply_dns_padding_null`], which keeps the previous `TYPE NULL`
 /// behaviour for those rare small pads (response S-values are normally far
 /// larger). Returns immediately when `pad_size == 0`.
-fn apply_dns_padding(data: &mut [u8], pad_size: usize) {
+fn apply_dns_padding(data: &mut [u8], pad_size: usize, echo: Option<&DnsEcho>) {
     if pad_size == 0 {
         return;
     }
-    if pad_size >= DNS_OPT_MIN {
-        let total_len = data.len();
-        let (padding, payload) = data.split_at_mut(pad_size);
-        let txid = [
-            payload.first().copied().unwrap_or(0),
-            payload.get(1).copied().unwrap_or(0),
-        ];
-        // Root-label question for now; Commit B passes a real echoed QNAME.
-        write_dns_opt_response(padding, total_len, txid, &[0x00, 0x00, 0x01, 0x00, 0x01]);
+    if pad_size < DNS_OPT_MIN {
+        apply_dns_padding_null(data, pad_size);
         return;
     }
-    apply_dns_padding_null(data, pad_size);
+
+    let total_len = data.len();
+    let (padding, payload) = data.split_at_mut(pad_size);
+
+    // Build the question section. When the client's most recent query fits the
+    // pad prefix, echo its QNAME/QTYPE and reuse its transaction ID so the
+    // response mirrors the request (RFC 1035 §4.1.1). Otherwise fall back to a
+    // root-label question with a payload-derived ID.
+    let mut qbuf = [0u8; 259]; // max QNAME 255 (incl. root) + QTYPE 2 + QCLASS 2
+    let (question, txid): (&[u8], [u8; 2]) = match echo {
+        Some(e)
+            if e.qname.len() + 4 <= qbuf.len()
+                && DNS_HEADER_LEN + e.qname.len() + 4 + DNS_OPT_FIXED_LEN + DNS_OPT_OPTION_HDR_LEN
+                    <= pad_size =>
+        {
+            let qn = e.qname.len();
+            qbuf[..qn].copy_from_slice(&e.qname);
+            qbuf[qn..qn + 2].copy_from_slice(&e.qtype);
+            qbuf[qn + 2..qn + 4].copy_from_slice(&[0x00, 0x01]); // QCLASS IN
+            (&qbuf[..qn + 4], e.txid)
+        }
+        _ => {
+            qbuf[..5].copy_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]); // root QNAME + A + IN
+            let txid = [
+                payload.first().copied().unwrap_or(0),
+                payload.get(1).copied().unwrap_or(0),
+            ];
+            (&qbuf[..5], txid)
+        }
+    };
+
+    write_dns_opt_response(padding, total_len, txid, question);
 }
 
 /// Write an EDNS OPT-framed DNS response header into `padding` (the `pad_size`
@@ -838,6 +870,60 @@ mod tests {
     }
 
     #[test]
+    fn dns_padding_echoes_query_question_and_txid() {
+        // Echo www.profi.ru / type A with TXID 0x1234. The question section in
+        // the response must be byte-identical to the query's, and the TXID must
+        // match (not be payload-derived).
+        let echo = DnsEcho {
+            txid: [0x12, 0x34],
+            qname: b"\x03www\x05profi\x02ru\x00".to_vec(),
+            qtype: [0x00, 0x01],
+        };
+        let qn = echo.qname.len(); // 15
+        // total comfortably fits header(12) + question(qn+4) + OPT(15) + payload.
+        let pad_size = 12 + qn + 4 + 15 + 8;
+        let total = pad_size + 40;
+        let mut data = vec![0x5Au8; total];
+        apply_dns_padding(&mut data, pad_size, Some(&echo));
+
+        // TXID echoed (not derived from the 0x5A payload).
+        assert_eq!(&data[0..2], &[0x12, 0x34], "TXID echoed from query");
+        assert_eq!(data[2], 0x81, "QR=1, RD=1");
+        assert_eq!(&data[10..12], &[0x00, 0x01], "ARCOUNT=1 (OPT)");
+        // Question section is byte-identical to the query's QNAME + QTYPE + QCLASS.
+        let q_end = 12 + qn + 4;
+        assert_eq!(&data[12..12 + qn], echo.qname.as_slice(), "QNAME echoed");
+        assert_eq!(&data[12 + qn..12 + qn + 2], &echo.qtype, "QTYPE echoed");
+        assert_eq!(&data[12 + qn + 2..q_end], &[0x00, 0x01], "QCLASS IN");
+        // OPT RR immediately follows the question.
+        assert_eq!(&data[q_end + 1..q_end + 3], &[0x00, 0x29], "TYPE OPT(41)");
+        // Payload untouched.
+        assert!(data[pad_size..].iter().all(|&b| b == 0x5A), "payload untouched");
+    }
+
+    #[test]
+    fn dns_padding_falls_back_to_root_when_qname_too_large_for_pad() {
+        // Echo present but pad_size too small for the echoed QNAME: fall back to
+        // the root-label question with a payload-derived TXID.
+        let echo = DnsEcho {
+            txid: [0x12, 0x34],
+            qname: b"\x03www\x05profi\x02ru\x00".to_vec(),
+            qtype: [0x00, 0x01],
+        };
+        let pad_size = DNS_OPT_MIN; // 32: only fits a root-label question
+        let total = pad_size + 20;
+        let mut data = vec![0u8; total];
+        data[pad_size] = 0xDE; // payload[0] -> tx_hi
+        data[pad_size + 1] = 0xAD; // payload[1] -> tx_lo
+        apply_dns_padding(&mut data, pad_size, Some(&echo));
+
+        assert_eq!(&data[0..2], &[0xDE, 0xAD], "payload-derived TXID on fallback");
+        assert_eq!(data[12], 0x00, "root-label QNAME");
+        assert_eq!(&data[13..15], &[0x00, 0x01], "QTYPE A");
+        assert_eq!(&data[18..20], &[0x00, 0x29], "TYPE OPT(41)");
+    }
+
+    #[test]
     fn dns_padding_null_fallback_below_opt_min() {
         // pad_size in [28, 32) is too small for OPT framing: the legacy NULL
         // record still covers the whole datagram (RDLENGTH = total - 28).
@@ -1193,7 +1279,7 @@ mod tests {
                     let (mut pkt, pad_size, header) = build_awg_packet(pkt_type, &params);
 
                     assert_eq!(classify_awg_packet(&pkt, &params), Some(pkt_type));
-                    assert!(apply_awg_transform(&mut pkt, &params, proto));
+                    assert!(apply_awg_transform(&mut pkt, &params, proto, None));
 
                     assert_protocol_prefix(proto, pkt_type, &pkt, pad_size);
                     assert_eq!(
@@ -1223,7 +1309,7 @@ mod tests {
         pkt.extend_from_slice(&body);
         assert_eq!(pkt.len(), 10 + 148); // S1 + WG message size
 
-        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic);
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic, None);
         assert!(result);
 
         // Prefix padding (first 10 bytes): 1-RTT short header (form=0, fixed=1)
@@ -1248,7 +1334,7 @@ mod tests {
         pkt.extend_from_slice(&header);
         pkt.extend_from_slice(&body);
 
-        let result = apply_awg_transform(&mut pkt, &params, Protocol::Sip);
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Sip, None);
         assert!(result);
 
         // Prefix padding should contain a complete minimal SIP response.
@@ -1272,7 +1358,7 @@ mod tests {
         pkt.extend_from_slice(&body);
         assert_eq!(pkt.len(), 40 + 92); // total_len = 132
 
-        let result = apply_awg_transform(&mut pkt, &params, Protocol::Dns);
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Dns, None);
         assert!(result);
 
         // DNS header: QR=1, RD=1, RA=1, NODATA + OPT.
@@ -1301,7 +1387,7 @@ mod tests {
         pkt.extend_from_slice(&[0xDD; 88]);
         assert_eq!(pkt.len(), 8 + 92);
 
-        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic);
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic, None);
         assert!(result);
 
         // S2 padding must use Handshake long-header (0xE0..), NOT Initial (0xC0..)
@@ -1320,7 +1406,7 @@ mod tests {
         pkt.extend_from_slice(&750u32.to_le_bytes());
         pkt.extend_from_slice(&[0xBB; 100]);
 
-        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic);
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic, None);
         assert!(result);
 
         // S4 padding must use 1-RTT short-header (form=0, fixed=1 => 0x40..0x7F)
@@ -1341,7 +1427,7 @@ mod tests {
         pkt.extend_from_slice(&header);
         pkt.extend_from_slice(&body);
 
-        let result = apply_awg_transform(&mut pkt, &params, Protocol::Stun);
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Stun, None);
         assert!(result);
 
         assert_eq!(&pkt[0..2], &0x0011u16.to_be_bytes());
@@ -1354,7 +1440,7 @@ mod tests {
     fn awg_transform_unknown_packet() {
         let params = test_awg_params();
         let mut pkt = vec![0xFF; 50]; // No valid H-range header at any S offset
-        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic);
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic, None);
         assert!(!result);
         // Packet should be unchanged
         assert!(pkt.iter().all(|&b| b == 0xFF));
@@ -1369,7 +1455,7 @@ mod tests {
         // Packet too short for S1(100) + 4 header bytes → can't classify
         let header = 150u32.to_le_bytes();
         let mut pkt = Vec::from(header); // only 4 bytes
-        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic);
+        let result = apply_awg_transform(&mut pkt, &params, Protocol::Quic, None);
         assert!(!result); // can't classify (too short for S1 offset)
     }
 }

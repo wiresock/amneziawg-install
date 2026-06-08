@@ -457,6 +457,81 @@ fn generate_stun_binding_success(incoming: &[u8], client_addr: SocketAddr) -> By
     buf.freeze()
 }
 
+/// Walk an uncompressed DNS QNAME starting at `start`, returning the index just
+/// past the terminating root label (`0x00`).
+///
+/// Returns `None` on a compression pointer / reserved label bits, truncation, or
+/// an RFC 1035 §2.3.4 limit violation (label > 63 octets, total name > 255).
+fn dns_qname_end(data: &[u8], start: usize) -> Option<usize> {
+    const MAX_LABEL: usize = 63;
+    const MAX_QNAME: usize = 255;
+    let mut pos = start;
+    let mut qname_len: usize = 0;
+    loop {
+        let label_len = *data.get(pos)? as usize;
+        // Compression pointers and reserved bits (top two bits) are not supported.
+        if label_len & 0xC0 != 0 {
+            return None;
+        }
+        if label_len == 0 {
+            return Some(pos + 1);
+        }
+        if label_len > MAX_LABEL {
+            return None;
+        }
+        qname_len += 1 + label_len;
+        // +1 accounts for the terminating root label.
+        if qname_len + 1 > MAX_QNAME {
+            return None;
+        }
+        pos += 1 + label_len;
+    }
+}
+
+/// Captured echo of a client's DNS query, reused so the proxy's DNS cover-traffic
+/// responses mirror the request: RFC 1035 §4.1.1 requires a response to repeat
+/// the question section, and resolvers echo the transaction ID. Without this the
+/// responses carry a root-label question and a payload-derived ID that matches no
+/// outstanding query — both easy fingerprints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsEcho {
+    /// Transaction ID copied verbatim from the query.
+    pub txid: [u8; 2],
+    /// QNAME wire bytes including the terminating root label (`0x00`).
+    pub qname: Vec<u8>,
+    /// QTYPE (e.g. A / AAAA / HTTPS), copied from the query.
+    pub qtype: [u8; 2],
+}
+
+/// Extract the transaction ID, QNAME, and QTYPE from a DNS query for later reuse
+/// in cover-traffic responses.
+///
+/// Returns `None` unless the packet is a well-formed query (QR=0, standard
+/// opcode, QDCOUNT >= 1) with a valid uncompressed QNAME followed by QTYPE and
+/// QCLASS. Mirrors the acceptance test in [`detect_protocol`].
+pub fn parse_dns_query_echo(data: &[u8]) -> Option<DnsEcho> {
+    if data.len() < 12 {
+        return None;
+    }
+    let flags = u16::from_be_bytes([data[2], data[3]]);
+    let qdcount = u16::from_be_bytes([data[4], data[5]]);
+    // QR=0 (query) and standard opcode (top five bits clear); at least one question.
+    if flags & 0xF800 != 0 || qdcount < 1 {
+        return None;
+    }
+    const QNAME_START: usize = 12;
+    let qname_end = dns_qname_end(data, QNAME_START)?;
+    // Require QTYPE(2) + QCLASS(2) after the QNAME.
+    if data.len() < qname_end + 4 {
+        return None;
+    }
+    Some(DnsEcho {
+        txid: [data[0], data[1]],
+        qname: data[QNAME_START..qname_end].to_vec(),
+        qtype: [data[qname_end], data[qname_end + 1]],
+    })
+}
+
 /// DNS SERVFAIL response (RFC 1035 §4.1):
 /// Echoes the transaction ID and question section, sets QR=1, RCODE=2
 /// (SERVFAIL).
@@ -466,8 +541,6 @@ fn generate_stun_binding_success(incoming: &[u8], client_addr: SocketAddr) -> By
 fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
     // Hard cap: standard DNS message size (RFC 1035 §2.3.4).
     const MAX_RESPONSE: usize = 512;
-    const MAX_LABEL: usize = 63;
-    const MAX_QNAME: usize = 255;
 
     let mut buf = BytesMut::with_capacity(MAX_RESPONSE);
 
@@ -497,49 +570,18 @@ fn generate_dns_servfail(incoming: &[u8]) -> Bytes {
     buf.put_u16(0);
 
     // Echo the question section from the incoming query if available.
-    // The question section starts at byte 12 in a DNS message and consists
-    // of: QNAME (sequence of labels ending with 0) + QTYPE (2) + QCLASS (2).
-    // We intentionally do not support compression pointers here; if we
-    // encounter them, we refrain from echoing the question.
-    //
-    // We validate RFC 1035 §2.3.4 label/QNAME limits (label ≤ 63, total
-    // name ≤ 255) and enforce a hard 512-byte response cap. Invalid or
-    // oversized names are silently dropped (header-only response).
+    // The question section starts at byte 12 and is QNAME + QTYPE(2) + QCLASS(2).
+    // `dns_qname_end` validates RFC 1035 §2.3.4 limits and rejects compression
+    // pointers; invalid or oversized names are silently dropped (header-only
+    // response). We also enforce the hard 512-byte response cap.
     if incoming.len() > 12 {
-        let mut pos = 12;
-        let mut qname_len: usize = 0;
-        // Walk QNAME labels until root label (0) or end of packet
-        while pos < incoming.len() {
-            let label_len = incoming[pos] as usize;
-            // Compression pointer (two high bits set) is not supported here.
-            if label_len & 0xC0 == 0xC0 {
-                break;
-            }
-            if label_len == 0 {
-                // Ensure we have root label (0) + QTYPE (2) + QCLASS (2) = 5 bytes
-                let question_end = pos + 5;
-                if question_end <= incoming.len() && buf.len() + (question_end - 12) <= MAX_RESPONSE
-                {
-                    buf.put_slice(&incoming[12..question_end]);
-                    // Patch QDCOUNT to 1 since we successfully echoed the question
-                    buf[qdcount_offset] = 0x00;
-                    buf[qdcount_offset + 1] = 0x01;
-                }
-                break;
-            }
-            // Validate label length (RFC 1035 §2.3.4: label ≤ 63 octets)
-            if label_len > MAX_LABEL {
-                break;
-            }
-            qname_len += 1 + label_len;
-            // Validate total QNAME length (RFC 1035 §2.3.4: ≤ 255 octets,
-            // including the terminating root label which adds 1 octet)
-            if qname_len + 1 > MAX_QNAME {
-                break;
-            }
-            pos += 1 + label_len;
-            if pos > incoming.len() {
-                break;
+        if let Some(qname_end) = dns_qname_end(incoming, 12) {
+            let question_end = qname_end + 4; // + QTYPE(2) + QCLASS(2)
+            if question_end <= incoming.len() && buf.len() + (question_end - 12) <= MAX_RESPONSE {
+                buf.put_slice(&incoming[12..question_end]);
+                // Patch QDCOUNT to 1 since we successfully echoed the question.
+                buf[qdcount_offset] = 0x00;
+                buf[qdcount_offset + 1] = 0x01;
             }
         }
     }
@@ -1409,6 +1451,80 @@ mod tests {
         assert_eq!(resp[1], 0xCD);
         // QR=1
         assert!(resp[2] & 0x80 != 0);
+    }
+
+    /// Build a minimal DNS query: header (RD=1) + QNAME(labels) + QTYPE + QCLASS IN.
+    fn dns_query(txid: [u8; 2], labels: &[&str], qtype: [u8; 2]) -> Vec<u8> {
+        let mut q = vec![
+            txid[0], txid[1], 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for label in labels {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0x00); // root label
+        q.extend_from_slice(&qtype);
+        q.extend_from_slice(&[0x00, 0x01]); // QCLASS IN
+        q
+    }
+
+    #[test]
+    fn parse_dns_query_echo_extracts_txid_qname_qtype() {
+        let q = dns_query([0x12, 0x34], &["www", "profi", "ru"], [0x00, 0x01]);
+        let echo = parse_dns_query_echo(&q).expect("valid query");
+        assert_eq!(echo.txid, [0x12, 0x34]);
+        assert_eq!(echo.qtype, [0x00, 0x01]);
+        // QNAME wire bytes include the terminating root label.
+        assert_eq!(
+            echo.qname,
+            b"\x03www\x05profi\x02ru\x00".to_vec(),
+            "QNAME must be the verbatim wire encoding"
+        );
+    }
+
+    #[test]
+    fn parse_dns_query_echo_preserves_qtype_for_aaaa_and_https() {
+        for qtype in [[0x00, 0x1c], [0x00, 0x41]] {
+            let q = dns_query([0xAA, 0xBB], &["example", "com"], qtype);
+            assert_eq!(parse_dns_query_echo(&q).unwrap().qtype, qtype);
+        }
+    }
+
+    #[test]
+    fn parse_dns_query_echo_rejects_response() {
+        let mut q = dns_query([0x00, 0x01], &["a"], [0x00, 0x01]);
+        q[2] |= 0x80; // set QR=1 -> not a query
+        assert!(parse_dns_query_echo(&q).is_none());
+    }
+
+    #[test]
+    fn parse_dns_query_echo_rejects_compression_pointer() {
+        // QNAME that starts with a compression pointer (0xC0xx) is not echoable.
+        let q = vec![
+            0x00, 0x01, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x0C,
+            0x00, 0x01, 0x00, 0x01,
+        ];
+        assert!(parse_dns_query_echo(&q).is_none());
+    }
+
+    #[test]
+    fn parse_dns_query_echo_rejects_truncated_question() {
+        // Valid QNAME but missing QTYPE/QCLASS.
+        let mut q = dns_query([0x00, 0x01], &["a"], [0x00, 0x01]);
+        q.truncate(q.len() - 3); // drop QCLASS + part of QTYPE
+        assert!(parse_dns_query_echo(&q).is_none());
+    }
+
+    #[test]
+    fn parse_dns_query_echo_rejects_oversize_label() {
+        let mut q = vec![
+            0x00, 0x01, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        q.push(64); // label length > 63 is invalid (RFC 1035 §2.3.4)
+        q.extend(std::iter::repeat(b'a').take(64));
+        q.push(0x00);
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        assert!(parse_dns_query_echo(&q).is_none());
     }
 
     #[test]

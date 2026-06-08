@@ -13,7 +13,7 @@ use crate::backend;
 use crate::config::{AwgParams, ProxyConfig};
 use crate::metrics::MetricsStore;
 use crate::quic_handshake::{QuicHandshakeResponder, QuicResponse};
-use crate::responder::{self, Protocol, SipDialog, SipDialogStage};
+use crate::responder::{self, DnsEcho, Protocol, SipDialog, SipDialogStage};
 use crate::session::SessionTable;
 use crate::transform;
 
@@ -76,6 +76,9 @@ pub struct Proxy {
     quic_handshake: Option<Arc<Mutex<QuicHandshakeResponder>>>,
     /// Per-client SIP dialog state, maintained across INVITE/ACK/BYE.
     sip_dialogs: Arc<DashMap<SocketAddr, SipDialog>>,
+    /// Most recent DNS query (TXID + QNAME + QTYPE) observed per client, so
+    /// DNS cover-traffic responses can echo the request (see `transform`).
+    dns_query_echo: Arc<DashMap<SocketAddr, DnsEcho>>,
     shutdown: Arc<Notify>,
     /// Per-session relay task handles, keyed by client address.
     /// Each task awaits data from the session's backend socket and relays it
@@ -151,6 +154,7 @@ impl Proxy {
             dns_upstream_timeout,
             quic_handshake,
             sip_dialogs: Arc::new(DashMap::new()),
+            dns_query_echo: Arc::new(DashMap::new()),
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
             sip_deferred_handles: Arc::new(DashMap::new()),
@@ -181,6 +185,7 @@ impl Proxy {
             dns_upstream_timeout: Duration::from_millis(1500),
             quic_handshake: None,
             sip_dialogs: Arc::new(DashMap::new()),
+            dns_query_echo: Arc::new(DashMap::new()),
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
             sip_deferred_handles: Arc::new(DashMap::new()),
@@ -329,6 +334,7 @@ impl Proxy {
                 self.metrics.remove(&client_addr);
                 self.client_protocols.remove(&client_addr);
                 self.sip_dialogs.remove(&client_addr);
+                self.dns_query_echo.remove(&client_addr);
                 if let Some((_, entry)) = self.sip_deferred_handles.remove(&client_addr) {
                     entry.handle.abort();
                 }
@@ -377,6 +383,13 @@ impl Proxy {
             if let Some(proto) = selected_proto {
                 if insert_needed {
                     self.client_protocols.insert(client_addr, proto);
+                }
+                // Remember this client's latest DNS query so the relay can echo
+                // its QNAME/QTYPE/transaction ID in the cover-traffic responses.
+                if proto == Protocol::Dns {
+                    if let Some(echo) = responder::parse_dns_query_echo(data) {
+                        self.dns_query_echo.insert(client_addr, echo);
+                    }
                 }
                 if let Some(ref metrics) = metrics_ref {
                     if proto == Protocol::Quic {
@@ -813,6 +826,7 @@ impl Proxy {
         let fixed_protocol = self.fixed_protocol;
         let client_protocols = Arc::clone(&self.client_protocols);
         let sip_dialogs = Arc::clone(&self.sip_dialogs);
+        let dns_query_echo = Arc::clone(&self.dns_query_echo);
         let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
         let awg_params = self.awg_params.clone();
         // Size the per-session relay buffer from configured `buffer_size` so
@@ -840,7 +854,15 @@ impl Proxy {
                                 .map(|p| *p)
                                 .or(fixed_protocol);
                             if let Some(protocol) = protocol {
-                                transform::apply_awg_transform(&mut buf[..n], params, protocol);
+                                // For DNS, echo the client's last query so the
+                                // response mirrors it; held only across the call.
+                                let echo = dns_query_echo.get(&client_addr);
+                                transform::apply_awg_transform(
+                                    &mut buf[..n],
+                                    params,
+                                    protocol,
+                                    echo.as_deref(),
+                                );
                             }
                         }
 
@@ -866,6 +888,7 @@ impl Proxy {
                         client_protocols.remove(&client_addr);
                         metrics.remove(&client_addr);
                         sip_dialogs.remove(&client_addr);
+                        dns_query_echo.remove(&client_addr);
                         if let Some((_, entry)) = sip_deferred_handles.remove(&client_addr) {
                             entry.handle.abort();
                         }
