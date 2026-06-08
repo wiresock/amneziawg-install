@@ -317,6 +317,24 @@ impl Proxy {
             self.handle_probe(data, client_addr, &metrics_ref).await;
         }
 
+        // Remember this client's latest DNS query so the relay can echo its
+        // QNAME/QTYPE/transaction ID in the cover-traffic responses. The client's
+        // real traffic is AWG (the query lives in the S-padding prefix) and skips
+        // `handle_probe`, so the capture must happen here on the data path, using
+        // the same effective-protocol resolution the relay uses. `parse_dns_query_echo`
+        // returns `None` for anything that is not a well-formed DNS query, so a
+        // non-DNS prefix simply leaves the previous echo (if any) in place.
+        let effective_proto = self
+            .client_protocols
+            .get(&client_addr)
+            .map(|p| *p)
+            .or(self.fixed_protocol);
+        if effective_proto == Some(Protocol::Dns) {
+            if let Some(echo) = responder::parse_dns_query_echo(data) {
+                self.dns_query_echo.insert(client_addr, echo);
+            }
+        }
+
         // Forward to backend (and spawn relay task for new sessions)
         match self.sessions.get_or_create(client_addr).await {
             Ok((backend_sock, is_new)) => {
@@ -383,13 +401,6 @@ impl Proxy {
             if let Some(proto) = selected_proto {
                 if insert_needed {
                     self.client_protocols.insert(client_addr, proto);
-                }
-                // Remember this client's latest DNS query so the relay can echo
-                // its QNAME/QTYPE/transaction ID in the cover-traffic responses.
-                if proto == Protocol::Dns {
-                    if let Some(echo) = responder::parse_dns_query_echo(data) {
-                        self.dns_query_echo.insert(client_addr, echo);
-                    }
                 }
                 if let Some(ref metrics) = metrics_ref {
                     if proto == Protocol::Quic {
@@ -931,6 +942,7 @@ impl Proxy {
         let metrics = Arc::clone(&self.metrics);
         let client_protocols = Arc::clone(&self.client_protocols);
         let sip_dialogs = Arc::clone(&self.sip_dialogs);
+        let dns_query_echo = Arc::clone(&self.dns_query_echo);
         let relay_handles = Arc::clone(&self.relay_handles);
         let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
         let interval = Duration::from_secs(self.config.cleanup_interval_secs);
@@ -945,6 +957,7 @@ impl Proxy {
                     metrics.remove(addr);
                     client_protocols.remove(addr);
                     sip_dialogs.remove(addr);
+                    dns_query_echo.remove(addr);
                     if let Some((_, entry)) = sip_deferred_handles.remove(addr) {
                         entry.handle.abort();
                     }
@@ -1238,6 +1251,102 @@ mod tests {
         // Body: needs at least WG_TRANSPORT_DATA_MIN_SIZE (32) bytes after s4.
         pkt.extend(std::iter::repeat(0xBBu8).take(32));
         pkt
+    }
+
+    /// Build an AWG transport-data packet whose S4-padding prefix is a DNS query
+    /// (mirroring what WireSock emits with `Ip=dns`): header + QNAME + QTYPE +
+    /// QCLASS, zero-filled to S4, then the H4 header and body.
+    fn awg_dns_masked_transport_packet(
+        params: &crate::config::AwgParams,
+        qname_wire: &[u8],
+        qtype: [u8; 2],
+        txid: [u8; 2],
+    ) -> Vec<u8> {
+        let s4 = params.s4 as usize;
+        assert!(s4 >= 12 + qname_wire.len() + 4, "S4 too small for the query");
+        let mut pkt = vec![0u8; s4];
+        pkt[0] = txid[0];
+        pkt[1] = txid[1];
+        pkt[2] = 0x01; // RD=1
+        pkt[3] = 0x20; // AD=1
+        pkt[4] = 0x00;
+        pkt[5] = 0x01; // QDCOUNT=1
+        let mut pos = 12;
+        pkt[pos..pos + qname_wire.len()].copy_from_slice(qname_wire);
+        pos += qname_wire.len();
+        pkt[pos..pos + 2].copy_from_slice(&qtype);
+        pos += 2;
+        pkt[pos..pos + 2].copy_from_slice(&[0x00, 0x01]); // QCLASS IN
+        pkt.extend_from_slice(&params.h4.min.to_le_bytes());
+        pkt.extend(std::iter::repeat(0xBBu8).take(32));
+        pkt
+    }
+
+    /// Regression test for the echo-capture path: the client's DNS query lives in
+    /// the S-padding prefix of an AWG packet, which is classified as AWG and so
+    /// skips `handle_probe`. The capture must therefore happen on the data path,
+    /// otherwise responses never echo the query (root-label fallback only).
+    #[tokio::test]
+    async fn dns_echo_captured_from_awg_data_packet() {
+        use crate::config::HRange;
+
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let awg_params = crate::config::AwgParams {
+            jc: 8,
+            jmin: 50,
+            jmax: 1000,
+            s1: 72,
+            s2: 142,
+            s3: 59,
+            s4: 40,
+            h1: HRange { min: 102_875_432, max: 202_875_431 },
+            h2: HRange { min: 728_639_326, max: 828_639_325 },
+            h3: HRange { min: 1_469_276_895, max: 1_569_276_894 },
+            h4: HRange { min: 2_037_058_179, max: 2_137_058_178 },
+        };
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec: 16,
+            imitate_protocol: "dns".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            awg_config: None,
+        };
+
+        let proxy = Proxy::bind(config, Some(awg_params.clone())).await.unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+
+        // QNAME wire bytes for "test.example".
+        let qname = b"\x04test\x07example\x00";
+        let pkt = awg_dns_masked_transport_packet(&awg_params, qname, [0x00, 0x01], [0x12, 0x34]);
+
+        // Precondition: classified as AWG, so `handle_probe` is skipped.
+        assert!(
+            responder::classify_awg_packet(&pkt, &awg_params).is_some(),
+            "packet must classify as AWG"
+        );
+
+        proxy.handle_client_packet(&pkt, client_addr).await;
+
+        let echo = proxy
+            .dns_query_echo
+            .get(&client_addr)
+            .map(|e| e.clone())
+            .expect("echo must be captured from the AWG data packet");
+        assert_eq!(echo.txid, [0x12, 0x34], "TXID captured");
+        assert_eq!(echo.qname, qname.to_vec(), "QNAME captured");
+        assert_eq!(echo.qtype, [0x00, 0x01], "QTYPE captured");
     }
 
     fn sip_test_config(backend_addr: SocketAddr) -> ProxyConfig {
