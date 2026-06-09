@@ -262,9 +262,11 @@ header-only fill would leave). Layout, when the prefix is at least
 `DNS_OPT_MIN` (32 bytes):
 
 - Bytes 0-1: Transaction ID. Echoed from the client's most recent DNS query
-  when its question fits the prefix (the response then mirrors a real request);
-  otherwise derived from the first two payload bytes.
-- Bytes 2-3: `0x81 0x80` (QR=1, RD=1, RA=1, RCODE=NOERROR).
+  when its question fits the prefix, otherwise derived from the first two
+  payload bytes. Only the transaction ID and the question bytes (below) are
+  reused from the query — the response flags are fixed, not mirrored.
+- Bytes 2-3: `0x81 0x80` (QR=1, RD=1, RA=1, RCODE=NOERROR) — fixed regardless
+  of the echoed query.
 - Bytes 4-11: Section counts — QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, **ARCOUNT=1**
   (the OPT pseudo-RR).
 - Question section: the echoed query's QNAME/QTYPE (+ QCLASS=IN) when it fits,

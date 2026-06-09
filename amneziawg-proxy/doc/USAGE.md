@@ -173,7 +173,8 @@ backend = "127.0.0.1:51821"
 #             with a valid Version Negotiation packet (RFC 9000).
 #   "dns"   — EDNS0 OPT-framed DNS response padding (the WG payload becomes the
 #             OPT option-data); responds to DNS queries with a valid SERVFAIL
-#             reply (RFC 1035).
+#             reply (RFC 1035), or with the real upstream answer when
+#             dns_forward_enabled is set (see DNS forwarding below).
 #   "stun"  — STUN Binding Success Response padding (XOR-MAPPED-ADDRESS +
 #             SOFTWARE attributes); responds to STUN Binding Requests with a
 #             valid Binding Success reply (RFC 5389/8489).
