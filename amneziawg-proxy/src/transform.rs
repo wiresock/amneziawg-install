@@ -519,7 +519,7 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     const STATUS: [&str; 3] = ["100 Trying", "180 Ringing", "200 OK"];
     const HOSTS: [&str; 3] = ["sip.example.com", "pbx.example.net", "voip.example.org"];
     const METHODS: [&str; 3] = ["INVITE", "OPTIONS", "REGISTER"];
-    let status = STATUS[next!() as usize % STATUS.len()];
+    let status_idx = next!() as usize % STATUS.len();
     let host = HOSTS[next!() as usize % HOSTS.len()];
     let method = METHODS[next!() as usize % METHODS.len()];
     let branch = next!();
@@ -551,10 +551,20 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
         }};
     }
 
-    // The status line is mandatory. If even it does not fit, emit a status-line
-    // fragment with a CRLF suffix so the bytes still look like the start of a SIP
-    // response rather than a broken header block.
-    if !put_line!("SIP/2.0 {status}\r\n") {
+    // The status line is mandatory. Try the seed-chosen status first, then the
+    // remaining ones (rotating), so a complete status line is emitted whenever
+    // *any* fits — e.g. the shorter "200 OK" still fits sizes where "180 Ringing"
+    // would not. Only when none fits (padding shorter than the smallest status
+    // line) fall back to a status-line fragment with a CRLF suffix.
+    let mut status_written = false;
+    for k in 0..STATUS.len() {
+        let status = STATUS[(status_idx + k) % STATUS.len()];
+        if put_line!("SIP/2.0 {status}\r\n") {
+            status_written = true;
+            break;
+        }
+    }
+    if !status_written {
         const FRAG: &[u8] = b"SIP/2.0 100 Trying\r\n";
         let take = FRAG.len().min(len);
         padding[..take].copy_from_slice(&FRAG[..take]);
@@ -1021,6 +1031,28 @@ mod tests {
             "Content-Length must cover the padding body and the WG payload"
         );
         assert!(data[280..300].iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
+    fn sip_padding_emits_complete_status_line_when_any_fits() {
+        // 20 B fits "SIP/2.0 200 OK\r\n\r\n" but not the longer "100 Trying" /
+        // "180 Ringing" status lines. Whatever the seed-chosen status, a complete
+        // status line must be emitted (the padding ends the header block with a
+        // CRLF-CRLF), never a truncated fragment — exercised across every payload
+        // marker so all seed-chosen statuses are covered.
+        for marker in 0u8..=u8::MAX {
+            let mut data = vec![0u8; 20 + 8];
+            data[20..].fill(marker);
+            apply_padding(&mut data, 20, Protocol::Sip);
+
+            let padding = &data[..20];
+            assert!(padding.starts_with(b"SIP/2.0 "), "marker {marker}");
+            assert!(
+                padding.windows(4).any(|w| w == b"\r\n\r\n"),
+                "a complete status line must be emitted at 20 B (marker {marker})"
+            );
+            assert_sip_response_padding(padding);
+        }
     }
 
     #[test]
