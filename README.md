@@ -118,7 +118,7 @@ See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for all insta
 
 ---
 
-## 🛡️ Traffic Obfuscation Proxy (amneziawg-proxy)
+## 🎭 Traffic Obfuscation Proxy (amneziawg-proxy)
 
 > ⚠️ Requires VPN to be installed first (`amneziawg-install.sh`).
 
@@ -149,20 +149,22 @@ sudo ./amneziawg-proxy.sh
 Run with no arguments and it walks you through guided prompts. Run it again
 later and it shows a management menu (status, logs, reconfigure, uninstall).
 
-**Non-interactive examples:**
+**Non-interactive examples.** `amneziawg-proxy.sh` forwards any flags to the
+installer (cloning the helper scripts on the fly when run standalone), so the
+one downloaded file is all you need:
 
 ```bash
 # QUIC imitation (safest default) — public :51820 → loopback :51821
-sudo ./amneziawg-proxy/scripts/amneziawg-proxy-install.sh \
+sudo ./amneziawg-proxy.sh \
   --non-interactive --listen-port 51820 --protocol quic
 
 # DNS imitation that also answers real DNS queries (run on port 53)
-sudo ./amneziawg-proxy/scripts/amneziawg-proxy-install.sh \
+sudo ./amneziawg-proxy.sh \
   --non-interactive --listen-port 53 --protocol dns \
   --dns-forward --dns-upstream 1.1.1.1:53
 
 # STUN imitation (port 3478, WebRTC/NAT-permissive networks)
-sudo ./amneziawg-proxy/scripts/amneziawg-proxy-install.sh \
+sudo ./amneziawg-proxy.sh \
   --non-interactive --listen-port 3478 --protocol stun
 ```
 
@@ -244,11 +246,19 @@ sudo tcpdump -i any -w awg-proxy.pcap udp port 51820
 
 ### Manage / Uninstall
 
-```bash
-# Re-run for the management menu (status, logs, reconfigure, uninstall)
-sudo ./amneziawg-proxy.sh
+Re-running `amneziawg-proxy.sh` on an installed host opens a management menu
+(status, logs, reconfigure, uninstall) — the simplest path, and it works from
+the single downloaded file:
 
-# Uninstall (keeps config/data); add --restore-awg to rebind AWG to the public port
+```bash
+sudo ./amneziawg-proxy.sh
+```
+
+From a repository checkout you can also drive the uninstaller non-interactively
+(keeps config/data by default; add `--restore-awg` to rebind AWG to the public
+port):
+
+```bash
 sudo ./amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh --force
 ```
 
