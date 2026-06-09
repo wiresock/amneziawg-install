@@ -443,6 +443,15 @@ fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
 
     const COOKIE: u32 = 0x2112_A442;
 
+    // Transaction ID, derived purely from the payload seed and consumed before
+    // any attribute randomness so it stays stable across pad sizes (a given
+    // payload always yields the same 96-bit transaction ID, independent of how
+    // many attributes happen to fit the padding).
+    let mut txn = [0u8; 12];
+    for chunk in txn.chunks_mut(4) {
+        chunk.copy_from_slice(&next!().to_be_bytes());
+    }
+
     // Attribute area available within the padding. A STUN message length is
     // always a multiple of 4; below a full 20-byte header there is no room for
     // any attribute.
@@ -500,9 +509,7 @@ fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
     header[0..2].copy_from_slice(&0x0101u16.to_be_bytes()); // Binding Success Response
     header[2..4].copy_from_slice(&(written as u16).to_be_bytes());
     header[4..8].copy_from_slice(&COOKIE.to_be_bytes());
-    for chunk in header[8..20].chunks_mut(4) {
-        chunk.copy_from_slice(&next!().to_be_bytes());
-    }
+    header[8..20].copy_from_slice(&txn);
     let copy_len = std::cmp::min(padding.len(), header.len());
     padding[..copy_len].copy_from_slice(&header[..copy_len]);
 
@@ -1105,6 +1112,29 @@ mod tests {
                 "padding past the STUN message must be zeroed at pad {pad}"
             );
         }
+    }
+
+    // The transaction ID is derived solely from the payload seed, so the same
+    // payload must yield the same 96-bit transaction ID regardless of pad size
+    // (the number of attributes that fit must not perturb it).
+    #[test]
+    fn stun_padding_transaction_id_is_stable_across_pad_sizes() {
+        let payload: Vec<u8> = (0..80u8).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
+
+        let txn_for = |pad: usize| -> [u8; 12] {
+            let mut data = vec![0u8; pad];
+            data.extend_from_slice(&payload);
+            apply_padding(&mut data, pad, Protocol::Stun);
+            data[8..20].try_into().unwrap()
+        };
+
+        // 20 (no attributes), 40 (XMA + SOFTWARE), 200 (capped SOFTWARE): all
+        // consume different amounts of PRNG state for attributes, yet the txn ID
+        // must be identical.
+        let base = txn_for(40);
+        assert_eq!(txn_for(20), base, "txn id must not depend on attribute count");
+        assert_eq!(txn_for(200), base, "txn id must not depend on capped SOFTWARE");
+        assert!(base.iter().any(|&b| b != 0), "txn id must be populated");
     }
 
     #[test]
