@@ -476,19 +476,22 @@ fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
     }
 
     // SOFTWARE (0x8022) fills the rest of the body with one attribute so the
-    // whole padding region is accounted for in the advertised length. The value
-    // length (remaining - 4) is a multiple of 4, so the TLV ends exactly on the
-    // message boundary; the value is printable ASCII for a clean UTF-8 string.
+    // padding region is accounted for in the advertised length. The value length
+    // is a multiple of 4, so the TLV ends on a 4-byte boundary; it is clamped to
+    // 124 because RFC 5389 §15.10 requires a SOFTWARE value below 128 bytes (124
+    // is the largest 4-aligned length under that). Any padding past the attribute
+    // is zeroed below as trailing bytes beyond the advertised length. The value
+    // is printable ASCII for a clean UTF-8 string.
     let remaining = body - written;
     if remaining >= 4 {
-        let vlen = remaining - 4;
+        let vlen = std::cmp::min(remaining - 4, 124);
         let off = 20 + written;
         padding[off..off + 2].copy_from_slice(&0x8022u16.to_be_bytes());
         padding[off + 2..off + 4].copy_from_slice(&(vlen as u16).to_be_bytes());
         for b in padding[off + 4..off + 4 + vlen].iter_mut() {
             *b = 0x20 + (next!() % 0x5F) as u8;
         }
-        written += remaining;
+        written += 4 + vlen;
     }
 
     // Header is built after `written` is known. Copy as much as fits; a partial
@@ -1069,6 +1072,39 @@ mod tests {
 
         // The WireGuard payload after the padding is left byte-for-byte intact.
         assert_eq!(&data[pad..], &payload_before[..]);
+    }
+
+    // RFC 5389 §15.10 requires a SOFTWARE value below 128 bytes. For padding large
+    // enough that the attribute area would otherwise exceed that, the value is
+    // clamped to 124 (largest 4-aligned length < 128); the advertised length then
+    // covers only XOR-MAPPED-ADDRESS (12) + capped SOFTWARE (128) and the rest of
+    // the padding is zeroed as trailing bytes beyond the message.
+    #[test]
+    fn stun_padding_caps_software_value_to_rfc_limit() {
+        for pad in [200usize, 256, 400] {
+            let mut data = vec![0xABu8; pad + 16];
+            apply_padding(&mut data, pad, Protocol::Stun);
+
+            assert_eq!(&data[0..2], &0x0101u16.to_be_bytes());
+
+            // SOFTWARE sits right after the 12-byte XOR-MAPPED-ADDRESS.
+            let soff = 20 + 12;
+            assert_eq!(&data[soff..soff + 2], &0x8022u16.to_be_bytes());
+            let vlen = u16::from_be_bytes([data[soff + 2], data[soff + 3]]) as usize;
+            assert_eq!(vlen, 124, "SOFTWARE value clamped to 124 at pad {pad}");
+            assert!(vlen < 128);
+
+            // Advertised length = XMA(12) + SOFTWARE header(4) + value(124) = 140.
+            let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+            assert_eq!(msg_len, 12 + 4 + 124, "advertised length at pad {pad}");
+            assert_eq!(msg_len % 4, 0);
+
+            // Bytes past the advertised message are zeroed trailing padding.
+            assert!(
+                data[20 + msg_len..pad].iter().all(|&b| b == 0x00),
+                "padding past the STUN message must be zeroed at pad {pad}"
+            );
+        }
     }
 
     #[test]
