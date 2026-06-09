@@ -253,12 +253,33 @@ response is returned header-only with QDCOUNT = 0. The total echoed response
 is capped at 512 bytes per RFC 1035 §2.3.4.
 
 **Padding fill** (`apply_dns_padding`):
-- Bytes 0-1: Transaction ID derived from the first two payload bytes
-  (H header bytes) that follow the padding prefix
-- Bytes 2-3: `0x80 0x80` (QR=1, RA=1, RCODE=NOERROR; RD left clear —
-  no client query to echo in outgoing padding filler)
-- Bytes 4-11: Section counts (QDCOUNT=0, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0)
-- Bytes 12+: Zero-filled (EDNS OPT padding per RFC 7830)
+
+The fill rewrites the S-padding prefix as a complete DNS **response** whose
+EDNS0 OPT record frames the *entire datagram* — the WireGuard payload that
+follows the prefix becomes the OPT option-data, so a DNS dissector consumes the
+whole packet with no trailing "extraneous data" (the fingerprint a naïve
+header-only fill would leave). Layout, when the prefix is at least
+`DNS_OPT_MIN` (32 bytes):
+
+- Bytes 0-1: Transaction ID. Echoed from the client's most recent DNS query
+  when its question fits the prefix (the response then mirrors a real request);
+  otherwise derived from the first two payload bytes.
+- Bytes 2-3: `0x81 0x80` (QR=1, RD=1, RA=1, RCODE=NOERROR).
+- Bytes 4-11: Section counts — QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, **ARCOUNT=1**
+  (the OPT pseudo-RR).
+- Question section: the echoed query's QNAME/QTYPE (+ QCLASS=IN) when it fits,
+  else a root-label `A`/`IN` question.
+- OPT RR: root NAME, TYPE=OPT(41), CLASS = UDP payload size (1232), TTL=0
+  (EDNS version 0, DO=0), RDLENGTH covering the option header + option-data,
+  OPTION-CODE = `0xFDE9` (an unknown / local-use code, so the opaque WG bytes
+  aren't held to a known option's format), OPTION-LENGTH spanning the
+  zero-filled tail of the prefix **plus the untouched WG payload**.
+
+When the prefix is smaller than `DNS_OPT_MIN` (too small for OPT framing), the
+fill falls back to a legacy `TYPE NULL` RR (`apply_dns_padding_null`): a NULL
+RR (RFC 1035 §3.3.10) carries opaque RDATA of any length, so for prefixes ≥ 28
+bytes it still covers the whole datagram; smaller pads degrade to
+header(+question) only.
 
 ```
 AWG packet (backend → client):
@@ -266,16 +287,14 @@ AWG packet (backend → client):
 │   S padding (random)     │ H header │   WG payload         │
 │   (S1-S4 bytes)          │ (4 bytes)│   (variable)         │
 └──────────────────────────┴──────────┴──────────────────────┘
- ▲
- │ overwritten with:
- ▼
-┌──────────────────────────┐
-│ TX_ID │ flags │ counts   │
-│ (2B)  │ (2B)  │ (8B)     │
-│ 0x80 0x80     │          │
-├──────────────────────────┤
-│ 0x00 ... (EDNS padding)  │
-└──────────────────────────┘
+ ▲                                     ▲
+ │ overwritten with DNS response       │ becomes OPT option-data
+ ▼ header + question + OPT header       (untouched, covered by OPTION-LENGTH)
+┌────────────────────────────────────┐┌──────────────────────┐
+│ ID │ 81 80 │ QD=1 AN=0 NS=0 AR=1   ││  WG payload          │
+│ question (echoed or root-label)    ││  (opaque option-data)│
+│ OPT RR: 00 29 04d0 … FDE9 OPT_LEN ─┼┼─► spans payload      │
+└────────────────────────────────────┘└──────────────────────┘
 ```
 
 ### STUN Imitation
@@ -311,15 +330,50 @@ the IPv4 address XORed with the magic cookie. IPv6 uses the magic cookie plus
 transaction ID as the 128-bit XOR key.
 
 **Padding fill** (`apply_stun_padding`):
-- Bytes 0-1: `0x0011` (STUN Binding Indication)
-- Bytes 2-3: `0x0000` (no attributes in the advertised header)
-- Bytes 4-7: `0x2112A442` magic cookie
-- Bytes 8-19: deterministic transaction ID derived from the WG payload
-- Bytes 20+: zero-filled
 
-Because outbound AWG payload bytes must remain untouched, the transform makes
-the padding prefix STUN-like rather than turning the entire UDP datagram into a
-strictly parseable STUN message.
+The fill rewrites the S-padding prefix as a **Binding Success Response** — the
+natural reply to the client's Binding Request cover traffic — carrying
+well-formed attributes rather than a bare header:
+
+- Bytes 0-1: `0x0101` (Binding Success Response).
+- Bytes 2-3: Advertised message length = **exactly the attribute bytes written**
+  (not the whole prefix), so a strict parser stops on the attribute boundary.
+- Bytes 4-7: `0x2112A442` magic cookie.
+- Bytes 8-19: 96-bit transaction ID derived from the WG payload (FNV-1a seed +
+  LCG), consumed before any attribute randomness so it is **stable across pad
+  sizes** for a given payload.
+- Bytes 20+ (when the prefix has room): an `XOR-MAPPED-ADDRESS` (0x0020, IPv4,
+  12-byte TLV) — the attribute that makes the message read as a genuine
+  response — followed by a `SOFTWARE` (0x8022) attribute that fills the rest of
+  the advertised body. The SOFTWARE value is printable ASCII and clamped to 124
+  bytes (RFC 5389 §15.10 requires a value below 128; 124 is the largest
+  4-aligned length under that).
+- Any prefix bytes past the advertised attributes are zero-filled.
+
+The advertised length covers exactly the TLVs written, so a strict STUN parser
+stops before the WireGuard payload — which trails undissected, as a short STUN
+message does inside an oversized datagram — instead of reading it as an
+attribute whose bogus length overruns the buffer (the "Malformed Packet"
+fingerprint a header-only fill would leave). Prefixes shorter than the 20-byte
+header copy the longest available header prefix; the 15-byte install-script
+minimum still carries the type, length, magic cookie, and partial transaction
+ID.
+
+```
+AWG packet (backend → client):
+┌──────────────────────────┬──────────┬──────────────────────┐
+│   S padding (random)     │ H header │   WG payload         │
+│   (S1-S4 bytes)          │ (4 bytes)│   (variable)         │
+└──────────────────────────┴──────────┴──────────────────────┘
+ ▲                                     ▲
+ │ overwritten with STUN response      │ trails the advertised
+ ▼ header + attributes                 length (undissected)
+┌────────────────────────────────────┐┌──────────────────────┐
+│ 0101 │ msg_len │ 2112A442 │ txn(12) ││  WG payload          │
+│ 0020 0008 XOR-MAPPED-ADDRESS        ││  (opaque ciphertext) │
+│ 8022 vlen   SOFTWARE (≤124) │ 00 …  ││                      │
+└────────────────────────────────────┘└──────────────────────┘
+```
 
 ### SIP Imitation
 

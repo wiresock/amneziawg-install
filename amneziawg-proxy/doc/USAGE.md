@@ -171,10 +171,12 @@ backend = "127.0.0.1:51821"
 # Which protocol to imitate.
 #   "quic"  — High-entropy QUIC 1-RTT padding; responds to QUIC Initial probes
 #             with a valid Version Negotiation packet (RFC 9000).
-#   "dns"   — DNS response header padding; responds to DNS queries with a valid
-#             SERVFAIL reply (RFC 1035).
-#   "stun"  — STUN Binding Indication padding; responds to STUN Binding
-#             Requests with a valid Binding Success reply (RFC 5389/8489).
+#   "dns"   — EDNS0 OPT-framed DNS response padding (the WG payload becomes the
+#             OPT option-data); responds to DNS queries with a valid SERVFAIL
+#             reply (RFC 1035).
+#   "stun"  — STUN Binding Success Response padding (XOR-MAPPED-ADDRESS +
+#             SOFTWARE attributes); responds to STUN Binding Requests with a
+#             valid Binding Success reply (RFC 5389/8489).
 #   "sip"   — SIP header-style padding; responds to SIP requests with a valid
 #             100 Trying reply (RFC 3261).
 #   "auto"  — Detect the protocol from each incoming packet; use the detected
@@ -275,8 +277,8 @@ applied and AWG packets are forwarded unmodified.
 | Mode | Padding transform | Probe response | Use case |
 |------|-------------------|----------------|----------|
 | `quic` | High-entropy PRNG bytes (QUIC short-header format) | QUIC Version Negotiation (RFC 9000 §17.2.1) | Ports 443/UDP; QUIC-heavy networks |
-| `dns` | DNS response header + zero fill | DNS SERVFAIL (RFC 1035) | Port 53/UDP; DNS-filtered networks |
-| `stun` | STUN Binding Indication header | STUN Binding Success with XOR-MAPPED-ADDRESS (RFC 5389/8489) | Port 3478/UDP; WebRTC/NAT traversal networks |
+| `dns` | EDNS0 OPT-framed DNS response (payload as option-data) | DNS SERVFAIL (RFC 1035) | Port 53/UDP; DNS-filtered networks |
+| `stun` | STUN Binding Success Response (XOR-MAPPED-ADDRESS + SOFTWARE) | STUN Binding Success with XOR-MAPPED-ADDRESS (RFC 5389/8489) | Port 3478/UDP; WebRTC/NAT traversal networks |
 | `sip` | Cycling SIP header text | SIP 100 Trying (RFC 3261) | Port 5060/UDP; VoIP infrastructure |
 | `auto` | Per-client, once protocol is detected (none until first probe) | Matches detected protocol | Mixed-probe environments |
 
