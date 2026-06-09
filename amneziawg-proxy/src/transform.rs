@@ -526,8 +526,9 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     let from_tag = next!();
     let to_tag = next!();
     let call_id = next!();
-    let cseq = 1 + (next!() % 100_000);
-    let _ = st; // the final next! advances `st` but no further value is drawn
+    // Last value reads the state directly (no further `next!`), so the final draw
+    // leaves no dead write to `st`.
+    let cseq = 1 + (st % 100_000);
 
     let mut pos = 0usize;
     let mut scratch = [0u8; 128];
