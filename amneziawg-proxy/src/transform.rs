@@ -591,16 +591,30 @@ fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     // Only when every mandatory header fit, append a Content-Length covering the
     // entire body — the space-fill remainder of the padding plus the WG payload —
     // so the datagram frames as one SIP message with no extraneous bytes. The
-    // body length equals total_len - header_end; solve for the digit count.
+    // declared length equals total_len - header_end, so the header_end (which
+    // includes the value's own digit count) must satisfy a fixed point.
+    //
+    // A single header width has rare unsolvable sizes (body lands on 11, 102,
+    // 1003, ...). RFC 3261 HCOLON allows the whitespace after the colon to vary,
+    // so we try one and two spaces: their unsolvable points are disjoint, so a
+    // correct Content-Length is always emitted whenever the mandatory headers fit.
     if all_mandatory {
-        for digits in 1..=decimal_digits(total_len) {
-            let header_end = pos + b"Content-Length: ".len() + digits + b"\r\n\r\n".len();
-            if header_end > len {
-                break;
-            }
-            if decimal_digits(total_len - header_end) == digits {
-                let _ = put_line!("Content-Length: {}\r\n", total_len - header_end);
-                break;
+        'content_length: for sws in 1..=2usize {
+            for digits in 1..=decimal_digits(total_len) {
+                let header_end =
+                    pos + "Content-Length:".len() + sws + digits + b"\r\n\r\n".len();
+                if header_end > len {
+                    break; // this width's line + blank line does not fit
+                }
+                if decimal_digits(total_len - header_end) == digits {
+                    let body = total_len - header_end;
+                    let written = match sws {
+                        1 => put_line!("Content-Length: {body}\r\n"),
+                        _ => put_line!("Content-Length:  {body}\r\n"),
+                    };
+                    debug_assert!(written, "Content-Length line must fit when header_end <= len");
+                    break 'content_length;
+                }
             }
         }
     }
@@ -1017,11 +1031,13 @@ mod tests {
         assert!(text.contains(";branch=z9hG4bK") && !text.contains(";branch=z9hG4bK\r\n"));
 
         // Content-Length covers the full body: the space-fill remainder of the
-        // padding plus the untouched WG payload.
+        // padding plus the untouched WG payload. (The post-colon whitespace may be
+        // one or two spaces, so trim before parsing.)
         let header_end = text.find("\r\n\r\n").unwrap() + 4;
         let content_length: usize = text
             .split("\r\n")
-            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .find_map(|line| line.strip_prefix("Content-Length:"))
+            .map(str::trim_start)
             .unwrap()
             .parse()
             .unwrap();
@@ -1031,6 +1047,38 @@ mod tests {
             "Content-Length must cover the padding body and the WG payload"
         );
         assert!(data[280..300].iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
+    fn sip_padding_content_length_always_present_when_headers_fit() {
+        // Across a contiguous range of sizes large enough for the full mandatory
+        // header set, a correct Content-Length must always be emitted. The range
+        // is wide enough to cross the digit fixed-point gap sizes that a single
+        // header width cannot solve; the one/two-space fallback must fill them.
+        for total in 320usize..=460 {
+            let pad = total - 32; // 32 B WG payload
+            let mut data = vec![0u8; total];
+            data[pad..].fill(0xCC);
+            apply_padding(&mut data, pad, Protocol::Sip);
+
+            let text = std::str::from_utf8(&data[..pad]).unwrap();
+            // These sizes are comfortably above a full response header block.
+            assert!(text.contains("\r\nCSeq: "), "size {total}: full header set expected");
+
+            let header_end = text.find("\r\n\r\n").unwrap() + 4;
+            let content_length: usize = text
+                .split("\r\n")
+                .find_map(|line| line.strip_prefix("Content-Length:"))
+                .map(str::trim_start)
+                .unwrap_or_else(|| panic!("size {total}: Content-Length missing"))
+                .parse()
+                .unwrap();
+            assert_eq!(
+                content_length,
+                data.len() - header_end,
+                "size {total}: Content-Length must cover the whole body"
+            );
+        }
     }
 
     #[test]
