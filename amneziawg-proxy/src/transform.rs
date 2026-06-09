@@ -22,8 +22,9 @@ use crate::responder::{classify_awg_packet, AwgPacketType, DnsEcho, Protocol};
 /// - **QUIC**: 1-RTT short header for every phase (see `apply_quic_padding_typed`).
 /// - **DNS**: DNS response header structure (transaction ID, flags, section
 ///   counts) followed by zero-fill for EDNS OPT padding (RFC 7830).
-/// - **STUN**: STUN Binding Indication header with the RFC 5389 magic cookie
-///   and a deterministic transaction ID derived from the payload.
+/// - **STUN**: STUN Binding Success Response (XOR-MAPPED-ADDRESS + SOFTWARE
+///   attributes) with the RFC 5389 magic cookie and a payload-derived
+///   transaction ID (see `apply_stun_padding`).
 /// - **SIP**: SIP header continuation text (`Via:`, `Content-Length:`)
 ///   ending with CRLF.
 pub fn apply_padding(data: &mut [u8], pad_size: usize, proto: Protocol) {
@@ -406,41 +407,128 @@ fn apply_dns_padding_null(data: &mut [u8], pad_size: usize) {
     }
 }
 
-/// STUN-style padding: Binding Indication header with deterministic transaction ID.
+/// STUN-style padding: a Binding Success Response with valid attributes.
 ///
-/// A strict STUN parser validates the whole UDP datagram length, while the proxy
-/// can only rewrite the AWG padding prefix and must leave the encrypted payload
-/// untouched. The leading bytes therefore mimic the STUN header shape that DPI
-/// heuristics look for: message type, zero length, magic cookie, and 96-bit
-/// transaction ID. Padding shorter than the 20-byte STUN header copies the
-/// longest available header prefix; 15-byte install-script padding still carries
-/// the type, length, magic cookie, and partial transaction ID.
+/// The proxy can only rewrite the AWG padding prefix and must leave the
+/// encrypted payload untouched, so the leading bytes mimic a STUN Binding
+/// Success Response — the natural reply to the client's Binding Request cover
+/// traffic. The message carries type `0x0101`, the RFC 5389 magic cookie, a
+/// transaction ID derived from the payload, and, when the padding is large
+/// enough, an `XOR-MAPPED-ADDRESS` attribute (the attribute that makes a
+/// response read as a real STUN reply) followed by a `SOFTWARE` attribute that
+/// fills the remainder of the advertised message.
+///
+/// The advertised message length covers exactly the TLVs written, so a strict
+/// STUN parser stops before the WireGuard payload — which trails undissected,
+/// as a short STUN message does inside an oversized datagram — instead of
+/// reading it as an attribute whose bogus length overruns the buffer (the
+/// "Malformed Packet" fingerprint). Padding shorter than the 20-byte STUN
+/// header copies the longest available header prefix; 15-byte install-script
+/// padding still carries the type, length, magic cookie, and partial
+/// transaction ID.
 fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
     let (padding, payload) = data.split_at_mut(pad_size);
     if padding.is_empty() {
         return;
     }
 
-    let mut state: u32 = 0x811c_9dc5;
-    for &b in payload.iter().take(64) {
-        state ^= b as u32;
-        state = state.wrapping_mul(0x0100_0193);
+    let mut state = fnv1a_seed(payload);
+    macro_rules! next {
+        () => {{
+            let v = state;
+            state = lcg_step(state);
+            v
+        }};
     }
 
+    const COOKIE: u32 = 0x2112_A442;
+
+    // Transaction ID, derived purely from the payload seed and consumed before
+    // any attribute randomness so it stays stable across pad sizes (a given
+    // payload always yields the same 96-bit transaction ID, independent of how
+    // many attributes happen to fit the padding).
+    let mut txn = [0u8; 12];
+    for chunk in txn.chunks_mut(4) {
+        chunk.copy_from_slice(&next!().to_be_bytes());
+    }
+
+    // Attribute area available within the padding. A STUN message length is
+    // always a multiple of 4; below a full 20-byte header there is no room for
+    // any attribute.
+    let body = if pad_size > 20 {
+        (pad_size - 20) & !0b11usize
+    } else {
+        0
+    };
+
+    // Write attributes into [20, 20 + written) as well-formed TLVs. A STUN
+    // dissector reads the advertised `written` bytes as attributes, so each TLV
+    // must frame itself exactly: a bogus length would overrun and flag the
+    // packet malformed.
+    let mut written = 0usize;
+
+    // XOR-MAPPED-ADDRESS (0x0020), IPv4: 4-byte TLV header + 8-byte value. This
+    // is what makes the message read as a genuine Binding response.
+    if body - written >= 12 {
+        let port = (next!() >> 16) as u16;
+        let addr = next!();
+        let xport = port ^ (COOKIE >> 16) as u16; // X-Port
+        let xaddr = addr ^ COOKIE; // X-Address
+        let off = 20 + written;
+        padding[off..off + 2].copy_from_slice(&0x0020u16.to_be_bytes());
+        padding[off + 2..off + 4].copy_from_slice(&8u16.to_be_bytes());
+        padding[off + 4] = 0x00; // reserved
+        padding[off + 5] = 0x01; // address family = IPv4
+        padding[off + 6..off + 8].copy_from_slice(&xport.to_be_bytes());
+        padding[off + 8..off + 12].copy_from_slice(&xaddr.to_be_bytes());
+        written += 12;
+    }
+
+    // SOFTWARE (0x8022) fills the rest of the body with one attribute so the
+    // padding region is accounted for in the advertised length. The value length
+    // is a multiple of 4, so the TLV ends on a 4-byte boundary; it is clamped to
+    // 124 because RFC 5389 §15.10 requires a SOFTWARE value below 128 bytes (124
+    // is the largest 4-aligned length under that). Any padding past the attribute
+    // is zeroed below as trailing bytes beyond the advertised length. The value
+    // is printable ASCII for a clean UTF-8 string.
+    let remaining = body - written;
+    if remaining >= 4 {
+        let vlen = std::cmp::min(remaining - 4, 124);
+        let off = 20 + written;
+        padding[off..off + 2].copy_from_slice(&0x8022u16.to_be_bytes());
+        padding[off + 2..off + 4].copy_from_slice(&(vlen as u16).to_be_bytes());
+        for b in padding[off + 4..off + 4 + vlen].iter_mut() {
+            *b = 0x20 + (next!() % 0x5F) as u8;
+        }
+        written += 4 + vlen;
+    }
+
+    // Header is built after `written` is known. Copy as much as fits; a partial
+    // header still carries the type, length, cookie and a partial transaction ID.
+    //
+    // `written` is bounded regardless of pad_size: at most XOR-MAPPED-ADDRESS (12)
+    // + SOFTWARE header (4) + the RFC 5389 §15.10 value cap (124) = 140 bytes. It
+    // is `body` that grows with pad_size, but `body` only gates how large the
+    // (capped) SOFTWARE value is — it is never advertised. So `written as u16`
+    // cannot truncate and the advertised length always equals the bytes written.
+    debug_assert!(
+        written <= u16::MAX as usize,
+        "advertised STUN message length must fit the u16 length field"
+    );
     let mut header = [0u8; 20];
-    header[0..2].copy_from_slice(&0x0011u16.to_be_bytes()); // Binding Indication
-    header[2..4].copy_from_slice(&0u16.to_be_bytes()); // no attributes in the header
-    header[4..8].copy_from_slice(&0x2112_A442u32.to_be_bytes());
-    for chunk in header[8..20].chunks_mut(4) {
-        chunk.copy_from_slice(&state.to_be_bytes());
-        state = lcg_step(state);
-    }
-
+    header[0..2].copy_from_slice(&0x0101u16.to_be_bytes()); // Binding Success Response
+    header[2..4].copy_from_slice(&(written as u16).to_be_bytes());
+    header[4..8].copy_from_slice(&COOKIE.to_be_bytes());
+    header[8..20].copy_from_slice(&txn);
     let copy_len = std::cmp::min(padding.len(), header.len());
     padding[..copy_len].copy_from_slice(&header[..copy_len]);
 
-    for byte in padding[copy_len..].iter_mut() {
-        *byte = 0x00;
+    // Any bytes between the advertised message end and the padding end sit beyond
+    // the STUN length; zero them (undissected, like the trailing WG payload).
+    if let Some(tail) = padding.get_mut(20 + written..) {
+        for b in tail.iter_mut() {
+            *b = 0x00;
+        }
     }
 }
 
@@ -741,7 +829,7 @@ mod tests {
                         assert_eq!(data[3], 0x80, "DNS RA flag at {pad_size} bytes");
                     }
                     Protocol::Stun => {
-                        assert_eq!(&data[0..2], &0x0011u16.to_be_bytes());
+                        assert_eq!(&data[0..2], &0x0101u16.to_be_bytes());
                         if pad_size >= 8 {
                             assert_eq!(&data[4..8], &0x2112_A442u32.to_be_bytes());
                         }
@@ -944,16 +1032,144 @@ mod tests {
     // -- STUN padding tests --
 
     #[test]
-    fn stun_padding_has_binding_indication_header() {
+    fn stun_padding_has_binding_response_header() {
+        // pad_size == 20 leaves no room for attributes: a bare, valid 20-byte
+        // Binding Success Response with length 0.
         let mut data = vec![0x00; 28];
         data[20..28].copy_from_slice(&[0xAB; 8]);
         apply_padding(&mut data, 20, Protocol::Stun);
 
-        assert_eq!(&data[0..2], &0x0011u16.to_be_bytes());
-        assert_eq!(&data[2..4], &0u16.to_be_bytes());
+        assert_eq!(&data[0..2], &0x0101u16.to_be_bytes()); // Binding Success Response
+        assert_eq!(&data[2..4], &0u16.to_be_bytes()); // no attributes fit
         assert_eq!(&data[4..8], &0x2112_A442u32.to_be_bytes());
         assert!(data[8..20].iter().any(|&b| b != 0x00));
         assert!(data[20..28].iter().all(|&b| b == 0xAB));
+    }
+
+    // A STUN dissector reads the advertised message length as attribute bytes,
+    // so the attribute area must contain well-formed TLVs (XOR-MAPPED-ADDRESS +
+    // SOFTWARE) that frame themselves exactly, never overrunning into the
+    // untouched WireGuard payload.
+    #[test]
+    fn stun_padding_emits_valid_attributes_when_they_fit() {
+        let pad = 48usize;
+        let mut data = vec![0x00; pad + 16];
+        for (i, b) in data[pad..].iter_mut().enumerate() {
+            *b = (i as u8) | 0x80; // distinct, non-zero payload
+        }
+        let payload_before: Vec<u8> = data[pad..].to_vec();
+        apply_padding(&mut data, pad, Protocol::Stun);
+
+        // Binding Success Response header.
+        assert_eq!(&data[0..2], &0x0101u16.to_be_bytes());
+        assert_eq!(&data[4..8], &0x2112_A442u32.to_be_bytes());
+
+        // Advertised length covers exactly the attribute area we filled, and is
+        // a multiple of 4.
+        let body = (pad - 20) & !0b11;
+        let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+        assert_eq!(msg_len, body);
+        assert_eq!(msg_len % 4, 0);
+
+        // First attribute: XOR-MAPPED-ADDRESS (0x0020), IPv4, length 8.
+        assert_eq!(&data[20..22], &0x0020u16.to_be_bytes());
+        assert_eq!(&data[22..24], &8u16.to_be_bytes());
+        assert_eq!(data[24], 0x00); // reserved
+        assert_eq!(data[25], 0x01); // IPv4 family
+
+        // Second attribute: SOFTWARE (0x8022) fills the rest with a printable
+        // value, ending exactly on the message boundary.
+        let soff = 20 + 12;
+        assert_eq!(&data[soff..soff + 2], &0x8022u16.to_be_bytes());
+        let vlen = u16::from_be_bytes([data[soff + 2], data[soff + 3]]) as usize;
+        assert_eq!(soff + 4 + vlen, 20 + body);
+        for &b in &data[soff + 4..soff + 4 + vlen] {
+            assert!((0x20..=0x7E).contains(&b), "SOFTWARE value must be printable");
+        }
+
+        // The WireGuard payload after the padding is left byte-for-byte intact.
+        assert_eq!(&data[pad..], &payload_before[..]);
+    }
+
+    // RFC 5389 §15.10 requires a SOFTWARE value below 128 bytes. For padding large
+    // enough that the attribute area would otherwise exceed that, the value is
+    // clamped to 124 (largest 4-aligned length < 128); the advertised length then
+    // covers only XOR-MAPPED-ADDRESS (12) + capped SOFTWARE (128) and the rest of
+    // the padding is zeroed as trailing bytes beyond the message.
+    #[test]
+    fn stun_padding_caps_software_value_to_rfc_limit() {
+        for pad in [200usize, 256, 400] {
+            let mut data = vec![0xABu8; pad + 16];
+            apply_padding(&mut data, pad, Protocol::Stun);
+
+            assert_eq!(&data[0..2], &0x0101u16.to_be_bytes());
+
+            // SOFTWARE sits right after the 12-byte XOR-MAPPED-ADDRESS.
+            let soff = 20 + 12;
+            assert_eq!(&data[soff..soff + 2], &0x8022u16.to_be_bytes());
+            let vlen = u16::from_be_bytes([data[soff + 2], data[soff + 3]]) as usize;
+            assert_eq!(vlen, 124, "SOFTWARE value clamped to 124 at pad {pad}");
+            assert!(vlen < 128);
+
+            // Advertised length = XMA(12) + SOFTWARE header(4) + value(124) = 140.
+            let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+            assert_eq!(msg_len, 12 + 4 + 124, "advertised length at pad {pad}");
+            assert_eq!(msg_len % 4, 0);
+
+            // Bytes past the advertised message are zeroed trailing padding.
+            assert!(
+                data[20 + msg_len..pad].iter().all(|&b| b == 0x00),
+                "padding past the STUN message must be zeroed at pad {pad}"
+            );
+        }
+    }
+
+    // The transaction ID is derived solely from the payload seed, so the same
+    // payload must yield the same 96-bit transaction ID regardless of pad size
+    // (the number of attributes that fit must not perturb it).
+    #[test]
+    fn stun_padding_transaction_id_is_stable_across_pad_sizes() {
+        let payload: Vec<u8> = (0..80u8).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
+
+        let txn_for = |pad: usize| -> [u8; 12] {
+            let mut data = vec![0u8; pad];
+            data.extend_from_slice(&payload);
+            apply_padding(&mut data, pad, Protocol::Stun);
+            data[8..20].try_into().unwrap()
+        };
+
+        // 20 (no attributes), 40 (XMA + SOFTWARE), 200 (capped SOFTWARE): all
+        // consume different amounts of PRNG state for attributes, yet the txn ID
+        // must be identical.
+        let base = txn_for(40);
+        assert_eq!(txn_for(20), base, "txn id must not depend on attribute count");
+        assert_eq!(txn_for(200), base, "txn id must not depend on capped SOFTWARE");
+        assert!(base.iter().any(|&b| b != 0), "txn id must be populated");
+    }
+
+    // The advertised length field is u16. `written` is bounded to <= 140 bytes
+    // (XOR-MAPPED-ADDRESS 12 + SOFTWARE header 4 + capped value 124) for any pad
+    // size, so even a pad far larger than u16::MAX must not truncate the length
+    // field nor desync it from the bytes actually written.
+    #[test]
+    fn stun_padding_advertised_length_never_truncates_for_huge_pad() {
+        let pad = (u16::MAX as usize) + 5000; // 70_535: body far exceeds u16
+        let mut data = vec![0xABu8; pad + 16];
+        apply_padding(&mut data, pad, Protocol::Stun);
+
+        let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+        // XMA(12) + SOFTWARE header(4) + capped value(124) = 140.
+        assert_eq!(msg_len, 12 + 4 + 124);
+        assert_eq!(msg_len % 4, 0);
+
+        // The advertised length frames exactly the two attributes, and everything
+        // past it (the rest of the huge pad) is zeroed trailing padding.
+        assert_eq!(&data[20..22], &0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+        assert_eq!(&data[32..34], &0x8022u16.to_be_bytes()); // SOFTWARE
+        let vlen = u16::from_be_bytes([data[34], data[35]]) as usize;
+        assert_eq!(vlen, 124);
+        assert!(vlen < 128);
+        assert!(data[20 + msg_len..pad].iter().all(|&b| b == 0x00));
     }
 
     #[test]
@@ -962,7 +1178,7 @@ mod tests {
         data[7..10].fill(0xCC);
         apply_padding(&mut data, 7, Protocol::Stun);
 
-        assert_eq!(&data[0..2], &0x0011u16.to_be_bytes());
+        assert_eq!(&data[0..2], &0x0101u16.to_be_bytes());
         assert_eq!(&data[2..4], &0u16.to_be_bytes());
         assert_eq!(&data[4..7], &0x2112_A442u32.to_be_bytes()[..3]);
         assert!(data[7..10].iter().all(|&b| b == 0xCC));
@@ -1215,7 +1431,7 @@ mod tests {
         let result = build_padded_packet(&payload, 20, Protocol::Stun);
         assert_eq!(result.len(), 24);
         assert_eq!(&result[20..24], &[0x42, 0x43, 0x44, 0x45]);
-        assert_eq!(&result[0..2], &0x0011u16.to_be_bytes());
+        assert_eq!(&result[0..2], &0x0101u16.to_be_bytes());
         assert_eq!(&result[4..8], &0x2112_A442u32.to_be_bytes());
     }
 
@@ -1274,7 +1490,7 @@ mod tests {
                 assert_eq!(data[3], 0x80, "DNS RA flag");
             }
             Protocol::Stun => {
-                assert_eq!(&data[0..2], &0x0011u16.to_be_bytes());
+                assert_eq!(&data[0..2], &0x0101u16.to_be_bytes());
                 assert_eq!(&data[4..8], &0x2112_A442u32.to_be_bytes());
             }
             Protocol::Sip => {
@@ -1454,7 +1670,7 @@ mod tests {
         let result = apply_awg_transform(&mut pkt, &params, Protocol::Stun, None);
         assert!(result);
 
-        assert_eq!(&pkt[0..2], &0x0011u16.to_be_bytes());
+        assert_eq!(&pkt[0..2], &0x0101u16.to_be_bytes());
         assert_eq!(&pkt[4..8], &0x2112_A442u32.to_be_bytes());
         assert_eq!(&pkt[20..24], &750u32.to_le_bytes());
         assert!(pkt[24..124].iter().all(|&b| b == 0xBB));
