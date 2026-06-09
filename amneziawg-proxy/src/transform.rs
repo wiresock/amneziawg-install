@@ -494,8 +494,8 @@ impl core::fmt::Write for SliceWriter<'_> {
 /// A complete header block cannot fit a small S value (a minimal realistic
 /// response is ~150–200 B), so below that the message is intentionally
 /// incomplete: whole-message parsers note missing headers, but the inspected
-/// prefix stays SIP-shaped. Padding too small for even the status line falls back
-/// to a status-line fragment with a CRLF suffix.
+/// prefix stays SIP-shaped. Padding too small for a complete status line plus a terminating
+/// blank line (`\r\n\r\n`) falls back to a status-line fragment with a CRLF suffix.
 fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
     use core::fmt::Write as _;
 
