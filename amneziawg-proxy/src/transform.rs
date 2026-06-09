@@ -505,6 +505,16 @@ fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
 
     // Header is built after `written` is known. Copy as much as fits; a partial
     // header still carries the type, length, cookie and a partial transaction ID.
+    //
+    // `written` is bounded regardless of pad_size: at most XOR-MAPPED-ADDRESS (12)
+    // + SOFTWARE header (4) + the RFC 5389 §15.10 value cap (124) = 140 bytes. It
+    // is `body` that grows with pad_size, but `body` only gates how large the
+    // (capped) SOFTWARE value is — it is never advertised. So `written as u16`
+    // cannot truncate and the advertised length always equals the bytes written.
+    debug_assert!(
+        written <= u16::MAX as usize,
+        "advertised STUN message length must fit the u16 length field"
+    );
     let mut header = [0u8; 20];
     header[0..2].copy_from_slice(&0x0101u16.to_be_bytes()); // Binding Success Response
     header[2..4].copy_from_slice(&(written as u16).to_be_bytes());
@@ -1135,6 +1145,31 @@ mod tests {
         assert_eq!(txn_for(20), base, "txn id must not depend on attribute count");
         assert_eq!(txn_for(200), base, "txn id must not depend on capped SOFTWARE");
         assert!(base.iter().any(|&b| b != 0), "txn id must be populated");
+    }
+
+    // The advertised length field is u16. `written` is bounded to <= 140 bytes
+    // (XOR-MAPPED-ADDRESS 12 + SOFTWARE header 4 + capped value 124) for any pad
+    // size, so even a pad far larger than u16::MAX must not truncate the length
+    // field nor desync it from the bytes actually written.
+    #[test]
+    fn stun_padding_advertised_length_never_truncates_for_huge_pad() {
+        let pad = (u16::MAX as usize) + 5000; // 70_535: body far exceeds u16
+        let mut data = vec![0xABu8; pad + 16];
+        apply_padding(&mut data, pad, Protocol::Stun);
+
+        let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+        // XMA(12) + SOFTWARE header(4) + capped value(124) = 140.
+        assert_eq!(msg_len, 12 + 4 + 124);
+        assert_eq!(msg_len % 4, 0);
+
+        // The advertised length frames exactly the two attributes, and everything
+        // past it (the rest of the huge pad) is zeroed trailing padding.
+        assert_eq!(&data[20..22], &0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+        assert_eq!(&data[32..34], &0x8022u16.to_be_bytes()); // SOFTWARE
+        let vlen = u16::from_be_bytes([data[34], data[35]]) as usize;
+        assert_eq!(vlen, 124);
+        assert!(vlen < 128);
+        assert!(data[20 + msg_len..pad].iter().all(|&b| b == 0x00));
     }
 
     #[test]
