@@ -289,6 +289,12 @@ pub struct ProxyConfig {
     /// values absorb bursts and prevent in-proxy UDP drops (which the tunnel
     /// would otherwise see as path loss). `0` leaves the OS defaults in place.
     /// The kernel may clamp the request to `net.core.rmem_max`/`wmem_max`.
+    ///
+    /// Note: this applies *per socket*, so the requested kernel memory scales
+    /// with the number of concurrent sessions (one backend socket each, plus
+    /// the frontend). The 4 MiB default suits typical session counts; lower it
+    /// (or set `0`) if running near `max_sessions` on a memory-constrained host
+    /// with raised `rmem_max`/`wmem_max` ceilings.
     #[serde(default = "default_socket_buffer_bytes")]
     pub socket_buffer_bytes: usize,
 

@@ -847,12 +847,19 @@ impl Proxy {
         };
         let frontend = Arc::clone(&self.frontend);
         let timeout = self.dns_upstream_timeout;
+        let shutdown = Arc::clone(&self.shutdown);
         tokio::spawn(async move {
-            let response = forward_dns_query(upstream, &query, timeout)
-                .await
-                .unwrap_or_else(|| {
-                    responder::generate_response_for_client(Protocol::Dns, &query, client_addr)
-                });
+            // Abandon the upstream round trip if the proxy is shutting down, so
+            // a slow resolver cannot keep this detached task (and a stray client
+            // send) alive for up to `dns_upstream_timeout` past shutdown.
+            let response = tokio::select! {
+                r = forward_dns_query(upstream, &query, timeout) => {
+                    r.unwrap_or_else(|| {
+                        responder::generate_response_for_client(Protocol::Dns, &query, client_addr)
+                    })
+                }
+                _ = shutdown.notified() => return,
+            };
             match frontend.send_to(&response, client_addr).await {
                 Ok(_) => {
                     metrics.record_probe();
@@ -1052,7 +1059,7 @@ async fn forward_dns_query(
         return None;
     }
 
-    let mut buf = vec![0u8; 4096];
+    let mut buf = [0u8; 4096];
     let recv = tokio::time::timeout(timeout, sock.recv_from(&mut buf)).await;
     let Ok(Ok((n, from))) = recv else {
         return None;
