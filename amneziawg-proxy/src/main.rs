@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
                     match tokio::signal::ctrl_c().await {
                         Ok(()) => {
                             info!("received SIGINT");
-                            shutdown_signal.notify_one();
+                            shutdown_signal.shutdown();
                         }
                         Err(e) => {
                             error!(error = %e, "failed to listen for SIGINT");
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
                     match result {
                         Ok(()) => {
                             info!("received SIGINT");
-                            shutdown_signal.notify_one();
+                            shutdown_signal.shutdown();
                         }
                         Err(e) => {
                             error!(error = %e, "failed to listen for SIGINT");
@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 _ = sigterm.recv() => {
                     info!("received SIGTERM");
-                    shutdown_signal.notify_one();
+                    shutdown_signal.shutdown();
                 }
             }
         }
@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
             match tokio::signal::ctrl_c().await {
                 Ok(()) => {
                     info!("received ctrl-c");
-                    shutdown_signal.notify_one();
+                    shutdown_signal.shutdown();
                 }
                 Err(e) => {
                     error!(error = %e, "failed to listen for ctrl-c");

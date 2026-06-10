@@ -22,6 +22,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde",
+ "socket2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
