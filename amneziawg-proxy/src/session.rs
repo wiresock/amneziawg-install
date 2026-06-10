@@ -44,7 +44,11 @@ pub struct Session {
     /// atomically (behind an `Arc` so the relay can hold an [`ActivityHandle`]
     /// to it) so both data paths refresh it without write-lock contention
     /// between the inbound receive loop and the per-session relay task.
-    pub last_active: Arc<AtomicU64>,
+    ///
+    /// Private: the value is an internal epoch representation only meaningful
+    /// alongside [`process_epoch`]; callers refresh it via [`Session::touch`]
+    /// or [`SessionTable::activity_handle`] rather than reading it directly.
+    last_active: Arc<AtomicU64>,
     /// The client address that owns this session.
     pub client_addr: SocketAddr,
 }

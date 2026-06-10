@@ -76,6 +76,15 @@ impl ShutdownHandle {
         // a task that subscribes afterwards still observes the signal.
         let _ = self.0.send_replace(true);
     }
+
+    /// Resolve once shutdown has been signalled (now or earlier), so a consumer
+    /// can await shutdown via the same handle it uses to trigger it without
+    /// reaching into `Proxy` internals. Level-triggered: returns immediately if
+    /// shutdown was already signalled.
+    pub async fn wait(&self) {
+        let mut rx = self.0.subscribe();
+        wait_for_shutdown(&mut rx).await;
+    }
 }
 
 /// Resolve once shutdown has been signalled. `wait_for` inspects the current
@@ -1294,16 +1303,17 @@ mod tests {
         let config = dns_forward_config(backend_addr, upstream, 60_000);
         let proxy = Proxy::bind(config, None).await.unwrap();
 
-        // Park several receivers on the shutdown signal, mimicking in-flight
+        let shutdown = proxy.shutdown_handle();
+
+        // Park several waiters on the shutdown signal, mimicking in-flight
         // detached DNS-forward / SIP-deferred tasks competing for the wake-up.
         let parked: Vec<_> = (0..8)
             .map(|_| {
-                let mut rx = proxy.shutdown_tx.subscribe();
-                tokio::spawn(async move { wait_for_shutdown(&mut rx).await })
+                let h = shutdown.clone();
+                tokio::spawn(async move { h.wait().await })
             })
             .collect();
 
-        let shutdown = proxy.shutdown_handle();
         let run = tokio::spawn(async move { proxy.run().await.unwrap() });
 
         // Let the run loop and parked tasks register as waiters first.
