@@ -1600,7 +1600,7 @@ mod tests {
 
     /// With `dns_forward_enabled`, an allowed DNS probe is forwarded to the
     /// upstream resolver and the resolver's reply is relayed back to the client
-    /// verbatim (off the receive loop, via the detached `spawn_dns_forward`
+    /// verbatim (off the receive loop, via the detached `try_spawn_dns_forward`
     /// task).
     #[tokio::test]
     async fn dns_forward_relays_upstream_reply_to_client() {
