@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -90,7 +90,17 @@ pub struct Proxy {
     relay_generation: AtomicU64,
     /// Monotonically increasing generation counter for deferred SIP tasks.
     sip_deferred_generation: AtomicU64,
+    /// Bounds the number of concurrent in-flight DNS upstream forwards so a
+    /// burst of DNS probes cannot amplify into an unbounded pile of detached
+    /// tasks each holding an ephemeral socket open for up to
+    /// `dns_upstream_timeout`. Probes that cannot get a permit fall back to the
+    /// synthetic response instead of querying upstream.
+    dns_forward_semaphore: Arc<Semaphore>,
 }
+
+/// Maximum concurrent in-flight DNS upstream forwards (see
+/// [`Proxy::dns_forward_semaphore`]).
+const MAX_INFLIGHT_DNS_FORWARDS: usize = 256;
 
 impl Proxy {
     /// Create and bind a new proxy instance.
@@ -173,6 +183,7 @@ impl Proxy {
             sip_deferred_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
             sip_deferred_generation: AtomicU64::new(0),
+            dns_forward_semaphore: Arc::new(Semaphore::new(MAX_INFLIGHT_DNS_FORWARDS)),
         })
     }
 
@@ -204,6 +215,7 @@ impl Proxy {
             sip_deferred_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
             sip_deferred_generation: AtomicU64::new(0),
+            dns_forward_semaphore: Arc::new(Semaphore::new(MAX_INFLIGHT_DNS_FORWARDS)),
         }
     }
 
@@ -848,17 +860,27 @@ impl Proxy {
         let frontend = Arc::clone(&self.frontend);
         let timeout = self.dns_upstream_timeout;
         let shutdown = Arc::clone(&self.shutdown);
+        let semaphore = Arc::clone(&self.dns_forward_semaphore);
         tokio::spawn(async move {
-            // Abandon the upstream round trip if the proxy is shutting down, so
-            // a slow resolver cannot keep this detached task (and a stray client
-            // send) alive for up to `dns_upstream_timeout` past shutdown.
-            let response = tokio::select! {
-                r = forward_dns_query(upstream, &query, timeout) => {
-                    r.unwrap_or_else(|| {
-                        responder::generate_response_for_client(Protocol::Dns, &query, client_addr)
-                    })
-                }
-                _ = shutdown.notified() => return,
+            let synthetic =
+                || responder::generate_response_for_client(Protocol::Dns, &query, client_addr);
+            // Cap concurrent upstream round-trips. If we're at the in-flight
+            // limit, answer with the synthetic response instead of querying
+            // upstream — the probe still gets a reply and the receive loop
+            // stays non-blocking, but a probe burst can't amplify into an
+            // unbounded pile of tasks each holding a socket open for the
+            // upstream timeout.
+            let response = match semaphore.try_acquire_owned() {
+                Ok(_permit) => tokio::select! {
+                    // Abandon the upstream round trip if the proxy is shutting
+                    // down, so a slow resolver cannot keep this detached task
+                    // (and a stray client send) alive past shutdown.
+                    r = forward_dns_query(upstream, &query, timeout) => {
+                        r.unwrap_or_else(synthetic)
+                    }
+                    _ = shutdown.notified() => return,
+                },
+                Err(_) => synthetic(),
             };
             match frontend.send_to(&response, client_addr).await {
                 Ok(_) => {
@@ -1447,6 +1469,118 @@ mod tests {
         assert_eq!(echo.txid, [0x12, 0x34], "TXID captured");
         assert_eq!(echo.qname, qname.to_vec(), "QNAME captured");
         assert_eq!(echo.qtype, [0x00, 0x01], "QTYPE captured");
+    }
+
+    /// Minimal well-formed DNS query: 12-byte header (given TXID, RD=1,
+    /// QDCOUNT=1) plus a single `example.com` IN A question. Accepted by
+    /// `detect_protocol` as `Protocol::Dns`.
+    fn dns_query(txid: [u8; 2]) -> Vec<u8> {
+        let mut q = vec![
+            txid[0], txid[1], // transaction ID
+            0x01, 0x00, // flags: RD=1, QR=0
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x00, // ANCOUNT=0
+            0x00, 0x00, // NSCOUNT=0
+            0x00, 0x00, // ARCOUNT=0
+        ];
+        q.extend_from_slice(b"\x07example\x03com\x00"); // QNAME
+        q.extend_from_slice(&[0x00, 0x01]); // QTYPE A
+        q.extend_from_slice(&[0x00, 0x01]); // QCLASS IN
+        q
+    }
+
+    fn dns_forward_config(backend_addr: SocketAddr, upstream: SocketAddr, timeout_ms: u64) -> ProxyConfig {
+        ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec: 16,
+            imitate_protocol: "dns".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: true,
+            dns_upstream: upstream.to_string(),
+            dns_upstream_timeout_ms: timeout_ms,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            socket_buffer_bytes: 0,
+            awg_config: None,
+        }
+    }
+
+    /// With `dns_forward_enabled`, an allowed DNS probe is forwarded to the
+    /// upstream resolver and the resolver's reply is relayed back to the client
+    /// verbatim (off the receive loop, via the detached `spawn_dns_forward`
+    /// task).
+    #[tokio::test]
+    async fn dns_forward_relays_upstream_reply_to_client() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = resolver.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let config = dns_forward_config(backend_addr, upstream_addr, 1500);
+        let proxy = Proxy::bind(config, None).await.unwrap();
+
+        // Stand-in resolver: echo the query TXID with a distinctive payload so
+        // the assertion can tell an upstream reply from the synthetic fallback.
+        let upstream_reply = b"\x12\x34\x81\x80UPSTREAM-REPLY".to_vec();
+        let reply = upstream_reply.clone();
+        let resolver_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, from) = resolver.recv_from(&mut buf).await.unwrap();
+            assert!(n >= 12, "resolver received a DNS-sized query");
+            resolver.send_to(&reply, from).await.unwrap();
+        });
+
+        let query = dns_query([0x12, 0x34]);
+        let metrics = proxy.metrics.get_or_create(client_addr);
+        proxy.handle_probe(&query, client_addr, &metrics).await;
+
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("client should receive the forwarded upstream reply")
+            .unwrap();
+        assert_eq!(
+            &buf[..n],
+            upstream_reply.as_slice(),
+            "client receives the upstream reply verbatim"
+        );
+        resolver_task.await.unwrap();
+    }
+
+    /// When the upstream resolver does not answer within the timeout, the
+    /// detached task still delivers the synthetic fallback (SERVFAIL echoing
+    /// the query TXID) so the probe is never left unanswered.
+    #[tokio::test]
+    async fn dns_forward_falls_back_to_synthetic_on_timeout() {
+        // A bound-but-silent upstream: sends succeed, no reply ever arrives.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = silent.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let config = dns_forward_config(backend_addr, upstream_addr, 100);
+        let proxy = Proxy::bind(config, None).await.unwrap();
+
+        let query = dns_query([0xAB, 0xCD]);
+        let metrics = proxy.metrics.get_or_create(client_addr);
+        proxy.handle_probe(&query, client_addr, &metrics).await;
+
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("client should receive the synthetic fallback after upstream timeout")
+            .unwrap();
+        assert!(n >= 12, "fallback is a DNS-sized message");
+        assert_eq!(&buf[..2], &[0xAB, 0xCD], "fallback echoes the query TXID");
+        assert_eq!(buf[2] & 0x80, 0x80, "fallback has QR=1 (a response)");
     }
 
     fn sip_test_config(backend_addr: SocketAddr) -> ProxyConfig {
