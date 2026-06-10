@@ -203,7 +203,7 @@ buffer_size = 4096
     );
 
     // 6. Shutdown
-    shutdown.notify_one();
+    shutdown.shutdown();
     tokio::time::timeout(Duration::from_secs(2), proxy_handle)
         .await
         .expect("proxy did not shut down in time")
@@ -287,7 +287,7 @@ buffer_size = 4096
     );
     assert_eq!(&buf_b[2..n_b], b"msg-from-b", "client B payload mismatch");
 
-    shutdown.notify_one();
+    shutdown.shutdown();
     tokio::time::timeout(Duration::from_secs(2), proxy_handle)
         .await
         .expect("proxy did not shut down in time")
@@ -385,7 +385,7 @@ buffer_size = 4096
     assert_eq!(backend_echo.len(), stun_pkt.len() + 2);
     assert_eq!(&backend_echo[2..], stun_pkt.as_slice());
 
-    shutdown.notify_one();
+    shutdown.shutdown();
     tokio::time::timeout(Duration::from_secs(2), proxy_handle)
         .await
         .expect("proxy did not shut down in time")

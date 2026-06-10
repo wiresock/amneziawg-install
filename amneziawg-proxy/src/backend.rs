@@ -10,19 +10,21 @@ use tracing::{debug, warn};
 /// Larger socket buffers absorb bursts while a worker is briefly busy, which is
 /// the main defense against in-proxy UDP drops that the tunnel would otherwise
 /// see as path loss (collapsing TCP throughput). Best-effort: failures are
-/// logged at debug and never abort session setup. The kernel may also clamp the
-/// request to `net.core.rmem_max` / `wmem_max`, so the effective size can be
-/// smaller than requested.
+/// logged at `warn` (not `debug`, which the `release_max_level_info` feature
+/// compiles out, leaving release builds blind to misconfiguration) and never
+/// abort session setup. This runs once per socket, not per packet, and the
+/// setters rarely error — the kernel clamps an oversized request to
+/// `net.core.rmem_max` / `wmem_max` instead of failing — so it does not spam.
 pub fn configure_socket_buffers(sock: &UdpSocket, bytes: usize) {
     if bytes == 0 {
         return;
     }
     let sock_ref = socket2::SockRef::from(sock);
     if let Err(e) = sock_ref.set_recv_buffer_size(bytes) {
-        debug!(error = %e, requested = bytes, "failed to set SO_RCVBUF");
+        warn!(error = %e, requested = bytes, "failed to set SO_RCVBUF");
     }
     if let Err(e) = sock_ref.set_send_buffer_size(bytes) {
-        debug!(error = %e, requested = bytes, "failed to set SO_SNDBUF");
+        warn!(error = %e, requested = bytes, "failed to set SO_SNDBUF");
     }
 }
 

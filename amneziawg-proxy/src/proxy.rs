@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -61,6 +61,31 @@ fn sip_stage_after_immediate_response(
     }
 }
 
+/// Handle for signalling proxy shutdown. Cloneable; [`shutdown`](Self::shutdown)
+/// is idempotent and reliably wakes the run loop and every detached task,
+/// because the underlying `watch` channel is level-triggered and broadcast.
+#[derive(Clone)]
+pub struct ShutdownHandle(watch::Sender<bool>);
+
+impl ShutdownHandle {
+    /// Signal all proxy tasks to shut down.
+    pub fn shutdown(&self) {
+        // `send_replace` (not `send`) so the value is stored even when there
+        // are currently no receivers — e.g. shutdown signalled after `bind`
+        // but before `run` has subscribed. The channel is level-triggered, so
+        // a task that subscribes afterwards still observes the signal.
+        let _ = self.0.send_replace(true);
+    }
+}
+
+/// Resolve once shutdown has been signalled. `wait_for` inspects the current
+/// value first, so a shutdown signalled before this receiver existed is still
+/// observed; a dropped sender (all handles gone) is likewise treated as
+/// shutdown.
+async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|&signalled| signalled).await;
+}
+
 /// The main proxy runtime state.
 pub struct Proxy {
     config: ProxyConfig,
@@ -79,7 +104,12 @@ pub struct Proxy {
     /// Most recent DNS query (TXID + QNAME + QTYPE) observed per client, so
     /// DNS cover-traffic responses can echo the request (see `transform`).
     dns_query_echo: Arc<DashMap<SocketAddr, DnsEcho>>,
-    shutdown: Arc<Notify>,
+    /// Broadcast shutdown signal. `watch` is level-triggered (a task that
+    /// checks after the signal still observes it) and wakes *all* receivers,
+    /// unlike the single-waiter `Notify` it replaced — which meant one
+    /// `notify_one()` could be consumed by a detached task instead of the run
+    /// loop, leaving shutdown unobserved by the rest.
+    shutdown_tx: watch::Sender<bool>,
     /// Per-session relay task handles, keyed by client address.
     /// Each task awaits data from the session's backend socket and relays it
     /// back to the client — fully event-driven, no polling.
@@ -178,7 +208,7 @@ impl Proxy {
             quic_handshake,
             sip_dialogs: Arc::new(DashMap::new()),
             dns_query_echo: Arc::new(DashMap::new()),
-            shutdown: Arc::new(Notify::new()),
+            shutdown_tx: watch::channel(false).0,
             relay_handles: Arc::new(DashMap::new()),
             sip_deferred_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
@@ -210,7 +240,7 @@ impl Proxy {
             quic_handshake: None,
             sip_dialogs: Arc::new(DashMap::new()),
             dns_query_echo: Arc::new(DashMap::new()),
-            shutdown: Arc::new(Notify::new()),
+            shutdown_tx: watch::channel(false).0,
             relay_handles: Arc::new(DashMap::new()),
             sip_deferred_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
@@ -238,8 +268,8 @@ impl Proxy {
     }
 
     /// Get a handle to signal shutdown.
-    pub fn shutdown_handle(&self) -> Arc<Notify> {
-        Arc::clone(&self.shutdown)
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle(self.shutdown_tx.clone())
     }
 
     /// Returns the actual listen address (useful when bound to port 0).
@@ -266,6 +296,7 @@ impl Proxy {
         // this can be changed to spawn per-packet tasks.
         let buffer_size = self.config.buffer_size.min(65_535);
         let mut buf = vec![0u8; buffer_size];
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
             tokio::select! {
@@ -279,7 +310,7 @@ impl Proxy {
                         }
                     }
                 }
-                _ = self.shutdown.notified() => {
+                _ = wait_for_shutdown(&mut shutdown_rx) => {
                     info!("shutdown signal received, stopping proxy");
                     break;
                 }
@@ -720,7 +751,7 @@ impl Proxy {
             let frontend = Arc::clone(&self.frontend);
             let dialogs = Arc::clone(&self.sip_dialogs);
             let metrics = metrics_ref.as_ref().map(Arc::clone);
-            let shutdown = Arc::clone(&self.shutdown);
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
             let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
             let generation = self.sip_deferred_generation.fetch_add(1, Ordering::Relaxed);
             let expected_call_id = match fresh_call_id {
@@ -733,7 +764,7 @@ impl Proxy {
                 // time so retransmits that already emitted 180 suppress this.
                 tokio::select! {
                     _ = time::sleep(Duration::from_millis(200)) => {}
-                    _ = shutdown.notified() => {
+                    _ = wait_for_shutdown(&mut shutdown_rx) => {
                         sip_deferred_handles.remove_if(&client_addr, |_, entry| {
                             entry.generation == generation
                         });
@@ -782,7 +813,7 @@ impl Proxy {
                 // where a CANCEL/BYE could terminate the dialog.
                 tokio::select! {
                     _ = time::sleep(Duration::from_millis(800)) => {}
-                    _ = shutdown.notified() => {
+                    _ = wait_for_shutdown(&mut shutdown_rx) => {
                         sip_deferred_handles.remove_if(&client_addr, |_, entry| {
                             entry.generation == generation
                         });
@@ -859,7 +890,7 @@ impl Proxy {
         };
         let frontend = Arc::clone(&self.frontend);
         let timeout = self.dns_upstream_timeout;
-        let shutdown = Arc::clone(&self.shutdown);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let semaphore = Arc::clone(&self.dns_forward_semaphore);
         tokio::spawn(async move {
             let synthetic =
@@ -878,7 +909,7 @@ impl Proxy {
                     r = forward_dns_query(upstream, &query, timeout) => {
                         r.unwrap_or_else(synthetic)
                     }
-                    _ = shutdown.notified() => return,
+                    _ = wait_for_shutdown(&mut shutdown_rx) => return,
                 },
                 Err(_) => synthetic(),
             };
@@ -1230,17 +1261,58 @@ mod tests {
             proxy.run().await.unwrap();
         });
 
-        // Notify::notify_one() stores the permit, so the proxy will pick it
-        // up on its first select! iteration even if the recv loop hasn't
-        // started yet. No readiness probe needed for a pure bind+shutdown test.
-        // Signal shutdown
-        shutdown.notify_one();
+        // The shutdown `watch` is level-triggered, so the proxy observes the
+        // signal on its first select! iteration even if the recv loop hasn't
+        // started yet (or had already started). No readiness probe needed for
+        // a pure bind+shutdown test.
+        shutdown.shutdown();
 
         // Should complete
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("proxy did not shut down in time")
             .unwrap();
+    }
+
+    /// Regression: with the previous single-waiter `Notify` + `notify_one()`,
+    /// one `shutdown()` woke only one waiter — which could be a detached task
+    /// rather than the run loop, leaving the proxy running. The broadcast
+    /// `watch` must wake the run loop *and* every parked task from a single
+    /// signal.
+    #[tokio::test]
+    async fn shutdown_wakes_run_loop_even_with_other_waiters_parked() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let upstream: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let config = dns_forward_config(backend_addr, upstream, 60_000);
+        let proxy = Proxy::bind(config, None).await.unwrap();
+
+        // Park several receivers on the shutdown signal, mimicking in-flight
+        // detached DNS-forward / SIP-deferred tasks competing for the wake-up.
+        let parked: Vec<_> = (0..8)
+            .map(|_| {
+                let mut rx = proxy.shutdown_tx.subscribe();
+                tokio::spawn(async move { wait_for_shutdown(&mut rx).await })
+            })
+            .collect();
+
+        let shutdown = proxy.shutdown_handle();
+        let run = tokio::spawn(async move { proxy.run().await.unwrap() });
+
+        // Let the run loop and parked tasks register as waiters first.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.shutdown();
+
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run loop must observe shutdown despite other parked waiters")
+            .unwrap();
+        for p in parked {
+            tokio::time::timeout(Duration::from_secs(1), p)
+                .await
+                .expect("each parked waiter must be woken by the broadcast")
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1324,7 +1396,7 @@ mod tests {
         let (n, _) = result.unwrap().unwrap();
         assert_eq!(&backend_buf[..n], &quic_pkt);
 
-        shutdown.notify_one();
+        shutdown.shutdown();
         // Await the proxy task to prevent leaked tasks / flaky CI.
         tokio::time::timeout(Duration::from_secs(5), proxy_handle)
             .await
@@ -2699,7 +2771,7 @@ Content-Length: 0\r\n\r\n";
             .unwrap()
             .starts_with("SIP/2.0 100 Trying\r\n"));
 
-        proxy.shutdown_handle().notify_one();
+        proxy.shutdown_handle().shutdown();
 
         let deferred =
             tokio::time::timeout(Duration::from_millis(350), client.recv_from(&mut buf)).await;
@@ -2748,7 +2820,7 @@ Content-Length: 0\r\n\r\n";
             assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with(expected));
         }
 
-        proxy.shutdown_handle().notify_one();
+        proxy.shutdown_handle().shutdown();
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
