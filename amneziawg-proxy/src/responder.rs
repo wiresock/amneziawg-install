@@ -503,6 +503,36 @@ pub struct DnsEcho {
     pub qtype: [u8; 2],
 }
 
+/// Borrowed view of a parsed DNS query echo, used on the per-packet hot path
+/// to compare against the stored [`DnsEcho`] without heap-allocating the QNAME.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DnsEchoRef<'a> {
+    /// Transaction ID copied verbatim from the query.
+    pub txid: [u8; 2],
+    /// QNAME wire bytes including the terminating root label (`0x00`).
+    pub qname: &'a [u8],
+    /// QTYPE (e.g. A / AAAA / HTTPS), copied from the query.
+    pub qtype: [u8; 2],
+}
+
+impl From<DnsEchoRef<'_>> for DnsEcho {
+    fn from(r: DnsEchoRef<'_>) -> Self {
+        DnsEcho {
+            txid: r.txid,
+            qname: r.qname.to_vec(),
+            qtype: r.qtype,
+        }
+    }
+}
+
+impl DnsEcho {
+    /// Returns `true` when this stored echo is identical to the borrowed view,
+    /// allowing callers to skip a redundant (allocating) map update.
+    pub fn matches(&self, r: &DnsEchoRef<'_>) -> bool {
+        self.txid == r.txid && self.qtype == r.qtype && self.qname == r.qname
+    }
+}
+
 /// Extract the transaction ID, QNAME, and QTYPE from a DNS query for later reuse
 /// in cover-traffic responses.
 ///
@@ -512,6 +542,13 @@ pub struct DnsEcho {
 /// acceptance test in [`detect_protocol`]; QCLASS is constrained to IN because
 /// the cover response always emits IN.
 pub fn parse_dns_query_echo(data: &[u8]) -> Option<DnsEcho> {
+    parse_dns_query_echo_ref(data).map(DnsEcho::from)
+}
+
+/// Allocation-free variant of [`parse_dns_query_echo`] returning borrowed
+/// QNAME bytes. Used on the per-packet data path where the echo is usually
+/// unchanged and an owned copy would be wasted work.
+pub fn parse_dns_query_echo_ref(data: &[u8]) -> Option<DnsEchoRef<'_>> {
     if data.len() < 12 {
         return None;
     }
@@ -541,9 +578,9 @@ pub fn parse_dns_query_echo(data: &[u8]) -> Option<DnsEcho> {
     if data[qname_end + 2] != 0x00 || data[qname_end + 3] != 0x01 {
         return None;
     }
-    Some(DnsEcho {
+    Some(DnsEchoRef {
         txid: [data[0], data[1]],
-        qname: data[QNAME_START..qname_end].to_vec(),
+        qname: &data[QNAME_START..qname_end],
         qtype: [data[qname_end], data[qname_end + 1]],
     })
 }

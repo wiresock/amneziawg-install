@@ -1,20 +1,61 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
+/// Process-wide monotonic epoch used to express session activity timestamps
+/// as a plain `u64` (milliseconds), so they can live in an atomic and be
+/// updated under a DashMap *read* guard on the per-packet hot path instead
+/// of requiring an exclusive shard lock.
+fn process_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Milliseconds elapsed since the process epoch.
+fn now_millis() -> u64 {
+    process_epoch().elapsed().as_millis() as u64
+}
+
+/// Lookup-free handle to a single session's activity timestamp.
+///
+/// The per-session relay task captures one of these at spawn time and refreshes
+/// it on every outbound packet, so keeping a download-heavy session alive costs
+/// a cached atomic store instead of a `DashMap` read guard + hash + lookup.
+#[derive(Clone)]
+pub struct ActivityHandle(Arc<AtomicU64>);
+
+impl ActivityHandle {
+    /// Refresh the activity timestamp (see [`Session::touch`] for ordering).
+    pub fn touch(&self) {
+        self.0.store(now_millis(), Ordering::Relaxed);
+    }
+}
+
 /// A single client session: maps a client address to a dedicated backend socket.
 pub struct Session {
     /// Dedicated UDP socket bound to an ephemeral port for talking to the backend.
     pub backend_sock: Arc<UdpSocket>,
-    /// Last time this session saw activity.
-    pub last_active: Instant,
+    /// Last activity time, as milliseconds since [`process_epoch`]. Stored
+    /// atomically (behind an `Arc` so the relay can hold an [`ActivityHandle`]
+    /// to it) so both data paths refresh it without write-lock contention
+    /// between the inbound receive loop and the per-session relay task.
+    pub last_active: Arc<AtomicU64>,
     /// The client address that owns this session.
     pub client_addr: SocketAddr,
+}
+
+impl Session {
+    /// Refresh the activity timestamp. Relaxed ordering is sufficient: the
+    /// value is only compared against the cleanup sweep's notion of "now",
+    /// and a stale read there merely delays expiry by one sweep interval.
+    fn touch(&self) {
+        self.last_active.store(now_millis(), Ordering::Relaxed);
+    }
 }
 
 /// Concurrent session table keyed by client SocketAddr.
@@ -26,6 +67,9 @@ pub struct SessionTable {
     /// Atomic counter kept in sync with `sessions.len()` so the capacity
     /// check + insert are race-free (same pattern as MetricsStore).
     session_count: AtomicUsize,
+    /// Requested kernel socket buffer size (SO_RCVBUF/SO_SNDBUF) for backend
+    /// session sockets, in bytes. `0` leaves the OS defaults untouched.
+    socket_buffer_bytes: usize,
 }
 
 impl SessionTable {
@@ -36,7 +80,15 @@ impl SessionTable {
             ttl,
             max_sessions,
             session_count: AtomicUsize::new(0),
+            socket_buffer_bytes: 0,
         }
+    }
+
+    /// Set the kernel socket buffer size applied to newly created backend
+    /// session sockets. `0` (the default) leaves the OS defaults untouched.
+    pub fn with_socket_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.socket_buffer_bytes = bytes;
+        self
     }
 
     /// Get the backend socket for a client, creating a new session if needed.
@@ -53,9 +105,11 @@ impl SessionTable {
         &self,
         client_addr: SocketAddr,
     ) -> anyhow::Result<(Arc<UdpSocket>, bool)> {
-        // Fast path: session exists
-        if let Some(mut entry) = self.sessions.get_mut(&client_addr) {
-            entry.last_active = Instant::now();
+        // Fast path: session exists. Uses a shared (read) guard — the
+        // activity timestamp is atomic, so no exclusive shard lock is taken
+        // on the per-packet path.
+        if let Some(entry) = self.sessions.get(&client_addr) {
+            entry.touch();
             return Ok((Arc::clone(&entry.backend_sock), false));
         }
 
@@ -68,8 +122,8 @@ impl SessionTable {
         // this point.
         let current = self.session_count.load(Ordering::Acquire);
         if current >= self.max_sessions {
-            if let Some(mut entry) = self.sessions.get_mut(&client_addr) {
-                entry.last_active = Instant::now();
+            if let Some(entry) = self.sessions.get(&client_addr) {
+                entry.touch();
                 return Ok((Arc::clone(&entry.backend_sock), false));
             }
             anyhow::bail!(
@@ -89,6 +143,7 @@ impl SessionTable {
         };
         let sock = UdpSocket::bind(bind_addr).await?;
         sock.connect(self.backend_addr).await?;
+        crate::backend::configure_socket_buffers(&sock, self.socket_buffer_bytes);
         let sock = Arc::new(sock);
 
         // Use entry API so concurrent calls for the same client_addr
@@ -98,9 +153,9 @@ impl SessionTable {
         // both consume a slot while only one insert succeeds.
         let entry = self.sessions.entry(client_addr);
         match entry {
-            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+            dashmap::mapref::entry::Entry::Occupied(occ) => {
                 // Another task raced us — reuse the existing session.
-                occ.get_mut().last_active = Instant::now();
+                occ.get().touch();
                 Ok((Arc::clone(&occ.get().backend_sock), false))
             }
             dashmap::mapref::entry::Entry::Vacant(vac) => {
@@ -133,7 +188,7 @@ impl SessionTable {
 
                 let session = Session {
                     backend_sock: Arc::clone(&sock),
-                    last_active: Instant::now(),
+                    last_active: Arc::new(AtomicU64::new(now_millis())),
                     client_addr,
                 };
                 vac.insert(session);
@@ -143,20 +198,34 @@ impl SessionTable {
         }
     }
 
-    /// Touch a session (update last_active).
+    /// Touch a session (update last_active). Takes only a shared (read)
+    /// DashMap guard — safe to call per packet from the relay task without
+    /// contending with the inbound receive loop.
     pub fn touch(&self, client_addr: &SocketAddr) {
-        if let Some(mut entry) = self.sessions.get_mut(client_addr) {
-            entry.last_active = Instant::now();
+        if let Some(entry) = self.sessions.get(client_addr) {
+            entry.touch();
         }
+    }
+
+    /// Return a lookup-free [`ActivityHandle`] for `client_addr`, or `None` if
+    /// the session does not exist. The relay task fetches this once at spawn so
+    /// its per-packet keep-alive is a cached atomic store rather than a table
+    /// lookup.
+    pub fn activity_handle(&self, client_addr: &SocketAddr) -> Option<ActivityHandle> {
+        self.sessions
+            .get(client_addr)
+            .map(|entry| ActivityHandle(Arc::clone(&entry.last_active)))
     }
 
     /// Remove expired sessions and return removed client addresses.
     pub fn cleanup_expired(&self) -> Vec<SocketAddr> {
-        let now = Instant::now();
+        let now = now_millis();
+        let ttl_ms = self.ttl.as_millis().min(u64::MAX as u128) as u64;
         let mut expired = Vec::new();
 
         self.sessions.retain(|addr, session| {
-            if now.duration_since(session.last_active) > self.ttl {
+            let last = session.last_active.load(Ordering::Relaxed);
+            if now.saturating_sub(last) > ttl_ms {
                 expired.push(*addr);
                 self.session_count.fetch_sub(1, Ordering::AcqRel);
                 false

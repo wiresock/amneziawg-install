@@ -13,11 +13,17 @@ tokio = { version = "1", features = ["full"] }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-tracing = "0.1"
+# `release_max_level_info` statically compiles out trace!/debug! in release
+# builds. The data path logs per packet at debug; without this a stray
+# `RUST_LOG=debug` in production would collapse throughput (per-packet
+# formatting + stderr writes), and even at the default filter each callsite
+# costs an atomic level check per datagram. Debug builds keep full verbosity.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
 dashmap = "6"
+socket2 = "0.5"
 quinn-proto = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
@@ -25,3 +31,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

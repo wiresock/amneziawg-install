@@ -284,6 +284,14 @@ pub struct ProxyConfig {
     #[serde(default = "default_buffer_size")]
     pub buffer_size: usize,
 
+    /// Kernel socket buffer size (`SO_RCVBUF`/`SO_SNDBUF`) applied to the
+    /// frontend listener and each backend session socket, in bytes. Larger
+    /// values absorb bursts and prevent in-proxy UDP drops (which the tunnel
+    /// would otherwise see as path loss). `0` leaves the OS defaults in place.
+    /// The kernel may clamp the request to `net.core.rmem_max`/`wmem_max`.
+    #[serde(default = "default_socket_buffer_bytes")]
+    pub socket_buffer_bytes: usize,
+
     /// Maximum number of concurrent sessions (prevents resource exhaustion).
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
@@ -325,6 +333,12 @@ fn default_dns_upstream_timeout_ms() -> u64 {
 fn default_buffer_size() -> usize {
     65535
 }
+fn default_socket_buffer_bytes() -> usize {
+    // 4 MiB. Large enough to absorb multi-millisecond bursts at gigabit rates
+    // without in-proxy UDP drops, while staying within common
+    // `net.core.rmem_max`/`wmem_max` ceilings (the kernel clamps if lower).
+    4 * 1024 * 1024
+}
 fn default_max_sessions() -> usize {
     10000
 }
@@ -344,6 +358,7 @@ impl Default for ProxyConfig {
             dns_upstream: default_dns_upstream(),
             dns_upstream_timeout_ms: default_dns_upstream_timeout_ms(),
             buffer_size: default_buffer_size(),
+            socket_buffer_bytes: default_socket_buffer_bytes(),
             max_sessions: default_max_sessions(),
             awg_config: None,
         }

@@ -3,6 +3,29 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
+/// Apply the requested kernel receive/send buffer sizes (`SO_RCVBUF`/`SO_SNDBUF`)
+/// to a UDP socket. A `bytes` value of `0` is a no-op, leaving the OS defaults
+/// in place.
+///
+/// Larger socket buffers absorb bursts while a worker is briefly busy, which is
+/// the main defense against in-proxy UDP drops that the tunnel would otherwise
+/// see as path loss (collapsing TCP throughput). Best-effort: failures are
+/// logged at debug and never abort session setup. The kernel may also clamp the
+/// request to `net.core.rmem_max` / `wmem_max`, so the effective size can be
+/// smaller than requested.
+pub fn configure_socket_buffers(sock: &UdpSocket, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let sock_ref = socket2::SockRef::from(sock);
+    if let Err(e) = sock_ref.set_recv_buffer_size(bytes) {
+        debug!(error = %e, requested = bytes, "failed to set SO_RCVBUF");
+    }
+    if let Err(e) = sock_ref.set_send_buffer_size(bytes) {
+        debug!(error = %e, requested = bytes, "failed to set SO_SNDBUF");
+    }
+}
+
 /// Forward a packet from the client to the backend via the session's dedicated socket.
 pub async fn forward_to_backend(
     backend_sock: &UdpSocket,
