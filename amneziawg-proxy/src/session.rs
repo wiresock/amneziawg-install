@@ -118,7 +118,7 @@ impl SessionTable {
         // is full, avoiding the expensive UdpSocket::bind()/connect() work
         // that would be discarded in the Vacant arm below.
         // Re-check the map when at capacity because a concurrent task may
-        // have inserted the session between the fast-path get_mut above and
+        // have inserted the session between the fast-path `get` above and
         // this point.
         let current = self.session_count.load(Ordering::Acquire);
         if current >= self.max_sessions {

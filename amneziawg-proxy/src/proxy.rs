@@ -524,20 +524,20 @@ impl Proxy {
                         self.handle_sip_probe(data, client_addr, metrics_ref, false)
                             .await;
                     } else if metrics.try_acquire_probe() {
-                        if proto == Protocol::Dns && self.dns_forward_enabled {
-                            // Forward to the upstream resolver off the hot path.
-                            // Awaiting it here would stall the single receive
-                            // loop for up to `dns_upstream_timeout` (default
-                            // 1.5 s), blocking *all* clients' data forwarding on
-                            // one probe. The spawned task sends the upstream
-                            // reply (or the synthetic fallback) to the client and
-                            // records the probe, preserving external behavior.
-                            self.spawn_dns_forward(
-                                data.to_vec(),
-                                client_addr,
-                                Arc::clone(metrics),
-                            );
-                        } else {
+                        // Forward DNS probes to the upstream resolver off the
+                        // hot path. Awaiting it here would stall the single
+                        // receive loop for up to `dns_upstream_timeout` (default
+                        // 1.5 s), blocking *all* clients' data forwarding on one
+                        // probe. `try_spawn_dns_forward` returns `false` when no
+                        // task was started (forwarding disabled, no upstream, or
+                        // the in-flight cap is reached); in that case — and for
+                        // non-DNS protocols — reply inline with the synthetic
+                        // response so a probe burst never amplifies into
+                        // unbounded task spawns.
+                        let forwarded = proto == Protocol::Dns
+                            && self.dns_forward_enabled
+                            && self.try_spawn_dns_forward(data, client_addr, metrics);
+                        if !forwarded {
                             probe_response = Some(responder::generate_response_for_client(
                                 proto,
                                 data,
@@ -875,43 +875,49 @@ impl Proxy {
         }
     }
 
-    /// Forward a DNS probe to the upstream resolver and deliver the response
-    /// (or a synthetic fallback) to the client *without* blocking the receive
-    /// loop. The probe rate-limit token has already been acquired by the
-    /// caller; this task only records the probe once a response is sent.
-    fn spawn_dns_forward(
+    /// Try to forward a DNS probe to the upstream resolver off the receive
+    /// loop. Returns `true` when a detached forward task was started (it will
+    /// deliver the upstream reply, or a synthetic fallback on timeout/error,
+    /// and record the probe). Returns `false` when nothing was spawned — no
+    /// upstream configured, or the in-flight forward cap is reached — so the
+    /// caller replies inline with the synthetic response instead. Acquiring the
+    /// concurrency permit *before* spawning bounds the number of detached tasks
+    /// to the permit count, so a probe burst can't amplify into unbounded task
+    /// spawns (only the upstream round-trips were bounded before).
+    ///
+    /// The probe rate-limit token is acquired by the caller; the spawned task
+    /// only records the probe once a response is sent.
+    fn try_spawn_dns_forward(
         &self,
-        query: Vec<u8>,
+        query: &[u8],
         client_addr: SocketAddr,
-        metrics: Arc<crate::metrics::ClientMetrics>,
-    ) {
+        metrics: &Arc<crate::metrics::ClientMetrics>,
+    ) -> bool {
         let Some(upstream) = self.dns_upstream else {
-            return;
+            return false;
         };
+        let Ok(permit) = Arc::clone(&self.dns_forward_semaphore).try_acquire_owned() else {
+            return false;
+        };
+        let query = query.to_vec();
+        let metrics = Arc::clone(metrics);
         let frontend = Arc::clone(&self.frontend);
         let timeout = self.dns_upstream_timeout;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let semaphore = Arc::clone(&self.dns_forward_semaphore);
         tokio::spawn(async move {
-            let synthetic =
-                || responder::generate_response_for_client(Protocol::Dns, &query, client_addr);
-            // Cap concurrent upstream round-trips. If we're at the in-flight
-            // limit, answer with the synthetic response instead of querying
-            // upstream — the probe still gets a reply and the receive loop
-            // stays non-blocking, but a probe burst can't amplify into an
-            // unbounded pile of tasks each holding a socket open for the
-            // upstream timeout.
-            let response = match semaphore.try_acquire_owned() {
-                Ok(_permit) => tokio::select! {
-                    // Abandon the upstream round trip if the proxy is shutting
-                    // down, so a slow resolver cannot keep this detached task
-                    // (and a stray client send) alive past shutdown.
-                    r = forward_dns_query(upstream, &query, timeout) => {
-                        r.unwrap_or_else(synthetic)
-                    }
-                    _ = wait_for_shutdown(&mut shutdown_rx) => return,
-                },
-                Err(_) => synthetic(),
+            // Hold the permit for the task's lifetime so the in-flight count
+            // reflects active upstream round-trips.
+            let _permit = permit;
+            let response = tokio::select! {
+                // Abandon the upstream round trip if the proxy is shutting
+                // down, so a slow resolver cannot keep this detached task
+                // (and a stray client send) alive past shutdown.
+                r = forward_dns_query(upstream, &query, timeout) => {
+                    r.unwrap_or_else(|| {
+                        responder::generate_response_for_client(Protocol::Dns, &query, client_addr)
+                    })
+                }
+                _ = wait_for_shutdown(&mut shutdown_rx) => return,
             };
             match frontend.send_to(&response, client_addr).await {
                 Ok(_) => {
@@ -921,6 +927,7 @@ impl Proxy {
                 Err(e) => warn!(%client_addr, error = %e, "failed to send DNS probe response"),
             }
         });
+        true
     }
 
     /// Spawn an event-driven relay task for a single session.
