@@ -292,9 +292,12 @@ pub struct ProxyConfig {
     ///
     /// Note: this applies *per socket*, so the requested kernel memory scales
     /// with the number of concurrent sessions (one backend socket each, plus
-    /// the frontend). The 4 MiB default suits typical session counts; lower it
-    /// (or set `0`) if running near `max_sessions` on a memory-constrained host
-    /// with raised `rmem_max`/`wmem_max` ceilings.
+    /// the frontend). On Linux the kernel also *doubles* the value set via
+    /// `SO_RCVBUF`/`SO_SNDBUF` for its own bookkeeping, so the effective
+    /// per-socket footprint is roughly 2× this setting. The 4 MiB default suits
+    /// typical session counts; lower it (or set `0`) if running near
+    /// `max_sessions` on a memory-constrained host with raised
+    /// `rmem_max`/`wmem_max` ceilings.
     #[serde(default = "default_socket_buffer_bytes")]
     pub socket_buffer_bytes: usize,
 
