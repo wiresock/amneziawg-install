@@ -12,7 +12,7 @@ on:
         default: ""
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: read
 
 concurrency:
@@ -29,12 +29,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Validate version files
-        run: python scripts/versioning/component_versions.py validate
+        run: python3 scripts/versioning/component_versions.py validate
 
   bump-and-tag:
     name: Bump changed component versions
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
     steps:
       - name: Check out main
         uses: actions/checkout@v4
@@ -54,7 +57,7 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          if git log --format=%s -n 100 --grep="for PR #${PR_NUMBER}" | grep -q "for PR #${PR_NUMBER}"; then
+          if git log --format=%s --grep="for PR #${PR_NUMBER}" | grep -q "for PR #${PR_NUMBER}"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "Version bump for PR #${PR_NUMBER} already exists."
           else
@@ -77,7 +80,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
-          python scripts/versioning/component_versions.py changed \
+          python3 scripts/versioning/component_versions.py changed \
             --changed-files changed-files.txt \
             --diff-base "$BASE_SHA" \
             --diff-head "$MERGE_SHA"
@@ -108,7 +111,7 @@ jobs:
 
           bumped_components=""
           for component in ${AUTO_COMPONENTS//,/ }; do
-            version="$(python scripts/versioning/component_versions.py bump --component "$component")"
+            version="$(python3 scripts/versioning/component_versions.py bump --component "$component")"
             if [ -z "$bumped_components" ]; then
               bumped_components="$component"
             else
@@ -117,7 +120,7 @@ jobs:
             echo "Bumped $component to $version"
           done
 
-          python scripts/versioning/component_versions.py validate
+          python3 scripts/versioning/component_versions.py validate
           echo "bumped_components=$bumped_components" >> "$GITHUB_OUTPUT"
 
       - name: Commit version bump
@@ -153,7 +156,7 @@ jobs:
 
           tags=""
           for component in ${COMPONENTS//,/ }; do
-            tag="$(python scripts/versioning/component_versions.py get --component "$component" --field tag)"
+            tag="$(python3 scripts/versioning/component_versions.py get --component "$component" --field tag)"
             if [ -z "$tags" ]; then
               tags="$tag"
             else

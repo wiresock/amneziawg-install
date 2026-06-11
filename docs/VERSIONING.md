@@ -61,7 +61,7 @@ For a shared major bump:
 Run the validation helper before opening the PR:
 
 ```bash
-python scripts/versioning/component_versions.py validate
+python3 scripts/versioning/component_versions.py validate
 ```
 
 ## Source Builds
