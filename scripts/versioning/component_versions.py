@@ -51,6 +51,14 @@ def load_config(path: Path) -> tuple[int, dict[str, Component]]:
     return project_major, components
 
 
+def require_component(components: dict[str, Component], key: str) -> Component:
+    try:
+        return components[key]
+    except KeyError as exc:
+        valid = ", ".join(sorted(components))
+        raise ValueError(f"unknown component {key!r}; valid components: {valid}") from exc
+
+
 def read_component_version(component: Component) -> str:
     in_package = False
     for line in component.manifest.read_text(encoding="utf-8").splitlines():
@@ -210,7 +218,7 @@ def cmd_changed(args: argparse.Namespace) -> int:
 
 def cmd_get(args: argparse.Namespace) -> int:
     _, components = load_config(args.config)
-    component = components[args.component]
+    component = require_component(components, args.component)
     version = read_component_version(component)
     tag = f"{component.tag_prefix}{version}"
     values = {
@@ -227,7 +235,7 @@ def cmd_get(args: argparse.Namespace) -> int:
 
 def cmd_bump(args: argparse.Namespace) -> int:
     project_major, components = load_config(args.config)
-    component = components[args.component]
+    component = require_component(components, args.component)
     current = read_component_version(component)
     major, minor, patch = parse_version(current)
     if major != project_major:

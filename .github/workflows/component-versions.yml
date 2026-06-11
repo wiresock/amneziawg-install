@@ -16,7 +16,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: component-version-bump-main
+  group: component-versions-${{ github.event_name == 'pull_request' && github.event.action != 'closed' && format('pr-{0}', github.event.pull_request.number) || 'main-bump' }}
   cancel-in-progress: false
 
 jobs:
