@@ -342,8 +342,8 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 if [[ $# -gt 0 ]]; then
-    command="$1"
-    case "${command}" in
+    subcommand="$1"
+    case "${subcommand}" in
         upgrade)
             shift
             run_script UPGRADER "$@"

@@ -220,13 +220,15 @@ CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"
 # -- Source-build support ------------------------------------------------------
 
 ensure_rust_toolchain() {
+    local home_dir="${HOME:-/root}"
+
     if command -v cargo >/dev/null 2>&1; then
         info "Rust toolchain found: $(cargo --version 2>/dev/null || echo 'unknown')"
         return 0
     fi
 
-    if [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
-        export PATH="${HOME}/.cargo/bin:${PATH}"
+    if [[ -x "${home_dir}/.cargo/bin/cargo" ]]; then
+        export PATH="${home_dir}/.cargo/bin:${PATH}"
         info "Rust toolchain found: $(cargo --version 2>/dev/null || echo 'unknown')"
         return 0
     fi
@@ -241,16 +243,20 @@ Or re-run with --install-rust to install automatically."
         die "Automatic Rust installation requires curl, but curl was not found."
     fi
 
+    if [[ -z "${HOME:-}" ]]; then
+        export HOME="${home_dir}"
+    fi
+
     info "Installing Rust toolchain via rustup..."
     if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable; then
         die "Failed to install Rust toolchain via rustup."
     fi
 
-    if [[ -f "${HOME}/.cargo/env" ]]; then
+    if [[ -f "${home_dir}/.cargo/env" ]]; then
         # shellcheck source=/dev/null
-        . "${HOME}/.cargo/env"
+        . "${home_dir}/.cargo/env"
     fi
-    export PATH="${HOME}/.cargo/bin:${PATH}"
+    export PATH="${home_dir}/.cargo/bin:${PATH}"
 
     if ! command -v cargo >/dev/null 2>&1; then
         die "Rust toolchain installation succeeded but cargo is still not in PATH."
@@ -363,7 +369,9 @@ confirm() {
     else
         prompt="${msg} [y/N] "
     fi
-    read -r -p "${prompt}" reply
+    if ! read -r -p "${prompt}" reply; then
+        reply="${default}"
+    fi
     reply="${reply:-${default}}"
     case "${reply}" in
         [Yy]*|true) return 0 ;;
@@ -402,10 +410,32 @@ refresh_unit_file() {
         die "Failed to copy unit file to: ${tmp_unit}"
     fi
 
+    local -a read_only_paths=("/etc/amnezia" "${CONFIG_DIR}")
+    if [[ -f "${SYSTEMD_UNIT_DEST}" ]]; then
+        local existing_ro path
+        existing_ro="$(grep -m1 '^ReadOnlyPaths=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null || true)"
+        if [[ -n "${existing_ro}" ]]; then
+            for path in ${existing_ro#ReadOnlyPaths=}; do
+                if [[ -n "${path}" ]]; then
+                    local existing_path found=false
+                    for existing_path in "${read_only_paths[@]}"; do
+                        if [[ "${existing_path}" == "${path}" ]]; then
+                            found=true
+                            break
+                        fi
+                    done
+                    if [[ "${found}" != "true" ]]; then
+                        read_only_paths+=("${path}")
+                    fi
+                fi
+            done
+        fi
+    fi
+
     local esc_exec esc_workdir esc_ro esc_rw
     esc_exec="$(escape_sed_replacement "ExecStart=${DEST_BINARY} ${CONFIG_FILE}")"
     esc_workdir="$(escape_sed_replacement "WorkingDirectory=${DATA_DIR}")"
-    esc_ro="$(escape_sed_replacement "ReadOnlyPaths=/etc/amnezia ${CONFIG_DIR}")"
+    esc_ro="$(escape_sed_replacement "ReadOnlyPaths=${read_only_paths[*]}")"
     esc_rw="$(escape_sed_replacement "ReadWritePaths=${DATA_DIR}")"
 
     sed -i "s|^ExecStart=.*|${esc_exec}|" "${tmp_unit}"
