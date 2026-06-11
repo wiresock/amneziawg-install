@@ -6,7 +6,7 @@
 # Behaviour mirrors amneziawg-install.sh:
 #   • If the proxy is NOT installed → runs the interactive installer.
 #   • If the proxy IS  installed    → shows a management menu with options
-#     to view status, tail logs, reconfigure, uninstall, or exit.
+#     to view status, tail logs, upgrade, reconfigure, uninstall, or exit.
 #
 # Recommended workflow:
 #   sudo ./amneziawg-install.sh      # 1. install AmneziaWG
@@ -29,6 +29,7 @@ SCRIPTS_DIR="${SCRIPT_DIR}/amneziawg-proxy/scripts"
 BOOTSTRAP_DIR=""
 
 INSTALLER="${SCRIPTS_DIR}/amneziawg-proxy-install.sh"
+UPGRADER="${SCRIPTS_DIR}/amneziawg-proxy-upgrade.sh"
 UNINSTALLER="${SCRIPTS_DIR}/amneziawg-proxy-uninstall.sh"
 
 # ── Clean-up ─────────────────────────────────────────────────────────────────
@@ -135,9 +136,10 @@ bootstrap_repo_if_needed() {
 
     SCRIPTS_DIR="${BOOTSTRAP_DIR}/amneziawg-proxy/scripts"
     INSTALLER="${SCRIPTS_DIR}/amneziawg-proxy-install.sh"
+    UPGRADER="${SCRIPTS_DIR}/amneziawg-proxy-upgrade.sh"
     UNINSTALLER="${SCRIPTS_DIR}/amneziawg-proxy-uninstall.sh"
 
-    if [[ ! -f "${INSTALLER}" ]] || [[ ! -f "${UNINSTALLER}" ]]; then
+    if [[ ! -f "${INSTALLER}" ]] || [[ ! -f "${UPGRADER}" ]] || [[ ! -f "${UNINSTALLER}" ]]; then
         echo "ERROR: Cloned repository is missing required scripts in ${SCRIPTS_DIR}" >&2
         echo "       The repository layout may have changed. Clone ${REPO_URL} manually." >&2
         exit 1
@@ -188,6 +190,39 @@ BINARY_PATH="$(_get_binary_path)"
 die()  { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 warn() { printf '\033[0;33m[WARN] \033[0m %s\n' "$*" >&2; }
 
+usage() {
+    cat <<EOF
+amneziawg-proxy - unified management script for the AmneziaWG UDP proxy.
+
+Usage:
+  sudo $0 [installer-options]              Install or manage the proxy
+  sudo $0 upgrade [upgrade-options]        Upgrade the proxy binary
+  sudo $0 install [installer-options]      Run the installer explicitly
+  sudo $0 uninstall [uninstall-options]    Run the uninstaller explicitly
+  sudo $0 help                             Show this help
+
+Common upgrade examples:
+  sudo $0 upgrade --source-dir ./amneziawg-proxy
+  sudo $0 upgrade --binary ./target/release/amneziawg-proxy
+  sudo $0 upgrade --source-dir ./amneziawg-proxy --force --restart
+
+Run inner commands with --help for command-specific options.
+EOF
+}
+
+run_script() {
+    local target_var="$1"
+    shift
+
+    local target="${!target_var}"
+    bootstrap_repo_if_needed "${target}"
+    target="${!target_var}"
+
+    local rc=0
+    bash "${target}" "$@" || rc=$?
+    exit "${rc}"
+}
+
 # ── Installation detection ────────────────────────────────────────────────────
 
 is_proxy_installed() {
@@ -204,13 +239,14 @@ manage_menu() {
     echo "What do you want to do?"
     echo "   1) Show service status"
     echo "   2) Tail service logs"
-    echo "   3) Reconfigure (re-run installer)"
-    echo "   4) Uninstall amneziawg-proxy"
-    echo "   5) Exit"
+    echo "   3) Upgrade binary"
+    echo "   4) Reconfigure (re-run installer)"
+    echo "   5) Uninstall amneziawg-proxy"
+    echo "   6) Exit"
 
     local option=""
-    until [[ "${option}" =~ ^[1-5]$ ]]; do
-        if ! read -rp "Select an option [1-5]: " option; then
+    until [[ "${option}" =~ ^[1-6]$ ]]; do
+        if ! read -rp "Select an option [1-6]: " option; then
             die "No input available; cannot read menu selection."
         fi
     done
@@ -235,12 +271,12 @@ manage_menu() {
             fi
             ;;
         3)
-            bootstrap_repo_if_needed "${INSTALLER}"
-            local rc=0
-            bash "${INSTALLER}" || rc=$?
-            exit "${rc}"
+            run_script UPGRADER
             ;;
         4)
+            run_script INSTALLER
+            ;;
+        5)
             bootstrap_repo_if_needed "${UNINSTALLER}"
 
             echo ""
@@ -284,7 +320,7 @@ manage_menu() {
             bash "${UNINSTALLER}" "${uninstall_args[@]}" || rc=$?
             exit "${rc}"
             ;;
-        5)
+        6)
             exit 0
             ;;
     esac
@@ -292,15 +328,39 @@ manage_menu() {
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        help|--help|-h)
+            usage
+            exit 0
+            ;;
+    esac
+fi
+
 if [[ "${EUID}" -ne 0 ]]; then
     die "This script must be run as root (use sudo)."
+fi
+
+if [[ $# -gt 0 ]]; then
+    command="$1"
+    case "${command}" in
+        upgrade)
+            shift
+            run_script UPGRADER "$@"
+            ;;
+        install)
+            shift
+            run_script INSTALLER "$@"
+            ;;
+        uninstall)
+            shift
+            run_script UNINSTALLER "$@"
+            ;;
+    esac
 fi
 
 if is_proxy_installed; then
     manage_menu "$@"
 else
-    bootstrap_repo_if_needed "${INSTALLER}"
-    rc=0
-    bash "${INSTALLER}" "$@" || rc=$?
-    exit "${rc}"
+    run_script INSTALLER "$@"
 fi
