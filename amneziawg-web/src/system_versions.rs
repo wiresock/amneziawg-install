@@ -253,7 +253,9 @@ fn parse_proxy_exec_start(service: &str) -> Option<PathBuf> {
             continue;
         };
         let value = value.strip_prefix('-').unwrap_or(value).trim_start();
-        let binary = parse_first_exec_token(value)?;
+        let Some(binary) = parse_first_exec_token(value) else {
+            continue;
+        };
         let path = PathBuf::from(&binary);
         if is_absolute_proxy_path(&binary, &path) {
             return Some(path);
@@ -316,6 +318,16 @@ mod tests {
         assert_eq!(
             parse_proxy_exec_start(service).as_deref(),
             Some(Path::new("/opt/proxy bin/amneziawg-proxy"))
+        );
+    }
+
+    #[test]
+    fn parse_proxy_exec_start_skips_empty_entries() {
+        let service =
+            "ExecStart=\nExecStart=/usr/local/bin/amneziawg-proxy /etc/amneziawg-proxy/proxy.toml\n";
+        assert_eq!(
+            parse_proxy_exec_start(service).as_deref(),
+            Some(Path::new("/usr/local/bin/amneziawg-proxy"))
         );
     }
 

@@ -136,8 +136,14 @@ impl AppState {
             }
         }
 
-        let value = crate::system_versions::detect().await;
         let mut cache = self.system_versions_cache.write().await;
+        if let Some(cached) = cache.as_ref() {
+            if cached.fetched_at.elapsed() < SYSTEM_VERSION_CACHE_TTL {
+                return cached.value.clone();
+            }
+        }
+
+        let value = crate::system_versions::detect().await;
         *cache = Some(CachedSystemVersions {
             value: value.clone(),
             fetched_at: std::time::Instant::now(),

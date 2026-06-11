@@ -60,8 +60,17 @@ def require_component(components: dict[str, Component], key: str) -> Component:
 
 
 def read_component_version(component: Component) -> str:
+    version = read_package_version_from_text(
+        component.manifest.read_text(encoding="utf-8")
+    )
+    if version:
+        return version
+    raise ValueError(f"package version not found in {component.manifest}")
+
+
+def read_package_version_from_text(contents: str) -> str | None:
     in_package = False
-    for line in component.manifest.read_text(encoding="utf-8").splitlines():
+    for line in contents.splitlines():
         stripped = line.strip()
         if stripped == "[package]":
             in_package = True
@@ -72,7 +81,7 @@ def read_component_version(component: Component) -> str:
             match = VERSION_RE.match(stripped)
             if match:
                 return match.group("version")
-    raise ValueError(f"package version not found in {component.manifest}")
+    return None
 
 
 def parse_version(version: str) -> tuple[int, int, int]:
@@ -161,24 +170,30 @@ def detect_changed_components(
     return changed
 
 
+def read_version_at_ref(component: Component, ref: str) -> str | None:
+    manifest = component.manifest.relative_to(REPO_ROOT).as_posix()
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{ref}:{manifest}"],
+            cwd=REPO_ROOT,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    return read_package_version_from_text(result.stdout)
+
+
 def git_diff_contains_package_version_change(
     component: Component,
     base_ref: str,
     head_ref: str,
 ) -> bool:
-    manifest = component.manifest.relative_to(REPO_ROOT).as_posix()
-    result = subprocess.run(
-        ["git", "diff", "--unified=0", base_ref, head_ref, "--", manifest],
-        cwd=REPO_ROOT,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    )
-    for line in result.stdout.splitlines():
-        if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
-            if VERSION_RE.match(line[1:].strip()):
-                return True
-    return False
+    base_version = read_version_at_ref(component, base_ref)
+    head_version = read_version_at_ref(component, head_ref)
+    return base_version != head_version
 
 
 def github_output(values: dict[str, str]) -> None:
