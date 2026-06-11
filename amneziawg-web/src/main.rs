@@ -9,6 +9,7 @@ mod config_store;
 mod db;
 mod domain;
 mod poller;
+mod system_versions;
 mod web;
 
 use anyhow::Context;

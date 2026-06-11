@@ -37,6 +37,7 @@ use crate::domain::{
     normalize_comment, normalize_display_name, resolve_display_name, ConnectionStatus,
     IdentityStatus, PeerStatus, ONLINE_THRESHOLD_SECS,
 };
+use crate::system_versions::SystemVersions;
 
 // ── App state ────────────────────────────────────────────────────────────────
 
@@ -60,7 +61,17 @@ pub struct AppState {
     /// Set once after logging a non-`NotFound` canonicalization error so
     /// subsequent retries don't flood the logs.
     logged_canon_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Cached best-effort component/system version information for the UI.
+    system_versions_cache: std::sync::Arc<tokio::sync::RwLock<Option<CachedSystemVersions>>>,
 }
+
+#[derive(Clone)]
+struct CachedSystemVersions {
+    value: SystemVersions,
+    fetched_at: std::time::Instant,
+}
+
+const SYSTEM_VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl AppState {
     fn new(
@@ -83,6 +94,7 @@ impl AppState {
             config_dir,
             canonical_config_dir: std::sync::Arc::new(cell),
             logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            system_versions_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -112,6 +124,25 @@ impl AppState {
             })
             .await
             .ok()
+    }
+
+    async fn system_versions(&self) -> SystemVersions {
+        {
+            let cache = self.system_versions_cache.read().await;
+            if let Some(cached) = cache.as_ref() {
+                if cached.fetched_at.elapsed() < SYSTEM_VERSION_CACHE_TTL {
+                    return cached.value.clone();
+                }
+            }
+        }
+
+        let value = crate::system_versions::detect().await;
+        let mut cache = self.system_versions_cache.write().await;
+        *cache = Some(CachedSystemVersions {
+            value: value.clone(),
+            fetched_at: std::time::Instant::now(),
+        });
+        value
     }
 }
 
@@ -588,6 +619,7 @@ pub fn router(
         .route("/api/peers/:id/usage", get(get_peer_usage))
         .route("/api/peers/:id/usage/summary", get(get_peer_usage_summary))
         .route("/api/usage", get(get_all_usage))
+        .route("/api/system/versions", get(get_system_versions))
         .route("/api/events", get(list_events_handler))
         // ── User lifecycle routes ────────────────────────────────
         .route("/api/admin/next-ips", get(api_next_ips))
@@ -823,6 +855,11 @@ async fn post_logout(
 /// `GET /api/health` – liveness probe.
 async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+/// `GET /api/system/versions` – best-effort installed component versions.
+async fn get_system_versions(State(state): State<AppState>) -> Json<SystemVersions> {
+    Json(state.system_versions().await)
 }
 
 /// `GET /api/events` – audit event log.
@@ -2453,6 +2490,8 @@ fn html_head(title: &str) -> String {
   .edit-form button[type=submit] {{ margin-top: 1rem; padding: .4rem 1.1rem; background: #0066cc; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .95rem; }}
   .edit-form button[type=submit]:hover {{ background: #0055aa; }}
   .nav {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; padding-bottom: .5rem; border-bottom: 1px solid #ddd; }}
+  .nav-brand {{ display: flex; flex-wrap: wrap; gap: .35rem .8rem; align-items: baseline; }}
+  .versions {{ font-size: .78rem; color: #666; }}
   .nav-logout {{ display: inline-block; }}
   .nav-logout button {{ padding: .3rem .8rem; background: #e55; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .85rem; }}
   .nav-logout button:hover {{ background: #c33; }}
@@ -2480,14 +2519,44 @@ fn html_head(title: &str) -> String {
 fn nav_bar(csrf_token: &str) -> String {
     format!(
         r#"<nav class="nav">
-  <span><a href="/">AmneziaWG Panel</a></span>
+  <span class="nav-brand"><a href="/">AmneziaWG Panel</a><span id="system-versions" class="versions">AWG: checking &nbsp;·&nbsp; Web: {web_version} &nbsp;·&nbsp; Proxy: checking</span></span>
   <form class="nav-logout" method="POST" action="/logout">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <button type="submit">Log out</button>
   </form>
 </nav>
+<script>
+(function() {{
+  var el = document.getElementById('system-versions');
+  if (!el || !window.fetch) return;
+
+  function text(label, item) {{
+    if (!item) return label + ': unknown';
+    if (item.version) return label + ': ' + item.version;
+    if (item.status === 'not_installed') return label + ': not installed';
+    return label + ': unknown';
+  }}
+
+  fetch('/api/system/versions', {{ credentials: 'same-origin' }})
+    .then(function(response) {{
+      if (!response.ok) throw new Error('version request failed');
+      return response.json();
+    }})
+    .then(function(data) {{
+      el.textContent = [
+        text('AWG', data.amneziawg),
+        text('Web', data.web_panel),
+        text('Proxy', data.proxy)
+      ].join(' · ');
+    }})
+    .catch(function() {{
+      el.textContent = 'AWG: unknown · Web: {web_version} · Proxy: unknown';
+    }});
+}})();
+</script>
 "#,
-        csrf = esc(csrf_token)
+        csrf = esc(csrf_token),
+        web_version = env!("CARGO_PKG_VERSION"),
     )
 }
 
@@ -3805,6 +3874,30 @@ mod tests {
         assert_eq!(peer_entry["tx_bytes"], "700");
     }
 
+    #[tokio::test]
+    async fn system_versions_api_includes_web_panel_version() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system/versions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["web_panel"]["status"], "installed");
+        assert_eq!(json["web_panel"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(json.get("amneziawg").is_some());
+        assert!(json.get("proxy").is_some());
+    }
+
     // ── period_to_secs ────────────────────────────────────────────────────
 
     #[test]
@@ -3834,6 +3927,9 @@ mod tests {
         assert!(
             body.windows(6).any(|w| w == b"<html>") || body.windows(10).any(|w| w == b"<html lang")
         );
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("id=\"system-versions\""));
+        assert!(html.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[tokio::test]
