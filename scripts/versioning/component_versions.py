@@ -170,16 +170,31 @@ def detect_changed_components(
     return changed
 
 
-def read_version_at_ref(component: Component, ref: str) -> str:
-    manifest = component.manifest.relative_to(REPO_ROOT).as_posix()
-    result = subprocess.run(
-        ["git", "show", f"{ref}:{manifest}"],
+def verify_git_ref(ref: str) -> None:
+    subprocess.run(
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
         cwd=REPO_ROOT,
         check=True,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+
+def read_version_at_ref(component: Component, ref: str) -> str | None:
+    manifest = component.manifest.relative_to(REPO_ROOT).as_posix()
+    verify_git_ref(ref)
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{manifest}"],
+        cwd=REPO_ROOT,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return None
+
     version = read_package_version_from_text(result.stdout)
     if version:
         return version

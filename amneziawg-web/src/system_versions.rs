@@ -118,7 +118,16 @@ async fn detect_amneziawg() -> VersionInfo {
 }
 
 async fn detect_proxy() -> VersionInfo {
-    let candidates = proxy_binary_candidates();
+    let candidates = match tokio::task::spawn_blocking(proxy_binary_candidates).await {
+        Ok(candidates) => candidates,
+        Err(_) => {
+            return VersionInfo::unknown(
+                "AmneziaWG Proxy",
+                PROXY_SERVICE,
+                "failed to inspect install paths",
+            );
+        }
+    };
     if candidates.is_empty() {
         return VersionInfo::not_installed("AmneziaWG Proxy");
     }
