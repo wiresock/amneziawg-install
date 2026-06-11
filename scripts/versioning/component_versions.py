@@ -257,6 +257,26 @@ def cmd_bump(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_files(args: argparse.Namespace) -> int:
+    _, components = load_config(args.config)
+    selected_keys = [
+        key.strip()
+        for key in args.components.split(",")
+        if key.strip()
+    ]
+    if not selected_keys:
+        selected_keys = sorted(components)
+
+    paths = []
+    for key in selected_keys:
+        component = require_component(components, key)
+        paths.append(component.manifest.relative_to(REPO_ROOT).as_posix())
+        paths.append(component.lockfile.relative_to(REPO_ROOT).as_posix())
+
+    print("\n".join(dict.fromkeys(paths)))
+    return 0
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     project_major, components = load_config(args.config)
     errors = []
@@ -315,6 +335,14 @@ def build_parser() -> argparse.ArgumentParser:
     bump = subparsers.add_parser("bump")
     bump.add_argument("--component", required=True)
     bump.set_defaults(func=cmd_bump)
+
+    files = subparsers.add_parser("files")
+    files.add_argument(
+        "--components",
+        default="",
+        help="Comma-separated component keys; defaults to all components",
+    )
+    files.set_defaults(func=cmd_files)
 
     validate = subparsers.add_parser("validate")
     validate.set_defaults(func=cmd_validate)

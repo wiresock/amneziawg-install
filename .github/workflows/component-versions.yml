@@ -81,6 +81,9 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
+          if [ -z "$MERGE_SHA" ]; then
+            MERGE_SHA="$(git rev-parse HEAD)"
+          fi
           python3 scripts/versioning/component_versions.py changed \
             --changed-files changed-files.txt \
             --diff-base "$BASE_SHA" \
@@ -131,7 +134,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BUMPED_COMPONENTS: ${{ steps.bump.outputs.bumped_components }}
         run: |
-          git add amneziawg-web/Cargo.toml amneziawg-web/Cargo.lock amneziawg-proxy/Cargo.toml amneziawg-proxy/Cargo.lock
+          python3 scripts/versioning/component_versions.py files --components "$BUMPED_COMPONENTS" | xargs git add
           if git diff --cached --quiet; then
             echo "No version files changed."
             exit 0
