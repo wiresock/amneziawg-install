@@ -170,20 +170,20 @@ def detect_changed_components(
     return changed
 
 
-def read_version_at_ref(component: Component, ref: str) -> str | None:
+def read_version_at_ref(component: Component, ref: str) -> str:
     manifest = component.manifest.relative_to(REPO_ROOT).as_posix()
-    try:
-        result = subprocess.run(
-            ["git", "show", f"{ref}:{manifest}"],
-            cwd=REPO_ROOT,
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except subprocess.CalledProcessError:
-        return None
-    return read_package_version_from_text(result.stdout)
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{manifest}"],
+        cwd=REPO_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    version = read_package_version_from_text(result.stdout)
+    if version:
+        return version
+    raise ValueError(f"package version not found in {manifest} at {ref}")
 
 
 def git_diff_contains_package_version_change(
