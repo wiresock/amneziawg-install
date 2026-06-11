@@ -107,6 +107,10 @@ def replace_lockfile_version(component: Component, new_version: str) -> None:
             in_package_block = True
             matching_package = False
             continue
+        if stripped.startswith("["):
+            in_package_block = False
+            matching_package = False
+            continue
         if in_package_block and stripped.startswith("name = "):
             matching_package = stripped == f'name = "{component.package}"'
             continue
@@ -163,8 +167,9 @@ def git_diff_contains_package_version_change(
         stdout=subprocess.PIPE,
     )
     for line in result.stdout.splitlines():
-        if line.startswith(("+version = ", "-version = ")):
-            return True
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+            if VERSION_RE.match(line[1:].strip()):
+                return True
     return False
 
 
@@ -257,7 +262,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"project_major {project_major}"
             )
 
-        lock_text = component.lockfile.read_text(encoding="utf-8")
+        lock_text = component.lockfile.read_text(encoding="utf-8").replace("\r\n", "\n")
         expected = f'name = "{component.package}"\nversion = "{manifest_version}"'
         if expected not in lock_text:
             errors.append(
