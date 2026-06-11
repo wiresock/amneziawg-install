@@ -1,0 +1,177 @@
+name: Component Versions
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+  workflow_dispatch:
+    inputs:
+      components:
+        description: "Comma-separated components to patch-bump, for example: web,proxy"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: component-version-bump-main
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate component versions
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Validate version files
+        run: python scripts/versioning/component_versions.py validate
+
+  bump-and-tag:
+    name: Bump changed component versions
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --tags origin
+
+      - name: Skip rerun for already processed PR
+        if: github.event_name == 'pull_request'
+        id: already_processed
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if git log --format=%s -n 100 --grep="for PR #${PR_NUMBER}" | grep -q "for PR #${PR_NUMBER}"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Version bump for PR #${PR_NUMBER} already exists."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch PR changed files
+        if: github.event_name == 'pull_request' && steps.already_processed.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > changed-files.txt
+
+      - name: Detect changed components
+        if: github.event_name == 'pull_request' && steps.already_processed.outputs.skip != 'true'
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          python scripts/versioning/component_versions.py changed \
+            --changed-files changed-files.txt \
+            --diff-base "$BASE_SHA" \
+            --diff-head "$MERGE_SHA"
+
+      - name: Use workflow-dispatch component input
+        if: github.event_name == 'workflow_dispatch'
+        id: manual
+        env:
+          COMPONENTS: ${{ github.event.inputs.components }}
+        run: |
+          normalized="$(echo "$COMPONENTS" | tr -d '[:space:]')"
+          echo "auto_bump_components=${normalized}" >> "$GITHUB_OUTPUT"
+          echo "components=${normalized}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump component patch versions
+        if: steps.already_processed.outputs.skip != 'true'
+        id: bump
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AUTO_COMPONENTS: ${{ steps.detect.outputs.auto_bump_components || steps.manual.outputs.auto_bump_components }}
+        run: |
+          if [ -z "$AUTO_COMPONENTS" ]; then
+            echo "No component version bump needed."
+            python scripts/versioning/component_versions.py validate
+            echo "bumped_components=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          bumped_components=""
+          for component in ${AUTO_COMPONENTS//,/ }; do
+            version="$(python scripts/versioning/component_versions.py bump --component "$component")"
+            if [ -z "$bumped_components" ]; then
+              bumped_components="$component"
+            else
+              bumped_components="${bumped_components},${component}"
+            fi
+            echo "Bumped $component to $version"
+          done
+
+          python scripts/versioning/component_versions.py validate
+          echo "bumped_components=$bumped_components" >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump
+        if: steps.bump.outputs.bumped_components != ''
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BUMPED_COMPONENTS: ${{ steps.bump.outputs.bumped_components }}
+        run: |
+          git add amneziawg-web/Cargo.toml amneziawg-web/Cargo.lock amneziawg-proxy/Cargo.toml amneziawg-proxy/Cargo.lock
+          if git diff --cached --quiet; then
+            echo "No version files changed."
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git commit -m "chore(version): bump ${BUMPED_COMPONENTS} for PR #${PR_NUMBER} [skip ci]"
+          else
+            git commit -m "chore(version): bump ${BUMPED_COMPONENTS} [skip ci]"
+          fi
+          git push origin HEAD:main
+
+      - name: Collect version tags
+        if: steps.already_processed.outputs.skip != 'true'
+        id: tags
+        env:
+          COMPONENTS: ${{ steps.detect.outputs.components || steps.manual.outputs.components }}
+        run: |
+          if [ -z "$COMPONENTS" ]; then
+            echo "tags=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tags=""
+          for component in ${COMPONENTS//,/ }; do
+            tag="$(python scripts/versioning/component_versions.py get --component "$component" --field tag)"
+            if [ -z "$tags" ]; then
+              tags="$tag"
+            else
+              tags="${tags},${tag}"
+            fi
+          done
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Create version tags
+        if: steps.tags.outputs.tags != ''
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          for tag in ${TAGS//,/ }; do
+            if git rev-parse "$tag" >/dev/null 2>&1; then
+              echo "Tag $tag already exists; skipping."
+            else
+              git tag -a "$tag" -m "$tag"
+            fi
+          done
+          git push origin --tags
