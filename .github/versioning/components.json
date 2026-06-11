@@ -1,0 +1,25 @@
+{
+  "project_major": 0,
+  "components": {
+    "web": {
+      "package": "amneziawg-web",
+      "manifest": "amneziawg-web/Cargo.toml",
+      "lockfile": "amneziawg-web/Cargo.lock",
+      "tag_prefix": "web-v",
+      "paths": [
+        "amneziawg-web/**",
+        "amneziawg-web.sh"
+      ]
+    },
+    "proxy": {
+      "package": "amneziawg-proxy",
+      "manifest": "amneziawg-proxy/Cargo.toml",
+      "lockfile": "amneziawg-proxy/Cargo.lock",
+      "tag_prefix": "proxy-v",
+      "paths": [
+        "amneziawg-proxy/**",
+        "amneziawg-proxy.sh"
+      ]
+    }
+  }
+}

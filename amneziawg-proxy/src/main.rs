@@ -7,6 +7,12 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
+        println!("amneziawg-proxy {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Initialize structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -17,8 +23,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Determine config path
-    let config_path = std::env::args()
-        .nth(1)
+    let config_path = args
+        .get(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("proxy.toml"));
 
