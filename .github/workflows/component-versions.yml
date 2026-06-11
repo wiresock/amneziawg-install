@@ -57,7 +57,8 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          if git log --format=%s --grep="for PR #${PR_NUMBER}" | grep -q "for PR #${PR_NUMBER}"; then
+          marker="for PR #${PR_NUMBER} [skip ci]"
+          if git log --format=%s --fixed-strings --grep="$marker" | grep -Fq "$marker"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "Version bump for PR #${PR_NUMBER} already exists."
           else
@@ -104,7 +105,7 @@ jobs:
         run: |
           if [ -z "$AUTO_COMPONENTS" ]; then
             echo "No component version bump needed."
-            python scripts/versioning/component_versions.py validate
+            python3 scripts/versioning/component_versions.py validate
             echo "bumped_components=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
