@@ -1,6 +1,6 @@
 [package]
 name = "amneziawg-web"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Self-hosted web panel for AmneziaWG (AWG) visibility and management"
 license = "MIT"
