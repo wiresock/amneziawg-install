@@ -63,9 +63,9 @@ pub struct AppState {
     logged_canon_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Cached best-effort component/system version information for the UI.
     system_versions_cache: std::sync::Arc<tokio::sync::RwLock<Option<CachedSystemVersions>>>,
-    /// Best-effort server boot timestamp. Used to explain when interface
+    /// Best-effort system boot timestamp. Used to explain when interface
     /// counters likely started after a reboot.
-    server_booted_at: Option<DateTime<Utc>>,
+    system_booted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -97,7 +97,7 @@ impl AppState {
             canonical_config_dir: std::sync::Arc::new(cell),
             logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             system_versions_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
-            server_booted_at: detect_server_boot_time(),
+            system_booted_at: detect_system_boot_time(),
         }
     }
 
@@ -157,9 +157,9 @@ impl AppState {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SystemStatusDto {
-    pub server_time: DateTime<Utc>,
-    pub server_booted_at: Option<DateTime<Utc>>,
-    pub server_uptime_seconds: Option<u64>,
+    pub system_time: DateTime<Utc>,
+    pub system_booted_at: Option<DateTime<Utc>>,
+    pub system_uptime_seconds: Option<u64>,
     pub statistics_note: String,
 }
 
@@ -491,7 +491,7 @@ fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
     ts.and_then(|t| Utc.timestamp_opt(t, 0).single())
 }
 
-fn detect_server_boot_time() -> Option<DateTime<Utc>> {
+fn detect_system_boot_time() -> Option<DateTime<Utc>> {
     detect_boot_time_from_proc_stat().or_else(detect_boot_time_from_proc_uptime)
 }
 
@@ -508,25 +508,32 @@ fn detect_boot_time_from_proc_stat() -> Option<DateTime<Utc>> {
 }
 
 fn detect_boot_time_from_proc_uptime() -> Option<DateTime<Utc>> {
+    let uptime_secs = detect_system_uptime_seconds()?;
+    Some(Utc::now() - chrono::Duration::seconds(uptime_secs as i64))
+}
+
+fn detect_system_uptime_seconds() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/uptime").ok()?;
     let uptime_secs = contents.split_whitespace().next()?.parse::<f64>().ok()?;
     if !uptime_secs.is_finite() || !(0.0..=MAX_REASONABLE_UPTIME_SECS).contains(&uptime_secs) {
         return None;
     }
-    Some(Utc::now() - chrono::Duration::seconds(uptime_secs.floor() as i64))
+    Some(uptime_secs.floor() as u64)
 }
 
 fn system_status(state: &AppState) -> SystemStatusDto {
     let now = Utc::now();
-    let uptime = state
-        .server_booted_at
-        .and_then(|booted_at| (now - booted_at).to_std().ok())
-        .map(|duration| duration.as_secs());
+    let uptime = detect_system_uptime_seconds().or_else(|| {
+        state
+            .system_booted_at
+            .and_then(|booted_at| (now - booted_at).to_std().ok())
+            .map(|duration| duration.as_secs())
+    });
 
     SystemStatusDto {
-        server_time: now,
-        server_booted_at: state.server_booted_at,
-        server_uptime_seconds: uptime,
+        system_time: now,
+        system_booted_at: state.system_booted_at,
+        system_uptime_seconds: uptime,
         statistics_note: STATISTICS_COUNTER_NOTE.to_string(),
     }
 }
@@ -918,7 +925,7 @@ async fn get_system_versions(State(state): State<AppState>) -> Json<SystemVersio
     Json(state.system_versions().await)
 }
 
-/// `GET /api/system/status` – server boot/uptime context for current counters.
+/// `GET /api/system/status` – system boot/uptime context for current counters.
 async fn get_system_status(State(state): State<AppState>) -> Json<SystemStatusDto> {
     Json(system_status(&state))
 }
@@ -2594,14 +2601,14 @@ fn fmt_last_handshake(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
 fn render_system_status(status: &SystemStatusDto) -> String {
     let uptime = status
-        .server_uptime_seconds
+        .system_uptime_seconds
         .map(fmt_duration_hms)
         .unwrap_or_else(|| "unknown".to_string());
-    let booted_at = fmt_optional_local_timestamp(status.server_booted_at, "unknown");
+    let booted_at = fmt_optional_local_timestamp(status.system_booted_at, "unknown");
     format!(
         r#"<section class="system-status" aria-label="Server status">
   <div class="system-status-grid">
-    <div><span class="status-label">Server uptime:</span> {uptime}</div>
+    <div><span class="status-label">System uptime:</span> {uptime}</div>
     <div><span class="status-label">System boot time:</span> {booted_at}</div>
   </div>
   <p class="meta">{note}</p>
@@ -3433,9 +3440,9 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["server_time"].as_str().is_some());
-        assert!(json.get("server_booted_at").is_some());
-        assert!(json.get("server_uptime_seconds").is_some());
+        assert!(json["system_time"].as_str().is_some());
+        assert!(json.get("system_booted_at").is_some());
+        assert!(json.get("system_uptime_seconds").is_some());
         assert!(json["statistics_note"]
             .as_str()
             .unwrap()
@@ -3455,7 +3462,7 @@ mod tests {
             .await
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
-        assert!(html.contains("Server uptime:"));
+        assert!(html.contains("System uptime:"));
         assert!(html.contains("System boot time:"));
         assert!(html.contains("interface counters"));
         assert!(html.contains("Traffic period: since boot/interface restart"));
