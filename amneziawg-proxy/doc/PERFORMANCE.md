@@ -130,7 +130,7 @@ Inbound does two DashMap lookups keyed by the same `SocketAddr` (`metrics` then
   Tier 1 lands (relatively more afterward). **Medium effort, medium risk** (the
   lighter variant is much safer).
 
-### D. Relay buffer memory: 64 KB per session — ✅ implemented
+### D. Relay buffer memory: 64 KB per session — implemented
 
 Each relay allocated `vec![0u8; min(buffer_size, 65535)]` = **64 KB/session**
 at the default (`default_buffer_size` = 65535). At `max_sessions` = 10k that
@@ -170,6 +170,40 @@ touched).
   order is a correctness constraint, not an oversight.
 
 ---
+
+## Measuring — the in-repo benchmark harness
+
+`examples/bench.rs` ships two modes (no extra dependencies; built by
+`cargo test`, so it cannot rot):
+
+```bash
+# End-to-end loopback throughput through a real Proxy instance.
+# --awg makes payloads AWG-transport-shaped and enables the padding
+# transform, exercising the full data path.
+cargo run --release --example bench -- throughput \
+    [--secs N] [--clients N] [--payload BYTES] [--window N] [--awg]
+
+# Userspace hot-path micro-benchmarks (classification, detection, padding).
+cargo run --release --example bench -- hot-path
+```
+
+The throughput numbers are loopback numbers — they overstate what a NIC will
+do, but they are the right tool for **before/after comparisons of proxy
+changes on the same machine** (e.g. validating the Tier 1 batched-I/O work).
+The hot-path mode confirms where userspace time goes; representative output
+(one dev machine, release build):
+
+```text
+classify_awg_packet / transport hit                ~8 ns/op
+detect_protocol / junk (probe path miss)           ~7 ns/op
+detect_protocol / strict DNS query                 ~8 ns/op
+apply_padding / quic|stun|sip (pad 64, 1200 B)   ~140–160 ns/op
+apply_padding / dns (pad 64, 1200 B)              ~22 ns/op
+```
+
+Even the most expensive padding fill is an order of magnitude below a single
+syscall — consistent with the syscall-bound headline. On the same machine the
+end-to-end `--awg` run was only ~9% slower than plain forwarding.
 
 ## Profiling plan — confirm before investing in Tier 1
 

@@ -485,10 +485,17 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
     }
     // Below the IPv6 minimum MTU no real tunnel datagram fits, and relayed
     // packets larger than this buffer are silently truncated — reject sizes
-    // that could only break the tunnel.
+    // that could only break the tunnel. Above the maximum UDP payload the
+    // extra bytes can never be used, so reject those too instead of silently
+    // capping.
     if config.relay_buffer_size < 1280 {
         return Err(ProxyError::Config(
             "relay_buffer_size must be >= 1280".into(),
+        ));
+    }
+    if config.relay_buffer_size > 65535 {
+        return Err(ProxyError::Config(
+            "relay_buffer_size must be <= 65535".into(),
         ));
     }
     if config.cleanup_interval_secs == 0 {
@@ -707,6 +714,21 @@ relay_buffer_size = 1024
         assert!(err
             .to_string()
             .contains("relay_buffer_size must be >= 1280"));
+    }
+
+    #[test]
+    fn reject_relay_buffer_above_max_udp_payload() {
+        // Values beyond the UDP payload maximum would only be silently
+        // capped; the config contract rejects them explicitly.
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+relay_buffer_size = 70000
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("relay_buffer_size must be <= 65535"));
     }
 
     #[test]
