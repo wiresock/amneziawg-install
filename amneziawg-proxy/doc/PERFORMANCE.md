@@ -173,8 +173,12 @@ touched).
 
 ## Measuring — the in-repo benchmark harness
 
-`examples/bench.rs` ships two modes (no extra dependencies; to compile-check the
-harness in CI, build all targets, e.g. `cargo test --all-targets`):
+`examples/bench.rs` ships two modes (no extra dependencies). Cargo's default
+target selection for `cargo test` includes building examples — see "Target
+Selection" in `cargo help test` — so the existing CI's plain `cargo test`
+already compile-checks the harness and it cannot rot (easily verified: delete
+`target/debug/examples/bench*` and run `cargo test`; it comes back).
+`cargo test --all-targets` makes the same guarantee explicit.
 
 ```bash
 # End-to-end loopback throughput through a real Proxy instance.

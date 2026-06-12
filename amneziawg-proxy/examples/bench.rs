@@ -178,7 +178,11 @@ async fn run_throughput(opts: ThroughputOpts) {
     });
     wait_until_ready(proxy_addr).await;
 
-    let stop_at = Instant::now() + Duration::from_secs(opts.secs);
+    // The clock starts before the clients are spawned: every counted round
+    // trip then falls inside the measured window, so `elapsed` cannot
+    // understate the runtime and inflate the reported rates.
+    let started = Instant::now();
+    let stop_at = started + Duration::from_secs(opts.secs);
     let total_rt = Arc::new(AtomicU64::new(0));
     let total_lost = Arc::new(AtomicU64::new(0));
 
@@ -217,7 +221,6 @@ async fn run_throughput(opts: ThroughputOpts) {
         }));
     }
 
-    let started = Instant::now();
     for client in clients {
         let _ = client.await;
     }
