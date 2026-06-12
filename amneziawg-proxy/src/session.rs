@@ -22,8 +22,11 @@ pub(crate) fn now_millis() -> u64 {
 }
 
 /// Sentinel for [`Session::relay_generation`]: no relay task has been
-/// registered for the session (yet). Real generations are produced by an
-/// incrementing counter starting at 0, so `u64::MAX` is never a live value.
+/// registered for the session (yet). Real generations come from an
+/// incrementing counter starting at 0, which would have to wrap through
+/// 2^64 relay spawns to collide with this value — a practical
+/// impossibility (centuries at millions of spawns per second), though not
+/// a typed invariant.
 pub(crate) const NO_RELAY_GENERATION: u64 = u64::MAX;
 
 /// A single client session: maps a client address to a dedicated backend socket.
