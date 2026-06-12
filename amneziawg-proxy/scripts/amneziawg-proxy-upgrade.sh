@@ -519,8 +519,11 @@ main() {
 
     if should_restart; then
         info "Restarting service..."
-        systemctl restart "${SERVICE_NAME}" && info "Service restarted: ${SERVICE_NAME}" || \
-            warn "Could not restart ${SERVICE_NAME}"
+        if ! systemctl restart "${SERVICE_NAME}"; then
+            die "Failed to restart ${SERVICE_NAME}. The binary was upgraded, but the service may be stopped.
+Check service logs with: sudo journalctl -u ${SERVICE_NAME} -e"
+        fi
+        info "Service restarted: ${SERVICE_NAME}"
     else
         info "Service not restarted (was inactive; use --restart to force)."
     fi
