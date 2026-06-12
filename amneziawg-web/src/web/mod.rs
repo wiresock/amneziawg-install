@@ -76,7 +76,8 @@ struct CachedSystemVersions {
 
 const SYSTEM_VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 const MAX_REASONABLE_UPTIME_SECS: f64 = 3_153_600_000.0; // 100 years
-const STATISTICS_COUNTER_NOTE: &str = "Traffic statistics below use live AmneziaWG interface counters. These counters can reset after a server reboot or interface restart.";
+const STATISTICS_COUNTER_NOTE: &str =
+    "Traffic counters below are live interface counters since the last system boot or interface restart.";
 
 impl AppState {
     fn new(db: Database, auth: AuthConfig, config_dir: std::path::PathBuf) -> Self {
@@ -2554,14 +2555,41 @@ fn fmt_duration_hms(total_secs: u64) -> String {
 }
 
 fn fmt_local_timestamp(ts: DateTime<Utc>) -> String {
-    ts.with_timezone(&Local)
-        .format("%Y-%m-%d %H:%M:%S %:z")
-        .to_string()
+    let local = ts.with_timezone(&Local);
+    if local.offset().local_minus_utc() == 0 {
+        format!("{} UTC", local.format("%Y-%m-%d %H:%M:%S"))
+    } else {
+        local.format("%Y-%m-%d %H:%M:%S %:z").to_string()
+    }
 }
 
 fn fmt_optional_local_timestamp(ts: Option<DateTime<Utc>>, fallback: &str) -> String {
     ts.map(fmt_local_timestamp)
         .unwrap_or_else(|| fallback.to_string())
+}
+
+fn fmt_time_ago(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let Ok(age) = now.signed_duration_since(ts).to_std() else {
+        return "in the future".to_string();
+    };
+    let secs = age.as_secs();
+    if secs < 60 {
+        return "just now".to_string();
+    }
+
+    let (value, unit) = if secs < 3_600 {
+        (secs / 60, "minute")
+    } else if secs < 86_400 {
+        (secs / 3_600, "hour")
+    } else {
+        (secs / 86_400, "day")
+    };
+    let suffix = if value == 1 { "" } else { "s" };
+    format!("{value} {unit}{suffix} ago")
+}
+
+fn fmt_last_handshake(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    format!("{} - {}", fmt_time_ago(ts, now), fmt_local_timestamp(ts))
 }
 
 fn render_system_status(status: &SystemStatusDto) -> String {
@@ -2572,8 +2600,10 @@ fn render_system_status(status: &SystemStatusDto) -> String {
     let booted_at = fmt_optional_local_timestamp(status.server_booted_at, "unknown");
     format!(
         r#"<section class="system-status" aria-label="Server status">
-  <div><strong>Server uptime:</strong> {uptime}</div>
-  <div><strong>Server booted at:</strong> {booted_at}</div>
+  <div class="system-status-grid">
+    <div><span class="status-label">Server uptime:</span> {uptime}</div>
+    <div><span class="status-label">System boot time:</span> {booted_at}</div>
+  </div>
   <p class="meta">{note}</p>
 </section>
 "#,
@@ -2602,11 +2632,17 @@ fn html_head(title: &str) -> String {
   a:hover {{ text-decoration: underline; }}
   .meta {{ font-size: .85rem; color: #666; margin-bottom: 1.5rem; }}
   .system-status {{ margin: 0 0 1.25rem; padding: .75rem 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f8fbff; }}
-  .system-status div {{ margin: .2rem 0; }}
+  .system-status-grid {{ display: flex; flex-wrap: wrap; gap: .35rem 2rem; }}
+  .status-label {{ font-weight: 700; }}
   .system-status .meta {{ margin: .45rem 0 0; }}
+  .counter-scope {{ display: inline-block; margin-left: .35rem; padding: .1rem .45rem; border: 1px solid #d6e2f0; border-radius: 999px; background: #f4f8fd; color: #496277; font-size: .78rem; }}
+  .th-hint {{ display: block; margin-top: .1rem; color: #777; font-size: .72rem; font-weight: 400; }}
   .back {{ margin-bottom: 1rem; display: block; }}
   .edit-form {{ margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; max-width: 480px; }}
   .edit-form h2 {{ margin-top: 0; font-size: 1.1rem; }}
+  .add-user-panel {{ max-width: 440px; padding: .75rem 1rem; }}
+  .add-user-panel summary {{ cursor: pointer; font-weight: 700; font-size: 1.05rem; }}
+  .add-user-panel[open] summary {{ margin-bottom: .75rem; }}
   .edit-form label {{ display: block; font-weight: bold; margin-bottom: .25rem; margin-top: .75rem; }}
   .edit-form input[type=text], .edit-form input[type=password], .edit-form textarea {{ width: 100%; padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 3px; font-family: inherit; font-size: .95rem; box-sizing: border-box; }}
   .edit-form textarea {{ resize: vertical; min-height: 4rem; }}
@@ -2748,11 +2784,13 @@ fn render_peer_list_inner(
     error: Option<&str>,
 ) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
+    let now = Utc::now();
     buf.push_str(&nav_bar(csrf_token));
     buf.push_str("<h1>AmneziaWG Peers</h1>\n");
     buf.push_str(&render_system_status(system_status));
     buf.push_str(&format!(
-        "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"/api/peers\">JSON API</a></p>\n",
+        "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"/api/peers\">JSON API</a>\
+         <span class=\"counter-scope\">Traffic period: since boot/interface restart</span></p>\n",
         peers.len()
     ));
 
@@ -2762,7 +2800,8 @@ fn render_peer_list_inner(
         buf.push_str(
             "<table>\n\
              <tr><th>Name</th><th>Connection</th><th>Identity</th><th>Endpoint</th>\
-             <th>Last handshake</th><th>RX</th><th>TX</th></tr>\n",
+             <th>Last handshake</th><th>RX<span class=\"th-hint\">current period</span></th>\
+             <th>TX<span class=\"th-hint\">current period</span></th></tr>\n",
         );
         for p in peers {
             let name_link = format!(
@@ -2777,7 +2816,7 @@ fn render_peer_list_inner(
                 .unwrap_or_else(|| "–".to_string());
             let handshake = p
                 .latest_handshake_at
-                .map(|ts| esc(&fmt_local_timestamp(ts)))
+                .map(|ts| esc(&fmt_last_handshake(ts, now)))
                 .unwrap_or_else(|| "never".to_string());
             buf.push_str(&format!(
                 "<tr><td>{name_link}</td><td>{conn}</td><td>{ident}</td><td>{endpoint}</td>\
@@ -2791,16 +2830,14 @@ fn render_peer_list_inner(
         buf.push_str("</table>\n");
     }
 
-    // Add user form
-    if let Some(err) = error {
-        buf.push_str(&format!(
-            "<p class=\"error\">Add user failed: {}</p>\n",
-            esc(err)
-        ));
-    }
+    let add_user_open = if error.is_some() { " open" } else { "" };
+    let add_user_error = error
+        .map(|err| format!("<p class=\"error\">Add user failed: {}</p>\n", esc(err)))
+        .unwrap_or_default();
     buf.push_str(&format!(
-        r#"<div class="edit-form">
-<h2>Add user</h2>
+        r#"<details class="edit-form add-user-panel"{open}>
+<summary>Add user</summary>
+{error}
 <form method="POST" action="/admin/users/add">
   <input type="hidden" name="csrf_token" value="{csrf}">
   <label for="add_user_name">Client name</label>
@@ -2818,7 +2855,7 @@ fn render_peer_list_inner(
   <p class="meta" style="margin-top:.25rem">Full IPv6 address. Pre-filled with the next available address; edit as needed.</p>
   <button type="submit">Add user</button>
 </form>
-</div>
+</details>
 <script>
 (function() {{
   var nextIpsRequested = false;
@@ -2858,7 +2895,9 @@ fn render_peer_list_inner(
 }})();
 </script>
 "#,
-        csrf = esc(csrf_token)
+        csrf = esc(csrf_token),
+        error = add_user_error,
+        open = add_user_open,
     ));
 
     buf.push_str("</body></html>");
@@ -2889,6 +2928,7 @@ fn render_peer_detail_inner(
     error: Option<&str>,
 ) -> String {
     let mut buf = html_head(&format!("Peer – {}", dto.name));
+    let now = Utc::now();
     buf.push_str(&nav_bar(csrf_token));
     if let Some(err) = error {
         buf.push_str(&format!("<p class=\"error\">{}</p>\n", esc(err)));
@@ -2918,7 +2958,7 @@ fn render_peer_detail_inner(
     }
     let handshake = dto
         .latest_handshake_at
-        .map(fmt_local_timestamp)
+        .map(|ts| fmt_last_handshake(ts, now))
         .unwrap_or_else(|| "never".to_string());
     buf.push_str(&format!(
         "<tr><th>Last handshake</th><td>{}</td></tr>\n",
@@ -3416,8 +3456,9 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.contains("Server uptime:"));
-        assert!(html.contains("Server booted at:"));
+        assert!(html.contains("System boot time:"));
         assert!(html.contains("interface counters"));
+        assert!(html.contains("Traffic period: since boot/interface restart"));
     }
 
     #[tokio::test]
@@ -3447,7 +3488,7 @@ mod tests {
         let html = std::str::from_utf8(&body).unwrap();
         let expected = fmt_local_timestamp(Utc.timestamp_opt(handshake_ts, 0).single().unwrap());
         assert!(html.contains(&expected));
-        assert!(!html.contains("UTC</td>"));
+        assert!(html.contains("ago - "));
     }
 
     #[test]
