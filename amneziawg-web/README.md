@@ -230,7 +230,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `GET` | `/api/peers/:id` | Yes | Peer detail (50 recent snapshots) |
 | `PATCH` | `/api/peers/:id` | Yes | Update `display_name` and/or `comment` |
 | `GET` | `/api/peers/:id/history` | Yes | Traffic history (`?range=24h\|7d\|30d`) |
-| `GET` | `/api/system/status` | Yes | Server time, boot time, and uptime context for current counters |
+| `GET` | `/api/system/status` | Yes | System time, boot time, and uptime context for current counters (`server_*` aliases are retained for compatibility) |
 | `GET` | `/api/events` | Yes | Audit log (`?peer_id=`, `?event_type=`, `?limit=`) |
 | `POST` | `/api/admin/users` | Yes | JSON API: create user `{"name":"..."}` |
 | `POST` | `/api/admin/users/:id/remove` | Yes | JSON API: remove user |

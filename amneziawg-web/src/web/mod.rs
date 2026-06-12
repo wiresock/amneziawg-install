@@ -63,9 +63,11 @@ pub struct AppState {
     logged_canon_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Cached best-effort component/system version information for the UI.
     system_versions_cache: std::sync::Arc<tokio::sync::RwLock<Option<CachedSystemVersions>>>,
-    /// Best-effort server boot timestamp. Used to explain when interface
+    /// Best-effort system boot timestamp. Used to explain when interface
     /// counters likely started after a reboot.
-    server_booted_at: Option<DateTime<Utc>>,
+    system_booted_at: Option<DateTime<Utc>>,
+    /// Monotonic uptime baseline captured at startup from `/proc/uptime`.
+    system_uptime_baseline: Option<SystemUptimeBaseline>,
 }
 
 #[derive(Clone)]
@@ -74,9 +76,23 @@ struct CachedSystemVersions {
     fetched_at: std::time::Instant,
 }
 
+#[derive(Clone)]
+struct SystemUptimeBaseline {
+    uptime_seconds: u64,
+    captured_at: std::time::Instant,
+}
+
+impl SystemUptimeBaseline {
+    fn current_uptime_seconds(&self) -> u64 {
+        self.uptime_seconds
+            .saturating_add(self.captured_at.elapsed().as_secs())
+    }
+}
+
 const SYSTEM_VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 const MAX_REASONABLE_UPTIME_SECS: f64 = 3_153_600_000.0; // 100 years
-const STATISTICS_COUNTER_NOTE: &str = "Traffic statistics below use live AmneziaWG interface counters. These counters can reset after a server reboot or interface restart.";
+const STATISTICS_COUNTER_NOTE: &str =
+    "Traffic counters below are live interface counters since the last system boot or interface restart.";
 
 impl AppState {
     fn new(db: Database, auth: AuthConfig, config_dir: std::path::PathBuf) -> Self {
@@ -86,6 +102,13 @@ impl AppState {
         if let Ok(p) = std::fs::canonicalize(&config_dir) {
             let _ = cell.set(p);
         }
+        let system_uptime_baseline =
+            detect_system_uptime_seconds().map(|uptime_seconds| SystemUptimeBaseline {
+                uptime_seconds,
+                captured_at: std::time::Instant::now(),
+            });
+        let system_booted_at =
+            detect_system_boot_time(system_uptime_baseline.as_ref().map(|b| b.uptime_seconds));
         Self {
             db,
             auth,
@@ -96,7 +119,8 @@ impl AppState {
             canonical_config_dir: std::sync::Arc::new(cell),
             logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             system_versions_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
-            server_booted_at: detect_server_boot_time(),
+            system_booted_at,
+            system_uptime_baseline,
         }
     }
 
@@ -156,6 +180,9 @@ impl AppState {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SystemStatusDto {
+    pub system_time: DateTime<Utc>,
+    pub system_booted_at: Option<DateTime<Utc>>,
+    pub system_uptime_seconds: Option<u64>,
     pub server_time: DateTime<Utc>,
     pub server_booted_at: Option<DateTime<Utc>>,
     pub server_uptime_seconds: Option<u64>,
@@ -490,8 +517,8 @@ fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
     ts.and_then(|t| Utc.timestamp_opt(t, 0).single())
 }
 
-fn detect_server_boot_time() -> Option<DateTime<Utc>> {
-    detect_boot_time_from_proc_stat().or_else(detect_boot_time_from_proc_uptime)
+fn detect_system_boot_time(uptime_seconds: Option<u64>) -> Option<DateTime<Utc>> {
+    detect_boot_time_from_proc_stat().or_else(|| uptime_seconds.map(boot_time_from_uptime_seconds))
 }
 
 fn detect_boot_time_from_proc_stat() -> Option<DateTime<Utc>> {
@@ -506,25 +533,38 @@ fn detect_boot_time_from_proc_stat() -> Option<DateTime<Utc>> {
     None
 }
 
-fn detect_boot_time_from_proc_uptime() -> Option<DateTime<Utc>> {
+fn boot_time_from_uptime_seconds(uptime_secs: u64) -> DateTime<Utc> {
+    Utc::now() - chrono::Duration::seconds(uptime_secs as i64)
+}
+
+fn detect_system_uptime_seconds() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/uptime").ok()?;
     let uptime_secs = contents.split_whitespace().next()?.parse::<f64>().ok()?;
     if !uptime_secs.is_finite() || !(0.0..=MAX_REASONABLE_UPTIME_SECS).contains(&uptime_secs) {
         return None;
     }
-    Some(Utc::now() - chrono::Duration::seconds(uptime_secs.floor() as i64))
+    Some(uptime_secs.floor() as u64)
 }
 
 fn system_status(state: &AppState) -> SystemStatusDto {
     let now = Utc::now();
     let uptime = state
-        .server_booted_at
-        .and_then(|booted_at| (now - booted_at).to_std().ok())
-        .map(|duration| duration.as_secs());
+        .system_uptime_baseline
+        .as_ref()
+        .map(SystemUptimeBaseline::current_uptime_seconds)
+        .or_else(|| {
+            state
+                .system_booted_at
+                .and_then(|booted_at| (now - booted_at).to_std().ok())
+                .map(|duration| duration.as_secs())
+        });
 
     SystemStatusDto {
+        system_time: now,
+        system_booted_at: state.system_booted_at,
+        system_uptime_seconds: uptime,
         server_time: now,
-        server_booted_at: state.server_booted_at,
+        server_booted_at: state.system_booted_at,
         server_uptime_seconds: uptime,
         statistics_note: STATISTICS_COUNTER_NOTE.to_string(),
     }
@@ -917,7 +957,7 @@ async fn get_system_versions(State(state): State<AppState>) -> Json<SystemVersio
     Json(state.system_versions().await)
 }
 
-/// `GET /api/system/status` – server boot/uptime context for current counters.
+/// `GET /api/system/status` – system boot/uptime context for current counters.
 async fn get_system_status(State(state): State<AppState>) -> Json<SystemStatusDto> {
     Json(system_status(&state))
 }
@@ -2554,9 +2594,12 @@ fn fmt_duration_hms(total_secs: u64) -> String {
 }
 
 fn fmt_local_timestamp(ts: DateTime<Utc>) -> String {
-    ts.with_timezone(&Local)
-        .format("%Y-%m-%d %H:%M:%S %:z")
-        .to_string()
+    let local = ts.with_timezone(&Local);
+    if local.offset().local_minus_utc() == 0 {
+        format!("{} UTC", local.format("%Y-%m-%d %H:%M:%S"))
+    } else {
+        local.format("%Y-%m-%d %H:%M:%S %:z").to_string()
+    }
 }
 
 fn fmt_optional_local_timestamp(ts: Option<DateTime<Utc>>, fallback: &str) -> String {
@@ -2564,16 +2607,42 @@ fn fmt_optional_local_timestamp(ts: Option<DateTime<Utc>>, fallback: &str) -> St
         .unwrap_or_else(|| fallback.to_string())
 }
 
+fn fmt_time_ago(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let Ok(age) = now.signed_duration_since(ts).to_std() else {
+        return "in the future".to_string();
+    };
+    let secs = age.as_secs();
+    if secs < 60 {
+        return "just now".to_string();
+    }
+
+    let (value, unit) = if secs < 3_600 {
+        (secs / 60, "minute")
+    } else if secs < 86_400 {
+        (secs / 3_600, "hour")
+    } else {
+        (secs / 86_400, "day")
+    };
+    let suffix = if value == 1 { "" } else { "s" };
+    format!("{value} {unit}{suffix} ago")
+}
+
+fn fmt_last_handshake(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    format!("{} - {}", fmt_time_ago(ts, now), fmt_local_timestamp(ts))
+}
+
 fn render_system_status(status: &SystemStatusDto) -> String {
     let uptime = status
-        .server_uptime_seconds
+        .system_uptime_seconds
         .map(fmt_duration_hms)
         .unwrap_or_else(|| "unknown".to_string());
-    let booted_at = fmt_optional_local_timestamp(status.server_booted_at, "unknown");
+    let booted_at = fmt_optional_local_timestamp(status.system_booted_at, "unknown");
     format!(
-        r#"<section class="system-status" aria-label="Server status">
-  <div><strong>Server uptime:</strong> {uptime}</div>
-  <div><strong>Server booted at:</strong> {booted_at}</div>
+        r#"<section class="system-status" aria-label="System status">
+  <div class="system-status-grid">
+    <div><span class="status-label">System uptime:</span> {uptime}</div>
+    <div><span class="status-label">System boot time:</span> {booted_at}</div>
+  </div>
   <p class="meta">{note}</p>
 </section>
 "#,
@@ -2602,11 +2671,17 @@ fn html_head(title: &str) -> String {
   a:hover {{ text-decoration: underline; }}
   .meta {{ font-size: .85rem; color: #666; margin-bottom: 1.5rem; }}
   .system-status {{ margin: 0 0 1.25rem; padding: .75rem 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f8fbff; }}
-  .system-status div {{ margin: .2rem 0; }}
+  .system-status-grid {{ display: flex; flex-wrap: wrap; gap: .35rem 2rem; }}
+  .status-label {{ font-weight: 700; }}
   .system-status .meta {{ margin: .45rem 0 0; }}
+  .counter-scope {{ display: inline-block; margin-left: .35rem; padding: .1rem .45rem; border: 1px solid #d6e2f0; border-radius: 999px; background: #f4f8fd; color: #496277; font-size: .78rem; }}
+  .th-hint {{ display: block; margin-top: .1rem; color: #777; font-size: .72rem; font-weight: 400; }}
   .back {{ margin-bottom: 1rem; display: block; }}
   .edit-form {{ margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; max-width: 480px; }}
   .edit-form h2 {{ margin-top: 0; font-size: 1.1rem; }}
+  .add-user-panel {{ max-width: 440px; padding: .75rem 1rem; }}
+  .add-user-panel summary {{ cursor: pointer; font-weight: 700; font-size: 1.05rem; }}
+  .add-user-panel[open] summary {{ margin-bottom: .75rem; }}
   .edit-form label {{ display: block; font-weight: bold; margin-bottom: .25rem; margin-top: .75rem; }}
   .edit-form input[type=text], .edit-form input[type=password], .edit-form textarea {{ width: 100%; padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 3px; font-family: inherit; font-size: .95rem; box-sizing: border-box; }}
   .edit-form textarea {{ resize: vertical; min-height: 4rem; }}
@@ -2748,11 +2823,13 @@ fn render_peer_list_inner(
     error: Option<&str>,
 ) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
+    let now = Utc::now();
     buf.push_str(&nav_bar(csrf_token));
     buf.push_str("<h1>AmneziaWG Peers</h1>\n");
     buf.push_str(&render_system_status(system_status));
     buf.push_str(&format!(
-        "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"/api/peers\">JSON API</a></p>\n",
+        "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"/api/peers\">JSON API</a>\
+         <span class=\"counter-scope\">Traffic period: since boot/interface restart</span></p>\n",
         peers.len()
     ));
 
@@ -2762,7 +2839,8 @@ fn render_peer_list_inner(
         buf.push_str(
             "<table>\n\
              <tr><th>Name</th><th>Connection</th><th>Identity</th><th>Endpoint</th>\
-             <th>Last handshake</th><th>RX</th><th>TX</th></tr>\n",
+             <th>Last handshake</th><th>RX<span class=\"th-hint\">current period</span></th>\
+             <th>TX<span class=\"th-hint\">current period</span></th></tr>\n",
         );
         for p in peers {
             let name_link = format!(
@@ -2777,7 +2855,7 @@ fn render_peer_list_inner(
                 .unwrap_or_else(|| "–".to_string());
             let handshake = p
                 .latest_handshake_at
-                .map(|ts| esc(&fmt_local_timestamp(ts)))
+                .map(|ts| esc(&fmt_last_handshake(ts, now)))
                 .unwrap_or_else(|| "never".to_string());
             buf.push_str(&format!(
                 "<tr><td>{name_link}</td><td>{conn}</td><td>{ident}</td><td>{endpoint}</td>\
@@ -2791,16 +2869,14 @@ fn render_peer_list_inner(
         buf.push_str("</table>\n");
     }
 
-    // Add user form
-    if let Some(err) = error {
-        buf.push_str(&format!(
-            "<p class=\"error\">Add user failed: {}</p>\n",
-            esc(err)
-        ));
-    }
+    let add_user_open = if error.is_some() { " open" } else { "" };
+    let add_user_error = error
+        .map(|err| format!("<p class=\"error\">Add user failed: {}</p>\n", esc(err)))
+        .unwrap_or_default();
     buf.push_str(&format!(
-        r#"<div class="edit-form">
-<h2>Add user</h2>
+        r#"<details class="edit-form add-user-panel"{open}>
+<summary>Add user</summary>
+{error}
 <form method="POST" action="/admin/users/add">
   <input type="hidden" name="csrf_token" value="{csrf}">
   <label for="add_user_name">Client name</label>
@@ -2818,7 +2894,7 @@ fn render_peer_list_inner(
   <p class="meta" style="margin-top:.25rem">Full IPv6 address. Pre-filled with the next available address; edit as needed.</p>
   <button type="submit">Add user</button>
 </form>
-</div>
+</details>
 <script>
 (function() {{
   var nextIpsRequested = false;
@@ -2858,7 +2934,9 @@ fn render_peer_list_inner(
 }})();
 </script>
 "#,
-        csrf = esc(csrf_token)
+        csrf = esc(csrf_token),
+        error = add_user_error,
+        open = add_user_open,
     ));
 
     buf.push_str("</body></html>");
@@ -2889,6 +2967,7 @@ fn render_peer_detail_inner(
     error: Option<&str>,
 ) -> String {
     let mut buf = html_head(&format!("Peer – {}", dto.name));
+    let now = Utc::now();
     buf.push_str(&nav_bar(csrf_token));
     if let Some(err) = error {
         buf.push_str(&format!("<p class=\"error\">{}</p>\n", esc(err)));
@@ -2918,7 +2997,7 @@ fn render_peer_detail_inner(
     }
     let handshake = dto
         .latest_handshake_at
-        .map(fmt_local_timestamp)
+        .map(|ts| fmt_last_handshake(ts, now))
         .unwrap_or_else(|| "never".to_string());
     buf.push_str(&format!(
         "<tr><th>Last handshake</th><td>{}</td></tr>\n",
@@ -3393,6 +3472,9 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["system_time"].as_str().is_some());
+        assert!(json.get("system_booted_at").is_some());
+        assert!(json.get("system_uptime_seconds").is_some());
         assert!(json["server_time"].as_str().is_some());
         assert!(json.get("server_booted_at").is_some());
         assert!(json.get("server_uptime_seconds").is_some());
@@ -3415,9 +3497,11 @@ mod tests {
             .await
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
-        assert!(html.contains("Server uptime:"));
-        assert!(html.contains("Server booted at:"));
+        assert!(html.contains("System uptime:"));
+        assert!(html.contains("System boot time:"));
+        assert!(html.contains("aria-label=\"System status\""));
         assert!(html.contains("interface counters"));
+        assert!(html.contains("Traffic period: since boot/interface restart"));
     }
 
     #[tokio::test]
@@ -3447,7 +3531,7 @@ mod tests {
         let html = std::str::from_utf8(&body).unwrap();
         let expected = fmt_local_timestamp(Utc.timestamp_opt(handshake_ts, 0).single().unwrap());
         assert!(html.contains(&expected));
-        assert!(!html.contains("UTC</td>"));
+        assert!(html.contains("ago - "));
     }
 
     #[test]
