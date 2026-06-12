@@ -216,8 +216,16 @@ rate_limit_per_sec = 5
 
 # ── I/O tuning ────────────────────────────────────────────────────────────────
 
-# UDP receive buffer size in bytes (frontend listener; one buffer total).
+# Userspace recv() buffer size in bytes for the frontend listener (a single
+# buffer — this is not kernel socket memory; see socket_buffer_bytes).
 buffer_size = 65535
+
+# Kernel socket buffer size (SO_RCVBUF/SO_SNDBUF) in bytes, applied to the
+# frontend listener and each backend session socket. Absorbs bursts so the
+# proxy does not drop datagrams under load; 0 leaves the OS defaults. The
+# kernel may clamp to net.core.rmem_max/wmem_max and roughly doubles the
+# requested value for its own bookkeeping.
+socket_buffer_bytes = 4194304
 
 # Receive-buffer size of each per-session relay task, in bytes. Resident
 # memory per active session (relay memory = max_sessions × this) and the

@@ -173,8 +173,9 @@ touched).
 
 ## Measuring — the in-repo benchmark harness
 
-`examples/bench.rs` ships two modes (no extra dependencies; built by
-`cargo test`, so it cannot rot):
+`examples/bench.rs` ships two modes (no extra dependencies; Cargo compiles
+examples during a plain `cargo test`, so the existing CI compile-checks the
+harness and it cannot rot):
 
 ```bash
 # End-to-end loopback throughput through a real Proxy instance.
@@ -202,8 +203,12 @@ apply_padding / dns (pad 64, 1200 B)              ~22 ns/op
 ```
 
 Even the most expensive padding fill is an order of magnitude below a single
-syscall — consistent with the syscall-bound headline. On the same machine the
-end-to-end `--awg` run was only ~9% slower than plain forwarding.
+syscall — consistent with the syscall-bound headline: at 100k pps the full
+transform costs ~1.5% of one core. The hot-path numbers are stable anywhere;
+the end-to-end throughput numbers are **scheduler-sensitive** — on a busy
+desktop, run-to-run variance can exceed the effect being measured — so
+compare medians of repeated runs on an otherwise idle machine (the production
+host is the right place for baselines).
 
 ## Profiling plan — confirm before investing in Tier 1
 

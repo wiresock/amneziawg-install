@@ -118,6 +118,26 @@ async fn spawn_echo_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
+/// Block until a probe datagram completes a full client→proxy→backend→client
+/// round trip, so the measurement starts with the proxy receive loop and
+/// relay path warm — early packets otherwise sit in socket buffers and skew
+/// short runs.
+async fn wait_until_ready(proxy_addr: SocketAddr) {
+    let probe = UdpSocket::bind("127.0.0.1:0").await.expect("bind probe");
+    probe.connect(proxy_addr).await.expect("connect probe");
+    let mut buf = [0u8; 64];
+    for _ in 0..50 {
+        let _ = probe.send(&[0u8; 16]).await;
+        if matches!(
+            tokio::time::timeout(Duration::from_millis(100), probe.recv(&mut buf)).await,
+            Ok(Ok(_))
+        ) {
+            return;
+        }
+    }
+    panic!("proxy did not become ready within 5 s");
+}
+
 async fn run_throughput(opts: ThroughputOpts) {
     let (backend_addr, backend_handle) = spawn_echo_backend().await;
 
@@ -156,6 +176,7 @@ async fn run_throughput(opts: ThroughputOpts) {
     let proxy_handle = tokio::spawn(async move {
         let _ = proxy.run().await;
     });
+    wait_until_ready(proxy_addr).await;
 
     let stop_at = Instant::now() + Duration::from_secs(opts.secs);
     let total_rt = Arc::new(AtomicU64::new(0));
