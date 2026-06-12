@@ -173,11 +173,10 @@ touched).
 
 ## Measuring — the in-repo benchmark harness
 
-`examples/bench.rs` ships two modes (no extra dependencies). Cargo's default
-target selection for `cargo test` includes building examples — see "Target
-Selection" in `cargo help test` — so the existing CI's plain `cargo test`
-already compile-checks the harness and it cannot rot (easily verified: delete
-`target/debug/examples/bench*` and run `cargo test`; it comes back).
+`examples/bench.rs` ships two modes (no extra dependencies). Note that plain
+`cargo test` does not build examples by default, so to keep the harness
+compile-checked in CI, run `cargo test --all-targets` (or `cargo test --examples`)
+or add a `[[example]]` stanza with `test = true` in `Cargo.toml`.
 `cargo test --all-targets` makes the same guarantee explicit.
 
 ```bash
