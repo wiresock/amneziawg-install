@@ -483,12 +483,12 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
     if config.buffer_size == 0 {
         return Err(ProxyError::Config("buffer_size must be > 0".into()));
     }
-    // 1280 is a conservative floor derived from the IPv6 minimum link MTU:
-    // a UDP payload carried over such a path is at most 1232 bytes (1280
-    // minus IPv6 and UDP headers), so a relay buffer below this floor could
-    // only truncate real tunnel datagrams. Above the maximum UDP payload
-    // the extra bytes can never be used, so reject those too instead of
-    // silently capping.
+    // 1280 is the IPv6 minimum link MTU. The maximum UDP payload on such a path
+    // is 1232 bytes (1280 minus IPv6 and UDP headers), but we enforce a
+    // conservative/easy-to-reason-about floor of 1280 so obviously-too-small
+    // relay buffers are rejected up front. Above the maximum UDP payload the
+    // extra bytes can never be used, so reject those too instead of silently
+    // capping.
     if config.relay_buffer_size < 1280 {
         return Err(ProxyError::Config(
             "relay_buffer_size must be >= 1280".into(),
