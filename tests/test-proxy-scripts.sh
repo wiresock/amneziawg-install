@@ -18,6 +18,7 @@ PROJECT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 
 INSTALL_SCRIPT="${PROJECT_ROOT}/amneziawg-proxy/scripts/amneziawg-proxy-install.sh"
 UNINSTALL_SCRIPT="${PROJECT_ROOT}/amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh"
+UPGRADE_SCRIPT="${PROJECT_ROOT}/amneziawg-proxy/scripts/amneziawg-proxy-upgrade.sh"
 
 TESTS_RUN=0
 TESTS_PASSED=0
@@ -88,11 +89,47 @@ run_uninstall_helper() {
     )
 }
 
+run_upgrade_helper() {
+    local helper_name="$1"
+    shift
+    local -a helper_args=("$@")
+    (
+        set --  # Clear $@ so sourcing the upgrade script does not parse test args
+        source "${UPGRADE_SCRIPT}"
+        info() { :; }
+        warn() { :; }
+        "${helper_name}" "${helper_args[@]}"
+    )
+}
+
 is_positive_integer() { run_install_helper  is_positive_integer  "$@"; }
 escape_sed_replacement() { run_install_helper escape_sed_replacement "$@"; }
 safe_rm_dir()           { run_uninstall_helper safe_rm_dir          "$@"; }
 _is_valid_ip_literal()       { run_install_helper _is_valid_ip_literal       "$@"; }
 _format_host_for_socketaddr() { run_install_helper _format_host_for_socketaddr "$@"; }
+upgrade_strip_quotes() { run_upgrade_helper strip_quotes "$@"; }
+upgrade_validate_config_file_path() {
+    local config_file="$1"
+    (
+        set --
+        source "${UPGRADE_SCRIPT}"
+        CONFIG_FILE="${config_file}"
+        validate_config_file_path
+    )
+}
+upgrade_validate_paths() {
+    local install_dir="$1"
+    local config_file="$2"
+    local data_dir="$3"
+    (
+        set --
+        source "${UPGRADE_SCRIPT}"
+        INSTALL_DIR="${install_dir}"
+        CONFIG_FILE="${config_file}"
+        DATA_DIR="${data_dir}"
+        validate_upgrade_paths
+    )
+}
 
 # ── is_positive_integer ───────────────────────────────────────────────────────
 
@@ -134,6 +171,80 @@ ESCAPED_LINE="$(escape_sed_replacement "ExecStart=/path/with|pipe")"
 AFTER="$(printf '%s\n' "${UNIT_BEFORE}" | sed "s|ExecStart=.*|${ESCAPED_LINE}|")"
 assert_eq 'ExecStart=/path/with|pipe' "${AFTER}" "sed replacement with pipe in path"
 
+# ── upgrade script pure helpers ───────────────────────────────────────────────
+
+echo "=== upgrade script helpers ==="
+
+result="$(
+    set -- --unexpected-caller-arg
+    source "${UPGRADE_SCRIPT}"
+    printf '%s\n' "$1"
+)"
+assert_eq "--unexpected-caller-arg" "${result}" "upgrade script source does not parse caller args"
+
+assert_eq "/tmp/proxy" "$(upgrade_strip_quotes '"/tmp/proxy"')" "upgrade strip double quotes"
+assert_eq "/tmp/proxy" "$(upgrade_strip_quotes "'/tmp/proxy'")" "upgrade strip single quotes"
+assert_eq "/tmp/proxy" "$(upgrade_strip_quotes "/tmp/proxy")" "upgrade preserve unquoted value"
+
+upgrade_should_restart() {
+    local restart_mode="$1"
+    local service_was_active="$2"
+    (
+        set --
+        source "${UPGRADE_SCRIPT}"
+        RESTART_MODE="${restart_mode}"
+        SERVICE_WAS_ACTIVE="${service_was_active}"
+        should_restart
+    )
+}
+
+assert_rc 0 upgrade_should_restart "yes" "false"
+assert_rc 1 upgrade_should_restart "no" "true"
+assert_rc 0 upgrade_should_restart "" "true"
+assert_rc 1 upgrade_should_restart "" "false"
+
+upgrade_append_paths() {
+    local unit_line="$1"
+    shift
+    (
+        set --
+        source "${UPGRADE_SCRIPT}"
+        local -a paths=("$@")
+        append_unique_paths_from_unit_line "${unit_line}" paths
+        printf '%s\n' "${paths[*]}"
+    )
+}
+
+result="$(upgrade_append_paths 'ReadWritePaths=/var/lib/amneziawg-proxy /srv/proxy-state /var/lib/amneziawg-proxy' \
+    "/var/lib/amneziawg-proxy")"
+assert_eq "/var/lib/amneziawg-proxy /srv/proxy-state" "${result}" \
+    "upgrade merges unique ReadWritePaths entries"
+
+result="$(upgrade_append_paths 'ReadWritePaths=/var/lib/amneziawg-proxy /tmp/proxy-*' \
+    "/var/lib/amneziawg-proxy")"
+assert_eq "/var/lib/amneziawg-proxy /tmp/proxy-*" "${result}" \
+    "upgrade preserves glob characters in path lists"
+
+result="$(upgrade_append_paths 'ReadOnlyPaths=/etc/amnezia /etc/amneziawg /etc/amneziawg-proxy' \
+    "/etc/amnezia" "/etc/amneziawg-proxy")"
+assert_eq "/etc/amnezia /etc/amneziawg /etc/amneziawg-proxy" "${result}" \
+    "upgrade merges unique ReadOnlyPaths entries"
+
+assert_rc 0 upgrade_validate_config_file_path "/etc/amneziawg-proxy/proxy.toml"
+assert_rc 1 upgrade_validate_config_file_path "/etc/amneziawg-proxy/"
+assert_rc 1 upgrade_validate_config_file_path "/etc/amneziawg-proxy//"
+
+tmp_config_dir="$(mktemp -d)"
+assert_rc 1 upgrade_validate_config_file_path "${tmp_config_dir}"
+rm -rf "${tmp_config_dir}"
+
+assert_rc 0 upgrade_validate_paths "/usr/local/bin" "/etc/amneziawg-proxy/proxy.toml" "/var/lib/amneziawg-proxy"
+assert_rc 1 upgrade_validate_paths "usr/local/bin" "/etc/amneziawg-proxy/proxy.toml" "/var/lib/amneziawg-proxy"
+assert_rc 1 upgrade_validate_paths "/usr/local/bin with-space" "/etc/amneziawg-proxy/proxy.toml" "/var/lib/amneziawg-proxy"
+assert_rc 1 upgrade_validate_paths "/usr/local/../bin" "/etc/amneziawg-proxy/proxy.toml" "/var/lib/amneziawg-proxy"
+assert_rc 1 upgrade_validate_paths "/usr/local/bin" "etc/amneziawg-proxy/proxy.toml" "/var/lib/amneziawg-proxy"
+assert_rc 1 upgrade_validate_paths "/usr/local/bin" "/etc/amneziawg-proxy/proxy.toml" "/var/lib/./amneziawg-proxy"
+
 # ── safe_rm_dir guards ────────────────────────────────────────────────────────
 
 echo "=== safe_rm_dir guards ==="
@@ -168,9 +279,12 @@ rm -rf "${TMPPREFIX_ROOT}"
 TMPLINK_DIR="$(mktemp -d)"
 TMPDIR_TARGET="$(mktemp -d)"
 TMPLINK="${TMPLINK_DIR}/test-symlink"
-ln -s "${TMPDIR_TARGET}" "${TMPLINK}"
-assert_rc 1 safe_rm_dir "${TMPLINK}" "/tmp/"
-rm -f "${TMPLINK}"
+if ln -s "${TMPDIR_TARGET}" "${TMPLINK}" 2>/dev/null && [[ -L "${TMPLINK}" ]]; then
+    assert_rc 1 safe_rm_dir "${TMPLINK}" "/tmp/"
+else
+    echo "  SKIP: symlink guard (symlink creation unavailable)"
+fi
+rm -rf "${TMPLINK}"
 rm -rf "${TMPDIR_TARGET}"
 rm -rf "${TMPLINK_DIR}"
 
@@ -595,6 +709,7 @@ assert_niv_rc 1 "DNS_UPSTREAM" 'not-valid' \
 echo "=== --help exits 0 ==="
 assert_rc 0 bash "${INSTALL_SCRIPT}"   --help
 assert_rc 0 bash "${UNINSTALL_SCRIPT}" --help
+assert_rc 0 bash "${UPGRADE_SCRIPT}"   --help
 
 # ── reconfigure_awg_listen_port ───────────────────────────────────────────────
 #
