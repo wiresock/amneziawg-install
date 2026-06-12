@@ -75,6 +75,8 @@ struct CachedSystemVersions {
 }
 
 const SYSTEM_VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+const MAX_REASONABLE_UPTIME_SECS: f64 = 3_153_600_000.0; // 100 years
+const STATISTICS_COUNTER_NOTE: &str = "Traffic statistics below use live AmneziaWG interface counters. These counters can reset after a server reboot or interface restart.";
 
 impl AppState {
     fn new(db: Database, auth: AuthConfig, config_dir: std::path::PathBuf) -> Self {
@@ -507,7 +509,7 @@ fn detect_boot_time_from_proc_stat() -> Option<DateTime<Utc>> {
 fn detect_boot_time_from_proc_uptime() -> Option<DateTime<Utc>> {
     let contents = std::fs::read_to_string("/proc/uptime").ok()?;
     let uptime_secs = contents.split_whitespace().next()?.parse::<f64>().ok()?;
-    if !uptime_secs.is_finite() || uptime_secs < 0.0 {
+    if !uptime_secs.is_finite() || !(0.0..=MAX_REASONABLE_UPTIME_SECS).contains(&uptime_secs) {
         return None;
     }
     Some(Utc::now() - chrono::Duration::seconds(uptime_secs.floor() as i64))
@@ -524,7 +526,7 @@ fn system_status(state: &AppState) -> SystemStatusDto {
         server_time: now,
         server_booted_at: state.server_booted_at,
         server_uptime_seconds: uptime,
-        statistics_note: "Traffic counters are read from the running AmneziaWG interface and may reset after a server reboot or interface restart.".to_string(),
+        statistics_note: STATISTICS_COUNTER_NOTE.to_string(),
     }
 }
 
@@ -2544,7 +2546,8 @@ fn fmt_duration_hms(total_secs: u64) -> String {
     let seconds = total_secs % 60;
 
     if days > 0 {
-        format!("{days} days {hours:02}:{minutes:02}:{seconds:02}")
+        let day_label = if days == 1 { "day" } else { "days" };
+        format!("{days} {day_label} {hours:02}:{minutes:02}:{seconds:02}")
     } else {
         format!("{hours:02}:{minutes:02}:{seconds:02}")
     }
@@ -2571,11 +2574,12 @@ fn render_system_status(status: &SystemStatusDto) -> String {
         r#"<section class="system-status" aria-label="Server status">
   <div><strong>Server uptime:</strong> {uptime}</div>
   <div><strong>Server started at:</strong> {started_at}</div>
-  <p class="meta">Traffic statistics below use live AmneziaWG interface counters. These counters can reset after a server reboot or interface restart.</p>
+  <p class="meta">{note}</p>
 </section>
 "#,
         uptime = esc(&uptime),
         started_at = esc(&started_at),
+        note = esc(&status.statistics_note),
     )
 }
 
@@ -3444,6 +3448,13 @@ mod tests {
         let expected = fmt_local_timestamp(Utc.timestamp_opt(handshake_ts, 0).single().unwrap());
         assert!(html.contains(&expected));
         assert!(!html.contains("UTC</td>"));
+    }
+
+    #[test]
+    fn fmt_duration_hms_singularizes_day() {
+        assert_eq!(fmt_duration_hms(86_400), "1 day 00:00:00");
+        assert_eq!(fmt_duration_hms(172_800), "2 days 00:00:00");
+        assert_eq!(fmt_duration_hms(3_725), "01:02:05");
     }
 
     #[tokio::test]
