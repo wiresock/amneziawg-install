@@ -229,7 +229,19 @@ Or re-run with --install-rust to install automatically."
     fi
 
     if ! command -v curl >/dev/null 2>&1; then
-        die "Automatic Rust installation requires curl, but curl was not found."
+        die "Automatic Rust installation requires curl, but curl was not found.
+Install curl (e.g. apt-get install curl), or install Rust manually and re-run."
+    fi
+
+    if [[ -z "${SSL_CERT_FILE:-}" && -z "${SSL_CERT_DIR:-}" ]] \
+        && [[ ! -f /etc/ssl/certs/ca-certificates.crt ]] \
+        && [[ ! -f /etc/pki/tls/certs/ca-bundle.crt ]] \
+        && [[ ! -f /etc/ssl/ca-bundle.pem ]] \
+        && [[ ! -f /etc/pki/tls/cacert.pem ]] \
+        && [[ ! -f /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem ]] \
+        && [[ ! -d /etc/ssl/certs ]]; then
+        die "Automatic Rust installation requires CA certificates for HTTPS downloads, but none were found.
+Install the ca-certificates package, or install Rust manually and re-run."
     fi
 
     if [[ -z "${HOME:-}" ]]; then
@@ -274,6 +286,11 @@ build_from_source() {
     if [[ ! -f "${SOURCE_DIR}/Cargo.toml" ]]; then
         die "No Cargo.toml found in source directory: ${SOURCE_DIR}
 Expected the amneziawg-proxy Rust crate directory."
+    fi
+
+    warn "Source builds run cargo as root. Cargo build scripts and proc-macros execute code from the source tree."
+    if ! confirm "Only continue if you trust this source tree. Build as root?" "false"; then
+        die "Source build cancelled. Build the binary as an unprivileged user and re-run with --binary PATH."
     fi
 
     ensure_rust_toolchain
