@@ -21,6 +21,11 @@ pub(crate) fn now_millis() -> u64 {
     process_epoch().elapsed().as_millis() as u64
 }
 
+/// Sentinel for [`Session::relay_generation`]: no relay task has been
+/// registered for the session (yet). Real generations are produced by an
+/// incrementing counter starting at 0, so `u64::MAX` is never a live value.
+pub(crate) const NO_RELAY_GENERATION: u64 = u64::MAX;
+
 /// A single client session: maps a client address to a dedicated backend socket.
 pub struct Session {
     /// Dedicated UDP socket bound to an ephemeral port for talking to the backend.
@@ -38,6 +43,14 @@ pub struct Session {
     /// alongside [`process_epoch`]; callers refresh it via [`Session::touch`]
     /// rather than reading it directly.
     last_active: AtomicU64,
+    /// Generation of the relay task currently serving this session
+    /// ([`NO_RELAY_GENERATION`] until one is registered via
+    /// [`SessionTable::set_relay_generation`]).
+    ///
+    /// Expiry reports this value so the cleanup sweep aborts exactly the
+    /// relay that served the expired session — never a newer relay spawned
+    /// for a session re-created concurrently with the sweep.
+    relay_generation: AtomicU64,
     /// The client address that owns this session.
     pub client_addr: SocketAddr,
 }
@@ -184,6 +197,7 @@ impl SessionTable {
                 let session = Session {
                     backend_sock: Arc::clone(&sock),
                     last_active: AtomicU64::new(now_millis()),
+                    relay_generation: AtomicU64::new(NO_RELAY_GENERATION),
                     client_addr,
                 };
                 vac.insert(session);
@@ -206,10 +220,23 @@ impl SessionTable {
         }
     }
 
-    /// Remove sessions whose client has been silent for longer than `ttl`
-    /// and return the removed client addresses. Backend→client traffic does
-    /// not count as activity (see [`Session::last_active`]).
-    pub fn cleanup_expired(&self) -> Vec<SocketAddr> {
+    /// Register the generation of the relay task serving `client_addr`'s
+    /// session, so expiry can later identify exactly that task for teardown.
+    pub fn set_relay_generation(&self, client_addr: &SocketAddr, generation: u64) {
+        if let Some(entry) = self.sessions.get(client_addr) {
+            entry.relay_generation.store(generation, Ordering::Relaxed);
+        }
+    }
+
+    /// Remove sessions whose client has been silent for longer than `ttl` and
+    /// return `(client_addr, relay_generation)` for each. Backend→client
+    /// traffic does not count as activity (see [`Session::last_active`]).
+    ///
+    /// The reported relay generation lets the caller abort only the relay
+    /// that served the expired session: if the client comes back between this
+    /// sweep and the teardown, the re-created session's fresh relay carries a
+    /// newer generation and must survive.
+    pub fn cleanup_expired(&self) -> Vec<(SocketAddr, u64)> {
         let now = now_millis();
         let ttl_ms = self.ttl.as_millis().min(u64::MAX as u128) as u64;
         let mut expired = Vec::new();
@@ -217,7 +244,7 @@ impl SessionTable {
         self.sessions.retain(|addr, session| {
             let last = session.last_active.load(Ordering::Relaxed);
             if now.saturating_sub(last) > ttl_ms {
-                expired.push(*addr);
+                expired.push((*addr, session.relay_generation.load(Ordering::Relaxed)));
                 self.session_count.fetch_sub(1, Ordering::AcqRel);
                 false
             } else {
@@ -227,7 +254,7 @@ impl SessionTable {
 
         // Log outside the retain closure to avoid holding DashMap shard locks
         // during formatting/IO under contention.
-        for addr in &expired {
+        for (addr, _) in &expired {
             info!(%addr, "session expired");
         }
 
@@ -316,8 +343,27 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         let expired = table.cleanup_expired();
-        assert_eq!(expired, vec![client]);
+        assert_eq!(expired, vec![(client, NO_RELAY_GENERATION)]);
         assert!(table.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_reports_registered_relay_generation() {
+        let backend: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+        let table = SessionTable::new(backend, Duration::from_millis(0), 1000);
+        let client: SocketAddr = "10.0.0.1:5555".parse().unwrap();
+
+        table.get_or_create(client).await.unwrap();
+        table.set_relay_generation(&client, 7);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let expired = table.cleanup_expired();
+        assert_eq!(
+            expired,
+            vec![(client, 7)],
+            "expiry must report the relay generation registered for the session"
+        );
     }
 
     #[tokio::test]

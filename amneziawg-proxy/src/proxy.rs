@@ -1188,6 +1188,11 @@ impl Proxy {
         let relay_buf_size = std::cmp::min(self.config.buffer_size, MAX_UDP_PAYLOAD_SIZE);
         let relay_handles = Arc::clone(&self.relay_handles);
         let generation = self.relay_generation.fetch_add(1, Ordering::Relaxed);
+        // Register this relay's generation on the session: expiry reports it,
+        // and the cleanup sweep aborts only a generation-matched relay, so a
+        // relay spawned for a re-created session can never be torn down by a
+        // sweep that expired the *previous* session for this address.
+        self.sessions.set_relay_generation(&client_addr, generation);
         // Cache this client's metrics handle once. The entry is created in
         // `handle_client_packet` before this relay is spawned and is removed
         // together with this task, so the `Arc` is stable for the session's
@@ -1314,7 +1319,7 @@ impl Proxy {
             loop {
                 ticker.tick().await;
                 let expired = sessions.cleanup_expired();
-                for addr in &expired {
+                for (addr, relay_generation) in &expired {
                     metrics.remove(addr);
                     client_protocols.remove(addr);
                     sip_dialogs.remove(addr);
@@ -1322,8 +1327,16 @@ impl Proxy {
                     if let Some((_, entry)) = sip_deferred_handles.remove(addr) {
                         entry.handle.abort();
                     }
-                    // Abort the relay task for the expired session
-                    if let Some((_, entry)) = relay_handles.remove(addr) {
+                    // Abort the relay that served the expired session — and
+                    // only that one. If the client came back between the
+                    // expiry sweep above and this teardown, the re-created
+                    // session's relay carries a newer generation and must
+                    // survive (an unconditional remove would leave the new
+                    // session permanently relay-less, black-holing backend
+                    // responses for that client).
+                    if let Some((_, entry)) =
+                        relay_handles.remove_if(addr, |_, e| e.generation == *relay_generation)
+                    {
                         entry.handle.abort();
                     }
                 }
@@ -1579,6 +1592,7 @@ mod tests {
         };
 
         let proxy = Proxy::bind(config, None).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = client.local_addr().unwrap();
@@ -1607,15 +1621,115 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
+        // Prove the relay actually delivered backend packets to the client —
+        // without this the test would also pass with a dead relay, which is
+        // not the scenario under test.
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                .await
+                .expect("relay must deliver backend packets to the client")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert_eq!(&buf[..n], b"backend says hi");
+
         // Despite the ongoing backend→client relay traffic, the client has
         // been silent for > TTL: the session must expire.
         let expired = proxy.sessions.cleanup_expired();
+        let expired_addrs: Vec<SocketAddr> = expired.iter().map(|(addr, _)| *addr).collect();
         assert_eq!(
-            expired,
+            expired_addrs,
             vec![client_addr],
             "session must expire after TTL of client silence"
         );
         assert!(proxy.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_spares_relay_of_recreated_session() {
+        // Race regression (flagged in review): the client returns between the
+        // expiry sweep (`cleanup_expired`) and the relay teardown that follows
+        // it in `spawn_cleanup_task`. The teardown must abort only the relay
+        // whose generation was reported by the sweep — aborting the re-created
+        // session's fresh relay would leave that session permanently
+        // relay-less, black-holing all backend responses for the client.
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 1,
+            cleanup_interval_secs: 3600, // swept manually below
+            rate_limit_per_sec: 16,
+            imitate_protocol: "auto".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
+            awg_config: None,
+        };
+
+        let proxy = Proxy::bind(config, None).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        // First life: session + relay.
+        proxy.handle_client_packet(b"first life", client_addr).await;
+        let mut buf = [0u8; 2048];
+        tokio::time::timeout(Duration::from_millis(500), backend.recv_from(&mut buf))
+            .await
+            .expect("first-life packet must be forwarded")
+            .unwrap();
+
+        // Client silent past the TTL: the sweep expires the session and
+        // reports the generation of the relay that served it.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let expired = proxy.sessions.cleanup_expired();
+        assert_eq!(expired.len(), 1);
+        let (expired_addr, expired_generation) = expired[0];
+        assert_eq!(expired_addr, client_addr);
+
+        // Before the teardown step runs, the client comes back: same address,
+        // new session, new relay with a newer generation.
+        proxy
+            .handle_client_packet(b"second life", client_addr)
+            .await;
+        let (_, session_backend_addr) =
+            tokio::time::timeout(Duration::from_millis(500), backend.recv_from(&mut buf))
+                .await
+                .expect("second-life packet must be forwarded")
+                .unwrap();
+
+        // The teardown step exactly as `spawn_cleanup_task` performs it, with
+        // the stale generation from the sweep: it must spare the new relay.
+        if let Some((_, entry)) = proxy
+            .relay_handles
+            .remove_if(&client_addr, |_, e| e.generation == expired_generation)
+        {
+            entry.handle.abort();
+        }
+
+        // The re-created session's relay is alive: backend traffic still
+        // reaches the client.
+        backend
+            .send_to(b"hello again", session_backend_addr)
+            .await
+            .unwrap();
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                .await
+                .expect("relay of the re-created session must still deliver")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert_eq!(&buf[..n], b"hello again");
     }
 
     #[tokio::test]
