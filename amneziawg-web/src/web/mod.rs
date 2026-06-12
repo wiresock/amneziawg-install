@@ -2569,16 +2569,16 @@ fn render_system_status(status: &SystemStatusDto) -> String {
         .server_uptime_seconds
         .map(fmt_duration_hms)
         .unwrap_or_else(|| "unknown".to_string());
-    let started_at = fmt_optional_local_timestamp(status.server_booted_at, "unknown");
+    let booted_at = fmt_optional_local_timestamp(status.server_booted_at, "unknown");
     format!(
         r#"<section class="system-status" aria-label="Server status">
   <div><strong>Server uptime:</strong> {uptime}</div>
-  <div><strong>Server started at:</strong> {started_at}</div>
+  <div><strong>Server booted at:</strong> {booted_at}</div>
   <p class="meta">{note}</p>
 </section>
 "#,
         uptime = esc(&uptime),
-        started_at = esc(&started_at),
+        booted_at = esc(&booted_at),
         note = esc(&status.statistics_note),
     )
 }
@@ -3416,7 +3416,7 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.contains("Server uptime:"));
-        assert!(html.contains("Server started at:"));
+        assert!(html.contains("Server booted at:"));
         assert!(html.contains("interface counters"));
     }
 
