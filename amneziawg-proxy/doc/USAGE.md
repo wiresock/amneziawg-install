@@ -216,8 +216,15 @@ rate_limit_per_sec = 5
 
 # ── I/O tuning ────────────────────────────────────────────────────────────────
 
-# UDP receive buffer size in bytes.
+# UDP receive buffer size in bytes (frontend listener; one buffer total).
 buffer_size = 65535
+
+# Receive-buffer size of each per-session relay task, in bytes. Resident
+# memory per active session (relay memory = max_sessions × this) and the
+# largest backend→client datagram a session can relay — larger datagrams are
+# truncated. The default covers any internet-path tunnel MTU (≤ ~1500) plus
+# AmneziaWG S-padding; raise it (up to 65535) only for jumbo-MTU deployments.
+relay_buffer_size = 8192
 
 # ── AWG integration ───────────────────────────────────────────────────────────
 

@@ -284,6 +284,19 @@ pub struct ProxyConfig {
     #[serde(default = "default_buffer_size")]
     pub buffer_size: usize,
 
+    /// Receive-buffer size of each per-session relay task, in bytes. This is
+    /// resident memory *per active session* (it bounds relay memory at
+    /// `max_sessions × relay_buffer_size`) and also bounds the largest
+    /// backend→client datagram a session can relay — larger datagrams are
+    /// truncated.
+    ///
+    /// The default (8192) comfortably covers any internet-path tunnel MTU
+    /// (≤ ~1500) plus AmneziaWG S-padding. Raise it (up to 65535) only for
+    /// jumbo-MTU deployments where the AWG interface emits datagrams larger
+    /// than this.
+    #[serde(default = "default_relay_buffer_size")]
+    pub relay_buffer_size: usize,
+
     /// Kernel socket buffer size (`SO_RCVBUF`/`SO_SNDBUF`) applied to the
     /// frontend listener and each backend session socket, in bytes. Larger
     /// values absorb bursts and prevent in-proxy UDP drops (which the tunnel
@@ -351,6 +364,12 @@ fn default_dns_upstream_timeout_ms() -> u64 {
 fn default_buffer_size() -> usize {
     65535
 }
+fn default_relay_buffer_size() -> usize {
+    // Per-session resident memory; 8 KiB covers any internet-path tunnel MTU
+    // (≤ ~1500 B) plus AmneziaWG S-padding with ample margin, vs. ~640 MB at
+    // max_sessions=10k when relays sized buffers from the 64 KiB buffer_size.
+    8192
+}
 fn default_socket_buffer_bytes() -> usize {
     // 4 MiB. Large enough to absorb multi-millisecond bursts at gigabit rates
     // without in-proxy UDP drops, while staying within common
@@ -382,6 +401,7 @@ impl Default for ProxyConfig {
             dns_upstream: default_dns_upstream(),
             dns_upstream_timeout_ms: default_dns_upstream_timeout_ms(),
             buffer_size: default_buffer_size(),
+            relay_buffer_size: default_relay_buffer_size(),
             socket_buffer_bytes: default_socket_buffer_bytes(),
             max_sessions: default_max_sessions(),
             status_file: default_status_file(),
@@ -463,6 +483,14 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
     if config.buffer_size == 0 {
         return Err(ProxyError::Config("buffer_size must be > 0".into()));
     }
+    // Below the IPv6 minimum MTU no real tunnel datagram fits, and relayed
+    // packets larger than this buffer are silently truncated — reject sizes
+    // that could only break the tunnel.
+    if config.relay_buffer_size < 1280 {
+        return Err(ProxyError::Config(
+            "relay_buffer_size must be >= 1280".into(),
+        ));
+    }
     if config.cleanup_interval_secs == 0 {
         return Err(ProxyError::Config(
             "cleanup_interval_secs must be > 0".into(),
@@ -510,6 +538,7 @@ backend = "127.0.0.1:51821"
         assert_eq!(cfg.dns_upstream, "1.1.1.1:53");
         assert_eq!(cfg.dns_upstream_timeout_ms, 1500);
         assert_eq!(cfg.buffer_size, 65535);
+        assert_eq!(cfg.relay_buffer_size, 8192);
         assert_eq!(cfg.status_file, "/var/lib/amneziawg-proxy/sessions.json");
         assert_eq!(cfg.status_interval_secs, 5);
         assert!(cfg.awg_config.is_none());
@@ -525,6 +554,7 @@ cleanup_interval_secs = 30
 rate_limit_per_sec = 10
 imitate_protocol = "dns"
 buffer_size = 4096
+relay_buffer_size = 2048
 awg_config = "/etc/awg/awg0.conf"
 quic_handshake_enabled = false
 quic_certificate_domain = "example.org"
@@ -545,6 +575,7 @@ status_interval_secs = 2
         assert_eq!(cfg.dns_upstream, "127.0.0.1:5300");
         assert_eq!(cfg.dns_upstream_timeout_ms, 700);
         assert_eq!(cfg.buffer_size, 4096);
+        assert_eq!(cfg.relay_buffer_size, 2048);
         assert_eq!(cfg.status_file, "/run/amneziawg-proxy/sessions.json");
         assert_eq!(cfg.status_interval_secs, 2);
         assert_eq!(cfg.awg_config.as_deref(), Some("/etc/awg/awg0.conf"));
@@ -661,6 +692,21 @@ buffer_size = 0
 "#;
         let err = parse_config(toml).unwrap_err();
         assert!(err.to_string().contains("buffer_size must be > 0"));
+    }
+
+    #[test]
+    fn reject_relay_buffer_below_min_mtu() {
+        // A relay buffer below the IPv6 minimum MTU can only truncate tunnel
+        // datagrams.
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+relay_buffer_size = 1024
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("relay_buffer_size must be >= 1280"));
     }
 
     #[test]
