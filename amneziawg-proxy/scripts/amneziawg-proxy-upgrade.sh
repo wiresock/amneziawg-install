@@ -592,6 +592,8 @@ main() {
 Check service logs with: sudo journalctl -u ${SERVICE_NAME} -e"
         fi
         info "Service restarted: ${SERVICE_NAME}"
+    elif [[ "${RESTART_MODE}" == "no" ]]; then
+        info "Service not restarted (--no-restart requested; use: sudo systemctl start ${SERVICE_NAME})"
     else
         info "Service not restarted (was inactive; use --restart to force)."
     fi
@@ -604,6 +606,8 @@ Check service logs with: sudo journalctl -u ${SERVICE_NAME} -e"
     info "AWG config preserved:   unchanged"
     if should_restart; then
         info "Service status:         restarted"
+    elif [[ "${RESTART_MODE}" == "no" ]]; then
+        info "Service status:         not restarted (--no-restart requested; use: sudo systemctl start ${SERVICE_NAME})"
     else
         info "Service status:         not restarted (use: sudo systemctl start ${SERVICE_NAME})"
     fi
