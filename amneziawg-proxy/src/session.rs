@@ -222,10 +222,20 @@ impl SessionTable {
 
     /// Register the generation of the relay task serving `client_addr`'s
     /// session, so expiry can later identify exactly that task for teardown.
+    ///
+    /// Release store: unlike `last_active` (best-effort telemetry), the
+    /// generation is a correctness key — the cleanup sweep decides which
+    /// relay to abort by it — so the registration is published with
+    /// Release/Acquire rather than Relaxed.
     pub fn set_relay_generation(&self, client_addr: &SocketAddr, generation: u64) {
         if let Some(entry) = self.sessions.get(client_addr) {
-            entry.relay_generation.store(generation, Ordering::Relaxed);
+            entry.relay_generation.store(generation, Ordering::Release);
         }
+    }
+
+    /// Whether a session currently exists for `client_addr`.
+    pub fn contains(&self, client_addr: &SocketAddr) -> bool {
+        self.sessions.contains_key(client_addr)
     }
 
     /// Remove sessions whose client has been silent for longer than `ttl` and
@@ -244,7 +254,8 @@ impl SessionTable {
         self.sessions.retain(|addr, session| {
             let last = session.last_active.load(Ordering::Relaxed);
             if now.saturating_sub(last) > ttl_ms {
-                expired.push((*addr, session.relay_generation.load(Ordering::Relaxed)));
+                // Acquire pairs with the Release in `set_relay_generation`.
+                expired.push((*addr, session.relay_generation.load(Ordering::Acquire)));
                 self.session_count.fetch_sub(1, Ordering::AcqRel);
                 false
             } else {
