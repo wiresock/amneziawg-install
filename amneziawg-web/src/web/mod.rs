@@ -94,7 +94,6 @@ impl SystemUptimeBaseline {
 
 const SYSTEM_VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 const MAX_REASONABLE_UPTIME_SECS: f64 = 3_153_600_000.0; // 100 years
-const DEFAULT_PROXY_SESSIONS_FILE: &str = "/var/lib/amneziawg-proxy/sessions.json";
 const PROXY_STATUS_STALE_AFTER_SECS: i64 = 30;
 const STATISTICS_COUNTER_NOTE: &str =
     "Traffic counters below are live interface counters since the last system boot or interface restart.";
@@ -859,16 +858,6 @@ fn normalize_period(period: &str) -> &'static str {
 }
 
 // ── Router ──────────────────────────────────────────────────────────────────
-
-/// Build the application router.
-pub fn router(db: Database, auth: AuthConfig, config_dir: PathBuf) -> Router {
-    router_with_proxy_sessions_file(
-        db,
-        auth,
-        config_dir,
-        PathBuf::from(DEFAULT_PROXY_SESSIONS_FILE),
-    )
-}
 
 /// Build the application router with an explicit proxy session status file.
 pub fn router_with_proxy_sessions_file(
@@ -3600,18 +3589,35 @@ mod tests {
         Database::connect_for_test().await.expect("connect")
     }
 
+    fn missing_proxy_sessions_file() -> PathBuf {
+        let file = tempfile::Builder::new()
+            .prefix("amneziawg-web-test-missing-proxy-sessions-")
+            .suffix(".json")
+            .tempfile()
+            .expect("create proxy sessions temp file");
+        let path = file.path().to_path_buf();
+        file.close().expect("remove proxy sessions temp file");
+        path
+    }
+
     /// Build a router with auth disabled (used for all pre-auth tests).
     fn test_router(db: Database) -> Router {
-        router(
+        router_with_proxy_sessions_file(
             db,
             AuthConfig::disabled(),
             std::path::PathBuf::from("/tmp/test-configs"),
+            missing_proxy_sessions_file(),
         )
     }
 
     /// Build a router with auth disabled and a custom config directory.
     fn test_router_with_config_dir(db: Database, config_dir: std::path::PathBuf) -> Router {
-        router(db, AuthConfig::disabled(), config_dir)
+        router_with_proxy_sessions_file(
+            db,
+            AuthConfig::disabled(),
+            config_dir,
+            missing_proxy_sessions_file(),
+        )
     }
 
     fn test_router_with_proxy_sessions_file(db: Database, proxy_sessions_file: PathBuf) -> Router {
@@ -3635,7 +3641,12 @@ mod tests {
             session_ttl: std::time::Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
         };
         (
-            router(db, auth, std::path::PathBuf::from("/tmp/test-configs")),
+            router_with_proxy_sessions_file(
+                db,
+                auth,
+                std::path::PathBuf::from("/tmp/test-configs"),
+                missing_proxy_sessions_file(),
+            ),
             "testpassword".to_string(),
         )
     }
@@ -5438,7 +5449,12 @@ mod tests {
             secure_cookie: false,
             session_ttl: std::time::Duration::from_secs(0),
         };
-        let app = router(db, auth, std::path::PathBuf::from("/tmp/test-configs"));
+        let app = router_with_proxy_sessions_file(
+            db,
+            auth,
+            std::path::PathBuf::from("/tmp/test-configs"),
+            missing_proxy_sessions_file(),
+        );
 
         // Login succeeds and we get a session cookie ...
         let login_resp = do_login(app.clone(), "admin", "pass").await;
