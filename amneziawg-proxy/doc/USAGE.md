@@ -189,6 +189,9 @@ imitate_protocol = "quic"
 # ── Session management ────────────────────────────────────────────────────────
 
 # How long (seconds) a client session can remain idle before it is cleaned up.
+# Idle means no packets *from the client*; backend→client relay traffic (e.g.
+# AWG retrying handshakes toward a client that disappeared) does not keep a
+# session alive.
 session_ttl_secs = 300
 
 # How often (seconds) the cleanup task runs to reap expired sessions.
@@ -318,7 +321,8 @@ status_interval_secs = 5
 ```
 
 Each session entry includes the remote client address, proxy listen port,
-backend target port, detected/fixed obfuscation protocol, last activity time,
+backend target port, detected/fixed obfuscation protocol, last activity time
+(the last packet received *from the client* — also what the TTL counts),
 packet counts, and byte counts. The per-session `backend_socket_addr` field
 is the proxy's local socket toward the AWG interface — it equals the peer
 `endpoint` shown by `awg show`, which is how `amneziawg-web` maps a proxy

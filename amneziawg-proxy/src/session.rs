@@ -21,34 +21,23 @@ pub(crate) fn now_millis() -> u64 {
     process_epoch().elapsed().as_millis() as u64
 }
 
-/// Lookup-free handle to a single session's activity timestamp.
-///
-/// The per-session relay task captures one of these at spawn time and refreshes
-/// it on every outbound packet, so keeping a download-heavy session alive costs
-/// a cached atomic store instead of a `DashMap` read guard + hash + lookup.
-#[derive(Clone)]
-pub struct ActivityHandle(Arc<AtomicU64>);
-
-impl ActivityHandle {
-    /// Refresh the activity timestamp (see [`Session::touch`] for ordering).
-    pub fn touch(&self) {
-        self.0.store(now_millis(), Ordering::Relaxed);
-    }
-}
-
 /// A single client session: maps a client address to a dedicated backend socket.
 pub struct Session {
     /// Dedicated UDP socket bound to an ephemeral port for talking to the backend.
     pub backend_sock: Arc<UdpSocket>,
-    /// Last activity time, as milliseconds since [`process_epoch`]. Stored
-    /// atomically (behind an `Arc` so the relay can hold an [`ActivityHandle`]
-    /// to it) so both data paths refresh it without write-lock contention
-    /// between the inbound receive loop and the per-session relay task.
+    /// Time of the last packet received *from the client*, as milliseconds
+    /// since [`process_epoch`]. Stored atomically so the per-packet refresh
+    /// happens under a shared DashMap guard.
+    ///
+    /// Deliberately client-only: backend→client relay traffic does not touch
+    /// it, so a session expires after `ttl` of client silence even while the
+    /// backend keeps retrying toward a client that vanished (e.g. AWG
+    /// handshake initiations triggered by stale return traffic).
     ///
     /// Private: the value is an internal epoch representation only meaningful
     /// alongside [`process_epoch`]; callers refresh it via [`Session::touch`]
-    /// or [`SessionTable::activity_handle`] rather than reading it directly.
-    last_active: Arc<AtomicU64>,
+    /// rather than reading it directly.
+    last_active: AtomicU64,
     /// The client address that owns this session.
     pub client_addr: SocketAddr,
 }
@@ -194,7 +183,7 @@ impl SessionTable {
 
                 let session = Session {
                     backend_sock: Arc::clone(&sock),
-                    last_active: Arc::new(AtomicU64::new(now_millis())),
+                    last_active: AtomicU64::new(now_millis()),
                     client_addr,
                 };
                 vac.insert(session);
@@ -204,26 +193,22 @@ impl SessionTable {
         }
     }
 
-    /// Touch a session (update last_active). Takes only a shared (read)
-    /// DashMap guard — safe to call per packet from the relay task without
-    /// contending with the inbound receive loop.
+    /// Record client activity for a session (update last_active). Takes only
+    /// a shared (read) DashMap guard — safe to call per packet without
+    /// contending with concurrent lookups.
+    ///
+    /// Only client-originated packets may be recorded here; see
+    /// [`Session::last_active`] for why relay traffic must not extend a
+    /// session's life.
     pub fn touch(&self, client_addr: &SocketAddr) {
         if let Some(entry) = self.sessions.get(client_addr) {
             entry.touch();
         }
     }
 
-    /// Return a lookup-free [`ActivityHandle`] for `client_addr`, or `None` if
-    /// the session does not exist. The relay task fetches this once at spawn so
-    /// its per-packet keep-alive is a cached atomic store rather than a table
-    /// lookup.
-    pub fn activity_handle(&self, client_addr: &SocketAddr) -> Option<ActivityHandle> {
-        self.sessions
-            .get(client_addr)
-            .map(|entry| ActivityHandle(Arc::clone(&entry.last_active)))
-    }
-
-    /// Remove expired sessions and return removed client addresses.
+    /// Remove sessions whose client has been silent for longer than `ttl`
+    /// and return the removed client addresses. Backend→client traffic does
+    /// not count as activity (see [`Session::last_active`]).
     pub fn cleanup_expired(&self) -> Vec<SocketAddr> {
         let now = now_millis();
         let ttl_ms = self.ttl.as_millis().min(u64::MAX as u128) as u64;

@@ -1194,10 +1194,6 @@ impl Proxy {
         // lifetime — caching it avoids a DashMap lookup + `Arc` clone on every
         // outbound packet.
         let client_metrics = self.metrics.get(&client_addr);
-        // Likewise capture a lookup-free activity handle once: the per-packet
-        // keep-alive becomes a cached atomic store instead of a session-table
-        // lookup. Created above, so it is present for this fresh session.
-        let activity = self.sessions.activity_handle(&client_addr);
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; relay_buf_size];
@@ -1242,10 +1238,12 @@ impl Proxy {
                             m.record_out_bytes(n);
                         }
 
-                        if let Some(a) = &activity {
-                            a.touch();
-                        }
-
+                        // Deliberately no session keep-alive here: only packets
+                        // *from the client* refresh the TTL (in `get_or_create`).
+                        // Backend→client traffic alone — e.g. AWG retrying
+                        // handshakes toward a client that vanished while return
+                        // traffic for its old flows still arrives — must not
+                        // keep the session alive forever.
                         if let Err(e) =
                             backend::send_to_client(&frontend, client_addr, &buf[..n]).await
                         {
@@ -1547,6 +1545,77 @@ mod tests {
         assert_eq!(status.imitate_protocol, "auto");
         assert_eq!(status.sessions.len(), 1);
         assert_eq!(status.sessions[0].obfuscation_protocol, "none");
+    }
+
+    #[tokio::test]
+    async fn backend_traffic_does_not_keep_session_alive() {
+        // Regression: a client vanished, but the backend (AWG) kept sending
+        // toward its last endpoint — handshake initiations triggered by stale
+        // return traffic for the client's old flows. The relayed backend→client
+        // packets used to refresh the session TTL, so the session (and its
+        // "active" row in the status file) lived forever. Only client packets
+        // may keep a session alive.
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 1,
+            cleanup_interval_secs: 3600, // swept manually below
+            rate_limit_per_sec: 16,
+            imitate_protocol: "auto".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
+            awg_config: None,
+        };
+
+        let proxy = Proxy::bind(config, None).await.unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        // A single client packet creates the session and spawns the relay.
+        proxy
+            .handle_client_packet(b"hello backend", client_addr)
+            .await;
+        assert_eq!(proxy.sessions.len(), 1);
+
+        // Learn the proxy's per-session backend socket from the forwarded packet.
+        let mut buf = [0u8; 64];
+        let (_, session_backend_addr) =
+            tokio::time::timeout(Duration::from_millis(500), backend.recv_from(&mut buf))
+                .await
+                .expect("client packet must be forwarded to the backend")
+                .unwrap();
+
+        // The client stays silent while the backend keeps sending past the
+        // 1 s TTL; each packet is relayed to the client.
+        for _ in 0..6 {
+            backend
+                .send_to(b"backend says hi", session_backend_addr)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        // Despite the ongoing backend→client relay traffic, the client has
+        // been silent for > TTL: the session must expire.
+        let expired = proxy.sessions.cleanup_expired();
+        assert_eq!(
+            expired,
+            vec![client_addr],
+            "session must expire after TTL of client silence"
+        );
+        assert!(proxy.sessions.is_empty());
     }
 
     #[tokio::test]
