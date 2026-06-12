@@ -152,16 +152,6 @@ if [[ -n "${BINARY_SRC}" ]] && [[ -n "${SOURCE_DIR}" ]]; then
     die "--binary/--binary-src and --source-dir are mutually exclusive."
 fi
 
-# -- Root / system checks ------------------------------------------------------
-
-if [[ "$(id -u)" -ne 0 ]]; then
-    die "This script must be run as root (e.g. sudo $0)"
-fi
-
-if ! command -v systemctl >/dev/null 2>&1; then
-    die "systemd is required but 'systemctl' was not found."
-fi
-
 # -- Existing install discovery ------------------------------------------------
 
 strip_quotes() {
@@ -212,10 +202,9 @@ read_existing_unit_paths() {
     fi
 }
 
-read_existing_unit_paths
-
 DEST_BINARY="${INSTALL_DIR}/${BINARY_NAME}"
 CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"
+UNIT_SRC="${SCRIPT_DIR}/../packaging/${SERVICE_NAME}.service"
 
 # -- Source-build support ------------------------------------------------------
 
@@ -309,51 +298,6 @@ Ensure build dependencies are installed (gcc, pkg-config, libssl-dev or equivale
     info "Built binary: ${BINARY_SRC}"
 }
 
-if [[ -z "${BINARY_SRC}" ]]; then
-    if [[ -z "${SOURCE_DIR}" ]]; then
-        detect_source_dir
-    fi
-
-    if [[ -n "${SOURCE_DIR}" ]]; then
-        build_from_source
-    else
-        die "Missing required flag: --binary PATH, --binary-src PATH, or --source-dir DIR
-Usage: sudo $0 --source-dir ./amneziawg-proxy
-       sudo $0 --binary ./target/release/amneziawg-proxy"
-    fi
-fi
-
-# -- Validation ----------------------------------------------------------------
-
-if [[ ! -f "${BINARY_SRC}" ]]; then
-    die "Source binary not found: ${BINARY_SRC}"
-fi
-
-if [[ ! -x "${BINARY_SRC}" ]]; then
-    chmod +x -- "${BINARY_SRC}" || die "Source binary is not executable: ${BINARY_SRC}"
-fi
-
-if [[ ! -d "${INSTALL_DIR}" ]]; then
-    die "Install directory does not exist: ${INSTALL_DIR}
-Has the proxy been installed? Run: sudo ./amneziawg-proxy.sh"
-fi
-
-if [[ ! -f "${DEST_BINARY}" ]]; then
-    die "Existing binary not found at: ${DEST_BINARY}
-Has the proxy been installed? Run: sudo ./amneziawg-proxy.sh"
-fi
-
-if [[ ! -f "${SYSTEMD_UNIT_DEST}" ]]; then
-    die "Systemd unit not found at: ${SYSTEMD_UNIT_DEST}
-Has the proxy been installed? Run: sudo ./amneziawg-proxy.sh"
-fi
-
-UNIT_SRC="${SCRIPT_DIR}/../packaging/${SERVICE_NAME}.service"
-if [[ "${REFRESH_UNIT}" == "true" && ! -f "${UNIT_SRC}" ]]; then
-    die "Unit file not found in repository: ${UNIT_SRC}
-Make sure you cloned the full repository."
-fi
-
 # -- Confirmation / service helpers -------------------------------------------
 
 confirm() {
@@ -400,6 +344,31 @@ escape_sed_replacement() {
     printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
 }
 
+path_in_array() {
+    local needle="$1"
+    shift
+
+    local path
+    for path in "$@"; do
+        if [[ "${path}" == "${needle}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+append_unique_paths_from_unit_line() {
+    local unit_line="$1"
+    local -n target_paths="$2"
+
+    local path
+    for path in ${unit_line#*=}; do
+        if [[ -n "${path}" ]] && ! path_in_array "${path}" "${target_paths[@]}"; then
+            target_paths+=("${path}")
+        fi
+    done
+}
+
 refresh_unit_file() {
     info "Refreshing systemd unit..."
 
@@ -411,24 +380,17 @@ refresh_unit_file() {
     fi
 
     local -a read_only_paths=("/etc/amnezia" "${CONFIG_DIR}")
+    local -a read_write_paths=("${DATA_DIR}")
     if [[ -f "${SYSTEMD_UNIT_DEST}" ]]; then
-        local existing_ro path
+        local existing_ro existing_rw
         existing_ro="$(grep -m1 '^ReadOnlyPaths=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null || true)"
         if [[ -n "${existing_ro}" ]]; then
-            for path in ${existing_ro#ReadOnlyPaths=}; do
-                if [[ -n "${path}" ]]; then
-                    local existing_path found=false
-                    for existing_path in "${read_only_paths[@]}"; do
-                        if [[ "${existing_path}" == "${path}" ]]; then
-                            found=true
-                            break
-                        fi
-                    done
-                    if [[ "${found}" != "true" ]]; then
-                        read_only_paths+=("${path}")
-                    fi
-                fi
-            done
+            append_unique_paths_from_unit_line "${existing_ro}" read_only_paths
+        fi
+
+        existing_rw="$(grep -m1 '^ReadWritePaths=' "${SYSTEMD_UNIT_DEST}" 2>/dev/null || true)"
+        if [[ -n "${existing_rw}" ]]; then
+            append_unique_paths_from_unit_line "${existing_rw}" read_write_paths
         fi
     fi
 
@@ -436,7 +398,7 @@ refresh_unit_file() {
     esc_exec="$(escape_sed_replacement "ExecStart=${DEST_BINARY} ${CONFIG_FILE}")"
     esc_workdir="$(escape_sed_replacement "WorkingDirectory=${DATA_DIR}")"
     esc_ro="$(escape_sed_replacement "ReadOnlyPaths=${read_only_paths[*]}")"
-    esc_rw="$(escape_sed_replacement "ReadWritePaths=${DATA_DIR}")"
+    esc_rw="$(escape_sed_replacement "ReadWritePaths=${read_write_paths[*]}")"
 
     sed -i "s|^ExecStart=.*|${esc_exec}|" "${tmp_unit}"
     sed -i "s|^WorkingDirectory=.*|${esc_workdir}|" "${tmp_unit}"
@@ -447,6 +409,64 @@ refresh_unit_file() {
     chmod 0644 "${SYSTEMD_UNIT_DEST}"
     systemctl daemon-reload
     info "Refreshed unit file: ${SYSTEMD_UNIT_DEST}"
+}
+
+prepare_upgrade() {
+    if [[ "$(id -u)" -ne 0 ]]; then
+        die "This script must be run as root (e.g. sudo $0)"
+    fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        die "systemd is required but 'systemctl' was not found."
+    fi
+
+    read_existing_unit_paths
+
+    DEST_BINARY="${INSTALL_DIR}/${BINARY_NAME}"
+    CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"
+    UNIT_SRC="${SCRIPT_DIR}/../packaging/${SERVICE_NAME}.service"
+
+    if [[ -z "${BINARY_SRC}" ]]; then
+        if [[ -z "${SOURCE_DIR}" ]]; then
+            detect_source_dir
+        fi
+
+        if [[ -n "${SOURCE_DIR}" ]]; then
+            build_from_source
+        else
+            die "Missing required flag: --binary PATH, --binary-src PATH, or --source-dir DIR
+Usage: sudo $0 --source-dir ./amneziawg-proxy
+       sudo $0 --binary ./target/release/amneziawg-proxy"
+        fi
+    fi
+
+    if [[ ! -f "${BINARY_SRC}" ]]; then
+        die "Source binary not found: ${BINARY_SRC}"
+    fi
+
+    if [[ ! -x "${BINARY_SRC}" ]]; then
+        chmod +x -- "${BINARY_SRC}" || die "Source binary is not executable: ${BINARY_SRC}"
+    fi
+
+    if [[ ! -d "${INSTALL_DIR}" ]]; then
+        die "Install directory does not exist: ${INSTALL_DIR}
+Has the proxy been installed? Run: sudo ./amneziawg-proxy.sh"
+    fi
+
+    if [[ ! -f "${DEST_BINARY}" ]]; then
+        die "Existing binary not found at: ${DEST_BINARY}
+Has the proxy been installed? Run: sudo ./amneziawg-proxy.sh"
+    fi
+
+    if [[ ! -f "${SYSTEMD_UNIT_DEST}" ]]; then
+        die "Systemd unit not found at: ${SYSTEMD_UNIT_DEST}
+Has the proxy been installed? Run: sudo ./amneziawg-proxy.sh"
+    fi
+
+    if [[ "${REFRESH_UNIT}" == "true" && ! -f "${UNIT_SRC}" ]]; then
+        die "Unit file not found in repository: ${UNIT_SRC}
+Make sure you cloned the full repository."
+    fi
 }
 
 print_plan() {
@@ -482,6 +502,7 @@ print_plan() {
 # -- Main upgrade --------------------------------------------------------------
 
 main() {
+    prepare_upgrade
     detect_service_state
     print_plan
 
@@ -492,8 +513,13 @@ main() {
 
     if [[ "${SERVICE_WAS_ACTIVE}" == "true" ]]; then
         info "Stopping service..."
-        systemctl stop "${SERVICE_NAME}" && info "Service stopped: ${SERVICE_NAME}" || \
-            warn "Could not stop ${SERVICE_NAME} (may already be stopped)"
+        if systemctl stop "${SERVICE_NAME}"; then
+            info "Service stopped: ${SERVICE_NAME}"
+        elif systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+            die "Failed to stop ${SERVICE_NAME}; service is still active. Upgrade aborted before replacing the binary."
+        else
+            warn "Could not confirm a clean stop for ${SERVICE_NAME}, but it is no longer active."
+        fi
     else
         info "Service not active; skipping stop."
     fi
@@ -541,4 +567,6 @@ Check service logs with: sudo journalctl -u ${SERVICE_NAME} -e"
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
