@@ -202,10 +202,13 @@ fn build_proxy_status_snapshot(
         .map(|session| {
             let last_activity_ms_ago = session_now_ms.saturating_sub(session.last_active_ms);
             let metric = metrics.get(&session.client_addr).map(|m| m.snapshot());
+            // In auto mode a client with no detected cover protocol is plain
+            // AWG pass-through (the relay applies no outbound transform), so
+            // report "none" rather than echoing the configured mode string.
             let protocol = fixed_protocol
                 .or_else(|| protocols.get(&session.client_addr).map(|p| *p))
                 .map(|protocol| protocol.to_string())
-                .unwrap_or_else(|| imitate_protocol.to_string());
+                .unwrap_or_else(|| "none".to_string());
             let backend_socket_addr = session.backend_local_addr.map(|addr| addr.to_string());
 
             ProxySessionStatus {
@@ -1513,6 +1516,37 @@ mod tests {
         assert_eq!(session.tx_bytes, 800);
         assert_eq!(session.probe_packets, 1);
         assert!(session.backend_socket_addr.is_some());
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_reports_none_when_no_protocol_detected() {
+        // Auto mode, client never sent recognisable cover traffic: the session
+        // is plain AWG pass-through and must be reported as "none", not as the
+        // configured mode string (and never as a junk-misdetected protocol).
+        let backend: SocketAddr = "127.0.0.1:51821".parse().unwrap();
+        let sessions = SessionTable::new(backend, Duration::from_secs(300), 1000);
+        let metrics = MetricsStore::new(16, 1000);
+        let protocols = DashMap::new();
+        let client: SocketAddr = "203.0.113.10:45678".parse().unwrap();
+
+        sessions.get_or_create(client).await.unwrap();
+        metrics.get_or_create(client).unwrap();
+
+        let status = build_proxy_status_snapshot(
+            &sessions,
+            &metrics,
+            &protocols,
+            None,
+            "0.0.0.0:51820".parse().unwrap(),
+            "127.0.0.1:51821",
+            51821,
+            "auto",
+            300,
+        );
+
+        assert_eq!(status.imitate_protocol, "auto");
+        assert_eq!(status.sessions.len(), 1);
+        assert_eq!(status.sessions[0].obfuscation_protocol, "none");
     }
 
     #[tokio::test]

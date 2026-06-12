@@ -319,7 +319,12 @@ status_interval_secs = 5
 
 Each session entry includes the remote client address, proxy listen port,
 backend target port, detected/fixed obfuscation protocol, last activity time,
-packet counts, and byte counts. The file is intended for local trusted
+packet counts, and byte counts. The per-session `backend_socket_addr` field
+is the proxy's local socket toward the AWG interface — it equals the peer
+`endpoint` shown by `awg show`, which is how `amneziawg-web` maps a proxy
+session to a user. In `auto` mode the `obfuscation_protocol` field reports
+`"none"` for clients whose traffic carries no recognised cover protocol
+(plain AmneziaWG pass-through). The file is intended for local trusted
 consumers; expose it through the authenticated web panel rather than serving
 it directly.
 

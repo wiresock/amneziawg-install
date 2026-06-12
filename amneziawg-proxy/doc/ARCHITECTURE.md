@@ -220,15 +220,26 @@ AWG packet (backend → client):
 
 ### DNS Imitation
 
-**Probe detection** (`detect_protocol`):
+**Probe detection** (`detect_protocol` → `is_plausible_dns_query`):
 ```
 data.len() >= 12
   AND (flags & 0xF800) == 0x0000   (QR=0, standard opcode)
-  AND QDCOUNT >= 1
+  AND QDCOUNT == 1
+  AND QNAME walk valid             (uncompressed labels, terminated in-bounds)
+  AND QTYPE + QCLASS present
+  AND QCLASS in {IN, CH, HS, ANY}
 ```
 Flags are bytes 2-3 (big-endian), QDCOUNT is bytes 4-5 (big-endian), per
 RFC 1035 §4.1.1. The mask `0xF800` checks QR bit (must be 0 = query) and
-opcode (must be 0 = standard query).
+opcode (must be 0 = standard query). Bytes after the question section are
+allowed (EDNS OPT records).
+
+The question section is validated end-to-end because the header flags alone
+are far too weak a signal: AmneziaWG junk packets are uniformly random and
+~3% of them pass the flags/QDCOUNT check, so in `auto` mode a non-masking
+client would sooner or later be mislabeled (and answered) as DNS. A random
+packet essentially never survives the QNAME label walk *and* lands one of
+the four accepted QCLASS values.
 
 **Probe response** (`generate_dns_servfail`):
 A valid DNS SERVFAIL response (RFC 1035 §4.1):
@@ -545,7 +556,8 @@ Byte  Value   Meaning
 ```
 
 **Proxy processing:**
-1. `detect_protocol()` → `len ≥ 12`, `flags & 0xF800 = 0x0000`, `QDCOUNT = 1`
+1. `detect_protocol()` → `len ≥ 12`, `flags & 0xF800 = 0x0000`, `QDCOUNT = 1`,
+   QNAME `example.com` walks cleanly to the root label, QCLASS = IN
    → `Protocol::Dns`
 2. `try_acquire_probe()` → `true`
 3. `generate_response(Dns, &data)` → SERVFAIL with echoed question section

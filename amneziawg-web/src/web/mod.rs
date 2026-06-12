@@ -225,6 +225,10 @@ pub struct ProxySessionDto {
     pub target_addr: String,
     pub target_port: u16,
     pub backend_socket_addr: Option<String>,
+    /// Peer served by this session, resolved by matching
+    /// `backend_socket_addr` against the peers' interface endpoints.
+    pub peer_id: Option<i64>,
+    pub peer_name: Option<String>,
     pub obfuscation_protocol: String,
     pub last_activity_at: Option<DateTime<Utc>>,
     pub last_activity_ms_ago: u64,
@@ -364,6 +368,11 @@ pub struct PeerSummaryDto {
     /// Comma-separated list of allowed CIDRs.
     pub allowed_ips: String,
     pub endpoint: Option<String>,
+    /// Real remote address of the client when it connects through
+    /// amneziawg-proxy (the interface `endpoint` is then the proxy's local
+    /// backend socket). Resolved from the active proxy session whose backend
+    /// socket equals `endpoint`.
+    pub proxy_remote_addr: Option<String>,
     pub latest_handshake_at: Option<DateTime<Utc>>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
@@ -399,6 +408,9 @@ pub struct PeerDetailDto {
     pub config_path: Option<String>,
     pub allowed_ips: String,
     pub endpoint: Option<String>,
+    /// Real remote address of the client when it connects through
+    /// amneziawg-proxy (see `PeerSummaryDto::proxy_remote_addr`).
+    pub proxy_remote_addr: Option<String>,
     pub latest_handshake_at: Option<DateTime<Utc>>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
@@ -705,6 +717,8 @@ async fn read_proxy_sessions_status(path: &FsPath) -> ProxySessionsDto {
             target_addr: session.target_addr,
             target_port: session.target_port,
             backend_socket_addr: session.backend_socket_addr,
+            peer_id: None,
+            peer_name: None,
             obfuscation_protocol: session.obfuscation_protocol,
             last_activity_at: unix_millis_to_utc(session.last_activity_unix_ms),
             last_activity_ms_ago: session.last_activity_ms_ago,
@@ -732,6 +746,95 @@ async fn read_proxy_sessions_status(path: &FsPath) -> ProxySessionsDto {
     }
 }
 
+/// Canonical form of a socket-address string for endpoint comparison, so
+/// textual variations (e.g. IPv6 zero-compression) cannot break a match.
+/// Strings that do not parse are compared verbatim.
+fn normalize_socket_addr(raw: &str) -> String {
+    raw.trim()
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| raw.trim().to_string())
+}
+
+/// Resolve which peer each proxy session serves.
+///
+/// All proxied AWG traffic reaches the interface from the proxy's per-session
+/// backend socket, so the `endpoint` the interface reports for a peer equals
+/// that session's `backend_socket_addr`. Matching the two yields the user
+/// behind each session.
+fn associate_proxy_sessions_with_peers(status: &mut ProxySessionsDto, peers: &[PeerSummaryDto]) {
+    if status.sessions.is_empty() {
+        return;
+    }
+    let by_endpoint: std::collections::HashMap<String, (i64, &str)> = peers
+        .iter()
+        .filter_map(|peer| {
+            let endpoint = peer.endpoint.as_deref()?;
+            Some((
+                normalize_socket_addr(endpoint),
+                (peer.id, peer.name.as_str()),
+            ))
+        })
+        .collect();
+    for session in &mut status.sessions {
+        let Some(backend_addr) = session.backend_socket_addr.as_deref() else {
+            continue;
+        };
+        if let Some((id, name)) = by_endpoint.get(&normalize_socket_addr(backend_addr)) {
+            session.peer_id = Some(*id);
+            session.peer_name = Some((*name).to_string());
+        }
+    }
+}
+
+/// Map of normalized backend socket → session remote address, the inverse
+/// direction of [`associate_proxy_sessions_with_peers`]: it resolves the real
+/// client address sitting behind a proxied peer's interface endpoint.
+///
+/// Returns an empty map when the status file is unavailable or stale, so
+/// endpoints are never relabeled from sessions that may no longer exist.
+fn proxy_remote_addr_map(status: &ProxySessionsDto) -> std::collections::HashMap<String, &str> {
+    if !status.available || status.stale {
+        return std::collections::HashMap::new();
+    }
+    status
+        .sessions
+        .iter()
+        .filter_map(|session| {
+            let backend = session.backend_socket_addr.as_deref()?;
+            Some((normalize_socket_addr(backend), session.remote_addr.as_str()))
+        })
+        .collect()
+}
+
+/// Fill `proxy_remote_addr` for every peer whose interface endpoint is the
+/// backend socket of an active proxy session.
+fn annotate_peers_with_proxy_remote(peers: &mut [PeerSummaryDto], status: &ProxySessionsDto) {
+    let by_backend = proxy_remote_addr_map(status);
+    if by_backend.is_empty() {
+        return;
+    }
+    for peer in peers.iter_mut() {
+        let Some(endpoint) = peer.endpoint.as_deref() else {
+            continue;
+        };
+        if let Some(remote) = by_backend.get(&normalize_socket_addr(endpoint)) {
+            peer.proxy_remote_addr = Some((*remote).to_string());
+        }
+    }
+}
+
+/// Single-peer variant of [`annotate_peers_with_proxy_remote`] for the
+/// detail DTO.
+fn annotate_peer_detail_with_proxy_remote(dto: &mut PeerDetailDto, status: &ProxySessionsDto) {
+    let Some(endpoint) = dto.endpoint.as_deref() else {
+        return;
+    };
+    dto.proxy_remote_addr = proxy_remote_addr_map(status)
+        .get(&normalize_socket_addr(endpoint))
+        .map(|remote| (*remote).to_string());
+}
+
 fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
     let last_handshake = epoch_to_utc(row.last_handshake_at);
     let disabled = row.disabled != 0;
@@ -755,6 +858,7 @@ fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
         has_config,
         allowed_ips: row.allowed_ips,
         endpoint: row.endpoint,
+        proxy_remote_addr: None,
         latest_handshake_at: last_handshake,
         rx_bytes: row.rx_bytes as u64,
         tx_bytes: row.tx_bytes as u64,
@@ -808,6 +912,7 @@ fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDt
         config_path: row.config_path,
         allowed_ips: row.allowed_ips,
         endpoint: row.endpoint,
+        proxy_remote_addr: None,
         latest_handshake_at: last_handshake,
         rx_bytes: row.rx_bytes as u64,
         tx_bytes: row.tx_bytes as u64,
@@ -1167,15 +1272,31 @@ async fn list_events_handler(
 }
 
 /// `GET /api/peers` – list all known peers with their current stats.
+///
+/// Peers connected through amneziawg-proxy additionally carry the session's
+/// real remote address in `proxy_remote_addr`.
 async fn list_peers(State(state): State<AppState>) -> ApiResult<Json<Vec<PeerSummaryDto>>> {
     let rows = crate::db::peers::list_all(&state.db.pool).await?;
-    let dtos: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+    let mut dtos: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+    annotate_peers_with_proxy_remote(&mut dtos, &proxy_sessions_status(&state).await);
     Ok(Json(dtos))
 }
 
 /// `GET /api/proxy/sessions` – active client sessions reported by amneziawg-proxy.
+///
+/// Sessions are annotated with the peer they serve (`peer_id`/`peer_name`)
+/// by matching backend sockets against peer endpoints. A peer lookup failure
+/// only drops the annotation — the proxy status itself is still returned.
 async fn get_proxy_sessions(State(state): State<AppState>) -> Json<ProxySessionsDto> {
-    Json(proxy_sessions_status(&state).await)
+    let mut status = proxy_sessions_status(&state).await;
+    match crate::db::peers::list_all(&state.db.pool).await {
+        Ok(rows) => {
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+            associate_proxy_sessions_with_peers(&mut status, &peers);
+        }
+        Err(e) => error!(error = ?e, "cannot load peers for proxy session association"),
+    }
+    Json(status)
 }
 
 /// `GET /api/peers/:id` – return full details for one peer.
@@ -1197,7 +1318,8 @@ async fn get_peer(
             let public_key = peer_row.public_key.clone();
             let snapshots =
                 crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
-            let dto = peer_row_to_detail(peer_row, snapshots);
+            let mut dto = peer_row_to_detail(peer_row, snapshots);
+            annotate_peer_detail_with_proxy_remote(&mut dto, &proxy_sessions_status(&state).await);
             Ok(Json(dto).into_response())
         }
     }
@@ -1908,7 +2030,11 @@ async fn patch_peer(
                     let public_key = row.public_key.clone();
                     let snapshots =
                         crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
-                    let dto = peer_row_to_detail(row, snapshots);
+                    let mut dto = peer_row_to_detail(row, snapshots);
+                    annotate_peer_detail_with_proxy_remote(
+                        &mut dto,
+                        &proxy_sessions_status(&state).await,
+                    );
                     Ok(Json(dto).into_response())
                 }
             }
@@ -1924,10 +2050,12 @@ async fn page_peer_list(
     headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let rows = crate::db::peers::list_all(&state.db.pool).await?;
-    let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+    let mut peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
     let csrf = session_csrf_from_headers(&state, &headers);
     let status = system_status(&state);
-    let proxy_sessions = proxy_sessions_status(&state).await;
+    let mut proxy_sessions = proxy_sessions_status(&state).await;
+    associate_proxy_sessions_with_peers(&mut proxy_sessions, &peers);
+    annotate_peers_with_proxy_remote(&mut peers, &proxy_sessions);
     Ok(Html(render_peer_list(&peers, &csrf, &status, &proxy_sessions)).into_response())
 }
 
@@ -1949,7 +2077,8 @@ async fn page_peer_detail(
             let snapshots =
                 crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
             let events = list_events(&state.db.pool, Some(id), None, 20).await?;
-            let dto = peer_row_to_detail(peer_row, snapshots);
+            let mut dto = peer_row_to_detail(peer_row, snapshots);
+            annotate_peer_detail_with_proxy_remote(&mut dto, &proxy_sessions_status(&state).await);
             let csrf = session_csrf_from_headers(&state, &headers);
             Ok(Html(render_peer_detail(&dto, &csrf, &events)).into_response())
         }
@@ -2425,7 +2554,8 @@ async fn post_remove_user_form(
         let public_key = peer.public_key.clone();
         let snapshots = crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
         let events = list_events(&state.db.pool, Some(id), None, 20).await?;
-        let dto = peer_row_to_detail(peer, snapshots);
+        let mut dto = peer_row_to_detail(peer, snapshots);
+        annotate_peer_detail_with_proxy_remote(&mut dto, &proxy_sessions_status(&state).await);
         let csrf = session_csrf_from_headers(&state, &headers);
         let message = format!("Remove failed: peer is not managed by installer: {e}");
         return Ok(Html(render_peer_detail_with_error(
@@ -2468,7 +2598,8 @@ async fn post_remove_user_form(
             let snapshots =
                 crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
             let events = list_events(&state.db.pool, Some(id), None, 20).await?;
-            let dto = peer_row_to_detail(peer_row, snapshots);
+            let mut dto = peer_row_to_detail(peer_row, snapshots);
+            annotate_peer_detail_with_proxy_remote(&mut dto, &proxy_sessions_status(&state).await);
             let csrf = session_csrf_from_headers(&state, &headers);
             Ok(Html(render_peer_detail_with_error(&dto, &csrf, &events, message)).into_response())
         }
@@ -2883,10 +3014,17 @@ fn render_proxy_sessions(status: &ProxySessionsDto) -> String {
     } else {
         buf.push_str(
             "<table class=\"proxy-session-table\">\n\
-             <tr><th>Remote client</th><th>Proxy port</th><th>Target port</th>\
+             <tr><th>User</th><th>Remote client</th><th>Proxy port</th><th>Target port</th>\
              <th>Protocol</th><th>Last activity</th><th>RX</th><th>TX</th></tr>\n",
         );
         for session in &status.sessions {
+            let user = match (session.peer_id, session.peer_name.as_deref()) {
+                (Some(id), Some(name)) => {
+                    format!(r#"<a href="/peers/{id}">{name}</a>"#, name = esc(name))
+                }
+                (None, Some(name)) => esc(name),
+                _ => "–".to_string(),
+            };
             let last_activity = session
                 .last_activity_at
                 .map(|ts| {
@@ -2902,8 +3040,8 @@ fn render_proxy_sessions(status: &ProxySessionsDto) -> String {
                 session.rx_packets, session.tx_packets, session.probe_packets
             );
             buf.push_str(&format!(
-                "<tr><td><code>{remote}</code></td><td>{proxy_port}</td><td>{target_port}</td>\
-                 <td>{protocol}</td><td>{last_activity}</td>\
+                "<tr><td>{user}</td><td><code>{remote}</code></td><td>{proxy_port}</td>\
+                 <td>{target_port}</td><td>{protocol}</td><td>{last_activity}</td>\
                  <td title=\"{title}\">{rx}</td><td title=\"{title}\">{tx}</td></tr>\n",
                 remote = esc(&session.remote_addr),
                 proxy_port = session.local_proxy_port,
@@ -2950,6 +3088,7 @@ fn html_head(title: &str) -> String {
   .proxy-session-table {{ margin-bottom: 1rem; }}
   .warning {{ color: #9a5a00; font-weight: 700; }}
   .counter-scope {{ display: inline-block; margin-left: .35rem; padding: .1rem .45rem; border: 1px solid #d6e2f0; border-radius: 999px; background: #f4f8fd; color: #496277; font-size: .78rem; }}
+  .proxy-hint {{ display: inline-block; margin-left: .25rem; padding: 0 .4rem; border: 1px solid #d6e2f0; border-radius: 999px; background: #f4f8fd; color: #496277; font-size: .72rem; vertical-align: .05rem; }}
   .th-hint {{ display: block; margin-top: .1rem; color: #777; font-size: .72rem; font-weight: 400; }}
   .back {{ margin-bottom: 1rem; display: block; }}
   .edit-form {{ margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; max-width: 480px; }}
@@ -3074,6 +3213,28 @@ fn render_login_page_inner(error_html: &str, csrf_token: &str) -> String {
     buf
 }
 
+/// Render an endpoint table cell.
+///
+/// For a peer connected through amneziawg-proxy the interface endpoint is the
+/// proxy's loopback backend socket, which tells an admin nothing — show the
+/// session's real remote address with a "proxy" pill instead, and keep the
+/// interface-visible socket in the tooltip.
+fn render_endpoint_cell(endpoint: Option<&str>, proxy_remote_addr: Option<&str>) -> String {
+    match (proxy_remote_addr, endpoint) {
+        (Some(remote), Some(local)) => format!(
+            r#"<span title="via amneziawg-proxy; interface endpoint: {local}">{remote} <span class="proxy-hint">proxy</span></span>"#,
+            local = esc(local),
+            remote = esc(remote),
+        ),
+        (Some(remote), None) => format!(
+            r#"<span title="via amneziawg-proxy">{remote} <span class="proxy-hint">proxy</span></span>"#,
+            remote = esc(remote),
+        ),
+        (None, Some(endpoint)) => esc(endpoint),
+        (None, None) => "–".to_string(),
+    }
+}
+
 fn render_peer_list(
     peers: &[PeerSummaryDto],
     csrf_token: &str,
@@ -3125,11 +3286,8 @@ fn render_peer_list_inner(
                 id = p.id,
                 name = esc(&p.name)
             );
-            let endpoint = p
-                .endpoint
-                .as_deref()
-                .map(esc)
-                .unwrap_or_else(|| "–".to_string());
+            let endpoint =
+                render_endpoint_cell(p.endpoint.as_deref(), p.proxy_remote_addr.as_deref());
             let handshake = p
                 .latest_handshake_at
                 .map(|ts| esc(&fmt_last_handshake(ts, now)))
@@ -3273,8 +3431,11 @@ fn render_peer_detail_inner(
         "<tr><th>Identity</th><td>{}</td></tr>\n",
         identity_badge(&dto.identity_status)
     ));
-    if let Some(ref ep) = dto.endpoint {
-        buf.push_str(&format!("<tr><th>Endpoint</th><td>{}</td></tr>\n", esc(ep)));
+    if dto.endpoint.is_some() {
+        buf.push_str(&format!(
+            "<tr><th>Endpoint</th><td>{}</td></tr>\n",
+            render_endpoint_cell(dto.endpoint.as_deref(), dto.proxy_remote_addr.as_deref())
+        ));
     }
     let handshake = dto
         .latest_handshake_at
@@ -3667,7 +3828,10 @@ mod tests {
     }
 
     fn write_proxy_status_file(path: &FsPath) {
-        let now_ms = Utc::now().timestamp_millis();
+        write_proxy_status_file_generated_at(path, Utc::now().timestamp_millis());
+    }
+
+    fn write_proxy_status_file_generated_at(path: &FsPath, now_ms: i64) {
         let json = format!(
             r#"{{
   "schema_version": 1,
@@ -3732,6 +3896,254 @@ mod tests {
         assert_eq!(json["sessions"][0]["obfuscation_protocol"], "dns");
         assert_eq!(json["sessions"][0]["rx_bytes"], 2048);
         assert!(json["sessions"][0]["last_activity_at"].is_string());
+        // No peer has a matching endpoint, so the session stays unassociated.
+        assert!(json["sessions"][0]["peer_id"].is_null());
+        assert!(json["sessions"][0]["peer_name"].is_null());
+    }
+
+    /// Insert a peer row carrying an interface endpoint, as the poller stores
+    /// it from `awg show` output.
+    async fn insert_peer_with_endpoint(
+        db: &Database,
+        public_key: &str,
+        display_name: &str,
+        endpoint: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO peers (public_key, display_name, allowed_ips, endpoint)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(public_key)
+        .bind(display_name)
+        .bind("10.8.0.2/32")
+        .bind(endpoint)
+        .execute(&db.pool)
+        .await
+        .expect("insert peer")
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn api_proxy_sessions_associates_sessions_with_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let status_file = dir.path().join("sessions.json");
+        write_proxy_status_file(&status_file);
+        let db = test_db().await;
+        // Endpoint equals the fixture session's backend_socket_addr; a second
+        // peer with an unrelated endpoint must not be picked up.
+        let peer_id =
+            insert_peer_with_endpoint(&db, "pk-proxied-peer", "iphone", "127.0.0.1:40000").await;
+        insert_peer_with_endpoint(&db, "pk-direct-peer", "laptop", "198.51.100.7:51820").await;
+        let app = test_router_with_proxy_sessions_file(db, status_file);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/proxy/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["sessions"][0]["peer_id"], peer_id);
+        assert_eq!(json["sessions"][0]["peer_name"], "iphone");
+    }
+
+    #[tokio::test]
+    async fn peer_list_page_links_proxy_session_to_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let status_file = dir.path().join("sessions.json");
+        write_proxy_status_file(&status_file);
+        let db = test_db().await;
+        let peer_id =
+            insert_peer_with_endpoint(&db, "pk-proxied-peer", "iphone", "127.0.0.1:40000").await;
+        let app = test_router_with_proxy_sessions_file(db, status_file);
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+
+        // The proxy-session table (after the "Active proxy sessions" heading)
+        // must link the session to the peer's detail page.
+        let proxy_section = html
+            .split("Active proxy sessions")
+            .nth(1)
+            .expect("proxy session section rendered");
+        assert!(
+            proxy_section.contains(&format!(r#"<a href="/peers/{peer_id}">iphone</a>"#)),
+            "proxy session must link to the matched peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_peers_includes_proxy_remote_addr() {
+        let dir = tempfile::tempdir().unwrap();
+        let status_file = dir.path().join("sessions.json");
+        write_proxy_status_file(&status_file);
+        let db = test_db().await;
+        insert_peer_with_endpoint(&db, "pk-proxied-peer", "iphone", "127.0.0.1:40000").await;
+        insert_peer_with_endpoint(&db, "pk-direct-peer", "laptop", "198.51.100.7:51820").await;
+        let app = test_router_with_proxy_sessions_file(db, status_file);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Proxied peer carries the session's real remote address; the peer
+        // connecting directly keeps a null proxy_remote_addr.
+        assert_eq!(json[0]["proxy_remote_addr"], "203.0.113.10:45678");
+        assert!(json[1]["proxy_remote_addr"].is_null());
+    }
+
+    #[tokio::test]
+    async fn api_peers_skips_proxy_remote_addr_when_status_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let status_file = dir.path().join("sessions.json");
+        // Stale status: generated well past PROXY_STATUS_STALE_AFTER_SECS, so
+        // the listed sessions may no longer exist and must not relabel
+        // endpoints.
+        write_proxy_status_file_generated_at(
+            &status_file,
+            Utc::now().timestamp_millis() - (PROXY_STATUS_STALE_AFTER_SECS + 60) * 1000,
+        );
+        let db = test_db().await;
+        insert_peer_with_endpoint(&db, "pk-proxied-peer", "iphone", "127.0.0.1:40000").await;
+        let app = test_router_with_proxy_sessions_file(db, status_file);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(json[0]["proxy_remote_addr"].is_null());
+    }
+
+    #[tokio::test]
+    async fn api_peer_detail_includes_proxy_remote_addr() {
+        let dir = tempfile::tempdir().unwrap();
+        let status_file = dir.path().join("sessions.json");
+        write_proxy_status_file(&status_file);
+        let db = test_db().await;
+        let peer_id =
+            insert_peer_with_endpoint(&db, "pk-proxied-peer", "iphone", "127.0.0.1:40000").await;
+        let app = test_router_with_proxy_sessions_file(db, status_file);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{peer_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["endpoint"], "127.0.0.1:40000");
+        assert_eq!(json["proxy_remote_addr"], "203.0.113.10:45678");
+    }
+
+    #[tokio::test]
+    async fn peer_list_page_shows_proxy_remote_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let status_file = dir.path().join("sessions.json");
+        write_proxy_status_file(&status_file);
+        let db = test_db().await;
+        insert_peer_with_endpoint(&db, "pk-proxied-peer", "iphone", "127.0.0.1:40000").await;
+        let app = test_router_with_proxy_sessions_file(db, status_file);
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+
+        // The peers table (before the proxy section) shows the real remote
+        // address with a proxy pill; the interface endpoint moves into the
+        // tooltip.
+        let peers_section = html
+            .split("Active proxy sessions")
+            .next()
+            .expect("peer table rendered");
+        assert!(
+            peers_section.contains(r#"203.0.113.10:45678 <span class="proxy-hint">proxy</span>"#),
+            "proxied peer must show the session's remote address"
+        );
+        assert!(
+            peers_section.contains("interface endpoint: 127.0.0.1:40000"),
+            "interface endpoint must be preserved in the tooltip"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_shows_proxy_remote_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let status_file = dir.path().join("sessions.json");
+        write_proxy_status_file(&status_file);
+        let db = test_db().await;
+        let peer_id =
+            insert_peer_with_endpoint(&db, "pk-proxied-peer", "iphone", "127.0.0.1:40000").await;
+        let app = test_router_with_proxy_sessions_file(db, status_file);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{peer_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+
+        assert!(
+            html.contains(r#"203.0.113.10:45678 <span class="proxy-hint">proxy</span>"#),
+            "detail page endpoint must show the session's remote address"
+        );
+        assert!(html.contains("interface endpoint: 127.0.0.1:40000"));
     }
 
     #[tokio::test]

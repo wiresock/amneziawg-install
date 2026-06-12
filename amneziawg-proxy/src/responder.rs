@@ -181,9 +181,13 @@ fn is_quic_version(version: u32) -> bool {
 /// - **STUN**: RFC 5389/8489 header with the top two message-type bits clear,
 ///   4-byte-aligned length, magic cookie `0x2112A442`, exact datagram length,
 ///   and Binding Request type.
-/// - **DNS**: At least 12 bytes, bytes 2-3 encode flags with QR=0 (query)
-///   and a standard query opcode, i.e. `(flags & 0xF800) == 0x0000`, plus
-///   QDCOUNT >= 1 in bytes 4-5 (RFC 1035 §4.1.1).
+/// - **DNS**: A complete, well-formed standard query: QR=0, standard opcode,
+///   QDCOUNT == 1, a valid uncompressed QNAME followed by QTYPE and a
+///   plausible QCLASS (see `is_plausible_dns_query`). Header flags alone are
+///   deliberately not enough: AmneziaWG junk packets are uniformly random and
+///   ~3% of them pass a flags-only check (top five bits of byte 2 clear),
+///   which in auto mode would eventually mislabel every non-masking client
+///   as DNS.
 /// - **SIP**: Starts with ASCII `SIP/` or a SIP method keyword followed by a
 ///   space (RFC 3261 §7). We check for `INVITE `, `ACK `, `BYE `, `CANCEL `,
 ///   `INFO `, `MESSAGE `, `NOTIFY `, `OPTIONS `, `REGISTER `, `SUBSCRIBE `,
@@ -234,13 +238,12 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
         }
     }
 
-    // DNS query: >= 12 bytes, QR=0, standard opcode, QDCOUNT >= 1
-    if data.len() >= 12 && !has_stun_cookie {
-        let flags = u16::from_be_bytes([data[2], data[3]]);
-        let qdcount = u16::from_be_bytes([data[4], data[5]]);
-        if flags & 0xF800 == 0x0000 && qdcount >= 1 {
-            return Some(Protocol::Dns);
-        }
+    // DNS query: a complete, well-formed standard query. Strict end-to-end
+    // validation keeps random AmneziaWG junk packets (which pass a
+    // flags-only check ~3% of the time) from locking an auto-mode client
+    // to DNS.
+    if !has_stun_cookie && is_plausible_dns_query(data) {
+        return Some(Protocol::Dns);
     }
 
     // SIP: starts with known SIP method or version prefix.
@@ -295,6 +298,37 @@ pub fn detect_protocol(data: &[u8]) -> Option<Protocol> {
     }
 
     None
+}
+
+/// Returns `true` if `data` parses end-to-end as a plausible DNS standard
+/// query: QR=0 and standard opcode (RFC 1035 §4.1.1), exactly one question,
+/// a valid uncompressed QNAME, and a QTYPE/QCLASS pair where the QCLASS is
+/// one a real client emits — IN(1), CH(3), HS(4), or ANY(255). Trailing bytes
+/// after the question are allowed (EDNS OPT records live there).
+///
+/// This is the acceptance test behind `detect_protocol`'s DNS arm. Unlike a
+/// header-flags-only check it is practically impossible for a random
+/// AmneziaWG junk packet to satisfy: the QNAME label walk must terminate
+/// exactly, and only 4 of 65536 QCLASS values are accepted.
+fn is_plausible_dns_query(data: &[u8]) -> bool {
+    if data.len() < 12 {
+        return false;
+    }
+    let flags = u16::from_be_bytes([data[2], data[3]]);
+    let qdcount = u16::from_be_bytes([data[4], data[5]]);
+    // QR=0 (query), standard opcode, and exactly one question — real
+    // resolvers and probe tools never send multi-question queries.
+    if flags & 0xF800 != 0 || qdcount != 1 {
+        return false;
+    }
+    let Some(qname_end) = dns_qname_end(data, 12) else {
+        return false;
+    };
+    if data.len() < qname_end + 4 {
+        return false;
+    }
+    let qclass = u16::from_be_bytes([data[qname_end + 2], data[qname_end + 3]]);
+    matches!(qclass, 1 | 3 | 4 | 255)
 }
 
 /// Generate a response packet that matches the detected protocol.
@@ -1208,17 +1242,102 @@ mod tests {
         assert_eq!(detect_protocol(&pkt), Some(Protocol::Quic));
     }
 
+    /// Wire bytes of a complete standard query for `name` (dotted), QCLASS IN.
+    fn dns_query_packet(name: &str, qtype: u16, qclass: u16) -> Vec<u8> {
+        let mut pkt = vec![
+            0xAB, 0xCD, // transaction ID
+            0x01, 0x00, // flags: standard query, RD=1
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT = 0
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+        ];
+        for label in name.split('.').filter(|l| !l.is_empty()) {
+            pkt.push(label.len() as u8);
+            pkt.extend_from_slice(label.as_bytes());
+        }
+        pkt.push(0x00); // root label
+        pkt.extend_from_slice(&qtype.to_be_bytes());
+        pkt.extend_from_slice(&qclass.to_be_bytes());
+        pkt
+    }
+
     #[test]
     fn detect_dns_query() {
-        // Standard DNS query
-        let mut pkt = vec![0x00u8; 12];
-        pkt[0] = 0xAB; // TX ID high
-        pkt[1] = 0xCD; // TX ID low
-        pkt[2] = 0x01; // flags: RD=1, QR=0
-        pkt[3] = 0x00;
-        pkt[4] = 0x00; // QDCOUNT = 1
-        pkt[5] = 0x01;
+        // Standard A/IN query with a real QNAME.
+        let pkt = dns_query_packet("www.example.com", 1, 1);
         assert_eq!(detect_protocol(&pkt), Some(Protocol::Dns));
+    }
+
+    #[test]
+    fn detect_dns_query_chaos_class() {
+        // `dig version.bind CH TXT` — the classic fingerprinting probe — must
+        // still be answered, so CHAOS-class queries stay detected as DNS.
+        let pkt = dns_query_packet("version.bind", 16, 3);
+        assert_eq!(detect_protocol(&pkt), Some(Protocol::Dns));
+    }
+
+    #[test]
+    fn detect_dns_query_with_trailing_edns_bytes() {
+        // Real resolvers append an EDNS OPT record after the question; bytes
+        // past the question section must not fail the validation.
+        let mut pkt = dns_query_packet("example.org", 28, 1);
+        pkt[11] = 0x01; // ARCOUNT = 1
+        // Minimal OPT RR: root name, TYPE OPT(41), UDP size 1232, TTL 0, RDLEN 0.
+        pkt.extend_from_slice(&[
+            0x00, 0x00, 0x29, 0x04, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        assert_eq!(detect_protocol(&pkt), Some(Protocol::Dns));
+    }
+
+    #[test]
+    fn detect_dns_rejects_header_only_query() {
+        // A bare 12-byte header advertising QDCOUNT=1 with no question section
+        // is not a well-formed query. The old flags-only heuristic accepted
+        // this shape, which is what random junk packets resemble.
+        let mut pkt = vec![0x00u8; 12];
+        pkt[0] = 0xAB;
+        pkt[1] = 0xCD;
+        pkt[2] = 0x01; // flags: RD=1, QR=0
+        pkt[4] = 0x00;
+        pkt[5] = 0x01; // QDCOUNT = 1
+        assert_eq!(detect_protocol(&pkt), None);
+    }
+
+    #[test]
+    fn detect_dns_rejects_junk_with_query_flags() {
+        // Regression for the auto-mode "defaults to dns" bug: an AmneziaWG
+        // junk packet whose bytes 2-5 happen to pass the flags/QDCOUNT check
+        // must not be classified as DNS — its "QNAME" is random bytes that
+        // fail the label walk (first label length 0xDE has the top bits set).
+        let mut pkt = vec![
+            0x5F, 0x21, // random transaction ID
+            0x00, 0x80, // flags: QR=0, opcode 0 (passes the 0xF800 mask)
+            0x00, 0x01, // QDCOUNT = 1
+            0x13, 0x37, // random
+            0xCA, 0xFE, // random
+            0xBA, 0xBE, // random
+        ];
+        pkt.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x99, 0x77, 0x10]);
+        assert_eq!(detect_protocol(&pkt), None);
+    }
+
+    #[test]
+    fn detect_dns_rejects_multi_question_count() {
+        // Random bytes 4-5 are almost never exactly 0x0001; a "query"
+        // advertising 513 questions is junk, not DNS.
+        let mut pkt = dns_query_packet("www.example.com", 1, 1);
+        pkt[4] = 0x02;
+        pkt[5] = 0x01;
+        assert_eq!(detect_protocol(&pkt), None);
+    }
+
+    #[test]
+    fn detect_dns_rejects_implausible_qclass() {
+        // A valid QNAME walk through random bytes can still happen; the
+        // QCLASS whitelist (IN/CH/HS/ANY) is the final gate.
+        let pkt = dns_query_packet("www.example.com", 1, 0x7A3B);
+        assert_eq!(detect_protocol(&pkt), None);
     }
 
     #[test]
