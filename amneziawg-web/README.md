@@ -47,6 +47,8 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 - **Peer rename / comment** – `PATCH /api/peers/:id` (JSON) and
   `POST /peers/:id` (HTML form) with normalisation and field-level validation.
 - **Traffic history** – counter-reset-safe per-snapshot deltas over 24 h / 7 d / 30 d.
+- **Proxy session visibility** – when `amneziawg-proxy` is enabled, reads its
+  local status file and shows active remote client sessions on the peer list.
 - **Session cookie authentication** – Argon2id password verification,
   32-byte cryptographically random session IDs, configurable TTL.
 - **Bearer token** – optional static token for headless API access.
@@ -201,6 +203,7 @@ All settings are read from environment variables (or a `.env`-style file via sys
 | `AWG_WEB_DB` | `awg-web.db` | Path to SQLite database file (created automatically) |
 | `AWG_CONFIG_DIR` | `/etc/amnezia/amneziawg/clients` | Directory of client `.conf` files |
 | `AWG_POLL_INTERVAL` | `30` | Polling interval in seconds |
+| `AWG_PROXY_SESSIONS_FILE` | `/var/lib/amneziawg-proxy/sessions.json` | Optional proxy active-session status file |
 | `RUST_LOG` | `amneziawg_web=info` | Log level (`error`/`warn`/`info`/`debug`) |
 | `AUTH_ENABLED` | `false` | Enable authentication (set `true` in production) |
 | `AUTH_USERNAME` | `admin` | Admin username |
@@ -231,6 +234,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `PATCH` | `/api/peers/:id` | Yes | Update `display_name` and/or `comment` |
 | `GET` | `/api/peers/:id/history` | Yes | Traffic history (`?range=24h\|7d\|30d`) |
 | `GET` | `/api/system/status` | Yes | System time, boot time, and uptime context for current counters (`server_*` aliases are retained for compatibility) |
+| `GET` | `/api/proxy/sessions` | Yes | Active sessions reported by `amneziawg-proxy` status file |
 | `GET` | `/api/events` | Yes | Audit log (`?peer_id=`, `?event_type=`, `?limit=`) |
 | `POST` | `/api/admin/users` | Yes | JSON API: create user `{"name":"..."}` |
 | `POST` | `/api/admin/users/:id/remove` | Yes | JSON API: remove user |

@@ -17,7 +17,7 @@ fn process_epoch() -> Instant {
 }
 
 /// Milliseconds elapsed since the process epoch.
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     process_epoch().elapsed().as_millis() as u64
 }
 
@@ -51,6 +51,13 @@ pub struct Session {
     last_active: Arc<AtomicU64>,
     /// The client address that owns this session.
     pub client_addr: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub client_addr: SocketAddr,
+    pub backend_local_addr: Option<SocketAddr>,
+    pub last_active_ms: u64,
 }
 
 impl Session {
@@ -178,12 +185,7 @@ impl SessionTable {
                     }
                     if self
                         .session_count
-                        .compare_exchange(
-                            current,
-                            current + 1,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
+                        .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
                         break;
@@ -248,10 +250,7 @@ impl SessionTable {
     }
 
     /// Look up a client address by the local address of its backend socket.
-    pub fn find_client_by_backend_local_addr(
-        &self,
-        local_addr: SocketAddr,
-    ) -> Option<SocketAddr> {
+    pub fn find_client_by_backend_local_addr(&self, local_addr: SocketAddr) -> Option<SocketAddr> {
         for entry in self.sessions.iter() {
             if let Ok(addr) = entry.backend_sock.local_addr() {
                 if addr == local_addr {
@@ -267,6 +266,17 @@ impl SessionTable {
         self.sessions
             .iter()
             .map(|entry| (entry.client_addr, Arc::clone(&entry.backend_sock)))
+            .collect()
+    }
+
+    pub fn snapshots(&self) -> Vec<SessionSnapshot> {
+        self.sessions
+            .iter()
+            .map(|entry| SessionSnapshot {
+                client_addr: entry.client_addr,
+                backend_local_addr: entry.backend_sock.local_addr().ok(),
+                last_active_ms: entry.last_active.load(Ordering::Relaxed),
+            })
             .collect()
     }
 
@@ -303,10 +313,7 @@ mod tests {
         assert!(!is_new2, "second call should return existing session");
 
         // Should return the same socket
-        assert_eq!(
-            sock1.local_addr().unwrap(),
-            sock2.local_addr().unwrap()
-        );
+        assert_eq!(sock1.local_addr().unwrap(), sock2.local_addr().unwrap());
         assert_eq!(table.len(), 1);
     }
 
@@ -363,6 +370,21 @@ mod tests {
 
         let socks = table.all_backend_sockets();
         assert_eq!(socks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn snapshots_include_addresses_and_activity() {
+        let backend: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+        let table = SessionTable::new(backend, Duration::from_secs(60), 1000);
+        let client: SocketAddr = "10.0.0.1:1111".parse().unwrap();
+
+        table.get_or_create(client).await.unwrap();
+
+        let snapshots = table.snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].client_addr, client);
+        assert!(snapshots[0].backend_local_addr.is_some());
+        assert!(snapshots[0].last_active_ms <= now_millis());
     }
 
     #[tokio::test]

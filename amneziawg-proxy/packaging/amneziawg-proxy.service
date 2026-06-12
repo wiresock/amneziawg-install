@@ -8,6 +8,7 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=16384
+UMask=0027
 
 # --- Run as root to bind privileged / low-numbered ports ---------------------
 # The proxy may need to bind to ports below 1024 (e.g. 443/UDP for QUIC).
@@ -37,7 +38,7 @@ ProtectControlGroups=yes
 # Allow reading the AWG server config and the proxy config.
 ReadOnlyPaths=/etc/amnezia /etc/amneziawg-proxy
 
-# Allow writing to the working directory (reserved for future state files).
+# Allow writing to the working directory, including sessions.json status.
 ReadWritePaths=/var/lib/amneziawg-proxy
 
 # --- Logging -----------------------------------------------------------------

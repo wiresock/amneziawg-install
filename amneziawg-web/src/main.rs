@@ -19,7 +19,7 @@ use tracing::info;
 use crate::auth::AuthConfig;
 use crate::db::Database;
 use crate::poller::Poller;
-use crate::web::router;
+use crate::web::router_with_proxy_sessions_file;
 
 /// CLI arguments / environment variable configuration.
 #[derive(Parser, Debug)]
@@ -34,12 +34,24 @@ pub struct Config {
     pub database_url: String,
 
     /// Directory where AWG client configs are stored.
-    #[arg(long, env = "AWG_CONFIG_DIR", default_value = "/etc/amnezia/amneziawg/clients")]
+    #[arg(
+        long,
+        env = "AWG_CONFIG_DIR",
+        default_value = "/etc/amnezia/amneziawg/clients"
+    )]
     pub config_dir: std::path::PathBuf,
 
     /// Polling interval in seconds.
     #[arg(long, env = "AWG_POLL_INTERVAL", default_value_t = 30)]
     pub poll_interval: u64,
+
+    /// Proxy active-session status file written by amneziawg-proxy.
+    #[arg(
+        long,
+        env = "AWG_PROXY_SESSIONS_FILE",
+        default_value = "/var/lib/amneziawg-proxy/sessions.json"
+    )]
+    pub proxy_sessions_file: std::path::PathBuf,
 
     // ── Authentication ────────────────────────────────────────────────────
     /// Enable authentication. When false, all requests are allowed through
@@ -178,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // --- HTTP server --------------------------------------------------------
-    let app = router(db, auth, config_dir);
+    let app = router_with_proxy_sessions_file(db, auth, config_dir, config.proxy_sessions_file);
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .context("failed to bind TCP listener")?;

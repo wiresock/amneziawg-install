@@ -305,6 +305,15 @@ pub struct ProxyConfig {
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
 
+    /// JSON status file written by the proxy for local consumers such as
+    /// amneziawg-web. The file contains the currently active sessions.
+    #[serde(default = "default_status_file")]
+    pub status_file: String,
+
+    /// Interval in seconds between status file refreshes.
+    #[serde(default = "default_status_interval")]
+    pub status_interval_secs: u64,
+
     /// Optional path to the AmneziaWG config file (e.g. `/etc/awg/awg0.conf`).
     /// When set, AWG obfuscation parameters (S1-S4, H1-H4) are loaded and used
     /// for packet classification and per-type padding transformation.
@@ -351,6 +360,12 @@ fn default_socket_buffer_bytes() -> usize {
 fn default_max_sessions() -> usize {
     10000
 }
+fn default_status_file() -> String {
+    "/var/lib/amneziawg-proxy/sessions.json".into()
+}
+fn default_status_interval() -> u64 {
+    5
+}
 
 impl Default for ProxyConfig {
     fn default() -> Self {
@@ -369,6 +384,8 @@ impl Default for ProxyConfig {
             buffer_size: default_buffer_size(),
             socket_buffer_bytes: default_socket_buffer_bytes(),
             max_sessions: default_max_sessions(),
+            status_file: default_status_file(),
+            status_interval_secs: default_status_interval(),
             awg_config: None,
         }
     }
@@ -457,6 +474,14 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
     if config.max_sessions == 0 {
         return Err(ProxyError::Config("max_sessions must be > 0".into()));
     }
+    if config.status_interval_secs == 0 {
+        return Err(ProxyError::Config(
+            "status_interval_secs must be > 0".into(),
+        ));
+    }
+    if config.status_file.trim().is_empty() {
+        return Err(ProxyError::Config("status_file must not be empty".into()));
+    }
     Ok(())
 }
 
@@ -485,6 +510,8 @@ backend = "127.0.0.1:51821"
         assert_eq!(cfg.dns_upstream, "1.1.1.1:53");
         assert_eq!(cfg.dns_upstream_timeout_ms, 1500);
         assert_eq!(cfg.buffer_size, 65535);
+        assert_eq!(cfg.status_file, "/var/lib/amneziawg-proxy/sessions.json");
+        assert_eq!(cfg.status_interval_secs, 5);
         assert!(cfg.awg_config.is_none());
     }
 
@@ -504,6 +531,8 @@ quic_certificate_domain = "example.org"
 dns_forward_enabled = true
 dns_upstream = "127.0.0.1:5300"
 dns_upstream_timeout_ms = 700
+status_file = "/run/amneziawg-proxy/sessions.json"
+status_interval_secs = 2
 "#;
         let cfg = parse_config(toml).unwrap();
         assert_eq!(cfg.session_ttl_secs, 600);
@@ -516,6 +545,8 @@ dns_upstream_timeout_ms = 700
         assert_eq!(cfg.dns_upstream, "127.0.0.1:5300");
         assert_eq!(cfg.dns_upstream_timeout_ms, 700);
         assert_eq!(cfg.buffer_size, 4096);
+        assert_eq!(cfg.status_file, "/run/amneziawg-proxy/sessions.json");
+        assert_eq!(cfg.status_interval_secs, 2);
         assert_eq!(cfg.awg_config.as_deref(), Some("/etc/awg/awg0.conf"));
     }
 
@@ -665,6 +696,17 @@ max_sessions = 0
 "#;
         let err = parse_config(toml).unwrap_err();
         assert!(err.to_string().contains("max_sessions must be > 0"));
+    }
+
+    #[test]
+    fn reject_zero_status_interval() {
+        let toml = r#"
+listen = "0.0.0.0:51820"
+backend = "127.0.0.1:51821"
+status_interval_secs = 0
+"#;
+        let err = parse_config(toml).unwrap_err();
+        assert!(err.to_string().contains("status_interval_secs must be > 0"));
     }
 
     #[test]

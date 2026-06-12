@@ -12,6 +12,7 @@ categories = ["network-programming"]
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 # `release_max_level_info` statically compiles out trace!/debug! in release
 # builds. The data path logs per packet at debug; without this a stray
