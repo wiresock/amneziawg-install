@@ -1186,9 +1186,14 @@ impl Proxy {
         // from `relay_buffer_size` (default 8 KiB — ample for any
         // internet-path tunnel MTU plus S-padding) rather than the 64 KiB
         // `buffer_size`; datagrams larger than this are truncated, and the
-        // config documents when to raise it.
-        const MAX_UDP_PAYLOAD_SIZE: usize = 65_535;
-        let relay_buf_size = std::cmp::min(self.config.relay_buffer_size, MAX_UDP_PAYLOAD_SIZE);
+        // config documents when to raise it. Clamped to the validated range
+        // defensively: `Proxy::bind` accepts a `ProxyConfig` without running
+        // `config::validate()` (tests, programmatic callers), and a zero or
+        // tiny buffer would truncate every relayed datagram.
+        let relay_buf_size = self.config.relay_buffer_size.clamp(
+            crate::config::RELAY_BUFFER_SIZE_MIN,
+            crate::config::RELAY_BUFFER_SIZE_MAX,
+        );
         let relay_handles = Arc::clone(&self.relay_handles);
         let generation = self.relay_generation.fetch_add(1, Ordering::Relaxed);
         // Register this relay's generation on the session: expiry reports it,
@@ -1876,6 +1881,67 @@ mod tests {
             !proxy.relay_handles.contains_key(&client_addr),
             "relay handle removed"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_buffer_clamped_for_programmatic_config() {
+        // `Proxy::bind` accepts a config without `config::validate()`; a
+        // zero relay_buffer_size must be clamped to the validated floor
+        // instead of allocating an empty recv buffer that would truncate
+        // every relayed datagram.
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec: 16,
+            imitate_protocol: "auto".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            relay_buffer_size: 0,
+            max_sessions: 1000,
+            socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
+            awg_config: None,
+        };
+
+        let proxy = Proxy::bind(config, None).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        proxy.handle_client_packet(b"hello", client_addr).await;
+        let mut buf = [0u8; 2048];
+        let (_, session_backend_addr) =
+            tokio::time::timeout(Duration::from_millis(500), backend.recv_from(&mut buf))
+                .await
+                .expect("client packet must be forwarded")
+                .unwrap();
+
+        // A 1200-byte datagram fits the clamped floor (1280) and must be
+        // relayed back intact, not truncated to zero bytes.
+        let payload = vec![0xA7u8; 1200];
+        backend
+            .send_to(&payload, session_backend_addr)
+            .await
+            .unwrap();
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                .await
+                .expect("backend datagram must be relayed to the client")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert_eq!(n, payload.len(), "datagram must arrive untruncated");
+        assert!(buf[..n].iter().all(|&b| b == 0xA7));
     }
 
     #[tokio::test]

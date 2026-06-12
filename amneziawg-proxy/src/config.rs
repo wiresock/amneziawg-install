@@ -370,6 +370,13 @@ fn default_relay_buffer_size() -> usize {
     // max_sessions=10k when relays sized buffers from the 64 KiB buffer_size.
     8192
 }
+
+/// Validated bounds for `relay_buffer_size`. Shared with the defensive clamp
+/// in the relay spawn path, because `Proxy::bind` accepts a `ProxyConfig`
+/// without running `validate()` (tests and programmatic callers) and a zero
+/// or tiny relay buffer would truncate every relayed datagram.
+pub const RELAY_BUFFER_SIZE_MIN: usize = 1280;
+pub const RELAY_BUFFER_SIZE_MAX: usize = 65_535;
 fn default_socket_buffer_bytes() -> usize {
     // 4 MiB. Large enough to absorb multi-millisecond bursts at gigabit rates
     // without in-proxy UDP drops, while staying within common
@@ -490,12 +497,12 @@ fn validate(config: &ProxyConfig) -> Result<(), ProxyError> {
     // maximum UDP length representable by the protocol's 16-bit length field,
     // so larger values could never be used; reject them instead of silently
     // capping.
-    if config.relay_buffer_size < 1280 {
+    if config.relay_buffer_size < RELAY_BUFFER_SIZE_MIN {
         return Err(ProxyError::Config(
             "relay_buffer_size must be >= 1280".into(),
         ));
     }
-    if config.relay_buffer_size > 65535 {
+    if config.relay_buffer_size > RELAY_BUFFER_SIZE_MAX {
         return Err(ProxyError::Config(
             "relay_buffer_size must be <= 65535".into(),
         ));
