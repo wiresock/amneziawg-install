@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
     Form, Json, Router,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::trace::TraceLayer;
@@ -63,6 +63,9 @@ pub struct AppState {
     logged_canon_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Cached best-effort component/system version information for the UI.
     system_versions_cache: std::sync::Arc<tokio::sync::RwLock<Option<CachedSystemVersions>>>,
+    /// Best-effort server boot timestamp. Used to explain when interface
+    /// counters likely started after a reboot.
+    server_booted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -74,11 +77,7 @@ struct CachedSystemVersions {
 const SYSTEM_VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl AppState {
-    fn new(
-        db: Database,
-        auth: AuthConfig,
-        config_dir: std::path::PathBuf,
-    ) -> Self {
+    fn new(db: Database, auth: AuthConfig, config_dir: std::path::PathBuf) -> Self {
         let cell = tokio::sync::OnceCell::new();
         // Eagerly try to canonicalize at startup; if the dir exists now the
         // result is cached immediately and no filesystem hit is needed later.
@@ -95,6 +94,7 @@ impl AppState {
             canonical_config_dir: std::sync::Arc::new(cell),
             logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             system_versions_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            server_booted_at: detect_server_boot_time(),
         }
     }
 
@@ -152,6 +152,14 @@ impl AppState {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct SystemStatusDto {
+    pub server_time: DateTime<Utc>,
+    pub server_booted_at: Option<DateTime<Utc>>,
+    pub server_uptime_seconds: Option<u64>,
+    pub statistics_note: String,
+}
+
 // ── Error helper ────────────────────────────────────────────────────────────
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -181,7 +189,9 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 /// fixed, non-sensitive messages for error variants that may contain raw
 /// stderr or filesystem paths, while keeping useful context for variants
 /// that are inherently safe (e.g. duplicate name, no free IP).
-fn create_user_diagnostic_message(error: &crate::admin::client_manager::CreateClientError) -> String {
+fn create_user_diagnostic_message(
+    error: &crate::admin::client_manager::CreateClientError,
+) -> String {
     use crate::admin::client_manager::CreateClientError;
     match error {
         CreateClientError::InvalidName(msg) => format!("Failed to create user: {msg}"),
@@ -478,6 +488,46 @@ fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
     ts.and_then(|t| Utc.timestamp_opt(t, 0).single())
 }
 
+fn detect_server_boot_time() -> Option<DateTime<Utc>> {
+    detect_boot_time_from_proc_stat().or_else(detect_boot_time_from_proc_uptime)
+}
+
+fn detect_boot_time_from_proc_stat() -> Option<DateTime<Utc>> {
+    let contents = std::fs::read_to_string("/proc/stat").ok()?;
+    for line in contents.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("btime") {
+            let ts = parts.next()?.parse::<i64>().ok()?;
+            return Utc.timestamp_opt(ts, 0).single();
+        }
+    }
+    None
+}
+
+fn detect_boot_time_from_proc_uptime() -> Option<DateTime<Utc>> {
+    let contents = std::fs::read_to_string("/proc/uptime").ok()?;
+    let uptime_secs = contents.split_whitespace().next()?.parse::<f64>().ok()?;
+    if !uptime_secs.is_finite() || uptime_secs < 0.0 {
+        return None;
+    }
+    Some(Utc::now() - chrono::Duration::seconds(uptime_secs.floor() as i64))
+}
+
+fn system_status(state: &AppState) -> SystemStatusDto {
+    let now = Utc::now();
+    let uptime = state
+        .server_booted_at
+        .and_then(|booted_at| (now - booted_at).to_std().ok())
+        .map(|duration| duration.as_secs());
+
+    SystemStatusDto {
+        server_time: now,
+        server_booted_at: state.server_booted_at,
+        server_uptime_seconds: uptime,
+        statistics_note: "Traffic counters are read from the running AmneziaWG interface and may reset after a server reboot or interface restart.".to_string(),
+    }
+}
+
 fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
     let last_handshake = epoch_to_utc(row.last_handshake_at);
     let disabled = row.disabled != 0;
@@ -606,11 +656,7 @@ fn normalize_period(period: &str) -> &'static str {
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Build the application router.
-pub fn router(
-    db: Database,
-    auth: AuthConfig,
-    config_dir: std::path::PathBuf,
-) -> Router {
+pub fn router(db: Database, auth: AuthConfig, config_dir: std::path::PathBuf) -> Router {
     let state = AppState::new(db, auth, config_dir);
 
     // Protected routes – all require a valid session.
@@ -625,6 +671,7 @@ pub fn router(
         .route("/api/peers/:id/usage", get(get_peer_usage))
         .route("/api/peers/:id/usage/summary", get(get_peer_usage_summary))
         .route("/api/usage", get(get_all_usage))
+        .route("/api/system/status", get(get_system_status))
         .route("/api/system/versions", get(get_system_versions))
         .route("/api/events", get(list_events_handler))
         // ── User lifecycle routes ────────────────────────────────
@@ -866,6 +913,11 @@ async fn health() -> impl IntoResponse {
 /// `GET /api/system/versions` – best-effort installed component versions.
 async fn get_system_versions(State(state): State<AppState>) -> Json<SystemVersions> {
     Json(state.system_versions().await)
+}
+
+/// `GET /api/system/status` – server boot/uptime context for current counters.
+async fn get_system_status(State(state): State<AppState>) -> Json<SystemStatusDto> {
+    Json(system_status(&state))
 }
 
 /// `GET /api/events` – audit event log.
@@ -1183,8 +1235,7 @@ async fn get_all_usage(
     let mut prev_tx: u64 = 0;
 
     use futures_util::TryStreamExt;
-    let mut stream =
-        crate::db::peers::stream_all_snapshots_since(&state.db.pool, &since_str);
+    let mut stream = crate::db::peers::stream_all_snapshots_since(&state.db.pool, &since_str);
     while let Some(row) = stream.try_next().await? {
         let rx = row.rx_bytes as u64;
         let tx = row.tx_bytes as u64;
@@ -1251,9 +1302,12 @@ async fn get_all_usage(
 /// validation logic stays in sync.
 fn is_safe_config_path(path: &std::path::Path) -> bool {
     path.is_absolute()
-        && !path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+        && !path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
 }
 
 /// Open a file with `O_NOFOLLOW` and read its contents.
@@ -1445,14 +1499,8 @@ async fn get_peer_config(
                 "text/plain; charset=utf-8".to_string(),
             ),
             (axum::http::header::CONTENT_DISPOSITION, disposition),
-            (
-                axum::http::header::CACHE_CONTROL,
-                "no-store".to_string(),
-            ),
-            (
-                axum::http::header::PRAGMA,
-                "no-cache".to_string(),
-            ),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+            (axum::http::header::PRAGMA, "no-cache".to_string()),
         ],
         content,
     )
@@ -1663,7 +1711,8 @@ async fn page_peer_list(
     let rows = crate::db::peers::list_all(&state.db.pool).await?;
     let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
     let csrf = session_csrf_from_headers(&state, &headers);
-    Ok(Html(render_peer_list(&peers, &csrf)).into_response())
+    let status = system_status(&state);
+    Ok(Html(render_peer_list(&peers, &csrf, &status)).into_response())
 }
 
 /// `GET /peers/:id` – server-rendered peer detail page.
@@ -2018,7 +2067,11 @@ async fn post_add_user_form(
             "forced test create-user failure".to_string(),
         );
         let message = create_user_diagnostic_message(&e);
-        return Ok(Html(render_peer_list_with_error(&peers, &csrf, &message)).into_response());
+        let status = system_status(&state);
+        return Ok(Html(render_peer_list_with_error(
+            &peers, &csrf, &status, &message,
+        ))
+        .into_response());
     }
 
     if state.auth.enabled {
@@ -2058,27 +2111,35 @@ async fn post_add_user_form(
             let rows = crate::db::peers::list_all(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
-            Ok(Html(render_peer_list_with_error(&peers, &csrf, &msg)).into_response())
+            let status = system_status(&state);
+            Ok(Html(render_peer_list_with_error(&peers, &csrf, &status, &msg)).into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::InvalidIp(ref msg)) => {
             let rows = crate::db::peers::list_all(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
-            Ok(Html(render_peer_list_with_error(&peers, &csrf, msg)).into_response())
+            let status = system_status(&state);
+            Ok(Html(render_peer_list_with_error(&peers, &csrf, &status, msg)).into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::IpInUse(ref ip)) => {
             let rows = crate::db::peers::list_all(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let message = format!("IP address already in use: {ip}");
-            Ok(Html(render_peer_list_with_error(&peers, &csrf, &message)).into_response())
+            let status = system_status(&state);
+            Ok(Html(render_peer_list_with_error(
+                &peers, &csrf, &status, &message,
+            ))
+            .into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::LockBusy) => {
             let rows = crate::db::peers::list_all(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
-            let message = "Another add/remove operation is already in progress; please try again later.";
-            Ok(Html(render_peer_list_with_error(&peers, &csrf, message)).into_response())
+            let message =
+                "Another add/remove operation is already in progress; please try again later.";
+            let status = system_status(&state);
+            Ok(Html(render_peer_list_with_error(&peers, &csrf, &status, message)).into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::Awg(ref awg_err)) => {
             // Configs were written, but interface sync failed. Treat as a
@@ -2094,7 +2155,11 @@ async fn post_add_user_form(
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let message = create_user_diagnostic_message(&e);
-            Ok(Html(render_peer_list_with_error(&peers, &csrf, &message)).into_response())
+            let status = system_status(&state);
+            Ok(Html(render_peer_list_with_error(
+                &peers, &csrf, &status, &message,
+            ))
+            .into_response())
         }
     }
 }
@@ -2147,7 +2212,10 @@ async fn post_remove_user_form(
         let dto = peer_row_to_detail(peer, snapshots);
         let csrf = session_csrf_from_headers(&state, &headers);
         let message = format!("Remove failed: peer is not managed by installer: {e}");
-        return Ok(Html(render_peer_detail_with_error(&dto, &csrf, &events, &message)).into_response());
+        return Ok(Html(render_peer_detail_with_error(
+            &dto, &csrf, &events, &message,
+        ))
+        .into_response());
     }
 
     match crate::admin::execute_remove_user(
@@ -2469,6 +2537,48 @@ fn fmt_bytes(b: u64) -> String {
     }
 }
 
+fn fmt_duration_hms(total_secs: u64) -> String {
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let seconds = total_secs % 60;
+
+    if days > 0 {
+        format!("{days} days {hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    }
+}
+
+fn fmt_local_timestamp(ts: DateTime<Utc>) -> String {
+    ts.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S %:z")
+        .to_string()
+}
+
+fn fmt_optional_local_timestamp(ts: Option<DateTime<Utc>>, fallback: &str) -> String {
+    ts.map(fmt_local_timestamp)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn render_system_status(status: &SystemStatusDto) -> String {
+    let uptime = status
+        .server_uptime_seconds
+        .map(fmt_duration_hms)
+        .unwrap_or_else(|| "unknown".to_string());
+    let started_at = fmt_optional_local_timestamp(status.server_booted_at, "unknown");
+    format!(
+        r#"<section class="system-status" aria-label="Server status">
+  <div><strong>Server uptime:</strong> {uptime}</div>
+  <div><strong>Server started at:</strong> {started_at}</div>
+  <p class="meta">Traffic statistics below use live AmneziaWG interface counters. These counters can reset after a server reboot or interface restart.</p>
+</section>
+"#,
+        uptime = esc(&uptime),
+        started_at = esc(&started_at),
+    )
+}
+
 fn html_head(title: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
@@ -2487,6 +2597,9 @@ fn html_head(title: &str) -> String {
   a {{ color: #0066cc; text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
   .meta {{ font-size: .85rem; color: #666; margin-bottom: 1.5rem; }}
+  .system-status {{ margin: 0 0 1.25rem; padding: .75rem 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f8fbff; }}
+  .system-status div {{ margin: .2rem 0; }}
+  .system-status .meta {{ margin: .45rem 0 0; }}
   .back {{ margin-bottom: 1rem; display: block; }}
   .edit-form {{ margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; max-width: 480px; }}
   .edit-form h2 {{ margin-top: 0; font-size: 1.1rem; }}
@@ -2607,22 +2720,33 @@ fn render_login_page_inner(error_html: &str, csrf_token: &str) -> String {
     buf
 }
 
-fn render_peer_list(peers: &[PeerSummaryDto], csrf_token: &str) -> String {
-    render_peer_list_inner(peers, csrf_token, None)
+fn render_peer_list(
+    peers: &[PeerSummaryDto],
+    csrf_token: &str,
+    system_status: &SystemStatusDto,
+) -> String {
+    render_peer_list_inner(peers, csrf_token, system_status, None)
 }
 
-fn render_peer_list_with_error(peers: &[PeerSummaryDto], csrf_token: &str, error: &str) -> String {
-    render_peer_list_inner(peers, csrf_token, Some(error))
+fn render_peer_list_with_error(
+    peers: &[PeerSummaryDto],
+    csrf_token: &str,
+    system_status: &SystemStatusDto,
+    error: &str,
+) -> String {
+    render_peer_list_inner(peers, csrf_token, system_status, Some(error))
 }
 
 fn render_peer_list_inner(
     peers: &[PeerSummaryDto],
     csrf_token: &str,
+    system_status: &SystemStatusDto,
     error: Option<&str>,
 ) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
     buf.push_str(&nav_bar(csrf_token));
     buf.push_str("<h1>AmneziaWG Peers</h1>\n");
+    buf.push_str(&render_system_status(system_status));
     buf.push_str(&format!(
         "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"/api/peers\">JSON API</a></p>\n",
         peers.len()
@@ -2649,7 +2773,7 @@ fn render_peer_list_inner(
                 .unwrap_or_else(|| "–".to_string());
             let handshake = p
                 .latest_handshake_at
-                .map(|ts| esc(&ts.format("%Y-%m-%d %H:%M:%S UTC").to_string()))
+                .map(|ts| esc(&fmt_local_timestamp(ts)))
                 .unwrap_or_else(|| "never".to_string());
             buf.push_str(&format!(
                 "<tr><td>{name_link}</td><td>{conn}</td><td>{ident}</td><td>{endpoint}</td>\
@@ -2763,10 +2887,7 @@ fn render_peer_detail_inner(
     let mut buf = html_head(&format!("Peer – {}", dto.name));
     buf.push_str(&nav_bar(csrf_token));
     if let Some(err) = error {
-        buf.push_str(&format!(
-            "<p class=\"error\">{}</p>\n",
-            esc(err)
-        ));
+        buf.push_str(&format!("<p class=\"error\">{}</p>\n", esc(err)));
     }
     buf.push_str(&format!(
         "<a class=\"back\" href=\"/\">&larr; All peers</a>\n\
@@ -2793,7 +2914,7 @@ fn render_peer_detail_inner(
     }
     let handshake = dto
         .latest_handshake_at
-        .map(|ts| ts.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .map(fmt_local_timestamp)
         .unwrap_or_else(|| "never".to_string());
     buf.push_str(&format!(
         "<tr><th>Last handshake</th><td>{}</td></tr>\n",
@@ -3130,11 +3251,7 @@ mod tests {
             session_ttl: std::time::Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
         };
         (
-            router(
-                db,
-                auth,
-                std::path::PathBuf::from("/tmp/test-configs"),
-            ),
+            router(db, auth, std::path::PathBuf::from("/tmp/test-configs")),
             "testpassword".to_string(),
         )
     }
@@ -3252,6 +3369,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn system_status_returns_uptime_context() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["server_time"].as_str().is_some());
+        assert!(json.get("server_booted_at").is_some());
+        assert!(json.get("server_uptime_seconds").is_some());
+        assert!(json["statistics_note"]
+            .as_str()
+            .unwrap()
+            .contains("counters"));
+    }
+
+    #[tokio::test]
+    async fn peer_list_page_shows_server_uptime_context() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Server uptime:"));
+        assert!(html.contains("Server started at:"));
+        assert!(html.contains("interface counters"));
+    }
+
+    #[tokio::test]
+    async fn peer_list_formats_last_handshake_in_local_time() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "LOCALTIME_HANDSHAKE_KEY==", Some("LocalTime")).await;
+        let handshake_ts = 1_700_000_000_i64;
+        sqlx::query(
+            "UPDATE peers SET last_handshake_at = ?, rx_bytes = 1, tx_bytes = 2 WHERE id = ?",
+        )
+        .bind(handshake_ts)
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .expect("update peer handshake");
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        let expected = fmt_local_timestamp(Utc.timestamp_opt(handshake_ts, 0).single().unwrap());
+        assert!(html.contains(&expected));
+        assert!(!html.contains("UTC</td>"));
     }
 
     #[tokio::test]
@@ -3530,10 +3722,10 @@ mod tests {
         let id = insert_peer(&db, "USAGE_DELTA_KEY=", Some("DeltaPeer")).await;
 
         let now = Utc::now();
-        let t1 = (now - chrono::Duration::hours(2))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let t2 = (now - chrono::Duration::hours(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t1 =
+            (now - chrono::Duration::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t2 =
+            (now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         insert_snapshot_with_bytes(&db, "USAGE_DELTA_KEY=", &t1, 100, 200).await;
         insert_snapshot_with_bytes(&db, "USAGE_DELTA_KEY=", &t2, 400, 700).await;
 
@@ -3653,10 +3845,10 @@ mod tests {
         let id = insert_peer(&db, "USAGE_SUMMARY_KEY=", Some("SummaryPeer")).await;
 
         let now = Utc::now();
-        let t1 = (now - chrono::Duration::hours(2))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let t2 = (now - chrono::Duration::hours(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t1 =
+            (now - chrono::Duration::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t2 =
+            (now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         insert_snapshot_with_bytes(&db, "USAGE_SUMMARY_KEY=", &t1, 100, 200).await;
         insert_snapshot_with_bytes(&db, "USAGE_SUMMARY_KEY=", &t2, 400, 700).await;
 
@@ -3751,10 +3943,10 @@ mod tests {
         insert_peer(&db, "ALL_USAGE_B=", Some("PeerB")).await;
 
         let now = Utc::now();
-        let t1 = (now - chrono::Duration::hours(3))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let t2 = (now - chrono::Duration::hours(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t1 =
+            (now - chrono::Duration::hours(3)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t2 =
+            (now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         insert_snapshot_with_bytes(&db, "ALL_USAGE_A=", &t1, 0, 0).await;
         insert_snapshot_with_bytes(&db, "ALL_USAGE_A=", &t2, 500, 1000).await;
@@ -3801,13 +3993,13 @@ mod tests {
 
         let now = Utc::now();
         // Baseline snapshot: before the day window but after the month window.
-        let baseline = (now - chrono::Duration::hours(25))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let baseline =
+            (now - chrono::Duration::hours(25)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         // First in-window snapshot: within the last 24h.
-        let t1 = (now - chrono::Duration::hours(3))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let t2 = (now - chrono::Duration::hours(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t1 =
+            (now - chrono::Duration::hours(3)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t2 =
+            (now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         insert_snapshot_with_bytes(&db, "USAGE_BL_KEY=", &baseline, 100, 200).await;
         insert_snapshot_with_bytes(&db, "USAGE_BL_KEY=", &t1, 400, 700).await;
@@ -3843,12 +4035,12 @@ mod tests {
         let id = insert_peer(&db, "ALLBL_KEY=", Some("AllBaselinePeer")).await;
 
         let now = Utc::now();
-        let baseline = (now - chrono::Duration::hours(25))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let t1 = (now - chrono::Duration::hours(3))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let t2 = (now - chrono::Duration::hours(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let baseline =
+            (now - chrono::Duration::hours(25)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t1 =
+            (now - chrono::Duration::hours(3)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let t2 =
+            (now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         insert_snapshot_with_bytes(&db, "ALLBL_KEY=", &baseline, 100, 200).await;
         insert_snapshot_with_bytes(&db, "ALLBL_KEY=", &t1, 400, 700).await;
@@ -4758,11 +4950,7 @@ mod tests {
             secure_cookie: false,
             session_ttl: std::time::Duration::from_secs(0),
         };
-        let app = router(
-            db,
-            auth,
-            std::path::PathBuf::from("/tmp/test-configs"),
-        );
+        let app = router(db, auth, std::path::PathBuf::from("/tmp/test-configs"));
 
         // Login succeeds and we get a session cookie ...
         let login_resp = do_login(app.clone(), "admin", "pass").await;
@@ -5245,12 +5433,7 @@ mod tests {
             .unwrap();
         assert_eq!(cache_control, "no-store");
 
-        let pragma = response
-            .headers()
-            .get("pragma")
-            .unwrap()
-            .to_str()
-            .unwrap();
+        let pragma = response.headers().get("pragma").unwrap().to_str().unwrap();
         assert_eq!(pragma, "no-cache");
 
         let disposition = response
@@ -5628,12 +5811,7 @@ mod tests {
     async fn peer_list_page_contains_ip_fields() {
         let app = test_router(test_db().await);
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -5859,12 +6037,7 @@ mod tests {
             .unwrap();
         assert_eq!(cache_control, "no-store", "QR response must not be cached");
 
-        let pragma = response
-            .headers()
-            .get("pragma")
-            .unwrap()
-            .to_str()
-            .unwrap();
+        let pragma = response.headers().get("pragma").unwrap().to_str().unwrap();
         assert_eq!(pragma, "no-cache", "QR response must not be cached");
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
