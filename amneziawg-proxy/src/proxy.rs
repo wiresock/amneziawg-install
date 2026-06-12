@@ -1182,10 +1182,18 @@ impl Proxy {
         let dns_query_echo = Arc::clone(&self.dns_query_echo);
         let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
         let awg_params = self.awg_params.clone();
-        // Size the per-session relay buffer from configured `buffer_size` so
-        // backend datagrams are not silently truncated by `recv()`.
-        const MAX_UDP_PAYLOAD_SIZE: usize = 65_535;
-        let relay_buf_size = std::cmp::min(self.config.buffer_size, MAX_UDP_PAYLOAD_SIZE);
+        // The relay buffer is resident memory per session, so it is sized
+        // from `relay_buffer_size` (default 8 KiB — ample for any
+        // internet-path tunnel MTU plus S-padding) rather than the 64 KiB
+        // `buffer_size`; datagrams larger than this are truncated, and the
+        // config documents when to raise it. Clamped to the validated range
+        // defensively: `Proxy::bind` accepts a `ProxyConfig` without running
+        // `config::validate()` (tests, programmatic callers), and a zero or
+        // tiny buffer would truncate every relayed datagram.
+        let relay_buf_size = self.config.relay_buffer_size.clamp(
+            crate::config::RELAY_BUFFER_SIZE_MIN,
+            crate::config::RELAY_BUFFER_SIZE_MAX,
+        );
         let relay_handles = Arc::clone(&self.relay_handles);
         let generation = self.relay_generation.fetch_add(1, Ordering::Relaxed);
         // Register this relay's generation on the session: expiry reports it,
@@ -1202,6 +1210,12 @@ impl Proxy {
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; relay_buf_size];
+            // Auto-mode protocol lock, cached once observed. The lock is
+            // insert-once per client (`handle_probe` never overwrites an
+            // existing entry, and removal only happens together with this
+            // relay's teardown), so after the first hit the per-packet
+            // DashMap lookup disappears from the outbound hot path.
+            let mut locked_protocol: Option<Protocol> = None;
             loop {
                 match backend_sock.recv(&mut buf).await {
                     Ok(n) => {
@@ -1215,11 +1229,16 @@ impl Proxy {
                         if let Some(ref params) = awg_params {
                             // In fixed mode the protocol is known statically and
                             // `client_protocols` is always empty, so skip the
-                            // per-packet lookup; only auto mode (late binding)
-                            // needs it.
-                            let protocol = match fixed_protocol {
-                                Some(p) => Some(p),
-                                None => client_protocols.get(&client_addr).map(|p| *p),
+                            // lookup entirely; in auto mode (late binding) look
+                            // it up only until the lock is first observed.
+                            let protocol = match (fixed_protocol, locked_protocol) {
+                                (Some(p), _) => Some(p),
+                                (None, Some(p)) => Some(p),
+                                (None, None) => {
+                                    locked_protocol =
+                                        client_protocols.get(&client_addr).map(|p| *p);
+                                    locked_protocol
+                                }
                             };
                             if let Some(protocol) = protocol {
                                 // The query echo only feeds DNS cover responses
@@ -1623,6 +1642,7 @@ mod tests {
             dns_upstream: "127.0.0.1:53".into(),
             dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
@@ -1707,6 +1727,7 @@ mod tests {
             dns_upstream: "127.0.0.1:53".into(),
             dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
@@ -1815,6 +1836,7 @@ mod tests {
             dns_upstream: "127.0.0.1:53".into(),
             dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
@@ -1862,6 +1884,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_buffer_clamped_for_programmatic_config() {
+        // `Proxy::bind` accepts a config without `config::validate()`; a
+        // zero relay_buffer_size must be clamped to the validated floor
+        // instead of allocating an empty recv buffer that would truncate
+        // every relayed datagram.
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec: 16,
+            imitate_protocol: "auto".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            relay_buffer_size: 0,
+            max_sessions: 1000,
+            socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
+            awg_config: None,
+        };
+
+        let proxy = Proxy::bind(config, None).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        proxy.handle_client_packet(b"hello", client_addr).await;
+        let mut buf = [0u8; 2048];
+        let (_, session_backend_addr) =
+            tokio::time::timeout(Duration::from_millis(500), backend.recv_from(&mut buf))
+                .await
+                .expect("client packet must be forwarded")
+                .unwrap();
+
+        // A 1200-byte datagram fits the clamped floor (1280) and must be
+        // relayed back intact, not truncated to zero bytes.
+        let payload = vec![0xA7u8; 1200];
+        backend
+            .send_to(&payload, session_backend_addr)
+            .await
+            .unwrap();
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                .await
+                .expect("backend datagram must be relayed to the client")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert_eq!(n, payload.len(), "datagram must arrive untruncated");
+        assert!(buf[..n].iter().all(|&b| b == 0xA7));
+    }
+
+    #[tokio::test]
     async fn proxy_bind_and_shutdown() {
         let config = ProxyConfig {
             listen: "127.0.0.1:0".into(),
@@ -1876,6 +1959,7 @@ mod tests {
             dns_upstream: "127.0.0.1:53".into(),
             dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
@@ -1967,6 +2051,7 @@ mod tests {
             dns_upstream: "127.0.0.1:53".into(),
             dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
@@ -2163,6 +2248,7 @@ mod tests {
             dns_upstream: "127.0.0.1:53".into(),
             dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
@@ -2231,6 +2317,7 @@ mod tests {
             dns_upstream: upstream.to_string(),
             dns_upstream_timeout_ms: timeout_ms,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
@@ -2331,6 +2418,7 @@ mod tests {
             dns_upstream: "127.0.0.1:53".into(),
             dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
@@ -2387,6 +2475,7 @@ mod tests {
             dns_upstream: "127.0.0.1:53".into(),
             dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
@@ -2464,6 +2553,7 @@ mod tests {
             dns_upstream: "127.0.0.1:53".into(),
             dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
@@ -2561,6 +2651,7 @@ mod tests {
             dns_upstream: "127.0.0.1:53".into(),
             dns_upstream_timeout_ms: 1500,
             buffer_size: 4096,
+            relay_buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
             status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
