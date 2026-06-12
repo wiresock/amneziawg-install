@@ -108,6 +108,15 @@ safe_rm_dir()           { run_uninstall_helper safe_rm_dir          "$@"; }
 _is_valid_ip_literal()       { run_install_helper _is_valid_ip_literal       "$@"; }
 _format_host_for_socketaddr() { run_install_helper _format_host_for_socketaddr "$@"; }
 upgrade_strip_quotes() { run_upgrade_helper strip_quotes "$@"; }
+upgrade_validate_config_file_path() {
+    local config_file="$1"
+    (
+        set --
+        source "${UPGRADE_SCRIPT}"
+        CONFIG_FILE="${config_file}"
+        validate_config_file_path
+    )
+}
 
 # ── is_positive_integer ───────────────────────────────────────────────────────
 
@@ -153,6 +162,13 @@ assert_eq 'ExecStart=/path/with|pipe' "${AFTER}" "sed replacement with pipe in p
 
 echo "=== upgrade script helpers ==="
 
+result="$(
+    set -- --unexpected-caller-arg
+    source "${UPGRADE_SCRIPT}"
+    printf '%s\n' "$1"
+)"
+assert_eq "--unexpected-caller-arg" "${result}" "upgrade script source does not parse caller args"
+
 assert_eq "/tmp/proxy" "$(upgrade_strip_quotes '"/tmp/proxy"')" "upgrade strip double quotes"
 assert_eq "/tmp/proxy" "$(upgrade_strip_quotes "'/tmp/proxy'")" "upgrade strip single quotes"
 assert_eq "/tmp/proxy" "$(upgrade_strip_quotes "/tmp/proxy")" "upgrade preserve unquoted value"
@@ -191,10 +207,23 @@ result="$(upgrade_append_paths 'ReadWritePaths=/var/lib/amneziawg-proxy /srv/pro
 assert_eq "/var/lib/amneziawg-proxy /srv/proxy-state" "${result}" \
     "upgrade merges unique ReadWritePaths entries"
 
+result="$(upgrade_append_paths 'ReadWritePaths=/var/lib/amneziawg-proxy /tmp/proxy-*' \
+    "/var/lib/amneziawg-proxy")"
+assert_eq "/var/lib/amneziawg-proxy /tmp/proxy-*" "${result}" \
+    "upgrade preserves glob characters in path lists"
+
 result="$(upgrade_append_paths 'ReadOnlyPaths=/etc/amnezia /etc/amneziawg /etc/amneziawg-proxy' \
     "/etc/amnezia" "/etc/amneziawg-proxy")"
 assert_eq "/etc/amnezia /etc/amneziawg /etc/amneziawg-proxy" "${result}" \
     "upgrade merges unique ReadOnlyPaths entries"
+
+assert_rc 0 upgrade_validate_config_file_path "/etc/amneziawg-proxy/proxy.toml"
+assert_rc 1 upgrade_validate_config_file_path "/etc/amneziawg-proxy/"
+assert_rc 1 upgrade_validate_config_file_path "/etc/amneziawg-proxy//"
+
+tmp_config_dir="$(mktemp -d)"
+assert_rc 1 upgrade_validate_config_file_path "${tmp_config_dir}"
+rm -rf "${tmp_config_dir}"
 
 # ── safe_rm_dir guards ────────────────────────────────────────────────────────
 

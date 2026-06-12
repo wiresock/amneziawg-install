@@ -62,6 +62,12 @@ info() { printf '[INFO]  %s\n' "$*"; }
 warn() { yellow "[WARN]  $*" >&2; }
 die()  { red "[ERROR] $*" >&2; exit 1; }
 
+require_bash_43() {
+    if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+        die "Bash 4.3 or newer is required."
+    fi
+}
+
 # -- Usage ---------------------------------------------------------------------
 
 usage() {
@@ -114,43 +120,45 @@ require_value() {
     fi
 }
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --binary|--binary-src)
-            require_value "$1" "${2:-}"
-            BINARY_SRC="$2"; shift 2 ;;
-        --source-dir)
-            require_value "$1" "${2:-}"
-            SOURCE_DIR="$2"; shift 2 ;;
-        --install-rust)
-            INSTALL_RUST=true; shift ;;
-        --install-dir)
-            require_value "$1" "${2:-}"
-            INSTALL_DIR="$2"; INSTALL_DIR_SET=true; shift 2 ;;
-        --config-file)
-            require_value "$1" "${2:-}"
-            CONFIG_FILE="$2"; CONFIG_FILE_SET=true; shift 2 ;;
-        --data-dir)
-            require_value "$1" "${2:-}"
-            DATA_DIR="$2"; DATA_DIR_SET=true; shift 2 ;;
-        --restart)
-            RESTART_MODE="yes"; shift ;;
-        --no-restart)
-            RESTART_MODE="no"; shift ;;
-        --refresh-unit)
-            REFRESH_UNIT=true; shift ;;
-        --force|--non-interactive)
-            FORCE=true; shift ;;
-        --help|-h)
-            usage; exit 0 ;;
-        *)
-            die "Unknown option: $1 (use --help for usage)" ;;
-    esac
-done
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --binary|--binary-src)
+                require_value "$1" "${2:-}"
+                BINARY_SRC="$2"; shift 2 ;;
+            --source-dir)
+                require_value "$1" "${2:-}"
+                SOURCE_DIR="$2"; shift 2 ;;
+            --install-rust)
+                INSTALL_RUST=true; shift ;;
+            --install-dir)
+                require_value "$1" "${2:-}"
+                INSTALL_DIR="$2"; INSTALL_DIR_SET=true; shift 2 ;;
+            --config-file)
+                require_value "$1" "${2:-}"
+                CONFIG_FILE="$2"; CONFIG_FILE_SET=true; shift 2 ;;
+            --data-dir)
+                require_value "$1" "${2:-}"
+                DATA_DIR="$2"; DATA_DIR_SET=true; shift 2 ;;
+            --restart)
+                RESTART_MODE="yes"; shift ;;
+            --no-restart)
+                RESTART_MODE="no"; shift ;;
+            --refresh-unit)
+                REFRESH_UNIT=true; shift ;;
+            --force|--non-interactive)
+                FORCE=true; shift ;;
+            --help|-h)
+                usage; exit 0 ;;
+            *)
+                die "Unknown option: $1 (use --help for usage)" ;;
+        esac
+    done
 
-if [[ -n "${BINARY_SRC}" ]] && [[ -n "${SOURCE_DIR}" ]]; then
-    die "--binary/--binary-src and --source-dir are mutually exclusive."
-fi
+    if [[ -n "${BINARY_SRC}" ]] && [[ -n "${SOURCE_DIR}" ]]; then
+        die "--binary/--binary-src and --source-dir are mutually exclusive."
+    fi
+}
 
 # -- Existing install discovery ------------------------------------------------
 
@@ -379,11 +387,25 @@ append_unique_paths_from_unit_line() {
     local -n target_paths="$2"
 
     local path
-    for path in ${unit_line#*=}; do
+    local -a parsed_paths=()
+    read -r -a parsed_paths <<< "${unit_line#*=}"
+    for path in "${parsed_paths[@]}"; do
         if [[ -n "${path}" ]] && ! path_in_array "${path}" "${target_paths[@]}"; then
             target_paths+=("${path}")
         fi
     done
+}
+
+validate_config_file_path() {
+    if [[ -z "${CONFIG_FILE}" ]]; then
+        die "--config-file must not be empty."
+    fi
+    if [[ "${CONFIG_FILE}" == */ ]]; then
+        die "--config-file must be a file path, not a directory-style path ending with '/': ${CONFIG_FILE}."
+    fi
+    if [[ -d "${CONFIG_FILE}" ]]; then
+        die "--config-file must not point to an existing directory: ${CONFIG_FILE}."
+    fi
 }
 
 refresh_unit_file() {
@@ -440,6 +462,7 @@ prepare_upgrade() {
     read_existing_unit_paths
 
     DEST_BINARY="${INSTALL_DIR}/${BINARY_NAME}"
+    validate_config_file_path
     CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"
     UNIT_SRC="${SCRIPT_DIR}/../packaging/${SERVICE_NAME}.service"
 
@@ -519,6 +542,8 @@ print_plan() {
 # -- Main upgrade --------------------------------------------------------------
 
 main() {
+    require_bash_43
+    parse_args "$@"
     prepare_upgrade
     detect_service_state
     print_plan
