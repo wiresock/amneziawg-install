@@ -479,6 +479,15 @@ refresh_unit_file() {
     info "Refreshed unit file: ${SYSTEMD_UNIT_DEST}"
 }
 
+adjust_status_sharing_permissions() {
+    if [[ -d "${DATA_DIR}" ]] && getent group awg-web >/dev/null 2>&1; then
+        chown root:awg-web "${DATA_DIR}" 2>/dev/null \
+            && chmod 2750 "${DATA_DIR}" 2>/dev/null \
+            && info "Configured ${DATA_DIR} for status sharing with awg-web." \
+            || warn "Could not adjust ${DATA_DIR} permissions; web proxy sessions may be unavailable."
+    fi
+}
+
 prepare_upgrade() {
     if [[ "$(id -u)" -ne 0 ]]; then
         die "This script must be run as root (e.g. sudo $0)"
@@ -613,6 +622,8 @@ main() {
     if [[ "${REFRESH_UNIT}" == "true" ]]; then
         refresh_unit_file
     fi
+
+    adjust_status_sharing_permissions
 
     if should_restart; then
         info "Restarting service..."

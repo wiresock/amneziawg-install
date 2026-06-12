@@ -14,6 +14,10 @@ pub struct ClientMetrics {
     pub packets_in: AtomicU64,
     /// Total packets sent to this client.
     pub packets_out: AtomicU64,
+    /// Total bytes received from this client.
+    pub bytes_in: AtomicU64,
+    /// Total bytes sent to this client.
+    pub bytes_out: AtomicU64,
     /// Total probe responses sent to this client.
     pub probes_sent: AtomicU64,
     /// Packed token bucket state: high 32 bits = tokens × 1000 (fixed-point
@@ -51,6 +55,8 @@ impl ClientMetrics {
         Self {
             packets_in: AtomicU64::new(0),
             packets_out: AtomicU64::new(0),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
             probes_sent: AtomicU64::new(0),
             rate_state: AtomicU64::new(pack(millitokens, now)),
             max_tokens: rate_limit_per_sec,
@@ -79,27 +85,27 @@ impl ClientMetrics {
                 .saturating_mul(self.refill_rate as u64)
                 .saturating_mul(1000);
             let max_mt = self.max_tokens.saturating_mul(1000);
-            let current_mt = std::cmp::min(
-                (old_mt as u64).saturating_add(refill),
-                max_mt as u64,
-            ) as u32;
+            let current_mt =
+                std::cmp::min((old_mt as u64).saturating_add(refill), max_mt as u64) as u32;
 
             if current_mt < 1000 {
                 // Not enough for one full token — store refilled state and reject.
                 let new = pack(current_mt, now);
                 // Best-effort update; if another thread won the race we'll
                 // recalculate on the next call.
-                let _ = self.rate_state.compare_exchange(
-                    old, new, Ordering::AcqRel, Ordering::Acquire,
-                );
+                let _ =
+                    self.rate_state
+                        .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire);
                 return false;
             }
 
             let new_mt = current_mt - 1000;
             let new = pack(new_mt, now);
-            if self.rate_state.compare_exchange(
-                old, new, Ordering::AcqRel, Ordering::Acquire,
-            ).is_ok() {
+            if self
+                .rate_state
+                .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 return true;
             }
             // CAS failed — another thread modified state, retry.
@@ -107,16 +113,51 @@ impl ClientMetrics {
     }
 
     pub fn record_in(&self) {
-        self.packets_in.fetch_add(1, Ordering::Relaxed);
+        self.record_in_bytes(0);
     }
 
     pub fn record_out(&self) {
+        self.record_out_bytes(0);
+    }
+
+    pub fn record_in_bytes(&self, bytes: usize) {
+        self.packets_in.fetch_add(1, Ordering::Relaxed);
+        self.bytes_in.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_out_bytes(&self, bytes: usize) {
         self.packets_out.fetch_add(1, Ordering::Relaxed);
+        self.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub fn record_probe(&self) {
         self.probes_sent.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn record_probe_bytes(&self, bytes: usize) {
+        self.probes_sent.fetch_add(1, Ordering::Relaxed);
+        self.packets_out.fetch_add(1, Ordering::Relaxed);
+        self.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ClientMetricsSnapshot {
+        ClientMetricsSnapshot {
+            packets_in: self.packets_in.load(Ordering::Relaxed),
+            packets_out: self.packets_out.load(Ordering::Relaxed),
+            bytes_in: self.bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out.load(Ordering::Relaxed),
+            probes_sent: self.probes_sent.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientMetricsSnapshot {
+    pub packets_in: u64,
+    pub packets_out: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub probes_sent: u64,
 }
 
 /// Global metrics store keyed by client address.
@@ -161,12 +202,11 @@ impl MetricsStore {
                     if current >= self.max_clients {
                         return None;
                     }
-                    if self.client_count.compare_exchange(
-                        current,
-                        current + 1,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ).is_ok() {
+                    if self
+                        .client_count
+                        .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
                         break;
                     }
                 }
@@ -233,13 +273,25 @@ mod tests {
     #[test]
     fn packet_counters() {
         let m = ClientMetrics::new(5);
-        m.record_in();
-        m.record_in();
-        m.record_out();
+        m.record_in_bytes(12);
+        m.record_in_bytes(30);
+        m.record_out_bytes(100);
         m.record_probe();
         assert_eq!(m.packets_in.load(Ordering::Relaxed), 2);
         assert_eq!(m.packets_out.load(Ordering::Relaxed), 1);
+        assert_eq!(m.bytes_in.load(Ordering::Relaxed), 42);
+        assert_eq!(m.bytes_out.load(Ordering::Relaxed), 100);
         assert_eq!(m.probes_sent.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            m.snapshot(),
+            ClientMetricsSnapshot {
+                packets_in: 2,
+                packets_out: 1,
+                bytes_in: 42,
+                bytes_out: 100,
+                probes_sent: 1
+            }
+        );
     }
 
     #[test]

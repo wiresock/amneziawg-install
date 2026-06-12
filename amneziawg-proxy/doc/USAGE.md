@@ -198,6 +198,12 @@ cleanup_interval_secs = 60
 # Both the session table and the metrics store enforce this limit.
 max_sessions = 10000
 
+# JSON file refreshed by the proxy with currently active sessions.
+status_file = "/var/lib/amneziawg-proxy/sessions.json"
+
+# How often (seconds) the status file is refreshed.
+status_interval_secs = 5
+
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 
 # Maximum number of probe responses sent to a single client per second.
@@ -299,6 +305,23 @@ applied and AWG packets are forwarded unmodified.
   forwarded before any probe has been seen are not transformed.
 
 ### Advanced options
+
+#### Active session status file
+
+The proxy writes a local JSON status file so `amneziawg-web` can show the
+real remote client addresses even when all AWG traffic reaches the interface
+through the proxy:
+
+```toml
+status_file = "/var/lib/amneziawg-proxy/sessions.json"
+status_interval_secs = 5
+```
+
+Each session entry includes the remote client address, proxy listen port,
+backend target port, detected/fixed obfuscation protocol, last activity time,
+packet counts, and byte counts. The file is intended for local trusted
+consumers; expose it through the authenticated web panel rather than serving
+it directly.
 
 #### DNS query forwarding
 

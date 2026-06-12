@@ -880,6 +880,15 @@ setup_filesystem() {
     chown "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}"
     chmod 0750 "${DATA_DIR}"
 
+    # If amneziawg-proxy is already installed, allow the web service to read
+    # its status file without making the directory world-readable.
+    if [[ -d /var/lib/amneziawg-proxy ]]; then
+        chown root:"${SERVICE_USER}" /var/lib/amneziawg-proxy 2>/dev/null \
+            && chmod 2750 /var/lib/amneziawg-proxy 2>/dev/null \
+            && info "Configured /var/lib/amneziawg-proxy for proxy status sharing." \
+            || warn "Could not adjust /var/lib/amneziawg-proxy permissions; proxy sessions may be unavailable."
+    fi
+
     # Env / config directory (root-owned, 0700)
     if [[ ! -d "${ENV_DIR}" ]]; then
         mkdir -p "${ENV_DIR}"
@@ -1556,6 +1565,7 @@ AWG_WEB_DB=${DATA_DIR}/awg-web.db
 # ── AWG integration ───────────────────────────────────────────────────────────
 AWG_CONFIG_DIR=${AWG_CONFIG_DIR}
 AWG_POLL_INTERVAL=${POLL_INTERVAL}
+AWG_PROXY_SESSIONS_FILE=/var/lib/amneziawg-proxy/sessions.json
 ENVEOF
 
     if [[ "${install_script_path}" != "${AWG_INSTALL_SCRIPT_DEST}" ]]; then
@@ -1754,6 +1764,7 @@ PrivateTmp=yes
 ReadWritePaths=/etc/amnezia/amneziawg
 ReadWritePaths=${AWG_CONFIG_DIR}
 ReadWritePaths=${DATA_DIR}
+ReadOnlyPaths=-/var/lib/amneziawg-proxy
 
 [Install]
 WantedBy=multi-user.target

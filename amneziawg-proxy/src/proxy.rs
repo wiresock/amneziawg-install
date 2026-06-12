@@ -1,9 +1,11 @@
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use serde::Serialize;
 use tokio::net::UdpSocket;
 use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::time;
@@ -141,6 +143,164 @@ pub struct Proxy {
 /// [`Proxy::dns_forward_semaphore`]).
 const MAX_INFLIGHT_DNS_FORWARDS: usize = 256;
 
+#[derive(Debug, Serialize)]
+struct ProxyStatusFile {
+    schema_version: u32,
+    generated_at_unix_ms: u64,
+    proxy_listen_addr: String,
+    proxy_listen_port: u16,
+    target_addr: String,
+    target_port: u16,
+    imitate_protocol: String,
+    session_ttl_secs: u64,
+    sessions: Vec<ProxySessionStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProxySessionStatus {
+    remote_addr: String,
+    remote_ip: String,
+    remote_port: u16,
+    local_proxy_addr: String,
+    local_proxy_port: u16,
+    target_addr: String,
+    target_port: u16,
+    backend_socket_addr: Option<String>,
+    obfuscation_protocol: String,
+    last_activity_unix_ms: u64,
+    last_activity_ms_ago: u64,
+    rx_packets: u64,
+    tx_packets: u64,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    probe_packets: u64,
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn build_proxy_status_snapshot(
+    sessions: &SessionTable,
+    metrics: &MetricsStore,
+    protocols: &DashMap<SocketAddr, Protocol>,
+    fixed_protocol: Option<Protocol>,
+    listen_addr: SocketAddr,
+    target_addr: &str,
+    target_port: u16,
+    imitate_protocol: &str,
+    session_ttl_secs: u64,
+) -> ProxyStatusFile {
+    let generated_at_unix_ms = current_unix_millis();
+    let session_now_ms = crate::session::now_millis();
+    let mut active_sessions: Vec<ProxySessionStatus> = sessions
+        .snapshots()
+        .into_iter()
+        .map(|session| {
+            let last_activity_ms_ago = session_now_ms.saturating_sub(session.last_active_ms);
+            let metric = metrics.get(&session.client_addr).map(|m| m.snapshot());
+            let protocol = fixed_protocol
+                .or_else(|| protocols.get(&session.client_addr).map(|p| *p))
+                .map(|protocol| protocol.to_string())
+                .unwrap_or_else(|| imitate_protocol.to_string());
+            let backend_socket_addr = session.backend_local_addr.map(|addr| addr.to_string());
+
+            ProxySessionStatus {
+                remote_addr: session.client_addr.to_string(),
+                remote_ip: session.client_addr.ip().to_string(),
+                remote_port: session.client_addr.port(),
+                local_proxy_addr: listen_addr.to_string(),
+                local_proxy_port: listen_addr.port(),
+                target_addr: target_addr.to_string(),
+                target_port,
+                backend_socket_addr,
+                obfuscation_protocol: protocol,
+                last_activity_unix_ms: generated_at_unix_ms.saturating_sub(last_activity_ms_ago),
+                last_activity_ms_ago,
+                rx_packets: metric.map(|m| m.packets_in).unwrap_or(0),
+                tx_packets: metric.map(|m| m.packets_out).unwrap_or(0),
+                rx_bytes: metric.map(|m| m.bytes_in).unwrap_or(0),
+                tx_bytes: metric.map(|m| m.bytes_out).unwrap_or(0),
+                probe_packets: metric.map(|m| m.probes_sent).unwrap_or(0),
+            }
+        })
+        .collect();
+
+    active_sessions.sort_by(|a, b| a.remote_addr.cmp(&b.remote_addr));
+
+    ProxyStatusFile {
+        schema_version: 1,
+        generated_at_unix_ms,
+        proxy_listen_addr: listen_addr.to_string(),
+        proxy_listen_port: listen_addr.port(),
+        target_addr: target_addr.to_string(),
+        target_port,
+        imitate_protocol: imitate_protocol.to_string(),
+        session_ttl_secs,
+        sessions: active_sessions,
+    }
+}
+
+async fn write_proxy_status_file(path: &Path, status: &ProxyStatusFile) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let json = serde_json::to_vec_pretty(status)?;
+    let tmp_path = status_tmp_path(path);
+    tokio::fs::write(&tmp_path, json).await?;
+    rename_status_file(&tmp_path, path).await?;
+    Ok(())
+}
+
+fn status_tmp_path(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sessions.json");
+    path.with_file_name(format!(
+        ".{filename}.{}.{}.tmp",
+        std::process::id(),
+        counter
+    ))
+}
+
+#[cfg(unix)]
+async fn rename_status_file(tmp_path: &Path, path: &Path) -> anyhow::Result<()> {
+    match tokio::fs::rename(tmp_path, path).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(tmp_path).await;
+            Err(e.into())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn rename_status_file(tmp_path: &Path, path: &Path) -> anyhow::Result<()> {
+    match tokio::fs::rename(tmp_path, path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = tokio::fs::remove_file(path).await;
+            match tokio::fs::rename(tmp_path, path).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(tmp_path).await;
+                    Err(e.into())
+                }
+            }
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(tmp_path).await;
+            Err(e.into())
+        }
+    }
+}
+
 impl Proxy {
     /// Create and bind a new proxy instance.
     pub async fn bind(config: ProxyConfig, awg_params: Option<AwgParams>) -> anyhow::Result<Self> {
@@ -271,7 +431,7 @@ impl Proxy {
                     "failed to send QUIC handshake response"
                 );
             } else if let Some(metrics) = self.metrics.get(&response.destination) {
-                metrics.record_probe();
+                metrics.record_probe_bytes(response.payload.len());
             }
         }
     }
@@ -289,6 +449,7 @@ impl Proxy {
     /// Run the proxy until shutdown is signaled.
     pub async fn run(&self) -> anyhow::Result<()> {
         let cleanup_handle = self.spawn_cleanup_task();
+        let status_handle = self.spawn_status_writer();
         let mut quic_tick = self
             .quic_handshake
             .as_ref()
@@ -342,6 +503,9 @@ impl Proxy {
         }
 
         cleanup_handle.abort();
+        if let Some(handle) = status_handle {
+            handle.abort();
+        }
         // Abort all per-session relay tasks
         self.relay_handles.iter().for_each(|entry| {
             entry.value().handle.abort();
@@ -355,6 +519,67 @@ impl Proxy {
         Ok(())
     }
 
+    fn spawn_status_writer(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let path = PathBuf::from(self.config.status_file.clone());
+        let interval = Duration::from_secs(self.config.status_interval_secs);
+        let sessions = Arc::clone(&self.sessions);
+        let metrics = Arc::clone(&self.metrics);
+        let protocols = Arc::clone(&self.client_protocols);
+        let fixed_protocol = self.fixed_protocol;
+        let listen_addr = match self.frontend.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                warn!(error = %e, "failed to read proxy listener address for status file");
+                match self.config.listen.parse() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        warn!(error = %e, "failed to parse configured listen address for status file");
+                        return None;
+                    }
+                }
+            }
+        };
+        let target_addr = self.config.backend.clone();
+        let target_port = self
+            .config
+            .backend
+            .parse::<SocketAddr>()
+            .map(|addr| addr.port())
+            .unwrap_or(0);
+        let imitate_protocol = self.config.imitate_protocol.clone();
+        let session_ttl_secs = self.config.session_ttl_secs;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        Some(tokio::spawn(async move {
+            let mut ticker = time::interval(interval);
+            ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let status = build_proxy_status_snapshot(
+                            &sessions,
+                            &metrics,
+                            &protocols,
+                            fixed_protocol,
+                            listen_addr,
+                            &target_addr,
+                            target_port,
+                            &imitate_protocol,
+                            session_ttl_secs,
+                        );
+                        if let Err(e) = write_proxy_status_file(&path, &status).await {
+                            warn!(path = %path.display(), error = %e, "failed to write proxy session status");
+                        }
+                    }
+                    _ = wait_for_shutdown(&mut shutdown_rx) => {
+                        break;
+                    }
+                }
+            }
+        }))
+    }
+
     /// Handle a packet received from a client.
     async fn handle_client_packet(&self, data: &[u8], client_addr: SocketAddr) {
         // Perform a single metrics lookup per client packet and reuse the
@@ -363,7 +588,7 @@ impl Proxy {
         let metrics_ref = self.metrics.get_or_create(client_addr);
 
         if let Some(ref metrics) = metrics_ref {
-            metrics.record_in();
+            metrics.record_in_bytes(data.len());
         }
 
         // When AWG params are available, check whether the incoming packet is
@@ -564,7 +789,7 @@ impl Proxy {
             if let Err(e) = self.frontend.send_to(&response, client_addr).await {
                 warn!(%client_addr, error = %e, "failed to send probe response");
             } else if let Some(ref metrics) = metrics_ref {
-                metrics.record_probe();
+                metrics.record_probe_bytes(response.len());
             }
             debug!(%client_addr, "probe response sent");
         }
@@ -608,10 +833,12 @@ impl Proxy {
                 match self.frontend.send_to(&response, client_addr).await {
                     Ok(_) => {
                         if let Some(metrics) = metrics_ref {
-                            metrics.record_probe();
+                            metrics.record_probe_bytes(response.len());
                         }
                     }
-                    Err(e) => warn!(%client_addr, error = %e, "failed to send SIP fallback response"),
+                    Err(e) => {
+                        warn!(%client_addr, error = %e, "failed to send SIP fallback response")
+                    }
                 }
                 return;
             }
@@ -729,7 +956,7 @@ impl Proxy {
             match self.frontend.send_to(pkt, client_addr).await {
                 Ok(_) => {
                     if let Some(metrics) = metrics_ref {
-                        metrics.record_probe();
+                        metrics.record_probe_bytes(pkt.len());
                     }
                     sent_any_response = true;
                     sent_response_count += 1;
@@ -784,32 +1011,31 @@ impl Proxy {
                     .as_ref()
                     .map_or(true, |metrics| metrics.try_acquire_probe());
                 if ringing_allowed {
-                    let sent = dialogs.get_mut(&client_addr).is_some_and(|mut d| {
-                        if d.stage == SipDialogStage::Invited
-                            && d.call_id_value == expected_call_id
+                    let sent_len = dialogs.get_mut(&client_addr).and_then(|mut d| {
+                        if d.stage != SipDialogStage::Invited || d.call_id_value != expected_call_id
                         {
-                            let pkt = responder::generate_sip_ringing(&d);
-                            match frontend.try_send_to(&pkt, client_addr) {
-                                Ok(_) => {
-                                    d.stage = SipDialogStage::Ringing;
-                                    true
-                                }
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    debug!(%client_addr, error = %e, "deferred SIP 180 Ringing send would block");
-                                    false
-                                }
-                                Err(e) => {
-                                    warn!(%client_addr, error = %e, "failed to send deferred SIP 180 Ringing");
-                                    false
-                                }
+                            return None;
+                        }
+                        let pkt = responder::generate_sip_ringing(&d);
+                        let len = pkt.len();
+                        match frontend.try_send_to(&pkt, client_addr) {
+                            Ok(_) => {
+                                d.stage = SipDialogStage::Ringing;
+                                Some(len)
                             }
-                        } else {
-                            false
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                debug!(%client_addr, error = %e, "deferred SIP 180 Ringing send would block");
+                                None
+                            }
+                            Err(e) => {
+                                warn!(%client_addr, error = %e, "failed to send deferred SIP 180 Ringing");
+                                None
+                            }
                         }
                     });
-                    if sent {
+                    if let Some(bytes) = sent_len {
                         if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_probe();
+                            metrics.record_probe_bytes(bytes);
                         }
                     }
                 } else {
@@ -833,40 +1059,39 @@ impl Proxy {
                     .as_ref()
                     .map_or(true, |metrics| metrics.try_acquire_probe());
                 if ok_allowed {
-                    let sent = dialogs.get_mut(&client_addr).is_some_and(|mut d| {
-                        if matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
-                            && d.call_id_value == expected_call_id
+                    let sent_len = dialogs.get_mut(&client_addr).and_then(|mut d| {
+                        if !matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
+                            || d.call_id_value != expected_call_id
                         {
-                            let pkt = responder::generate_sip_ok(&d);
-                            match frontend.try_send_to(&pkt, client_addr) {
-                                Ok(_) => {
-                                    d.stage = SipDialogStage::Established;
-                                    true
-                                }
-                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    debug!(%client_addr, error = %e, "deferred SIP 200 OK send would block");
-                                    false
-                                }
-                                Err(e) => {
-                                    warn!(%client_addr, error = %e, "failed to send deferred SIP 200 OK");
-                                    false
-                                }
+                            return None;
+                        }
+                        let pkt = responder::generate_sip_ok(&d);
+                        let len = pkt.len();
+                        match frontend.try_send_to(&pkt, client_addr) {
+                            Ok(_) => {
+                                d.stage = SipDialogStage::Established;
+                                Some(len)
                             }
-                        } else {
-                            false
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                debug!(%client_addr, error = %e, "deferred SIP 200 OK send would block");
+                                None
+                            }
+                            Err(e) => {
+                                warn!(%client_addr, error = %e, "failed to send deferred SIP 200 OK");
+                                None
+                            }
                         }
                     });
-                    if sent {
+                    if let Some(bytes) = sent_len {
                         if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_probe();
+                            metrics.record_probe_bytes(bytes);
                         }
                     }
                 } else {
                     debug!(%client_addr, "deferred SIP 200 OK rate limited");
                 }
-                sip_deferred_handles.remove_if(&client_addr, |_, entry| {
-                    entry.generation == generation
-                });
+                sip_deferred_handles
+                    .remove_if(&client_addr, |_, entry| entry.generation == generation);
             });
             if let Some((_, old_entry)) = self.sip_deferred_handles.remove(&client_addr) {
                 old_entry.handle.abort();
@@ -930,7 +1155,7 @@ impl Proxy {
             };
             match frontend.send_to(&response, client_addr).await {
                 Ok(_) => {
-                    metrics.record_probe();
+                    metrics.record_probe_bytes(response.len());
                     debug!(%client_addr, "DNS probe response sent");
                 }
                 Err(e) => warn!(%client_addr, error = %e, "failed to send DNS probe response"),
@@ -1011,7 +1236,7 @@ impl Proxy {
                         }
 
                         if let Some(m) = &client_metrics {
-                            m.record_out();
+                            m.record_out_bytes(n);
                         }
 
                         if let Some(a) = &activity {
@@ -1248,6 +1473,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_snapshot_reports_active_session() {
+        let backend: SocketAddr = "127.0.0.1:51821".parse().unwrap();
+        let sessions = SessionTable::new(backend, Duration::from_secs(300), 1000);
+        let metrics = MetricsStore::new(16, 1000);
+        let protocols = DashMap::new();
+        let client: SocketAddr = "203.0.113.10:45678".parse().unwrap();
+
+        sessions.get_or_create(client).await.unwrap();
+        let client_metrics = metrics.get_or_create(client).unwrap();
+        client_metrics.record_in_bytes(1200);
+        client_metrics.record_out_bytes(800);
+        client_metrics.record_probe();
+        protocols.insert(client, Protocol::Dns);
+
+        let status = build_proxy_status_snapshot(
+            &sessions,
+            &metrics,
+            &protocols,
+            None,
+            "0.0.0.0:51820".parse().unwrap(),
+            "127.0.0.1:51821",
+            51821,
+            "auto",
+            300,
+        );
+
+        assert_eq!(status.schema_version, 1);
+        assert_eq!(status.sessions.len(), 1);
+        let session = &status.sessions[0];
+        assert_eq!(session.remote_addr, "203.0.113.10:45678");
+        assert_eq!(session.remote_ip, "203.0.113.10");
+        assert_eq!(session.local_proxy_port, 51820);
+        assert_eq!(session.target_port, 51821);
+        assert_eq!(session.obfuscation_protocol, "dns");
+        assert_eq!(session.rx_packets, 1);
+        assert_eq!(session.tx_packets, 1);
+        assert_eq!(session.rx_bytes, 1200);
+        assert_eq!(session.tx_bytes, 800);
+        assert_eq!(session.probe_packets, 1);
+        assert!(session.backend_socket_addr.is_some());
+    }
+
+    #[tokio::test]
     async fn proxy_bind_and_shutdown() {
         let config = ProxyConfig {
             listen: "127.0.0.1:0".into(),
@@ -1264,6 +1532,8 @@ mod tests {
             buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
             awg_config: None,
         };
 
@@ -1353,6 +1623,8 @@ mod tests {
             buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
             awg_config: None,
         };
 
@@ -1473,7 +1745,10 @@ mod tests {
         txid: [u8; 2],
     ) -> Vec<u8> {
         let s4 = params.s4 as usize;
-        assert!(s4 >= 12 + qname_wire.len() + 4, "S4 too small for the query");
+        assert!(
+            s4 >= 12 + qname_wire.len() + 4,
+            "S4 too small for the query"
+        );
         let mut pkt = vec![0u8; s4];
         pkt[0] = txid[0];
         pkt[1] = txid[1];
@@ -1511,10 +1786,22 @@ mod tests {
             s2: 142,
             s3: 59,
             s4: 40,
-            h1: HRange { min: 102_875_432, max: 202_875_431 },
-            h2: HRange { min: 728_639_326, max: 828_639_325 },
-            h3: HRange { min: 1_469_276_895, max: 1_569_276_894 },
-            h4: HRange { min: 2_037_058_179, max: 2_137_058_178 },
+            h1: HRange {
+                min: 102_875_432,
+                max: 202_875_431,
+            },
+            h2: HRange {
+                min: 728_639_326,
+                max: 828_639_325,
+            },
+            h3: HRange {
+                min: 1_469_276_895,
+                max: 1_569_276_894,
+            },
+            h4: HRange {
+                min: 2_037_058_179,
+                max: 2_137_058_178,
+            },
         };
 
         let config = ProxyConfig {
@@ -1532,6 +1819,8 @@ mod tests {
             buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
             awg_config: None,
         };
 
@@ -1578,7 +1867,11 @@ mod tests {
         q
     }
 
-    fn dns_forward_config(backend_addr: SocketAddr, upstream: SocketAddr, timeout_ms: u64) -> ProxyConfig {
+    fn dns_forward_config(
+        backend_addr: SocketAddr,
+        upstream: SocketAddr,
+        timeout_ms: u64,
+    ) -> ProxyConfig {
         ProxyConfig {
             listen: "127.0.0.1:0".into(),
             backend: backend_addr.to_string(),
@@ -1594,6 +1887,8 @@ mod tests {
             buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
             awg_config: None,
         }
     }
@@ -1692,6 +1987,8 @@ mod tests {
             buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
             awg_config: None,
         }
     }
@@ -1746,6 +2043,8 @@ mod tests {
             buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
             awg_config: None,
         };
 
@@ -1821,6 +2120,8 @@ mod tests {
             buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
             awg_config: None,
         };
 
@@ -1850,10 +2151,11 @@ mod tests {
         proxy.handle_client_packet(&dns_query, client_addr).await;
 
         let mut buf = [0u8; 4096];
-        let (n, from) = tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
-            .await
-            .expect("DNS probe should receive a response")
-            .unwrap();
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("DNS probe should receive a response")
+                .unwrap();
         assert_eq!(from, proxy_addr);
         assert!(n >= 12, "DNS response must contain a header");
         assert_eq!(&buf[..2], &dns_query[..2], "must echo DNS transaction ID");
@@ -1882,8 +2184,8 @@ mod tests {
         );
         proxy.handle_client_packet(&quic_pkt, client_addr).await;
 
-        let mismatched = tokio::time::timeout(Duration::from_millis(150), client.recv_from(&mut buf))
-            .await;
+        let mismatched =
+            tokio::time::timeout(Duration::from_millis(150), client.recv_from(&mut buf)).await;
         assert!(
             mismatched.is_err(),
             "a DNS-locked client must not receive a QUIC probe response"
@@ -1915,6 +2217,8 @@ mod tests {
             buffer_size: 4096,
             max_sessions: 1000,
             socket_buffer_bytes: 0,
+            status_file: "/tmp/amneziawg-proxy-sessions.json".into(),
+            status_interval_secs: 5,
             awg_config: None,
         };
 
@@ -2388,10 +2692,17 @@ Content-Length: 0\r\n\r\n";
         let mut buf = [0u8; 1024];
         let ack_response =
             tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
-        assert!(ack_response.is_err(), "ACK without dialog should not emit a response");
+        assert!(
+            ack_response.is_err(),
+            "ACK without dialog should not emit a response"
+        );
 
         proxy
-            .handle_probe(invite, client_addr, &proxy.metrics.get_or_create(client_addr))
+            .handle_probe(
+                invite,
+                client_addr,
+                &proxy.metrics.get_or_create(client_addr),
+            )
             .await;
 
         let (n, from) =
@@ -2743,7 +3054,9 @@ Content-Length: 0\r\n\r\n";
                     .await
                     .expect("expected SIP response")
                     .unwrap();
-            assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with(expected));
+            assert!(std::str::from_utf8(&buf[..n])
+                .unwrap()
+                .starts_with(expected));
         }
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2834,7 +3147,9 @@ Content-Length: 0\r\n\r\n";
                     .expect("expected SIP response before shutdown")
                     .unwrap();
             assert_eq!(from, proxy_addr);
-            assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with(expected));
+            assert!(std::str::from_utf8(&buf[..n])
+                .unwrap()
+                .starts_with(expected));
         }
 
         proxy.shutdown_handle().shutdown();
@@ -2846,7 +3161,10 @@ Content-Length: 0\r\n\r\n";
         );
         let final_ok =
             tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
-        assert!(final_ok.is_err(), "shutdown should suppress deferred SIP 200 OK");
+        assert!(
+            final_ok.is_err(),
+            "shutdown should suppress deferred SIP 200 OK"
+        );
     }
 
     #[tokio::test]

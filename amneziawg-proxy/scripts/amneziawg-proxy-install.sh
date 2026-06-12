@@ -1259,8 +1259,14 @@ setup_filesystem() {
     else
         info "Data directory already exists: ${DATA_DIR}"
     fi
-    chown root:root "${DATA_DIR}"
-    chmod 0750 "${DATA_DIR}"
+    if getent group awg-web >/dev/null 2>&1; then
+        chown root:awg-web "${DATA_DIR}"
+        chmod 2750 "${DATA_DIR}"
+        info "Configured ${DATA_DIR} for status sharing with awg-web."
+    else
+        chown root:root "${DATA_DIR}"
+        chmod 0750 "${DATA_DIR}"
+    fi
 }
 
 # ── Binary installation ────────────────────────────────────────────────────────
@@ -1384,6 +1390,12 @@ cleanup_interval_secs = 60
 
 # Maximum number of concurrent client sessions.
 max_sessions = 10000
+
+# Local JSON status file with currently active proxy sessions.
+status_file = "${DATA_DIR}/sessions.json"
+
+# Refresh interval for the status file in seconds.
+status_interval_secs = 5
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 
@@ -1620,6 +1632,7 @@ Documentation=https://github.com/wiresock/amneziawg-install
 Type=simple
 Restart=on-failure
 RestartSec=5s
+UMask=0027
 User=root
 ExecStart=${INSTALL_DIR}/amneziawg-proxy ${CONFIG_FILE}
 WorkingDirectory=${DATA_DIR}

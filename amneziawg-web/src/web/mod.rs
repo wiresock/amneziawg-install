@@ -14,6 +14,7 @@ use axum::{
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::{Path as FsPath, PathBuf};
 use tower_http::trace::TraceLayer;
 use tracing::error;
 
@@ -52,12 +53,14 @@ pub struct AppState {
     /// Sliding-window login attempt counters keyed by client IP.
     pub rate_limiter: LoginRateLimiter,
     /// Directory where AWG client configs are stored (for rescan).
-    pub config_dir: std::path::PathBuf,
+    pub config_dir: PathBuf,
+    /// Local JSON file written by amneziawg-proxy with active session status.
+    pub proxy_sessions_file: PathBuf,
     /// Lazily-canonicalized `config_dir` for safe `starts_with` comparisons.
     /// Populated on first successful canonicalization (either at startup or on
     /// the first request that triggers it), so that a `config_dir` created
     /// after the process starts still gets properly resolved.
-    canonical_config_dir: std::sync::Arc<tokio::sync::OnceCell<std::path::PathBuf>>,
+    canonical_config_dir: std::sync::Arc<tokio::sync::OnceCell<PathBuf>>,
     /// Set once after logging a non-`NotFound` canonicalization error so
     /// subsequent retries don't flood the logs.
     logged_canon_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -91,11 +94,18 @@ impl SystemUptimeBaseline {
 
 const SYSTEM_VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 const MAX_REASONABLE_UPTIME_SECS: f64 = 3_153_600_000.0; // 100 years
+const DEFAULT_PROXY_SESSIONS_FILE: &str = "/var/lib/amneziawg-proxy/sessions.json";
+const PROXY_STATUS_STALE_AFTER_SECS: i64 = 30;
 const STATISTICS_COUNTER_NOTE: &str =
     "Traffic counters below are live interface counters since the last system boot or interface restart.";
 
 impl AppState {
-    fn new(db: Database, auth: AuthConfig, config_dir: std::path::PathBuf) -> Self {
+    fn new(
+        db: Database,
+        auth: AuthConfig,
+        config_dir: PathBuf,
+        proxy_sessions_file: PathBuf,
+    ) -> Self {
         let cell = tokio::sync::OnceCell::new();
         // Eagerly try to canonicalize at startup; if the dir exists now the
         // result is cached immediately and no filesystem hit is needed later.
@@ -116,6 +126,7 @@ impl AppState {
             login_csrf: new_login_csrf_store(),
             rate_limiter: new_login_rate_limiter(),
             config_dir,
+            proxy_sessions_file,
             canonical_config_dir: std::sync::Arc::new(cell),
             logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             system_versions_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
@@ -187,6 +198,77 @@ pub struct SystemStatusDto {
     pub server_booted_at: Option<DateTime<Utc>>,
     pub server_uptime_seconds: Option<u64>,
     pub statistics_note: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProxySessionsDto {
+    pub available: bool,
+    pub stale: bool,
+    pub status_file: String,
+    pub generated_at: Option<DateTime<Utc>>,
+    pub proxy_listen_addr: Option<String>,
+    pub proxy_listen_port: Option<u16>,
+    pub target_addr: Option<String>,
+    pub target_port: Option<u16>,
+    pub imitate_protocol: Option<String>,
+    pub session_ttl_secs: Option<u64>,
+    pub sessions: Vec<ProxySessionDto>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProxySessionDto {
+    pub remote_addr: String,
+    pub remote_ip: String,
+    pub remote_port: u16,
+    pub local_proxy_addr: String,
+    pub local_proxy_port: u16,
+    pub target_addr: String,
+    pub target_port: u16,
+    pub backend_socket_addr: Option<String>,
+    pub obfuscation_protocol: String,
+    pub last_activity_at: Option<DateTime<Utc>>,
+    pub last_activity_ms_ago: u64,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub probe_packets: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyStatusFileRaw {
+    #[allow(dead_code)]
+    schema_version: u32,
+    generated_at_unix_ms: u64,
+    proxy_listen_addr: String,
+    proxy_listen_port: u16,
+    target_addr: String,
+    target_port: u16,
+    imitate_protocol: String,
+    session_ttl_secs: u64,
+    #[serde(default)]
+    sessions: Vec<ProxySessionRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxySessionRaw {
+    remote_addr: String,
+    remote_ip: String,
+    remote_port: u16,
+    local_proxy_addr: String,
+    local_proxy_port: u16,
+    target_addr: String,
+    target_port: u16,
+    backend_socket_addr: Option<String>,
+    obfuscation_protocol: String,
+    last_activity_unix_ms: u64,
+    last_activity_ms_ago: u64,
+    rx_packets: u64,
+    tx_packets: u64,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    probe_packets: u64,
 }
 
 // ── Error helper ────────────────────────────────────────────────────────────
@@ -517,6 +599,12 @@ fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
     ts.and_then(|t| Utc.timestamp_opt(t, 0).single())
 }
 
+fn unix_millis_to_utc(ts: u64) -> Option<DateTime<Utc>> {
+    let seconds = i64::try_from(ts / 1000).ok()?;
+    let nanos = ((ts % 1000) as u32) * 1_000_000;
+    Utc.timestamp_opt(seconds, nanos).single()
+}
+
 fn detect_system_boot_time(uptime_seconds: Option<u64>) -> Option<DateTime<Utc>> {
     detect_boot_time_from_proc_stat().or_else(|| uptime_seconds.map(boot_time_from_uptime_seconds))
 }
@@ -567,6 +655,81 @@ fn system_status(state: &AppState) -> SystemStatusDto {
         server_booted_at: state.system_booted_at,
         server_uptime_seconds: uptime,
         statistics_note: STATISTICS_COUNTER_NOTE.to_string(),
+    }
+}
+
+async fn proxy_sessions_status(state: &AppState) -> ProxySessionsDto {
+    read_proxy_sessions_status(&state.proxy_sessions_file).await
+}
+
+async fn read_proxy_sessions_status(path: &FsPath) -> ProxySessionsDto {
+    let status_file = path.display().to_string();
+    let unavailable = |error: Option<String>| ProxySessionsDto {
+        available: false,
+        stale: false,
+        status_file: status_file.clone(),
+        generated_at: None,
+        proxy_listen_addr: None,
+        proxy_listen_port: None,
+        target_addr: None,
+        target_port: None,
+        imitate_protocol: None,
+        session_ttl_secs: None,
+        sessions: Vec::new(),
+        error,
+    };
+
+    let contents = match tokio::fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return unavailable(None),
+        Err(e) => return unavailable(Some(format!("cannot read proxy session status: {e}"))),
+    };
+
+    let raw: ProxyStatusFileRaw = match serde_json::from_str(&contents) {
+        Ok(raw) => raw,
+        Err(e) => return unavailable(Some(format!("cannot parse proxy session status: {e}"))),
+    };
+
+    let generated_at = unix_millis_to_utc(raw.generated_at_unix_ms);
+    let stale = generated_at
+        .and_then(|ts| Utc::now().signed_duration_since(ts).to_std().ok())
+        .is_some_and(|age| age.as_secs() > PROXY_STATUS_STALE_AFTER_SECS as u64);
+    let sessions = raw
+        .sessions
+        .into_iter()
+        .map(|session| ProxySessionDto {
+            remote_addr: session.remote_addr,
+            remote_ip: session.remote_ip,
+            remote_port: session.remote_port,
+            local_proxy_addr: session.local_proxy_addr,
+            local_proxy_port: session.local_proxy_port,
+            target_addr: session.target_addr,
+            target_port: session.target_port,
+            backend_socket_addr: session.backend_socket_addr,
+            obfuscation_protocol: session.obfuscation_protocol,
+            last_activity_at: unix_millis_to_utc(session.last_activity_unix_ms),
+            last_activity_ms_ago: session.last_activity_ms_ago,
+            rx_packets: session.rx_packets,
+            tx_packets: session.tx_packets,
+            rx_bytes: session.rx_bytes,
+            tx_bytes: session.tx_bytes,
+            probe_packets: session.probe_packets,
+        })
+        .collect();
+
+    ProxySessionsDto {
+        available: true,
+        stale,
+        status_file,
+        generated_at,
+        proxy_listen_addr: Some(raw.proxy_listen_addr),
+        proxy_listen_port: Some(raw.proxy_listen_port),
+        target_addr: Some(raw.target_addr),
+        target_port: Some(raw.target_port),
+        imitate_protocol: Some(raw.imitate_protocol),
+        session_ttl_secs: Some(raw.session_ttl_secs),
+        sessions,
+        error: None,
     }
 }
 
@@ -698,8 +861,23 @@ fn normalize_period(period: &str) -> &'static str {
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Build the application router.
-pub fn router(db: Database, auth: AuthConfig, config_dir: std::path::PathBuf) -> Router {
-    let state = AppState::new(db, auth, config_dir);
+pub fn router(db: Database, auth: AuthConfig, config_dir: PathBuf) -> Router {
+    router_with_proxy_sessions_file(
+        db,
+        auth,
+        config_dir,
+        PathBuf::from(DEFAULT_PROXY_SESSIONS_FILE),
+    )
+}
+
+/// Build the application router with an explicit proxy session status file.
+pub fn router_with_proxy_sessions_file(
+    db: Database,
+    auth: AuthConfig,
+    config_dir: PathBuf,
+    proxy_sessions_file: PathBuf,
+) -> Router {
+    let state = AppState::new(db, auth, config_dir, proxy_sessions_file);
 
     // Protected routes – all require a valid session.
     let protected = Router::new()
@@ -715,6 +893,7 @@ pub fn router(db: Database, auth: AuthConfig, config_dir: std::path::PathBuf) ->
         .route("/api/usage", get(get_all_usage))
         .route("/api/system/status", get(get_system_status))
         .route("/api/system/versions", get(get_system_versions))
+        .route("/api/proxy/sessions", get(get_proxy_sessions))
         .route("/api/events", get(list_events_handler))
         // ── User lifecycle routes ────────────────────────────────
         .route("/api/admin/next-ips", get(api_next_ips))
@@ -1003,6 +1182,11 @@ async fn list_peers(State(state): State<AppState>) -> ApiResult<Json<Vec<PeerSum
     let rows = crate::db::peers::list_all(&state.db.pool).await?;
     let dtos: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
     Ok(Json(dtos))
+}
+
+/// `GET /api/proxy/sessions` – active client sessions reported by amneziawg-proxy.
+async fn get_proxy_sessions(State(state): State<AppState>) -> Json<ProxySessionsDto> {
+    Json(proxy_sessions_status(&state).await)
 }
 
 /// `GET /api/peers/:id` – return full details for one peer.
@@ -1754,7 +1938,8 @@ async fn page_peer_list(
     let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
     let csrf = session_csrf_from_headers(&state, &headers);
     let status = system_status(&state);
-    Ok(Html(render_peer_list(&peers, &csrf, &status)).into_response())
+    let proxy_sessions = proxy_sessions_status(&state).await;
+    Ok(Html(render_peer_list(&peers, &csrf, &status, &proxy_sessions)).into_response())
 }
 
 /// `GET /peers/:id` – server-rendered peer detail page.
@@ -2652,6 +2837,102 @@ fn render_system_status(status: &SystemStatusDto) -> String {
     )
 }
 
+fn render_proxy_sessions(status: &ProxySessionsDto) -> String {
+    if !status.available && status.error.is_none() {
+        return String::new();
+    }
+
+    let mut buf = String::new();
+    buf.push_str("<section class=\"proxy-sessions\" aria-label=\"Proxy sessions\">\n");
+    buf.push_str("<h2>Active proxy sessions</h2>\n");
+
+    if let Some(error) = &status.error {
+        buf.push_str(&format!(
+            "<p class=\"meta warning\">Proxy session status unavailable: {}</p>\n",
+            esc(error)
+        ));
+        buf.push_str("</section>\n");
+        return buf;
+    }
+
+    let generated = fmt_optional_local_timestamp(status.generated_at, "unknown");
+    let target = status
+        .target_addr
+        .as_deref()
+        .map(esc)
+        .unwrap_or_else(|| "unknown".to_string());
+    let listen = status
+        .proxy_listen_addr
+        .as_deref()
+        .map(esc)
+        .unwrap_or_else(|| "unknown".to_string());
+    let protocol = status
+        .imitate_protocol
+        .as_deref()
+        .map(esc)
+        .unwrap_or_else(|| "unknown".to_string());
+    let stale_note = if status.stale {
+        r#" <span class="warning">stale</span>"#
+    } else {
+        ""
+    };
+
+    buf.push_str(&format!(
+        "<p class=\"meta\">{} session(s) &nbsp;·&nbsp; listen: <code>{}</code> \
+         &nbsp;·&nbsp; target: <code>{}</code> &nbsp;·&nbsp; protocol: {} \
+         &nbsp;·&nbsp; updated: {}{} &nbsp;·&nbsp; <a href=\"/api/proxy/sessions\">JSON API</a></p>\n",
+        status.sessions.len(),
+        listen,
+        target,
+        protocol,
+        esc(&generated),
+        stale_note,
+    ));
+
+    if status.sessions.is_empty() {
+        buf.push_str("<p class=\"meta\">No active proxy sessions reported.</p>\n");
+    } else {
+        buf.push_str(
+            "<table class=\"proxy-session-table\">\n\
+             <tr><th>Remote client</th><th>Proxy port</th><th>Target port</th>\
+             <th>Protocol</th><th>Last activity</th><th>RX</th><th>TX</th></tr>\n",
+        );
+        for session in &status.sessions {
+            let last_activity = session
+                .last_activity_at
+                .map(|ts| {
+                    format!(
+                        "{} ago - {}",
+                        fmt_duration_hms(session.last_activity_ms_ago / 1000),
+                        fmt_local_timestamp(ts)
+                    )
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let traffic_title = format!(
+                "RX packets: {}, TX packets: {}, probe responses: {}",
+                session.rx_packets, session.tx_packets, session.probe_packets
+            );
+            buf.push_str(&format!(
+                "<tr><td><code>{remote}</code></td><td>{proxy_port}</td><td>{target_port}</td>\
+                 <td>{protocol}</td><td>{last_activity}</td>\
+                 <td title=\"{title}\">{rx}</td><td title=\"{title}\">{tx}</td></tr>\n",
+                remote = esc(&session.remote_addr),
+                proxy_port = session.local_proxy_port,
+                target_port = session.target_port,
+                protocol = esc(&session.obfuscation_protocol),
+                last_activity = esc(&last_activity),
+                title = esc(&traffic_title),
+                rx = fmt_bytes(session.rx_bytes),
+                tx = fmt_bytes(session.tx_bytes),
+            ));
+        }
+        buf.push_str("</table>\n");
+    }
+
+    buf.push_str("</section>\n");
+    buf
+}
+
 fn html_head(title: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
@@ -2674,6 +2955,11 @@ fn html_head(title: &str) -> String {
   .system-status-grid {{ display: flex; flex-wrap: wrap; gap: .35rem 2rem; }}
   .status-label {{ font-weight: 700; }}
   .system-status .meta {{ margin: .45rem 0 0; }}
+  .proxy-sessions {{ margin: 1.5rem 0 0; }}
+  .proxy-sessions h2 {{ margin: 0 0 .45rem; font-size: 1.1rem; }}
+  .proxy-sessions .meta {{ margin: 0 0 .6rem; }}
+  .proxy-session-table {{ margin-bottom: 1rem; }}
+  .warning {{ color: #9a5a00; font-weight: 700; }}
   .counter-scope {{ display: inline-block; margin-left: .35rem; padding: .1rem .45rem; border: 1px solid #d6e2f0; border-radius: 999px; background: #f4f8fd; color: #496277; font-size: .78rem; }}
   .th-hint {{ display: block; margin-top: .1rem; color: #777; font-size: .72rem; font-weight: 400; }}
   .back {{ margin-bottom: 1rem; display: block; }}
@@ -2803,8 +3089,9 @@ fn render_peer_list(
     peers: &[PeerSummaryDto],
     csrf_token: &str,
     system_status: &SystemStatusDto,
+    proxy_sessions: &ProxySessionsDto,
 ) -> String {
-    render_peer_list_inner(peers, csrf_token, system_status, None)
+    render_peer_list_inner(peers, csrf_token, system_status, Some(proxy_sessions), None)
 }
 
 fn render_peer_list_with_error(
@@ -2813,13 +3100,14 @@ fn render_peer_list_with_error(
     system_status: &SystemStatusDto,
     error: &str,
 ) -> String {
-    render_peer_list_inner(peers, csrf_token, system_status, Some(error))
+    render_peer_list_inner(peers, csrf_token, system_status, None, Some(error))
 }
 
 fn render_peer_list_inner(
     peers: &[PeerSummaryDto],
     csrf_token: &str,
     system_status: &SystemStatusDto,
+    proxy_sessions: Option<&ProxySessionsDto>,
     error: Option<&str>,
 ) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
@@ -2867,6 +3155,10 @@ fn render_peer_list_inner(
             ));
         }
         buf.push_str("</table>\n");
+    }
+
+    if let Some(proxy_sessions) = proxy_sessions {
+        buf.push_str(&render_proxy_sessions(proxy_sessions));
     }
 
     let add_user_open = if error.is_some() { " open" } else { "" };
@@ -3322,6 +3614,15 @@ mod tests {
         router(db, AuthConfig::disabled(), config_dir)
     }
 
+    fn test_router_with_proxy_sessions_file(db: Database, proxy_sessions_file: PathBuf) -> Router {
+        router_with_proxy_sessions_file(
+            db,
+            AuthConfig::disabled(),
+            PathBuf::from("/tmp/test-configs"),
+            proxy_sessions_file,
+        )
+    }
+
     /// Build a router with auth enabled and known test credentials.
     fn test_router_with_auth(db: Database) -> (Router, String) {
         let hash = AuthConfig::hash_password_fast("testpassword");
@@ -3352,6 +3653,98 @@ mod tests {
                 rest[..rest.find('"').unwrap_or(0)].to_string()
             })
             .unwrap_or_default()
+    }
+
+    fn write_proxy_status_file(path: &FsPath) {
+        let now_ms = Utc::now().timestamp_millis();
+        let json = format!(
+            r#"{{
+  "schema_version": 1,
+  "generated_at_unix_ms": {now_ms},
+  "proxy_listen_addr": "0.0.0.0:51820",
+  "proxy_listen_port": 51820,
+  "target_addr": "127.0.0.1:51821",
+  "target_port": 51821,
+  "imitate_protocol": "auto",
+  "session_ttl_secs": 300,
+  "sessions": [
+    {{
+      "remote_addr": "203.0.113.10:45678",
+      "remote_ip": "203.0.113.10",
+      "remote_port": 45678,
+      "local_proxy_addr": "0.0.0.0:51820",
+      "local_proxy_port": 51820,
+      "target_addr": "127.0.0.1:51821",
+      "target_port": 51821,
+      "backend_socket_addr": "127.0.0.1:40000",
+      "obfuscation_protocol": "dns",
+      "last_activity_unix_ms": {now_ms},
+      "last_activity_ms_ago": 1200,
+      "rx_packets": 2,
+      "tx_packets": 1,
+      "rx_bytes": 2048,
+      "tx_bytes": 1024,
+      "probe_packets": 1
+    }}
+  ]
+}}"#
+        );
+        std::fs::write(path, json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_proxy_sessions_reads_status_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let status_file = dir.path().join("sessions.json");
+        write_proxy_status_file(&status_file);
+        let app = test_router_with_proxy_sessions_file(test_db().await, status_file);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/proxy/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["available"], true);
+        assert_eq!(json["proxy_listen_port"], 51820);
+        assert_eq!(json["target_port"], 51821);
+        assert_eq!(json["sessions"][0]["remote_addr"], "203.0.113.10:45678");
+        assert_eq!(json["sessions"][0]["obfuscation_protocol"], "dns");
+        assert_eq!(json["sessions"][0]["rx_bytes"], 2048);
+        assert!(json["sessions"][0]["last_activity_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn peer_list_page_shows_proxy_sessions_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let status_file = dir.path().join("sessions.json");
+        write_proxy_status_file(&status_file);
+        let app = test_router_with_proxy_sessions_file(test_db().await, status_file);
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+
+        assert!(html.contains("Active proxy sessions"));
+        assert!(html.contains("203.0.113.10:45678"));
+        assert!(html.contains("/api/proxy/sessions"));
+        assert!(html.contains("dns"));
+        assert!(html.contains("2.0 KiB"));
     }
 
     /// Call `GET /login`, extract the pre-login CSRF token, then `POST /login`

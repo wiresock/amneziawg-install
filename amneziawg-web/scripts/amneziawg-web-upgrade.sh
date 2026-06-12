@@ -649,6 +649,21 @@ Please report this issue."
     # Fall back to the default clients directory used by the installer.
     awg_config_dir_upgrade="${awg_config_dir_upgrade:-/etc/amnezia/amneziawg/clients}"
 
+    if [[ -f "${ENV_FILE}" ]] && ! grep -q '^AWG_PROXY_SESSIONS_FILE=' "${ENV_FILE}" 2>/dev/null; then
+        {
+            printf '\n'
+            printf '# Proxy active-session status file (written by amneziawg-proxy)\n'
+            printf 'AWG_PROXY_SESSIONS_FILE=/var/lib/amneziawg-proxy/sessions.json\n'
+        } >>"${ENV_FILE}" && info "Added AWG_PROXY_SESSIONS_FILE to ${ENV_FILE}."
+    fi
+
+    if [[ -d /var/lib/amneziawg-proxy ]]; then
+        chown root:"${SERVICE_USER}" /var/lib/amneziawg-proxy 2>/dev/null \
+            && chmod 2750 /var/lib/amneziawg-proxy 2>/dev/null \
+            && info "Configured /var/lib/amneziawg-proxy for proxy status sharing." \
+            || warn "Could not adjust /var/lib/amneziawg-proxy permissions; proxy sessions may be unavailable."
+    fi
+
     # Reject paths containing whitespace or control characters early.  These
     # break systemd ReadWritePaths= directives and sudoers entries.
     if [[ "${awg_config_dir_upgrade}" =~ [[:space:][:cntrl:]] ]]; then
