@@ -117,6 +117,19 @@ upgrade_validate_config_file_path() {
         validate_config_file_path
     )
 }
+upgrade_validate_paths() {
+    local install_dir="$1"
+    local config_file="$2"
+    local data_dir="$3"
+    (
+        set --
+        source "${UPGRADE_SCRIPT}"
+        INSTALL_DIR="${install_dir}"
+        CONFIG_FILE="${config_file}"
+        DATA_DIR="${data_dir}"
+        validate_upgrade_paths
+    )
+}
 
 # ── is_positive_integer ───────────────────────────────────────────────────────
 
@@ -224,6 +237,13 @@ assert_rc 1 upgrade_validate_config_file_path "/etc/amneziawg-proxy//"
 tmp_config_dir="$(mktemp -d)"
 assert_rc 1 upgrade_validate_config_file_path "${tmp_config_dir}"
 rm -rf "${tmp_config_dir}"
+
+assert_rc 0 upgrade_validate_paths "/usr/local/bin" "/etc/amneziawg-proxy/proxy.toml" "/var/lib/amneziawg-proxy"
+assert_rc 1 upgrade_validate_paths "usr/local/bin" "/etc/amneziawg-proxy/proxy.toml" "/var/lib/amneziawg-proxy"
+assert_rc 1 upgrade_validate_paths "/usr/local/bin with-space" "/etc/amneziawg-proxy/proxy.toml" "/var/lib/amneziawg-proxy"
+assert_rc 1 upgrade_validate_paths "/usr/local/../bin" "/etc/amneziawg-proxy/proxy.toml" "/var/lib/amneziawg-proxy"
+assert_rc 1 upgrade_validate_paths "/usr/local/bin" "etc/amneziawg-proxy/proxy.toml" "/var/lib/amneziawg-proxy"
+assert_rc 1 upgrade_validate_paths "/usr/local/bin" "/etc/amneziawg-proxy/proxy.toml" "/var/lib/./amneziawg-proxy"
 
 # ── safe_rm_dir guards ────────────────────────────────────────────────────────
 
@@ -689,6 +709,7 @@ assert_niv_rc 1 "DNS_UPSTREAM" 'not-valid' \
 echo "=== --help exits 0 ==="
 assert_rc 0 bash "${INSTALL_SCRIPT}"   --help
 assert_rc 0 bash "${UNINSTALL_SCRIPT}" --help
+assert_rc 0 bash "${UPGRADE_SCRIPT}"   --help
 
 # ── reconfigure_awg_listen_port ───────────────────────────────────────────────
 #

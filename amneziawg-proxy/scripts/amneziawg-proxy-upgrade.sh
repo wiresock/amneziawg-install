@@ -408,6 +408,35 @@ validate_config_file_path() {
     fi
 }
 
+path_has_dot_components() {
+    local path="$1"
+    [[ "${path}" == "." || "${path}" == ".." || "${path}" == */./* || "${path}" == */../* || "${path}" == */. || "${path}" == */.. ]]
+}
+
+validate_upgrade_paths() {
+    local path_var path_val flag_name
+    for path_var in INSTALL_DIR CONFIG_FILE DATA_DIR; do
+        path_val="${!path_var}"
+        flag_name="--${path_var//_/-}"
+        flag_name="${flag_name,,}"
+
+        if [[ -z "${path_val}" ]]; then
+            die "${flag_name} must not be empty."
+        fi
+        if [[ "${path_val}" != /* ]]; then
+            die "${flag_name} must be an absolute path (got: '${path_val}')."
+        fi
+        if [[ "${path_val}" == *$'\n'* || "${path_val}" == *$'\r'* || "${path_val}" == *[[:space:]]* ]]; then
+            die "${flag_name} must not contain whitespace or newlines."
+        fi
+        if path_has_dot_components "${path_val}"; then
+            die "${flag_name} must not contain '.' or '..' path components (got: '${path_val}')."
+        fi
+    done
+
+    validate_config_file_path
+}
+
 refresh_unit_file() {
     info "Refreshing systemd unit..."
 
@@ -462,7 +491,7 @@ prepare_upgrade() {
     read_existing_unit_paths
 
     DEST_BINARY="${INSTALL_DIR}/${BINARY_NAME}"
-    validate_config_file_path
+    validate_upgrade_paths
     CONFIG_DIR="$(dirname -- "${CONFIG_FILE}")"
     UNIT_SRC="${SCRIPT_DIR}/../packaging/${SERVICE_NAME}.service"
 
@@ -542,8 +571,8 @@ print_plan() {
 # -- Main upgrade --------------------------------------------------------------
 
 main() {
-    require_bash_43
     parse_args "$@"
+    require_bash_43
     prepare_upgrade
     detect_service_state
     print_plan
