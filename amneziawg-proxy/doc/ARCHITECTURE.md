@@ -671,7 +671,11 @@ ephemeral UDP socket `connect()`ed to the backend. This provides:
   allocation), keeping CPU usage proportional to actual traffic.
 - **Automatic cleanup** — a periodic task (default: every 60 s) reaps
   sessions idle longer than `session_ttl_secs` (default: 300 s) and removes
-  associated metrics.
+  associated metrics. Idleness is measured from the last packet *received
+  from the client*; backend→client relay traffic does not refresh it, so a
+  session expires on schedule even while the backend keeps retrying toward
+  a client that vanished (e.g. AWG handshake initiations triggered by stale
+  return traffic for the client's old flows).
 - **Resource limits** — `max_sessions` (default: 10,000) prevents resource
   exhaustion. Both the session table and the metrics store enforce this limit.
   Excess clients receive an error log and their packets are dropped.
