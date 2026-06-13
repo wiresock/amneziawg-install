@@ -6,6 +6,7 @@
 2. [Installation](#installation)
    - [Automated installer (recommended)](#automated-installer-recommended)
    - [Manual build & install](#manual-build--install)
+   - [Custom/manual deployments](#custommanual-deployments)
 3. [Configuration](#configuration)
    - [proxy.toml reference](#proxytoml-reference)
    - [AWG config integration](#awg-config-integration)
@@ -114,6 +115,11 @@ sudo ./amneziawg-proxy/scripts/amneziawg-proxy-install.sh \
 
 ### Manual build & install
 
+This quick path assumes the proxy and AWG run on the same host and that AWG can
+be rebound to a loopback backend port. For Docker-hosted AWG, split-host
+deployments, custom systemd units, or web-panel status-file sharing, see
+[MANUAL_DEPLOYMENT.md](MANUAL_DEPLOYMENT.md).
+
 ```bash
 # 1. Build release binary
 cd amneziawg-proxy
@@ -146,6 +152,17 @@ sudo install -m 644 \
 sudo systemctl daemon-reload
 sudo systemctl enable --now amneziawg-proxy
 ```
+
+### Custom/manual deployments
+
+Use [MANUAL_DEPLOYMENT.md](MANUAL_DEPLOYMENT.md) when the automated installer
+should not manage the AWG interface directly. It covers:
+
+- AWG running inside Docker while the proxy runs on the host.
+- Proxy and AWG running as separate containers on a Docker network.
+- AWG running on another host or VM behind a private backend address.
+- Writing `proxy.toml` by hand, including `status_file` for `amneziawg-web`.
+- Custom systemd hardening, file permissions, firewall rules, and validation.
 
 ---
 

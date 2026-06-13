@@ -35,8 +35,9 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 
-# Allow reading the AWG server config and the proxy config.
-ReadOnlyPaths=/etc/amnezia /etc/amneziawg-proxy
+# Keep proxy config read-only. The AWG config path is optional for split-host
+# and container deployments that omit awg_config.
+ReadOnlyPaths=-/etc/amnezia /etc/amneziawg-proxy
 
 # Allow writing to the working directory, including sessions.json status.
 ReadWritePaths=/var/lib/amneziawg-proxy

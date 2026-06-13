@@ -1644,7 +1644,7 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-ReadOnlyPaths=/etc/amnezia ${CONFIG_DIR}
+ReadOnlyPaths=-/etc/amnezia ${CONFIG_DIR}
 ReadWritePaths=${DATA_DIR}
 Environment=RUST_LOG=amneziawg_proxy=info
 
@@ -1661,9 +1661,9 @@ UNITEOF
     # overwrote it (unit_installed=true). Existing user-managed units are
     # preserved as-is to avoid removing custom flags or capabilities.
     if [[ -f "${SYSTEMD_UNIT_DEST}" ]] && [[ "${unit_installed}" == "true" ]]; then
-        local -a read_only_paths=("/etc/amnezia" "${CONFIG_DIR}")
+        local -a read_only_paths=("-/etc/amnezia" "${CONFIG_DIR}")
         if [[ "${AWG_DIR}" != "/etc/amnezia" ]]; then
-            read_only_paths+=("${AWG_DIR}")
+            read_only_paths+=("-${AWG_DIR}")
         fi
 
         local esc_exec esc_workdir esc_ro esc_rw
