@@ -80,9 +80,10 @@ awg_config = "/etc/amnezia/amneziawg/awg0.conf"
 ```
 
 If the host cannot read the AWG config, omit `awg_config`. The proxy will still
-forward traffic, but it will not apply AWG packet padding transformation on
-backend-to-client packets. Use this only if your AWG setup does not require
-that transformation or if you have verified clients still connect correctly.
+forward traffic, but it will not load AWG obfuscation parameters, classify AWG
+packet types, or apply padding transformation. Use this only if your AWG setup
+does not require that transformation or if you have verified clients still
+connect correctly.
 
 ### Proxy and AWG in Docker
 
