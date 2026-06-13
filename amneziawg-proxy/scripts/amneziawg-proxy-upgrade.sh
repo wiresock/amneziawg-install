@@ -373,9 +373,10 @@ path_in_array() {
     local needle="$1"
     shift
 
+    local needle_path="${needle#-}"
     local path
     for path in "$@"; do
-        if [[ "${path}" == "${needle}" ]]; then
+        if [[ "${path#-}" == "${needle_path}" ]]; then
             return 0
         fi
     done
@@ -447,7 +448,7 @@ refresh_unit_file() {
         die "Failed to copy unit file to: ${tmp_unit}"
     fi
 
-    local -a read_only_paths=("/etc/amnezia" "${CONFIG_DIR}")
+    local -a read_only_paths=("-/etc/amnezia" "${CONFIG_DIR}")
     local -a read_write_paths=("${DATA_DIR}")
     if [[ -f "${SYSTEMD_UNIT_DEST}" ]]; then
         local existing_ro existing_rw

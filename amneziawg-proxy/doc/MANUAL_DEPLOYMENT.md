@@ -212,8 +212,9 @@ Important notes:
 - `awg_config` is optional, but recommended when the proxy must apply AWG
   padding transformation. The file only needs the `[Interface]` obfuscation
   parameters; peer sections are ignored.
-- `status_file` is optional from a forwarding perspective, but recommended when
-  `amneziawg-web` should show active proxy sessions.
+- `status_file` defaults to `/var/lib/amneziawg-proxy/sessions.json` when it is
+  omitted. Set it explicitly when `amneziawg-web` should read sessions from a
+  different path.
 
 Install the config:
 
@@ -283,16 +284,17 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-ReadOnlyPaths=/etc/amnezia /etc/amneziawg-proxy
+ReadOnlyPaths=-/etc/amnezia /etc/amneziawg-proxy
 ReadWritePaths=/var/lib/amneziawg-proxy
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-If `awg_config` points somewhere else, update `ReadOnlyPaths` so systemd allows
-the service to read that path. If `awg_config` is omitted, `/etc/amnezia` is not
-required.
+If `awg_config` points somewhere else, make sure the service user has normal
+filesystem read access to that file. You can also add the config directory to
+`ReadOnlyPaths` for hardening; prefix it with `-` when the directory may be
+absent on hosts where `awg_config` is omitted.
 
 For public ports below 1024, either keep `User=root` or add
 `AmbientCapabilities=CAP_NET_BIND_SERVICE` and run as a dedicated service user

@@ -206,10 +206,11 @@ assert_rc 1 upgrade_should_restart "" "false"
 upgrade_append_paths() {
     local unit_line="$1"
     shift
+    local -a initial_paths=("$@")
     (
         set --
         source "${UPGRADE_SCRIPT}"
-        local -a paths=("$@")
+        local -a paths=("${initial_paths[@]}")
         append_unique_paths_from_unit_line "${unit_line}" paths
         printf '%s\n' "${paths[*]}"
     )
@@ -226,9 +227,14 @@ assert_eq "/var/lib/amneziawg-proxy /tmp/proxy-*" "${result}" \
     "upgrade preserves glob characters in path lists"
 
 result="$(upgrade_append_paths 'ReadOnlyPaths=/etc/amnezia /etc/amneziawg /etc/amneziawg-proxy' \
-    "/etc/amnezia" "/etc/amneziawg-proxy")"
-assert_eq "/etc/amnezia /etc/amneziawg /etc/amneziawg-proxy" "${result}" \
+    "-/etc/amnezia" "/etc/amneziawg-proxy")"
+assert_eq "-/etc/amnezia /etc/amneziawg-proxy /etc/amneziawg" "${result}" \
     "upgrade merges unique ReadOnlyPaths entries"
+
+result="$(upgrade_append_paths 'ReadOnlyPaths=-/etc/amnezia /etc/amneziawg-proxy' \
+    "/etc/amnezia")"
+assert_eq "/etc/amnezia /etc/amneziawg-proxy" "${result}" \
+    "upgrade treats optional and required path entries as duplicates"
 
 assert_rc 0 upgrade_validate_config_file_path "/etc/amneziawg-proxy/proxy.toml"
 assert_rc 1 upgrade_validate_config_file_path "/etc/amneziawg-proxy/"
