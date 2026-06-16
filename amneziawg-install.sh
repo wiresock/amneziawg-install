@@ -2255,46 +2255,46 @@ function newClient() {
 		# When disabled, the safety net below derives a placeholder that is never
 		# written to the config.
 		if [[ "${ENABLE_IPV6}" == "y" ]]; then
-		# Normalize server IPv6 and extract /64 prefix (first 4 groups)
-		local NORMALIZED_SERVER_IPV6
-		NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
-		BASE_IP=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
+			# Normalize server IPv6 and extract /64 prefix (first 4 groups)
+			local NORMALIZED_SERVER_IPV6
+			NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
+			BASE_IP=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
 
-		# Reset IPV6_EXISTS so the until-loop below actually prompts the user.
-		# The free-IP search loop above already set it to '0' for the first
-		# available slot, which would cause the until condition to be immediately
-		# true and skip the interactive IPv6 selection entirely.
-		IPV6_EXISTS=""
+			# Reset IPV6_EXISTS so the until-loop below actually prompts the user.
+			# The free-IP search loop above already set it to '0' for the first
+			# available slot, which would cause the until condition to be immediately
+			# true and skip the interactive IPv6 selection entirely.
+			IPV6_EXISTS=""
 
-		until [[ ${IPV6_EXISTS} == '0' ]]; do
-			read -rp "Client AmneziaWG IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
+			until [[ ${IPV6_EXISTS} == '0' ]]; do
+				read -rp "Client AmneziaWG IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
 
-			# Validate IPv6 host part is a valid hex segment (1-4 hex characters)
-			if ! [[ ${DOT_IP} =~ ^[a-fA-F0-9]{1,4}$ ]]; then
-				echo ""
-				echo -e "${ORANGE}Invalid IPv6 host part. Must be 1-4 hexadecimal characters.${NC}"
-				echo ""
-				IPV6_EXISTS='1'
-				continue
-			fi
-
-			CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IP}::${DOT_IP}")
-			# Semantic duplicate check: normalize all existing IPv6 in config for comparison
-			IPV6_EXISTS=0
-			local EXISTING_IPV6_RAW
-			while IFS= read -r EXISTING_IPV6_RAW; do
-				if [[ "$(normalizeIPv6 "${EXISTING_IPV6_RAW%/128}")" == "${CLIENT_AWG_IPV6}" ]]; then
-					IPV6_EXISTS=1
-					break
+				# Validate IPv6 host part is a valid hex segment (1-4 hex characters)
+				if ! [[ ${DOT_IP} =~ ^[a-fA-F0-9]{1,4}$ ]]; then
+					echo ""
+					echo -e "${ORANGE}Invalid IPv6 host part. Must be 1-4 hexadecimal characters.${NC}"
+					echo ""
+					IPV6_EXISTS='1'
+					continue
 				fi
-			done < <(grep -oE '[a-fA-F0-9:]+/128' "${SERVER_AWG_CONF}")
 
-			if [[ ${IPV6_EXISTS} != 0 ]]; then
-				echo ""
-				echo -e "${ORANGE}A client with the specified IPv6 was already created, please choose another IPv6.${NC}"
-				echo ""
-			fi
-		done
+				CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IP}::${DOT_IP}")
+				# Semantic duplicate check: normalize all existing IPv6 in config for comparison
+				IPV6_EXISTS=0
+				local EXISTING_IPV6_RAW
+				while IFS= read -r EXISTING_IPV6_RAW; do
+					if [[ "$(normalizeIPv6 "${EXISTING_IPV6_RAW%/128}")" == "${CLIENT_AWG_IPV6}" ]]; then
+						IPV6_EXISTS=1
+						break
+					fi
+				done < <(grep -oE '[a-fA-F0-9:]+/128' "${SERVER_AWG_CONF}")
+
+				if [[ ${IPV6_EXISTS} != 0 ]]; then
+					echo ""
+					echo -e "${ORANGE}A client with the specified IPv6 was already created, please choose another IPv6.${NC}"
+					echo ""
+				fi
+			done
 		fi
 	fi
 
