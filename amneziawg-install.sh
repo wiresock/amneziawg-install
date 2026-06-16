@@ -1631,6 +1631,76 @@ function installQuestions() {
 	read -n1 -r -p "Press any key to continue..."
 }
 
+# Emit the server's PostUp/PostDown firewall rules on stdout.
+#
+# The backend is chosen in priority order:
+#   1. firewalld - when the firewalld service is active.
+#   2. nftables  - when the nft binary is available and iptables is either absent
+#                  or backed by nf_tables (the default on modern Debian/Ubuntu/
+#                  Fedora). Emitting native nft rules avoids the iptables-nft
+#                  compatibility layer, which on these systems either inserts the
+#                  rules into a backend the kernel does not enforce (so NAT/forward
+#                  silently breaks) or aborts awg-quick when the legacy ip6_tables
+#                  module is unavailable. See issue #79.
+#   3. iptables  - legacy fallback for systems without nft.
+#
+# Reads the SERVER_* globals populated by installQuestions(). The brace blocks in
+# the nft chain definitions are single-quoted so awg-quick's `eval` of each hook
+# passes them to nft intact instead of treating { ; } as shell syntax.
+function writeFirewallRules() {
+	if systemctl is-active --quiet firewalld 2>/dev/null; then
+		local FIREWALLD_IPV4_ADDRESS FIREWALLD_IPV6_ADDRESS
+		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_AWG_IPV4}" | cut -d"." -f1-3)".0"
+		# Derive /64 network address from the normalized IPv6 (first 4 groups + :0:0:0:0)
+		FIREWALLD_IPV6_ADDRESS="$(echo "${SERVER_AWG_IPV6}" | cut -d':' -f1-4):0:0:0:0"
+		echo "PostUp = firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'
+PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'"
+	elif command -v nft >/dev/null 2>&1 && { ! command -v iptables >/dev/null 2>&1 || iptables --version 2>/dev/null | grep -qi 'nf_tables'; }; then
+		# A single inet table covers both IPv4 and IPv6; the nat chain masquerades
+		# both families. PostDown drops the whole table atomically, so no per-rule
+		# deletion (and no ordering fragility) is required.
+		# The MSS-clamp rule is scoped to 'oifname <awg>' so it only touches traffic
+		# entering the tunnel (notably the return-path SYN-ACK) and leaves any other
+		# forwarding the host does alone. It must precede the accept rules: it carries
+		# no verdict so the packet falls through to them, but an accept would otherwise
+		# terminate the chain before the clamp runs. 'tcp flags & (syn|rst) == syn'
+		# matches SYN and SYN-ACK (the segments carrying the MSS option); the &/(|)
+		# tokens are single-quoted so awg-quick's eval passes them to nft intact.
+		local NFT_TABLE="awg-${SERVER_AWG_NIC}"
+		echo "PostUp = nft add table inet ${NFT_TABLE}
+PostUp = nft add chain inet ${NFT_TABLE} input '{ type filter hook input priority 0 ; policy accept ; }'
+PostUp = nft add rule inet ${NFT_TABLE} input udp dport ${SERVER_PORT} accept
+PostUp = nft add chain inet ${NFT_TABLE} forward '{ type filter hook forward priority 0 ; policy accept ; }'
+PostUp = nft add rule inet ${NFT_TABLE} forward oifname ${SERVER_AWG_NIC} tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu
+PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_AWG_NIC} accept
+PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_PUB_NIC} oifname ${SERVER_AWG_NIC} accept
+PostUp = nft add chain inet ${NFT_TABLE} postrouting '{ type nat hook postrouting priority 100 ; policy accept ; }'
+PostUp = nft add rule inet ${NFT_TABLE} postrouting oifname ${SERVER_PUB_NIC} masquerade
+PostDown = nft delete table inet ${NFT_TABLE}"
+	else
+		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = iptables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = ip6tables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = ip6tables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = iptables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostUp = ip6tables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = ip6tables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = iptables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = ip6tables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+	fi
+}
+
 function installAmneziaWG() {
 	ensureSupportedInstallDistro
 
@@ -1676,7 +1746,7 @@ function installAmneziaWG() {
 		apt-get update || { echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
-		apt install -y dkms iptables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		apt install -y dkms iptables nftables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
 			# Tag managed file with sentinel so uninstall can verify ownership
@@ -1773,21 +1843,21 @@ function installAmneziaWG() {
 		apt-get update || { echo -e "${RED}ERROR: Failed to update package index.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
-		apt-get install -y dkms amneziawg amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		apt-get install -y dkms amneziawg amneziawg-tools qrencode iptables nftables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
-		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables nftables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'centos' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
 		dnf copr enable -y amneziavpn/amneziawg
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
-		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		dnf install -y dkms amneziawg-dkms amneziawg-tools qrencode iptables nftables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	fi
 	disable_apt_ipv4
 
@@ -1884,30 +1954,7 @@ H4 = ${SERVER_AWG_H4}" >"${SERVER_AWG_CONF}"
 	# Restore default umask before creating system files and running services
 	umask "${OLD_UMASK}"
 
-	if systemctl is-active --quiet firewalld 2>/dev/null; then
-		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_AWG_IPV4}" | cut -d"." -f1-3)".0"
-		# Derive /64 network address from the normalized IPv6 (first 4 groups + :0:0:0:0)
-		FIREWALLD_IPV6_ADDRESS="$(echo "${SERVER_AWG_IPV6}" | cut -d':' -f1-4):0:0:0:0"
-		echo "PostUp = firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'
-PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'" >>"${SERVER_AWG_CONF}"
-	else
-		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostUp = ip6tables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
-PostUp = ip6tables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
-PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = ip6tables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
-PostDown = ip6tables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
-PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >>"${SERVER_AWG_CONF}"
-	fi
+	writeFirewallRules >>"${SERVER_AWG_CONF}"
 
 	# Enable routing on the server
 	mkdir -p /etc/sysctl.d

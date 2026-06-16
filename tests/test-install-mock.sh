@@ -104,8 +104,18 @@ create_mock "depmod" 'exit 0'
 create_mock "dkms" 'exit 0'
 create_mock "sysctl" 'exit 0'
 create_mock "lsmod" 'echo "amneziawg 12345 0"'
-create_mock "iptables" 'exit 0'
+# Report the nf_tables backend so the installer selects the native nftables
+# firewall path (the default on modern Debian/Ubuntu), matching real systems.
+create_mock "iptables" '
+case "$1" in
+	--version) echo "iptables v1.8.10 (nf_tables)";;
+	*) exit 0;;
+esac'
 create_mock "ip6tables" 'exit 0'
+# nft only needs to resolve on PATH so writeFirewallRules' `command -v nft` check
+# selects the nftables backend; the generated rules are asserted on the config
+# file below. (Any actual invocation is logged for debugging.)
+create_mock "nft" 'echo "$@" >> /tmp/nft-calls.log; exit 0'
 create_mock "qrencode" 'exit 0'
 create_mock "firewall-cmd" 'exit 1'
 
@@ -131,7 +141,7 @@ exec "${shift_args[@]}"
 cp /sbin/sudo /usr/bin/sudo
 
 # Mock systemctl (unit-aware: only awg-quick@* is reported as active after start;
-# firewalld stays inactive to ensure the iptables code path is exercised)
+# firewalld stays inactive to ensure the nftables code path is exercised)
 create_mock "systemctl" '
 # Log every systemctl call for later verification.
 echo "$@" >> /tmp/systemctl-calls.log
@@ -273,6 +283,7 @@ fi
 
 # Clean up any previous test state
 rm -f /tmp/awg-mock-started
+rm -f /tmp/nft-calls.log
 
 # Ensure necessary directories exist
 mkdir -p /etc/apt/sources.list.d /etc/apt/keyrings 2>/dev/null || true
@@ -379,6 +390,34 @@ if [[ -f "${SERVER_CONF}" ]]; then
 			FAILED=$((FAILED + 1))
 		fi
 	done
+
+	# Verify the native nftables firewall rules were generated (issue #79).
+	# The installer should emit nft rules — not iptables — on nf_tables hosts.
+	NFT_TABLE="awg-awg0"
+	declare -A NFT_EXPECT=(
+		["nft table created"]="^PostUp = nft add table inet ${NFT_TABLE}\$"
+		["nft input/port accept rule"]="^PostUp = nft add rule inet ${NFT_TABLE} input udp dport [0-9]\+ accept\$"
+		["nft forward accept rule"]="^PostUp = nft add rule inet ${NFT_TABLE} forward iifname awg0 accept\$"
+		["nft masquerade rule"]="^PostUp = nft add rule inet ${NFT_TABLE} postrouting oifname eth0 masquerade\$"
+		["nft postrouting nat chain"]="hook postrouting priority 100"
+		["nft mss clamp rule"]="forward oifname awg0 tcp flags .* tcp option maxseg size set rt mtu"
+		["nft teardown on PostDown"]="^PostDown = nft delete table inet ${NFT_TABLE}\$"
+	)
+	for DESC in "${!NFT_EXPECT[@]}"; do
+		if grep -q "${NFT_EXPECT[$DESC]}" "${SERVER_CONF}"; then
+			echo "  OK: ${DESC} present in server config"
+		else
+			echo "  FAIL: ${DESC} missing from server config"
+			FAILED=$((FAILED + 1))
+		fi
+	done
+	# The nf_tables host must NOT get legacy iptables/ip6tables hooks.
+	if grep -qE "^PostUp = (ip6?tables) " "${SERVER_CONF}"; then
+		echo "  FAIL: legacy iptables rules emitted on nf_tables host"
+		FAILED=$((FAILED + 1))
+	else
+		echo "  OK: no legacy iptables rules on nf_tables host"
+	fi
 
 	# Verify a client peer was added
 	if grep -q "^### Client client$" "${SERVER_CONF}"; then

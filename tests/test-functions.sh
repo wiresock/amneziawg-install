@@ -865,6 +865,109 @@ _make_mock "systemctl" 'exit 0'
 
 rm -rf "${MOCK_BIN_DIR}"
 
+# ============================================================
+# writeFirewallRules tests (issue #79: nftables vs iptables)
+# ============================================================
+echo "=== writeFirewallRules ==="
+
+assert_contains() {  # haystack needle msg
+	TESTS_RUN=$((TESTS_RUN + 1))
+	if [[ "$1" == *"$2"* ]]; then
+		TESTS_PASSED=$((TESTS_PASSED + 1))
+	else
+		TESTS_FAILED=$((TESTS_FAILED + 1))
+		echo "  FAIL: ${3:-assertion} (missing: '$2')"
+	fi
+}
+assert_not_contains() {  # haystack needle msg
+	TESTS_RUN=$((TESTS_RUN + 1))
+	if [[ "$1" != *"$2"* ]]; then
+		TESTS_PASSED=$((TESTS_PASSED + 1))
+	else
+		TESTS_FAILED=$((TESTS_FAILED + 1))
+		echo "  FAIL: ${3:-assertion} (unexpected: '$2')"
+	fi
+}
+
+# Isolated PATH so `command -v nft`/`iptables` only sees our stubs (the CI runner
+# itself ships a real nft, which would otherwise leak into the fallback case).
+FW_TMP="$(mktemp -d)"
+mkdir -p "${FW_TMP}/bin" "${FW_TMP}/realbin"
+for _cmd in grep cut cat bash sed; do
+	if _real="$(command -v "${_cmd}" 2>/dev/null)"; then
+		ln -sf "${_real}" "${FW_TMP}/realbin/${_cmd}"
+	fi
+done
+unset _cmd _real
+
+SERVER_PORT="51820"
+SERVER_PUB_NIC="eth0"
+SERVER_AWG_NIC="awg0"
+SERVER_AWG_IPV4="10.66.66.1"
+SERVER_AWG_IPV6="fd42:42:42:0:0:0:0:1"
+
+_fw_stub() {  # name body
+	printf '%s\n%s\n' '#!/usr/bin/env bash' "$2" > "${FW_TMP}/bin/$1"
+	chmod +x "${FW_TMP}/bin/$1"
+}
+_run_fw() { ( PATH="${FW_TMP}/bin:${FW_TMP}/realbin"; export PATH; writeFirewallRules ); }
+
+# Backend 1: firewalld active -> firewall-cmd rules.
+_fw_stub systemctl '[[ "$*" == "is-active --quiet firewalld" ]] && exit 0; exit 1'
+rm -f "${FW_TMP}/bin/nft" "${FW_TMP}/bin/iptables"
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "PostUp = firewall-cmd --add-port 51820/udp" "firewalld: adds port"
+assert_contains "${FW_OUT}" "family=ipv4 source address=10.66.66.0/24 masquerade" "firewalld: ipv4 masquerade"
+assert_not_contains "${FW_OUT}" "nft add table" "firewalld: no nft rules"
+
+# Backend 2: firewalld inactive, nft present, iptables nf_tables-backed -> nft rules.
+_fw_stub systemctl 'exit 1'
+_fw_stub nft 'exit 0'
+_fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.10 (nf_tables)";; esac; exit 0'
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "PostUp = nft add table inet awg-awg0" "nft: creates inet table"
+assert_contains "${FW_OUT}" "input udp dport 51820 accept" "nft: accepts vpn port"
+assert_contains "${FW_OUT}" "postrouting oifname eth0 masquerade" "nft: masquerades via pub nic"
+assert_contains "${FW_OUT}" "hook postrouting priority 100" "nft: nat chain at srcnat priority"
+assert_contains "${FW_OUT}" "forward oifname awg0 tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu" "nft: clamps MSS on tunnel egress"
+assert_contains "${FW_OUT}" "PostDown = nft delete table inet awg-awg0" "nft: tears down table"
+assert_not_contains "${FW_OUT}" "iptables -" "nft: no legacy iptables rules"
+# The MSS clamp carries no verdict, so it must appear before the accept rules
+# that would otherwise terminate the forward chain first.
+NFT_MSS_LINE="$(printf '%s\n' "${FW_OUT}" | grep -n 'maxseg size set' | head -1 | cut -d: -f1)"
+NFT_ACCEPT_LINE="$(printf '%s\n' "${FW_OUT}" | grep -n 'forward iifname awg0 accept' | head -1 | cut -d: -f1)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -n "${NFT_MSS_LINE}" && -n "${NFT_ACCEPT_LINE}" && "${NFT_MSS_LINE}" -lt "${NFT_ACCEPT_LINE}" ]]; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: nft MSS clamp must precede forward accept (mss=${NFT_MSS_LINE}, accept=${NFT_ACCEPT_LINE})"
+fi
+
+# Backend 3: firewalld inactive, nft absent -> iptables fallback.
+_fw_stub systemctl 'exit 1'
+rm -f "${FW_TMP}/bin/nft"
+_fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.7 (legacy)";; esac; exit 0'
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables: masquerade rule"
+assert_contains "${FW_OUT}" "ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables: ipv6 masquerade rule"
+assert_contains "${FW_OUT}" "iptables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS on tunnel egress"
+assert_contains "${FW_OUT}" "ip6tables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS on tunnel egress (ipv6)"
+assert_contains "${FW_OUT}" "PostDown = iptables -t mangle -D FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: removes MSS clamp (matches PostUp)"
+assert_not_contains "${FW_OUT}" "nft add table" "iptables: no nft rules"
+
+# Backend gate: nft present but iptables is legacy-backed -> stay on iptables so we
+# don't disturb a host that deliberately uses the legacy backend.
+_fw_stub systemctl 'exit 1'
+_fw_stub nft 'exit 0'
+_fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.7 (legacy)";; esac; exit 0'
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING" "legacy gate: keeps iptables when backend is legacy"
+assert_not_contains "${FW_OUT}" "nft add table" "legacy gate: no nft rules on legacy backend"
+
+rm -rf "${FW_TMP}"
+unset FW_TMP FW_OUT
+
 echo ""
 echo "=========================================="
 echo "Results: ${TESTS_PASSED}/${TESTS_RUN} passed, ${TESTS_FAILED} failed"
