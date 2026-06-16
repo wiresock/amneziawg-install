@@ -965,8 +965,115 @@ FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING" "legacy gate: keeps iptables when backend is legacy"
 assert_not_contains "${FW_OUT}" "nft add table" "legacy gate: no nft rules on legacy backend"
 
+# IPv4-only mode (issue #51): no IPv6 firewall rules in any backend.
+ENABLE_IPV6=n
+# firewalld
+_fw_stub systemctl '[[ "$*" == "is-active --quiet firewalld" ]] && exit 0; exit 1'
+rm -f "${FW_TMP}/bin/nft" "${FW_TMP}/bin/iptables"
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "family=ipv4 source address=10.66.66.0/24 masquerade" "firewalld v4-only: ipv4 masquerade present"
+assert_not_contains "${FW_OUT}" "family=ipv6" "firewalld v4-only: no ipv6 rich rule"
+# iptables fallback
+_fw_stub systemctl 'exit 1'
+rm -f "${FW_TMP}/bin/nft"
+_fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.7 (legacy)";; esac; exit 0'
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables v4-only: ipv4 masquerade present"
+assert_not_contains "${FW_OUT}" "ip6tables" "iptables v4-only: no ip6tables rules"
+# nft (inet table still emitted; it is inert for v6 on an IPv6-disabled host)
+_fw_stub systemctl 'exit 1'
+_fw_stub nft 'exit 0'
+_fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.10 (nf_tables)";; esac; exit 0'
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "PostUp = nft add table inet awg-awg0" "nft v4-only: still emits inet table"
+assert_contains "${FW_OUT}" "postrouting oifname eth0 masquerade" "nft v4-only: masquerade present"
+unset ENABLE_IPV6
+
 rm -rf "${FW_TMP}"
 unset FW_TMP FW_OUT
+
+echo "=== stripIPv6FromList ==="
+assert_eq "0.0.0.0/0" "$(stripIPv6FromList "0.0.0.0/0,::/0")" "stripIPv6FromList drops ::/0"
+assert_eq "10.0.0.0/8,192.168.0.0/16" "$(stripIPv6FromList "10.0.0.0/8,fd00::/8,192.168.0.0/16")" "stripIPv6FromList keeps v4 order, drops v6"
+assert_eq "0.0.0.0/0" "$(stripIPv6FromList "0.0.0.0/0")" "stripIPv6FromList no-op on v4-only"
+assert_eq "" "$(stripIPv6FromList "::/0")" "stripIPv6FromList empties an all-IPv6 list"
+assert_eq "0.0.0.0/0" "$(stripIPv6FromList " 0.0.0.0/0 , ::/0 ")" "stripIPv6FromList trims surrounding whitespace"
+
+echo "=== ipv6Available ==="
+# Environment-dependent, but it must always exit cleanly with 0 (available) or 1.
+ipv6Available; IPV6_AVAIL_RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "${IPV6_AVAIL_RC}" == "0" || "${IPV6_AVAIL_RC}" == "1" ]]; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: ipv6Available returned unexpected code ${IPV6_AVAIL_RC}"
+fi
+unset IPV6_AVAIL_RC
+
+echo "=== nonInteractiveAddClient (IPv4-only vs dual-stack) ==="
+# Drive the real client generator with mocked externals and assert that an
+# IPv4-only client carries no IPv6 anywhere, while dual-stack still does (#51).
+NIAC_BIN="$(mktemp -d)"
+cat > "${NIAC_BIN}/awg" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+	genkey) echo "PRIVKEY";;
+	pubkey) read -r _ 2>/dev/null; echo "PUBKEY";;
+	genpsk) echo "PSK";;
+	*) exit 0;;
+esac
+EOF
+cat > "${NIAC_BIN}/awg-quick" <<'EOF'
+#!/usr/bin/env bash
+echo "[Interface]"
+EOF
+chmod +x "${NIAC_BIN}/awg" "${NIAC_BIN}/awg-quick"
+
+# Run nonInteractiveAddClient in a subshell; echo "<clientconf>|||<serverconf>".
+_run_niac() {  # $1=ENABLE_IPV6 (y/n) $2=client name
+	local dir; dir="$(mktemp -d)"
+	mkdir -p "${dir}/amneziawg"
+	printf '%s\n' "[Interface]" "Address = 10.66.66.1/24" "ListenPort = 51820" \
+		> "${dir}/amneziawg/awg0.conf"
+	(
+		PATH="${NIAC_BIN}:${PATH}"; export PATH
+		AMNEZIAWG_DIR="${dir}/amneziawg"
+		WEB_PANEL_CONFIG_DIR="${dir}/amneziawg/clients"
+		SERVER_AWG_NIC="awg0"; SERVER_AWG_IPV4="10.66.66.1"
+		SERVER_AWG_IPV6="fd42:42:42:0:0:0:0:1"; SERVER_PORT="51820"
+		SERVER_PUB_IP="198.51.100.1"; SERVER_PUB_KEY="SRVPUB"
+		CLIENT_DNS_1="1.1.1.1"; CLIENT_DNS_2=""
+		SERVER_AWG_JC=4; SERVER_AWG_JMIN=50; SERVER_AWG_JMAX=1000
+		SERVER_AWG_S1=30; SERVER_AWG_S2=100; SERVER_AWG_S3=45; SERVER_AWG_S4=120
+		SERVER_AWG_H1="5-10"; SERVER_AWG_H2="11-20"; SERVER_AWG_H3="21-30"; SERVER_AWG_H4="31-40"
+		ALLOWED_IPS="0.0.0.0/0,::/0"; ENABLE_IPV6="$1"
+		# Neutralize side-effecting helpers for the unit test.
+		ensureAmneziawgKernelModule() { :; }
+		copyToWebPanelDir() { :; }
+		nonInteractiveAddClient "$2" >/dev/null 2>&1
+	)
+	echo "${dir}/amneziawg/clients/awg0-client-$2.conf|||${dir}/amneziawg/awg0.conf"
+}
+
+# Dual-stack: client and server peer keep IPv6.
+NIAC_PATHS="$(_run_niac y dsclient)"
+NIAC_CC="$(cat "${NIAC_PATHS%%|||*}" 2>/dev/null)"
+NIAC_SC_PEER="$(grep '^AllowedIPs' "${NIAC_PATHS##*|||}" 2>/dev/null | tail -1)"
+assert_contains "${NIAC_CC}" "/128" "niac dual-stack: client Address keeps IPv6"
+assert_contains "${NIAC_SC_PEER}" "/128" "niac dual-stack: server peer keeps IPv6"
+
+# IPv4-only: no IPv6 in the client config or the server peer entry.
+NIAC_PATHS="$(_run_niac n v4client)"
+NIAC_CC="$(cat "${NIAC_PATHS%%|||*}" 2>/dev/null)"
+NIAC_SC_PEER="$(grep '^AllowedIPs' "${NIAC_PATHS##*|||}" 2>/dev/null | tail -1)"
+assert_contains "${NIAC_CC}" "Address = 10.66.66.2/32" "niac v4-only: client has IPv4 address"
+assert_not_contains "${NIAC_CC}" "::" "niac v4-only: client config has no IPv6"
+assert_not_contains "${NIAC_CC}" "/128" "niac v4-only: client config has no /128"
+assert_not_contains "${NIAC_SC_PEER}" "/128" "niac v4-only: server peer has no /128"
+assert_not_contains "${NIAC_SC_PEER}" "::" "niac v4-only: server peer has no IPv6"
+rm -rf "${NIAC_BIN}"
+unset NIAC_BIN NIAC_PATHS NIAC_CC NIAC_SC_PEER
 
 echo ""
 echo "=========================================="

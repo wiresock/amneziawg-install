@@ -320,15 +320,23 @@ Override specific defaults with environment variables:
 | `SERVER_AWG_NIC` | `awg0` |
 | `SERVER_AWG_IPV4` | `10.66.66.1` |
 | `SERVER_AWG_IPV6` | `fd42:42:42::1` |
+| `ENABLE_IPV6` | `y` if the host has IPv6, otherwise `n` |
 | `SERVER_PORT` | Random (49152–65535) |
 | `CLIENT_DNS_1` | `1.1.1.1` |
 | `CLIENT_DNS_2` | `1.0.0.1` |
-| `ALLOWED_IPS` | `0.0.0.0/0,::/0` |
+| `ALLOWED_IPS` | `0.0.0.0/0,::/0` (IPv4 only when `ENABLE_IPV6=n`) |
+
+Set `ENABLE_IPV6=n` for an IPv4-only deployment: the server interface, firewall
+rules, and all generated client configs omit IPv6 (no IPv6 address, no `::/0`
+route), which avoids route-setup errors on hosts where IPv6 is disabled.
 
 Example:
 
 ```bash
 sudo AUTO_INSTALL=y SERVER_PORT=51820 CLIENT_DNS_1=8.8.8.8 ./amneziawg-install.sh
+
+# IPv4-only server
+sudo AUTO_INSTALL=y ENABLE_IPV6=n ./amneziawg-install.sh
 ```
 
 ---

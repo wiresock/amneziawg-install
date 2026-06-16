@@ -295,8 +295,12 @@ fi
 echo "Running installer with AUTO_INSTALL=y..."
 echo ""
 
-# Run the installer in AUTO_INSTALL mode
+# Run the installer in AUTO_INSTALL mode. Pin IPv6 on so the dual-stack
+# assertions below are deterministic regardless of the container's IPv6 state
+# (ENABLE_IPV6 otherwise defaults from the host's IPv6 capability). The
+# IPv4-only path is covered separately by tests/test-install-ipv4only.sh.
 export AUTO_INSTALL=y
+export ENABLE_IPV6=y
 bash "${PROJECT_ROOT}/amneziawg-install.sh"
 INSTALL_RC=$?
 
