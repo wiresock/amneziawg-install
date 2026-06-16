@@ -400,7 +400,7 @@ if [[ -f "${SERVER_CONF}" ]]; then
 		["nft forward accept rule"]="^PostUp = nft add rule inet ${NFT_TABLE} forward iifname awg0 accept\$"
 		["nft masquerade rule"]="^PostUp = nft add rule inet ${NFT_TABLE} postrouting oifname eth0 masquerade\$"
 		["nft postrouting nat chain"]="hook postrouting priority 100"
-		["nft mss clamp rule"]="forward tcp flags .* tcp option maxseg size set rt mtu"
+		["nft mss clamp rule"]="forward oifname awg0 tcp flags .* tcp option maxseg size set rt mtu"
 		["nft teardown on PostDown"]="^PostDown = nft delete table inet ${NFT_TABLE}\$"
 	)
 	for DESC in "${!NFT_EXPECT[@]}"; do

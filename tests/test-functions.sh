@@ -929,7 +929,7 @@ assert_contains "${FW_OUT}" "PostUp = nft add table inet awg-awg0" "nft: creates
 assert_contains "${FW_OUT}" "input udp dport 51820 accept" "nft: accepts vpn port"
 assert_contains "${FW_OUT}" "postrouting oifname eth0 masquerade" "nft: masquerades via pub nic"
 assert_contains "${FW_OUT}" "hook postrouting priority 100" "nft: nat chain at srcnat priority"
-assert_contains "${FW_OUT}" "forward tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu" "nft: clamps MSS on forward"
+assert_contains "${FW_OUT}" "forward oifname awg0 tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu" "nft: clamps MSS on tunnel egress"
 assert_contains "${FW_OUT}" "PostDown = nft delete table inet awg-awg0" "nft: tears down table"
 assert_not_contains "${FW_OUT}" "iptables -" "nft: no legacy iptables rules"
 # The MSS clamp carries no verdict, so it must appear before the accept rules
@@ -951,9 +951,9 @@ _fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.7 (legacy)";; esa
 FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables: masquerade rule"
 assert_contains "${FW_OUT}" "ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables: ipv6 masquerade rule"
-assert_contains "${FW_OUT}" "iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS"
-assert_contains "${FW_OUT}" "ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS (ipv6)"
-assert_contains "${FW_OUT}" "PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: removes MSS clamp"
+assert_contains "${FW_OUT}" "iptables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS on tunnel egress"
+assert_contains "${FW_OUT}" "ip6tables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS on tunnel egress (ipv6)"
+assert_contains "${FW_OUT}" "PostDown = iptables -t mangle -D FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: removes MSS clamp (matches PostUp)"
 assert_not_contains "${FW_OUT}" "nft add table" "iptables: no nft rules"
 
 # Backend gate: nft present but iptables is legacy-backed -> stay on iptables so we

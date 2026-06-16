@@ -1659,17 +1659,19 @@ PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remov
 		# A single inet table covers both IPv4 and IPv6; the nat chain masquerades
 		# both families. PostDown drops the whole table atomically, so no per-rule
 		# deletion (and no ordering fragility) is required.
-		# The MSS-clamp rule must precede the accept rules: it carries no verdict so
-		# the packet falls through to them, but an accept would otherwise terminate
-		# the chain before the clamp runs. 'tcp flags & (syn|rst) == syn' matches
-		# SYN and SYN-ACK (the segments carrying the MSS option); the &/(|) tokens
-		# are single-quoted so awg-quick's eval passes them to nft intact.
+		# The MSS-clamp rule is scoped to 'oifname <awg>' so it only touches traffic
+		# entering the tunnel (notably the return-path SYN-ACK) and leaves any other
+		# forwarding the host does alone. It must precede the accept rules: it carries
+		# no verdict so the packet falls through to them, but an accept would otherwise
+		# terminate the chain before the clamp runs. 'tcp flags & (syn|rst) == syn'
+		# matches SYN and SYN-ACK (the segments carrying the MSS option); the &/(|)
+		# tokens are single-quoted so awg-quick's eval passes them to nft intact.
 		local NFT_TABLE="awg-${SERVER_AWG_NIC}"
 		echo "PostUp = nft add table inet ${NFT_TABLE}
 PostUp = nft add chain inet ${NFT_TABLE} input '{ type filter hook input priority 0 ; policy accept ; }'
 PostUp = nft add rule inet ${NFT_TABLE} input udp dport ${SERVER_PORT} accept
 PostUp = nft add chain inet ${NFT_TABLE} forward '{ type filter hook forward priority 0 ; policy accept ; }'
-PostUp = nft add rule inet ${NFT_TABLE} forward tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu
+PostUp = nft add rule inet ${NFT_TABLE} forward oifname ${SERVER_AWG_NIC} tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu
 PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_AWG_NIC} accept
 PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_PUB_NIC} oifname ${SERVER_AWG_NIC} accept
 PostUp = nft add chain inet ${NFT_TABLE} postrouting '{ type nat hook postrouting priority 100 ; policy accept ; }'
@@ -1684,8 +1686,8 @@ PostUp = ip6tables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = ip6tables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostUp = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-PostUp = ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostUp = iptables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostUp = ip6tables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
@@ -1694,8 +1696,8 @@ PostDown = ip6tables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-PostDown = ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+PostDown = iptables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = ip6tables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
 	fi
 }
 
