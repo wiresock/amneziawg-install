@@ -404,6 +404,8 @@ if [[ -f "${SERVER_CONF}" ]]; then
 		["nft table created"]="^PostUp = nft add table inet ${NFT_TABLE}\$"
 		["nft input/port accept rule"]="^PostUp = nft add rule inet ${NFT_TABLE} input udp dport [0-9]\+ accept\$"
 		["nft forward accept rule"]="^PostUp = nft add rule inet ${NFT_TABLE} forward iifname awg0 accept\$"
+		["nft stateful return rule"]="^PostUp = nft add rule inet ${NFT_TABLE} forward iifname eth0 oifname awg0 ct state related,established accept\$"
+		["nft internet-to-tunnel drop rule"]="^PostUp = nft add rule inet ${NFT_TABLE} forward iifname eth0 oifname awg0 drop\$"
 		["nft masquerade rule"]="^PostUp = nft add rule inet ${NFT_TABLE} postrouting oifname eth0 masquerade\$"
 		["nft postrouting nat chain"]="hook postrouting priority 100"
 		["nft mss clamp rule"]="forward oifname awg0 tcp flags .* tcp option maxseg size set rt mtu"

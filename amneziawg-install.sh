@@ -405,7 +405,7 @@ SERVER_PUB_KEY=$(safeQuoteParam "${SERVER_PUB_KEY}")
 CLIENT_DNS_1=$(safeQuoteParam "${CLIENT_DNS_1}")
 CLIENT_DNS_2=$(safeQuoteParam "${CLIENT_DNS_2}")
 ALLOWED_IPS=$(safeQuoteParam "${ALLOWED_IPS}")
-ENABLE_IPV6=$(safeQuoteParam "${ENABLE_IPV6}")
+ENABLE_IPV6=$(safeQuoteParam "${ENABLE_IPV6:-}")
 SERVER_AWG_JC=$(safeQuoteParam "${SERVER_AWG_JC}")
 SERVER_AWG_JMIN=$(safeQuoteParam "${SERVER_AWG_JMIN}")
 SERVER_AWG_JMAX=$(safeQuoteParam "${SERVER_AWG_JMAX}")
@@ -1770,6 +1770,8 @@ PostUp = nft add rule inet ${NFT_TABLE} input udp dport ${SERVER_PORT} accept
 PostUp = nft add chain inet ${NFT_TABLE} forward '{ type filter hook forward priority 0 ; policy accept ; }'
 PostUp = nft add rule inet ${NFT_TABLE} forward oifname ${SERVER_AWG_NIC} tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu
 PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_AWG_NIC} accept
+PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_PUB_NIC} oifname ${SERVER_AWG_NIC} ct state related,established accept
+PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_PUB_NIC} oifname ${SERVER_AWG_NIC} drop
 PostUp = nft add chain inet ${NFT_TABLE} postrouting '{ type nat hook postrouting priority 100 ; policy accept ; }'
 PostUp = nft add rule inet ${NFT_TABLE} postrouting oifname ${SERVER_PUB_NIC} masquerade
 PostDown = nft delete table inet ${NFT_TABLE}"

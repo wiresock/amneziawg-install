@@ -941,6 +941,8 @@ assert_contains "${FW_OUT}" "input udp dport 51820 accept" "nft: accepts vpn por
 assert_contains "${FW_OUT}" "postrouting oifname eth0 masquerade" "nft: masquerades via pub nic"
 assert_contains "${FW_OUT}" "hook postrouting priority 100" "nft: nat chain at srcnat priority"
 assert_contains "${FW_OUT}" "forward oifname awg0 tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu" "nft: clamps MSS on tunnel egress"
+assert_contains "${FW_OUT}" "forward iifname eth0 oifname awg0 ct state related,established accept" "nft: allows established return traffic only"
+assert_contains "${FW_OUT}" "forward iifname eth0 oifname awg0 drop" "nft: drops new internet-to-tunnel traffic"
 assert_contains "${FW_OUT}" "PostDown = nft delete table inet awg-awg0" "nft: tears down table"
 assert_not_contains "${FW_OUT}" "forward iifname eth0 oifname awg0 accept" "nft: no internet-to-tunnel forward accept"
 assert_not_contains "${FW_OUT}" "iptables -" "nft: no legacy iptables rules"
