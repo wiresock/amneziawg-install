@@ -957,6 +957,7 @@ fi
 _fw_stub systemctl '[[ "$*" == "is-active --quiet ufw" ]] && exit 0; exit 1'
 _fw_stub nft 'exit 0'
 _fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.10 (nf_tables)";; esac; exit 0'
+_fw_stub ip6tables 'exit 0'
 FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "iptables -I INPUT -p udp --dport 51820 -j ACCEPT" "ufw: inserts udp accept through iptables"
 assert_contains "${FW_OUT}" "iptables -I FORWARD -i awg0 -j ACCEPT" "ufw: allows tunnel-originated forwarding"
@@ -965,21 +966,32 @@ assert_contains "${FW_OUT}" "ip6tables -I FORWARD -i eth0 -o awg0 -m conntrack -
 assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "ufw: masquerade rule"
 assert_not_contains "${FW_OUT}" "nft add table" "ufw: no native nft table"
 assert_not_contains "${FW_OUT}" "-i eth0 -o awg0 -j ACCEPT" "ufw: no internet-to-tunnel forward accept"
+rm -f "${FW_TMP}/bin/ip6tables"
+FW_OUT="$(_run_fw)"
+assert_not_contains "${FW_OUT}" "ip6tables" "ufw: skips ipv6 rules when ip6tables is unavailable"
 
 # Backend 4: firewalld inactive, nft absent -> iptables fallback.
 _fw_stub systemctl 'exit 1'
 rm -f "${FW_TMP}/bin/nft"
 _fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.7 (legacy)";; esac; exit 0'
+_fw_stub ip6tables 'exit 0'
 FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables: masquerade rule"
 assert_contains "${FW_OUT}" "ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables: ipv6 masquerade rule"
 assert_contains "${FW_OUT}" "iptables -I FORWARD -i eth0 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "iptables: allows established return traffic only"
+assert_contains "${FW_OUT}" "iptables -I FORWARD 2 -i eth0 -o awg0 -j DROP" "iptables: drops new internet-to-tunnel traffic"
+assert_contains "${FW_OUT}" "PostDown = iptables -D FORWARD -i eth0 -o awg0 -j DROP" "iptables: removes internet-to-tunnel drop"
 assert_contains "${FW_OUT}" "ip6tables -I FORWARD -i eth0 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "iptables: allows established return traffic only (ipv6)"
+assert_contains "${FW_OUT}" "ip6tables -I FORWARD 2 -i eth0 -o awg0 -j DROP" "iptables: drops new internet-to-tunnel traffic (ipv6)"
+assert_contains "${FW_OUT}" "PostDown = ip6tables -D FORWARD -i eth0 -o awg0 -j DROP" "iptables: removes internet-to-tunnel drop (ipv6)"
 assert_contains "${FW_OUT}" "iptables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS on tunnel egress"
 assert_contains "${FW_OUT}" "ip6tables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS on tunnel egress (ipv6)"
 assert_contains "${FW_OUT}" "PostDown = iptables -t mangle -D FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: removes MSS clamp (matches PostUp)"
 assert_not_contains "${FW_OUT}" "-i eth0 -o awg0 -j ACCEPT" "iptables: no internet-to-tunnel forward accept"
 assert_not_contains "${FW_OUT}" "nft add table" "iptables: no nft rules"
+rm -f "${FW_TMP}/bin/ip6tables"
+FW_OUT="$(_run_fw)"
+assert_not_contains "${FW_OUT}" "ip6tables" "iptables: skips ipv6 rules when ip6tables is unavailable"
 
 # Backend gate: nft present but iptables is legacy-backed -> stay on iptables so we
 # don't disturb a host that deliberately uses the legacy backend.
