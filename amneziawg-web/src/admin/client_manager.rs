@@ -635,9 +635,7 @@ fn resolve_client_ips(
             if existing_ipv6s.contains(&ipv6_norm) {
                 return Err(CreateClientError::IpInUse(ipv6.to_string()));
             }
-            let dot_ip = (2..=254u16)
-                .find(|d| !used_ipv4.contains(d))
-                .ok_or(CreateClientError::NoFreeIp)?;
+            let dot_ip = find_available_ipv4_dot(&used_ipv4).ok_or(CreateClientError::NoFreeIp)?;
             Ok((format!("{base_ipv4}.{dot_ip}"), Some(ipv6.to_string())))
         }
     }
@@ -665,10 +663,13 @@ pub fn suggest_next_ips() -> Result<SuggestedIps, CreateClientError> {
     let base_ipv4 = ipv4_base(&params.server_awg_ipv4);
 
     let used_ipv4 = find_used_ipv4_dots(&server_config, base_ipv4);
-    let ipv6_enabled = server_interface_has_ipv6_address(&server_config);
-    let dot_ip = if ipv6_enabled {
-        let server_ipv6_normalized = normalize_ipv6(&params.server_awg_ipv6)?;
-        let base_ipv6 = ipv6_prefix(&server_ipv6_normalized);
+    let server_ipv6_normalized = if server_interface_has_ipv6_address(&server_config) {
+        Some(normalize_ipv6(&params.server_awg_ipv6)?)
+    } else {
+        None
+    };
+    let base_ipv6 = server_ipv6_normalized.as_deref().map(ipv6_prefix);
+    let dot_ip = if let Some(base_ipv6) = base_ipv6 {
         let existing_ipv6s = find_existing_ipv6_normalized(&server_config);
         find_available_dot(&used_ipv4, &existing_ipv6s, base_ipv6)
             .ok_or(CreateClientError::NoFreeIp)?
@@ -677,13 +678,9 @@ pub fn suggest_next_ips() -> Result<SuggestedIps, CreateClientError> {
     };
 
     let ipv4 = format!("{base_ipv4}.{dot_ip}");
-    let ipv6 = if ipv6_enabled {
-        let server_ipv6_normalized = normalize_ipv6(&params.server_awg_ipv6)?;
-        let base_ipv6 = ipv6_prefix(&server_ipv6_normalized);
-        Some(compress_ipv6(&format!("{base_ipv6}::{dot_ip}"))?)
-    } else {
-        None
-    };
+    let ipv6 = base_ipv6
+        .map(|base_ipv6| compress_ipv6(&format!("{base_ipv6}::{dot_ip}")))
+        .transpose()?;
 
     Ok(SuggestedIps { ipv4, ipv6 })
 }
@@ -831,6 +828,28 @@ fn format_client_allowed_ips(allowed_ips: &str) -> String {
         .join(", ")
 }
 
+fn prepare_client_allowed_ips(
+    allowed_ips: &str,
+    ipv6_enabled: bool,
+) -> Result<String, CreateClientError> {
+    let filtered = allowed_ips
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| ipv6_enabled || !entry.contains(':'))
+        .collect::<Vec<_>>()
+        .join(",");
+    let formatted = format_client_allowed_ips(&filtered);
+
+    if formatted.is_empty() {
+        return Err(CreateClientError::ConfigParse(
+            "ALLOWED_IPS has no usable routes for this client's address family".to_string(),
+        ));
+    }
+
+    Ok(formatted)
+}
+
 /// Build the client configuration file content.
 fn build_client_config(
     params: &ServerParams,
@@ -840,14 +859,15 @@ fn build_client_config(
     client_psk: &str,
     dns: &str,
     endpoint: &str,
-) -> String {
+) -> Result<String, CreateClientError> {
     let address = match client_ipv6_display {
         Some(ipv6) => format!("{client_ipv4}/32,{ipv6}/128"),
         None => format!("{client_ipv4}/32"),
     };
-    let allowed_ips = format_client_allowed_ips(&params.allowed_ips);
+    let allowed_ips =
+        prepare_client_allowed_ips(&params.allowed_ips, client_ipv6_display.is_some())?;
 
-    format!(
+    Ok(format!(
         "\
 [Interface]
 PrivateKey = {client_priv_key}
@@ -883,7 +903,7 @@ AllowedIPs = {allowed_ips}",
         h4 = params.h4,
         server_pub_key = params.server_pub_key,
         allowed_ips = allowed_ips,
-    )
+    ))
 }
 
 /// Build the peer block to append to the server config.
@@ -1161,7 +1181,7 @@ pub fn create_client(
         &psk,
         &dns,
         &endpoint,
-    );
+    )?;
 
     // Write with restrictive permissions (mode 600).
     {
@@ -1818,7 +1838,8 @@ AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
             "PSK_KEY=",
             "1.1.1.1,1.0.0.1",
             "1.2.3.4:51820",
-        );
+        )
+        .unwrap();
         assert!(config.contains("PrivateKey = PRIV_KEY="));
         assert!(config.contains("Address = 10.66.66.2/32,fd42:42:42::2/128"));
         assert!(config.contains("DNS = 1.1.1.1,1.0.0.1"));
@@ -1862,10 +1883,52 @@ AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
             "PSK_KEY=",
             "1.1.1.1",
             "1.2.3.4:51820",
-        );
+        )
+        .unwrap();
 
         assert!(config.contains("Address = 10.66.66.2/32\n"));
+        assert!(config.contains("AllowedIPs = 0.0.0.0/0"));
+        assert!(!config.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
         assert!(!config.contains("/128"));
+    }
+
+    #[test]
+    fn build_client_config_rejects_empty_allowed_ips() {
+        let params = ServerParams {
+            server_pub_ip: "1.2.3.4".into(),
+            server_awg_nic: "awg0".into(),
+            server_awg_ipv4: "10.66.66.1".into(),
+            server_awg_ipv6: "fd42:42:42::1".into(),
+            server_port: "51820".into(),
+            server_pub_key: "SVR_PUB=".into(),
+            client_dns_1: "1.1.1.1".into(),
+            client_dns_2: "".into(),
+            allowed_ips: "fd00::/8, ::/0".into(),
+            jc: "8".into(),
+            jmin: "50".into(),
+            jmax: "1000".into(),
+            s1: "107".into(),
+            s2: "105".into(),
+            s3: "62".into(),
+            s4: "95".into(),
+            h1: "321941292".into(),
+            h2: "774489227".into(),
+            h3: "1084244185".into(),
+            h4: "1837068650".into(),
+        };
+
+        let err = build_client_config(
+            &params,
+            "PRIV_KEY=",
+            "10.66.66.2",
+            None,
+            "PSK_KEY=",
+            "1.1.1.1",
+            "1.2.3.4:51820",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CreateClientError::ConfigParse(_)));
     }
 
     // ── IP override / resolve_client_ips tests ─────────────────────────
