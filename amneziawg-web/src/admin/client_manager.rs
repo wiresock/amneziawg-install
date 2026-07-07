@@ -826,6 +826,7 @@ fn format_client_allowed_ips(allowed_ips: &str) -> String {
     allowed_ips
         .split(',')
         .map(str::trim)
+        .filter(|entry| !entry.is_empty())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1743,6 +1744,15 @@ AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
             format_client_allowed_ips("0.0.0.0/0,::/0"),
             "0.0.0.0/0, ::/0"
         );
+    }
+
+    #[test]
+    fn format_client_allowed_ips_trims_and_drops_empty_entries() {
+        assert_eq!(
+            format_client_allowed_ips(" 0.0.0.0/0,, ::/0, "),
+            "0.0.0.0/0, ::/0"
+        );
+        assert_eq!(format_client_allowed_ips(" , , "), "");
     }
 
     #[test]

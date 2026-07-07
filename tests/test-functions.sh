@@ -443,15 +443,10 @@ fi
 rm -f "${SERIALIZE_TMP}"
 
 echo "=== formatClientAllowedIPs ==="
-FORMATTED_ALLOWED_IPS="$(formatClientAllowedIPs "0.0.0.0/0,::/0")"
-TESTS_RUN=$((TESTS_RUN + 1))
-if [[ "${FORMATTED_ALLOWED_IPS}" == "0.0.0.0/0, ::/0" ]]; then
-	TESTS_PASSED=$((TESTS_PASSED + 1))
-else
-	TESTS_FAILED=$((TESTS_FAILED + 1))
-	echo "  FAIL: formatClientAllowedIPs returned '${FORMATTED_ALLOWED_IPS}'"
-fi
-unset FORMATTED_ALLOWED_IPS
+assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs "0.0.0.0/0,::/0")" "formatClientAllowedIPs adds space after comma"
+assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs " 0.0.0.0/0, ::/0 ")" "formatClientAllowedIPs trims entries"
+assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs "0.0.0.0/0,, ::/0,")" "formatClientAllowedIPs drops empty entries"
+assert_eq "" "$(formatClientAllowedIPs " , , ")" "formatClientAllowedIPs returns empty for no entries"
 
 # ============================================================
 # checkOS tests (Linux Mint support)

@@ -1837,7 +1837,16 @@ function shouldCreateInitialClient() {
 }
 
 function formatClientAllowedIPs() {
-	printf '%s\n' "$1" | sed 's/[[:space:]]*,[[:space:]]*/, /g'
+	local OUT="" ENTRY
+	local -a PARTS
+	IFS=',' read -ra PARTS <<< "$1"
+	for ENTRY in "${PARTS[@]}"; do
+		ENTRY="${ENTRY#"${ENTRY%%[![:space:]]*}"}"
+		ENTRY="${ENTRY%"${ENTRY##*[![:space:]]}"}"
+		[[ -z "${ENTRY}" ]] && continue
+		if [[ -z "${OUT}" ]]; then OUT="${ENTRY}"; else OUT="${OUT}, ${ENTRY}"; fi
+	done
+	printf '%s\n' "${OUT}"
 }
 
 function installAmneziaWG() {
