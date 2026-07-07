@@ -401,7 +401,7 @@ SERVER_PRIV_KEY="test_priv_key"
 SERVER_PUB_KEY="test_pub_key"
 CLIENT_DNS_1="1.1.1.1"
 CLIENT_DNS_2="1.0.0.1"
-ALLOWED_IPS="0.0.0.0/0,::/0"
+ALLOWED_IPS="0.0.0.0/0, ::/0"
 SERVER_AWG_JC="5"
 SERVER_AWG_JMIN="50"
 SERVER_AWG_JMAX="1000"
@@ -441,6 +441,17 @@ fi
 	TESTS_FAILED=$((TESTS_FAILED + 1))
 }
 rm -f "${SERIALIZE_TMP}"
+
+echo "=== formatClientAllowedIPs ==="
+FORMATTED_ALLOWED_IPS="$(formatClientAllowedIPs "0.0.0.0/0,::/0")"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "${FORMATTED_ALLOWED_IPS}" == "0.0.0.0/0, ::/0" ]]; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: formatClientAllowedIPs returned '${FORMATTED_ALLOWED_IPS}'"
+fi
+unset FORMATTED_ALLOWED_IPS
 
 # ============================================================
 # checkOS tests (Linux Mint support)
@@ -931,6 +942,7 @@ assert_contains "${FW_OUT}" "postrouting oifname eth0 masquerade" "nft: masquera
 assert_contains "${FW_OUT}" "hook postrouting priority 100" "nft: nat chain at srcnat priority"
 assert_contains "${FW_OUT}" "forward oifname awg0 tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu" "nft: clamps MSS on tunnel egress"
 assert_contains "${FW_OUT}" "PostDown = nft delete table inet awg-awg0" "nft: tears down table"
+assert_not_contains "${FW_OUT}" "forward iifname eth0 oifname awg0 accept" "nft: no internet-to-tunnel forward accept"
 assert_not_contains "${FW_OUT}" "iptables -" "nft: no legacy iptables rules"
 # The MSS clamp carries no verdict, so it must appear before the accept rules
 # that would otherwise terminate the forward chain first.
@@ -944,16 +956,30 @@ else
 	echo "  FAIL: nft MSS clamp must precede forward accept (mss=${NFT_MSS_LINE}, accept=${NFT_ACCEPT_LINE})"
 fi
 
-# Backend 3: firewalld inactive, nft absent -> iptables fallback.
+# Backend 3: firewalld inactive, UFW active -> UFW-compatible iptables rules.
+_fw_stub systemctl '[[ "$*" == "is-active --quiet ufw" ]] && exit 0; exit 1'
+_fw_stub nft 'exit 0'
+_fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.10 (nf_tables)";; esac; exit 0'
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "iptables -I INPUT -p udp --dport 51820 -j ACCEPT" "ufw: inserts udp accept through iptables"
+assert_contains "${FW_OUT}" "iptables -I FORWARD -i awg0 -j ACCEPT" "ufw: allows tunnel-originated forwarding"
+assert_contains "${FW_OUT}" "iptables -I FORWARD -i eth0 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "ufw: allows established return traffic only"
+assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "ufw: masquerade rule"
+assert_not_contains "${FW_OUT}" "nft add table" "ufw: no native nft table"
+assert_not_contains "${FW_OUT}" "-i eth0 -o awg0 -j ACCEPT" "ufw: no internet-to-tunnel forward accept"
+
+# Backend 4: firewalld inactive, nft absent -> iptables fallback.
 _fw_stub systemctl 'exit 1'
 rm -f "${FW_TMP}/bin/nft"
 _fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.7 (legacy)";; esac; exit 0'
 FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables: masquerade rule"
 assert_contains "${FW_OUT}" "ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables: ipv6 masquerade rule"
+assert_contains "${FW_OUT}" "iptables -I FORWARD -i eth0 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "iptables: allows established return traffic only"
 assert_contains "${FW_OUT}" "iptables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS on tunnel egress"
 assert_contains "${FW_OUT}" "ip6tables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS on tunnel egress (ipv6)"
 assert_contains "${FW_OUT}" "PostDown = iptables -t mangle -D FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: removes MSS clamp (matches PostUp)"
+assert_not_contains "${FW_OUT}" "-i eth0 -o awg0 -j ACCEPT" "iptables: no internet-to-tunnel forward accept"
 assert_not_contains "${FW_OUT}" "nft add table" "iptables: no nft rules"
 
 # Backend gate: nft present but iptables is legacy-backed -> stay on iptables so we

@@ -411,6 +411,12 @@ if [[ -f "${SERVER_CONF}" ]]; then
 			FAILED=$((FAILED + 1))
 		fi
 	done
+	if grep -q "^PostUp = nft add rule inet ${NFT_TABLE} forward iifname eth0 oifname awg0 accept$" "${SERVER_CONF}"; then
+		echo "  FAIL: nft internet-to-tunnel forward accept rule should not be generated"
+		FAILED=$((FAILED + 1))
+	else
+		echo "  OK: nft internet-to-tunnel forward accept rule not generated"
+	fi
 	# The nf_tables host must NOT get legacy iptables/ip6tables hooks.
 	if grep -qE "^PostUp = (ip6?tables) " "${SERVER_CONF}"; then
 		echo "  FAIL: legacy iptables rules emitted on nf_tables host"
@@ -934,7 +940,7 @@ DNS = 1.1.1.1
 PublicKey = old_server_pub_key
 PresharedKey = old_psk
 Endpoint = 203.0.113.1:51820
-AllowedIPs = 0.0.0.0/0,::/0
+AllowedIPs = 0.0.0.0/0, ::/0
 STALE_EOF
 
 REGEN_STALE_OUTPUT=$(regenerateClients 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
@@ -1051,7 +1057,7 @@ SERVER_PRIV_KEY='test_priv_key'
 SERVER_PUB_KEY='test_pub_key'
 CLIENT_DNS_1='1.1.1.1'
 CLIENT_DNS_2=''
-ALLOWED_IPS='0.0.0.0/0,::/0'
+ALLOWED_IPS='0.0.0.0/0, ::/0'
 SERVER_AWG_JC='5'
 SERVER_AWG_JMIN='50'
 SERVER_AWG_JMAX='1000'
@@ -1132,7 +1138,7 @@ SERVER_PRIV_KEY='test_priv_key'
 SERVER_PUB_KEY='test_pub_key'
 CLIENT_DNS_1='1.1.1.1'
 CLIENT_DNS_2=''
-ALLOWED_IPS='0.0.0.0/0,::/0'
+ALLOWED_IPS='0.0.0.0/0, ::/0'
 SERVER_AWG_JC='5'
 SERVER_AWG_JMIN='50'
 SERVER_AWG_JMAX='1000'
@@ -1199,7 +1205,7 @@ SERVER_PRIV_KEY='test_priv_key'
 SERVER_PUB_KEY='test_pub_key'
 CLIENT_DNS_1='1.1.1.1'
 CLIENT_DNS_2=''
-ALLOWED_IPS='0.0.0.0/0,::/0'
+ALLOWED_IPS='0.0.0.0/0, ::/0'
 SERVER_AWG_JC='5'
 SERVER_AWG_JMIN='50'
 SERVER_AWG_JMAX='1000'
@@ -1273,7 +1279,7 @@ SERVER_PRIV_KEY='test_priv_key'
 SERVER_PUB_KEY='test_pub_key'
 CLIENT_DNS_1='1.1.1.1'
 CLIENT_DNS_2=''
-ALLOWED_IPS='0.0.0.0/0,::/0'
+ALLOWED_IPS='0.0.0.0/0, ::/0'
 SERVER_AWG_JC='5'
 SERVER_AWG_JMIN='50'
 SERVER_AWG_JMAX='1000'
@@ -1337,7 +1343,7 @@ SERVER_PRIV_KEY='test_priv_key'
 SERVER_PUB_KEY='test_pub_key'
 CLIENT_DNS_1='1.1.1.1'
 CLIENT_DNS_2=''
-ALLOWED_IPS='0.0.0.0/0,::/0'
+ALLOWED_IPS='0.0.0.0/0, ::/0'
 SERVER_AWG_JC='5'
 SERVER_AWG_JMIN='50'
 SERVER_AWG_JMAX='1000'

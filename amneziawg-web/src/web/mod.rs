@@ -3454,7 +3454,7 @@ fn render_peer_detail_inner(
         fmt_bytes(dto.tx_bytes)
     ));
     buf.push_str(&format!(
-        "<tr><th>Allowed IPs</th><td>{}</td></tr>\n",
+        "<tr><th>Server peer AllowedIPs</th><td>{}</td></tr>\n",
         esc(&dto.allowed_ips)
     ));
     if let Some(ref cn) = dto.config_name {

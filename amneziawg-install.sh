@@ -1428,7 +1428,7 @@ function installQuestions() {
 		# Use ${var-default} (not ${var:-default}) so an explicitly empty CLIENT_DNS_2
 		# is honored (skip second resolver), matching the interactive flow.
 		CLIENT_DNS_2=${CLIENT_DNS_2-1.0.0.1}
-		ALLOWED_IPS=${ALLOWED_IPS:-0.0.0.0/0,::/0}
+		ALLOWED_IPS=${ALLOWED_IPS:-0.0.0.0/0, ::/0}
 
 		# Validate all overrides with the same checks used in the interactive flow.
 		# These values end up in iptables rules, systemd unit paths, and config files,
@@ -1572,9 +1572,9 @@ function installQuestions() {
 
 	until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
 		echo -e "\nAmneziaWG uses a parameter called AllowedIPs to determine what is routed over the VPN."
-		read -rp "Allowed IPs list for generated clients (leave default to route everything): " -e -i '0.0.0.0/0,::/0' ALLOWED_IPS
+		read -rp "Allowed IPs list for generated clients (leave default to route everything): " -e -i '0.0.0.0/0, ::/0' ALLOWED_IPS
 		if [[ ${ALLOWED_IPS} == "" ]]; then
-			ALLOWED_IPS="0.0.0.0/0,::/0"
+			ALLOWED_IPS="0.0.0.0/0, ::/0"
 		fi
 	done
 
@@ -1655,6 +1655,31 @@ function writeFirewallRules() {
 		FIREWALLD_IPV6_ADDRESS="$(echo "${SERVER_AWG_IPV6}" | cut -d':' -f1-4):0:0:0:0"
 		echo "PostUp = firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'
 PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'"
+	elif systemctl is-active --quiet ufw 2>/dev/null && command -v iptables >/dev/null 2>&1; then
+		# UFW installs default-drop rules in its own filtering path. Native nft
+		# accept rules in a separate base chain cannot reliably override those
+		# drops, so use iptables-compatible insertion when UFW is active. This
+		# inserts before UFW's final drop while keeping NAT scoped to VPN clients.
+		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostUp = iptables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = ip6tables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostUp = ip6tables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = iptables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostUp = ip6tables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = ip6tables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = iptables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = ip6tables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
 	elif command -v nft >/dev/null 2>&1 && { ! command -v iptables >/dev/null 2>&1 || iptables --version 2>/dev/null | grep -qi 'nf_tables'; }; then
 		# A single inet table covers both IPv4 and IPv6; the nat chain masquerades
 		# both families. PostDown drops the whole table atomically, so no per-rule
@@ -1673,32 +1698,68 @@ PostUp = nft add rule inet ${NFT_TABLE} input udp dport ${SERVER_PORT} accept
 PostUp = nft add chain inet ${NFT_TABLE} forward '{ type filter hook forward priority 0 ; policy accept ; }'
 PostUp = nft add rule inet ${NFT_TABLE} forward oifname ${SERVER_AWG_NIC} tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu
 PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_AWG_NIC} accept
-PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_PUB_NIC} oifname ${SERVER_AWG_NIC} accept
 PostUp = nft add chain inet ${NFT_TABLE} postrouting '{ type nat hook postrouting priority 100 ; policy accept ; }'
 PostUp = nft add rule inet ${NFT_TABLE} postrouting oifname ${SERVER_PUB_NIC} masquerade
 PostDown = nft delete table inet ${NFT_TABLE}"
 	else
 		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostUp = ip6tables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = ip6tables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostUp = iptables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostUp = ip6tables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = ip6tables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = iptables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = ip6tables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
 	fi
+}
+
+function shouldCreateInitialClient() {
+	local CREATE_CLIENT="${CREATE_INITIAL_CLIENT:-}"
+
+	case "${CREATE_CLIENT,,}" in
+	y|yes|true|1)
+		return 0
+		;;
+	n|no|false|0)
+		return 1
+		;;
+	esac
+
+	if [[ "${AUTO_INSTALL,,}" == "y" ]]; then
+		return 0
+	fi
+
+	while true; do
+		read -rp "Create an initial client configuration now? [Y/n]: " CREATE_CLIENT
+		CREATE_CLIENT=${CREATE_CLIENT:-y}
+		case "${CREATE_CLIENT,,}" in
+		y|yes)
+			return 0
+			;;
+		n|no)
+			return 1
+			;;
+		*)
+			echo -e "${ORANGE}Please answer yes or no.${NC}"
+			;;
+		esac
+	done
+}
+
+function formatClientAllowedIPs() {
+	printf '%s\n' "$1" | sed 's/[[:space:]]*,[[:space:]]*/, /g'
 }
 
 function installAmneziaWG() {
@@ -2018,8 +2079,12 @@ EOF
 	fi
 
 	if [[ ${MODULE_READY} -eq 1 ]]; then
-		newClient
-		echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
+		if shouldCreateInitialClient; then
+			newClient
+			echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
+		else
+			echo -e "${ORANGE}Skipping initial client generation. You can add users later from this script or the web panel.${NC}"
+		fi
 	else
 		echo -e "${ORANGE}Skipping client generation because the server interface is not active.${NC}"
 	fi
@@ -2234,6 +2299,9 @@ function newClient() {
 		CLIENT_DNS="${CLIENT_DNS_1},${CLIENT_DNS_2}"
 	fi
 
+	local CLIENT_ALLOWED_IPS
+	CLIENT_ALLOWED_IPS=$(formatClientAllowedIPs "${ALLOWED_IPS}")
+
 	# Compress IPv6 to canonical RFC 5952 form for client config display
 	local CLIENT_AWG_IPV6_DISPLAY
 	CLIENT_AWG_IPV6_DISPLAY=$(compressIPv6 "${CLIENT_AWG_IPV6}")
@@ -2264,7 +2332,7 @@ H4 = ${SERVER_AWG_H4}
 PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
-AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+AllowedIPs = ${CLIENT_ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# Restore default umask
 	umask "${OLD_UMASK}"
@@ -2639,6 +2707,9 @@ function regenerateClients() {
 			continue
 		}
 
+		local CLIENT_ALLOWED_IPS
+		CLIENT_ALLOWED_IPS=$(formatClientAllowedIPs "${ALLOWED_IPS}")
+
 		if cat <<EOF >"${TMP_CONF}" && chmod 600 "${TMP_CONF}" && mv "${TMP_CONF}" "${OUTPUT_CONF}"; then
 [Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
@@ -2660,7 +2731,7 @@ H4 = ${SERVER_AWG_H4}
 PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
-AllowedIPs = ${ALLOWED_IPS}
+AllowedIPs = ${CLIENT_ALLOWED_IPS}
 EOF
 
 		# Copy regenerated config to the web panel directory (best-effort)
@@ -3569,6 +3640,9 @@ function nonInteractiveAddClient() {
 		CLIENT_DNS="${CLIENT_DNS_1},${CLIENT_DNS_2}"
 	fi
 
+	local CLIENT_ALLOWED_IPS
+	CLIENT_ALLOWED_IPS=$(formatClientAllowedIPs "${ALLOWED_IPS}")
+
 	local CLIENT_AWG_IPV6_DISPLAY
 	CLIENT_AWG_IPV6_DISPLAY=$(compressIPv6 "${CLIENT_AWG_IPV6}")
 
@@ -3604,7 +3678,7 @@ H4 = ${SERVER_AWG_H4}
 PublicKey = ${SERVER_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 Endpoint = ${ENDPOINT}
-AllowedIPs = ${ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+AllowedIPs = ${CLIENT_ALLOWED_IPS}" >"${HOME_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	umask "${OLD_UMASK}"
 

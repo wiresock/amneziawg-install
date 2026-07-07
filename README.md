@@ -323,7 +323,8 @@ Override specific defaults with environment variables:
 | `SERVER_PORT` | Random (49152–65535) |
 | `CLIENT_DNS_1` | `1.1.1.1` |
 | `CLIENT_DNS_2` | `1.0.0.1` |
-| `ALLOWED_IPS` | `0.0.0.0/0,::/0` |
+| `ALLOWED_IPS` | `0.0.0.0/0, ::/0` |
+| `CREATE_INITIAL_CLIENT` | `yes` in `AUTO_INSTALL`; prompted interactively |
 
 Example:
 
