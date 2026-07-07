@@ -1733,22 +1733,26 @@ PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remov
 		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -I FORWARD 2 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
 PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostUp = iptables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
 PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = iptables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
 		if [[ "${ENABLE_IPV6:-y}" == "y" ]] && command -v ip6tables >/dev/null 2>&1; then
 			echo "PostUp = ip6tables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostUp = ip6tables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = ip6tables -I FORWARD 2 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
 PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostUp = ip6tables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = ip6tables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
 PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = ip6tables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
 		fi
