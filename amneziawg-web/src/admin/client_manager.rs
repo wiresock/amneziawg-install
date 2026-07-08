@@ -532,7 +532,12 @@ fn server_interface_has_ipv6_address(server_config: &str) -> bool {
             continue;
         }
         if let Some(value) = parse_kv(trimmed, "Address") {
-            if value.split(',').map(str::trim).any(|cidr| {
+            let uncommented = value
+                .split(|ch| ch == '#' || ch == ';')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            if uncommented.split(',').map(str::trim).any(|cidr| {
                 cidr.split('/')
                     .next()
                     .is_some_and(|addr| addr.contains(':'))
@@ -1720,9 +1725,17 @@ Address = 10.66.66.1/24
 [Peer]
 AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
 ";
+        let commented_after_comma = "\
+[Interface]
+Address = 10.66.66.1/24, #fd42:42:42::1/64
+
+[Peer]
+AllowedIPs = 10.66.66.2/32
+";
 
         assert!(server_interface_has_ipv6_address(enabled));
         assert!(!server_interface_has_ipv6_address(disabled));
+        assert!(!server_interface_has_ipv6_address(commented_after_comma));
     }
 
     // ── Config generation ───────────────────────────────────────────────
