@@ -1765,12 +1765,19 @@ function installQuestions() {
 # the nft chain definitions are single-quoted so awg-quick's `eval` of each hook
 # passes them to nft intact instead of treating { ; } as shell syntax.
 function ufwIsActive() {
-	systemctl is-active --quiet ufw 2>/dev/null || return 1
+	local UFW_CONF="${UFW_CONF_PATH:-/etc/ufw/ufw.conf}"
+	local UFW_STATUS=""
+
 	if command -v ufw >/dev/null 2>&1; then
-		ufw status 2>/dev/null | grep -qiE '^Status:[[:space:]]+active'
-		return $?
+		UFW_STATUS="$(ufw status 2>/dev/null || true)"
+		if printf '%s\n' "${UFW_STATUS}" | grep -qiE '^Status:[[:space:]]+active'; then
+			return 0
+		fi
+		if printf '%s\n' "${UFW_STATUS}" | grep -qiE '^Status:[[:space:]]+inactive'; then
+			return 1
+		fi
 	fi
-	grep -qiE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*yes' /etc/ufw/ufw.conf 2>/dev/null
+	grep -qiE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*yes' "${UFW_CONF}" 2>/dev/null
 }
 
 function writeFirewallRules() {

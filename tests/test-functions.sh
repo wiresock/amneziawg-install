@@ -923,7 +923,7 @@ _fw_stub() {  # name body
 	printf '%s\n%s\n' '#!/usr/bin/env bash' "$2" > "${FW_TMP}/bin/$1"
 	chmod +x "${FW_TMP}/bin/$1"
 }
-_run_fw() { ( PATH="${FW_TMP}/bin:${FW_TMP}/realbin"; export PATH; writeFirewallRules ); }
+_run_fw() { ( PATH="${FW_TMP}/bin:${FW_TMP}/realbin"; UFW_CONF_PATH="${FW_TMP}/ufw.conf"; export PATH UFW_CONF_PATH; writeFirewallRules ); }
 
 # Backend 1: firewalld active -> firewall-cmd rules.
 _fw_stub systemctl '[[ "$*" == "is-active --quiet firewalld" ]] && exit 0; exit 1'
@@ -974,7 +974,16 @@ FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "PostUp = nft add table inet awg-awg0" "ufw disabled: uses nft backend"
 assert_not_contains "${FW_OUT}" "iptables -I INPUT" "ufw disabled: does not use ufw iptables branch"
 
-# Backend 4: firewalld inactive, UFW active -> UFW-compatible iptables rules.
+# Backend 4: firewalld inactive, UFW enabled by config without an active systemd unit -> UFW-compatible iptables rules.
+_fw_stub systemctl 'exit 1'
+rm -f "${FW_TMP}/bin/ufw"
+printf '%s\n' 'ENABLED=yes' > "${FW_TMP}/ufw.conf"
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "iptables -I INPUT -p udp --dport 51820 -j ACCEPT" "ufw config: uses ufw iptables branch"
+assert_not_contains "${FW_OUT}" "nft add table" "ufw config: no native nft table"
+rm -f "${FW_TMP}/ufw.conf"
+
+# Backend 5: firewalld inactive, UFW active without an active systemd unit -> UFW-compatible iptables rules.
 _fw_stub ufw '[[ "$*" == "status" ]] && echo "Status: active"; exit 0'
 _fw_stub ip6tables 'exit 0'
 FW_OUT="$(_run_fw)"
@@ -994,7 +1003,8 @@ FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "iptables -I FORWARD 2 -i eth0 -o awg0 -j DROP" "ufw: keeps ipv4 internet-to-tunnel drop without ip6tables"
 assert_not_contains "${FW_OUT}" "ip6tables" "ufw: skips ipv6 rules when ip6tables is unavailable"
 
-# Backend 5: firewalld inactive, nft absent -> iptables fallback.
+# Backend 6: firewalld inactive, nft absent -> iptables fallback.
+rm -f "${FW_TMP}/bin/ufw" "${FW_TMP}/ufw.conf"
 _fw_stub systemctl 'exit 1'
 rm -f "${FW_TMP}/bin/nft"
 _fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.7 (legacy)";; esac; exit 0'
@@ -1052,6 +1062,7 @@ FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "ufw v4-only: ipv4 masquerade present"
 assert_not_contains "${FW_OUT}" "ip6tables" "ufw v4-only: no ip6tables rules"
 # nft uses an IPv4-only table when IPv6 is disabled.
+rm -f "${FW_TMP}/bin/ufw" "${FW_TMP}/ufw.conf"
 _fw_stub systemctl 'exit 1'
 _fw_stub nft 'exit 0'
 _fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.10 (nf_tables)";; esac; exit 0'
