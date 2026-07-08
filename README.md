@@ -324,7 +324,8 @@ Override specific defaults with environment variables:
 | `SERVER_PORT` | Random (49152–65535) |
 | `CLIENT_DNS_1` | `1.1.1.1` |
 | `CLIENT_DNS_2` | `1.0.0.1` |
-| `ALLOWED_IPS` | `0.0.0.0/0,::/0` (IPv4 only when `ENABLE_IPV6=n`) |
+| `ALLOWED_IPS` | `0.0.0.0/0, ::/0` (IPv4 only when `ENABLE_IPV6=n`) |
+| `CREATE_INITIAL_CLIENT` | `yes` in `AUTO_INSTALL`; prompted interactively |
 
 Set `ENABLE_IPV6=n` for an IPv4-only deployment: the server interface, firewall
 rules, and all generated client configs omit IPv6 (no IPv6 address, no `::/0`

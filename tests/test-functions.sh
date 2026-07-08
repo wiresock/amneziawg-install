@@ -401,7 +401,7 @@ SERVER_PRIV_KEY="test_priv_key"
 SERVER_PUB_KEY="test_pub_key"
 CLIENT_DNS_1="1.1.1.1"
 CLIENT_DNS_2="1.0.0.1"
-ALLOWED_IPS="0.0.0.0/0,::/0"
+ALLOWED_IPS="0.0.0.0/0, ::/0"
 SERVER_AWG_JC="5"
 SERVER_AWG_JMIN="50"
 SERVER_AWG_JMAX="1000"
@@ -441,6 +441,19 @@ fi
 	TESTS_FAILED=$((TESTS_FAILED + 1))
 }
 rm -f "${SERIALIZE_TMP}"
+
+echo "=== formatClientAllowedIPs ==="
+assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs "0.0.0.0/0,::/0")" "formatClientAllowedIPs adds space after comma"
+assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs " 0.0.0.0/0, ::/0 ")" "formatClientAllowedIPs trims entries"
+assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs "0.0.0.0/0,, ::/0,")" "formatClientAllowedIPs drops empty entries"
+assert_eq "" "$(formatClientAllowedIPs " , , ")" "formatClientAllowedIPs returns empty for no entries"
+assert_eq "0.0.0.0/0" "$(prepareClientAllowedIPs "0.0.0.0/0, ::/0" n)" "prepareClientAllowedIPs strips ipv6 in v4-only mode"
+PREP_OUT=""
+PREP_RC=0
+PREP_OUT="$(prepareClientAllowedIPs "fd00::/8, ::/0" n)" || PREP_RC=$?
+assert_eq "1" "${PREP_RC}" "prepareClientAllowedIPs rejects empty v4-only route list"
+assert_eq "" "${PREP_OUT}" "prepareClientAllowedIPs emits nothing on empty result"
+unset PREP_OUT PREP_RC
 
 # ============================================================
 # checkOS tests (Linux Mint support)
@@ -910,7 +923,7 @@ _fw_stub() {  # name body
 	printf '%s\n%s\n' '#!/usr/bin/env bash' "$2" > "${FW_TMP}/bin/$1"
 	chmod +x "${FW_TMP}/bin/$1"
 }
-_run_fw() { ( PATH="${FW_TMP}/bin:${FW_TMP}/realbin"; export PATH; writeFirewallRules ); }
+_run_fw() { ( PATH="${FW_TMP}/bin:${FW_TMP}/realbin"; UFW_CONF_PATH="${FW_TMP}/ufw.conf"; export PATH UFW_CONF_PATH; writeFirewallRules ); }
 
 # Backend 1: firewalld active -> firewall-cmd rules.
 _fw_stub systemctl '[[ "$*" == "is-active --quiet firewalld" ]] && exit 0; exit 1'
@@ -918,6 +931,11 @@ rm -f "${FW_TMP}/bin/nft" "${FW_TMP}/bin/iptables"
 FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "PostUp = firewall-cmd --add-port 51820/udp" "firewalld: adds port"
 assert_contains "${FW_OUT}" "family=ipv4 source address=10.66.66.0/24 masquerade" "firewalld: ipv4 masquerade"
+assert_contains "${FW_OUT}" "firewall-cmd --direct --add-rule ipv4 filter FORWARD 0 -i awg0 -j ACCEPT" "firewalld: allows tunnel-originated forwarding"
+assert_contains "${FW_OUT}" "firewall-cmd --direct --add-rule ipv4 filter FORWARD 0 -i eth0 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "firewalld: allows established return traffic only"
+assert_contains "${FW_OUT}" "firewall-cmd --direct --add-rule ipv4 filter FORWARD 1 -i eth0 -o awg0 -j DROP" "firewalld: drops new internet-to-tunnel traffic"
+assert_contains "${FW_OUT}" "firewall-cmd --direct --add-rule ipv4 mangle FORWARD 0 -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "firewalld: clamps MSS on tunnel egress"
+assert_contains "${FW_OUT}" "firewall-cmd --direct --remove-rule ipv4 filter FORWARD 1 -i eth0 -o awg0 -j DROP" "firewalld: removes internet-to-tunnel drop"
 assert_not_contains "${FW_OUT}" "nft add table" "firewalld: no nft rules"
 
 # Backend 2: firewalld inactive, nft present, iptables nf_tables-backed -> nft rules.
@@ -930,7 +948,10 @@ assert_contains "${FW_OUT}" "input udp dport 51820 accept" "nft: accepts vpn por
 assert_contains "${FW_OUT}" "postrouting oifname eth0 masquerade" "nft: masquerades via pub nic"
 assert_contains "${FW_OUT}" "hook postrouting priority 100" "nft: nat chain at srcnat priority"
 assert_contains "${FW_OUT}" "forward oifname awg0 tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu" "nft: clamps MSS on tunnel egress"
+assert_contains "${FW_OUT}" "forward iifname eth0 oifname awg0 ct state related,established accept" "nft: allows established return traffic only"
+assert_contains "${FW_OUT}" "forward iifname eth0 oifname awg0 drop" "nft: drops new internet-to-tunnel traffic"
 assert_contains "${FW_OUT}" "PostDown = nft delete table inet awg-awg0" "nft: tears down table"
+assert_not_contains "${FW_OUT}" "forward iifname eth0 oifname awg0 accept" "nft: no internet-to-tunnel forward accept"
 assert_not_contains "${FW_OUT}" "iptables -" "nft: no legacy iptables rules"
 # The MSS clamp carries no verdict, so it must appear before the accept rules
 # that would otherwise terminate the forward chain first.
@@ -944,17 +965,67 @@ else
 	echo "  FAIL: nft MSS clamp must precede forward accept (mss=${NFT_MSS_LINE}, accept=${NFT_ACCEPT_LINE})"
 fi
 
-# Backend 3: firewalld inactive, nft absent -> iptables fallback.
+# Backend 3: ufw.service active but UFW disabled -> stay on nft.
+_fw_stub systemctl '[[ "$*" == "is-active --quiet ufw" ]] && exit 0; exit 1'
+_fw_stub nft 'exit 0'
+_fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.10 (nf_tables)";; esac; exit 0'
+_fw_stub ufw '[[ "$*" == "status" ]] && echo "Status: inactive"; exit 0'
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "PostUp = nft add table inet awg-awg0" "ufw disabled: uses nft backend"
+assert_not_contains "${FW_OUT}" "iptables -I INPUT" "ufw disabled: does not use ufw iptables branch"
+
+# Backend 4: firewalld inactive, UFW enabled by config without an active systemd unit -> UFW-compatible iptables rules.
+_fw_stub systemctl 'exit 1'
+rm -f "${FW_TMP}/bin/ufw"
+printf '%s\n' 'ENABLED=yes' > "${FW_TMP}/ufw.conf"
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "iptables -I INPUT -p udp --dport 51820 -j ACCEPT" "ufw config: uses ufw iptables branch"
+assert_not_contains "${FW_OUT}" "nft add table" "ufw config: no native nft table"
+rm -f "${FW_TMP}/ufw.conf"
+
+# Backend 5: firewalld inactive, UFW active without an active systemd unit -> UFW-compatible iptables rules.
+_fw_stub ufw '[[ "$*" == "status" ]] && echo "Status: active"; exit 0'
+_fw_stub ip6tables 'exit 0'
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "iptables -I INPUT -p udp --dport 51820 -j ACCEPT" "ufw: inserts udp accept through iptables"
+assert_contains "${FW_OUT}" "iptables -I FORWARD -i awg0 -j ACCEPT" "ufw: allows tunnel-originated forwarding"
+assert_contains "${FW_OUT}" "iptables -I FORWARD -i eth0 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "ufw: allows established return traffic only"
+assert_contains "${FW_OUT}" "iptables -I FORWARD 2 -i eth0 -o awg0 -j DROP" "ufw: drops new internet-to-tunnel traffic"
+assert_contains "${FW_OUT}" "PostDown = iptables -D FORWARD -i eth0 -o awg0 -j DROP" "ufw: removes internet-to-tunnel drop"
+assert_contains "${FW_OUT}" "ip6tables -I FORWARD -i eth0 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "ufw: allows established return traffic only (ipv6)"
+assert_contains "${FW_OUT}" "ip6tables -I FORWARD 2 -i eth0 -o awg0 -j DROP" "ufw: drops new internet-to-tunnel traffic (ipv6)"
+assert_contains "${FW_OUT}" "PostDown = ip6tables -D FORWARD -i eth0 -o awg0 -j DROP" "ufw: removes internet-to-tunnel drop (ipv6)"
+assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "ufw: masquerade rule"
+assert_not_contains "${FW_OUT}" "nft add table" "ufw: no native nft table"
+assert_not_contains "${FW_OUT}" "-i eth0 -o awg0 -j ACCEPT" "ufw: no internet-to-tunnel forward accept"
+rm -f "${FW_TMP}/bin/ip6tables"
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "iptables -I FORWARD 2 -i eth0 -o awg0 -j DROP" "ufw: keeps ipv4 internet-to-tunnel drop without ip6tables"
+assert_not_contains "${FW_OUT}" "ip6tables" "ufw: skips ipv6 rules when ip6tables is unavailable"
+
+# Backend 6: firewalld inactive, nft absent -> iptables fallback.
+rm -f "${FW_TMP}/bin/ufw" "${FW_TMP}/ufw.conf"
 _fw_stub systemctl 'exit 1'
 rm -f "${FW_TMP}/bin/nft"
 _fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.7 (legacy)";; esac; exit 0'
+_fw_stub ip6tables 'exit 0'
 FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables: masquerade rule"
 assert_contains "${FW_OUT}" "ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables: ipv6 masquerade rule"
+assert_contains "${FW_OUT}" "iptables -I FORWARD -i eth0 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "iptables: allows established return traffic only"
+assert_contains "${FW_OUT}" "iptables -I FORWARD 2 -i eth0 -o awg0 -j DROP" "iptables: drops new internet-to-tunnel traffic"
+assert_contains "${FW_OUT}" "PostDown = iptables -D FORWARD -i eth0 -o awg0 -j DROP" "iptables: removes internet-to-tunnel drop"
+assert_contains "${FW_OUT}" "ip6tables -I FORWARD -i eth0 -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" "iptables: allows established return traffic only (ipv6)"
+assert_contains "${FW_OUT}" "ip6tables -I FORWARD 2 -i eth0 -o awg0 -j DROP" "iptables: drops new internet-to-tunnel traffic (ipv6)"
+assert_contains "${FW_OUT}" "PostDown = ip6tables -D FORWARD -i eth0 -o awg0 -j DROP" "iptables: removes internet-to-tunnel drop (ipv6)"
 assert_contains "${FW_OUT}" "iptables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS on tunnel egress"
 assert_contains "${FW_OUT}" "ip6tables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: clamps MSS on tunnel egress (ipv6)"
 assert_contains "${FW_OUT}" "PostDown = iptables -t mangle -D FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu" "iptables: removes MSS clamp (matches PostUp)"
+assert_not_contains "${FW_OUT}" "-i eth0 -o awg0 -j ACCEPT" "iptables: no internet-to-tunnel forward accept"
 assert_not_contains "${FW_OUT}" "nft add table" "iptables: no nft rules"
+rm -f "${FW_TMP}/bin/ip6tables"
+FW_OUT="$(_run_fw)"
+assert_not_contains "${FW_OUT}" "ip6tables" "iptables: skips ipv6 rules when ip6tables is unavailable"
 
 # Backend gate: nft present but iptables is legacy-backed -> stay on iptables so we
 # don't disturb a host that deliberately uses the legacy backend.
@@ -977,15 +1048,27 @@ assert_not_contains "${FW_OUT}" "family=ipv6" "firewalld v4-only: no ipv6 rich r
 _fw_stub systemctl 'exit 1'
 rm -f "${FW_TMP}/bin/nft"
 _fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.7 (legacy)";; esac; exit 0'
+_fw_stub ip6tables 'exit 0'
 FW_OUT="$(_run_fw)"
 assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "iptables v4-only: ipv4 masquerade present"
 assert_not_contains "${FW_OUT}" "ip6tables" "iptables v4-only: no ip6tables rules"
-# nft (inet table still emitted; it is inert for v6 on an IPv6-disabled host)
+# UFW path should also avoid ip6tables in IPv4-only mode.
+_fw_stub systemctl '[[ "$*" == "is-active --quiet ufw" ]] && exit 0; exit 1'
+_fw_stub nft 'exit 0'
+_fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.10 (nf_tables)";; esac; exit 0'
+_fw_stub ufw '[[ "$*" == "status" ]] && echo "Status: active"; exit 0'
+_fw_stub ip6tables 'exit 0'
+FW_OUT="$(_run_fw)"
+assert_contains "${FW_OUT}" "iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" "ufw v4-only: ipv4 masquerade present"
+assert_not_contains "${FW_OUT}" "ip6tables" "ufw v4-only: no ip6tables rules"
+# nft uses an IPv4-only table when IPv6 is disabled.
+rm -f "${FW_TMP}/bin/ufw" "${FW_TMP}/ufw.conf"
 _fw_stub systemctl 'exit 1'
 _fw_stub nft 'exit 0'
 _fw_stub iptables 'case "$1" in --version) echo "iptables v1.8.10 (nf_tables)";; esac; exit 0'
 FW_OUT="$(_run_fw)"
-assert_contains "${FW_OUT}" "PostUp = nft add table inet awg-awg0" "nft v4-only: still emits inet table"
+assert_contains "${FW_OUT}" "PostUp = nft add table ip awg-awg0" "nft v4-only: emits ipv4-only table"
+assert_not_contains "${FW_OUT}" "nft add table inet" "nft v4-only: no dual-family inet table"
 assert_contains "${FW_OUT}" "postrouting oifname eth0 masquerade" "nft v4-only: masquerade present"
 unset ENABLE_IPV6
 
@@ -998,6 +1081,21 @@ assert_eq "10.0.0.0/8,192.168.0.0/16" "$(stripIPv6FromList "10.0.0.0/8,fd00::/8,
 assert_eq "0.0.0.0/0" "$(stripIPv6FromList "0.0.0.0/0")" "stripIPv6FromList no-op on v4-only"
 assert_eq "" "$(stripIPv6FromList "::/0")" "stripIPv6FromList empties an all-IPv6 list"
 assert_eq "0.0.0.0/0" "$(stripIPv6FromList " 0.0.0.0/0 , ::/0 ")" "stripIPv6FromList trims surrounding whitespace"
+
+echo "=== serverConfigHasIPv6Address ==="
+SC_IPV6_TMP="$(mktemp -d)"
+cat > "${SC_IPV6_TMP}/dual.conf" <<'EOF'
+[Interface]
+Address=10.66.66.1/24, fd42:42:42::1/64
+EOF
+cat > "${SC_IPV6_TMP}/comment.conf" <<'EOF'
+[Interface]
+Address = 10.66.66.1/24 # converted from fd42:42:42::1/64
+EOF
+assert_rc 0 serverConfigHasIPv6Address "${SC_IPV6_TMP}/dual.conf"
+assert_rc 1 serverConfigHasIPv6Address "${SC_IPV6_TMP}/comment.conf"
+rm -rf "${SC_IPV6_TMP}"
+unset SC_IPV6_TMP
 
 echo "=== ipv6Available ==="
 # Environment-dependent, but it must always exit cleanly with 0 (available) or 1.

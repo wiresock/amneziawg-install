@@ -405,7 +405,7 @@ SERVER_PUB_KEY=$(safeQuoteParam "${SERVER_PUB_KEY}")
 CLIENT_DNS_1=$(safeQuoteParam "${CLIENT_DNS_1}")
 CLIENT_DNS_2=$(safeQuoteParam "${CLIENT_DNS_2}")
 ALLOWED_IPS=$(safeQuoteParam "${ALLOWED_IPS}")
-ENABLE_IPV6=$(safeQuoteParam "${ENABLE_IPV6}")
+ENABLE_IPV6=$(safeQuoteParam "${ENABLE_IPV6:-}")
 SERVER_AWG_JC=$(safeQuoteParam "${SERVER_AWG_JC}")
 SERVER_AWG_JMIN=$(safeQuoteParam "${SERVER_AWG_JMIN}")
 SERVER_AWG_JMAX=$(safeQuoteParam "${SERVER_AWG_JMAX}")
@@ -1387,7 +1387,16 @@ function ipv6Available() {
 	local disabled
 	disabled="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)"
 	[[ "${disabled}" == "1" ]] && return 1
+	disabled="$(cat /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null)"
+	[[ "${disabled}" == "1" ]] && return 1
 	return 0
+}
+
+function trimWhitespace() {
+	local VALUE="$1"
+	VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
+	VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
+	printf '%s\n' "${VALUE}"
 }
 
 # Echo a comma-separated CIDR list with IPv6 entries removed (IPv4 kept). Keeps
@@ -1404,6 +1413,46 @@ function stripIPv6FromList() {
 		if [[ -z "${OUT}" ]]; then OUT="${ENTRY}"; else OUT="${OUT},${ENTRY}"; fi
 	done
 	echo "${OUT}"
+}
+
+function prepareClientAllowedIPs() {
+	local RAW_ALLOWED_IPS="$1"
+	local IPV6_ENABLED="${2:-${ENABLE_IPV6:-y}}"
+	local CLIENT_ALLOWED_IPS="${RAW_ALLOWED_IPS}"
+
+	if [[ "${IPV6_ENABLED}" == "n" ]]; then
+		CLIENT_ALLOWED_IPS=$(stripIPv6FromList "${RAW_ALLOWED_IPS}")
+	fi
+	CLIENT_ALLOWED_IPS=$(formatClientAllowedIPs "${CLIENT_ALLOWED_IPS}")
+	[[ -n "${CLIENT_ALLOWED_IPS}" ]] || return 1
+	printf '%s\n' "${CLIENT_ALLOWED_IPS}"
+}
+
+function serverConfigHasIPv6Address() {
+	local CONFIG_PATH="$1"
+	local IN_INTERFACE=0 LINE TRIMMED KEY VALUE SECTION
+
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		TRIMMED=$(trimWhitespace "${LINE}")
+		[[ -z "${TRIMMED}" || "${TRIMMED}" == \#* || "${TRIMMED}" == \;* ]] && continue
+		if [[ "${TRIMMED}" =~ ^\[(.*)\]$ ]]; then
+			SECTION="${BASH_REMATCH[1],,}"
+			IN_INTERFACE=0
+			[[ "${SECTION}" == "interface" ]] && IN_INTERFACE=1
+			continue
+		fi
+		(( IN_INTERFACE )) || continue
+		[[ "${TRIMMED}" == *=* ]] || continue
+		KEY=$(trimWhitespace "${TRIMMED%%=*}")
+		[[ "${KEY,,}" == "address" ]] || continue
+		VALUE=$(trimWhitespace "${TRIMMED#*=}")
+		VALUE="${VALUE%%#*}"
+		VALUE="${VALUE%%;*}"
+		VALUE=$(trimWhitespace "${VALUE}")
+		[[ "${VALUE}" == *:* ]] && return 0
+	done < "${CONFIG_PATH}"
+
+	return 1
 }
 
 function installQuestions() {
@@ -1468,12 +1517,14 @@ function installQuestions() {
 			exit 1
 		fi
 		if [[ "${ENABLE_IPV6}" == "y" ]]; then
-			ALLOWED_IPS=${ALLOWED_IPS:-0.0.0.0/0,::/0}
+			ALLOWED_IPS=${ALLOWED_IPS:-0.0.0.0/0, ::/0}
 		else
 			ALLOWED_IPS=${ALLOWED_IPS:-0.0.0.0/0}
-			# Drop any IPv6 routes the operator may have passed in IPv4-only mode.
-			ALLOWED_IPS=$(stripIPv6FromList "${ALLOWED_IPS}")
-			[[ -z "${ALLOWED_IPS}" ]] && ALLOWED_IPS="0.0.0.0/0"
+		fi
+		local RAW_ALLOWED_IPS="${ALLOWED_IPS}"
+		if ! ALLOWED_IPS=$(prepareClientAllowedIPs "${ALLOWED_IPS}" "${ENABLE_IPV6}"); then
+			echo -e "${RED}ERROR: ALLOWED_IPS has no usable routes after applying ENABLE_IPV6=${ENABLE_IPV6}: ${RAW_ALLOWED_IPS}${NC}"
+			exit 1
 		fi
 
 		# Validate all overrides with the same checks used in the interactive flow.
@@ -1631,18 +1682,18 @@ function installQuestions() {
 		echo -e "${ORANGE}Invalid IPv4 address. Enter a valid address or leave empty to skip.${NC}"
 	done
 
-	if [[ "${ENABLE_IPV6}" == "y" ]]; then ALLOWED_IPS_DEFAULT='0.0.0.0/0,::/0'; else ALLOWED_IPS_DEFAULT='0.0.0.0/0'; fi
-	until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
+	if [[ "${ENABLE_IPV6}" == "y" ]]; then ALLOWED_IPS_DEFAULT='0.0.0.0/0, ::/0'; else ALLOWED_IPS_DEFAULT='0.0.0.0/0'; fi
+	while true; do
 		echo -e "\nAmneziaWG uses a parameter called AllowedIPs to determine what is routed over the VPN."
 		read -rp "Allowed IPs list for generated clients (leave default to route everything): " -e -i "${ALLOWED_IPS_DEFAULT}" ALLOWED_IPS
 		if [[ ${ALLOWED_IPS} == "" ]]; then
 			ALLOWED_IPS="${ALLOWED_IPS_DEFAULT}"
 		fi
+		if ALLOWED_IPS=$(prepareClientAllowedIPs "${ALLOWED_IPS}" "${ENABLE_IPV6}"); then
+			break
+		fi
+		echo -e "${ORANGE}AllowedIPs must contain at least one route usable with ENABLE_IPV6=${ENABLE_IPV6}.${NC}"
 	done
-	if [[ "${ENABLE_IPV6}" == "n" ]]; then
-		ALLOWED_IPS=$(stripIPv6FromList "${ALLOWED_IPS}")
-		[[ -z "${ALLOWED_IPS}" ]] && ALLOWED_IPS="0.0.0.0/0"
-	fi
 
 	# Jc
 	RANDOM_AWG_JC=$(shuf -i3-10 -n1)
@@ -1713,6 +1764,22 @@ function installQuestions() {
 # Reads the SERVER_* globals populated by installQuestions(). The brace blocks in
 # the nft chain definitions are single-quoted so awg-quick's `eval` of each hook
 # passes them to nft intact instead of treating { ; } as shell syntax.
+function ufwIsActive() {
+	local UFW_CONF="${UFW_CONF_PATH:-/etc/ufw/ufw.conf}"
+	local UFW_STATUS=""
+
+	if command -v ufw >/dev/null 2>&1; then
+		UFW_STATUS="$(ufw status 2>/dev/null || true)"
+		if printf '%s\n' "${UFW_STATUS}" | grep -qiE '^Status:[[:space:]]+active'; then
+			return 0
+		fi
+		if printf '%s\n' "${UFW_STATUS}" | grep -qiE '^Status:[[:space:]]+inactive'; then
+			return 1
+		fi
+	fi
+	grep -qiE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*yes' "${UFW_CONF}" 2>/dev/null
+}
+
 function writeFirewallRules() {
 	if systemctl is-active --quiet firewalld 2>/dev/null; then
 		local FIREWALLD_IPV4_ADDRESS FIREWALLD_IPV6_ADDRESS FW_PU_V6="" FW_PD_V6=""
@@ -1724,11 +1791,63 @@ function writeFirewallRules() {
 			FW_PD_V6=" && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'"
 		fi
 		echo "PostUp = firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade'${FW_PU_V6}
-PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade'${FW_PD_V6}"
+PostUp = firewall-cmd --direct --add-rule ipv4 filter FORWARD 0 -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = firewall-cmd --direct --add-rule ipv4 filter FORWARD 0 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = firewall-cmd --direct --add-rule ipv4 filter FORWARD 1 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
+PostUp = firewall-cmd --direct --add-rule ipv4 mangle FORWARD 0 -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade'${FW_PD_V6}
+PostDown = firewall-cmd --direct --remove-rule ipv4 filter FORWARD 0 -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = firewall-cmd --direct --remove-rule ipv4 filter FORWARD 0 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = firewall-cmd --direct --remove-rule ipv4 filter FORWARD 1 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
+PostDown = firewall-cmd --direct --remove-rule ipv4 mangle FORWARD 0 -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+		if [[ "${ENABLE_IPV6:-y}" == "y" ]]; then
+			echo "PostUp = firewall-cmd --direct --add-rule ipv6 filter FORWARD 0 -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = firewall-cmd --direct --add-rule ipv6 filter FORWARD 0 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = firewall-cmd --direct --add-rule ipv6 filter FORWARD 1 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
+PostUp = firewall-cmd --direct --add-rule ipv6 mangle FORWARD 0 -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = firewall-cmd --direct --remove-rule ipv6 filter FORWARD 0 -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = firewall-cmd --direct --remove-rule ipv6 filter FORWARD 0 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = firewall-cmd --direct --remove-rule ipv6 filter FORWARD 1 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
+PostDown = firewall-cmd --direct --remove-rule ipv6 mangle FORWARD 0 -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+		fi
+	elif ufwIsActive && command -v iptables >/dev/null 2>&1; then
+		# UFW installs default-drop rules in its own filtering path. Native nft
+		# accept rules in a separate base chain cannot reliably override those
+		# drops, so use iptables-compatible insertion when UFW is active. This
+		# inserts before UFW's final drop while keeping NAT scoped to VPN clients.
+		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostUp = iptables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -I FORWARD 2 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
+PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = iptables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
+PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = iptables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+		if [[ "${ENABLE_IPV6:-y}" == "y" ]] && command -v ip6tables >/dev/null 2>&1; then
+			echo "PostUp = ip6tables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostUp = ip6tables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = ip6tables -I FORWARD 2 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
+PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = ip6tables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = ip6tables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
+PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = ip6tables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+		elif [[ "${ENABLE_IPV6:-y}" == "y" ]]; then
+			echo -e "${ORANGE}WARNING: ENABLE_IPV6=y but ip6tables is unavailable; UFW IPv6 firewall rules will not be generated.${NC}" >&2
+		fi
 	elif command -v nft >/dev/null 2>&1 && { ! command -v iptables >/dev/null 2>&1 || iptables --version 2>/dev/null | grep -qi 'nf_tables'; }; then
-		# A single inet table covers both IPv4 and IPv6; the nat chain masquerades
-		# both families. PostDown drops the whole table atomically, so no per-rule
-		# deletion (and no ordering fragility) is required.
+		# In dual-stack mode a single inet table covers both IPv4 and IPv6; in
+		# IPv4-only mode an ip table avoids opening/forwarding IPv6 at all.
+		# PostDown drops the whole table atomically, so no per-rule deletion (and
+		# no ordering fragility) is required.
 		# The MSS-clamp rule is scoped to 'oifname <awg>' so it only touches traffic
 		# entering the tunnel (notably the return-path SYN-ACK) and leaves any other
 		# forwarding the host does alone. It must precede the accept rules: it carries
@@ -1736,43 +1855,105 @@ PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remov
 		# terminate the chain before the clamp runs. 'tcp flags & (syn|rst) == syn'
 		# matches SYN and SYN-ACK (the segments carrying the MSS option); the &/(|)
 		# tokens are single-quoted so awg-quick's eval passes them to nft intact.
-		local NFT_TABLE="awg-${SERVER_AWG_NIC}"
-		echo "PostUp = nft add table inet ${NFT_TABLE}
-PostUp = nft add chain inet ${NFT_TABLE} input '{ type filter hook input priority 0 ; policy accept ; }'
-PostUp = nft add rule inet ${NFT_TABLE} input udp dport ${SERVER_PORT} accept
-PostUp = nft add chain inet ${NFT_TABLE} forward '{ type filter hook forward priority 0 ; policy accept ; }'
-PostUp = nft add rule inet ${NFT_TABLE} forward oifname ${SERVER_AWG_NIC} tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu
-PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_AWG_NIC} accept
-PostUp = nft add rule inet ${NFT_TABLE} forward iifname ${SERVER_PUB_NIC} oifname ${SERVER_AWG_NIC} accept
-PostUp = nft add chain inet ${NFT_TABLE} postrouting '{ type nat hook postrouting priority 100 ; policy accept ; }'
-PostUp = nft add rule inet ${NFT_TABLE} postrouting oifname ${SERVER_PUB_NIC} masquerade
-PostDown = nft delete table inet ${NFT_TABLE}"
+		local NFT_TABLE="awg-${SERVER_AWG_NIC}" NFT_FAMILY="inet"
+		[[ "${ENABLE_IPV6:-y}" == "n" ]] && NFT_FAMILY="ip"
+		echo "PostUp = nft add table ${NFT_FAMILY} ${NFT_TABLE}
+PostUp = nft add chain ${NFT_FAMILY} ${NFT_TABLE} input '{ type filter hook input priority 0 ; policy accept ; }'
+PostUp = nft add rule ${NFT_FAMILY} ${NFT_TABLE} input udp dport ${SERVER_PORT} accept
+PostUp = nft add chain ${NFT_FAMILY} ${NFT_TABLE} forward '{ type filter hook forward priority 0 ; policy accept ; }'
+PostUp = nft add rule ${NFT_FAMILY} ${NFT_TABLE} forward oifname ${SERVER_AWG_NIC} tcp flags '&' '(syn|rst)' == syn tcp option maxseg size set rt mtu
+PostUp = nft add rule ${NFT_FAMILY} ${NFT_TABLE} forward iifname ${SERVER_AWG_NIC} accept
+PostUp = nft add rule ${NFT_FAMILY} ${NFT_TABLE} forward iifname ${SERVER_PUB_NIC} oifname ${SERVER_AWG_NIC} ct state related,established accept
+PostUp = nft add rule ${NFT_FAMILY} ${NFT_TABLE} forward iifname ${SERVER_PUB_NIC} oifname ${SERVER_AWG_NIC} drop
+PostUp = nft add chain ${NFT_FAMILY} ${NFT_TABLE} postrouting '{ type nat hook postrouting priority 100 ; policy accept ; }'
+PostUp = nft add rule ${NFT_FAMILY} ${NFT_TABLE} postrouting oifname ${SERVER_PUB_NIC} masquerade
+PostDown = nft delete table ${NFT_FAMILY} ${NFT_TABLE}"
 	else
 		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -I FORWARD 2 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
 PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostUp = iptables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
 PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = iptables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
-		# Emit the ip6tables rules only when IPv6 is enabled; on IPv6-disabled
-		# hosts these commands fail and would abort awg-quick (issue #51).
-		if [[ "${ENABLE_IPV6:-y}" == "y" ]]; then
+		# Emit the ip6tables rules only when IPv6 is enabled and ip6tables is
+		# available; otherwise these commands would abort awg-quick.
+		if [[ "${ENABLE_IPV6:-y}" == "y" ]] && command -v ip6tables >/dev/null 2>&1; then
 			echo "PostUp = ip6tables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = ip6tables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = ip6tables -I FORWARD 2 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
 PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostUp = ip6tables -t mangle -A FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = ip6tables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j DROP
 PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = ip6tables -t mangle -D FORWARD -o ${SERVER_AWG_NIC} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+		elif [[ "${ENABLE_IPV6:-y}" == "y" ]]; then
+			echo -e "${ORANGE}WARNING: ENABLE_IPV6=y but ip6tables is unavailable; legacy IPv6 firewall rules will not be generated.${NC}" >&2
 		fi
 	fi
+}
+
+function shouldCreateInitialClient() {
+	local CREATE_CLIENT="${CREATE_INITIAL_CLIENT:-}"
+	CREATE_CLIENT=$(trimWhitespace "${CREATE_CLIENT}")
+
+	case "${CREATE_CLIENT,,}" in
+	y|yes|true|1)
+		return 0
+		;;
+	n|no|false|0)
+		return 1
+		;;
+	esac
+
+	if [[ -n "${CREATE_CLIENT}" ]]; then
+		echo -e "${RED}ERROR: CREATE_INITIAL_CLIENT must be y/n, yes/no, true/false, or 1/0: ${CREATE_CLIENT}${NC}"
+		if [[ "${AUTO_INSTALL,,}" == "y" ]]; then
+			exit 1
+		fi
+	fi
+
+	if [[ "${AUTO_INSTALL,,}" == "y" ]]; then
+		return 0
+	fi
+
+	while true; do
+		read -rp "Create an initial client configuration now? [Y/n]: " CREATE_CLIENT
+		CREATE_CLIENT=${CREATE_CLIENT:-y}
+		case "${CREATE_CLIENT,,}" in
+		y|yes)
+			return 0
+			;;
+		n|no)
+			return 1
+			;;
+		*)
+			echo -e "${ORANGE}Please answer yes or no.${NC}"
+			;;
+		esac
+	done
+}
+
+function formatClientAllowedIPs() {
+	local OUT="" ENTRY
+	local -a PARTS
+	IFS=',' read -ra PARTS <<< "$1"
+	for ENTRY in "${PARTS[@]}"; do
+		ENTRY="${ENTRY#"${ENTRY%%[![:space:]]*}"}"
+		ENTRY="${ENTRY%"${ENTRY##*[![:space:]]}"}"
+		[[ -z "${ENTRY}" ]] && continue
+		if [[ -z "${OUT}" ]]; then OUT="${ENTRY}"; else OUT="${OUT}, ${ENTRY}"; fi
+	done
+	printf '%s\n' "${OUT}"
 }
 
 function installAmneziaWG() {
@@ -2098,8 +2279,12 @@ EOF
 	fi
 
 	if [[ ${MODULE_READY} -eq 1 ]]; then
-		newClient
-		echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
+		if shouldCreateInitialClient; then
+			newClient
+			echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
+		else
+			echo -e "${ORANGE}Skipping initial client generation. You can add users later from this script or the web panel.${NC}"
+		fi
 	else
 		echo -e "${ORANGE}Skipping client generation because the server interface is not active.${NC}"
 	fi
@@ -2326,12 +2511,13 @@ function newClient() {
 	# Build the client Address and route list, including IPv6 only when enabled
 	# (issue #51): an IPv6 address/route on an IPv4-only client fails to apply.
 	local CLIENT_ADDRESS="${CLIENT_AWG_IPV4}/32"
-	local CLIENT_ALLOWED_IPS="${ALLOWED_IPS}"
 	if [[ "${ENABLE_IPV6:-y}" == "y" ]]; then
 		CLIENT_ADDRESS="${CLIENT_ADDRESS},${CLIENT_AWG_IPV6_DISPLAY}/128"
-	else
-		CLIENT_ALLOWED_IPS=$(stripIPv6FromList "${ALLOWED_IPS}")
-		[[ -z "${CLIENT_ALLOWED_IPS}" ]] && CLIENT_ALLOWED_IPS="0.0.0.0/0"
+	fi
+	local CLIENT_ALLOWED_IPS
+	if ! CLIENT_ALLOWED_IPS=$(prepareClientAllowedIPs "${ALLOWED_IPS}" "${ENABLE_IPV6:-y}"); then
+		echo -e "${RED}ERROR: ALLOWED_IPS has no usable routes after applying ENABLE_IPV6=${ENABLE_IPV6:-y}: ${ALLOWED_IPS}${NC}"
+		return 1
 	fi
 
 	# Restrict umask for client config file creation (contains private key)
@@ -2616,18 +2802,23 @@ function regenerateClients() {
 			CLIENT_AWG_IPV6=$(compressIPv6 "$(normalizeIPv6 "${CLIENT_AWG_IPV6}")")
 		fi
 
-		# Build address string, including IPv6 only if present in AllowedIPs
+		# Build address string, including IPv6 only when the server still has it enabled.
 		local CLIENT_ADDRESS="${CLIENT_AWG_IPV4}/32"
-		if [[ -n "${CLIENT_AWG_IPV6}" ]]; then
+		if [[ "${ENABLE_IPV6:-y}" == "y" && -n "${CLIENT_AWG_IPV6}" ]]; then
 			CLIENT_ADDRESS="${CLIENT_ADDRESS},${CLIENT_AWG_IPV6}/128"
 		fi
 
-		# Route list: drop IPv6 routes for clients that have no IPv6 address, so an
-		# IPv4-only client never tries to add a ::/0 route (issue #51).
-		local CLIENT_ROUTE_IPS="${ALLOWED_IPS}"
+		# Route list: drop IPv6 routes whenever the regenerated client will not have
+		# an IPv6 address, so it never tries to add a ::/0 route (issue #51).
+		local CLIENT_ROUTE_IPV6_ENABLED="${ENABLE_IPV6:-y}"
 		if [[ -z "${CLIENT_AWG_IPV6}" ]]; then
-			CLIENT_ROUTE_IPS=$(stripIPv6FromList "${ALLOWED_IPS}")
-			[[ -z "${CLIENT_ROUTE_IPS}" ]] && CLIENT_ROUTE_IPS="0.0.0.0/0"
+			CLIENT_ROUTE_IPV6_ENABLED=n
+		fi
+		local CLIENT_ROUTE_IPS
+		if ! CLIENT_ROUTE_IPS=$(prepareClientAllowedIPs "${ALLOWED_IPS}" "${CLIENT_ROUTE_IPV6_ENABLED}"); then
+			echo -e "${RED}  FAIL: ${CLIENT_NAME} - ALLOWED_IPS has no usable routes after applying ENABLE_IPV6=${CLIENT_ROUTE_IPV6_ENABLED}${NC}"
+			FAILED=$((FAILED + 1))
+			continue
 		fi
 
 		# Determine home directory and locate existing client config file
@@ -2997,6 +3188,9 @@ function validateParamsFile() {
 		fi
 	fi
 
+	# Params must be authoritative; do not let an exported shell variable fill in
+	# keys that older params files legitimately lack.
+	unset ENABLE_IPV6
 	# shellcheck source=/etc/amnezia/amneziawg/params
 	if ! source "${AMNEZIAWG_DIR}/params"; then
 		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}" >&2
@@ -3012,19 +3206,23 @@ function validateParamsFile() {
 		return 1
 	fi
 
-	# Backward compat: installs created before the ENABLE_IPV6 flag existed don't
-	# carry it in params. Derive it from the server config's Address line so a
-	# manually IPv4-only'd server stops generating IPv6 client configs (issue #51).
-	# Anything other than an explicit "n" is treated as enabled (dual-stack).
-	if [[ -z "${ENABLE_IPV6:-}" ]]; then
-		if grep -qE '^Address = .*:' "${SERVER_AWG_CONF}"; then
-			ENABLE_IPV6=y
-		else
-			ENABLE_IPV6=n
+	# Validate any persisted flag, but use the actual server interface Address as
+	# the authority for installed-server management. This keeps bash and the web
+	# panel aligned when an operator converts a server to IPv4-only by removing
+	# the IPv6 address from the live config (issue #51).
+	if [[ -n "${ENABLE_IPV6:-}" ]]; then
+		ENABLE_IPV6=$(trimWhitespace "${ENABLE_IPV6}")
+		ENABLE_IPV6="${ENABLE_IPV6,,}"
+		if [[ "${ENABLE_IPV6}" != "y" && "${ENABLE_IPV6}" != "n" ]]; then
+			echo -e "${RED}ERROR: ENABLE_IPV6 in params must be 'y' or 'n': ${ENABLE_IPV6}${NC}" >&2
+			return 1
 		fi
 	fi
-	ENABLE_IPV6="${ENABLE_IPV6,,}"
-	[[ "${ENABLE_IPV6}" == "n" ]] || ENABLE_IPV6=y
+	if serverConfigHasIPv6Address "${SERVER_AWG_CONF}"; then
+		ENABLE_IPV6=y
+	else
+		ENABLE_IPV6=n
+	fi
 
 	# Validate and normalize SERVER_AWG_IPV6 from params file
 	# Older installations may have stored non-normalized or oddly formatted IPv6
@@ -3697,12 +3895,13 @@ function nonInteractiveAddClient() {
 
 	# Include IPv6 in the client Address/route list only when enabled (issue #51).
 	local CLIENT_ADDRESS="${CLIENT_AWG_IPV4}/32"
-	local CLIENT_ALLOWED_IPS="${ALLOWED_IPS}"
 	if [[ "${ENABLE_IPV6:-y}" == "y" ]]; then
 		CLIENT_ADDRESS="${CLIENT_ADDRESS},${CLIENT_AWG_IPV6_DISPLAY}/128"
-	else
-		CLIENT_ALLOWED_IPS=$(stripIPv6FromList "${ALLOWED_IPS}")
-		[[ -z "${CLIENT_ALLOWED_IPS}" ]] && CLIENT_ALLOWED_IPS="0.0.0.0/0"
+	fi
+	local CLIENT_ALLOWED_IPS
+	if ! CLIENT_ALLOWED_IPS=$(prepareClientAllowedIPs "${ALLOWED_IPS}" "${ENABLE_IPV6:-y}"); then
+		echo -e "${RED}ERROR: ALLOWED_IPS has no usable routes after applying ENABLE_IPV6=${ENABLE_IPV6:-y}: ${ALLOWED_IPS}${NC}"
+		return 1
 	fi
 
 	# If SERVER_PUB_IP is IPv6, normalize brackets
