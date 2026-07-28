@@ -45,6 +45,9 @@ GAI_CONF="/etc/gai.conf"
 GAI_CONF_SENTINEL="# Added by amneziawg-install - safe to remove"
 GAI_CONF_IPV4_RULE="precedence ::ffff:0:0/96 100"
 GAI_CONF_IPV4_RULE_REGEX='^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]*(#.*)?)?$'
+AMNEZIA_PPA_URI="https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu"
+AMNEZIA_PPA_SOURCES_DIR="/etc/apt/sources.list.d"
+AMNEZIA_PPA_SOURCE_CREATED=0
 _APT_IPV4_PREV_TRAP_EXIT=""
 _APT_IPV4_PREV_TRAP_INT=""
 _APT_IPV4_PREV_TRAP_TERM=""
@@ -118,9 +121,9 @@ _remove_ipv4_overrides() {
 # given signal, then immediately invoke the restored handler so it runs
 # during the same exit / signal delivery.
 _cleanup_apt_ipv4_and_chain() {
-	local sig="$1"
 	# Preserve the original exit status so chained handlers see the real value.
 	local _saved_status=$?
+	local sig="$1"
 	_remove_ipv4_overrides
 	# Restore + chain: re-install the previous trap (if any), then
 	# re-deliver the signal / exit so bash invokes the restored handler.
@@ -177,6 +180,1299 @@ disable_apt_ipv4() {
 	else
 		trap - TERM
 	fi
+}
+
+# Return the Ubuntu archive codename that add-apt-repository should use.
+# Linux Mint exposes its Ubuntu base in UBUNTU_CODENAME.
+function getUbuntuPpaCodename() {
+	local CODENAME
+	if [[ "${ID:-}" == "linuxmint" ]]; then
+		CODENAME="${UBUNTU_CODENAME:-}"
+	else
+		CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+	fi
+
+	if [[ -z "${CODENAME}" ]] || ! [[ "${CODENAME}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+		echo -e "${RED}ERROR: Unable to determine a valid Ubuntu codename for the Amnezia PPA.${NC}" >&2
+		return 1
+	fi
+
+	printf '%s\n' "${CODENAME}"
+}
+
+# Reviewed cross-release mappings. Unknown releases must never be mapped
+# automatically; every mapping requires package and DKMS compatibility testing.
+function getAmneziaPpaFallbackSuite() {
+	case "$1" in
+		resolute) printf '%s\n' "noble" ;;
+		*) return 1 ;;
+	esac
+}
+
+# Noble currently publishes amneziawg-tools for these architectures. Although
+# the Release file advertises i386, the required tools package is absent there.
+function isAmneziaPpaFallbackArchitectureSupported() {
+	case "$1" in
+		amd64 | arm64 | armhf | ppc64el | riscv64 | s390x) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Print the direct HTTP status for a PPA metadata URL without following
+# redirects. A redirect is ambiguous and must remain a 3xx so the caller fails
+# closed. Network, TLS, timeout, and tool failures return 2 without inventing a
+# status. curl is installed by the normal Ubuntu flow; wget/python3 allow
+# recovery from an older partial install before the first apt-get update.
+function getAmneziaPpaHttpStatus() {
+	local URL="$1"
+	local STATUS=""
+	local OUTPUT=""
+
+	if command -v curl &>/dev/null; then
+		STATUS=$(curl --disable -4 --silent --show-error \
+			--connect-timeout 10 --max-time 30 \
+			--output /dev/null --write-out '%{http_code}' "${URL}") || return 2
+	elif command -v wget &>/dev/null; then
+		OUTPUT=$(wget -4 --server-response --spider --max-redirect=0 \
+			--timeout=30 --tries=1 "${URL}" 2>&1) || true
+		STATUS=$(printf '%s\n' "${OUTPUT}" | awk '
+			/^[[:space:]]*HTTP\/[0-9.]+[[:space:]]+[0-9][0-9][0-9]/ { status=$2 }
+			END { print status }
+		')
+	elif command -v python3 &>/dev/null; then
+		STATUS=$(python3 - "${URL}" <<'PY'
+import sys
+import urllib.error
+import urllib.request
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+request = urllib.request.Request(sys.argv[1], method="GET")
+opener = urllib.request.build_opener(NoRedirect())
+try:
+    with opener.open(request, timeout=30) as response:
+        print(response.status)
+except urllib.error.HTTPError as error:
+    print(error.code)
+except (OSError, urllib.error.URLError):
+    raise SystemExit(2)
+PY
+		) || return 2
+	else
+		return 2
+	fi
+
+	if ! [[ "${STATUS}" =~ ^[0-9]{3}$ ]]; then
+		return 2
+	fi
+	printf '%s\n' "${STATUS}"
+}
+
+# Tri-state PPA metadata probe:
+#   0: suite is available (signed metadata resource exists)
+#   1: suite is definitely unavailable (both resources are 404/410)
+#   2: status is unknown (network/server/auth/other failure)
+function probeAmneziaPpaSuite() {
+	local SUITE="$1"
+	local RESOURCE
+	local STATUS
+
+	for RESOURCE in InRelease Release; do
+		STATUS=$(getAmneziaPpaHttpStatus \
+			"${AMNEZIA_PPA_URI}/dists/${SUITE}/${RESOURCE}") || return 2
+		case "${STATUS}" in
+			200) return 0 ;;
+			404 | 410) ;;
+			*) return 2 ;;
+		esac
+	done
+
+	return 1
+}
+
+# Select the native suite whenever it exists. A fallback is considered only
+# after definite native absence, never after a transient or ambiguous failure.
+function selectAmneziaPpaSuite() {
+	local NATIVE_SUITE="$1"
+	local ARCHITECTURE="$2"
+	local FALLBACK_SUITE
+	local PROBE_RC
+
+	if probeAmneziaPpaSuite "${NATIVE_SUITE}"; then
+		PROBE_RC=0
+	else
+		PROBE_RC=$?
+	fi
+	case "${PROBE_RC}" in
+		0)
+			printf '%s\n' "${NATIVE_SUITE}"
+			return 0
+			;;
+		2)
+			echo -e "${RED}ERROR: Could not determine whether the Amnezia PPA supports Ubuntu '${NATIVE_SUITE}'.${NC}" >&2
+			echo -e "${ORANGE}A network, TLS, rate-limit, or server error occurred. No cross-release fallback was applied.${NC}" >&2
+			return 1
+			;;
+	esac
+
+	FALLBACK_SUITE=$(getAmneziaPpaFallbackSuite "${NATIVE_SUITE}") || {
+		echo -e "${RED}ERROR: The Amnezia PPA does not publish packages for Ubuntu '${NATIVE_SUITE}', and no verified fallback is configured.${NC}" >&2
+		return 1
+	}
+
+	if ! isAmneziaPpaFallbackArchitectureSupported "${ARCHITECTURE}"; then
+		echo -e "${RED}ERROR: The verified ${NATIVE_SUITE} -> ${FALLBACK_SUITE} Amnezia PPA fallback is not available for architecture '${ARCHITECTURE}'.${NC}" >&2
+		return 1
+	fi
+
+	if probeAmneziaPpaSuite "${FALLBACK_SUITE}"; then
+		PROBE_RC=0
+	else
+		PROBE_RC=$?
+	fi
+	case "${PROBE_RC}" in
+		0)
+			echo -e "${ORANGE}WARNING: The Amnezia PPA has no native '${NATIVE_SUITE}' repository. Using signed '${FALLBACK_SUITE}' PPA packages from Ubuntu 24.04 for this reviewed compatibility fallback.${NC}" >&2
+			printf '%s\n' "${FALLBACK_SUITE}"
+			return 0
+			;;
+		1)
+			echo -e "${RED}ERROR: Neither the native '${NATIVE_SUITE}' suite nor its reviewed '${FALLBACK_SUITE}' fallback is available in the Amnezia PPA.${NC}" >&2
+			;;
+		2)
+			echo -e "${RED}ERROR: The native '${NATIVE_SUITE}' suite is unavailable, but the '${FALLBACK_SUITE}' fallback could not be verified because of a network or server error.${NC}" >&2
+			echo -e "${ORANGE}No cross-release fallback was applied.${NC}" >&2
+			;;
+	esac
+	return 1
+}
+
+# Transform one legacy .list file. Only active deb/deb-src lines whose URI
+# token is exactly the Amnezia PPA are considered. Exit codes: 0 matched,
+# 3 no match, 4 malformed matching entry.
+function _transformAmneziaPpaLegacyFile() {
+	local FILE="$1"
+	local MODE="$2"
+	local SUITE="${3:-}"
+	local ARCHITECTURE="${4:-}"
+
+	awk -v mode="${MODE}" -v replacement="${SUITE}" \
+		-v target="${AMNEZIA_PPA_URI}" -v host_arch="${ARCHITECTURE}" '
+	function is_target_uri(uri, normalized, http_target) {
+		normalized=uri
+		sub(/\/+$/, "", normalized)
+		http_target=target
+		sub(/^https:/, "http:", http_target)
+		return normalized == target || normalized == http_target
+	}
+	function contains_target_literal(value, http_target) {
+		http_target=target
+		sub(/^https:/, "http:", http_target)
+		return index(value, target) > 0 || index(value, http_target) > 0
+	}
+	function dequote_token(value, first, last) {
+		first=substr(value, 1, 1)
+		last=substr(value, length(value), 1)
+		if (length(value) >= 2 && first == "\"" && last == "\"") {
+			return substr(value, 2, length(value) - 2)
+		}
+		return value
+	}
+	function has_unsupported_quote(value, first, last) {
+		first=substr(value, 1, 1)
+		last=substr(value, length(value), 1)
+		return (first == "\"" && last != "\"") ||
+			first == "\047" || last == "\047"
+	}
+	function hex_value(character) {
+		return index("0123456789abcdef", tolower(character)) - 1
+	}
+	function percent_decode(value, result, i, character, high, low) {
+		result=""
+		for (i=1; i<=length(value); i++) {
+			character=substr(value, i, 1)
+			if (character == "%" && i + 2 <= length(value)) {
+				high=hex_value(substr(value, i + 1, 1))
+				low=hex_value(substr(value, i + 2, 1))
+				if (high >= 0 && low >= 0) {
+					result=result sprintf("%c", high * 16 + low)
+					i += 2
+					continue
+				}
+			}
+			result=result character
+		}
+		return result
+	}
+	function apt_comment_position(value, i, character, in_options) {
+		in_options=0
+		for (i=1; i<=length(value); i++) {
+			character=substr(value, i, 1)
+			if (character == "[") {
+				in_options=1
+			} else if (character == "]") {
+				in_options=0
+			} else if (character == "#" && !in_options) {
+				return i
+			}
+		}
+		return 0
+	}
+	function emit_line(value) {
+		if (mode != "count") {
+			print value
+		}
+	}
+	function csv_contains(value, wanted, count, values, i) {
+		count=split(value, values, ",")
+		for (i=1; i<=count; i++) {
+			if (values[i] == wanted) {
+				for (i=1; i<=count; i++) delete values[i]
+				return 1
+			}
+		}
+		for (i=1; i<=count; i++) delete values[i]
+		return 0
+	}
+	function options_are_safe(value, count, options, i, option, option_value, arch_value) {
+		# APT applies a quote-word lexer to option tokens. Reject quoted option
+		# text instead of attempting a partial reimplementation that could miss
+		# a quoted signature-bypass key.
+		if (index(value, "\"") > 0 || index(value, "\047") > 0 ||
+			index(value, "\\") > 0 || index(value, "%") > 0) {
+			return 0
+		}
+		count=split(value, options, /[[:space:]]+/)
+		for (i=1; i<=count; i++) {
+			option=tolower(options[i])
+			if (option ~ /^(trusted|allow-insecure|allow-weak|allow-downgrade-to-insecure)$/) {
+				for (i=1; i<=count; i++) delete options[i]
+				return 0
+			}
+			if (option ~ /^(trusted|allow-insecure|allow-weak|allow-downgrade-to-insecure)=/) {
+				option_value=substr(option, index(option, "=") + 1)
+				if (option_value !~ /^(0|no|false|off|disable|without)$/) {
+					for (i=1; i<=count; i++) delete options[i]
+					return 0
+				}
+			}
+			if (option ~ /^arch=/) {
+				arch_value=substr(option, 6)
+				if (host_arch == "" || !csv_contains(arch_value, host_arch)) {
+					for (i=1; i<=count; i++) delete options[i]
+					return 0
+				}
+			}
+			if (option ~ /^arch[-+]=/) {
+				# Avoid guessing how additive/subtractive filters interact with
+				# the host architecture in an administrator-authored entry.
+				for (i=1; i<=count; i++) delete options[i]
+				return 0
+			}
+		}
+		for (i=1; i<=count; i++) delete options[i]
+		return 1
+	}
+	BEGIN {
+		found=0
+		binary_found=0
+		source_found=0
+		malformed=0
+	}
+	{
+		line=$0
+		comment_position=apt_comment_position(line)
+		if (comment_position > 0) {
+			length_line=comment_position - 1
+		} else {
+			length_line=length(line)
+		}
+		position=1
+		while (position <= length_line && substr(line, position, 1) ~ /[[:space:]]/) {
+			position++
+		}
+
+		type_start=position
+		while (position <= length_line && substr(line, position, 1) !~ /[[:space:]]/) {
+			position++
+		}
+		entry_type=substr(line, type_start, position - type_start)
+		if (entry_type != "deb" && entry_type != "deb-src") {
+			emit_line(line)
+			next
+		}
+
+		while (position <= length_line && substr(line, position, 1) ~ /[[:space:]]/) {
+			position++
+		}
+		options=""
+		if (substr(line, position, 1) == "[") {
+			close_offset=index(substr(line, position), "]")
+			if (close_offset == 0) {
+				if (contains_target_literal(substr(line, 1, length_line))) {
+					malformed=1
+				}
+				emit_line(line)
+				next
+			}
+			options=substr(line, position + 1, close_offset - 2)
+			position += close_offset
+			while (position <= length_line && substr(line, position, 1) ~ /[[:space:]]/) {
+				position++
+			}
+		}
+
+		uri_start=position
+		while (position <= length_line && substr(line, position, 1) !~ /[[:space:]]/) {
+			position++
+		}
+		raw_uri=substr(line, uri_start, position - uri_start)
+		decoded_uri_token=percent_decode(raw_uri)
+		uri=dequote_token(decoded_uri_token)
+		if (!is_target_uri(uri)) {
+			if (has_unsupported_quote(raw_uri) && contains_target_literal(decoded_uri_token)) {
+				malformed=1
+			}
+			emit_line(line)
+			next
+		}
+
+		found++
+		if (mode == "remove") {
+			next
+		}
+		if (!options_are_safe(options)) {
+			malformed=1
+			emit_line(line)
+			next
+		}
+
+		while (position <= length_line && substr(line, position, 1) ~ /[[:space:]]/) {
+			position++
+		}
+		suite_start=position
+		while (position <= length_line && substr(line, position, 1) !~ /[[:space:]]/) {
+			position++
+		}
+		if (suite_start > length_line) {
+			malformed=1
+			emit_line(line)
+			next
+		}
+		suite_end=position - 1
+		suite_value=substr(line, suite_start, suite_end - suite_start + 1)
+		if (suite_value !~ /^[a-z0-9][a-z0-9-]*$/) {
+			malformed=1
+			emit_line(line)
+			next
+		}
+
+		while (position <= length_line && substr(line, position, 1) ~ /[[:space:]]/) {
+			position++
+		}
+		component_start=position
+		while (position <= length_line && substr(line, position, 1) !~ /[[:space:]]/) {
+			position++
+		}
+		component=substr(line, component_start, position - component_start)
+		if (component != "main") {
+			malformed=1
+			emit_line(line)
+			next
+		}
+		while (position <= length_line && substr(line, position, 1) ~ /[[:space:]]/) {
+			position++
+		}
+		if (position <= length_line && substr(line, position, 1) != "#") {
+			malformed=1
+			emit_line(line)
+			next
+		}
+
+		if (entry_type == "deb") {
+			binary_found++
+		} else {
+			source_found++
+		}
+
+		if (mode == "set" && suite_value != replacement) {
+			line=substr(line, 1, suite_start - 1) replacement substr(line, suite_end + 1)
+		}
+		emit_line(line)
+	}
+	END {
+		if (mode == "count") {
+			print found, binary_found, source_found
+		}
+		if (malformed) {
+			exit 4
+		}
+		if (!found) {
+			exit 3
+		}
+		if (mode != "remove" && !binary_found) {
+			exit 5
+		}
+	}
+	' "${FILE}"
+}
+
+# Transform one DEB822 .sources file stanza-by-stanza. A matching stanza must
+# contain the Amnezia PPA as its sole URI; mixed-URI stanzas are rejected so an
+# unrelated repository can never inherit the fallback suite.
+function _transformAmneziaPpaDeb822File() {
+	local FILE="$1"
+	local MODE="$2"
+	local SUITE="${3:-}"
+	local ARCHITECTURE="${4:-}"
+
+	awk -v mode="${MODE}" -v replacement="${SUITE}" \
+		-v target="${AMNEZIA_PPA_URI}" -v host_arch="${ARCHITECTURE}" '
+	function trim(value) {
+		gsub(/^[[:space:]]+/, "", value)
+		gsub(/[[:space:]]+$/, "", value)
+		return value
+	}
+	function is_target_uri(uri, normalized, http_target) {
+		normalized=uri
+		sub(/\/+$/, "", normalized)
+		http_target=target
+		sub(/^https:/, "http:", http_target)
+		return normalized == target || normalized == http_target
+	}
+	function token_list_contains(value, wanted, count, tokens, i, result) {
+		result=0
+		count=split(trim(value), tokens, /[[:space:]]+/)
+		for (i=1; i<=count; i++) {
+			if (tokens[i] == wanted) {
+				result=1
+			}
+			delete tokens[i]
+		}
+		return result
+	}
+	function is_explicit_false(value, normalized) {
+		normalized=tolower(trim(value))
+		return normalized ~ /^(0|no|false|off|disable|without)$/
+	}
+	function is_explicit_true(value, normalized) {
+		normalized=tolower(trim(value))
+		return normalized ~ /^(1|yes|true|on|enable|with)$/
+	}
+	function clear_stanza( i) {
+		for (i=1; i<=line_count; i++) {
+			delete lines[i]
+			delete suite_continuation_lines[i]
+			delete skip_lines[i]
+		}
+		line_count=0
+	}
+	function emit_stanza( i) {
+		if (mode != "count") {
+			for (i=1; i<=line_count; i++) {
+				if (!skip_lines[i]) {
+					print lines[i]
+				}
+			}
+		}
+	}
+	function process_stanza( i, line, colon, field, value, current_field,
+			uri_value, type_value, suite_value, component_value, enabled_value,
+			trusted_value, allow_insecure_value, allow_weak_value,
+			allow_downgrade_value, architecture_value,
+			uri_fields, type_fields, suite_fields, component_fields,
+			enabled_fields, trusted_fields, allow_insecure_fields,
+			allow_weak_fields, allow_downgrade_fields, architecture_fields,
+			architecture_remove_fields, suite_line, syntax_error,
+			uri_count, target_count, type_count, type_has_deb,
+			type_has_deb_src, type_valid,
+			suite_count, suite_valid, component_count, component_valid,
+			start, finish) {
+		if (line_count == 0) {
+			return
+		}
+
+		current_field=""
+		uri_value=""
+		type_value=""
+		suite_value=""
+		component_value=""
+		enabled_value=""
+		trusted_value=""
+		allow_insecure_value=""
+		allow_weak_value=""
+		allow_downgrade_value=""
+		architecture_value=""
+		uri_fields=0
+		type_fields=0
+		suite_fields=0
+		component_fields=0
+		enabled_fields=0
+		trusted_fields=0
+		allow_insecure_fields=0
+		allow_weak_fields=0
+		allow_downgrade_fields=0
+		architecture_fields=0
+		architecture_remove_fields=0
+		suite_line=0
+		syntax_error=0
+
+		for (i=1; i<=line_count; i++) {
+			line=lines[i]
+			if (line ~ /^#/) {
+				continue
+			}
+			if (line ~ /^[A-Za-z0-9-]+:/) {
+				colon=index(line, ":")
+				field=tolower(substr(line, 1, colon - 1))
+				value=trim(substr(line, colon + 1))
+				current_field=field
+				if (field == "uris") {
+					uri_fields++
+					uri_value=(uri_value == "" ? value : uri_value " " value)
+				} else if (field == "types") {
+					type_fields++
+					type_value=(type_value == "" ? value : type_value " " value)
+				} else if (field == "suites") {
+					suite_fields++
+					suite_line=i
+					suite_value=(suite_value == "" ? value : suite_value " " value)
+				} else if (field == "components") {
+					component_fields++
+					component_value=(component_value == "" ? value : component_value " " value)
+				} else if (field == "enabled") {
+					enabled_fields++
+					enabled_value=(enabled_value == "" ? value : enabled_value " " value)
+				} else if (field == "trusted") {
+					trusted_fields++
+					trusted_value=(trusted_value == "" ? value : trusted_value " " value)
+				} else if (field == "allow-insecure") {
+					allow_insecure_fields++
+					allow_insecure_value=(allow_insecure_value == "" ? value : allow_insecure_value " " value)
+				} else if (field == "allow-weak") {
+					allow_weak_fields++
+					allow_weak_value=(allow_weak_value == "" ? value : allow_weak_value " " value)
+				} else if (field == "allow-downgrade-to-insecure") {
+					allow_downgrade_fields++
+					allow_downgrade_value=(allow_downgrade_value == "" ? value : allow_downgrade_value " " value)
+				} else if (field == "architectures") {
+					architecture_fields++
+					architecture_value=(architecture_value == "" ? value : architecture_value " " value)
+				} else if (field == "architectures-remove") {
+					architecture_remove_fields++
+				}
+				continue
+			}
+			if (line ~ /^[[:space:]]+/) {
+				value=trim(line)
+				if (current_field == "") {
+					syntax_error=1
+				} else if (current_field == "uris") {
+					uri_value=uri_value " " value
+				} else if (current_field == "types") {
+					type_value=type_value " " value
+				} else if (current_field == "suites") {
+					suite_value=suite_value " " value
+					suite_continuation_lines[i]=1
+				} else if (current_field == "components") {
+					component_value=component_value " " value
+				} else if (current_field == "enabled") {
+					enabled_value=enabled_value " " value
+				} else if (current_field == "trusted") {
+					trusted_value=trusted_value " " value
+				} else if (current_field == "allow-insecure") {
+					allow_insecure_value=allow_insecure_value " " value
+				} else if (current_field == "allow-weak") {
+					allow_weak_value=allow_weak_value " " value
+				} else if (current_field == "allow-downgrade-to-insecure") {
+					allow_downgrade_value=allow_downgrade_value " " value
+				} else if (current_field == "architectures") {
+					architecture_value=architecture_value " " value
+				}
+			} else {
+				syntax_error=1
+				current_field=""
+			}
+		}
+
+		uri_count=split(trim(uri_value), uri_tokens, /[[:space:]]+/)
+		target_count=0
+		for (i=1; i<=uri_count; i++) {
+			if (is_target_uri(uri_tokens[i])) {
+				target_count++
+			}
+			delete uri_tokens[i]
+		}
+		if (target_count == 0) {
+			emit_stanza()
+			clear_stanza()
+			return
+		}
+
+		found++
+		if (uri_fields != 1 || uri_count != 1 || target_count != 1) {
+			malformed=1
+			emit_stanza()
+			clear_stanza()
+			return
+		}
+
+		if (mode == "remove") {
+			# Preserve comments even when removing the repository stanza.
+			if (mode != "count") {
+				for (i=1; i<=line_count; i++) {
+					if (lines[i] ~ /^#/) {
+						print lines[i]
+					}
+				}
+			}
+			clear_stanza()
+			return
+		}
+
+		type_count=split(trim(type_value), type_tokens, /[[:space:]]+/)
+		type_has_deb=0
+		type_has_deb_src=0
+		type_valid=(type_count > 0)
+		for (i=1; i<=type_count; i++) {
+			if (type_tokens[i] == "deb") {
+				type_has_deb=1
+			} else if (type_tokens[i] == "deb-src") {
+				type_has_deb_src=1
+			} else {
+				type_valid=0
+			}
+			delete type_tokens[i]
+		}
+
+		suite_count=split(trim(suite_value), suite_tokens, /[[:space:]]+/)
+		suite_valid=(suite_count > 0)
+		for (i=1; i<=suite_count; i++) {
+			if (suite_tokens[i] !~ /^[a-z0-9][a-z0-9-]*$/) {
+				suite_valid=0
+			}
+			delete suite_tokens[i]
+		}
+
+		component_count=split(trim(component_value), component_tokens, /[[:space:]]+/)
+		component_valid=(component_count == 1 && component_tokens[1] == "main")
+		for (i=1; i<=component_count; i++) {
+			delete component_tokens[i]
+		}
+
+		if (syntax_error || type_fields != 1 || !type_valid ||
+				suite_fields != 1 || !suite_valid || component_fields != 1 ||
+				!component_valid || enabled_fields > 1 ||
+				(enabled_fields == 1 && !is_explicit_true(enabled_value)) ||
+				trusted_fields > 1 ||
+				(trusted_fields == 1 && !is_explicit_false(trusted_value)) ||
+				allow_insecure_fields > 1 ||
+				(allow_insecure_fields == 1 && !is_explicit_false(allow_insecure_value)) ||
+				allow_weak_fields > 1 ||
+				(allow_weak_fields == 1 && !is_explicit_false(allow_weak_value)) ||
+				allow_downgrade_fields > 1 ||
+				(allow_downgrade_fields == 1 && !is_explicit_false(allow_downgrade_value)) ||
+				architecture_fields > 1 ||
+				(architecture_fields == 1 &&
+					(host_arch == "" || !token_list_contains(architecture_value, host_arch))) ||
+				architecture_remove_fields > 0) {
+			malformed=1
+			emit_stanza()
+			clear_stanza()
+			return
+		}
+
+		if (type_has_deb) {
+			binary_found++
+		}
+		if (type_has_deb_src) {
+			source_found++
+		}
+
+		if (mode == "set" && trim(suite_value) != replacement) {
+			line=lines[suite_line]
+			start=index(line, ":") + 1
+			while (start <= length(line) && substr(line, start, 1) ~ /[[:space:]]/) {
+				start++
+			}
+			finish=length(line) + 1
+			while (finish > start && substr(line, finish - 1, 1) ~ /[[:space:]]/) {
+				finish--
+			}
+			lines[suite_line]=substr(line, 1, start - 1) replacement substr(line, finish)
+			for (i=1; i<=line_count; i++) {
+				if (suite_continuation_lines[i]) {
+					skip_lines[i]=1
+				}
+			}
+		}
+		emit_stanza()
+		clear_stanza()
+	}
+	BEGIN {
+		line_count=0
+		found=0
+		binary_found=0
+		source_found=0
+		malformed=0
+	}
+	{
+		if ($0 ~ /^[[:space:]]*$/) {
+			process_stanza()
+			if (mode != "count") {
+				print $0
+			}
+		} else {
+			lines[++line_count]=$0
+		}
+	}
+	END {
+		process_stanza()
+		if (mode == "count") {
+			print found, binary_found, source_found
+		}
+		if (malformed) {
+			exit 4
+		}
+		if (!found) {
+			exit 3
+		}
+		if (mode != "remove" && !binary_found) {
+			exit 5
+		}
+	}
+	' "${FILE}"
+}
+
+function _transformAmneziaPpaSourceFile() {
+	local FILE="$1"
+	local MODE="$2"
+	local SUITE="${3:-}"
+	local ARCHITECTURE="${4:-}"
+	case "${FILE}" in
+		*.sources) _transformAmneziaPpaDeb822File "${FILE}" "${MODE}" "${SUITE}" "${ARCHITECTURE}" ;;
+		*.list) _transformAmneziaPpaLegacyFile "${FILE}" "${MODE}" "${SUITE}" "${ARCHITECTURE}" ;;
+		*) return 3 ;;
+	esac
+}
+
+function isValidAptSourceFilename() {
+	local BASENAME="${1##*/}"
+	[[ "${BASENAME}" =~ ^[A-Za-z0-9_.-]+\.(list|sources)$ ]]
+}
+
+function _preserveAptSourceFinalNewline() {
+	local SOURCE_FILE="$1"
+	local TRANSFORMED_FILE="$2"
+	local FINAL_BYTE_LINE_COUNT
+
+	[[ -s "${SOURCE_FILE}" && -s "${TRANSFORMED_FILE}" ]] || return 0
+	FINAL_BYTE_LINE_COUNT=$(tail -c 1 -- "${SOURCE_FILE}" | wc -l) || return 1
+	if [[ "${FINAL_BYTE_LINE_COUNT}" -eq 0 ]]; then
+		truncate -s -1 -- "${TRANSFORMED_FILE}"
+	fi
+}
+
+# Return 0 when exactly one usable binary entry exists, 1 when absent, and 2
+# when target content is duplicated, unusable, malformed, or unsafe to rewrite.
+function amneziaPpaSourceEntriesExist() {
+	local SOURCES_DIR="${1:-${AMNEZIA_PPA_SOURCES_DIR}}"
+	local ARCHITECTURE="${2:-}"
+	local FILE
+	local RC
+	local ENTRY_COUNTS
+	local FILE_TARGET_COUNT
+	local FILE_BINARY_COUNT
+	local FILE_SOURCE_COUNT
+	local TARGET_COUNT=0
+	local BINARY_COUNT=0
+	local SOURCE_COUNT=0
+
+	[[ -d "${SOURCES_DIR}" ]] || return 1
+	if [[ -z "${ARCHITECTURE}" ]]; then
+		ARCHITECTURE=$(dpkg --print-architecture 2>/dev/null) || return 2
+	fi
+
+	for FILE in "${SOURCES_DIR}"/*.sources "${SOURCES_DIR}"/*.list; do
+		[[ -e "${FILE}" || -L "${FILE}" ]] || continue
+		isValidAptSourceFilename "${FILE}" || continue
+		if ENTRY_COUNTS=$(_transformAmneziaPpaSourceFile \
+			"${FILE}" "count" "" "${ARCHITECTURE}"); then
+			RC=0
+		else
+			RC=$?
+		fi
+		case "${RC}" in
+			0 | 5)
+				if [[ -L "${FILE}" ]]; then
+					echo -e "${RED}ERROR: Refusing to modify Amnezia PPA source through symlink: ${FILE}${NC}" >&2
+					return 2
+				fi
+				read -r FILE_TARGET_COUNT FILE_BINARY_COUNT FILE_SOURCE_COUNT <<< "${ENTRY_COUNTS}"
+				if ! [[ "${FILE_TARGET_COUNT}" =~ ^[0-9]+$ &&
+					"${FILE_BINARY_COUNT}" =~ ^[0-9]+$ &&
+					"${FILE_SOURCE_COUNT}" =~ ^[0-9]+$ ]]; then
+					return 2
+				fi
+				TARGET_COUNT=$((TARGET_COUNT + FILE_TARGET_COUNT))
+				BINARY_COUNT=$((BINARY_COUNT + FILE_BINARY_COUNT))
+				SOURCE_COUNT=$((SOURCE_COUNT + FILE_SOURCE_COUNT))
+				;;
+			3) ;;
+			*)
+				echo -e "${RED}ERROR: Unusable, insecure, malformed, or ambiguous Amnezia PPA source entry in ${FILE}.${NC}" >&2
+				return 2
+				;;
+		esac
+	done
+
+	if [[ "${TARGET_COUNT}" -eq 0 ]]; then
+		return 1
+	fi
+	if [[ "${BINARY_COUNT}" -eq 0 ]]; then
+		echo -e "${RED}ERROR: Existing Amnezia PPA source content has no active binary ('deb') entry for architecture '${ARCHITECTURE}'.${NC}" >&2
+		return 2
+	fi
+	if [[ "${BINARY_COUNT}" -gt 1 ]]; then
+		echo -e "${RED}ERROR: Multiple active Amnezia PPA binary entries were found. Remove the duplicate entries before continuing.${NC}" >&2
+		return 2
+	fi
+	if [[ "${SOURCE_COUNT}" -gt 1 ]]; then
+		echo -e "${RED}ERROR: Multiple active Amnezia PPA source-package entries were found. Remove the duplicate entries before continuing.${NC}" >&2
+		return 2
+	fi
+	return 0
+}
+
+# Set the suite of each exact Amnezia PPA entry, replacing each affected file
+# atomically. Unrelated files, stanzas, fields, comments, options, and inline
+# signing keys are preserved. Return 2 when no target entry exists.
+function setAmneziaPpaSuite() {
+	local SUITE="$1"
+	local SOURCES_DIR="${2:-${AMNEZIA_PPA_SOURCES_DIR}}"
+	local ARCHITECTURE="${3:-}"
+	local FILE
+	local TMP_FILE
+	local RC
+	local INDEX
+	local ROLLBACK_INDEX
+	local FAILED_INDEX=-1
+	local ROLLBACK_FAILED=0
+	local ENTRY_COUNTS
+	local FILE_TARGET_COUNT
+	local FILE_BINARY_COUNT
+	local FILE_SOURCE_COUNT
+	local FILE_CHECKSUM
+	local BACKUP_FILE
+	local TARGET_COUNT=0
+	local BINARY_COUNT=0
+	local SOURCE_COUNT=0
+	local -a TARGET_FILES=()
+	local -a TEMP_FILES=()
+	local -a SOURCE_CHECKSUMS=()
+	local -a BACKUP_FILES=()
+	local -a CHANGED_FLAGS=()
+
+	if ! [[ "${SUITE}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+		echo -e "${RED}ERROR: Invalid Amnezia PPA suite '${SUITE}'.${NC}" >&2
+		return 1
+	fi
+	[[ -d "${SOURCES_DIR}" ]] || return 2
+	if [[ -z "${ARCHITECTURE}" ]]; then
+		ARCHITECTURE=$(dpkg --print-architecture 2>/dev/null) || return 1
+	fi
+
+	# Validate all matching content before creating any staged replacements.
+	for FILE in "${SOURCES_DIR}"/*.sources "${SOURCES_DIR}"/*.list; do
+		[[ -e "${FILE}" || -L "${FILE}" ]] || continue
+		isValidAptSourceFilename "${FILE}" || continue
+		if ENTRY_COUNTS=$(_transformAmneziaPpaSourceFile \
+			"${FILE}" "count" "" "${ARCHITECTURE}"); then
+			RC=0
+		else
+			RC=$?
+		fi
+		case "${RC}" in
+			0 | 5)
+				if [[ -L "${FILE}" ]]; then
+					echo -e "${RED}ERROR: Refusing to modify Amnezia PPA source through symlink: ${FILE}${NC}" >&2
+					return 1
+				fi
+				read -r FILE_TARGET_COUNT FILE_BINARY_COUNT FILE_SOURCE_COUNT <<< "${ENTRY_COUNTS}"
+				if ! [[ "${FILE_TARGET_COUNT}" =~ ^[0-9]+$ &&
+					"${FILE_BINARY_COUNT}" =~ ^[0-9]+$ &&
+					"${FILE_SOURCE_COUNT}" =~ ^[0-9]+$ ]]; then
+					return 1
+				fi
+				TARGET_COUNT=$((TARGET_COUNT + FILE_TARGET_COUNT))
+				BINARY_COUNT=$((BINARY_COUNT + FILE_BINARY_COUNT))
+				SOURCE_COUNT=$((SOURCE_COUNT + FILE_SOURCE_COUNT))
+				FILE_CHECKSUM=$(cksum -- "${FILE}") || return 1
+				TARGET_FILES+=("${FILE}")
+				SOURCE_CHECKSUMS+=("${FILE_CHECKSUM}")
+				;;
+			3) ;;
+			*)
+				echo -e "${RED}ERROR: Unusable, insecure, malformed, or ambiguous Amnezia PPA source entry in ${FILE}.${NC}" >&2
+				return 1
+				;;
+		esac
+	done
+
+	if [[ "${TARGET_COUNT}" -eq 0 ]]; then
+		return 2
+	fi
+	if [[ "${BINARY_COUNT}" -eq 0 ]]; then
+		echo -e "${RED}ERROR: Existing Amnezia PPA source content has no active binary ('deb') entry for architecture '${ARCHITECTURE}'.${NC}" >&2
+		return 1
+	fi
+	if [[ "${BINARY_COUNT}" -gt 1 ]]; then
+		echo -e "${RED}ERROR: Multiple active Amnezia PPA binary entries were found. Remove the duplicate entries before continuing.${NC}" >&2
+		return 1
+	fi
+	if [[ "${SOURCE_COUNT}" -gt 1 ]]; then
+		echo -e "${RED}ERROR: Multiple active Amnezia PPA source-package entries were found. Remove the duplicate entries before continuing.${NC}" >&2
+		return 1
+	fi
+
+	for FILE in "${TARGET_FILES[@]}"; do
+		if [[ -L "${FILE}" || ! -f "${FILE}" ]]; then
+			echo -e "${RED}ERROR: Amnezia PPA source changed while it was being validated: ${FILE}${NC}" >&2
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			return 1
+		fi
+		TMP_FILE=$(mktemp "${FILE}.amneziawg.XXXXXX") || {
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			return 1
+		}
+		if ! cp --preserve=all -- "${FILE}" "${TMP_FILE}"; then
+			rm -f "${TMP_FILE}"
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			return 1
+		fi
+		if _transformAmneziaPpaSourceFile \
+			"${FILE}" "set" "${SUITE}" "${ARCHITECTURE}" > "${TMP_FILE}"; then
+			RC=0
+		else
+			RC=$?
+		fi
+		case "${RC}" in
+			0 | 5)
+				if ! _preserveAptSourceFinalNewline "${FILE}" "${TMP_FILE}"; then
+					rm -f "${TMP_FILE}"
+					for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+					return 1
+				fi
+				TEMP_FILES+=("${TMP_FILE}")
+				;;
+			*)
+				rm -f "${TMP_FILE}"
+				for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+				echo -e "${RED}ERROR: Amnezia PPA source changed while it was being rewritten: ${FILE}${NC}" >&2
+				return 1
+				;;
+		esac
+	done
+
+	# Recheck every source after staging so a concurrent administrator edit is
+	# never overwritten. Backups let a later per-file rename failure roll back
+	# earlier files in the same reconciliation.
+	for INDEX in "${!TARGET_FILES[@]}"; do
+		if [[ -L "${TARGET_FILES[INDEX]}" || ! -f "${TARGET_FILES[INDEX]}" ]] ||
+			[[ "$(cksum -- "${TARGET_FILES[INDEX]}")" != "${SOURCE_CHECKSUMS[INDEX]}" ]]; then
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			for BACKUP_FILE in "${BACKUP_FILES[@]}"; do rm -f "${BACKUP_FILE}"; done
+			echo -e "${RED}ERROR: Amnezia PPA source changed while replacements were being staged: ${TARGET_FILES[INDEX]}${NC}" >&2
+			return 1
+		fi
+		BACKUP_FILE=$(mktemp "${TARGET_FILES[INDEX]}.amneziawg-backup.XXXXXX") || {
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			for BACKUP_FILE in "${BACKUP_FILES[@]}"; do rm -f "${BACKUP_FILE}"; done
+			return 1
+		}
+		if ! cp --preserve=all -- "${TARGET_FILES[INDEX]}" "${BACKUP_FILE}"; then
+			rm -f "${BACKUP_FILE}"
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			for BACKUP_FILE in "${BACKUP_FILES[@]}"; do rm -f "${BACKUP_FILE}"; done
+			return 1
+		fi
+		BACKUP_FILES+=("${BACKUP_FILE}")
+		if cmp -s "${TARGET_FILES[INDEX]}" "${TEMP_FILES[INDEX]}"; then
+			CHANGED_FLAGS+=("0")
+		else
+			CHANGED_FLAGS+=("1")
+		fi
+	done
+
+	for INDEX in "${!TARGET_FILES[@]}"; do
+		if [[ -L "${TARGET_FILES[INDEX]}" || ! -f "${TARGET_FILES[INDEX]}" ]] ||
+			[[ "$(cksum -- "${TARGET_FILES[INDEX]}")" != "${SOURCE_CHECKSUMS[INDEX]}" ]]; then
+			FAILED_INDEX="${INDEX}"
+			break
+		fi
+		if [[ "${CHANGED_FLAGS[INDEX]}" -eq 0 ]]; then
+			rm -f "${TEMP_FILES[INDEX]}"
+		elif ! mv -f "${TEMP_FILES[INDEX]}" "${TARGET_FILES[INDEX]}"; then
+			FAILED_INDEX="${INDEX}"
+			break
+		fi
+	done
+	if [[ "${FAILED_INDEX}" -ge 0 ]]; then
+		for ((ROLLBACK_INDEX=0; ROLLBACK_INDEX<FAILED_INDEX; ROLLBACK_INDEX++)); do
+			if [[ "${CHANGED_FLAGS[ROLLBACK_INDEX]}" -eq 1 ]] &&
+				! mv -f "${BACKUP_FILES[ROLLBACK_INDEX]}" "${TARGET_FILES[ROLLBACK_INDEX]}"; then
+				ROLLBACK_FAILED=1
+			fi
+		done
+		for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+		for BACKUP_FILE in "${BACKUP_FILES[@]}"; do rm -f "${BACKUP_FILE}"; done
+		if [[ "${ROLLBACK_FAILED}" -eq 1 ]]; then
+			echo -e "${RED}ERROR: Failed to roll back every PPA source after a replacement error. Review ${SOURCES_DIR}.${NC}" >&2
+		fi
+		return 1
+	fi
+	for BACKUP_FILE in "${BACKUP_FILES[@]}"; do rm -f "${BACKUP_FILE}"; done
+	return 0
+}
+
+# Remove only exact Amnezia PPA entries, regardless of their suite or filename.
+# Empty source files are deleted; files retaining comments or unrelated entries
+# remain in place. This is idempotent and is also used for failed-add cleanup.
+function removeAmneziaPpaSourceEntries() {
+	local SOURCES_DIR="${1:-${AMNEZIA_PPA_SOURCES_DIR}}"
+	local FILE
+	local TMP_FILE
+	local RC
+	local INDEX
+	local ROLLBACK_INDEX
+	local FAILED_INDEX=-1
+	local ROLLBACK_FAILED=0
+	local FILE_CHECKSUM
+	local BACKUP_FILE
+	local -a TARGET_FILES=()
+	local -a TEMP_FILES=()
+	local -a SOURCE_CHECKSUMS=()
+	local -a BACKUP_FILES=()
+
+	[[ -d "${SOURCES_DIR}" ]] || return 0
+
+	# Validate every prospective removal before staging any file. In particular,
+	# mixed-URI DEB822 stanzas and symlinks are never partially processed.
+	for FILE in "${SOURCES_DIR}"/*.sources "${SOURCES_DIR}"/*.list; do
+		[[ -e "${FILE}" || -L "${FILE}" ]] || continue
+		isValidAptSourceFilename "${FILE}" || continue
+		if _transformAmneziaPpaSourceFile "${FILE}" "remove" >/dev/null; then
+			RC=0
+		else
+			RC=$?
+		fi
+		case "${RC}" in
+			0)
+				if [[ -L "${FILE}" ]]; then
+					echo -e "${RED}ERROR: Refusing to modify Amnezia PPA source through symlink: ${FILE}${NC}" >&2
+					return 1
+				fi
+				FILE_CHECKSUM=$(cksum -- "${FILE}") || return 1
+				TARGET_FILES+=("${FILE}")
+				SOURCE_CHECKSUMS+=("${FILE_CHECKSUM}")
+				;;
+			3) ;;
+			*)
+				echo -e "${RED}ERROR: Malformed or ambiguous Amnezia PPA source entry in ${FILE}.${NC}" >&2
+				return 1
+				;;
+		esac
+	done
+
+	for FILE in "${TARGET_FILES[@]}"; do
+		if [[ -L "${FILE}" || ! -f "${FILE}" ]]; then
+			echo -e "${RED}ERROR: Amnezia PPA source changed while it was being validated: ${FILE}${NC}" >&2
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			return 1
+		fi
+		TMP_FILE=$(mktemp "${FILE}.amneziawg.XXXXXX") || {
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			return 1
+		}
+		if ! cp --preserve=all -- "${FILE}" "${TMP_FILE}"; then
+			rm -f "${TMP_FILE}"
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			return 1
+		fi
+		if _transformAmneziaPpaSourceFile "${FILE}" "remove" > "${TMP_FILE}"; then
+			RC=0
+		else
+			RC=$?
+		fi
+		if [[ "${RC}" -ne 0 ]] ||
+			! _preserveAptSourceFinalNewline "${FILE}" "${TMP_FILE}"; then
+			rm -f "${TMP_FILE}"
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			echo -e "${RED}ERROR: Amnezia PPA source changed while it was being removed: ${FILE}${NC}" >&2
+			return 1
+		fi
+		TEMP_FILES+=("${TMP_FILE}")
+	done
+
+	for INDEX in "${!TARGET_FILES[@]}"; do
+		if [[ -L "${TARGET_FILES[INDEX]}" || ! -f "${TARGET_FILES[INDEX]}" ]] ||
+			[[ "$(cksum -- "${TARGET_FILES[INDEX]}")" != "${SOURCE_CHECKSUMS[INDEX]}" ]]; then
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			for BACKUP_FILE in "${BACKUP_FILES[@]}"; do rm -f "${BACKUP_FILE}"; done
+			echo -e "${RED}ERROR: Amnezia PPA source changed while removals were being staged: ${TARGET_FILES[INDEX]}${NC}" >&2
+			return 1
+		fi
+		BACKUP_FILE=$(mktemp "${TARGET_FILES[INDEX]}.amneziawg-backup.XXXXXX") || {
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			for BACKUP_FILE in "${BACKUP_FILES[@]}"; do rm -f "${BACKUP_FILE}"; done
+			return 1
+		}
+		if ! cp --preserve=all -- "${TARGET_FILES[INDEX]}" "${BACKUP_FILE}"; then
+			rm -f "${BACKUP_FILE}"
+			for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+			for BACKUP_FILE in "${BACKUP_FILES[@]}"; do rm -f "${BACKUP_FILE}"; done
+			return 1
+		fi
+		BACKUP_FILES+=("${BACKUP_FILE}")
+	done
+
+	for INDEX in "${!TARGET_FILES[@]}"; do
+		if [[ -L "${TARGET_FILES[INDEX]}" || ! -f "${TARGET_FILES[INDEX]}" ]] ||
+			[[ "$(cksum -- "${TARGET_FILES[INDEX]}")" != "${SOURCE_CHECKSUMS[INDEX]}" ]]; then
+			FAILED_INDEX="${INDEX}"
+			break
+		fi
+		if grep -q '[^[:space:]]' "${TEMP_FILES[INDEX]}"; then
+			if ! mv -f "${TEMP_FILES[INDEX]}" "${TARGET_FILES[INDEX]}"; then
+				FAILED_INDEX="${INDEX}"
+				break
+			fi
+		else
+			rm -f "${TEMP_FILES[INDEX]}"
+			if ! rm -f -- "${TARGET_FILES[INDEX]}"; then
+				FAILED_INDEX="${INDEX}"
+				break
+			fi
+		fi
+	done
+	if [[ "${FAILED_INDEX}" -ge 0 ]]; then
+		for ((ROLLBACK_INDEX=0; ROLLBACK_INDEX<FAILED_INDEX; ROLLBACK_INDEX++)); do
+			if ! mv -f "${BACKUP_FILES[ROLLBACK_INDEX]}" "${TARGET_FILES[ROLLBACK_INDEX]}"; then
+				ROLLBACK_FAILED=1
+			fi
+		done
+		for TMP_FILE in "${TEMP_FILES[@]}"; do rm -f "${TMP_FILE}"; done
+		for BACKUP_FILE in "${BACKUP_FILES[@]}"; do rm -f "${BACKUP_FILE}"; done
+		if [[ "${ROLLBACK_FAILED}" -eq 1 ]]; then
+			echo -e "${RED}ERROR: Failed to roll back every PPA source after a removal error. Review ${SOURCES_DIR}.${NC}" >&2
+		fi
+		return 1
+	fi
+	for BACKUP_FILE in "${BACKUP_FILES[@]}"; do rm -f "${BACKUP_FILE}"; done
+	return 0
+}
+
+# Add or reconcile the PPA without letting add-apt-repository update APT before
+# a fallback suite can be selected. Existing valid entries are reused, which
+# prevents duplicate stanzas on installer reruns.
+function configureUbuntuAmneziaPpa() {
+	local NATIVE_SUITE="${1:-}"
+	local SOURCES_DIR="${2:-${AMNEZIA_PPA_SOURCES_DIR}}"
+	local ARCHITECTURE="${3:-}"
+	local EXIST_RC
+	local SELECTED_SUITE
+
+	AMNEZIA_PPA_SOURCE_CREATED=0
+	if [[ -z "${NATIVE_SUITE}" ]]; then
+		NATIVE_SUITE=$(getUbuntuPpaCodename) || return 1
+	fi
+	if [[ -z "${ARCHITECTURE}" ]]; then
+		ARCHITECTURE=$(dpkg --print-architecture 2>/dev/null) || {
+			echo -e "${RED}ERROR: Unable to determine the system package architecture.${NC}" >&2
+			return 1
+		}
+	fi
+	SELECTED_SUITE=$(selectAmneziaPpaSuite "${NATIVE_SUITE}" "${ARCHITECTURE}") || return 1
+
+	if amneziaPpaSourceEntriesExist "${SOURCES_DIR}" "${ARCHITECTURE}"; then
+		EXIST_RC=0
+	else
+		EXIST_RC=$?
+	fi
+	case "${EXIST_RC}" in
+		0)
+			if ! setAmneziaPpaSuite "${SELECTED_SUITE}" "${SOURCES_DIR}" "${ARCHITECTURE}"; then
+				echo -e "${RED}ERROR: Failed to reconcile the existing Amnezia PPA source.${NC}" >&2
+				return 1
+			fi
+			;;
+		1)
+			if ! add-apt-repository -y -n ppa:amnezia/ppa; then
+				if ! removeAmneziaPpaSourceEntries "${SOURCES_DIR}"; then
+					echo -e "${ORANGE}WARNING: Failed to clean up a partial Amnezia PPA source after add-apt-repository failed.${NC}" >&2
+				fi
+				echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}" >&2
+				return 1
+			fi
+			if ! setAmneziaPpaSuite "${SELECTED_SUITE}" "${SOURCES_DIR}" "${ARCHITECTURE}"; then
+				if ! removeAmneziaPpaSourceEntries "${SOURCES_DIR}"; then
+					echo -e "${ORANGE}WARNING: Failed to clean up the unusable source created by add-apt-repository.${NC}" >&2
+				fi
+				echo -e "${RED}ERROR: add-apt-repository did not create a usable Amnezia PPA source entry.${NC}" >&2
+				return 1
+			fi
+			AMNEZIA_PPA_SOURCE_CREATED=1
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	return 0
+}
+
+# Roll back only a source entry created by the current configure call. A
+# pre-existing administrator-owned entry is never removed because another
+# repository or a transient network failure made apt-get update fail.
+# Return 0 when removed, 1 on cleanup failure, and 2 when no new entry is owned.
+function cleanupNewlyCreatedUbuntuAmneziaPpa() {
+	local SOURCES_DIR="${1:-${AMNEZIA_PPA_SOURCES_DIR}}"
+
+	[[ "${AMNEZIA_PPA_SOURCE_CREATED}" -eq 1 ]] || return 2
+	if ! removeAmneziaPpaSourceEntries "${SOURCES_DIR}"; then
+		return 1
+	fi
+	AMNEZIA_PPA_SOURCE_CREATED=0
+	return 0
+}
+
+# Best-effort reconciliation for an already-installed server. This rechecks the
+# native suite on every rerun so a temporary fallback automatically stops being
+# used once Launchpad publishes native metadata. Management remains available
+# during network outages.
+function refreshConfiguredUbuntuAmneziaPpa() {
+	local EXIST_RC
+	if amneziaPpaSourceEntriesExist "${AMNEZIA_PPA_SOURCES_DIR}"; then
+		EXIST_RC=0
+	else
+		EXIST_RC=$?
+	fi
+	case "${EXIST_RC}" in
+		0)
+			enable_apt_ipv4
+			if ! configureUbuntuAmneziaPpa "" "${AMNEZIA_PPA_SOURCES_DIR}"; then
+				echo -e "${ORANGE}WARNING: Could not refresh the configured Amnezia PPA suite. Leaving the existing entry unchanged.${NC}" >&2
+			fi
+			disable_apt_ipv4
+			;;
+		1) return 0 ;;
+		*)
+			echo -e "${ORANGE}WARNING: Existing Amnezia PPA source content is malformed; automatic suite refresh was skipped.${NC}" >&2
+			;;
+	esac
+	return 0
 }
 
 # For sensitive files (private keys, params, configs), a restrictive umask (077)
@@ -1995,10 +3291,43 @@ function installAmneziaWG() {
 				chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 			fi
 		fi
+		# Repair a PPA entry left by an older interrupted install before the
+		# initial update; otherwise a stale unsupported suite breaks the rerun.
+		local EXISTING_PPA_RC
+		if amneziaPpaSourceEntriesExist "${AMNEZIA_PPA_SOURCES_DIR}"; then
+			EXISTING_PPA_RC=0
+		else
+			EXISTING_PPA_RC=$?
+		fi
+		if [[ "${EXISTING_PPA_RC}" -eq 0 ]]; then
+			configureUbuntuAmneziaPpa "" "${AMNEZIA_PPA_SOURCES_DIR}" || exit 1
+		elif [[ "${EXISTING_PPA_RC}" -ne 1 ]]; then
+			exit 1
+		fi
+
 		apt-get update || { echo -e "${RED}ERROR: Failed to refresh APT package index.${NC}"; exit 1; }
-		apt install -y software-properties-common || { echo -e "${RED}ERROR: Failed to install software-properties-common.${NC}"; exit 1; }
-		add-apt-repository -y ppa:amnezia/ppa || { echo -e "${RED}ERROR: Failed to add Amnezia PPA.${NC}"; exit 1; }
-		apt-get update || { echo -e "${RED}ERROR: Failed to update APT package index after adding Amnezia PPA.${NC}"; exit 1; }
+		apt install -y software-properties-common curl || { echo -e "${RED}ERROR: Failed to install software-properties-common and curl.${NC}"; exit 1; }
+		configureUbuntuAmneziaPpa "" "${AMNEZIA_PPA_SOURCES_DIR}" || exit 1
+		if ! apt-get -o APT::Update::Error-Mode=any update; then
+			local PPA_CLEANUP_RC
+			if cleanupNewlyCreatedUbuntuAmneziaPpa "${AMNEZIA_PPA_SOURCES_DIR}"; then
+				PPA_CLEANUP_RC=0
+			else
+				PPA_CLEANUP_RC=$?
+			fi
+			case "${PPA_CLEANUP_RC}" in
+				0)
+					echo -e "${RED}ERROR: Failed to update APT package indexes after configuring the Amnezia PPA. The newly created PPA source was removed so future APT operations remain usable.${NC}"
+					;;
+				1)
+					echo -e "${RED}ERROR: Failed to update APT package indexes after configuring the Amnezia PPA, and the newly created source could not be removed safely. Review ${AMNEZIA_PPA_SOURCES_DIR}.${NC}"
+					;;
+				2)
+					echo -e "${RED}ERROR: Failed to update APT package indexes after reconciling the pre-existing Amnezia PPA source. The administrator-owned source was left in place.${NC}"
+					;;
+			esac
+			exit 1
+		fi
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
 		apt install -y dkms iptables nftables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
@@ -3013,6 +4342,22 @@ EOF
 	echo -e "${ORANGE}Distribute the new .conf files to your clients.${NC}"
 }
 
+function removeInstalledAptPackages() {
+	local PACKAGE
+	local PACKAGE_STATUS
+	local -a INSTALLED_PACKAGES=()
+
+	for PACKAGE in "$@"; do
+		if PACKAGE_STATUS=$(dpkg-query -W -f='${db:Status-Abbrev}' "${PACKAGE}" 2>/dev/null) &&
+			[[ "${PACKAGE_STATUS}" == i* ]]; then
+			INSTALLED_PACKAGES+=("${PACKAGE}")
+		fi
+	done
+
+	[[ "${#INSTALLED_PACKAGES[@]}" -gt 0 ]] || return 0
+	apt remove -y "${INSTALLED_PACKAGES[@]}"
+}
+
 function uninstallAmneziaWG() {
 	echo ""
 	echo -e "\n${RED}WARNING: This will uninstall AmneziaWG and remove all the configuration files!${NC}"
@@ -3021,6 +4366,7 @@ function uninstallAmneziaWG() {
 	REMOVE=${REMOVE:-n}
 	if [[ $REMOVE == [yY] ]]; then
 		checkOS
+		local UNINSTALL_FAILED=0
 
 		systemctl stop "awg-quick@${SERVER_AWG_NIC}"
 		systemctl disable "awg-quick@${SERVER_AWG_NIC}"
@@ -3050,26 +4396,34 @@ function uninstallAmneziaWG() {
 		rm -rf "${AMNEZIAWG_DIR:?}"
 
 		if [[ ${OS} == 'ubuntu' ]]; then
-			apt remove -y amneziawg amneziawg-tools
-			enable_apt_ipv4
-			add-apt-repository -ry ppa:amnezia/ppa
-			disable_apt_ipv4
-			# Only remove source files that we created (identified by sentinel comment)
-			if [[ -e /etc/apt/sources.list.d/ubuntu.sources ]]; then
-				if [[ -f /etc/apt/sources.list.d/amneziawg.sources ]] && head -1 /etc/apt/sources.list.d/amneziawg.sources | grep -q '# Managed by amneziawg-install'; then
-					rm -f /etc/apt/sources.list.d/amneziawg.sources
-				elif [[ -f /etc/apt/sources.list.d/amneziawg.sources ]]; then
-					echo -e "${ORANGE}NOTE: /etc/apt/sources.list.d/amneziawg.sources was not created by this installer (missing sentinel). Leaving it in place.${NC}"
-				fi
-			else
-				if [[ -f /etc/apt/sources.list.d/amneziawg.sources.list ]] && head -1 /etc/apt/sources.list.d/amneziawg.sources.list | grep -q '# Managed by amneziawg-install'; then
-					rm -f /etc/apt/sources.list.d/amneziawg.sources.list
-				elif [[ -f /etc/apt/sources.list.d/amneziawg.sources.list ]]; then
-					echo -e "${ORANGE}NOTE: /etc/apt/sources.list.d/amneziawg.sources.list was not created by this installer (missing sentinel). Leaving it in place.${NC}"
-				fi
+			if ! removeInstalledAptPackages amneziawg amneziawg-tools amneziawg-dkms; then
+				echo -e "${RED}ERROR: Failed to remove one or more installed AmneziaWG packages.${NC}"
+				UNINSTALL_FAILED=1
 			fi
+			if ! removeAmneziaPpaSourceEntries "${AMNEZIA_PPA_SOURCES_DIR}"; then
+				echo -e "${ORANGE}WARNING: Could not safely remove every Amnezia PPA source entry. Review ${AMNEZIA_PPA_SOURCES_DIR} manually.${NC}"
+				UNINSTALL_FAILED=1
+			fi
+			# Remove both possible auxiliary deb-src files when owned by this
+			# installer. Systems upgraded between formats can contain both.
+			local MANAGED_SOURCE
+			for MANAGED_SOURCE in \
+				/etc/apt/sources.list.d/amneziawg.sources \
+				/etc/apt/sources.list.d/amneziawg.sources.list; do
+				if [[ -f "${MANAGED_SOURCE}" ]] && head -1 "${MANAGED_SOURCE}" | grep -q '# Managed by amneziawg-install'; then
+					rm -f "${MANAGED_SOURCE}"
+				elif [[ -f "${MANAGED_SOURCE}" ]]; then
+					echo -e "${ORANGE}NOTE: ${MANAGED_SOURCE} was not created by this installer (missing sentinel). Leaving it in place.${NC}"
+				fi
+			done
+			enable_apt_ipv4
+			apt-get update || echo -e "${ORANGE}WARNING: Failed to refresh APT indexes after removing the Amnezia PPA.${NC}"
+			disable_apt_ipv4
 		elif [[ ${OS} == 'debian' ]]; then
-			apt-get remove -y amneziawg amneziawg-tools
+			if ! removeInstalledAptPackages amneziawg amneziawg-tools; then
+				echo -e "${RED}ERROR: Failed to remove one or more installed AmneziaWG packages.${NC}"
+				UNINSTALL_FAILED=1
+			fi
 			# Only remove source file and keyring if the source file has our sentinel on line 1
 			if [[ -f /etc/apt/sources.list.d/amneziawg.sources.list ]] && head -1 /etc/apt/sources.list.d/amneziawg.sources.list | grep -q '# Managed by amneziawg-install'; then
 				rm -f /etc/apt/sources.list.d/amneziawg.sources.list
@@ -3094,7 +4448,7 @@ function uninstallAmneziaWG() {
 		systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"
 		AWG_RUNNING=$?
 
-		if [[ ${AWG_RUNNING} -eq 0 ]]; then
+		if [[ ${AWG_RUNNING} -eq 0 || ${UNINSTALL_FAILED} -ne 0 ]]; then
 			echo "AmneziaWG failed to uninstall properly."
 			exit 1
 		else
@@ -4093,6 +5447,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 
 	# Check if AmneziaWG is already installed and load params
 	if [[ -e "${AMNEZIAWG_DIR}/params" ]]; then
+		if [[ "${OS}" == "ubuntu" ]]; then
+			refreshConfiguredUbuntuAmneziaPpa
+		fi
 		loadParams
 		manageMenu
 	else

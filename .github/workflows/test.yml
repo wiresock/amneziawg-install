@@ -22,6 +22,7 @@ jobs:
       - name: Run unit tests
         run: |
           bash tests/test-functions.sh
+          bash tests/test-ubuntu-ppa.sh
           bash tests/test-proxy-scripts.sh
 
       - name: Run proxy Rust tests
@@ -54,6 +55,7 @@ jobs:
         distro:
           - "ubuntu:22.04"
           - "ubuntu:24.04"
+          - "ubuntu:26.04"
           - "debian:11"
           - "debian:12"
     steps:
@@ -71,3 +73,13 @@ jobs:
             -w /workspace \
             ${{ matrix.distro }} \
             bash tests/test-install-mock.sh
+
+  resolute-live:
+    name: Ubuntu 26.04 PPA + DKMS Live Smoke
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate signed PPA selection, DKMS, module, and tools
+        run: sudo bash tests/test-ubuntu-resolute-live.sh

@@ -364,7 +364,32 @@ sudo ./amneziawg-install.sh --list-clients
 Supported Linux distributions:
 
 - Debian ≥ 11
-- Ubuntu ≥ 22.04
+- Ubuntu ≥ 22.04 (CI-tested on 22.04, 24.04, and 26.04)
+
+### Ubuntu 26.04 PPA compatibility
+
+When the Amnezia PPA does not publish a `resolute` suite, the Ubuntu 26.04
+(Resolute) installer uses the PPA's signed Ubuntu 24.04 (`noble`) suite as a
+temporary, narrowly scoped fallback:
+
+- The native `resolute` suite is checked first on every install or management
+  run. Once it is published, the installer automatically stops using the
+  fallback.
+- Network failures and unexpected HTTP responses do **not** trigger the
+  fallback. Both native PPA metadata endpoints must explicitly report that the
+  suite is absent.
+- Normal APT signature verification remains enabled. The installer does not
+  add `trusted=yes` or allow insecure repositories.
+- The fallback is allowed on `amd64`, `arm64`, `armhf`, `ppc64el`, `riscv64`,
+  and `s390x`, where the required package indexes are published. It is rejected
+  on `i386`, which lacks `amneziawg-tools`.
+- Runtime module loading is continuously tested on the GitHub-hosted Ubuntu
+  26.04 `amd64` image. Other listed architectures have package-index coverage
+  but are not runtime-tested by this repository's CI.
+
+Uninstalling AmneziaWG removes only source entries that exactly match the
+Amnezia PPA, including a fallback entry left by an interrupted older install.
+Unrelated APT sources in the same file are preserved.
 
 Temporarily disabled:
 
