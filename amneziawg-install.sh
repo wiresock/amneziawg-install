@@ -218,21 +218,23 @@ function isAmneziaPpaFallbackArchitectureSupported() {
 	esac
 }
 
-# Print the final HTTP status for a PPA metadata URL. Network, TLS, timeout, and
-# tool failures return 2 without inventing a status. curl is installed by the
-# normal Ubuntu flow; wget/python3 allow recovery from an older partial install
-# before the first apt-get update.
+# Print the direct HTTP status for a PPA metadata URL without following
+# redirects. A redirect is ambiguous and must remain a 3xx so the caller fails
+# closed. Network, TLS, timeout, and tool failures return 2 without inventing a
+# status. curl is installed by the normal Ubuntu flow; wget/python3 allow
+# recovery from an older partial install before the first apt-get update.
 function getAmneziaPpaHttpStatus() {
 	local URL="$1"
 	local STATUS=""
 	local OUTPUT=""
 
 	if command -v curl &>/dev/null; then
-		STATUS=$(curl -4 --silent --show-error --location \
+		STATUS=$(curl --disable -4 --silent --show-error \
 			--connect-timeout 10 --max-time 30 \
 			--output /dev/null --write-out '%{http_code}' "${URL}") || return 2
 	elif command -v wget &>/dev/null; then
-		OUTPUT=$(wget -4 --server-response --spider --timeout=30 --tries=1 "${URL}" 2>&1) || true
+		OUTPUT=$(wget -4 --server-response --spider --max-redirect=0 \
+			--timeout=30 --tries=1 "${URL}" 2>&1) || true
 		STATUS=$(printf '%s\n' "${OUTPUT}" | awk '
 			/^[[:space:]]*HTTP\/[0-9.]+[[:space:]]+[0-9][0-9][0-9]/ { status=$2 }
 			END { print status }
@@ -243,9 +245,14 @@ import sys
 import urllib.error
 import urllib.request
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
 request = urllib.request.Request(sys.argv[1], method="GET")
+opener = urllib.request.build_opener(NoRedirect())
 try:
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with opener.open(request, timeout=30) as response:
         print(response.status)
 except urllib.error.HTTPError as error:
     print(error.code)

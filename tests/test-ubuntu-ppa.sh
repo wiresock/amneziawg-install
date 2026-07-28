@@ -136,6 +136,86 @@ assert_eq "2" "$(wc -l < "${PROBE_LOG}" | tr -d ' ')" "unavailable suite checks 
 )
 assert_rc 2 "$?" "HTTP 5xx after one 404 leaves suite status unknown"
 
+(
+	function getAmneziaPpaHttpStatus() {
+		printf '%s\n' 302
+	}
+	probeAmneziaPpaSuite resolute
+)
+assert_rc 2 "$?" "HTTP redirects leave suite status unknown"
+
+echo "=== PPA HTTP backend redirect handling ==="
+REDIRECT_URL="https://example.invalid/redirect"
+
+CURL_STUB_DIR="${TEST_ROOT}/curl-stub"
+mkdir -p "${CURL_STUB_DIR}"
+cat > "${CURL_STUB_DIR}/curl" <<'SH'
+#!/bin/bash
+FIRST_ARGUMENT="${1:-}"
+FOLLOW_REDIRECT=0
+for ARG in "$@"; do
+	case "${ARG}" in
+		--location | -L | --location-trusted) FOLLOW_REDIRECT=1 ;;
+	esac
+done
+if [[ "${FIRST_ARGUMENT}" == "--disable" && "${FOLLOW_REDIRECT}" -eq 0 ]]; then
+	printf '%s\n' 302
+else
+	printf '%s\n' 200
+fi
+SH
+chmod +x "${CURL_STUB_DIR}/curl"
+OUTPUT=$(PATH="${CURL_STUB_DIR}" getAmneziaPpaHttpStatus "${REDIRECT_URL}")
+RC=$?
+assert_rc 0 "${RC}" "curl backend returns a direct redirect status"
+assert_eq "302" "${OUTPUT}" "curl backend disables config first and does not follow redirects"
+
+WGET_STUB_DIR="${TEST_ROOT}/wget-stub"
+mkdir -p "${WGET_STUB_DIR}"
+ln -s "$(command -v awk)" "${WGET_STUB_DIR}/awk"
+cat > "${WGET_STUB_DIR}/wget" <<'SH'
+#!/bin/bash
+NO_FOLLOW=0
+for ARG in "$@"; do
+	if [[ "${ARG}" == "--max-redirect=0" ]]; then
+		NO_FOLLOW=1
+	fi
+done
+printf '%s\n' "  HTTP/1.1 302 Found" >&2
+if [[ "${NO_FOLLOW}" -eq 1 ]]; then
+	exit 8
+fi
+printf '%s\n' "  HTTP/1.1 200 OK" >&2
+SH
+chmod +x "${WGET_STUB_DIR}/wget"
+OUTPUT=$(PATH="${WGET_STUB_DIR}" getAmneziaPpaHttpStatus "${REDIRECT_URL}")
+RC=$?
+assert_rc 0 "${RC}" "wget backend returns a direct redirect status"
+assert_eq "302" "${OUTPUT}" "wget backend does not follow redirects"
+
+PYTHON_STUB_DIR="${TEST_ROOT}/python-stub"
+mkdir -p "${PYTHON_STUB_DIR}"
+cat > "${PYTHON_STUB_DIR}/python3" <<'SH'
+#!/bin/bash
+SCRIPT=""
+while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+	SCRIPT+="${LINE}"$'\n'
+done
+if [[ "${SCRIPT}" == *"HTTPRedirectHandler"* \
+	&& "${SCRIPT}" == *"redirect_request"* \
+	&& "${SCRIPT}" == *"build_opener"* \
+	&& "${SCRIPT}" != *"urllib.request.urlopen("* ]]; then
+	printf '%s\n' 302
+else
+	printf '%s\n' 200
+fi
+SH
+chmod +x "${PYTHON_STUB_DIR}/python3"
+OUTPUT=$(PATH="${PYTHON_STUB_DIR}" getAmneziaPpaHttpStatus "${REDIRECT_URL}")
+RC=$?
+assert_rc 0 "${RC}" "Python backend returns a direct redirect status"
+assert_eq "302" "${OUTPUT}" "Python backend installs a no-redirect handler"
+
 : > "${PROBE_LOG}"
 OUTPUT=$(
 	(
