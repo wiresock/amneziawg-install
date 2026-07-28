@@ -23,6 +23,9 @@ pub struct PeerRow {
     pub disabled: i64,
     /// `1` if a matching client config file has been discovered, `0` otherwise.
     pub has_config: i64,
+    /// `1` until a newly-created peer has been observed on the live interface.
+    #[allow(dead_code)]
+    pub sync_pending: i64,
     /// Stem of the matching config filename (no `.conf` extension).
     pub config_name: Option<String>,
     /// Absolute path to the matching config file.
@@ -34,6 +37,19 @@ pub struct PeerRow {
     pub created_at: String,
     #[allow(dead_code)]
     pub updated_at: String,
+}
+
+/// Metadata known immediately after the native client-creation flow succeeds.
+///
+/// This is persisted before the HTTP handler returns so that human-entered
+/// metadata is not dependent on a later AWG poll or config-directory rescan.
+pub struct CreatedPeerMetadata<'a> {
+    pub public_key: &'a str,
+    pub allowed_ips: &'a str,
+    pub comment: Option<&'a str>,
+    pub config_name: &'a str,
+    pub config_path: &'a str,
+    pub friendly_name: &'a str,
 }
 
 /// A row fetched from the `snapshots` table.
@@ -67,7 +83,7 @@ pub struct UsageSnapshotRow {
 pub async fn list_all(pool: &SqlitePool) -> Result<Vec<PeerRow>, sqlx::Error> {
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
-                last_handshake_at, rx_bytes, tx_bytes, disabled, has_config,
+                last_handshake_at, rx_bytes, tx_bytes, disabled, has_config, sync_pending,
                 config_name, config_path, friendly_name, created_at, updated_at
          FROM   peers
          ORDER  BY id",
@@ -80,7 +96,7 @@ pub async fn list_all(pool: &SqlitePool) -> Result<Vec<PeerRow>, sqlx::Error> {
 pub async fn find_by_id(pool: &SqlitePool, id: i64) -> Result<Option<PeerRow>, sqlx::Error> {
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
-                last_handshake_at, rx_bytes, tx_bytes, disabled, has_config,
+                last_handshake_at, rx_bytes, tx_bytes, disabled, has_config, sync_pending,
                 config_name, config_path, friendly_name, created_at, updated_at
          FROM   peers
          WHERE  id = ?",
@@ -97,7 +113,7 @@ pub async fn find_by_public_key(
 ) -> Result<Option<PeerRow>, sqlx::Error> {
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
-                last_handshake_at, rx_bytes, tx_bytes, disabled, has_config,
+                last_handshake_at, rx_bytes, tx_bytes, disabled, has_config, sync_pending,
                 config_name, config_path, friendly_name, created_at, updated_at
          FROM   peers
          WHERE  public_key = ?",
@@ -315,6 +331,47 @@ pub async fn update_peer_metadata(
     find_by_id(pool, id).await
 }
 
+/// Insert or update the database row for a newly-created client.
+///
+/// The AWG poller may have already inserted the peer between interface sync and
+/// this write. In that case, update only creation-time metadata and preserve
+/// live network fields, counters, administrative state, and any display name.
+/// Later poller upserts intentionally leave `comment` and config metadata
+/// untouched, so the values written here remain durable across refreshes.
+pub async fn upsert_created_peer(
+    pool: &SqlitePool,
+    metadata: &CreatedPeerMetadata<'_>,
+) -> Result<PeerRow, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO peers (
+             public_key, comment, allowed_ips, has_config, sync_pending,
+             config_name, config_path, friendly_name
+         )
+         VALUES (?, ?, ?, 1, 1, ?, ?, ?)
+         ON CONFLICT(public_key) DO UPDATE SET
+             comment       = excluded.comment,
+             allowed_ips   = excluded.allowed_ips,
+             has_config    = 1,
+             sync_pending  = 1,
+             config_name   = excluded.config_name,
+             config_path   = excluded.config_path,
+             friendly_name = excluded.friendly_name,
+             updated_at    = CURRENT_TIMESTAMP",
+    )
+    .bind(metadata.public_key)
+    .bind(metadata.comment)
+    .bind(metadata.allowed_ips)
+    .bind(metadata.config_name)
+    .bind(metadata.config_path)
+    .bind(metadata.friendly_name)
+    .execute(pool)
+    .await?;
+
+    find_by_public_key(pool, metadata.public_key)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)
+}
+
 /// Delete a peer row by integer ID.
 ///
 /// Returns `true` if a row was deleted, `false` if no peer with that ID exists.
@@ -326,12 +383,14 @@ pub async fn delete_by_id(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Erro
     Ok(result.rows_affected() > 0)
 }
 
-/// Delete non-disabled peers whose public keys are **not** in `active_keys`.
+/// Delete non-disabled, non-pending peers whose public keys are **not** in
+/// `active_keys`.
 ///
 /// This removes "stale" peers that were deleted outside the web panel (e.g.
-/// via the install script's `--remove-client` flag).  Disabled peers are
+/// via the install script's `--remove-client` flag). Disabled peers are
 /// preserved because they were intentionally marked via the UI and may be
-/// re-enabled later.
+/// re-enabled later. Newly-created peers are preserved only while both their
+/// config is present and they are awaiting observation on the live interface.
 ///
 /// Returns the list of `(id, public_key)` pairs that were **actually**
 /// deleted so the caller can perform follow-up cleanup (e.g. clearing event
@@ -341,12 +400,17 @@ pub async fn delete_stale_peers(
     pool: &SqlitePool,
     active_keys: &std::collections::HashSet<String>,
 ) -> Result<Vec<(i64, String)>, sqlx::Error> {
-    // Only fetch non-disabled peers; disabled peers are never candidates for
-    // stale-peer cleanup since they were intentionally marked via the UI.
-    let all: Vec<(i64, String)> =
-        sqlx::query_as("SELECT id, public_key FROM peers WHERE disabled = 0")
-            .fetch_all(pool)
-            .await?;
+    // The config mapping step runs before stale cleanup. A newly-created row is
+    // protected only while its config is still present; ordinary config-linked
+    // rows retain the historical stale-cleanup behaviour.
+    let all: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, public_key
+         FROM peers
+         WHERE disabled = 0
+           AND NOT (sync_pending = 1 AND has_config = 1)",
+    )
+    .fetch_all(pool)
+    .await?;
 
     let stale: Vec<(i64, String)> = all
         .into_iter()
@@ -366,7 +430,12 @@ pub async fn delete_stale_peers(
             .take(chunk.len())
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!("DELETE FROM peers WHERE id IN ({placeholders}) AND disabled = 0");
+        let sql = format!(
+            "DELETE FROM peers
+             WHERE id IN ({placeholders})
+               AND disabled = 0
+               AND NOT (sync_pending = 1 AND has_config = 1)"
+        );
         let mut query = sqlx::query(&sql);
         for (id, _) in chunk {
             query = query.bind(id);
@@ -375,8 +444,8 @@ pub async fn delete_stale_peers(
     }
 
     // Some stale peers may have been concurrently disabled between the
-    // SELECT and DELETE above.  The DELETE's `AND disabled = 0` guard
-    // prevents their removal, but they would still be in the `stale` list.
+    // SELECT and DELETE above. The DELETE guards prevent their removal, but
+    // they would still be in the `stale` list.
     // Re-check which IDs still exist to return only actually-deleted peers.
     let mut surviving_ids: std::collections::HashSet<i64> =
         std::collections::HashSet::new();
@@ -929,6 +998,165 @@ mod tests {
         assert!(result.is_none());
     }
 
+    // ── upsert_created_peer ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upsert_created_peer_inserts_comment_and_config_metadata() {
+        let db = test_db().await;
+        let metadata = CreatedPeerMetadata {
+            public_key: "KEY_CREATED_COMMENT=",
+            allowed_ips: "10.66.66.2/32,fd42:42:42::2/128",
+            comment: Some("Main phone"),
+            config_name: "awg0-client-alice",
+            config_path: "/etc/amnezia/amneziawg/clients/awg0-client-alice.conf",
+            friendly_name: "alice",
+        };
+
+        let row = upsert_created_peer(&db.pool, &metadata)
+            .await
+            .expect("upsert created peer");
+
+        assert_eq!(row.public_key, metadata.public_key);
+        assert_eq!(row.allowed_ips, metadata.allowed_ips);
+        assert_eq!(row.comment.as_deref(), Some("Main phone"));
+        assert_eq!(row.has_config, 1);
+        assert_eq!(row.sync_pending, 1);
+        assert_eq!(row.config_name.as_deref(), Some(metadata.config_name));
+        assert_eq!(row.config_path.as_deref(), Some(metadata.config_path));
+        assert_eq!(row.friendly_name.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn upsert_created_peer_accepts_missing_comment() {
+        let db = test_db().await;
+        let metadata = CreatedPeerMetadata {
+            public_key: "KEY_CREATED_NO_COMMENT=",
+            allowed_ips: "10.66.66.3/32,fd42:42:42::3/128",
+            comment: None,
+            config_name: "awg0-client-bob",
+            config_path: "/etc/amnezia/amneziawg/clients/awg0-client-bob.conf",
+            friendly_name: "bob",
+        };
+
+        let row = upsert_created_peer(&db.pool, &metadata)
+            .await
+            .expect("upsert created peer without comment");
+
+        assert!(row.comment.is_none());
+        assert_eq!(row.has_config, 1);
+        assert_eq!(row.sync_pending, 1);
+        assert_eq!(row.friendly_name.as_deref(), Some("bob"));
+    }
+
+    #[tokio::test]
+    async fn upsert_created_peer_updates_pollered_row_without_losing_live_state() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_CREATED_EXISTING=", Some("Custom name")).await;
+        sqlx::query(
+            "UPDATE peers
+             SET endpoint = '203.0.113.5:51820',
+                 last_handshake_at = 123456,
+                 rx_bytes = 100,
+                 tx_bytes = 200,
+                 disabled = 1
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .expect("seed live state");
+
+        let metadata = CreatedPeerMetadata {
+            public_key: "KEY_CREATED_EXISTING=",
+            allowed_ips: "10.66.66.4/32,fd42:42:42::4/128",
+            comment: Some("Persisted note"),
+            config_name: "awg0-client-carol",
+            config_path: "/etc/amnezia/amneziawg/clients/awg0-client-carol.conf",
+            friendly_name: "carol",
+        };
+
+        let row = upsert_created_peer(&db.pool, &metadata)
+            .await
+            .expect("update pollered peer");
+
+        assert_eq!(row.id, id);
+        assert_eq!(row.display_name.as_deref(), Some("Custom name"));
+        assert_eq!(row.comment.as_deref(), Some("Persisted note"));
+        assert_eq!(row.endpoint.as_deref(), Some("203.0.113.5:51820"));
+        assert_eq!(row.last_handshake_at, Some(123456));
+        assert_eq!(row.rx_bytes, 100);
+        assert_eq!(row.tx_bytes, 200);
+        assert_eq!(row.disabled, 1);
+        assert_eq!(row.allowed_ips, metadata.allowed_ips);
+        assert_eq!(row.has_config, 1);
+        assert_eq!(row.friendly_name.as_deref(), Some("carol"));
+    }
+
+    #[tokio::test]
+    async fn one_shot_refresh_preserves_comment_and_pending_cleanup_guard() {
+        let db = test_db().await;
+        let metadata = CreatedPeerMetadata {
+            public_key: "KEY_CREATED_REFRESH=",
+            allowed_ips: "10.66.66.6/32,fd42:42:42::6/128",
+            comment: Some("Survives refresh"),
+            config_name: "awg0-client-erin",
+            config_path: "/etc/amnezia/amneziawg/clients/awg0-client-erin.conf",
+            friendly_name: "erin",
+        };
+        upsert_created_peer(&db.pool, &metadata)
+            .await
+            .expect("insert created peer");
+
+        // Mirror poller::sync_peers_from_awg's live-field-only UPSERT. It must
+        // not clear sync_pending because an older full poll may still hold an
+        // active-key snapshot from before this peer was created.
+        sqlx::query(
+            "INSERT INTO peers (
+                 public_key, endpoint, allowed_ips, last_handshake_at, rx_bytes, tx_bytes
+             )
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(public_key) DO UPDATE SET
+                 endpoint          = excluded.endpoint,
+                 allowed_ips       = excluded.allowed_ips,
+                 last_handshake_at = excluded.last_handshake_at,
+                 rx_bytes          = excluded.rx_bytes,
+                 tx_bytes          = excluded.tx_bytes,
+                 updated_at        = CURRENT_TIMESTAMP",
+        )
+        .bind(metadata.public_key)
+        .bind("198.51.100.7:51820")
+        .bind(metadata.allowed_ips)
+        .bind(654321_i64)
+        .bind(300_i64)
+        .bind(400_i64)
+        .execute(&db.pool)
+        .await
+        .expect("poller-style upsert");
+
+        let row = find_by_public_key(&db.pool, metadata.public_key)
+            .await
+            .expect("find peer")
+            .expect("peer");
+        assert_eq!(row.comment.as_deref(), Some("Survives refresh"));
+        assert_eq!(row.config_name.as_deref(), Some(metadata.config_name));
+        assert_eq!(row.endpoint.as_deref(), Some("198.51.100.7:51820"));
+        assert_eq!(row.rx_bytes, 300);
+        assert_eq!(row.tx_bytes, 400);
+        assert_eq!(row.sync_pending, 1);
+
+        // Model the older full poll's stale cleanup. Its snapshot does not
+        // contain the newly-created key, but the one-shot refresh above must
+        // not have removed the pending guard.
+        let stale = delete_stale_peers(&db.pool, &std::collections::HashSet::new())
+            .await
+            .expect("stale cleanup with old snapshot");
+        assert!(stale.is_empty());
+        assert!(find_by_public_key(&db.pool, metadata.public_key)
+            .await
+            .expect("find after stale cleanup")
+            .is_some());
+    }
+
     // ── update_peer_disabled ─────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1057,6 +1285,84 @@ mod tests {
 
         // Disabled peer should still exist
         assert!(find_by_id(&db.pool, id_d).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_stale_peers_preserves_config_linked_peer_awaiting_sync() {
+        let db = test_db().await;
+        let metadata = CreatedPeerMetadata {
+            public_key: "KEY_AWAITING_SYNC=",
+            allowed_ips: "10.66.66.5/32,fd42:42:42::5/128",
+            comment: Some("Awaiting live sync"),
+            config_name: "awg0-client-dave",
+            config_path: "/etc/amnezia/amneziawg/clients/awg0-client-dave.conf",
+            friendly_name: "dave",
+        };
+        let inserted = upsert_created_peer(&db.pool, &metadata)
+            .await
+            .expect("insert config-linked peer");
+
+        let active = std::collections::HashSet::new();
+        let stale = delete_stale_peers(&db.pool, &active)
+            .await
+            .expect("delete stale peers");
+
+        assert!(stale.is_empty());
+        let row = find_by_id(&db.pool, inserted.id)
+            .await
+            .expect("find peer")
+            .expect("config-linked peer should survive");
+        assert_eq!(row.comment.as_deref(), Some("Awaiting live sync"));
+        assert_eq!(row.has_config, 1);
+        assert_eq!(row.sync_pending, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_stale_peers_removes_ordinary_config_linked_peer() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_CONFIG_STALE=", None).await;
+        apply_config_mapping(
+            &db.pool,
+            "KEY_CONFIG_STALE=",
+            "awg0-client-stale",
+            "/etc/amnezia/amneziawg/clients/awg0-client-stale.conf",
+            "stale",
+        )
+        .await
+        .expect("apply config mapping");
+
+        let stale = delete_stale_peers(&db.pool, &std::collections::HashSet::new())
+            .await
+            .expect("delete stale peers");
+
+        assert_eq!(stale, vec![(id, "KEY_CONFIG_STALE=".to_string())]);
+        assert!(find_by_id(&db.pool, id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_stale_peers_removes_pending_peer_after_config_disappears() {
+        let db = test_db().await;
+        let metadata = CreatedPeerMetadata {
+            public_key: "KEY_PENDING_WITHOUT_CONFIG=",
+            allowed_ips: "10.66.66.7/32",
+            comment: Some("No longer recoverable"),
+            config_name: "awg0-client-gone",
+            config_path: "/etc/amnezia/amneziawg/clients/awg0-client-gone.conf",
+            friendly_name: "gone",
+        };
+        let row = upsert_created_peer(&db.pool, &metadata)
+            .await
+            .expect("insert pending peer");
+        clear_all_config_mappings(&db.pool)
+            .await
+            .expect("clear removed config mapping");
+
+        let stale = delete_stale_peers(&db.pool, &std::collections::HashSet::new())
+            .await
+            .expect("delete stale peers");
+
+        assert_eq!(stale, vec![(row.id, metadata.public_key.to_string())]);
+        assert!(find_by_id(&db.pool, row.id).await.unwrap().is_none());
     }
 
     #[tokio::test]

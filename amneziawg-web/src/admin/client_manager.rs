@@ -962,8 +962,18 @@ fn remove_client_block(server_config: &str, name: &str) -> Option<String> {
 pub struct CreateClientResult {
     /// Absolute path to the generated client config file.
     pub config_path: String,
+    /// Stem of the generated client config filename.
+    pub config_name: String,
     /// The client name that was created.
     pub client_name: String,
+    /// Human-readable peer name derived from the generated config filename.
+    pub friendly_name: String,
+    /// Public key generated for the new peer.
+    pub public_key: String,
+    /// Comma-separated client CIDRs as written to the server config.
+    pub allowed_ips: String,
+    /// Whether the on-disk configs were written but the live interface sync failed.
+    pub sync_required: bool,
 }
 
 /// Create a new AmneziaWG client directly, without the external install script.
@@ -1131,7 +1141,8 @@ pub fn create_client(
     }
 
     // Also check if a client config file already exists.
-    let client_conf_path = config_dir.join(format!("{}-client-{name}.conf", params.server_awg_nic));
+    let config_name = format!("{}-client-{name}", params.server_awg_nic);
+    let client_conf_path = config_dir.join(format!("{config_name}.conf"));
     if client_conf_path.exists() {
         return Err(CreateClientError::DuplicateName(name.to_string()));
     }
@@ -1209,6 +1220,10 @@ pub fn create_client(
     info!(path = %client_conf_path.display(), "client config written");
 
     // Step 8: Append the peer block to the server config.
+    let allowed_ips = match client_ipv6_normalized.as_deref() {
+        Some(ipv6) => format!("{client_ipv4}/32,{ipv6}/128"),
+        None => format!("{client_ipv4}/32"),
+    };
     let peer_block = build_peer_block(
         name,
         &pub_key,
@@ -1230,22 +1245,28 @@ pub fn create_client(
     // Step 9: Sync the running AWG interface.
     // Keep the lock held through strip+syncconf to prevent a concurrent
     // remove/add from modifying on-disk config between the two steps.
-    if let Err(e) = awg::sync_interface(&params.server_awg_nic, disabled_keys) {
-        // The peer is in the config file but not yet on the running interface.
-        // It will become active only after an explicit AWG sync (e.g. `awg syncconf`)
-        // or a full AWG restart; the poller does not perform this sync automatically.
-        let err_msg = e.to_string();
-        tracing::warn!(
-            error = %err_msg,
-            "interface sync failed after adding peer – peer will become active after an explicit AWG sync or restart"
-        );
-        // Surface a hard error so callers know the operation was only partially applied.
-        return Err(CreateClientError::Awg(e));
-    }
+    let sync_required = match awg::sync_interface(&params.server_awg_nic, disabled_keys) {
+        Ok(()) => false,
+        Err(e) => {
+            // The peer is in the config file but not yet on the running interface.
+            // Return the creation metadata so the caller can durably persist the
+            // peer and its comment even though a later interface sync is required.
+            tracing::warn!(
+                error = %e,
+                "interface sync failed after adding peer – peer will become active after an explicit AWG sync or restart"
+            );
+            true
+        }
+    };
 
     Ok(CreateClientResult {
         config_path: client_conf_path.to_string_lossy().to_string(),
+        config_name,
         client_name: name.to_string(),
+        friendly_name: name.to_string(),
+        public_key: pub_key,
+        allowed_ips,
+        sync_required,
     })
 }
 

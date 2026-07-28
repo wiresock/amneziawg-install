@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::SecondsFormat;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
 
 use crate::awg;
@@ -35,6 +35,15 @@ use crate::domain::PublicKey;
 /// Serializes access to the clear-all + re-map sequence so that concurrent
 /// calls from the poller and on-demand `rescan_configs` cannot interleave.
 static CONFIG_MAPPING_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Serialize config discovery/mapping with newly-created peer persistence.
+///
+/// The guard deliberately covers the directory scan as well as the database
+/// clear-and-remap sequence, so a scan cannot apply a pre-creation snapshot
+/// after creation metadata has been stored.
+pub(crate) async fn acquire_config_mapping_lock() -> MutexGuard<'static, ()> {
+    CONFIG_MAPPING_LOCK.lock().await
+}
 
 pub struct Poller {
     db: Database,
@@ -247,18 +256,20 @@ impl Poller {
     /// step returns `Ok(())` — existing config-mapping fields are **not**
     /// cleared (they retain whatever values they had from the previous cycle).
     async fn apply_config_mapping_step(&self) -> anyhow::Result<()> {
+        let _guard = acquire_config_mapping_lock().await;
         let config_dir = self.config_dir.clone();
-        let configs = match tokio::task::spawn_blocking(move || config_store::scan(&config_dir)).await {
-            Ok(scan_result) => scan_result,
-            Err(e) => {
-                warn!(
-                    config_dir = %self.config_dir.display(),
-                    error = %e,
-                    "config scan task failed – skipping config mapping"
-                );
-                return Ok(());
-            }
-        };
+        let configs =
+            match tokio::task::spawn_blocking(move || config_store::scan(&config_dir)).await {
+                Ok(scan_result) => scan_result,
+                Err(e) => {
+                    warn!(
+                        config_dir = %self.config_dir.display(),
+                        error = %e,
+                        "config scan task failed – skipping config mapping"
+                    );
+                    return Ok(());
+                }
+            };
 
         let configs = match configs {
             Ok(c) => c,
@@ -326,6 +337,7 @@ impl Poller {
                  last_handshake_at   = excluded.last_handshake_at, \
                  rx_bytes            = excluded.rx_bytes, \
                  tx_bytes            = excluded.tx_bytes, \
+                 sync_pending        = 0, \
                  updated_at          = CURRENT_TIMESTAMP",
         )
         .bind(&public_key.0)
@@ -468,16 +480,12 @@ fn base_ip(cidr: &str) -> &str {
 /// on-demand rescan.  Resets all mappings, then applies Strategy 1 (public-key)
 /// and Strategy 2 (AllowedIPs fallback) for each config.
 ///
-/// The clear-all + re-map sequence is serialized via [`CONFIG_MAPPING_LOCK`]
-/// so that concurrent calls from the poller and on-demand `rescan_configs`
-/// cannot interleave and leave stale/missing mappings.
+/// Callers hold [`CONFIG_MAPPING_LOCK`] across both their directory scan and
+/// this clear-and-remap sequence.
 async fn apply_config_mappings(
     db: &crate::db::Database,
     configs: &[config_store::ClientConfig],
 ) -> anyhow::Result<()> {
-    // Acquire the lock so the clear + re-apply is atomic w.r.t. other callers.
-    let _guard = CONFIG_MAPPING_LOCK.lock().await;
-
     // Reset all mapping fields so that removed configs don't persist.
     crate::db::peers::clear_all_config_mappings(&db.pool).await?;
 
@@ -627,6 +635,7 @@ pub async fn rescan_configs(
     db: &crate::db::Database,
     config_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
+    let _guard = acquire_config_mapping_lock().await;
     let dir = config_dir.to_path_buf();
     let configs = match tokio::task::spawn_blocking(move || config_store::scan(&dir)).await {
         Ok(scan_result) => scan_result,

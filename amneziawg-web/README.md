@@ -236,7 +236,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `GET` | `/api/system/status` | Yes | System time, boot time, and uptime context for current counters (`server_*` aliases are retained for compatibility) |
 | `GET` | `/api/proxy/sessions` | Yes | Active sessions reported by `amneziawg-proxy` status file; sessions carry `peer_id`/`peer_name` when the backend socket matches a peer endpoint |
 | `GET` | `/api/events` | Yes | Audit log (`?peer_id=`, `?event_type=`, `?limit=`) |
-| `POST` | `/api/admin/users` | Yes | JSON API: create user `{"name":"..."}` |
+| `POST` | `/api/admin/users` | Yes | JSON API: create user `{"name":"...","comment":"optional note"}` (`comment` optional, max 512 characters) |
 | `POST` | `/api/admin/users/:id/remove` | Yes | JSON API: remove user |
 
 ---

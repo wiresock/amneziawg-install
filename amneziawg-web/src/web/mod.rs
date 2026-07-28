@@ -359,6 +359,8 @@ pub struct PeerSummaryDto {
     /// Resolved display name (display_name → friendly_name → config_name → peer-<key prefix>).
     pub name: String,
     pub public_key: String,
+    /// Optional administrator-supplied peer comment.
+    pub comment: Option<String>,
     /// Stem of the matching `.conf` filename, if known.
     pub config_name: Option<String>,
     /// Human-readable name from config filename (e.g. `"gramm"`).
@@ -572,6 +574,8 @@ pub struct EventDto {
 #[derive(Debug, Deserialize)]
 pub struct CreateUserRequest {
     pub name: String,
+    /// Optional comment stored with the newly created peer.
+    pub comment: Option<String>,
     /// Optional full IPv4 address for the client (e.g. `"10.66.66.100"`).
     pub ipv4_address: Option<String>,
     /// Optional full IPv6 address for the client (e.g. `"fd42:42:42::ff"`).
@@ -582,11 +586,19 @@ pub struct CreateUserRequest {
 #[derive(Debug, Deserialize)]
 pub struct AddUserForm {
     pub name: String,
+    /// Optional comment stored with the newly created peer.
+    pub comment: Option<String>,
     pub csrf_token: Option<String>,
     /// Optional full IPv4 address for the client.
     pub ipv4_address: Option<String>,
     /// Optional full IPv6 address for the client.
     pub ipv6_address: Option<String>,
+}
+
+/// Fixed notice code accepted by the peer-list page after a create redirect.
+#[derive(Debug, Default, Deserialize)]
+struct PeerListQuery {
+    create_notice: Option<String>,
 }
 
 /// HTML form body for `POST /admin/users/:id/remove`.
@@ -853,6 +865,7 @@ fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
         id: row.id,
         name,
         public_key: row.public_key,
+        comment: row.comment,
         config_name: row.config_name,
         friendly_name: row.friendly_name,
         has_config,
@@ -2048,6 +2061,7 @@ async fn patch_peer(
 async fn page_peer_list(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    Query(query): Query<PeerListQuery>,
 ) -> Result<Response, ApiError> {
     let rows = crate::db::peers::list_all(&state.db.pool).await?;
     let mut peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
@@ -2056,7 +2070,18 @@ async fn page_peer_list(
     let mut proxy_sessions = proxy_sessions_status(&state).await;
     associate_proxy_sessions_with_peers(&mut proxy_sessions, &peers);
     annotate_peers_with_proxy_remote(&mut peers, &proxy_sessions);
-    Ok(Html(render_peer_list(&peers, &csrf, &status, &proxy_sessions)).into_response())
+    let notice = query
+        .create_notice
+        .as_deref()
+        .and_then(create_user_notice_message);
+    Ok(Html(render_peer_list(
+        &peers,
+        &csrf,
+        &status,
+        &proxy_sessions,
+        notice,
+    ))
+    .into_response())
 }
 
 /// `GET /peers/:id` – server-rendered peer detail page.
@@ -2210,6 +2235,80 @@ async fn api_next_ips() -> Result<Response, ApiError> {
     }
 }
 
+const CREATE_NOTICE_SYNC_REQUIRED: &str = "sync_required";
+const CREATE_NOTICE_METADATA_NOT_PERSISTED: &str = "metadata_not_persisted";
+const CREATE_NOTICE_SYNC_AND_METADATA: &str = "sync_and_metadata";
+
+fn create_user_warning_codes(result: &crate::admin::CreateUserResult) -> Vec<&'static str> {
+    let mut warnings = Vec::with_capacity(2);
+    if result.sync_required {
+        warnings.push(CREATE_NOTICE_SYNC_REQUIRED);
+    }
+    if !result.metadata_persisted {
+        warnings.push(CREATE_NOTICE_METADATA_NOT_PERSISTED);
+    }
+    warnings
+}
+
+fn create_user_notice_code(result: &crate::admin::CreateUserResult) -> Option<&'static str> {
+    match (result.sync_required, result.metadata_persisted) {
+        (false, true) => None,
+        (true, true) => Some(CREATE_NOTICE_SYNC_REQUIRED),
+        (false, false) => Some(CREATE_NOTICE_METADATA_NOT_PERSISTED),
+        (true, false) => Some(CREATE_NOTICE_SYNC_AND_METADATA),
+    }
+}
+
+fn create_user_notice_message(code: &str) -> Option<&'static str> {
+    match code {
+        CREATE_NOTICE_SYNC_REQUIRED => Some(
+            "User created, but interface sync is still required before the peer becomes active.",
+        ),
+        CREATE_NOTICE_METADATA_NOT_PERSISTED => Some(
+            "User created, but its metadata could not be saved. If you entered a comment, it was not persisted; do not add this user again.",
+        ),
+        CREATE_NOTICE_SYNC_AND_METADATA => Some(
+            "User created, but interface sync is still required and its metadata could not be saved. If you entered a comment, it was not persisted; do not add this user again.",
+        ),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn injected_create_result(
+    headers: &HeaderMap,
+    state: &AppState,
+    name: &str,
+    ip_override: &crate::admin::client_manager::IpOverride,
+) -> Option<crate::admin::client_manager::CreateClientResult> {
+    if !headers.contains_key("x-test-force-create-user-success") {
+        return None;
+    }
+
+    let ipv4 = ip_override
+        .ipv4_address
+        .as_deref()
+        .unwrap_or("10.66.66.250");
+    let ipv6 = ip_override
+        .ipv6_address
+        .as_deref()
+        .unwrap_or("fd42:42:42::250");
+    let config_name = format!("awg0-client-{name}");
+    Some(crate::admin::client_manager::CreateClientResult {
+        config_path: state
+            .config_dir
+            .join(format!("{config_name}.conf"))
+            .to_string_lossy()
+            .into_owned(),
+        config_name,
+        client_name: name.to_string(),
+        friendly_name: name.to_string(),
+        public_key: format!("TEST_CREATE_{name}_PUBLIC_KEY="),
+        allowed_ips: format!("{ipv4}/32,{ipv6}/128"),
+        sync_required: headers.contains_key("x-test-force-create-user-sync-required"),
+    })
+}
+
 /// `POST /api/admin/users` – JSON API to create a new user/client.
 async fn api_create_user(
     State(state): State<AppState>,
@@ -2232,6 +2331,7 @@ async fn api_create_user(
     let _ = headers;
 
     let name = body.name.trim().to_string();
+    let comment = body.comment.as_deref().and_then(normalize_comment);
     let ip_override = crate::admin::client_manager::IpOverride {
         ipv4_address: trim_optional_string(body.ipv4_address.as_deref()),
         ipv6_address: trim_optional_string(body.ipv6_address.as_deref()),
@@ -2240,21 +2340,31 @@ async fn api_create_user(
         &state.db,
         &state.config_dir,
         &name,
+        comment.as_deref(),
         &state.auth.username,
         &ip_override,
+        #[cfg(test)]
+        injected_create_result(&headers, &state, &name, &ip_override),
     )
     .await
     {
         Ok(result) => {
             refresh_peer_state_after_lifecycle(&state).await;
-            Ok((
-                StatusCode::CREATED,
-                Json(json!({
-                    "name": result.client_name,
-                    "config_path": result.config_path,
-                })),
-            )
-                .into_response())
+            let warning_codes = create_user_warning_codes(&result);
+            let mut payload = json!({
+                "name": result.client_name,
+                "config_path": result.config_path,
+                "comment": comment,
+                "sync_required": result.sync_required,
+                "metadata_persisted": result.metadata_persisted,
+                "warnings": warning_codes,
+            });
+            if let Some(code) = create_user_notice_code(&result) {
+                if let Some(message) = create_user_notice_message(code) {
+                    payload["warning"] = json!(message);
+                }
+            }
+            Ok((StatusCode::CREATED, Json(payload)).into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::InvalidName(msg)) => {
             Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response())
@@ -2287,23 +2397,6 @@ async fn api_create_user(
             Ok((
                 StatusCode::CONFLICT,
                 Json(json!({ "error": "no free IP addresses available (max 253 clients)" })),
-            )
-                .into_response())
-        }
-        Err(crate::admin::client_manager::CreateClientError::Awg(ref awg_err)) => {
-            // The client config and server config have been written, but the
-            // live interface sync failed.  Return 201 with a flag so the
-            // caller knows the peer will become active after an explicit
-            // AWG sync or service restart.
-            tracing::warn!(error = %awg_err, "client created but interface sync failed");
-            refresh_peer_state_after_lifecycle(&state).await;
-            Ok((
-                StatusCode::CREATED,
-                Json(json!({
-                    "name": name,
-                    "sync_required": true,
-                    "warning": "client created but interface sync failed; the peer will become active after an AWG sync or service restart",
-                })),
             )
                 .into_response())
         }
@@ -2431,6 +2524,7 @@ async fn post_add_user_form(
     }
 
     let name = form.name.trim().to_string();
+    let comment = form.comment.as_deref().and_then(normalize_comment);
     let ipv4_address = trim_optional_string(form.ipv4_address.as_deref());
     let ipv6_address = trim_optional_string(form.ipv6_address.as_deref());
     let ip_override = crate::admin::client_manager::IpOverride {
@@ -2441,15 +2535,20 @@ async fn post_add_user_form(
         &state.db,
         &state.config_dir,
         &name,
+        comment.as_deref(),
         &state.auth.username,
         &ip_override,
+        #[cfg(test)]
+        injected_create_result(&headers, &state, &name, &ip_override),
     )
     .await
     {
-        Ok(_result) => {
+        Ok(result) => {
             refresh_peer_state_after_lifecycle(&state).await;
-            // Redirect back to the peer list.
-            Ok(Redirect::to("/").into_response())
+            let location = create_user_notice_code(&result)
+                .map(|notice| format!("/?create_notice={notice}"))
+                .unwrap_or_else(|| "/".to_string());
+            Ok(Redirect::to(&location).into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::InvalidName(msg)) => {
             // Show the peer list page with an error message.
@@ -2485,14 +2584,6 @@ async fn post_add_user_form(
                 "Another add/remove operation is already in progress; please try again later.";
             let status = system_status(&state);
             Ok(Html(render_peer_list_with_error(&peers, &csrf, &status, message)).into_response())
-        }
-        Err(crate::admin::client_manager::CreateClientError::Awg(ref awg_err)) => {
-            // Configs were written, but interface sync failed. Treat as a
-            // partial success: rescan so the new peer appears, log the
-            // warning, and redirect (PRG) instead of showing an error page.
-            tracing::warn!(error = %awg_err, "interface sync failed after client creation (HTML form)");
-            refresh_peer_state_after_lifecycle(&state).await;
-            Ok(Redirect::to("/").into_response())
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to create user via HTML form");
@@ -3087,9 +3178,11 @@ fn html_head(title: &str) -> String {
   .proxy-sessions .meta {{ margin: 0 0 .6rem; }}
   .proxy-session-table {{ margin-bottom: 1rem; }}
   .warning {{ color: #9a5a00; font-weight: 700; }}
+  .creation-warning {{ margin: 0 0 1rem; padding: .65rem .8rem; border: 1px solid #d6a947; border-radius: 4px; background: #fff8e6; color: #6e4800; }}
   .counter-scope {{ display: inline-block; margin-left: .35rem; padding: .1rem .45rem; border: 1px solid #d6e2f0; border-radius: 999px; background: #f4f8fd; color: #496277; font-size: .78rem; }}
   .proxy-hint {{ display: inline-block; margin-left: .25rem; padding: 0 .4rem; border: 1px solid #d6e2f0; border-radius: 999px; background: #f4f8fd; color: #496277; font-size: .72rem; vertical-align: .05rem; }}
   .th-hint {{ display: block; margin-top: .1rem; color: #777; font-size: .72rem; font-weight: 400; }}
+  .comment-cell {{ max-width: 24rem; overflow-wrap: anywhere; }}
   .back {{ margin-bottom: 1rem; display: block; }}
   .edit-form {{ margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; max-width: 480px; }}
   .edit-form h2 {{ margin-top: 0; font-size: 1.1rem; }}
@@ -3240,8 +3333,16 @@ fn render_peer_list(
     csrf_token: &str,
     system_status: &SystemStatusDto,
     proxy_sessions: &ProxySessionsDto,
+    notice: Option<&str>,
 ) -> String {
-    render_peer_list_inner(peers, csrf_token, system_status, Some(proxy_sessions), None)
+    render_peer_list_inner(
+        peers,
+        csrf_token,
+        system_status,
+        Some(proxy_sessions),
+        notice,
+        None,
+    )
 }
 
 fn render_peer_list_with_error(
@@ -3250,7 +3351,7 @@ fn render_peer_list_with_error(
     system_status: &SystemStatusDto,
     error: &str,
 ) -> String {
-    render_peer_list_inner(peers, csrf_token, system_status, None, Some(error))
+    render_peer_list_inner(peers, csrf_token, system_status, None, None, Some(error))
 }
 
 fn render_peer_list_inner(
@@ -3258,6 +3359,7 @@ fn render_peer_list_inner(
     csrf_token: &str,
     system_status: &SystemStatusDto,
     proxy_sessions: Option<&ProxySessionsDto>,
+    notice: Option<&str>,
     error: Option<&str>,
 ) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
@@ -3270,6 +3372,12 @@ fn render_peer_list_inner(
          <span class=\"counter-scope\">Traffic period: since boot/interface restart</span></p>\n",
         peers.len()
     ));
+    if let Some(notice) = notice {
+        buf.push_str(&format!(
+            "<p class=\"creation-warning\" role=\"status\">{}</p>\n",
+            esc(notice)
+        ));
+    }
 
     if peers.is_empty() {
         buf.push_str("<p>No peers found. The poller may not have run yet.</p>\n");
@@ -3277,7 +3385,7 @@ fn render_peer_list_inner(
         buf.push_str(
             "<table>\n\
              <tr><th>Name</th><th>Connection</th><th>Identity</th><th>Endpoint</th>\
-             <th>Last handshake</th><th>RX<span class=\"th-hint\">current period</span></th>\
+             <th>Comment</th><th>Last handshake</th><th>RX<span class=\"th-hint\">current period</span></th>\
              <th>TX<span class=\"th-hint\">current period</span></th></tr>\n",
         );
         for p in peers {
@@ -3292,9 +3400,15 @@ fn render_peer_list_inner(
                 .latest_handshake_at
                 .map(|ts| esc(&fmt_last_handshake(ts, now)))
                 .unwrap_or_else(|| "never".to_string());
+            let comment = p
+                .comment
+                .as_deref()
+                .filter(|comment| !comment.is_empty())
+                .map(esc)
+                .unwrap_or_else(|| "–".to_string());
             buf.push_str(&format!(
                 "<tr><td>{name_link}</td><td>{conn}</td><td>{ident}</td><td>{endpoint}</td>\
-                 <td>{handshake}</td><td>{rx}</td><td>{tx}</td></tr>\n",
+                 <td class=\"comment-cell\">{comment}</td><td>{handshake}</td><td>{rx}</td><td>{tx}</td></tr>\n",
                 conn = connection_badge(&p.connection_status),
                 ident = identity_badge(&p.identity_status),
                 rx = fmt_bytes(p.rx_bytes),
@@ -3331,6 +3445,9 @@ fn render_peer_list_inner(
   <input type="text" id="add_user_ipv6" name="ipv6_address"
          placeholder="loading…" title="Full IPv6 address for this client">
   <p class="meta" style="margin-top:.25rem">Full IPv6 address. Pre-filled with the next available address; edit as needed.</p>
+  <label for="add_user_comment">Comment <span class="meta">(optional)</span></label>
+  <textarea id="add_user_comment" name="comment" maxlength="512"
+            placeholder="e.g. Primary phone"></textarea>
   <button type="submit">Add user</button>
 </form>
 </details>
@@ -4382,7 +4499,13 @@ mod tests {
     #[tokio::test]
     async fn list_peers_returns_inserted_peer() {
         let db = test_db().await;
-        insert_peer(&db, "TESTKEY1234567890ABCDEF==", Some("Alice")).await;
+        let id = insert_peer(&db, "TESTKEY1234567890ABCDEF==", Some("Alice")).await;
+        sqlx::query("UPDATE peers SET comment = ? WHERE id = ?")
+            .bind("Primary phone")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
 
         let app = test_router(db);
         let response = app
@@ -4404,6 +4527,7 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0]["name"], "Alice");
         assert_eq!(peers[0]["public_key"], "TESTKEY1234567890ABCDEF==");
+        assert_eq!(peers[0]["comment"], "Primary phone");
         // Private key must NOT appear anywhere in the response
         assert!(!body.windows(11).any(|w| w == b"private_key"));
     }
@@ -5044,7 +5168,13 @@ mod tests {
     #[tokio::test]
     async fn root_lists_peers_in_html() {
         let db = test_db().await;
-        insert_peer(&db, "HTMLKEY1234567890ABCDEF==", Some("Charlie")).await;
+        let id = insert_peer(&db, "HTMLKEY1234567890ABCDEF==", Some("Charlie")).await;
+        sqlx::query("UPDATE peers SET comment = ? WHERE id = ?")
+            .bind("Phone <primary> & travel")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
 
         let app = test_router(db);
         let response = app
@@ -5058,6 +5188,9 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.contains("Charlie"));
+        assert!(html.contains("<th>Comment</th>"));
+        assert!(html.contains("Phone &lt;primary&gt; &amp; travel"));
+        assert!(!html.contains("Phone <primary> & travel"));
         // The peer LIST shows names, not raw public keys.  Verify the public key
         // is not exposed in the list HTML (it only appears on the detail page).
         assert!(!html.contains("HTMLKEY1234567890ABCDEF=="));
@@ -6449,6 +6582,28 @@ mod tests {
             html.contains("name=\"name\""),
             "peer list page should contain name input field"
         );
+        assert!(
+            html.contains("id=\"add_user_comment\""),
+            "peer list page should contain an accessible comment input"
+        );
+        assert!(
+            html.contains("name=\"comment\""),
+            "peer list page should submit the comment field"
+        );
+        assert!(
+            html.contains("maxlength=\"512\""),
+            "comment input should expose the server-side length limit"
+        );
+        let comment_position = html
+            .find("id=\"add_user_comment\"")
+            .expect("comment field position");
+        let button_position = html
+            .find("<button type=\"submit\">Add user</button>")
+            .expect("Add user button position");
+        assert!(
+            comment_position < button_position,
+            "comment field should appear before the Add user button"
+        );
     }
 
     #[tokio::test]
@@ -6648,7 +6803,7 @@ mod tests {
                     .uri("/admin/users/add")
                     .header("content-type", "application/x-www-form-urlencoded")
                     .header("x-test-force-create-user-failure", "1")
-                    .body(Body::from("name=alice"))
+                    .body(Body::from("name=alice&comment=Primary+phone"))
                     .unwrap(),
             )
             .await
@@ -6694,6 +6849,276 @@ mod tests {
             error_msg.contains("name"),
             "error should be a name-validation error (not a deserialization error), got: {error_msg}"
         );
+    }
+
+    #[test]
+    fn create_user_request_accepts_comment_and_omission() {
+        let with_comment: CreateUserRequest = serde_json::from_str(
+            r#"{"name":"alice","comment":"Primary phone","ipv4_address":"10.66.66.100"}"#,
+        )
+        .expect("request with comment should deserialize");
+        assert_eq!(with_comment.name, "alice");
+        assert_eq!(with_comment.comment.as_deref(), Some("Primary phone"));
+        assert_eq!(with_comment.ipv4_address.as_deref(), Some("10.66.66.100"));
+
+        let without_comment: CreateUserRequest =
+            serde_json::from_str(r#"{"name":"bob"}"#).expect("legacy request should deserialize");
+        assert_eq!(without_comment.name, "bob");
+        assert!(without_comment.comment.is_none());
+    }
+
+    #[tokio::test]
+    async fn api_create_user_accepts_optional_comment_field() {
+        // The invalid name makes the native lifecycle stop at validation while
+        // still proving that the extended JSON payload reached the handler.
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"../bad","comment":"Primary phone"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"].as_str().unwrap().contains("name"),
+            "comment must not cause a payload-deserialization error"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_create_user_with_comment_persists_and_displays_after_refresh() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("awg0-client-alice.conf"),
+            "[Interface]\nAddress = 10.66.66.100/32, fd42:42:42::100/128\n",
+        )
+        .expect("write client config");
+        let app = test_router_with_config_dir(db.clone(), dir.path().to_path_buf());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .header("x-test-force-create-user-success", "1")
+                    .body(Body::from(
+                        r#"{"name":"alice","comment":"  Primary <phone> & tablet  ","ipv4_address":"10.66.66.100","ipv6_address":"fd42:42:42::100"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["comment"], "Primary <phone> & tablet");
+        assert_eq!(payload["metadata_persisted"], true);
+        assert_eq!(payload["sync_required"], false);
+        assert_eq!(payload["warnings"], json!([]));
+
+        let row = crate::db::peers::find_by_public_key(&db.pool, "TEST_CREATE_alice_PUBLIC_KEY=")
+            .await
+            .expect("query created peer")
+            .expect("created peer");
+        assert_eq!(row.comment.as_deref(), Some("Primary <phone> & tablet"));
+        assert_eq!(row.has_config, 1);
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let peers: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(peers[0]["comment"], "Primary <phone> & tablet");
+
+        for _ in 0..2 {
+            let page_response = app
+                .clone()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let page_body = axum::body::to_bytes(page_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = std::str::from_utf8(&page_body).unwrap();
+            assert!(html.contains("<th>Comment</th>"));
+            assert!(html.contains("Primary &lt;phone&gt; &amp; tablet"));
+            assert!(!html.contains("Primary <phone> & tablet"));
+        }
+    }
+
+    #[tokio::test]
+    async fn add_user_form_without_comment_preserves_backward_compatibility() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("awg0-client-bob.conf"),
+            "[Interface]\nAddress = 10.66.66.250/32, fd42:42:42::250/128\n",
+        )
+        .expect("write client config");
+        let app = test_router_with_config_dir(db.clone(), dir.path().to_path_buf());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/add")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-test-force-create-user-success", "1")
+                    .body(Body::from("name=bob"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()["location"], "/");
+
+        let row = crate::db::peers::find_by_public_key(&db.pool, "TEST_CREATE_bob_PUBLIC_KEY=")
+            .await
+            .expect("query created peer")
+            .expect("created peer");
+        assert!(row.comment.is_none());
+
+        let page_response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let page_body = axum::body::to_bytes(page_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&page_body).unwrap();
+        assert!(html.contains(">bob</a>"));
+        assert!(html.contains("<td class=\"comment-cell\">–</td>"));
+    }
+
+    #[tokio::test]
+    async fn add_user_form_warns_when_comment_metadata_cannot_be_persisted() {
+        let db = test_db().await;
+        sqlx::query(
+            "CREATE TRIGGER fail_web_created_peer_insert
+             BEFORE INSERT ON peers
+             BEGIN
+               SELECT RAISE(FAIL, 'forced peer metadata failure');
+             END",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("install failure trigger");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/add")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("x-test-force-create-user-success", "1")
+                    .body(Body::from("name=carol&comment=Primary+phone"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()["location"],
+            "/?create_notice=metadata_not_persisted"
+        );
+
+        let page_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/?create_notice=metadata_not_persisted")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let page_body = axum::body::to_bytes(page_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&page_body).unwrap();
+        assert!(html.contains("User created, but its metadata could not be saved."));
+        assert!(html.contains(
+            "If you entered a comment, it was not persisted; do not add this user again."
+        ));
+        assert!(html.contains("role=\"status\""));
+    }
+
+    #[tokio::test]
+    async fn api_create_user_reports_all_durable_partial_success_warnings() {
+        let db = test_db().await;
+        sqlx::query(
+            "CREATE TRIGGER fail_api_created_peer_insert
+             BEFORE INSERT ON peers
+             BEGIN
+               SELECT RAISE(FAIL, 'forced peer metadata failure');
+             END",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("install failure trigger");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = test_router_with_config_dir(db, dir.path().to_path_buf());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .header("x-test-force-create-user-success", "1")
+                    .header("x-test-force-create-user-sync-required", "1")
+                    .body(Body::from(r#"{"name":"dave","comment":"Primary phone"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["name"], "dave");
+        assert_eq!(payload["comment"], "Primary phone");
+        assert_eq!(payload["sync_required"], true);
+        assert_eq!(payload["metadata_persisted"], false);
+        assert_eq!(
+            payload["warnings"],
+            json!(["sync_required", "metadata_not_persisted"])
+        );
+        assert!(payload["config_path"]
+            .as_str()
+            .expect("config path")
+            .ends_with("awg0-client-dave.conf"));
+        assert!(payload["warning"]
+            .as_str()
+            .expect("warning")
+            .contains("If you entered a comment, it was not persisted"));
     }
 
     #[tokio::test]
