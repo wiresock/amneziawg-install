@@ -234,8 +234,23 @@ case "$1$2" in
 esac
 '
 
-# Mock add-apt-repository (not present in minimal containers)
-create_mock "add-apt-repository" 'exit 0'
+# Mock add-apt-repository (not present in minimal containers). The installer
+# requires the command to create a real fixture entry before it can reconcile
+# the suite, so model the modern DEB822 output in this disposable container.
+create_mock "add-apt-repository" '
+source /etc/os-release
+mkdir -p /etc/apt/sources.list.d
+cat > "/etc/apt/sources.list.d/amnezia-ubuntu-ppa-${VERSION_CODENAME}.sources" <<EOF
+Types: deb
+URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu/
+Suites: ${VERSION_CODENAME}
+Components: main
+Signed-By:
+ -----BEGIN PGP PUBLIC KEY BLOCK-----
+ MOCKKEY
+ -----END PGP PUBLIC KEY BLOCK-----
+EOF
+exit 0'
 
 # Mock gpg (needed for Debian key import path)
 create_mock "gpg" '
@@ -254,12 +269,23 @@ exit 0
 create_mock "curl" '
 OUTPUT_FILE=""
 PREV=""
+PPA_METADATA_URL=""
 for ARG in "$@"; do
 	if [[ "${PREV}" == "-o" ]]; then
 		OUTPUT_FILE="${ARG}"
 	fi
+	if [[ "${ARG}" == https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu/dists/* ]]; then
+		PPA_METADATA_URL="${ARG}"
+	fi
 	PREV="${ARG}"
 done
+if [[ -n "${PPA_METADATA_URL}" ]]; then
+	case "${PPA_METADATA_URL}" in
+		*/resolute/*) printf "404" ;;
+		*) printf "200" ;;
+	esac
+	exit 0
+fi
 if [[ -n "${OUTPUT_FILE}" ]]; then
 	echo "-----BEGIN PGP PUBLIC KEY BLOCK-----" > "${OUTPUT_FILE}"
 	echo "MOCKKEY" >> "${OUTPUT_FILE}"

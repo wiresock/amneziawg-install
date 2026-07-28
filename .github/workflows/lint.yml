@@ -23,6 +23,8 @@ jobs:
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-common.sh
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-install.sh
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh
+          bash -n tests/test-ubuntu-ppa.sh
+          bash -n tests/test-ubuntu-resolute-live.sh
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -43,3 +45,5 @@ jobs:
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-common.sh
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-install.sh
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh
+          shellcheck --severity=warning tests/test-ubuntu-ppa.sh
+          shellcheck --severity=warning tests/test-ubuntu-resolute-live.sh
