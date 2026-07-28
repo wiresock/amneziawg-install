@@ -56,6 +56,7 @@ apt-get -o APT::Update::Error-Mode=any update
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
 	curl \
 	gnupg \
+	python3 \
 	software-properties-common \
 	"linux-headers-$(uname -r)"
 

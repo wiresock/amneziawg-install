@@ -364,7 +364,7 @@ sudo ./amneziawg-install.sh --list-clients
 Supported Linux distributions:
 
 - Debian ≥ 11
-- Ubuntu 22.04, 24.04, and 26.04
+- Ubuntu ≥ 22.04 (CI-tested on 22.04, 24.04, and 26.04)
 
 ### Ubuntu 26.04 PPA compatibility
 
