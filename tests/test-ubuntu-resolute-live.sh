@@ -259,8 +259,7 @@ for PACKAGE in amneziawg amneziawg-dkms amneziawg-tools; do
 		echo "ERROR: ${PACKAGE} installed/candidate version mismatch" >&2
 		exit 1
 	fi
-	if ! grep -Fq "${AMNEZIA_PPA_URI}" <<< "${POLICY}" ||
-		! grep -Eq "(^|[ ,])n=${SELECTED_SUITE}([, ]|$)" <<< "${POLICY}"; then
+	if ! grep -Fq "${AMNEZIA_PPA_URI} ${SELECTED_SUITE}/main" <<< "${POLICY}"; then
 		echo "ERROR: ${PACKAGE} candidate is not attributed to the selected Amnezia PPA suite" >&2
 		printf '%s\n' "${POLICY}" >&2
 		exit 1
