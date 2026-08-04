@@ -30,6 +30,8 @@ readonly SYSTEMD_UNIT_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly SUDOERS_FILE="/etc/sudoers.d/amneziawg-web"
 readonly AWG_INSTALL_SCRIPT_DEST="/usr/local/bin/amneziawg-install.sh"
 readonly AWG_INSTALL_SCRIPT_MARKER_NAME="installed-awg-script.path"
+readonly PRIVILEGED_HELPER_NAME="amneziawg-web-privileged"
+readonly PRIVILEGED_HELPER_DEST="/usr/local/libexec/${PRIVILEGED_HELPER_NAME}"
 
 # Default paths
 readonly DEFAULT_BINARY_SRC="./target/release/amneziawg-web"
@@ -87,6 +89,30 @@ PASSWORD=""               # plaintext; only accepted interactively or with expli
 ENABLE_SERVICE=true
 START_SERVICE=true
 FORCE=false               # overwrite existing env.conf without prompt
+
+# Exact temporary paths used while installing privilege-boundary artifacts.
+# Keeping them globally tracked lets the EXIT/signal traps remove an orphaned
+# file without touching an existing live helper or sudoers drop-in.
+STAGED_PRIVILEGED_HELPER=""
+STAGED_SUDOERS=""
+
+cleanup_staged_privilege_artifacts() {
+    local exit_code=$?
+
+    if [[ -n "${STAGED_PRIVILEGED_HELPER}" ]]; then
+        rm -f -- "${STAGED_PRIVILEGED_HELPER}" 2>/dev/null || true
+    fi
+    if [[ -n "${STAGED_SUDOERS}" ]]; then
+        rm -f -- "${STAGED_SUDOERS}" 2>/dev/null || true
+    fi
+
+    return "${exit_code}"
+}
+
+trap cleanup_staged_privilege_artifacts EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ── Usage ─────────────────────────────────────────────────────────────────────
 
@@ -1447,7 +1473,47 @@ install_awg_install_script() {
     fi
 }
 
-# ── Sudoers drop-in ───────────────────────────────────────────────────────────
+# ── Privileged helper / sudoers drop-in ───────────────────────────────────────
+
+install_privileged_helper() {
+    step "Installing privileged AWG helper"
+
+    local helper_src="${SCRIPT_DIR}/${PRIVILEGED_HELPER_NAME}"
+    local helper_dir
+    helper_dir="$(dirname "${PRIVILEGED_HELPER_DEST}")"
+
+    if [[ ! -f "${helper_src}" ]] || [[ -L "${helper_src}" ]]; then
+        die "Privileged helper source is missing or unsafe: ${helper_src}"
+    fi
+    if [[ -L "${helper_dir}" ]]; then
+        die "Refusing to install privileged helper through symlinked directory: ${helper_dir}"
+    fi
+    if [[ -L "${PRIVILEGED_HELPER_DEST}" ]]; then
+        die "Refusing to replace symlink at privileged helper path: ${PRIVILEGED_HELPER_DEST}"
+    fi
+    if [[ -e "${PRIVILEGED_HELPER_DEST}" ]] && [[ ! -f "${PRIVILEGED_HELPER_DEST}" ]]; then
+        die "Privileged helper destination is not a regular file: ${PRIVILEGED_HELPER_DEST}"
+    fi
+
+    # sudo trusts this helper to validate every operation and argument.  Keep
+    # both the helper and its parent directory root-owned and non-writable by
+    # the service account.
+    install -d -m 0755 -o root -g root -- "${helper_dir}"
+    STAGED_PRIVILEGED_HELPER="$(mktemp "${PRIVILEGED_HELPER_DEST}.tmp.XXXXXX")" \
+        || die "Could not create temporary privileged helper"
+    if ! install -m 0755 -o root -g root -- \
+            "${helper_src}" "${STAGED_PRIVILEGED_HELPER}"; then
+        die "Could not stage privileged helper"
+    fi
+    if ! /bin/bash -n "${STAGED_PRIVILEGED_HELPER}"; then
+        die "Staged privileged helper failed its Bash syntax check"
+    fi
+    if ! mv -fT -- "${STAGED_PRIVILEGED_HELPER}" "${PRIVILEGED_HELPER_DEST}"; then
+        die "Could not atomically install privileged helper"
+    fi
+    STAGED_PRIVILEGED_HELPER=""
+    info "Installed privileged helper: ${PRIVILEGED_HELPER_DEST}"
+}
 
 install_sudoers() {
     step "Installing sudoers rule for AWG access"
@@ -1458,51 +1524,54 @@ install_sudoers() {
     # 3. Sync interface config via `awg syncconf` + `awg-quick strip` to
     #    restore re-enabled peers to the running interface.
     # 4. Read server params and config for native client lifecycle actions.
-    # 5. Rewrite/append peer blocks in the server config for create/remove.
+    # 5. Atomically append/remove validated peer blocks in the server config.
     #
-    # Instead of running the whole service as root, we install tightly-scoped
-    # sudoers rules that grant the service user passwordless sudo for only
-    # these specific commands.
+    # The helper performs strict verb, argument, interface, key, and path
+    # validation before invoking any privileged command.  Keeping all dynamic
+    # arguments out of sudoers is compatible with both sudo.ws and sudo-rs
+    # (the default on Ubuntu 25.10+), and avoids unsafe sudoers argument globs.
+    local rule="${SERVICE_USER} ALL=(root) NOPASSWD: ${PRIVILEGED_HELPER_DEST}"
 
-    local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
-    # Direct client lifecycle in native Rust: read params/server config and
-    # rewrite or append peer blocks.
-    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf"
-
-    info "Sudoers rule (AWG): ${rule_awg}"
-    info "Sudoers rule (direct): ${rule_direct}"
+    info "Sudoers rule (validated helper): ${rule}"
 
     # Ensure the sudoers drop-in directory exists (may be absent in minimal
     # containers or stripped images).
     mkdir -p "$(dirname "${SUDOERS_FILE}")"
 
-    # Write with strict permissions first, then validate.
+    # Build and validate a temporary drop-in first.  On upgrade/reinstall, a
+    # validation failure must not destroy the last known-good sudoers file.
+    STAGED_SUDOERS="$(mktemp "${SUDOERS_FILE}.tmp.XXXXXX")" \
+        || die "Could not create temporary sudoers file"
     printf '# Allow amneziawg-web service to manage AWG state and peers.\n' \
-        > "${SUDOERS_FILE}"
+        > "${STAGED_SUDOERS}"
     printf '# Installed by amneziawg-web-install.sh – do not edit manually.\n' \
-        >> "${SUDOERS_FILE}"
-    printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
-    printf '# Allow amneziawg-web to manage clients directly in Rust (read/rewrite config).\n' \
-        >> "${SUDOERS_FILE}"
-    printf '%s\n' "${rule_direct}" >> "${SUDOERS_FILE}"
+        >> "${STAGED_SUDOERS}"
+    printf '%s\n' "${rule}" >> "${STAGED_SUDOERS}"
 
-    chmod 0440 "${SUDOERS_FILE}"
-    chown root:root "${SUDOERS_FILE}"
+    chmod 0440 "${STAGED_SUDOERS}"
+    chown root:root "${STAGED_SUDOERS}"
 
-    # Validate syntax if visudo is available (best-effort).
+    # Validate syntax if visudo is available (best-effort), preserving the
+    # parser's diagnostic so compatibility failures are actionable.
     if command -v visudo &>/dev/null; then
-        if visudo -cf "${SUDOERS_FILE}" &>/dev/null; then
+        local visudo_output=""
+        if visudo_output="$(visudo -cf "${STAGED_SUDOERS}" 2>&1)"; then
             info "Sudoers file validated: ${SUDOERS_FILE}"
         else
-            warn "visudo validation failed for ${SUDOERS_FILE}."
-            warn "Removing broken sudoers file to protect system integrity."
-            rm -f "${SUDOERS_FILE}"
-            die "Sudoers file syntax check failed. This should not happen with the default rule.
-Please report this issue."
+            warn "visudo validation failed for generated sudoers rule:"
+            if [[ -n "${visudo_output}" ]]; then
+                printf '%s\n' "${visudo_output}" >&2
+            fi
+            die "Sudoers file syntax check failed; the existing rule (if any) was preserved."
         fi
     else
         info "visudo not available; skipping syntax check."
     fi
+
+    if ! mv -fT -- "${STAGED_SUDOERS}" "${SUDOERS_FILE}"; then
+        die "Could not install sudoers drop-in: ${SUDOERS_FILE}"
+    fi
+    STAGED_SUDOERS=""
 
     info "Installed sudoers drop-in: ${SUDOERS_FILE}"
 }
@@ -1823,6 +1892,7 @@ print_summary() {
     printf "  Binary:           %s/amneziawg-web\n" "${INSTALL_DIR}"
     printf "  Database:         %s/awg-web.db\n" "${DATA_DIR}"
     printf "  Env file:         %s\n" "${ENV_FILE}"
+    printf "  Privileged helper: %s\n" "${PRIVILEGED_HELPER_DEST}"
     printf "  Sudoers:          %s\n" "${SUDOERS_FILE}"
     printf "  Service:          %s\n" "${SERVICE_NAME}"
     printf "\n"
@@ -1912,6 +1982,7 @@ main() {
     setup_filesystem
     install_binary
     install_awg_install_script
+    install_privileged_helper
     install_sudoers
     write_env_file
     install_service_unit

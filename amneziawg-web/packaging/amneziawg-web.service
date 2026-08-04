@@ -47,8 +47,9 @@ Environment=RUST_LOG=amneziawg_web=info
 # and write client config files directly under the config directory.
 ReadWritePaths=/etc/amnezia/amneziawg
 
-# The service invokes sudo to run `awg`, `cat`, `tee`, etc. via a
-# tightly-scoped sudoers rule (see /etc/sudoers.d/amneziawg-web).
+# The service invokes a root-owned validating helper via a tightly-scoped
+# sudoers rule (see /etc/sudoers.d/amneziawg-web).  The helper dispatches only
+# approved AWG and config-file operations.
 # sudo relies on the setuid bit, which requires NoNewPrivileges=no.
 #
 # Do NOT add PrivateDevices=, ProtectKernelTunables=, ProtectKernelModules=,

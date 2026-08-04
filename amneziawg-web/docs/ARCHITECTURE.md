@@ -12,11 +12,11 @@ server-rendered HTML UI.
 │                  Host OS                   │
 │                                            │
 │   ┌──────────┐    ┌──────────────────────┐ │
-│   │ AWG kern │◄───│  awg show all dump   │ │
-│   │  module  │    └──────────┬───────────┘ │
-│   └──────────┘               │             │
-│                              ▼             │
-│   ┌──────────────────────────────────────┐ │
+│   │ AWG kern │◄───│ privileged helper    │ │
+│   │  module  │    │ (root:root, 0755)    │ │
+│   └──────────┘    └──────────▲───────────┘ │
+│                              │ exact sudo  │
+│   ┌──────────────────────────┴───────────┐ │
 │   │         amneziawg-web (this app)     │ │
 │   │                                      │ │
 │   │  ┌─────────┐  ┌──────┐  ┌─────────┐ │ │
@@ -37,11 +37,15 @@ server-rendered HTML UI.
 
 ### `awg` module (`src/awg/`)
 
-Executes `awg show all dump` via `std::process::Command` – **no shell
-interpolation**.  Parses the tab-separated output into Rust structs.
+Executes the root-owned privileged helper through `sudo` and
+`std::process::Command` – **no shell interpolation**.  Parses AWG's
+tab-separated `show all dump` output into Rust structs.
 
 **Security constraints:**
-- The binary path is hard-coded as `/usr/bin/awg`.
+- The sudo path and helper path are hard-coded as `/usr/bin/sudo` and
+  `/usr/local/libexec/amneziawg-web-privileged`.
+- The sudoers drop-in grants access only to that exact helper path; dynamic
+  command arguments are not expressed as sudoers globs.
 - Private key fields in the output are read and immediately discarded.
 - Parsed output is never interpolated back into shell commands.
 
@@ -49,6 +53,22 @@ interpolation**.  Parses the tab-separated output into Rust structs.
 - The field layout (5 fields for interface, 9 for peer) was derived from the
   WireGuard `wg show all dump` format.  Verify against the actual AWG binary.
 - If AWG uses a different field layout, update `parse_dump()` accordingly.
+
+---
+
+### Privileged helper (`scripts/amneziawg-web-privileged`)
+
+Installed at `/usr/local/libexec/amneziawg-web-privileged` as
+`0755 root:root`.  It is the sole executable authorized by
+`/etc/sudoers.d/amneziawg-web` for the `awg-web` service user.
+
+The helper allow-lists subcommands and validates each argument count,
+interface/client name, peer key, AllowedIPs value, and configuration path.  It
+rejects unsafe paths, symbolic links, hard links, and non-regular config files.
+Peer additions and removals are semantic operations: the helper holds a stable
+per-interface lock, reconstructs an approved peer block or removes one exact
+managed-client block, and atomically replaces the config.  Arbitrary config
+content and unknown operations are rejected rather than forwarded.
 
 ---
 
@@ -103,12 +123,13 @@ These will be wired up to web handlers in a later milestone.
 ```
 1. Poller wakes (every 30 s by default)
 2. Calls awg::show_all_dump()
-   → executes: /usr/bin/awg show all dump
-3. Parses output into Vec<AwgInterface>
-4. For each peer:
+   → executes: /usr/bin/sudo -n /usr/local/libexec/amneziawg-web-privileged show-all
+3. Helper validates `show-all` and executes: /usr/bin/awg show all dump
+4. Parses output into Vec<AwgInterface>
+5. For each peer:
    a. INSERT INTO snapshots
    b. UPSERT INTO peers
-5. HTTP handler reads from DB and returns JSON
+6. HTTP handler reads from DB and returns JSON
 ```
 
 ---

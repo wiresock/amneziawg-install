@@ -7,14 +7,16 @@
 //! ## Privilege model
 //!
 //! The web service runs as a non-root user (`awg-web`).  Privileged
-//! operations are performed via tightly-scoped sudo commands:
+//! operations are delegated through a root-owned helper that validates every
+//! subcommand and argument before executing fixed absolute binaries:
 //!
 //! | Operation | Command |
 //! |-----------|---------|
-//! | Read params / server config | `sudo -n /usr/bin/cat -- <path>` |
-//! | Append peer to server config | `sudo -n /usr/bin/tee -a -- <path>` |
-//! | Strip interface config | `sudo awg-quick strip <iface>` (existing) |
-//! | Sync interface | `sudo awg syncconf <iface> /dev/stdin` (existing) |
+//! | Read params / server config | `…-privileged read-file <path>` |
+//! | Append peer to server config | `…-privileged append-peer <iface> <name>` |
+//! | Remove managed peer block | `…-privileged remove-client <iface> <name>` |
+//! | Strip interface config | `…-privileged strip-interface <iface>` |
+//! | Sync interface | `…-privileged sync-interface <iface>` |
 //!
 //! Key generation (`awg genkey`, `awg pubkey`, `awg genpsk`) does **not**
 //! require root privileges.
@@ -911,24 +913,6 @@ AllowedIPs = {allowed_ips}",
     ))
 }
 
-/// Build the peer block to append to the server config.
-fn build_peer_block(
-    name: &str,
-    client_pub_key: &str,
-    client_psk: &str,
-    client_ipv4: &str,
-    client_ipv6_normalized: Option<&str>,
-) -> String {
-    let allowed_ips = match client_ipv6_normalized {
-        Some(ipv6) => format!("{client_ipv4}/32,{ipv6}/128"),
-        None => format!("{client_ipv4}/32"),
-    };
-
-    format!(
-        "\n### Client {name}\n[Peer]\nPublicKey = {client_pub_key}\nPresharedKey = {client_psk}\nAllowedIPs = {allowed_ips}\n"
-    )
-}
-
 fn remove_client_block(server_config: &str, name: &str) -> Option<String> {
     let marker = format!("### Client {name}");
     let lines: Vec<&str> = server_config.lines().collect();
@@ -1224,15 +1208,13 @@ pub fn create_client(
         Some(ipv6) => format!("{client_ipv4}/32,{ipv6}/128"),
         None => format!("{client_ipv4}/32"),
     };
-    let peer_block = build_peer_block(
+    if let Err(e) = awg::append_peer_via_sudo(
+        &params.server_awg_nic,
         name,
         &pub_key,
         &psk,
-        &client_ipv4,
-        client_ipv6_normalized.as_deref(),
-    );
-
-    if let Err(e) = awg::append_file_via_sudo(&server_conf_path, &peer_block) {
+        &allowed_ips,
+    ) {
         // Clean up the client config on failure.
         let _ = std::fs::remove_file(&client_conf_path);
         return Err(CreateClientError::FileWrite(format!(
@@ -1290,23 +1272,9 @@ pub fn remove_client(
 ) -> Result<(), RemoveClientError> {
     script_bridge::validate_client_name(name)?;
 
-    let amneziawg_dir = Path::new("/etc/amnezia/amneziawg");
-    let params_path = amneziawg_dir.join("params");
-    let params_content = awg::read_file_via_sudo(&params_path)
-        .map_err(|e| RemoveClientError::ParamsRead(format!("failed to read params file: {e}")))?;
-    let params =
-        parse_params(&params_content).map_err(|e| RemoveClientError::ParamsRead(e.to_string()))?;
-
-    let server_conf_path = amneziawg_dir.join(format!("{}.conf", params.server_awg_nic));
-    let server_config = awg::read_file_via_sudo(&server_conf_path)
-        .map_err(|e| RemoveClientError::ParamsRead(format!("failed to read server config: {e}")))?;
-
-    let updated = remove_client_block(&server_config, name)
-        .ok_or_else(|| RemoveClientError::ClientNotFound(name.to_string()))?;
-
-    awg::write_file_via_sudo(&server_conf_path, &updated)
-        .map_err(|e| RemoveClientError::FileWrite(format!("rewrite server config: {e}")))?;
-
+    // Validate the unprivileged client-config directory before changing the
+    // root-owned server config.  Otherwise a redirected directory could make
+    // the request fail only after the peer block had already been removed.
     match std::fs::symlink_metadata(config_dir) {
         Ok(sym_meta) => {
             if sym_meta.file_type().is_symlink() {
@@ -1326,6 +1294,24 @@ pub fn remove_client(
             )));
         }
     }
+
+    let amneziawg_dir = Path::new("/etc/amnezia/amneziawg");
+    let params_path = amneziawg_dir.join("params");
+    let params_content = awg::read_file_via_sudo(&params_path)
+        .map_err(|e| RemoveClientError::ParamsRead(format!("failed to read params file: {e}")))?;
+    let params =
+        parse_params(&params_content).map_err(|e| RemoveClientError::ParamsRead(e.to_string()))?;
+
+    let server_conf_path = amneziawg_dir.join(format!("{}.conf", params.server_awg_nic));
+    let server_config = awg::read_file_via_sudo(&server_conf_path)
+        .map_err(|e| RemoveClientError::ParamsRead(format!("failed to read server config: {e}")))?;
+
+    if remove_client_block(&server_config, name).is_none() {
+        return Err(RemoveClientError::ClientNotFound(name.to_string()));
+    }
+
+    awg::remove_client_via_sudo(&params.server_awg_nic, name)
+        .map_err(|e| RemoveClientError::FileWrite(format!("remove from server config: {e}")))?;
 
     if let Ok(entries) = std::fs::read_dir(config_dir) {
         let suffix = format!("-client-{name}.conf");
@@ -1807,37 +1793,6 @@ AllowedIPs = 10.66.66.2/32
             "0.0.0.0/0, ::/0"
         );
         assert_eq!(format_client_allowed_ips(" , , "), "");
-    }
-
-    #[test]
-    fn build_peer_block_format() {
-        let block = build_peer_block(
-            "alice",
-            "PUB_KEY=",
-            "PSK_KEY=",
-            "10.66.66.2",
-            Some("fd42:0042:0042:0000:0000:0000:0000:0002"),
-        );
-        assert!(block.contains("### Client alice"));
-        assert!(
-            block.contains("\n[Peer]\n"),
-            "section header must start at line beginning"
-        );
-        assert!(
-            block.contains("\nPublicKey = PUB_KEY=\n"),
-            "keys must start at line beginning"
-        );
-        assert!(block.contains("\nPresharedKey = PSK_KEY=\n"));
-        assert!(block.contains(
-            "\nAllowedIPs = 10.66.66.2/32,fd42:0042:0042:0000:0000:0000:0000:0002/128\n"
-        ));
-    }
-
-    #[test]
-    fn build_peer_block_omits_ipv6_when_disabled() {
-        let block = build_peer_block("alice", "PUB_KEY=", "PSK_KEY=", "10.66.66.2", None);
-        assert!(block.contains("\nAllowedIPs = 10.66.66.2/32\n"));
-        assert!(!block.contains("/128"));
     }
 
     #[test]

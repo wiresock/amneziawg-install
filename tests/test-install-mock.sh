@@ -51,6 +51,7 @@ echo "Setting up mock commands..."
 
 # Mock awg (AmneziaWG CLI tool)
 create_mock "awg" '
+printf "%s\n" "$*" >> /tmp/awg-calls.log
 case "$1" in
 	genkey)   echo "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=";;
 	pubkey)
@@ -63,7 +64,7 @@ case "$1" in
 		esac
 		;;
 	genpsk)   echo "cHNrMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnM=";;
-	syncconf) exit 0;;
+	syncconf) cat > /tmp/awg-syncconf-stdin; exit 0;;
 	show)
 		if [[ "${2:-}" == "all" ]] && [[ "${3:-}" == "dump" ]]; then
 			# Tab-separated dump format used by the Rust poller.
@@ -92,6 +93,7 @@ esac
 
 # Mock awg-quick
 create_mock "awg-quick" '
+printf "%s\n" "$*" >> /tmp/awg-quick-calls.log
 case "$1" in
 	strip) echo "[Interface]"; echo "PrivateKey = mock";;
 	*)     exit 0;;
@@ -123,10 +125,13 @@ create_mock "firewall-cmd" 'exit 1'
 # Ensure the mock is also available there.
 mkdir -p /usr/bin
 cp /sbin/awg /usr/bin/awg
+cp /sbin/awg-quick /usr/bin/awg-quick
 
-# Mock sudo: the Rust app calls `sudo -n /usr/bin/awg show all dump`.
-# In the test harness we simply exec the target command directly (we are root).
-create_mock "sudo" '
+install_sudo_mock() {
+	# The Rust app calls the installed privileged helper via sudo.  Most matrix
+	# jobs use this delegating mock; Ubuntu 26.04 defers it until after a real
+	# sudo-rs authorization check.
+	create_mock "sudo" '
 # Skip -n flag (non-interactive) and exec the rest
 shift_args=()
 for arg in "$@"; do
@@ -137,8 +142,14 @@ for arg in "$@"; do
 done
 exec "${shift_args[@]}"
 '
-# Ensure mock is also at /usr/bin/sudo (Rust uses absolute path)
-cp /sbin/sudo /usr/bin/sudo
+	# Rust uses the absolute path.
+	cp /sbin/sudo /usr/bin/sudo
+}
+
+EXPECT_REAL_SUDO_AUTH="${EXPECT_REAL_SUDO_AUTH:-false}"
+if [[ "${EXPECT_REAL_SUDO_AUTH}" != "true" ]]; then
+	install_sudo_mock
+fi
 
 # Mock systemctl (unit-aware: only awg-quick@* is reported as active after start;
 # firewalld stays inactive to ensure the nftables code path is exercised)
@@ -2052,52 +2063,213 @@ if [[ -f "${SUDOERS_FILE}" ]]; then
 	fi
 fi
 
-# Verify content: the rule must allow `awg show all dump`, `awg set * peer * remove`,
-# `awg syncconf * /dev/stdin`, and `awg-quick strip *`
+# Verify the privileged helper was installed as a root-owned executable.
+PRIVILEGED_HELPER="/usr/local/libexec/amneziawg-web-privileged"
+if [[ -f "${PRIVILEGED_HELPER}" && -x "${PRIVILEGED_HELPER}" ]]; then
+	echo "OK: Privileged helper installed at ${PRIVILEGED_HELPER}"
+else
+	echo "FAIL: Privileged helper missing or not executable"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${PRIVILEGED_HELPER}" ]]; then
+	HELPER_PERMS=$(stat -c "%a" "${PRIVILEGED_HELPER}")
+	HELPER_OWNER=$(stat -c "%U:%G" "${PRIVILEGED_HELPER}")
+	if [[ "${HELPER_PERMS}" == "755" && "${HELPER_OWNER}" == "root:root" ]]; then
+		echo "OK: Privileged helper is root-owned with permissions 0755"
+	else
+		echo "FAIL: Privileged helper metadata is ${HELPER_OWNER} ${HELPER_PERMS}, expected root:root 755"
+		FAILED=$((FAILED + 1))
+	fi
+fi
+
+# Verify sudoers grants only the validating helper.  Direct awg/cat/tee globs
+# are both incompatible with sudo-rs and unsafe under classic sudo.
 if [[ -f "${SUDOERS_FILE}" ]]; then
-	if grep -q "awg-web.*NOPASSWD:.*/usr/bin/awg show all dump" "${SUDOERS_FILE}"; then
-		echo "OK: Sudoers rule grants NOPASSWD for /usr/bin/awg show all dump"
+	EXPECTED_HELPER_RULE="awg-web ALL=(root) NOPASSWD: ${PRIVILEGED_HELPER}"
+	if grep -Fxq "${EXPECTED_HELPER_RULE}" "${SUDOERS_FILE}"; then
+		echo "OK: Sudoers grants NOPASSWD only through the validating helper"
 	else
-		echo "FAIL: Sudoers rule does not contain expected narrowly-scoped command"
+		echo "FAIL: Sudoers rule does not contain the exact helper command"
 		echo "  Content: $(cat "${SUDOERS_FILE}")"
 		FAILED=$((FAILED + 1))
 	fi
 
-	# Verify the rule includes the peer-removal command
-	if grep -q '/usr/bin/awg set \* peer \* remove' "${SUDOERS_FILE}"; then
-		echo "OK: Sudoers rule includes awg set * peer * remove"
+	NOPASSWD_COUNT=$(grep -c 'NOPASSWD:' "${SUDOERS_FILE}" || true)
+	if [[ "${NOPASSWD_COUNT}" -eq 1 ]] && ! grep -Eq '/usr/bin/(awg|awg-quick|cat|tee)' "${SUDOERS_FILE}"; then
+		echo "OK: Sudoers contains no direct privileged command or wildcard rules"
 	else
-		echo "FAIL: Sudoers rule missing peer-removal command"
+		echo "FAIL: Sudoers contains unexpected direct command permissions"
 		echo "  Content: $(cat "${SUDOERS_FILE}")"
 		FAILED=$((FAILED + 1))
 	fi
 
-	# Verify the rule includes syncconf (for re-enabling peers)
-	if grep -q '/usr/bin/awg syncconf \* /dev/stdin' "${SUDOERS_FILE}"; then
-		echo "OK: Sudoers rule includes awg syncconf * /dev/stdin"
+	if command -v visudo >/dev/null 2>&1; then
+		VISUDO_OUTPUT=""
+		if VISUDO_OUTPUT=$(visudo -cf "${SUDOERS_FILE}" 2>&1); then
+			echo "OK: Installed sudoers rule passes the system visudo parser"
+		else
+			echo "FAIL: Installed sudoers rule failed visudo validation"
+			echo "  ${VISUDO_OUTPUT}"
+			FAILED=$((FAILED + 1))
+		fi
 	else
-		echo "FAIL: Sudoers rule missing syncconf command"
-		echo "  Content: $(cat "${SUDOERS_FILE}")"
+		echo "SKIP: visudo is not installed in this container"
+	fi
+fi
+
+# Ubuntu 26.04 CI keeps the real sudo-rs binary in place through installation
+# so this exercises command authorization, not only parser compatibility.
+if [[ "${EXPECT_REAL_SUDO_AUTH}" == "true" ]]; then
+	REAL_SUDO_AUTH_FAILED=0
+	REAL_SUDO_OUTPUT=""
+	if [[ ! -x /usr/bin/sudo ]] || ! command -v runuser >/dev/null 2>&1; then
+		echo "FAIL: Real sudo-rs authorization prerequisites are unavailable"
+		REAL_SUDO_AUTH_FAILED=1
+	elif REAL_SUDO_OUTPUT=$(runuser -u awg-web -- /usr/bin/sudo -n \
+			"${PRIVILEGED_HELPER}" show-all 2>&1) && \
+			echo "${REAL_SUDO_OUTPUT}" | grep -q '^awg0'; then
+		echo "OK: Real sudo-rs authorizes helper arguments for awg-web"
+	else
+		echo "FAIL: Real sudo-rs rejected the installed helper rule"
+		echo "  ${REAL_SUDO_OUTPUT}"
+		REAL_SUDO_AUTH_FAILED=1
+	fi
+
+	if runuser -u awg-web -- /usr/bin/sudo -n /usr/bin/awg show all dump \
+				>/dev/null 2>&1; then
+		echo "FAIL: Real sudo-rs unexpectedly authorized direct awg access"
+		REAL_SUDO_AUTH_FAILED=1
+	else
+		echo "OK: Real sudo-rs denies direct awg access"
+	fi
+
+	if [[ "${REAL_SUDO_AUTH_FAILED}" -ne 0 ]]; then
 		FAILED=$((FAILED + 1))
 	fi
 
-	# Verify the rule includes awg-quick strip (for re-enabling peers)
-	if grep -q '/usr/bin/awg-quick strip \*' "${SUDOERS_FILE}"; then
-		echo "OK: Sudoers rule includes awg-quick strip *"
+	# Remaining integration phases intentionally use the delegating mock.
+	install_sudo_mock
+fi
+
+# Exercise the helper's allow-list and rejection boundary directly.
+if [[ -x "${PRIVILEGED_HELPER}" ]]; then
+	VALID_HELPER_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	VALID_HELPER_PSK="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+	HELPER_TEST_INTERFACE="helpertest"
+	HELPER_TEST_CONF="/etc/amnezia/amneziawg/${HELPER_TEST_INTERFACE}.conf"
+	HELPER_TEST_LOCK="/etc/amnezia/amneziawg/.${HELPER_TEST_INTERFACE}.web.lock"
+	SYNC_EXPECTED="/tmp/amneziawg-helper-sync-expected"
+	READ_ACTUAL="/tmp/amneziawg-helper-read-actual"
+	rm -f "${HELPER_TEST_CONF}" "${HELPER_TEST_LOCK}" "${SYNC_EXPECTED}" \
+		"${READ_ACTUAL}" /tmp/awg-syncconf-stdin
+	printf '[Interface]\nPrivateKey = trusted\nPostUp = echo trusted\n' > "${HELPER_TEST_CONF}"
+	chmod 0600 "${HELPER_TEST_CONF}"
+	chown root:root "${HELPER_TEST_CONF}"
+	printf '[Interface]\nPrivateKey = sync-test\n' > "${SYNC_EXPECTED}"
+
+	if "${PRIVILEGED_HELPER}" show-all >/dev/null && \
+	   "${PRIVILEGED_HELPER}" remove-peer awg0 "${VALID_HELPER_KEY}" >/dev/null && \
+	   "${PRIVILEGED_HELPER}" strip-interface awg0 >/dev/null && \
+	   "${PRIVILEGED_HELPER}" sync-interface awg0 < "${SYNC_EXPECTED}" && \
+	   cmp -s "${SYNC_EXPECTED}" /tmp/awg-syncconf-stdin && \
+	   "${PRIVILEGED_HELPER}" read-file /etc/amnezia/amneziawg/params > "${READ_ACTUAL}" && \
+	   cmp -s /etc/amnezia/amneziawg/params "${READ_ACTUAL}"; then
+		echo "OK: Privileged helper dispatches approved AWG operations"
 	else
-		echo "FAIL: Sudoers rule missing awg-quick strip command"
-		echo "  Content: $(cat "${SUDOERS_FILE}")"
+		echo "FAIL: Privileged helper rejected an approved AWG operation"
 		FAILED=$((FAILED + 1))
 	fi
 
-	# Verify the rule is narrowly scoped (only the expected commands)
-	if grep -Eq '^awg-web ALL=\(root\) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set \* peer \* remove, /usr/bin/awg syncconf \* /dev/stdin, /usr/bin/awg-quick strip \*$' "${SUDOERS_FILE}"; then
-		echo "OK: Sudoers rule is narrowly scoped (exact commands)"
+	if printf 'PublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n' \
+			"${VALID_HELPER_KEY}" "${VALID_HELPER_PSK}" \
+			'10.66.66.42/32,fd42:0042:0042:0000:0000:0000:0000:002a/128' \
+			| "${PRIVILEGED_HELPER}" append-peer "${HELPER_TEST_INTERFACE}" alice && \
+		grep -Fq 'PostUp = echo trusted' "${HELPER_TEST_CONF}" && \
+		grep -Fq '### Client alice' "${HELPER_TEST_CONF}" && \
+		grep -Fq "PublicKey = ${VALID_HELPER_KEY}" "${HELPER_TEST_CONF}" && \
+		[[ "$(stat -c '%a %U:%G' "${HELPER_TEST_CONF}")" == "600 root:root" ]]; then
+		echo "OK: Privileged helper atomically appends a validated peer and preserves metadata"
 	else
-		echo "FAIL: Sudoers rule may be too broad or incorrectly formatted"
-		echo "  Content: $(cat "${SUDOERS_FILE}")"
+		echo "FAIL: Privileged helper failed semantic peer append"
 		FAILED=$((FAILED + 1))
 	fi
+
+	HELPER_REJECTION_FAILED=0
+	"${PRIVILEGED_HELPER}" show-all extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" remove-peer awg0 invalid-key >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" sync-interface ../etc >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" read-file /etc/amnezia/amneziawg/../../shadow.conf >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" write-file /etc/sudoers >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" append-file /etc/sudoers >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" append-peer missing alice </dev/null >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	printf 'PublicKey = %s\nPresharedKey = %s\nAllowedIPs = 10.66.66.43/32\nPostUp = touch /tmp/pwned\n' \
+		"${VALID_HELPER_KEY}" "${VALID_HELPER_PSK}" \
+		| "${PRIVILEGED_HELPER}" append-peer "${HELPER_TEST_INTERFACE}" bob \
+			>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	printf 'PublicKey = %s\nPresharedKey = %s\nAllowedIPs = 10.66.66.43/32,::::::::/128\n' \
+		"${VALID_HELPER_KEY}" "${VALID_HELPER_PSK}" \
+		| "${PRIVILEGED_HELPER}" append-peer "${HELPER_TEST_INTERFACE}" bob \
+			>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	printf 'PublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n' \
+		"${VALID_HELPER_KEY}" "${VALID_HELPER_PSK}" \
+		'10.66.66.42/32,fd42:0042:0042:0000:0000:0000:0000:002a/128' \
+		| "${PRIVILEGED_HELPER}" append-peer "${HELPER_TEST_INTERFACE}" alice \
+			>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	rm -f /etc/amnezia/amneziawg/link.conf
+	ln -s /etc/passwd /etc/amnezia/amneziawg/link.conf
+	"${PRIVILEGED_HELPER}" read-file /etc/amnezia/amneziawg/link.conf >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	rm -f /etc/amnezia/amneziawg/link.conf
+	ln "${HELPER_TEST_CONF}" /etc/amnezia/amneziawg/hardlink.conf
+	"${PRIVILEGED_HELPER}" read-file /etc/amnezia/amneziawg/hardlink.conf >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	rm -f /etc/amnezia/amneziawg/hardlink.conf
+
+	if "${PRIVILEGED_HELPER}" remove-client "${HELPER_TEST_INTERFACE}" alice && \
+		! grep -Fq '### Client alice' "${HELPER_TEST_CONF}" && \
+		grep -Fq 'PostUp = echo trusted' "${HELPER_TEST_CONF}"; then
+		echo "OK: Privileged helper atomically removes only the validated client block"
+	else
+		echo "FAIL: Privileged helper failed semantic client removal"
+		FAILED=$((FAILED + 1))
+	fi
+	"${PRIVILEGED_HELPER}" remove-client "${HELPER_TEST_INTERFACE}" alice \
+		>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+
+	# Refuse to remove only the fixed prefix of a block that has acquired an
+	# extra field: that would orphan the field in the server config.
+	printf 'PublicKey = %s\nPresharedKey = %s\nAllowedIPs = 10.66.66.43/32\n' \
+		"${VALID_HELPER_PSK}" "${VALID_HELPER_KEY}" \
+		| "${PRIVILEGED_HELPER}" append-peer "${HELPER_TEST_INTERFACE}" bob
+	printf 'PersistentKeepalive = 25\n' >> "${HELPER_TEST_CONF}"
+	HELPER_CONFIG_HASH_BEFORE=$(sha256sum "${HELPER_TEST_CONF}" | awk '{print $1}')
+	"${PRIVILEGED_HELPER}" remove-client "${HELPER_TEST_INTERFACE}" bob \
+		>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	HELPER_CONFIG_HASH_AFTER=$(sha256sum "${HELPER_TEST_CONF}" | awk '{print $1}')
+	if [[ "${HELPER_CONFIG_HASH_BEFORE}" != "${HELPER_CONFIG_HASH_AFTER}" ]]; then
+		HELPER_REJECTION_FAILED=1
+	fi
+	sed -i '$d' "${HELPER_TEST_CONF}"
+	"${PRIVILEGED_HELPER}" remove-client "${HELPER_TEST_INTERFACE}" bob
+
+	# Oversized stdin must be rejected before the helper acquires the stable
+	# interface lock.
+	rm -f "${HELPER_TEST_LOCK}"
+	head -c 513 /dev/zero | tr '\0' A \
+		| "${PRIVILEGED_HELPER}" append-peer "${HELPER_TEST_INTERFACE}" mallory \
+			>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	if [[ -e "${HELPER_TEST_LOCK}" ]]; then
+		HELPER_REJECTION_FAILED=1
+	fi
+
+	if [[ "${HELPER_REJECTION_FAILED}" -eq 0 ]]; then
+		echo "OK: Privileged helper rejects malformed records, legacy writes, unsafe paths, links, and duplicates"
+	else
+		echo "FAIL: Privileged helper accepted an unsafe operation"
+		FAILED=$((FAILED + 1))
+	fi
+
+	rm -f "${HELPER_TEST_CONF}" "${HELPER_TEST_LOCK}" "${SYNC_EXPECTED}" \
+		"${READ_ACTUAL}" /tmp/awg-syncconf-stdin
 fi
 
 # Verify the systemd unit does NOT contain NoNewPrivileges=yes
@@ -2231,6 +2403,14 @@ if [[ ! -f /etc/sudoers.d/amneziawg-web ]]; then
 	echo "OK: Sudoers drop-in removed after uninstall"
 else
 	echo "FAIL: Sudoers drop-in still exists after uninstall"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify the privileged helper was removed
+if [[ ! -e /usr/local/libexec/amneziawg-web-privileged ]]; then
+	echo "OK: Privileged helper removed after uninstall"
+else
+	echo "FAIL: Privileged helper still exists after uninstall"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -2564,6 +2744,201 @@ else
 fi
 
 echo ""
+echo "--- Web upgrader: failed sudoers preflight preserves live install ---"
+
+PREFLIGHT_BINARY="/tmp/amneziawg-web-upgrade-preflight"
+cat > "${PREFLIGHT_BINARY}" <<'PREFLIGHTEOF'
+#!/bin/bash
+echo "this binary must not be installed"
+PREFLIGHTEOF
+chmod +x "${PREFLIGHT_BINARY}"
+
+PREFLIGHT_VISUDO_DIR=$(mktemp -d /tmp/amneziawg-visudo-fail.XXXXXX)
+cat > "${PREFLIGHT_VISUDO_DIR}/visudo" <<'VISUDOEOF'
+#!/bin/bash
+echo "mock visudo rejection" >&2
+exit 1
+VISUDOEOF
+chmod +x "${PREFLIGHT_VISUDO_DIR}/visudo"
+
+PREFLIGHT_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+PREFLIGHT_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
+PREFLIGHT_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
+touch /tmp/awg-web-mock-started
+rm -f /tmp/systemctl-calls.log
+
+WEB_UPGRADE_PREFLIGHT_RC=0
+WEB_UPGRADE_PREFLIGHT_OUTPUT=$(PATH="${PREFLIGHT_VISUDO_DIR}:${PATH}" \
+	bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${PREFLIGHT_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--force 2>&1) || WEB_UPGRADE_PREFLIGHT_RC=$?
+
+PREFLIGHT_FAILED=0
+if [[ "${WEB_UPGRADE_PREFLIGHT_RC}" -eq 0 ]]; then
+	echo "FAIL: Upgrader accepted a sudoers file rejected by visudo"
+	PREFLIGHT_FAILED=1
+fi
+if [[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != \
+		"${PREFLIGHT_BINARY_HASH}" ]] || \
+		[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != \
+		"${PREFLIGHT_HELPER_HASH}" ]] || \
+		[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != \
+		"${PREFLIGHT_SUDOERS_HASH}" ]]; then
+	echo "FAIL: Failed sudoers preflight changed a live install artifact"
+	PREFLIGHT_FAILED=1
+fi
+if grep -q "stop amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "FAIL: Failed sudoers preflight stopped the service"
+	PREFLIGHT_FAILED=1
+fi
+if compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
+		compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
+		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null; then
+	echo "FAIL: Failed sudoers preflight left a staged artifact behind"
+	PREFLIGHT_FAILED=1
+fi
+if [[ "${PREFLIGHT_FAILED}" -eq 0 ]]; then
+	echo "OK: Failed sudoers preflight preserves artifacts, service state, and cleans staging"
+else
+	echo "  Output: ${WEB_UPGRADE_PREFLIGHT_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+rm -f "${PREFLIGHT_BINARY}"
+rm -rf "${PREFLIGHT_VISUDO_DIR}"
+
+echo ""
+echo "--- Web upgrader: failed binary commit rolls back privilege artifacts ---"
+
+ROLLBACK_BINARY="/tmp/amneziawg-web-upgrade-rollback"
+cat > "${ROLLBACK_BINARY}" <<'ROLLBACKEOF'
+#!/bin/bash
+echo "this binary rename must fail"
+ROLLBACKEOF
+chmod +x "${ROLLBACK_BINARY}"
+
+ROLLBACK_MV_DIR=$(mktemp -d /tmp/amneziawg-mv-fail.XXXXXX)
+cat > "${ROLLBACK_MV_DIR}/mv" <<'MVEOF'
+#!/bin/bash
+last_arg="${!#}"
+if [[ "${last_arg}" == "${FAIL_MV_DEST:?}" ]]; then
+	exit 73
+fi
+exec /usr/bin/mv "$@"
+MVEOF
+chmod +x "${ROLLBACK_MV_DIR}/mv"
+
+ROLLBACK_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+ROLLBACK_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
+ROLLBACK_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
+touch /tmp/awg-web-mock-started
+rm -f /tmp/systemctl-calls.log
+
+WEB_UPGRADE_ROLLBACK_RC=0
+WEB_UPGRADE_ROLLBACK_OUTPUT=$(FAIL_MV_DEST="${WEB_TEST_INSTALL_DIR}/amneziawg-web" \
+	PATH="${ROLLBACK_MV_DIR}:${PATH}" \
+	bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${ROLLBACK_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--force 2>&1) || WEB_UPGRADE_ROLLBACK_RC=$?
+
+ROLLBACK_FAILED=0
+if [[ "${WEB_UPGRADE_ROLLBACK_RC}" -eq 0 ]]; then
+	echo "FAIL: Upgrader succeeded despite the forced binary rename failure"
+	ROLLBACK_FAILED=1
+fi
+if [[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != \
+		"${ROLLBACK_BINARY_HASH}" ]] || \
+		[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != \
+		"${ROLLBACK_HELPER_HASH}" ]] || \
+		[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != \
+		"${ROLLBACK_SUDOERS_HASH}" ]]; then
+	echo "FAIL: Binary commit failure did not restore all live artifacts"
+	ROLLBACK_FAILED=1
+fi
+if ! grep -q "stop amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+		! grep -q "start amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "FAIL: Rollback did not restore the previously active service state"
+	ROLLBACK_FAILED=1
+fi
+if compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
+		compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+		compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
+		compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
+		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null; then
+	echo "FAIL: Binary commit rollback left a staged or rollback artifact behind"
+	ROLLBACK_FAILED=1
+fi
+if [[ "${ROLLBACK_FAILED}" -eq 0 ]]; then
+	echo "OK: Binary commit failure restores artifacts and the active service"
+else
+	echo "  Output: ${WEB_UPGRADE_ROLLBACK_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+
+# The first and second rename failures must not attempt to overwrite the
+# unchanged failing destination during rollback.  For the sudoers case, make
+# the old helper byte-distinct so its successful first commit must be undone.
+for EARLY_FAIL_DEST in "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
+	if [[ "${EARLY_FAIL_DEST}" == "${SUDOERS_FILE}" ]]; then
+		printf '\n# rollback sentinel\n' >> "${PRIVILEGED_HELPER}"
+	fi
+	EARLY_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+	EARLY_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
+	EARLY_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
+	touch /tmp/awg-web-mock-started
+	rm -f /tmp/systemctl-calls.log
+
+	EARLY_UPGRADE_RC=0
+	EARLY_UPGRADE_OUTPUT=$(FAIL_MV_DEST="${EARLY_FAIL_DEST}" \
+		PATH="${ROLLBACK_MV_DIR}:${PATH}" \
+		bash "${WEB_UPGRADER_IMPL}" \
+		--binary "${ROLLBACK_BINARY}" \
+		--install-dir "${WEB_TEST_INSTALL_DIR}" \
+		--env-file "${WEB_TEST_ENV_FILE}" \
+		--data-dir "${WEB_TEST_DATA_DIR}" \
+		--force 2>&1) || EARLY_UPGRADE_RC=$?
+
+	EARLY_FAILED=0
+	if [[ "${EARLY_UPGRADE_RC}" -eq 0 ]] || \
+			[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != \
+			"${EARLY_BINARY_HASH}" ]] || \
+			[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != \
+			"${EARLY_HELPER_HASH}" ]] || \
+			[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != \
+			"${EARLY_SUDOERS_HASH}" ]]; then
+		EARLY_FAILED=1
+	fi
+	if ! grep -q "stop amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+			! grep -q "start amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null; then
+		EARLY_FAILED=1
+	fi
+	if compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
+			compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+			compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
+			compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
+			compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null; then
+		EARLY_FAILED=1
+	fi
+
+	if [[ "${EARLY_FAILED}" -eq 0 ]]; then
+		echo "OK: Commit failure at ${EARLY_FAIL_DEST} preserves artifacts and service state"
+	else
+		echo "FAIL: Commit failure at ${EARLY_FAIL_DEST} was not recovered cleanly"
+		echo "  Output: ${EARLY_UPGRADE_OUTPUT}"
+		FAILED=$((FAILED + 1))
+	fi
+done
+
+rm -f "${ROLLBACK_BINARY}"
+rm -rf "${ROLLBACK_MV_DIR}"
+
+echo ""
 echo "--- Web upgrader: successful upgrade (service active) ---"
 
 # Create a new stub binary with different content to verify replacement
@@ -2626,6 +3001,27 @@ if [[ -x "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
 	echo "OK: Upgraded binary is executable"
 else
 	echo "FAIL: Upgraded binary is not executable"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify the upgrader refreshes both sides of the privilege boundary.
+if cmp -s "${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-privileged" \
+	"${PRIVILEGED_HELPER}"; then
+	echo "OK: Upgrader refreshed the privileged helper"
+else
+	echo "FAIL: Upgrader did not install the current privileged helper"
+	FAILED=$((FAILED + 1))
+fi
+
+if grep -Fxq "awg-web ALL=(root) NOPASSWD: ${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; then
+	echo "OK: Upgrader refreshed the helper-only sudoers rule"
+else
+	echo "FAIL: Upgrader did not preserve the helper-only sudoers rule"
+	FAILED=$((FAILED + 1))
+fi
+
+if command -v visudo >/dev/null 2>&1 && ! visudo -cf "${SUDOERS_FILE}" >/dev/null 2>&1; then
+	echo "FAIL: Upgrader generated a sudoers rule rejected by visudo"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -3875,9 +4271,9 @@ echo "=== Phase 7: Service startup tests complete ==="
 # - The mock awg binary supports `show all dump` (tab-separated format)
 # - The mock sudo delegates to the actual command (we are root in Docker)
 # - The enhanced stub binary runs an HTTP server (python3 preferred, perl fallback) that also:
-#   1. calls `sudo /usr/bin/awg show all dump` (or our mock equivalent)
+#   1. calls the installed privileged helper's `show-all` operation via sudo
 #   2. stores the output for retrieval via /api/peers
-# - This validates the full chain: service → sudo → awg → parse → API
+# - This validates the full chain: service → sudo → helper → awg → parse → API
 # - This test would have caught the real-box failure (Operation not permitted)
 #
 echo ""
@@ -3886,7 +4282,7 @@ echo "=== Phase 8: Peer visibility via AWG polling ==="
 if [[ "${HAVE_HTTP_RUNTIME}" != "true" ]]; then
 	echo "SKIP: Peer visibility test skipped (no python3/perl runtime available)"
 else
-	# Create an enhanced stub that simulates the poller calling sudo awg show all dump
+	# Create an enhanced stub that simulates the poller calling the helper.
 	PHASE8_PORT=18743
 	rm -f "${WEB_TEST_ENV_FILE}"
 	rm -rf "${WEB_TEST_DATA_DIR}"
@@ -3905,13 +4301,13 @@ else
 		--password-hash "${TEST_PASSWORD_HASH}" \
 		--no-start --no-enable >/dev/null 2>&1
 
-	# Build a stub that calls sudo /usr/bin/awg show all dump and serves the result
+	# Build a stub that calls the privileged helper and serves the result.
 	PHASE8_STUB="${WEB_TEST_INSTALL_DIR}/amneziawg-web"
 	cat > "${PHASE8_STUB}" <<'PHASE8STUBEOF'
 #!/bin/bash
 # Enhanced stub: simulates amneziawg-web with AWG polling.
 # 1. Creates DB file
-# 2. Calls sudo -n /usr/bin/awg show all dump (or mock equivalent)
+# 2. Calls sudo -n /usr/local/libexec/amneziawg-web-privileged show-all
 # 3. Serves parsed results via /api/peers
 
 if [[ -z "${AWG_WEB_DB}" ]]; then
@@ -3931,10 +4327,10 @@ fi
 LISTEN="${AWG_WEB_LISTEN:-0.0.0.0:8080}"
 PORT="${LISTEN##*:}"
 
-# Call sudo awg show all dump and capture the output.
+# Call the privileged helper and capture the AWG dump.
 # This exercises the exact privilege path the real app uses.
-AWG_DUMP=$(/usr/bin/sudo -n /usr/bin/awg show all dump 2>&1) || {
-	echo "ERROR: sudo awg show all dump failed: ${AWG_DUMP}" >&2
+AWG_DUMP=$(/usr/bin/sudo -n /usr/local/libexec/amneziawg-web-privileged show-all 2>&1) || {
+	echo "ERROR: privileged AWG show-all failed: ${AWG_DUMP}" >&2
 	# Still start the server, but report the error via /api/peers
 	AWG_DUMP="POLL_ERROR: ${AWG_DUMP}"
 }
@@ -4075,7 +4471,7 @@ PHASE8STUBEOF
 		FAILED=$((FAILED + 1))
 	fi
 
-	# Test 1: Verify the sudo→awg chain works (no "Operation not permitted")
+	# Test 1: Verify the sudo→helper→awg chain works.
 	if [[ "${PHASE8_UP}" == "true" ]]; then
 		PEERS_RESPONSE="$(http_get_body "http://127.0.0.1:${PHASE8_PORT}/api/peers" 2>/dev/null)" || PEERS_RESPONSE=""
 		PHASE8_RESPONSE_VALID=true

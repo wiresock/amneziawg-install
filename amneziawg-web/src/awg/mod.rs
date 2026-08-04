@@ -1,25 +1,25 @@
 //! AWG integration layer.
 //!
-//! Executes `sudo /usr/bin/awg …` via `std::process::Command`
-//! (NO shell interpolation) and parses the output into [`AwgInterface`] /
-//! [`AwgPeer`] structs.
+//! Executes a root-owned privileged helper via `sudo` and
+//! `std::process::Command` (NO shell interpolation), then parses AWG output
+//! into [`AwgInterface`] / [`AwgPeer`] structs.
 //!
 //! ## Privilege model
 //!
 //! Managing AWG interface state requires `CAP_NET_ADMIN`.  The web service
 //! runs as a dedicated non-root user (`awg-web`).  Rather than running the
 //! entire service as root, the installer configures a tightly-scoped sudoers
-//! drop-in (`/etc/sudoers.d/amneziawg-web`) that allows **only**:
+//! drop-in (`/etc/sudoers.d/amneziawg-web`) that allows only a root-owned
+//! validator:
 //!
 //! ```text
-//! awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, \
-//!     /usr/bin/awg set * peer * remove, \
-//!     /usr/bin/awg syncconf * /dev/stdin, \
-//!     /usr/bin/awg-quick strip *
+//! awg-web ALL=(root) NOPASSWD: /usr/local/libexec/amneziawg-web-privileged
 //! ```
 //!
-//! This grants the minimum privilege needed for AWG inspection, removing
-//! disabled peers, and re-adding enabled peers to the running interface.
+//! The helper strictly validates the requested operation, argument count,
+//! interface/client name, peer keys, AllowedIPs, and configuration path.
+//! Server-config mutations are semantic, locked, and atomic.  This avoids
+//! unsafe sudoers argument globs and works with both sudo.ws and sudo-rs.
 //!
 //! ## Output format assumptions
 //!
@@ -94,18 +94,18 @@ pub const SUDO_BIN: &str = "/usr/bin/sudo";
 /// Absolute path to the `awg` binary.
 const AWG_BIN: &str = "/usr/bin/awg";
 
-/// Absolute path to the `awg-quick` binary.
-const AWG_QUICK_BIN: &str = "/usr/bin/awg-quick";
+/// Root-owned validator installed by the web-panel installer.
+const PRIVILEGED_HELPER_BIN: &str = "/usr/local/libexec/amneziawg-web-privileged";
 
-/// Execute `sudo /usr/bin/awg show all dump` and return parsed interfaces.
+/// Execute the helper's `show-all` operation and return parsed interfaces.
 ///
 /// Uses absolute paths for both `sudo` and `awg` to prevent PATH
 /// manipulation attacks.  The service user must be granted passwordless
-/// sudo for exactly this command — see the sudoers drop-in installed by
-/// `amneziawg-web-install.sh`.
+/// sudo for the helper path — see the sudoers drop-in installed by
+/// `amneziawg-web-install.sh`.  The helper accepts only known operations.
 pub fn show_all_dump() -> Result<Vec<AwgInterface>, AwgError> {
     let output = Command::new(SUDO_BIN)
-        .args(["-n", AWG_BIN, "show", "all", "dump"])
+        .args(["-n", PRIVILEGED_HELPER_BIN, "show-all"])
         .output()?;
 
     if !output.status.success() {
@@ -123,17 +123,20 @@ pub fn show_all_dump() -> Result<Vec<AwgInterface>, AwgError> {
 
 /// Remove a single peer from a running AWG interface.
 ///
-/// Executes `sudo -n /usr/bin/awg set <interface> peer <pubkey> remove`.
-/// The sudoers drop-in installed by the installer restricts `awg set` to
-/// only the `remove` sub-command, and the arguments are passed as an
-/// explicit array (no shell interpolation).
+/// Executes the helper's `remove-peer <interface> <pubkey>` operation.  The
+/// helper validates both values before constructing the fixed `awg set …
+/// remove` argument array.
 ///
 /// Returns `Ok(())` if the peer was removed or the command exited
 /// successfully (e.g. the peer was already absent).
 pub fn remove_peer(interface: &str, public_key: &str) -> Result<(), AwgError> {
     let output = Command::new(SUDO_BIN)
         .args([
-            "-n", AWG_BIN, "set", interface, "peer", public_key, "remove",
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "remove-peer",
+            interface,
+            public_key,
         ])
         .output()?;
 
@@ -151,13 +154,13 @@ pub fn remove_peer(interface: &str, public_key: &str) -> Result<(), AwgError> {
 
 /// Obtain the stripped AWG config for a given interface.
 ///
-/// Executes `sudo -n /usr/bin/awg-quick strip <interface>` and returns the
-/// config text with non-WG directives (Address, DNS, PostUp, etc.) removed.
+/// Executes the helper's `strip-interface <interface>` operation and returns
+/// the config text with non-WG directives (Address, DNS, PostUp, etc.) removed.
 /// The `[Interface]` and `[Peer]` sections with their WireGuard/AWG-specific
 /// keys are preserved.
 pub fn strip_interface(interface: &str) -> Result<String, AwgError> {
     let strip_output = Command::new(SUDO_BIN)
-        .args(["-n", AWG_QUICK_BIN, "strip", interface])
+        .args(["-n", PRIVILEGED_HELPER_BIN, "strip-interface", interface])
         .output()?;
 
     if !strip_output.status.success() {
@@ -181,10 +184,11 @@ pub fn strip_interface(interface: &str) -> Result<String, AwgError> {
 ///    `disabled_keys`, so disabled peers are **never** piped into `syncconf`
 ///    and cannot be temporarily reactivated.
 /// 3. Pipes the filtered config into
-///    `sudo -n /usr/bin/awg syncconf <interface> /dev/stdin` which adds any
-///    peers present in the config but missing from the running interface and
-///    updates peers whose settings have changed.  Peers already active on the
-///    interface but absent from the config file are left untouched.
+///    the helper's `sync-interface <interface>` operation.  The helper pipes
+///    stdin to `awg syncconf <interface> /dev/stdin`, adding peers present in
+///    the config but missing from the running interface and updating peers
+///    whose settings have changed.  Peers already active on the interface but
+///    absent from the config file are left untouched.
 pub fn sync_interface(
     interface: &str,
     disabled_keys: &std::collections::HashSet<String>,
@@ -197,7 +201,7 @@ pub fn sync_interface(
 
     // Step 3: pipe the filtered config into `awg syncconf`.
     let mut child = Command::new(SUDO_BIN)
-        .args(["-n", AWG_BIN, "syncconf", interface, "/dev/stdin"])
+        .args(["-n", PRIVILEGED_HELPER_BIN, "sync-interface", interface])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -300,14 +304,14 @@ pub fn genpsk() -> Result<String, AwgError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Read a root-owned file via `sudo -n /usr/bin/cat`.
+/// Read an approved root-owned file through the privileged helper.
 ///
 /// Used to read the params file and server config without granting the
 /// service user direct filesystem access to sensitive files.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn read_file_via_sudo(path: &std::path::Path) -> Result<String, AwgError> {
     let output = Command::new(SUDO_BIN)
-        .args(["-n", "/usr/bin/cat", "--"])
+        .args(["-n", PRIVILEGED_HELPER_BIN, "read-file"])
         .arg(path)
         .output()?;
 
@@ -322,15 +326,29 @@ pub fn read_file_via_sudo(path: &std::path::Path) -> Result<String, AwgError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Append content to a root-owned file via `sudo -n /usr/bin/tee -a`.
+/// Append one strictly validated peer block through the privileged helper.
 ///
 /// The content is piped via stdin to avoid shell interpolation.  Used to
 /// add peer blocks to the server config file.
 #[cfg_attr(not(unix), allow(dead_code))]
-pub fn append_file_via_sudo(path: &std::path::Path, content: &str) -> Result<(), AwgError> {
+pub fn append_peer_via_sudo(
+    interface: &str,
+    name: &str,
+    public_key: &str,
+    preshared_key: &str,
+    allowed_ips: &str,
+) -> Result<(), AwgError> {
+    let content = format!(
+        "PublicKey = {public_key}\nPresharedKey = {preshared_key}\nAllowedIPs = {allowed_ips}\n"
+    );
     let mut child = Command::new(SUDO_BIN)
-        .args(["-n", "/usr/bin/tee", "-a", "--"])
-        .arg(path)
+        .args([
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "append-peer",
+            interface,
+            name,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -338,7 +356,7 @@ pub fn append_file_via_sudo(path: &std::path::Path, content: &str) -> Result<(),
 
     if let Some(mut stdin) = child.stdin.take() {
         if let Err(e) = stdin.write_all(content.as_bytes()) {
-            tracing::debug!(error = %e, "stdin write to tee failed – aborting append");
+            tracing::debug!(error = %e, "stdin write to privileged helper failed – aborting append");
             // Ensure the stdin handle is closed before manipulating the child.
             drop(stdin);
             // Best-effort cleanup of the child process; ignore errors here
@@ -362,32 +380,18 @@ pub fn append_file_via_sudo(path: &std::path::Path, content: &str) -> Result<(),
     Ok(())
 }
 
-/// Overwrite a root-owned file via `sudo -n /usr/bin/tee`.
-///
-/// The full replacement content is piped via stdin (no shell interpolation).
-/// Used by native client removal to rewrite the server config after deleting
-/// a client block.
+/// Remove one validated, installer-managed client block through the helper.
 #[cfg_attr(not(unix), allow(dead_code))]
-pub fn write_file_via_sudo(path: &std::path::Path, content: &str) -> Result<(), AwgError> {
-    let mut child = Command::new(SUDO_BIN)
-        .args(["-n", "/usr/bin/tee", "--"])
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(content.as_bytes()) {
-            tracing::debug!(error = %e, "stdin write to tee failed – aborting overwrite");
-            drop(stdin);
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e.into());
-        }
-    }
-
-    let output = child.wait_with_output()?;
+pub fn remove_client_via_sudo(interface: &str, name: &str) -> Result<(), AwgError> {
+    let output = Command::new(SUDO_BIN)
+        .args([
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "remove-client",
+            interface,
+            name,
+        ])
+        .output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -695,8 +699,7 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
 
     // ── Command construction tests ──────────────────────────────────
 
-    /// Verify `show_all_dump` invokes `sudo -n /usr/bin/awg show all dump`
-    /// with explicit argument arrays and no shell wrapping.
+    /// Verify privileged operations invoke sudo through absolute paths.
     #[test]
     fn command_uses_sudo_with_absolute_paths() {
         // Build the same Command that show_all_dump() would construct.
@@ -709,30 +712,38 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
     fn constants_use_absolute_paths() {
         assert_eq!(SUDO_BIN, "/usr/bin/sudo");
         assert_eq!(AWG_BIN, "/usr/bin/awg");
-        assert_eq!(AWG_QUICK_BIN, "/usr/bin/awg-quick");
+        assert_eq!(
+            PRIVILEGED_HELPER_BIN,
+            "/usr/local/libexec/amneziawg-web-privileged"
+        );
     }
 
     /// Verify the command is assembled without shell interpolation.
     #[test]
     fn command_args_are_explicit_array() {
         let mut cmd = Command::new(SUDO_BIN);
-        cmd.args(["-n", AWG_BIN, "show", "all", "dump"]);
+        cmd.args(["-n", PRIVILEGED_HELPER_BIN, "show-all"]);
 
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
-        assert_eq!(args, vec!["-n", AWG_BIN, "show", "all", "dump"]);
+        assert_eq!(args, vec!["-n", PRIVILEGED_HELPER_BIN, "show-all"]);
     }
 
     // ── remove_peer command construction tests ──────────────────────
 
-    /// Verify `remove_peer` constructs the correct `awg set … peer … remove`
-    /// command with explicit argument array.
+    /// Verify `remove_peer` delegates to the validating helper.
     #[test]
     fn remove_peer_command_args() {
         let mut cmd = Command::new(SUDO_BIN);
-        cmd.args(["-n", AWG_BIN, "set", "awg0", "peer", "SOME_KEY=", "remove"]);
+        cmd.args([
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "remove-peer",
+            "awg0",
+            "SOME_KEY=",
+        ]);
 
         let args: Vec<_> = cmd
             .get_args()
@@ -740,32 +751,117 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
             .collect();
         assert_eq!(
             args,
-            vec!["-n", AWG_BIN, "set", "awg0", "peer", "SOME_KEY=", "remove"]
+            vec![
+                "-n",
+                PRIVILEGED_HELPER_BIN,
+                "remove-peer",
+                "awg0",
+                "SOME_KEY=",
+            ]
         );
     }
 
     // ── sync_interface command construction tests ───────────────────
 
-    /// Verify `awg-quick strip` command is constructed with absolute paths.
+    /// Verify `awg-quick strip` is delegated to the validating helper.
     #[test]
     fn awg_quick_strip_command_args() {
         let mut cmd = Command::new(SUDO_BIN);
-        cmd.args(["-n", AWG_QUICK_BIN, "strip", "awg0"]);
+        cmd.args(["-n", PRIVILEGED_HELPER_BIN, "strip-interface", "awg0"]);
 
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
-        assert_eq!(args, vec!["-n", AWG_QUICK_BIN, "strip", "awg0"]);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["-n", PRIVILEGED_HELPER_BIN, "strip-interface", "awg0"]
+        );
     }
 
-    /// Verify `awg syncconf` command uses `/dev/stdin` for piped input.
+    /// Verify `awg syncconf` is delegated to the validating helper.
     #[test]
     fn syncconf_command_args() {
         let mut cmd = Command::new(SUDO_BIN);
-        cmd.args(["-n", AWG_BIN, "syncconf", "awg0", "/dev/stdin"]);
+        cmd.args(["-n", PRIVILEGED_HELPER_BIN, "sync-interface", "awg0"]);
 
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
         assert_eq!(
             args,
-            vec!["-n", AWG_BIN, "syncconf", "awg0", "/dev/stdin"]
+            vec!["-n", PRIVILEGED_HELPER_BIN, "sync-interface", "awg0"]
+        );
+    }
+
+    #[test]
+    fn config_file_commands_use_privileged_helper() {
+        let mut read_cmd = Command::new(SUDO_BIN);
+        read_cmd.args([
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "read-file",
+            "/etc/amnezia/amneziawg/params",
+        ]);
+        let read_args: Vec<_> = read_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            read_args,
+            vec![
+                "-n",
+                PRIVILEGED_HELPER_BIN,
+                "read-file",
+                "/etc/amnezia/amneziawg/params",
+            ]
+        );
+
+        let mut append_cmd = Command::new(SUDO_BIN);
+        append_cmd.args([
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "append-peer",
+            "awg0",
+            "alice",
+        ]);
+        let append_args: Vec<_> = append_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            append_args,
+            vec![
+                "-n",
+                PRIVILEGED_HELPER_BIN,
+                "append-peer",
+                "awg0",
+                "alice",
+            ]
+        );
+
+        let mut cmd = Command::new(SUDO_BIN);
+        cmd.args([
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "remove-client",
+            "awg0",
+            "alice",
+        ]);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-n",
+                PRIVILEGED_HELPER_BIN,
+                "remove-client",
+                "awg0",
+                "alice",
+            ]
         );
     }
 
