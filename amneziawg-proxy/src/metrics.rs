@@ -171,7 +171,7 @@ impl ClientMetrics {
 /// degrading camouflage to the silence a bare WireGuard port would give. That
 /// only costs obfuscation — the relay datapath does not consume this budget,
 /// so real client traffic is unaffected.
-pub struct GlobalProbeBudget {
+pub(crate) struct GlobalProbeBudget {
     /// Packed: high 32 bits = bytes remaining this second, low 32 = timestamp.
     state: AtomicU64,
     max_bytes_per_sec: u32,
@@ -183,12 +183,12 @@ pub struct GlobalProbeBudget {
     /// not these counters -- a test that checked the admitted count passed
     /// even with the gate deleted, because `try_consume` records the
     /// reservation whether or not the caller honours the answer.
-    pub bytes_admitted: AtomicU64,
-    pub bytes_refused: AtomicU64,
+    pub(crate) bytes_admitted: AtomicU64,
+    pub(crate) bytes_refused: AtomicU64,
 }
 
 impl GlobalProbeBudget {
-    pub fn new(max_bytes_per_sec: u32) -> Self {
+    pub(crate) fn new(max_bytes_per_sec: u32) -> Self {
         Self {
             state: AtomicU64::new(pack(max_bytes_per_sec, coarse_now_secs())),
             max_bytes_per_sec,
@@ -201,12 +201,12 @@ impl GlobalProbeBudget {
     /// caller may send. Charge *before* sending, not after: charging after the
     /// fact would let an unbounded burst through in the window between the
     /// check and the accounting.
-    pub fn try_consume(&self, bytes: usize) -> bool {
+    pub(crate) fn try_consume(&self, bytes: usize) -> bool {
         self.try_consume_at(bytes, coarse_now_secs())
     }
 
     /// Same, with an injectable clock so tests need no real sleeps.
-    pub fn try_consume_at(&self, bytes: usize, now: u32) -> bool {
+    pub(crate) fn try_consume_at(&self, bytes: usize, now: u32) -> bool {
         // A single reply larger than the whole per-second allowance can never
         // be admitted; treat it as suppressed rather than looping forever.
         let want = match u32::try_from(bytes) {
