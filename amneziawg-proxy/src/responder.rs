@@ -730,7 +730,12 @@ pub(crate) struct SipDialog {
 }
 
 const SIP_SCAN_LIMIT: usize = 2048;
-const SIP_MAX_RESPONSE_SIZE: usize = 512;
+/// Upper bound on a generated SIP response, enforced by `SipDialog::from_request`'s
+/// Via-byte and reflected-response gates. Public so the deferred-response path can
+/// charge the byte budget *before* generating the packet: the alternative is
+/// generating first and discovering the budget is spent, which wastes the work and
+/// makes the accounting depend on where in the closure the check sits.
+pub const SIP_MAX_RESPONSE_SIZE: usize = 512;
 
 impl SipDialog {
     /// Create a new dialog by parsing a SIP request.  Returns `None` if the

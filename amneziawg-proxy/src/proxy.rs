@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::backend;
 use crate::config::{AwgParams, ProxyConfig};
-use crate::metrics::MetricsStore;
+use crate::metrics::{GlobalProbeBudget, MetricsStore};
 use crate::quic_handshake::{QuicHandshakeResponder, QuicResponse};
 use crate::responder::{self, DnsEcho, Protocol, SipDialog, SipDialogStage};
 use crate::session::SessionTable;
@@ -103,6 +103,10 @@ pub struct Proxy {
     frontend: Arc<UdpSocket>,
     sessions: Arc<SessionTable>,
     metrics: Arc<MetricsStore>,
+    /// Aggregate ceiling on unauthenticated reply bytes. Shared with every
+    /// detached task that can emit one, because a budget that some send paths
+    /// bypass is not a ceiling.
+    probe_budget: Arc<GlobalProbeBudget>,
     fixed_protocol: Option<Protocol>,
     client_protocols: Arc<DashMap<SocketAddr, Protocol>>,
     awg_params: Option<Arc<AwgParams>>,
@@ -367,6 +371,7 @@ impl Proxy {
         );
 
         Ok(Self {
+            probe_budget: Arc::new(GlobalProbeBudget::new(config.probe_reply_bytes_per_sec)),
             config,
             frontend,
             sessions,
@@ -399,6 +404,7 @@ impl Proxy {
         awg_params: Option<AwgParams>,
     ) -> Self {
         Self {
+            probe_budget: Arc::new(GlobalProbeBudget::new(config.probe_reply_bytes_per_sec)),
             config,
             frontend,
             sessions,
@@ -789,6 +795,12 @@ impl Proxy {
         }
 
         if let Some(response) = probe_response {
+            // Aggregate ceiling, checked after the per-client bucket because
+            // this one is the backstop that source spoofing cannot refresh.
+            if !self.probe_budget.try_consume(response.len()) {
+                debug!(%client_addr, "probe response suppressed by the global byte budget");
+                return;
+            }
             if let Err(e) = self.frontend.send_to(&response, client_addr).await {
                 warn!(%client_addr, error = %e, "failed to send probe response");
             } else if let Some(ref metrics) = metrics_ref {
@@ -833,6 +845,10 @@ impl Proxy {
 
                 let response =
                     responder::generate_response_for_client(Protocol::Sip, data, client_addr);
+                if !self.probe_budget.try_consume(response.len()) {
+                    debug!(%client_addr, "SIP fallback response suppressed by the global byte budget");
+                    return;
+                }
                 match self.frontend.send_to(&response, client_addr).await {
                     Ok(_) => {
                         if let Some(metrics) = metrics_ref {
@@ -956,6 +972,13 @@ impl Proxy {
                 debug!(%client_addr, method = %method, "SIP response rate limited");
                 continue;
             }
+            // Charge every datagram, not every request: the Invited arm
+            // returns both 100 Trying and 180 Ringing, so a per-request charge
+            // would let SIP emit at twice the accounted rate.
+            if !self.probe_budget.try_consume(pkt.len()) {
+                debug!(%client_addr, method = %method, "SIP response suppressed by the global byte budget");
+                continue;
+            }
             match self.frontend.send_to(pkt, client_addr).await {
                 Ok(_) => {
                     if let Some(metrics) = metrics_ref {
@@ -990,6 +1013,7 @@ impl Proxy {
             let frontend = Arc::clone(&self.frontend);
             let dialogs = Arc::clone(&self.sip_dialogs);
             let metrics = metrics_ref.as_ref().map(Arc::clone);
+            let probe_budget = Arc::clone(&self.probe_budget);
             let mut shutdown_rx = self.shutdown_tx.subscribe();
             let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
             let generation = self.sip_deferred_generation.fetch_add(1, Ordering::Relaxed);
@@ -1013,6 +1037,11 @@ impl Proxy {
                 let ringing_allowed = metrics
                     .as_ref()
                     .map_or(true, |metrics| metrics.try_acquire_probe());
+                // Deferred datagrams are emitted from a detached task long
+                // after the request was charged, so they must draw on the same
+                // budget or the timers become an uncounted egress path.
+                let ringing_allowed =
+                    ringing_allowed && probe_budget.try_consume(responder::SIP_MAX_RESPONSE_SIZE);
                 if ringing_allowed {
                     let sent_len = dialogs.get_mut(&client_addr).and_then(|mut d| {
                         if d.stage != SipDialogStage::Invited || d.call_id_value != expected_call_id
@@ -1061,6 +1090,8 @@ impl Proxy {
                 let ok_allowed = metrics
                     .as_ref()
                     .map_or(true, |metrics| metrics.try_acquire_probe());
+                let ok_allowed =
+                    ok_allowed && probe_budget.try_consume(responder::SIP_MAX_RESPONSE_SIZE);
                 if ok_allowed {
                     let sent_len = dialogs.get_mut(&client_addr).and_then(|mut d| {
                         if !matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
@@ -1139,6 +1170,7 @@ impl Proxy {
         let query = query.to_vec();
         let metrics = Arc::clone(metrics);
         let frontend = Arc::clone(&self.frontend);
+        let probe_budget = Arc::clone(&self.probe_budget);
         let timeout = self.dns_upstream_timeout;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -1156,6 +1188,13 @@ impl Proxy {
                 }
                 _ = wait_for_shutdown(&mut shutdown_rx) => return,
             };
+            // The forwarded answer is attacker-influenced in size -- this is
+            // the amplification path -- so it is charged like any other
+            // unauthenticated reply.
+            if !probe_budget.try_consume(response.len()) {
+                debug!(%client_addr, "forwarded DNS response suppressed by the global byte budget");
+                return;
+            }
             match frontend.send_to(&response, client_addr).await {
                 Ok(_) => {
                     metrics.record_probe_bytes(response.len());
@@ -1635,6 +1674,7 @@ mod tests {
             session_ttl_secs: 1,
             cleanup_interval_secs: 3600, // swept manually below
             rate_limit_per_sec: 16,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "auto".into(),
             quic_handshake_enabled: false,
             quic_certificate_domain: "localhost".into(),
@@ -1720,6 +1760,7 @@ mod tests {
             session_ttl_secs: 1,
             cleanup_interval_secs: 3600, // swept manually below
             rate_limit_per_sec: 16,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "auto".into(),
             quic_handshake_enabled: false,
             quic_certificate_domain: "localhost".into(),
@@ -1829,6 +1870,7 @@ mod tests {
             session_ttl_secs: 1,
             cleanup_interval_secs: 3600, // swept manually below
             rate_limit_per_sec: 16,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "auto".into(),
             quic_handshake_enabled: false,
             quic_certificate_domain: "localhost".into(),
@@ -1898,6 +1940,7 @@ mod tests {
             session_ttl_secs: 60,
             cleanup_interval_secs: 60,
             rate_limit_per_sec: 16,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "auto".into(),
             quic_handshake_enabled: false,
             quic_certificate_domain: "localhost".into(),
@@ -1952,6 +1995,7 @@ mod tests {
             session_ttl_secs: 60,
             cleanup_interval_secs: 60,
             rate_limit_per_sec: 16,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "quic".into(),
             quic_handshake_enabled: true,
             quic_certificate_domain: "localhost".into(),
@@ -2044,6 +2088,7 @@ mod tests {
             session_ttl_secs: 60,
             cleanup_interval_secs: 60,
             rate_limit_per_sec: 16,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "quic".into(),
             quic_handshake_enabled: false, // exercises the VN fallback path explicitly
             quic_certificate_domain: "localhost".into(),
@@ -2241,6 +2286,7 @@ mod tests {
             session_ttl_secs: 60,
             cleanup_interval_secs: 60,
             rate_limit_per_sec: 16,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "dns".into(),
             quic_handshake_enabled: false,
             quic_certificate_domain: "localhost".into(),
@@ -2281,6 +2327,66 @@ mod tests {
         assert_eq!(echo.qtype, [0x00, 0x01], "QTYPE captured");
     }
 
+    /// The per-client limiter is keyed by source address, so an attacker who
+    /// spoofs the source never hits it twice. This asserts the aggregate byte
+    /// ceiling actually binds *on the send path*.
+    ///
+    /// It counts datagrams that really arrive at a socket rather than the
+    /// budget's own counters: `try_consume` increments those whether or not
+    /// the caller honours its answer, so asserting on them passes even if the
+    /// gate is deleted. Verified by mutation — replacing the gate with
+    /// `let _ = ...try_consume(..)` must make this test fail.
+    #[tokio::test]
+    async fn global_byte_budget_binds_on_the_send_path() {
+        const PROBES: usize = 200;
+        const BUDGET: u32 = 512;
+
+        let victim = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let victim_addr = victim.local_addr().unwrap();
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: "127.0.0.1:1".into(),
+            // Deliberately generous: anything suppressed below was suppressed
+            // by the global ceiling, not by the per-client bucket.
+            rate_limit_per_sec: 100_000,
+            probe_reply_bytes_per_sec: BUDGET,
+            imitate_protocol: "dns".into(),
+            quic_handshake_enabled: false,
+            dns_forward_enabled: false,
+            ..Default::default()
+        };
+
+        let proxy = Proxy::bind(config, None).await.unwrap();
+
+        for i in 0..PROBES {
+            proxy
+                .handle_client_packet(&dns_query([(i >> 8) as u8, i as u8]), victim_addr)
+                .await;
+        }
+
+        // Drain whatever actually arrived.
+        let mut received = 0usize;
+        let mut buf = [0u8; 2048];
+        while tokio::time::timeout(Duration::from_millis(50), victim.recv_from(&mut buf))
+            .await
+            .is_ok()
+        {
+            received += 1;
+        }
+
+        // A DNS SERVFAIL echo here is ~29 bytes, so a 512-byte ceiling admits
+        // roughly 17. Two seconds' worth is the flakiness allowance.
+        assert!(
+            received > 0,
+            "the ceiling must throttle, not silence: nothing was delivered"
+        );
+        assert!(
+            received < PROBES / 2,
+            "budget did not bind on the send path: {received} of {PROBES} probes were answered"
+        );
+    }
+
     /// Minimal well-formed DNS query: 12-byte header (given TXID, RD=1,
     /// QDCOUNT=1) plus a single `example.com` IN A question. Accepted by
     /// `detect_protocol` as `Protocol::Dns`.
@@ -2310,6 +2416,7 @@ mod tests {
             session_ttl_secs: 60,
             cleanup_interval_secs: 60,
             rate_limit_per_sec: 16,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "dns".into(),
             quic_handshake_enabled: false,
             quic_certificate_domain: "localhost".into(),
@@ -2411,6 +2518,7 @@ mod tests {
             session_ttl_secs: 60,
             cleanup_interval_secs: 60,
             rate_limit_per_sec,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "sip".into(),
             quic_handshake_enabled: false,
             quic_certificate_domain: "localhost".into(),
@@ -2468,6 +2576,7 @@ mod tests {
             session_ttl_secs: 60,
             cleanup_interval_secs: 60,
             rate_limit_per_sec: 16,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "auto".into(),
             quic_handshake_enabled: true,
             quic_certificate_domain: "cloudflare.com".into(),
@@ -2544,6 +2653,7 @@ mod tests {
             session_ttl_secs: 60,
             cleanup_interval_secs: 60,
             rate_limit_per_sec: 16,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "auto".into(),
             // QUIC would use the easily-identifiable VN fallback if it fired.
             quic_handshake_enabled: false,
@@ -2644,6 +2754,7 @@ mod tests {
             session_ttl_secs: 60,
             cleanup_interval_secs: 60,
             rate_limit_per_sec: 1,
+            probe_reply_bytes_per_sec: 32 * 1024,
             imitate_protocol: "quic".into(),
             quic_handshake_enabled: true,
             quic_certificate_domain: "localhost".into(),
