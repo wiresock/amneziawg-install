@@ -40,6 +40,8 @@ readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_ENV_FILE="/etc/amneziawg-web/env.conf"
 readonly DEFAULT_DATA_DIR="/var/lib/amneziawg-web"
 readonly BINARY_NAME="amneziawg-web"
+readonly PRIVILEGED_HELPER_NAME="amneziawg-web-privileged"
+readonly PRIVILEGED_HELPER_DEST="/usr/local/libexec/${PRIVILEGED_HELPER_NAME}"
 
 # Script location (for finding the service unit file relative to the repo)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,6 +58,104 @@ INSTALL_RUST=false
 FORCE="false"
 RESTART_MODE=""          # "" = auto-detect, "yes" = always, "no" = never
 REFRESH_UNIT="false"
+
+STAGED_BINARY=""
+STAGED_HELPER=""
+STAGED_SUDOERS=""
+ROLLBACK_BINARY=""
+ROLLBACK_HELPER=""
+ROLLBACK_SUDOERS=""
+HAD_LIVE_BINARY="false"
+HAD_LIVE_HELPER="false"
+HAD_LIVE_SUDOERS="false"
+SERVICE_WAS_ACTIVE="false"
+BINARY_COMMITTED="false"
+HELPER_COMMITTED="false"
+SUDOERS_COMMITTED="false"
+BINARY_RENAME_STARTED="false"
+HELPER_RENAME_STARTED="false"
+SUDOERS_RENAME_STARTED="false"
+TRANSACTION_ACTIVE="false"
+ACTIVATION_COMPLETE="false"
+ROLLBACK_FAILED="false"
+
+cleanup_staged_artifacts() {
+    local exit_code=$?
+
+    # Do not let a second signal interrupt recovery. A signal can arrive after
+    # an atomic rename but before Bash updates the corresponding state flag;
+    # refresh_commit_state resolves only that narrow window by checking that
+    # the staged pathname disappeared after its rename was explicitly started.
+    trap '' HUP INT TERM
+    if [[ "${TRANSACTION_ACTIVE}" == "true" && "${ACTIVATION_COMPLETE}" != "true" ]]; then
+        refresh_commit_state
+        if [[ "${BINARY_COMMITTED}" == "true" || \
+              "${HELPER_COMMITTED}" == "true" || \
+              "${SUDOERS_COMMITTED}" == "true" ]]; then
+            if systemctl stop "${SERVICE_NAME}" 2>/dev/null; then
+                if ! rollback_runtime_artifacts; then
+                    ROLLBACK_FAILED="true"
+                fi
+            else
+                warn "Could not stop ${SERVICE_NAME}; leaving rollback copies for manual recovery."
+                ROLLBACK_FAILED="true"
+            fi
+        fi
+        if [[ "${ROLLBACK_FAILED}" != "true" ]]; then
+            TRANSACTION_ACTIVE="false"
+        fi
+        if [[ "${exit_code}" -eq 0 ]]; then
+            exit_code=1
+        fi
+    fi
+
+    if [[ -n "${STAGED_BINARY}" ]]; then
+        rm -f -- "${STAGED_BINARY}" 2>/dev/null || true
+    fi
+    if [[ -n "${STAGED_HELPER}" ]]; then
+        rm -f -- "${STAGED_HELPER}" 2>/dev/null || true
+    fi
+    if [[ -n "${STAGED_SUDOERS}" ]]; then
+        rm -f -- "${STAGED_SUDOERS}" 2>/dev/null || true
+    fi
+    if [[ -n "${ROLLBACK_BINARY}" ]] && \
+            [[ "${ROLLBACK_FAILED}" != "true" || "${BINARY_COMMITTED}" != "true" ]]; then
+        rm -f -- "${ROLLBACK_BINARY}" 2>/dev/null || true
+        ROLLBACK_BINARY=""
+    fi
+    if [[ -n "${ROLLBACK_HELPER}" ]] && \
+            [[ "${ROLLBACK_FAILED}" != "true" || "${HELPER_COMMITTED}" != "true" ]]; then
+        rm -f -- "${ROLLBACK_HELPER}" 2>/dev/null || true
+        ROLLBACK_HELPER=""
+    fi
+    if [[ -n "${ROLLBACK_SUDOERS}" ]] && \
+            [[ "${ROLLBACK_FAILED}" != "true" || "${SUDOERS_COMMITTED}" != "true" ]]; then
+        rm -f -- "${ROLLBACK_SUDOERS}" 2>/dev/null || true
+        ROLLBACK_SUDOERS=""
+    fi
+
+    if [[ "${exit_code}" -ne 0 ]] && \
+            [[ "${SERVICE_WAS_ACTIVE}" == "true" ]] && \
+            [[ "${ROLLBACK_FAILED}" != "true" ]]; then
+        if systemctl start "${SERVICE_NAME}" && \
+                systemctl is-active --quiet "${SERVICE_NAME}"; then
+            info "Restored the previously active service after upgrade failure."
+        else
+            warn "Previous artifacts are intact, but ${SERVICE_NAME} could not be restarted."
+        fi
+    fi
+
+    if [[ "${ROLLBACK_FAILED}" == "true" ]]; then
+        report_retained_rollback_artifacts
+    fi
+
+    return "${exit_code}"
+}
+
+trap cleanup_staged_artifacts EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ── Output helpers ─────────────────────────────────────────────────────────────
 
@@ -546,6 +646,7 @@ print_plan() {
     printf '\n'
     printf 'Will REPLACE:\n'
     printf '  Binary:       %s  ←  %s\n' "${DEST_BINARY}" "${BINARY_SRC}"
+    printf '  Helper:       %s\n' "${PRIVILEGED_HELPER_DEST}"
     printf '\n'
     printf 'Service:\n'
     printf '  Status:       %s\n' "$(if [[ "${SERVICE_WAS_ACTIVE}" == "true" ]]; then echo "active"; else echo "inactive"; fi)"
@@ -562,6 +663,263 @@ print_plan() {
     printf '\n'
 }
 
+stage_privileged_helper() {
+    local helper_src="${SCRIPT_DIR}/${PRIVILEGED_HELPER_NAME}"
+    local helper_dir
+    helper_dir="$(dirname "${PRIVILEGED_HELPER_DEST}")"
+
+    if [[ ! -f "${helper_src}" ]] || [[ -L "${helper_src}" ]]; then
+        die "Privileged helper source is missing or unsafe: ${helper_src}"
+    fi
+    if [[ -L "${helper_dir}" ]]; then
+        die "Refusing to install privileged helper through symlinked directory: ${helper_dir}"
+    fi
+    if [[ -L "${PRIVILEGED_HELPER_DEST}" ]]; then
+        die "Refusing to replace symlink at privileged helper path: ${PRIVILEGED_HELPER_DEST}"
+    fi
+    if [[ -e "${PRIVILEGED_HELPER_DEST}" ]] && [[ ! -f "${PRIVILEGED_HELPER_DEST}" ]]; then
+        die "Privileged helper destination is not a regular file: ${PRIVILEGED_HELPER_DEST}"
+    fi
+
+    install -d -m 0755 -o root -g root -- "${helper_dir}"
+    STAGED_HELPER="$(mktemp "${PRIVILEGED_HELPER_DEST}.tmp.XXXXXX")" \
+        || die "Could not create temporary privileged helper"
+    install -m 0755 -o root -g root -- "${helper_src}" "${STAGED_HELPER}" \
+        || die "Could not stage privileged helper"
+    if ! /bin/bash -n "${STAGED_HELPER}"; then
+        die "Staged privileged helper failed its Bash syntax check"
+    fi
+    info "Staged privileged helper: ${PRIVILEGED_HELPER_DEST}"
+}
+
+stage_sudoers() {
+    local rule="${SERVICE_USER} ALL=(root) NOPASSWD: ${PRIVILEGED_HELPER_DEST}"
+
+    info "Staging sudoers drop-in: ${SUDOERS_FILE}"
+    mkdir -p "$(dirname "${SUDOERS_FILE}")"
+    STAGED_SUDOERS="$(mktemp "${SUDOERS_FILE}.tmp.XXXXXX")" \
+        || die "Could not create temporary sudoers file"
+    printf '# Allow amneziawg-web service to manage AWG state and peers.\n' \
+        > "${STAGED_SUDOERS}"
+    printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \
+        >> "${STAGED_SUDOERS}"
+    printf '%s\n' "${rule}" >> "${STAGED_SUDOERS}"
+    chmod 0440 "${STAGED_SUDOERS}"
+    chown root:root "${STAGED_SUDOERS}"
+
+    if command -v visudo &>/dev/null; then
+        local visudo_output=""
+        if visudo_output="$(visudo -cf "${STAGED_SUDOERS}" 2>&1)"; then
+            info "Staged sudoers rule validated: ${SUDOERS_FILE}"
+        else
+            warn "visudo validation failed for generated sudoers rule:"
+            if [[ -n "${visudo_output}" ]]; then
+                printf '%s\n' "${visudo_output}" >&2
+            fi
+            die "Sudoers file syntax check failed; the existing rule was preserved."
+        fi
+    else
+        info "visudo not available; skipping syntax check."
+    fi
+}
+
+stage_binary() {
+    STAGED_BINARY="$(mktemp "${DEST_BINARY}.upgrade-tmp.XXXXXX")" \
+        || die "Could not create temporary application binary"
+    install -m 0755 -o root -g root -- "${BINARY_SRC}" "${STAGED_BINARY}" \
+        || die "Could not stage upgraded binary"
+    info "Staged upgraded binary: ${DEST_BINARY}"
+}
+
+stage_rollback_artifacts() {
+    if [[ -L "${DEST_BINARY}" ]] || \
+            { [[ -e "${DEST_BINARY}" ]] && [[ ! -f "${DEST_BINARY}" ]]; }; then
+        die "Refusing to replace unsafe binary destination: ${DEST_BINARY}"
+    fi
+    if [[ -f "${DEST_BINARY}" ]]; then
+        ROLLBACK_BINARY="$(mktemp "${DEST_BINARY}.rollback.XXXXXX")" \
+            || die "Could not create application-binary rollback file"
+        cp -a -- "${DEST_BINARY}" "${ROLLBACK_BINARY}" \
+            || die "Could not back up the installed application binary"
+        HAD_LIVE_BINARY="true"
+    fi
+
+    if [[ -f "${PRIVILEGED_HELPER_DEST}" ]]; then
+        ROLLBACK_HELPER="$(mktemp "${PRIVILEGED_HELPER_DEST}.rollback.XXXXXX")" \
+            || die "Could not create privileged-helper rollback file"
+        cp -a -- "${PRIVILEGED_HELPER_DEST}" "${ROLLBACK_HELPER}" \
+            || die "Could not back up the installed privileged helper"
+        HAD_LIVE_HELPER="true"
+    fi
+
+    if [[ -L "${SUDOERS_FILE}" ]] || \
+            { [[ -e "${SUDOERS_FILE}" ]] && [[ ! -f "${SUDOERS_FILE}" ]]; }; then
+        die "Refusing to replace unsafe sudoers destination: ${SUDOERS_FILE}"
+    fi
+    if [[ -f "${SUDOERS_FILE}" ]]; then
+        ROLLBACK_SUDOERS="$(mktemp "${SUDOERS_FILE}.rollback.XXXXXX")" \
+            || die "Could not create sudoers rollback file"
+        cp -a -- "${SUDOERS_FILE}" "${ROLLBACK_SUDOERS}" \
+            || die "Could not back up the installed sudoers drop-in"
+        HAD_LIVE_SUDOERS="true"
+    fi
+}
+
+rollback_runtime_artifacts() {
+    local rollback_ok="true"
+
+    # Restore authorization first so the old binary regains its original
+    # command permissions before the transitional helper is removed.
+    if [[ "${SUDOERS_COMMITTED}" == "true" ]]; then
+        if [[ "${HAD_LIVE_SUDOERS}" == "true" ]]; then
+            if mv -fT -- "${ROLLBACK_SUDOERS}" "${SUDOERS_FILE}"; then
+                ROLLBACK_SUDOERS=""
+                SUDOERS_COMMITTED="false"
+            else
+                rollback_ok="false"
+            fi
+        elif rm -f -- "${SUDOERS_FILE}"; then
+            SUDOERS_COMMITTED="false"
+        else
+            rollback_ok="false"
+        fi
+    fi
+
+    if [[ "${HELPER_COMMITTED}" == "true" ]]; then
+        if [[ "${HAD_LIVE_HELPER}" == "true" ]]; then
+            if mv -fT -- "${ROLLBACK_HELPER}" "${PRIVILEGED_HELPER_DEST}"; then
+                ROLLBACK_HELPER=""
+                HELPER_COMMITTED="false"
+            else
+                rollback_ok="false"
+            fi
+        elif rm -f -- "${PRIVILEGED_HELPER_DEST}"; then
+            HELPER_COMMITTED="false"
+        else
+            rollback_ok="false"
+        fi
+    fi
+
+    # Restore the old application last, after its matching authorization and
+    # helper are back in place. Fresh-install-style destinations are removed.
+    if [[ "${BINARY_COMMITTED}" == "true" ]]; then
+        if [[ "${HAD_LIVE_BINARY}" == "true" ]]; then
+            if mv -fT -- "${ROLLBACK_BINARY}" "${DEST_BINARY}"; then
+                ROLLBACK_BINARY=""
+                BINARY_COMMITTED="false"
+            else
+                rollback_ok="false"
+            fi
+        elif rm -f -- "${DEST_BINARY}"; then
+            BINARY_COMMITTED="false"
+        else
+            rollback_ok="false"
+        fi
+    fi
+
+    [[ "${rollback_ok}" == "true" ]]
+}
+
+refresh_commit_state() {
+    if [[ "${HELPER_RENAME_STARTED}" == "true" ]] && \
+            [[ -n "${STAGED_HELPER}" ]] && [[ ! -e "${STAGED_HELPER}" ]] && \
+            [[ -e "${PRIVILEGED_HELPER_DEST}" ]]; then
+        HELPER_COMMITTED="true"
+    fi
+
+    if [[ "${SUDOERS_RENAME_STARTED}" == "true" ]] && \
+            [[ -n "${STAGED_SUDOERS}" ]] && [[ ! -e "${STAGED_SUDOERS}" ]] && \
+            [[ -e "${SUDOERS_FILE}" ]]; then
+        SUDOERS_COMMITTED="true"
+    fi
+
+    if [[ "${BINARY_RENAME_STARTED}" == "true" ]] && \
+            [[ -n "${STAGED_BINARY}" ]] && [[ ! -e "${STAGED_BINARY}" ]] && \
+            [[ -e "${DEST_BINARY}" ]]; then
+        BINARY_COMMITTED="true"
+    fi
+}
+
+report_retained_rollback_artifacts() {
+    if [[ -n "${ROLLBACK_BINARY}" ]] && [[ -e "${ROLLBACK_BINARY}" ]]; then
+        warn "Retained application-binary recovery copy: ${ROLLBACK_BINARY}"
+    fi
+    if [[ -n "${ROLLBACK_HELPER}" ]] && [[ -e "${ROLLBACK_HELPER}" ]]; then
+        warn "Retained helper recovery copy: ${ROLLBACK_HELPER}"
+    fi
+    if [[ -n "${ROLLBACK_SUDOERS}" ]] && [[ -e "${ROLLBACK_SUDOERS}" ]]; then
+        warn "Retained sudoers recovery copy: ${ROLLBACK_SUDOERS}"
+    fi
+}
+
+abort_commit_with_rollback() {
+    local reason="$1"
+
+    die "${reason}; the previous runtime generation will be restored."
+}
+
+discard_rollback_artifacts() {
+    if [[ -n "${ROLLBACK_BINARY}" ]]; then
+        if rm -f -- "${ROLLBACK_BINARY}"; then
+            ROLLBACK_BINARY=""
+        else
+            warn "Could not remove application-binary rollback file: ${ROLLBACK_BINARY}"
+        fi
+    fi
+    if [[ -n "${ROLLBACK_HELPER}" ]]; then
+        if rm -f -- "${ROLLBACK_HELPER}"; then
+            ROLLBACK_HELPER=""
+        else
+            warn "Could not remove helper rollback file: ${ROLLBACK_HELPER}"
+        fi
+    fi
+    if [[ -n "${ROLLBACK_SUDOERS}" ]]; then
+        if rm -f -- "${ROLLBACK_SUDOERS}"; then
+            ROLLBACK_SUDOERS=""
+        else
+            warn "Could not remove sudoers rollback file: ${ROLLBACK_SUDOERS}"
+        fi
+    fi
+}
+
+finalize_transaction() {
+    ACTIVATION_COMPLETE="true"
+    TRANSACTION_ACTIVE="false"
+    discard_rollback_artifacts
+}
+
+commit_staged_artifacts() {
+    TRANSACTION_ACTIVE="true"
+    HELPER_RENAME_STARTED="true"
+    if ! mv -fT -- "${STAGED_HELPER}" "${PRIVILEGED_HELPER_DEST}"; then
+        abort_commit_with_rollback "Could not install staged privileged helper"
+    fi
+    HELPER_COMMITTED="true"
+    HELPER_RENAME_STARTED="false"
+    STAGED_HELPER=""
+    info "Installed privileged helper: ${PRIVILEGED_HELPER_DEST}"
+
+    SUDOERS_RENAME_STARTED="true"
+    if ! mv -fT -- "${STAGED_SUDOERS}" "${SUDOERS_FILE}"; then
+        abort_commit_with_rollback "Could not install staged sudoers drop-in"
+    fi
+    SUDOERS_COMMITTED="true"
+    SUDOERS_RENAME_STARTED="false"
+    STAGED_SUDOERS=""
+    info "Installed sudoers drop-in: ${SUDOERS_FILE}"
+
+    # Commit the application last so it never runs without the matching
+    # helper and authorization rule already in place.
+    BINARY_RENAME_STARTED="true"
+    if ! mv -fT -- "${STAGED_BINARY}" "${DEST_BINARY}"; then
+        abort_commit_with_rollback "Could not install staged application binary"
+    fi
+    BINARY_COMMITTED="true"
+    BINARY_RENAME_STARTED="false"
+    STAGED_BINARY=""
+    info "Replaced binary: ${DEST_BINARY}"
+}
+
 # ── Main upgrade ───────────────────────────────────────────────────────────────
 
 main() {
@@ -574,67 +932,31 @@ main() {
         exit 0
     fi
 
-    # 1. Stop service if it was active (clean shutdown before binary swap)
+    # 1. Validate and stage every replacement before stopping the service.
+    #    Each temporary file is in its destination directory, so the final
+    #    renames are atomic and any staging failure leaves the live install
+    #    untouched.
+    stage_privileged_helper
+    stage_sudoers
+    stage_binary
+    stage_rollback_artifacts
+
+    # 2. Stop service if it was active (clean shutdown before artifact swap).
     if [[ "${SERVICE_WAS_ACTIVE}" == "true" ]]; then
         info "Stopping service..."
-        systemctl stop "${SERVICE_NAME}" && info "Service stopped: ${SERVICE_NAME}" || \
-            warn "Could not stop ${SERVICE_NAME} (may already be stopped)"
+        if systemctl stop "${SERVICE_NAME}"; then
+            info "Service stopped: ${SERVICE_NAME}"
+        else
+            die "Could not stop ${SERVICE_NAME}; staged artifacts were not installed."
+        fi
     else
         info "Service not active; skipping stop."
     fi
 
-    # 2. Replace binary using safe temp-file + move approach
-    info "Replacing binary..."
-    local tmp_dest="${DEST_BINARY}.upgrade-tmp"
-    # Remove any stale temp file from a previous failed upgrade
-    rm -f -- "${tmp_dest}"
+    # 3. Commit helper and sudoers first, then the matching application last.
+    commit_staged_artifacts
 
-    # Copy to temp file in the same directory (same filesystem for atomic mv)
-    if ! cp -- "${BINARY_SRC}" "${tmp_dest}"; then
-        die "Failed to copy binary to: ${tmp_dest}"
-    fi
-    chmod 0755 "${tmp_dest}"
-
-    # Atomic move: rename in the same directory
-    if ! mv -f -- "${tmp_dest}" "${DEST_BINARY}"; then
-        rm -f -- "${tmp_dest}"
-        die "Failed to move upgraded binary to: ${DEST_BINARY}"
-    fi
-    info "Replaced binary: ${DEST_BINARY}"
-
-    # 3. Ensure the sudoers drop-in is up-to-date.
-    #    Always rewrite so that upgrades from older versions pick up the
-    #    current native-lifecycle rules (`awg syncconf`/`awg-quick strip`
-    #    and scoped `cat`/`tee` access under /etc/amnezia/amneziawg).
-    local rule_awg="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *"
-    # Direct client lifecycle in native Rust: read params/server config and
-    # rewrite or append peer blocks.
-    local rule_direct="${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf"
-    info "Installing/updating sudoers drop-in: ${SUDOERS_FILE}"
-    mkdir -p "$(dirname "${SUDOERS_FILE}")"
-    printf '# Allow amneziawg-web service to manage AWG state and peers.\n' \
-        > "${SUDOERS_FILE}"
-    printf '# Installed by amneziawg-web-upgrade.sh – do not edit manually.\n' \
-        >> "${SUDOERS_FILE}"
-    printf '%s\n' "${rule_awg}" >> "${SUDOERS_FILE}"
-    printf '# Allow amneziawg-web to manage clients directly in Rust (read/rewrite config).\n' \
-        >> "${SUDOERS_FILE}"
-    printf '%s\n' "${rule_direct}" >> "${SUDOERS_FILE}"
-    chmod 0440 "${SUDOERS_FILE}"
-    chown root:root "${SUDOERS_FILE}"
-    if command -v visudo &>/dev/null; then
-        if visudo -cf "${SUDOERS_FILE}" &>/dev/null; then
-            info "Sudoers file validated: ${SUDOERS_FILE}"
-        else
-            warn "visudo validation failed for ${SUDOERS_FILE}."
-            warn "Removing broken sudoers file to protect system integrity."
-            rm -f "${SUDOERS_FILE}"
-            die "Sudoers file syntax check failed. This should not happen with the default rule.
-Please report this issue."
-        fi
-    fi
-
-    # 3b. Ensure AWG_CONFIG_DIR is writable by the service user.
+    # 3a. Ensure AWG_CONFIG_DIR is writable by the service user.
     #     Direct client creation writes config files into AWG_CONFIG_DIR, so
     #     the directory must exist and be owned by the service user. Older
     #     installs may have left it root-owned; fix that here.
@@ -794,10 +1116,19 @@ Please report this issue."
     # 5. Restart or start service based on policy
     if should_restart; then
         info "Restarting service..."
-        systemctl restart "${SERVICE_NAME}" && info "Service restarted: ${SERVICE_NAME}" || \
-            warn "Could not restart ${SERVICE_NAME}"
+        if systemctl restart "${SERVICE_NAME}"; then
+            if systemctl is-active --quiet "${SERVICE_NAME}"; then
+                info "Service restarted and active: ${SERVICE_NAME}"
+                finalize_transaction
+            else
+                die "${SERVICE_NAME} restart returned success but the service is inactive."
+            fi
+        else
+            die "Could not restart ${SERVICE_NAME}."
+        fi
     else
         info "Service not restarted (was inactive; use --restart to force)."
+        finalize_transaction
     fi
 
     printf '\n'

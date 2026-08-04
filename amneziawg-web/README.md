@@ -63,7 +63,8 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
   implemented natively in Rust (no install-script bridge for lifecycle operations).
 - **Server-rendered HTML** – peer list, peer detail, edit form, add/remove user,
   recent activity — no JavaScript framework.
-- **Zero external dependencies** – single binary + one SQLite file.
+- **Zero external services** – one application binary, one root-owned helper,
+  and one SQLite file; no separate database or container runtime.
 
 ---
 
@@ -74,11 +75,11 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 │                     Host OS                        │
 │                                                    │
 │  ┌──────────┐    ┌──────────────────────────────┐  │
-│  │ AWG kern │◄───│  sudo awg show all dump      │  │
-│  │  module  │    └──────────┬───────────────────┘  │
-│  └──────────┘               │                      │
-│                             ▼                      │
-│  ┌──────────────────────────────────────────────┐  │
+│  │ AWG kern │◄───│ validated helper (root:root) │  │
+│  │  module  │    │ mode 0755; fixed commands    │  │
+│  └──────────┘    └──────────▲───────────────────┘  │
+│                             │ exact sudoers path    │
+│  ┌──────────────────────────┴───────────────────┐  │
 │  │      amneziawg-web (runs as awg-web user)    │  │
 │  │                                              │  │
 │  │  ┌──────────┐  ┌──────────┐  ┌────────────┐ │  │
@@ -87,8 +88,9 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 │  │  └──────────┘  └──────────┘  └────────────┘ │  │
 │  └──────────────────────────────────────────────┘  │
 │                                                    │
-│  /etc/sudoers.d/amneziawg-web  (AWG read/remove + cat/tee /etc/amnezia/amneziawg/*) │
-│  /etc/amnezia/amneziawg/clients/*.conf                     │
+│  /usr/local/libexec/amneziawg-web-privileged      │
+│  /etc/sudoers.d/amneziawg-web                     │
+│  /etc/amnezia/amneziawg/clients/*.conf            │
 └────────────────────────────────────────────────────┘
          ▲
   reverse proxy (nginx / Caddy)
@@ -133,8 +135,9 @@ If you already have a pre-built binary:
 sudo ./amneziawg-web.sh install --binary-src ./target/release/amneziawg-web
 ```
 
-The installer handles user creation, directory setup, environment file generation,
-password hashing, and systemd service installation interactively.
+The installer handles user creation, directory setup, privileged-helper installation,
+environment file generation, password hashing, and systemd service installation
+interactively.
 For non-interactive / automated installs, see [docs/INSTALL.md](docs/INSTALL.md).
 
 ### Upgrading
@@ -151,8 +154,9 @@ To upgrade with a pre-built binary:
 sudo ./amneziawg-web.sh upgrade --binary ./target/release/amneziawg-web
 ```
 
-The upgrade script replaces the binary and restarts the service if it was running.
-Configuration, data, and the systemd unit are preserved by default.
+The upgrade script replaces the binary and root-owned privileged helper, then restarts
+the service if it was running. Configuration, data, and the systemd unit are preserved
+by default.
 See [docs/INSTALL.md](docs/INSTALL.md) for full details.
 
 ### Uninstalling
@@ -160,16 +164,16 @@ See [docs/INSTALL.md](docs/INSTALL.md) for full details.
 To remove the web panel:
 
 ```bash
-# Safe uninstall: removes service + binary, preserves config/data
+# Safe uninstall: removes service + helper + binary, preserves config/data
 sudo ./amneziawg-web.sh uninstall
 
 # Full purge: also removes config and data
 sudo ./amneziawg-web.sh uninstall --purge-config --purge-data --force
 ```
 
-By default the uninstaller is safe: it stops the service and removes the binary
-but keeps your configuration and database intact. See [docs/INSTALL.md](docs/INSTALL.md)
-for full details.
+By default the uninstaller is safe: it stops the service and removes the helper and
+application binary but keeps your configuration and database intact. See
+[docs/INSTALL.md](docs/INSTALL.md) for full details.
 
 ### Manual / development
 
@@ -252,41 +256,41 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | CSRF | Per-session token on write forms; short-lived pre-login token |
 | Rate limiting | 5 login attempts per 5-minute window per IP; `429` on excess |
 | Audit log | Every peer write, login, and logout recorded |
-| No shell injection | AWG binary called via `Command::new()` with explicit args |
-| AWG access | Narrowly-scoped sudoers rules (`awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`, scoped `cat`/`tee` under `/etc/amnezia/amneziawg`) |
+| No shell injection | The helper is called via `Command::new()` with explicit arguments and invokes fixed absolute binaries without shell interpolation |
+| AWG access | The sudoers rule allows only a root-owned validating helper; no command-argument globs are granted |
 
 ### AWG privilege model
 
 The service runs as a dedicated non-root user (`awg-web`).  Managing AWG
 interface state requires root-level `CAP_NET_ADMIN`.  Rather than running
-the entire service as root, the installer configures a tightly-scoped
-sudoers drop-in at `/etc/sudoers.d/amneziawg-web`:
+the entire service as root, the installer places a validating helper at
+`/usr/local/libexec/amneziawg-web-privileged` (`0755 root:root`) and configures
+the sudoers drop-in at `/etc/sudoers.d/amneziawg-web` to allow only that exact
+executable path:
 
 ```
-awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, \
-    /usr/bin/awg set * peer * remove, \
-    /usr/bin/awg syncconf * /dev/stdin, \
-    /usr/bin/awg-quick strip *
-awg-web ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, \
-    /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, \
-    /usr/bin/tee -- /etc/amnezia/amneziawg/*.conf, \
-    /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf
+awg-web ALL=(root) NOPASSWD: /usr/local/libexec/amneziawg-web-privileged
 ```
 
-The first rule grants the minimum privilege needed for AWG inspection,
-disabling peers (removal), and re-enabling peers (config sync).
-The second rule grants tightly scoped read/write access required by native
-Rust lifecycle operations that read params/server config and rewrite/append
-peer blocks.
-All invocations use `Command::new()` with explicit argument arrays — no shell
-interpolation.
+The helper accepts only the supported subcommands and validates argument
+counts, interface and client names, peer keys, AllowedIPs, and configuration
+paths. Server-config mutations are semantic: it reconstructs only a validated
+peer block or removes one exact managed-client block while holding a stable
+lock, then atomically replaces the file. State reads redact private keys and
+PSKs and expose only the fields the panel needs. Reconciliation accepts only
+validated disabled-peer keys and derives the trusted config inside the helper,
+so the service cannot read or submit arbitrary root-owned configuration
+content. This keeps dynamic arguments out of sudoers while providing the AWG
+inspection, peer management, and config synchronization the panel requires.
+Application invocations use `Command::new()` with explicit argument arrays —
+no shell interpolation.
 
 **Troubleshooting:** If peer polling fails with "Operation not permitted",
 verify the sudoers file exists and is correct:
 
 ```bash
 cat /etc/sudoers.d/amneziawg-web
-sudo -u awg-web sudo -n /usr/bin/awg show all dump
+sudo -u awg-web sudo -n /usr/local/libexec/amneziawg-web-privileged show-all
 ```
 
 ### Known limitations for v0.1.0

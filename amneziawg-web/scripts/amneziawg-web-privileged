@@ -1,0 +1,693 @@
+#!/bin/bash -p
+
+# Privileged command gateway for amneziawg-web.
+#
+# This helper is intended to be installed as a root-owned, non-writable file
+# and invoked by the awg-web service through a narrowly scoped sudoers rule.
+# It deliberately accepts only the operations and argument shapes required by
+# the service.  Paths to privileged executables and AWG configuration files
+# are fixed here and cannot be overridden through the environment.
+
+set -euo pipefail
+
+# Keep character-class validation deterministic and ensure that a missing
+# server config can never be created with group or world access.
+readonly LC_ALL="C"
+export LC_ALL
+readonly PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+umask 077
+
+readonly AWG_BIN="/usr/bin/awg"
+readonly AWG_QUICK_BIN="/usr/bin/awg-quick"
+
+# Debian 11 can use a non-merged /usr layout, where essential coreutils live
+# under /bin rather than /usr/bin. Resolve only through the fixed, root-owned
+# PATH above so the helper remains portable without trusting caller input.
+# Privileged Bash mode prevents imported functions from shadowing commands;
+# type -P additionally ignores shell functions and aliases during lookup.
+resolve_system_command() {
+    local resolved=""
+
+    resolved="$(type -P "$1" 2>/dev/null || true)"
+    case "${resolved}" in
+        /usr/sbin/*|/usr/bin/*|/sbin/*|/bin/*)
+            printf '%s\n' "${resolved}"
+            ;;
+        *)
+            printf '\n'
+            ;;
+    esac
+}
+
+CAT_BIN="$(resolve_system_command cat)"
+CHMOD_BIN="$(resolve_system_command chmod)"
+CHOWN_BIN="$(resolve_system_command chown)"
+FLOCK_BIN="$(resolve_system_command flock)"
+MKTEMP_BIN="$(resolve_system_command mktemp)"
+MV_BIN="$(resolve_system_command mv)"
+RM_BIN="$(resolve_system_command rm)"
+STAT_BIN="$(resolve_system_command stat)"
+readonly CAT_BIN CHMOD_BIN CHOWN_BIN FLOCK_BIN MKTEMP_BIN MV_BIN RM_BIN STAT_BIN
+readonly AWG_CONFIG_ROOT="/etc/amnezia/amneziawg"
+readonly AWG_PARAMS_PATH="${AWG_CONFIG_ROOT}/params"
+
+TEMPORARY_FILE=""
+PEER_PUBLIC_KEY=""
+PEER_PRESHARED_KEY=""
+PEER_ALLOWED_IPS=""
+declare -A DISABLED_KEYS=()
+
+cleanup() {
+    if [[ -n "${TEMPORARY_FILE}" ]]; then
+        "${RM_BIN}" -f -- "${TEMPORARY_FILE}" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+fail() {
+    printf 'amneziawg-web-privileged: %s\n' "$*" >&2
+    exit 2
+}
+
+require_root() {
+    if (( EUID != 0 )); then
+        fail "must be run as root (invoke it through sudo)"
+    fi
+}
+
+require_arg_count() {
+    local subcommand="$1"
+    local expected="$2"
+    local actual="$3"
+
+    if (( actual != expected )); then
+        fail "${subcommand} expects ${expected} argument(s), received ${actual}"
+    fi
+}
+
+require_executable() {
+    local executable="$1"
+
+    if [[ "${executable}" != /* || ! -x "${executable}" ]]; then
+        fail "required executable is missing or not executable: ${executable}"
+    fi
+}
+
+validate_interface() {
+    local interface="$1"
+
+    if [[ -z "${interface}" ]]; then
+        fail "interface name must not be empty"
+    fi
+    if (( ${#interface} >= 16 )); then
+        fail "invalid interface name '${interface}': must be shorter than 16 characters"
+    fi
+    if [[ "${interface}" == -* ]]; then
+        fail "invalid interface name '${interface}': must not start with '-'"
+    fi
+    if [[ "${interface}" == *..* ]]; then
+        fail "invalid interface name '${interface}': must not contain '..'"
+    fi
+    if [[ ! "${interface}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        fail "invalid interface name '${interface}': only A-Z, a-z, 0-9, '_', '.', and '-' are allowed"
+    fi
+}
+
+validate_public_key() {
+    local public_key="$1"
+
+    if [[ ! "${public_key}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+        fail "invalid peer public key: expected a 44-character WireGuard base64 key"
+    fi
+}
+
+read_disabled_keys() {
+    local payload="" line
+    local count=0
+
+    # A disabled-key list is the only caller-controlled input accepted by the
+    # reconciliation operation. Read it before taking the interface lock and
+    # cap it at 64 KiB / 1024 peers to avoid an unbounded privileged process.
+    IFS= read -r -N 65537 payload || true
+    if (( ${#payload} > 65536 )); then
+        fail "disabled-key payload exceeds the 64 KiB limit"
+    fi
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ -z "${line}" ]]; then
+            continue
+        fi
+        validate_public_key "${line}"
+        DISABLED_KEYS["${line}"]=1
+        (( count += 1 ))
+        if (( count > 1024 )); then
+            fail "disabled-key payload contains more than 1024 entries"
+        fi
+    done < <(printf '%s' "${payload}")
+}
+
+validate_client_name() {
+    local client_name="$1"
+
+    if [[ -z "${client_name}" ]]; then
+        fail "client name must not be empty"
+    fi
+    if (( ${#client_name} > 15 )); then
+        fail "invalid client name '${client_name}': must be at most 15 characters"
+    fi
+    if [[ ! "${client_name}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        fail "invalid client name '${client_name}': only A-Z, a-z, 0-9, '_', and '-' are allowed"
+    fi
+}
+
+validate_peer_allowed_ips() {
+    local allowed_ips="$1"
+    local ipv6 octet group
+    local -a entries octets groups
+
+    if (( ${#allowed_ips} > 128 )) || \
+            [[ "${allowed_ips}" == ,* ]] || \
+            [[ "${allowed_ips}" == *, ]] || \
+            [[ "${allowed_ips}" == *,,* ]]; then
+        fail "invalid peer AllowedIPs value"
+    fi
+
+    IFS=',' read -r -a entries <<< "${allowed_ips}"
+    if (( ${#entries[@]} < 1 || ${#entries[@]} > 2 )); then
+        fail "peer AllowedIPs must contain one IPv4 /32 and at most one IPv6 /128"
+    fi
+
+    if [[ ! "${entries[0]}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/32$ ]]; then
+        fail "peer AllowedIPs must start with an IPv4 /32"
+    fi
+    IFS='.' read -r -a octets <<< "${entries[0]%/32}"
+    for octet in "${octets[@]}"; do
+        if (( 10#${octet} > 255 )); then
+            fail "peer AllowedIPs contains an invalid IPv4 octet"
+        fi
+    done
+
+    if (( ${#entries[@]} == 2 )); then
+        if [[ "${entries[1]}" != *:* ]] || \
+                [[ ! "${entries[1]}" =~ ^[0-9A-Fa-f:]+/128$ ]]; then
+            fail "the second peer AllowedIPs entry must be an IPv6 /128"
+        fi
+        ipv6="${entries[1]%/128}"
+        if [[ "${ipv6}" == *::* ]]; then
+            fail "peer IPv6 must use the fully expanded eight-group form"
+        fi
+        IFS=':' read -r -a groups <<< "${ipv6}"
+        if (( ${#groups[@]} != 8 )); then
+            fail "peer IPv6 must contain exactly eight groups"
+        fi
+        for group in "${groups[@]}"; do
+            if [[ ! "${group}" =~ ^[0-9A-Fa-f]{1,4}$ ]]; then
+                fail "peer IPv6 contains an invalid group"
+            fi
+        done
+    fi
+}
+
+reject_symlinks() {
+    local path="$1"
+    local component link_count
+
+    # Check every component controlled by this helper, including a dangling
+    # symlink at the final path.  The fixed /etc prefix is included so that a
+    # redirected configuration tree is never followed with root privileges.
+    for component in \
+        /etc \
+        /etc/amnezia \
+        "${AWG_CONFIG_ROOT}" \
+        "${path}"; do
+        if [[ -L "${component}" ]]; then
+            fail "refusing symbolic-link path component: ${component}"
+        fi
+    done
+
+    if [[ ! -e "${path}" ]]; then
+        fail "refusing missing configuration file: ${path}"
+    fi
+    if [[ ! -f "${path}" ]]; then
+        fail "refusing non-regular file: ${path}"
+    fi
+
+    require_executable "${STAT_BIN}"
+    link_count="$("${STAT_BIN}" -c '%h' -- "${path}")" \
+        || fail "could not inspect configuration file: ${path}"
+    if (( link_count != 1 )); then
+        fail "refusing hard-linked configuration file: ${path}"
+    fi
+}
+
+validate_server_config_path() {
+    local path="$1"
+    local filename interface expected_path
+
+    if [[ "${path}" != "${AWG_CONFIG_ROOT}/"*.conf ]]; then
+        fail "server config path must be ${AWG_CONFIG_ROOT}/<interface>.conf"
+    fi
+
+    filename="${path#${AWG_CONFIG_ROOT}/}"
+    interface="${filename%.conf}"
+    validate_interface "${interface}"
+
+    expected_path="${AWG_CONFIG_ROOT}/${interface}.conf"
+    if [[ "${path}" != "${expected_path}" ]]; then
+        fail "server config path must be exactly ${expected_path}"
+    fi
+
+    reject_symlinks "${path}"
+}
+
+acquire_server_config_lock() {
+    local interface="$1"
+    local lock_path="${AWG_CONFIG_ROOT}/.${interface}.web.lock"
+    local lock_fd
+
+    require_executable "${FLOCK_BIN}"
+    if [[ -L "${lock_path}" ]] || \
+            { [[ -e "${lock_path}" ]] && [[ ! -f "${lock_path}" ]]; }; then
+        fail "refusing unsafe server-config lock: ${lock_path}"
+    fi
+    if ! exec {lock_fd}> "${lock_path}"; then
+        fail "could not open server-config lock: ${lock_path}"
+    fi
+    "${CHOWN_BIN}" root:root -- "${lock_path}" \
+        || fail "could not secure server-config lock ownership"
+    "${CHMOD_BIN}" 0600 -- "${lock_path}" \
+        || fail "could not secure server-config lock permissions"
+    "${FLOCK_BIN}" -x "${lock_fd}" \
+        || fail "could not acquire server-config lock"
+}
+
+read_peer_payload() {
+    local client_name="$1"
+    local payload="" line public_key preshared_key allowed_ips
+    local -a peer_lines=()
+
+    # Read at most 513 bytes before doing anything that can hold the shared
+    # server-config lock.  LC_ALL=C makes the limit byte-oriented.  This keeps
+    # a stalled or oversized stdin stream from blocking every config mutation
+    # or growing a root Bash process without bound.
+    IFS= read -r -N 513 payload || true
+    if (( ${#payload} > 512 )); then
+        fail "peer payload exceeds the 512-byte limit"
+    fi
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        peer_lines+=("${line}")
+        if (( ${#peer_lines[@]} > 3 )); then
+            fail "peer block contains unexpected extra lines"
+        fi
+    done < <(printf '%s' "${payload}")
+
+    if (( ${#peer_lines[@]} != 3 )); then
+        fail "peer payload must contain exactly three approved fields"
+    fi
+    validate_client_name "${client_name}"
+
+    if [[ "${peer_lines[0]}" =~ ^PublicKey[[:space:]]=[[:space:]]([A-Za-z0-9+/]{43}=)$ ]]; then
+        public_key="${BASH_REMATCH[1]}"
+    else
+        fail "peer block has an invalid public key"
+    fi
+    validate_public_key "${public_key}"
+
+    if [[ "${peer_lines[1]}" =~ ^PresharedKey[[:space:]]=[[:space:]]([A-Za-z0-9+/]{43}=)$ ]]; then
+        preshared_key="${BASH_REMATCH[1]}"
+    else
+        fail "peer block has an invalid preshared key"
+    fi
+    validate_public_key "${preshared_key}"
+
+    if [[ "${peer_lines[2]}" =~ ^AllowedIPs[[:space:]]=[[:space:]]([0-9A-Fa-f:.,/]+)$ ]]; then
+        allowed_ips="${BASH_REMATCH[1]}"
+    else
+        fail "peer block has an invalid AllowedIPs value"
+    fi
+    validate_peer_allowed_ips "${allowed_ips}"
+
+    PEER_PUBLIC_KEY="${public_key}"
+    PEER_PRESHARED_KEY="${preshared_key}"
+    PEER_ALLOWED_IPS="${allowed_ips}"
+}
+
+show_sanitized_dump() {
+    local dump line interface
+    local -a fields=()
+    local -A seen_interfaces=()
+
+    require_executable "${AWG_BIN}"
+    if ! dump="$("${AWG_BIN}" show all dump 2>/dev/null)"; then
+        fail "could not read AWG interface state"
+    fi
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ -z "${line}" ]]; then
+            continue
+        fi
+        IFS=$'\t' read -r -a fields <<< "${line}"
+        if (( ${#fields[@]} < 5 )); then
+            fail "AWG dump contained a malformed record"
+        fi
+        interface="${fields[0]}"
+        validate_interface "${interface}"
+        if [[ -n "${seen_interfaces[${interface}]+present}" ]]; then
+            if (( ${#fields[@]} < 9 )); then
+                fail "AWG dump contained a malformed peer record"
+            fi
+            # A peer pre-shared key is field 3 (index 2).
+            fields[2]="(redacted)"
+        else
+            seen_interfaces["${interface}"]=1
+            # The interface private key is field 2 (index 1).
+            fields[1]="(redacted)"
+        fi
+        (IFS=$'\t'; printf '%s\n' "${fields[*]}")
+    done <<< "${dump}"
+}
+
+emit_safe_params() {
+    local line key
+
+    reject_symlinks "${AWG_PARAMS_PATH}"
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        key="${line%%=*}"
+        case "${key}" in
+            SERVER_PUB_IP|SERVER_AWG_NIC|SERVER_AWG_IPV4|SERVER_AWG_IPV6|\
+            SERVER_PORT|SERVER_PUB_KEY|CLIENT_DNS_1|CLIENT_DNS_2|ALLOWED_IPS|\
+            SERVER_AWG_JC|SERVER_AWG_JMIN|SERVER_AWG_JMAX|SERVER_AWG_S1|\
+            SERVER_AWG_S2|SERVER_AWG_S3|SERVER_AWG_S4|SERVER_AWG_H1|\
+            SERVER_AWG_H2|SERVER_AWG_H3|SERVER_AWG_H4)
+                printf '%s\n' "${line}"
+                ;;
+        esac
+    done < "${AWG_PARAMS_PATH}"
+}
+
+emit_safe_server_state() {
+    local interface="$1"
+    local path="${AWG_CONFIG_ROOT}/${interface}.conf"
+    local line trimmed value
+
+    validate_server_config_path "${path}"
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+
+        if [[ "${trimmed}" =~ ^\[(Interface|Peer)\]$ ]]; then
+            printf '[%s]\n' "${BASH_REMATCH[1]}"
+        elif [[ "${trimmed}" =~ ^###[[:space:]]Client[[:space:]]([A-Za-z0-9_-]{1,15})$ ]]; then
+            printf '### Client %s\n' "${BASH_REMATCH[1]}"
+        elif [[ "${trimmed}" =~ ^Address[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+            if [[ ! "${value}" =~ ^[0-9A-Fa-f:.,/[:space:]]+$ ]]; then
+                fail "server Address contains unexpected content"
+            fi
+            printf 'Address = %s\n' "${value}"
+        elif [[ "${trimmed}" =~ ^AllowedIPs[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+            if [[ ! "${value}" =~ ^[0-9A-Fa-f:.,/[:space:]]+$ ]]; then
+                fail "peer AllowedIPs contains unexpected content"
+            fi
+            printf 'AllowedIPs = %s\n' "${value}"
+        fi
+    done < "${path}"
+}
+
+reconcile_interface() {
+    local interface="$1"
+    local path="${AWG_CONFIG_ROOT}/${interface}.conf"
+    local stripped line trimmed key
+    local in_peer="false"
+    local peer_disabled="false"
+    local -a config_lines=() peer_lines=()
+
+    validate_server_config_path "${path}"
+    acquire_server_config_lock "${interface}"
+    validate_server_config_path "${path}"
+    require_executable "${AWG_QUICK_BIN}"
+    require_executable "${AWG_BIN}"
+    require_executable "${MKTEMP_BIN}"
+
+    if ! stripped="$("${AWG_QUICK_BIN}" strip "${interface}" 2>/dev/null)"; then
+        fail "could not strip the trusted interface config"
+    fi
+    mapfile -t config_lines <<< "${stripped}"
+
+    TEMPORARY_FILE="$("${MKTEMP_BIN}" "${AWG_CONFIG_ROOT}/.${interface}.sync.XXXXXX")" \
+        || fail "could not create a temporary sync config"
+
+    for line in "${config_lines[@]}"; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+
+        if [[ "${trimmed}" =~ ^\[[^]]+\]$ ]]; then
+            if [[ "${in_peer}" == "true" ]]; then
+                if [[ "${peer_disabled}" != "true" ]]; then
+                    printf '%s\n' "${peer_lines[@]}" >> "${TEMPORARY_FILE}"
+                fi
+                peer_lines=()
+                peer_disabled="false"
+            fi
+
+            if [[ "${trimmed,,}" == "[peer]" ]]; then
+                in_peer="true"
+                peer_lines=("${line}")
+                continue
+            fi
+            in_peer="false"
+            printf '%s\n' "${line}" >> "${TEMPORARY_FILE}"
+            continue
+        fi
+
+        if [[ "${in_peer}" == "true" ]]; then
+            peer_lines+=("${line}")
+            if [[ "${trimmed}" =~ ^PublicKey[[:space:]]*=[[:space:]]*([A-Za-z0-9+/]{43}=)[[:space:]]*$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                if [[ -n "${DISABLED_KEYS[${key}]+present}" ]]; then
+                    peer_disabled="true"
+                fi
+            fi
+        else
+            printf '%s\n' "${line}" >> "${TEMPORARY_FILE}"
+        fi
+    done
+
+    if [[ "${in_peer}" == "true" && "${peer_disabled}" != "true" ]]; then
+        printf '%s\n' "${peer_lines[@]}" >> "${TEMPORARY_FILE}"
+    fi
+
+    if ! "${AWG_BIN}" syncconf "${interface}" "${TEMPORARY_FILE}" >/dev/null 2>&1; then
+        fail "could not reconcile the running AWG interface"
+    fi
+    "${RM_BIN}" -f -- "${TEMPORARY_FILE}"
+    TEMPORARY_FILE=""
+}
+
+append_peer_block() {
+    local path="$1"
+    local client_name="$2"
+    local public_key="$3"
+    local preshared_key="$4"
+    local allowed_ips="$5"
+    local line
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ^[[:space:]]*###[[:space:]]Client[[:space:]]${client_name}[[:space:]]*$ ]]; then
+            fail "client marker already exists in ${path}: ${client_name}"
+        fi
+    done < "${path}"
+
+    require_executable "${MKTEMP_BIN}"
+    require_executable "${CAT_BIN}"
+    require_executable "${CHOWN_BIN}"
+    require_executable "${CHMOD_BIN}"
+    require_executable "${MV_BIN}"
+    TEMPORARY_FILE="$("${MKTEMP_BIN}" "${path}.tmp.XXXXXX")" \
+        || fail "could not create a temporary server config"
+    if ! "${CAT_BIN}" -- "${path}" > "${TEMPORARY_FILE}"; then
+        fail "could not copy server config: ${path}"
+    fi
+    if ! printf '\n### Client %s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n' \
+            "${client_name}" "${public_key}" "${preshared_key}" "${allowed_ips}" \
+            >> "${TEMPORARY_FILE}"; then
+        fail "could not append peer block to temporary server config"
+    fi
+    if ! "${CHOWN_BIN}" --reference="${path}" -- "${TEMPORARY_FILE}" || \
+            ! "${CHMOD_BIN}" --reference="${path}" -- "${TEMPORARY_FILE}"; then
+        fail "could not preserve server config ownership and permissions"
+    fi
+    if ! "${MV_BIN}" -fT -- "${TEMPORARY_FILE}" "${path}"; then
+        fail "could not atomically replace server config: ${path}"
+    fi
+    TEMPORARY_FILE=""
+}
+
+remove_client_block() {
+    local path="$1"
+    local client_name="$2"
+    local marker_index=-1 marker_count=0 start end index
+    local interface_seen=false marker_after_interface=false
+    local -a config_lines=()
+
+    validate_client_name "${client_name}"
+    mapfile -t config_lines < "${path}"
+
+    for index in "${!config_lines[@]}"; do
+        if [[ "${config_lines[index]}" =~ ^[[:space:]]*\[Interface\][[:space:]]*$ ]]; then
+            interface_seen=true
+        fi
+        if [[ "${config_lines[index]}" =~ ^[[:space:]]*###[[:space:]]Client[[:space:]]${client_name}[[:space:]]*$ ]]; then
+            (( marker_count += 1 ))
+            if (( marker_index < 0 )); then
+                marker_index="${index}"
+                marker_after_interface="${interface_seen}"
+            fi
+        fi
+    done
+    if (( marker_index < 0 )); then
+        fail "client marker not found in ${path}: ${client_name}"
+    fi
+    if (( marker_count != 1 )) || [[ "${marker_after_interface}" != "true" ]]; then
+        fail "client marker is ambiguous or outside the interface config: ${client_name}"
+    fi
+
+    start="${marker_index}"
+    while (( start > 0 )) && [[ "${config_lines[start - 1]}" =~ ^[[:space:]]*$ ]]; do
+        start=$((start - 1))
+    done
+
+    if (( marker_index + 4 >= ${#config_lines[@]} )) || \
+            [[ ! "${config_lines[marker_index + 1]}" =~ ^[[:space:]]*\[Peer\][[:space:]]*$ ]] || \
+            [[ ! "${config_lines[marker_index + 2]}" =~ ^[[:space:]]*PublicKey[[:space:]]*= ]] || \
+            [[ ! "${config_lines[marker_index + 3]}" =~ ^[[:space:]]*PresharedKey[[:space:]]*= ]] || \
+            [[ ! "${config_lines[marker_index + 4]}" =~ ^[[:space:]]*AllowedIPs[[:space:]]*= ]]; then
+        fail "managed client block has an unexpected shape: ${client_name}"
+    fi
+
+    # The web panel creates an exact five-line managed block.  Refuse to
+    # remove only its prefix if an operator has added another field or comment;
+    # doing so would leave an orphaned directive and corrupt the next section.
+    if (( marker_index + 5 < ${#config_lines[@]} )) && \
+            [[ ! "${config_lines[marker_index + 5]}" =~ ^[[:space:]]*$ ]] && \
+            [[ ! "${config_lines[marker_index + 5]}" =~ ^[[:space:]]*###[[:space:]]Client[[:space:]][A-Za-z0-9_-]+[[:space:]]*$ ]]; then
+        fail "managed client block has unexpected trailing content: ${client_name}"
+    fi
+
+    end=$((marker_index + 5))
+    while (( end < ${#config_lines[@]} )) && \
+            [[ "${config_lines[end]}" =~ ^[[:space:]]*$ ]]; do
+        end=$((end + 1))
+    done
+
+    require_executable "${MKTEMP_BIN}"
+    require_executable "${CHOWN_BIN}"
+    require_executable "${CHMOD_BIN}"
+    require_executable "${MV_BIN}"
+    TEMPORARY_FILE="$("${MKTEMP_BIN}" "${path}.tmp.XXXXXX")" \
+        || fail "could not create a temporary server config"
+
+    if ! {
+        for index in "${!config_lines[@]}"; do
+            if (( index < start || index >= end )); then
+                printf '%s\n' "${config_lines[index]}"
+            fi
+        done
+    } > "${TEMPORARY_FILE}"; then
+        fail "could not build updated server config"
+    fi
+
+    if ! "${CHOWN_BIN}" --reference="${path}" -- "${TEMPORARY_FILE}" || \
+            ! "${CHMOD_BIN}" --reference="${path}" -- "${TEMPORARY_FILE}"; then
+        fail "could not preserve server config ownership and permissions"
+    fi
+    if ! "${MV_BIN}" -fT -- "${TEMPORARY_FILE}" "${path}"; then
+        fail "could not atomically replace server config: ${path}"
+    fi
+    TEMPORARY_FILE=""
+}
+
+main() {
+    require_root
+
+    if (( $# == 0 )); then
+        fail "missing subcommand"
+    fi
+
+    local subcommand="$1"
+    shift
+
+    local -a command
+    case "${subcommand}" in
+        show-all)
+            require_arg_count "${subcommand}" 0 "$#"
+            show_sanitized_dump
+            return 0
+            ;;
+        remove-peer)
+            require_arg_count "${subcommand}" 2 "$#"
+            validate_interface "$1"
+            validate_public_key "$2"
+            require_executable "${AWG_BIN}"
+            command=("${AWG_BIN}" set "$1" peer "$2" remove)
+            ;;
+        reconcile-interface)
+            require_arg_count "${subcommand}" 1 "$#"
+            validate_interface "$1"
+            read_disabled_keys
+            reconcile_interface "$1"
+            return 0
+            ;;
+        read-params)
+            require_arg_count "${subcommand}" 0 "$#"
+            emit_safe_params
+            return 0
+            ;;
+        read-server-state)
+            require_arg_count "${subcommand}" 1 "$#"
+            validate_interface "$1"
+            emit_safe_server_state "$1"
+            return 0
+            ;;
+        append-peer)
+            require_arg_count "${subcommand}" 2 "$#"
+            validate_interface "$1"
+            validate_client_name "$2"
+            read_peer_payload "$2"
+            local append_path="${AWG_CONFIG_ROOT}/$1.conf"
+            validate_server_config_path "${append_path}"
+            acquire_server_config_lock "$1"
+            validate_server_config_path "${append_path}"
+            append_peer_block "${append_path}" "$2" \
+                "${PEER_PUBLIC_KEY}" "${PEER_PRESHARED_KEY}" "${PEER_ALLOWED_IPS}"
+            return 0
+            ;;
+        remove-client)
+            require_arg_count "${subcommand}" 2 "$#"
+            validate_interface "$1"
+            validate_client_name "$2"
+            local remove_path="${AWG_CONFIG_ROOT}/$1.conf"
+            validate_server_config_path "${remove_path}"
+            acquire_server_config_lock "$1"
+            validate_server_config_path "${remove_path}"
+            remove_client_block "${remove_path}" "$2"
+            return 0
+            ;;
+        *)
+            fail "unsupported subcommand: ${subcommand}"
+            ;;
+    esac
+
+    if ! "${command[@]}" >/dev/null 2>&1; then
+        fail "privileged AWG operation failed"
+    fi
+}
+
+main "$@"

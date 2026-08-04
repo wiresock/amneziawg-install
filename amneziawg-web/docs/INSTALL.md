@@ -115,52 +115,74 @@ sudo chmod 0700 /etc/amneziawg-web
 
 ## 4. AWG binary and privilege setup
 
-`amneziawg-web` calls `sudo /usr/bin/awg show all dump` to read tunnel state,
-`sudo /usr/bin/awg set … peer … remove` to disable peers,
-`sudo /usr/bin/awg syncconf` + `sudo /usr/bin/awg-quick strip` to re-enable
-peers, and scoped `cat`/`tee` access to `/etc/amnezia/amneziawg/{params,*.conf}`
-for native Rust user lifecycle actions (add/remove clients).
-The service runs as a dedicated non-root user (`awg-web`) and uses
-tightly-scoped sudoers rules for only these commands.
+`amneziawg-web` sends privileged operations through the root-owned
+`/usr/local/libexec/amneziawg-web-privileged` helper.  The helper validates
+the requested subcommand, argument count, interface/client name, peer keys,
+AllowedIPs, and configuration path.  Config mutations are semantic, locked,
+and atomic; arbitrary root-owned configuration content is never accepted.
+The service runs as a dedicated non-root user (`awg-web`), and sudoers grants
+passwordless access only to the helper's exact executable path.
 
 ### Automated setup (installer)
 
 The installer (`amneziawg-web.sh install`) handles all of this automatically:
 
-- Installs a sudoers drop-in at `/etc/sudoers.d/amneziawg-web`
+- Installs the helper at `/usr/local/libexec/amneziawg-web-privileged` as
+  `0755 root:root`
+- Installs an exact-path sudoers drop-in at `/etc/sudoers.d/amneziawg-web`
 - Validates the file with `visudo -cf` (if available)
 - Sets permissions to `0440` (required by sudoers)
 
 ### Manual setup
 
-If installing manually, create the sudoers rules:
+If installing manually from the `amneziawg-web` source directory, install the
+helper and create the sudoers rule:
 
 ```bash
+sudo install -d -m 0755 -o root -g root /usr/local/libexec
+sudo install -m 0755 -o root -g root \
+  scripts/amneziawg-web-privileged \
+  /usr/local/libexec/amneziawg-web-privileged
+
 cat <<'EOF' | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
-awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *
-awg-web ALL=(root) NOPASSWD: /usr/bin/cat -- /etc/amnezia/amneziawg/params, /usr/bin/cat -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -- /etc/amnezia/amneziawg/*.conf, /usr/bin/tee -a -- /etc/amnezia/amneziawg/*.conf
+awg-web ALL=(root) NOPASSWD: /usr/local/libexec/amneziawg-web-privileged
 EOF
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
+sudo chown root:root /etc/sudoers.d/amneziawg-web
+sudo visudo -cf /etc/sudoers.d/amneziawg-web
 ```
 
 Verify it works:
 
 ```bash
-sudo -u awg-web sudo -n /usr/bin/awg show all dump
+sudo -u awg-web sudo -n /usr/local/libexec/amneziawg-web-privileged show-all
 ```
 
 ### Why sudoers?
 
 Managing AWG interfaces requires `CAP_NET_ADMIN`, which is only
 available to root.  Rather than running the whole web service as root,
-we grant the service user passwordless sudo for a small, fixed set of
-commands:
+we grant the service user passwordless sudo for one root-owned helper.  Its
+allow-listed operations provide:
 
-- `awg show all dump` – read tunnel state (read-only)
-- `awg set … peer … remove` – disable a peer by removing it from the running interface
-- `awg syncconf` + `awg-quick strip` – re-enable a peer by syncing a sanitized on-disk config
-- `cat /etc/amnezia/amneziawg/{params,*.conf}` – read params and server config for lifecycle operations
-- `tee /etc/amnezia/amneziawg/*.conf` + `tee -a /etc/amnezia/amneziawg/*.conf` – rewrite/append peer blocks during remove/create
+- `show-all` – read tunnel state with interface private keys and peer PSKs redacted
+- `remove-peer` – disable a validated peer on a validated interface
+- `reconcile-interface` – derive the trusted stripped config inside the helper,
+  exclude a bounded list of validated disabled-peer keys, and sync it
+- `read-params` – expose only the non-secret parameters needed for client generation
+- `read-server-state` – expose only interface addresses, managed-client markers,
+  and peer AllowedIPs needed for allocation
+- `append-peer` – validate and atomically append one reconstructed managed-peer block
+- `remove-client` – atomically remove one exact, validated managed-client block
+
+Every operation has a fixed argument shape.  Unknown subcommands, malformed
+interface/client names, keys or AllowedIPs, unsafe configuration paths,
+symbolic/hard links, and non-regular files are rejected before a privileged
+command is invoked. Existing root-owned server private keys and PSKs are never
+exposed to the service. Apart from the newly generated peer payload required by
+`append-peer`, the helper accepts no secrets; raw config files and
+caller-supplied `syncconf` content are never accepted. Config mutations and live
+reconciliation share a stable per-interface lock.
 
 This follows the principle of least privilege.
 
@@ -173,9 +195,11 @@ active.
 
 | File | Purpose | Permissions |
 |---|---|---|
-| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run `awg show all dump`, `awg set … peer … remove`, `awg syncconf`, `awg-quick strip`, and scoped `cat`/`tee` access under `/etc/amnezia/amneziawg` for lifecycle operations | `0440 root:root` |
+| `/usr/local/libexec/amneziawg-web-privileged` | Validates privileged operations and performs locked, semantic AWG/config actions | `0755 root:root` |
+| `/etc/sudoers.d/amneziawg-web` | Allows `awg-web` to run only the exact privileged-helper path | `0440 root:root` |
 
-The uninstaller removes this file.  The upgrader always rewrites it to keep rules current.
+The uninstaller removes both files.  The upgrader reinstalls the helper and
+rewrites the sudoers drop-in to keep the privilege boundary current.
 
 Client config files are expected in `AWG_CONFIG_DIR` (default:
 `/etc/amnezia/amneziawg/clients`).  Each file should be a standard WireGuard/AmneziaWG
@@ -379,9 +403,13 @@ docker run -d \
 
 ## Upgrading
 
-1. Build the new binary with `cargo build --release`.
-2. Copy it to `/usr/local/bin/amneziawg-web`.
-3. `sudo systemctl restart amneziawg-web`.
+Use the unified upgrade command so the application, privileged helper, and
+sudoers rule stay in sync:
+
+```bash
+sudo ./amneziawg-web.sh upgrade --source-dir ./amneziawg-web
+# Or: sudo ./amneziawg-web.sh upgrade --binary ./target/release/amneziawg-web
+```
 
 Database migrations run automatically on startup.
 
@@ -450,9 +478,10 @@ sudo ./amneziawg-web.sh install \
 2. **Build** – *(source mode only)* verifies Rust toolchain and runs `cargo build --release`
 3. **User + directories** – creates `awg-web` system user, data dir (`0750`), env dir (`0700`)
 4. **Binary install** – copies binary to `--install-dir`
-5. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440`) granting `awg-web` passwordless sudo for AWG inspection, peer removal, config sync, and scoped `cat`/`tee` access under `/etc/amnezia/amneziawg` used by native lifecycle operations
-6. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
-7. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
+5. **Privileged helper** – installs `/usr/local/libexec/amneziawg-web-privileged` as `0755 root:root`
+6. **Sudoers** – installs `/etc/sudoers.d/amneziawg-web` (`0440 root:root`) granting `awg-web` passwordless sudo for only the exact helper path
+7. **Env file** – writes all runtime variables to `--env-file` with mode `0600`
+8. **Service** – installs systemd unit, reloads daemon, optionally enables and starts
 
 ### Re-running / upgrading
 
@@ -460,6 +489,8 @@ The installer is idempotent:
 - System user is not recreated if it exists
 - Existing env file is preserved unless `--force` is given
 - Existing service unit is preserved unless `--force` is given
+- The privileged helper is refreshed atomically
+- The helper-only sudoers drop-in is regenerated and validated before replacement
 
 To upgrade, use the dedicated upgrade script (see [Upgrade reference](#upgrade-reference)):
 
@@ -496,12 +527,15 @@ fetched on demand when missing.
 
 ### Default behavior
 
-The upgrade script replaces the installed binary while preserving everything else:
+The upgrade script stages and validates the application and both privilege
+artifacts before it stops an active service:
 
 | Action | What happens |
 |---|---|
 | **Built** | *(source mode)* compiled from source via `cargo build --release` |
 | **Replaced** | installed binary (`/usr/local/bin/amneziawg-web`) |
+| **Replaced** | privileged helper (`/usr/local/libexec/amneziawg-web-privileged`) |
+| **Regenerated** | sudoers drop-in (`/etc/sudoers.d/amneziawg-web`), validated before replacement |
 | **Restarted** | service (only if it was active before upgrade) |
 | **Preserved** | env/config directory (`/etc/amneziawg-web/`) |
 | **Preserved** | data directory (`/var/lib/amneziawg-web/`) |
@@ -511,8 +545,8 @@ The upgrade script replaces the installed binary while preserving everything els
 ### Restart behavior
 
 By default, the upgrade script detects whether the service was running:
-- If **active**: the service is stopped, the binary is replaced, and the service is restarted
-- If **inactive**: the binary is replaced; the service is left inactive
+- If **active**: all artifacts are staged, the service is stopped, helper/sudoers/application are atomically replaced, and the service is restarted
+- If **inactive**: the same artifacts are refreshed; the service is left inactive
 
 Use `--restart` to force a restart even if the service was inactive, or `--no-restart`
 to skip restarting entirely.
@@ -630,14 +664,15 @@ sudo ./amneziawg-web.sh uninstall
 
 ### Default behavior (safe)
 
-By default, the uninstaller removes the service integration and installed binary
-while preserving all configuration and data:
+By default, the uninstaller removes the service integration, privileged helper,
+and installed binary while preserving all configuration and data:
 
 | Action | What happens |
 |---|---|
 | **Removed** | systemd service (stopped + disabled) |
 | **Removed** | systemd unit file (`/etc/systemd/system/amneziawg-web.service`) |
 | **Removed** | sudoers drop-in (`/etc/sudoers.d/amneziawg-web`) |
+| **Removed** | privileged helper (`/usr/local/libexec/amneziawg-web-privileged`) |
 | **Removed** | installed binary (`/usr/local/bin/amneziawg-web`) |
 | **Reloaded** | systemd daemon |
 | **Preserved** | env/config directory (`/etc/amneziawg-web/`) |
@@ -711,7 +746,8 @@ sudo ./amneziawg-web.sh uninstall \
 3. **Stop + disable** – gracefully stops and disables the systemd service
 4. **Remove unit** – deletes the systemd unit file, reloads daemon
 5. **Remove sudoers** – deletes `/etc/sudoers.d/amneziawg-web`
-6. **Remove binary** – deletes the installed binary
-7. **Purge config** – *(only with `--purge-config`)* removes the env/config directory
-8. **Purge data** – *(only with `--purge-data`)* removes the data directory
-9. **Remove user** – *(only with `--remove-user`)* removes the service user
+6. **Remove helper** – deletes `/usr/local/libexec/amneziawg-web-privileged`
+7. **Remove binary** – deletes the installed binary
+8. **Purge config** – *(only with `--purge-config`)* removes the env/config directory
+9. **Purge data** – *(only with `--purge-data`)* removes the data directory
+10. **Remove user** – *(only with `--remove-user`)* removes the service user

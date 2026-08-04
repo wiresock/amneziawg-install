@@ -31,6 +31,10 @@ jobs:
           cargo test
           cargo check --examples
 
+      - name: Run web-panel Rust tests
+        working-directory: amneziawg-web
+        run: cargo test
+
   proxy-rust-msrv:
     name: Proxy Rust Tests (MSRV 1.75)
     runs-on: ubuntu-latest
@@ -52,12 +56,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro:
-          - "ubuntu:22.04"
-          - "ubuntu:24.04"
-          - "ubuntu:26.04"
-          - "debian:11"
-          - "debian:12"
+        include:
+          - distro: "ubuntu:22.04"
+            prepare: ":"
+            expect_real_sudo_auth: "false"
+          - distro: "ubuntu:24.04"
+            prepare: ":"
+            expect_real_sudo_auth: "false"
+          - distro: "ubuntu:26.04"
+            prepare: "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y sudo-rs && test -x /usr/bin/sudo && command -v visudo >/dev/null"
+            expect_real_sudo_auth: "true"
+          - distro: "debian:11"
+            prepare: ":"
+            expect_real_sudo_auth: "false"
+          - distro: "debian:12"
+            prepare: ":"
+            expect_real_sudo_auth: "false"
     steps:
       - uses: actions/checkout@v6
 
@@ -69,10 +83,11 @@ jobs:
       - name: Run integration test in Docker
         run: |
           docker run --rm \
+            -e EXPECT_REAL_SUDO_AUTH='${{ matrix.expect_real_sudo_auth }}' \
             -v "$PWD:/workspace:ro" \
             -w /workspace \
             ${{ matrix.distro }} \
-            bash tests/test-install-mock.sh
+            bash -lc '${{ matrix.prepare }} && bash tests/test-install-mock.sh'
 
   resolute-live:
     name: Ubuntu 26.04 PPA + DKMS Live Smoke

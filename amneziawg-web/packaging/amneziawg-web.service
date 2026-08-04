@@ -43,12 +43,14 @@ Environment=RUST_LOG=amneziawg_web=info
 # Environment=AUTH_API_TOKEN=<random-32-byte-hex>
 
 # --- Hardening ---------------------------------------------------------------
-# Allow the process to read AWG config files (typically owned by root)
-# and write client config files directly under the config directory.
+# Allow the process to write client config files under the configured clients
+# directory. Root-owned server config and params are accessed only through the
+# semantic helper operations described below.
 ReadWritePaths=/etc/amnezia/amneziawg
 
-# The service invokes sudo to run `awg`, `cat`, `tee`, etc. via a
-# tightly-scoped sudoers rule (see /etc/sudoers.d/amneziawg-web).
+# The service invokes a root-owned validating helper via a tightly-scoped
+# sudoers rule (see /etc/sudoers.d/amneziawg-web).  The helper dispatches only
+# approved, secret-redacting AWG and semantic config operations.
 # sudo relies on the setuid bit, which requires NoNewPrivileges=no.
 #
 # Do NOT add PrivateDevices=, ProtectKernelTunables=, ProtectKernelModules=,

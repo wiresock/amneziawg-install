@@ -87,18 +87,32 @@ openssl rand -hex 32
 ## 5. Configure AWG access (sudoers)
 
 The service runs as `awg-web` (non-root) but needs to manage AWG interface
-state.  Install a tightly-scoped sudoers rule:
+state.  Install the validating helper as a root-owned, non-writable artifact,
+then allow only its exact path in sudoers.  The helper accepts only supported
+subcommands and validates argument counts, interface/client names, peer keys,
+AllowedIPs, and configuration paths. State reads are projected and redact
+private keys and PSKs; reconciliation derives the trusted config inside the
+helper instead of accepting raw `syncconf` input. Config mutations are limited
+to validated peer append/remove operations performed under a stable lock with
+an atomic replacement:
 
 ```bash
-echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *' \
+sudo install -d -m 0755 -o root -g root /usr/local/libexec
+sudo install -m 0755 -o root -g root \
+  scripts/amneziawg-web-privileged \
+  /usr/local/libexec/amneziawg-web-privileged
+
+echo 'awg-web ALL=(root) NOPASSWD: /usr/local/libexec/amneziawg-web-privileged' \
   | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
+sudo chown root:root /etc/sudoers.d/amneziawg-web
+sudo visudo -cf /etc/sudoers.d/amneziawg-web
 ```
 
 Verify:
 
 ```bash
-sudo -u awg-web sudo -n /usr/bin/awg show all dump
+sudo -u awg-web sudo -n /usr/local/libexec/amneziawg-web-privileged show-all
 ```
 
 > The installer does this automatically.  Manual setup is only needed for
@@ -224,22 +238,31 @@ awg show all dump failed
 Unable to access interface awg0: Operation not permitted
 ```
 
-This means the sudoers rule is missing or incorrect.  Fix it:
+This means the privileged helper or sudoers rule is missing or incorrect.
+Fix it:
 
 ```bash
-# Verify the file exists
+# Verify the installed artifacts
+stat -c '%a %U:%G %n' /usr/local/libexec/amneziawg-web-privileged
 cat /etc/sudoers.d/amneziawg-web
 
-# Expected content:
-# awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *
+# Expected helper mode/owner: 755 root:root
+# Expected sudoers content:
+# awg-web ALL=(root) NOPASSWD: /usr/local/libexec/amneziawg-web-privileged
 
 # Test it manually
-sudo -u awg-web sudo -n /usr/bin/awg show all dump
+sudo -u awg-web sudo -n /usr/local/libexec/amneziawg-web-privileged show-all
 
 # If missing, recreate:
-echo 'awg-web ALL=(root) NOPASSWD: /usr/bin/awg show all dump, /usr/bin/awg set * peer * remove, /usr/bin/awg syncconf * /dev/stdin, /usr/bin/awg-quick strip *' \
+sudo install -d -m 0755 -o root -g root /usr/local/libexec
+sudo install -m 0755 -o root -g root \
+  scripts/amneziawg-web-privileged \
+  /usr/local/libexec/amneziawg-web-privileged
+echo 'awg-web ALL=(root) NOPASSWD: /usr/local/libexec/amneziawg-web-privileged' \
   | sudo tee /etc/sudoers.d/amneziawg-web > /dev/null
 sudo chmod 0440 /etc/sudoers.d/amneziawg-web
+sudo chown root:root /etc/sudoers.d/amneziawg-web
+sudo visudo -cf /etc/sudoers.d/amneziawg-web
 sudo systemctl restart amneziawg-web
 ```
 
