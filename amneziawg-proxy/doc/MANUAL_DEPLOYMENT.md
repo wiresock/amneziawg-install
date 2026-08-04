@@ -199,6 +199,11 @@ backend = "127.0.0.1:51821"
 imitate_protocol = "quic"
 session_ttl_secs = 300
 rate_limit_per_sec = 5
+
+# Aggregate ceiling on reply bytes/sec to unauthenticated traffic across all
+# sources. Unlike rate_limit_per_sec above, this is not keyed by source, so
+# spoofing cannot reset it. This is the amplification control.
+probe_reply_bytes_per_sec = 32768
 status_file = "/var/lib/amneziawg-proxy/sessions.json"
 status_interval_secs = 5
 awg_config = "/etc/amnezia/amneziawg/awg0.conf"
@@ -226,6 +231,11 @@ backend = "127.0.0.1:51821"
 imitate_protocol = "quic"
 session_ttl_secs = 300
 rate_limit_per_sec = 5
+
+# Aggregate ceiling on reply bytes/sec to unauthenticated traffic across all
+# sources. Unlike rate_limit_per_sec above, this is not keyed by source, so
+# spoofing cannot reset it. This is the amplification control.
+probe_reply_bytes_per_sec = 32768
 status_file = "/var/lib/amneziawg-proxy/sessions.json"
 status_interval_secs = 5
 awg_config = "/etc/amnezia/amneziawg/awg0.conf"

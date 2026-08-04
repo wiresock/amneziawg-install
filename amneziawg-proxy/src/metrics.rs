@@ -151,6 +151,110 @@ impl ClientMetrics {
     }
 }
 
+/// Device-wide ceiling on bytes emitted in reply to *unauthenticated* traffic.
+///
+/// The per-client bucket in `ClientMetrics` is keyed by source address, so an
+/// attacker who spoofs the source gets a fresh bucket for every forged address
+/// and the per-client limit never binds. `MetricsStore::max_clients` caps how
+/// many buckets exist, but until that fills, aggregate egress is
+/// `max_clients * rate_limit_per_sec` replies per second — with the default
+/// 10000 x 5 that is 50,000 replies/s aimed at whatever address the attacker
+/// forged.
+///
+/// This budget is keyed by nothing at all, which is the point: there is no
+/// input an attacker controls that grants a fresh allowance. It bounds bytes
+/// rather than packets because amplification is a byte ratio, and DNS
+/// forwarding means a small query can return a much larger answer.
+///
+/// The trade is deliberate and worth stating: an attacker who sustains enough
+/// probe traffic to drain the budget silences probe replies for everyone,
+/// degrading camouflage to the silence a bare WireGuard port would give. That
+/// only costs obfuscation — the relay datapath does not consume this budget,
+/// so real client traffic is unaffected.
+pub(crate) struct GlobalProbeBudget {
+    /// Packed: high 32 bits = bytes remaining this second, low 32 = timestamp.
+    state: AtomicU64,
+    max_bytes_per_sec: u32,
+    /// Bytes this budget *admitted*, and bytes it refused.
+    ///
+    /// Deliberately not "bytes sent": admission is recorded when the
+    /// allowance is reserved, before the socket write, so a failed send still
+    /// counts here. Anything asserting on real egress must observe the wire,
+    /// not these counters -- a test that checked the admitted count passed
+    /// even with the gate deleted, because `try_consume` records the
+    /// reservation whether or not the caller honours the answer.
+    pub(crate) bytes_admitted: AtomicU64,
+    pub(crate) bytes_refused: AtomicU64,
+}
+
+impl GlobalProbeBudget {
+    pub(crate) fn new(max_bytes_per_sec: u32) -> Self {
+        Self {
+            state: AtomicU64::new(pack(max_bytes_per_sec, coarse_now_secs())),
+            max_bytes_per_sec,
+            bytes_admitted: AtomicU64::new(0),
+            bytes_refused: AtomicU64::new(0),
+        }
+    }
+
+    /// Reserve `bytes` of the current second's allowance. `true` means the
+    /// caller may send. Charge *before* sending, not after: charging after the
+    /// fact would let an unbounded burst through in the window between the
+    /// check and the accounting.
+    pub(crate) fn try_consume(&self, bytes: usize) -> bool {
+        self.try_consume_at(bytes, coarse_now_secs())
+    }
+
+    /// Same, with an injectable clock so tests need no real sleeps.
+    pub(crate) fn try_consume_at(&self, bytes: usize, now: u32) -> bool {
+        // A single reply larger than the whole per-second allowance can never
+        // be admitted; treat it as suppressed rather than looping forever.
+        let want = match u32::try_from(bytes) {
+            Ok(b) if b <= self.max_bytes_per_sec => b,
+            _ => {
+                self.bytes_refused
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                return false;
+            }
+        };
+
+        loop {
+            let old = self.state.load(Ordering::Acquire);
+            let (old_bytes, old_ts) = unpack(old);
+
+            // Refill is a reset rather than an accrual: unused allowance does
+            // not roll over, so a long-idle port cannot bank a burst that
+            // defeats the ceiling the moment it is probed.
+            let available = if now != old_ts {
+                self.max_bytes_per_sec
+            } else {
+                old_bytes
+            };
+
+            if available < want {
+                let new = pack(available, now);
+                let _ = self
+                    .state
+                    .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire);
+                self.bytes_refused.fetch_add(want as u64, Ordering::Relaxed);
+                return false;
+            }
+
+            let new = pack(available - want, now);
+            if self
+                .state
+                .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.bytes_admitted
+                    .fetch_add(want as u64, Ordering::Relaxed);
+                return true;
+            }
+            // Lost the race; recompute against the winner's state.
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientMetricsSnapshot {
     pub packets_in: u64,
@@ -332,5 +436,60 @@ mod tests {
         // Third client should be rejected
         assert!(store.get_or_create(a3).is_none());
         assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn global_budget_bounds_bytes_within_a_second() {
+        let b = GlobalProbeBudget::new(1000);
+        assert!(b.try_consume_at(600, 100));
+        assert!(b.try_consume_at(400, 100));
+        // Exactly exhausted: the next byte must be refused.
+        assert!(!b.try_consume_at(1, 100));
+        assert_eq!(b.bytes_admitted.load(Ordering::Relaxed), 1000);
+    }
+
+    #[test]
+    fn global_budget_refills_on_the_next_second() {
+        let b = GlobalProbeBudget::new(1000);
+        assert!(b.try_consume_at(1000, 100));
+        assert!(!b.try_consume_at(1, 100));
+        assert!(b.try_consume_at(1000, 101));
+    }
+
+    #[test]
+    fn global_budget_does_not_bank_idle_allowance() {
+        // The whole point of the ceiling is that a long-idle port cannot
+        // accumulate a burst. Ten idle seconds must still yield exactly one
+        // second's worth.
+        // The earlier timestamp is the load-bearing part: without spending
+        // at t=100 first, this asserts nothing that
+        // `global_budget_bounds_bytes_within_a_second` does not already cover.
+        let b = GlobalProbeBudget::new(1000);
+        assert!(b.try_consume_at(1000, 100), "second 100's allowance");
+        // Ten seconds idle. A bucket that accrued would now hold 10_000.
+        assert!(
+            b.try_consume_at(1000, 110),
+            "exactly one second's worth after the gap"
+        );
+        assert!(!b.try_consume_at(1, 110), "and not a byte more");
+    }
+
+    #[test]
+    fn global_budget_refuses_a_reply_larger_than_the_whole_allowance() {
+        // Must refuse rather than spin or underflow.
+        let b = GlobalProbeBudget::new(100);
+        assert!(!b.try_consume_at(101, 100));
+        // And the budget is left intact for replies that do fit.
+        assert!(b.try_consume_at(100, 100));
+    }
+
+    #[test]
+    fn global_budget_is_not_keyed_on_anything_spoofable() {
+        // The regression this guards: 1000 distinct "sources" must share one
+        // allowance. If this ever becomes per-source again, the loop below
+        // succeeds 1000 times instead of 10.
+        let b = GlobalProbeBudget::new(1000);
+        let admitted = (0..1000).filter(|_| b.try_consume_at(100, 42)).count();
+        assert_eq!(admitted, 10);
     }
 }

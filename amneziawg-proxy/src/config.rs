@@ -246,6 +246,16 @@ pub struct ProxyConfig {
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_sec: u32,
 
+    /// Ceiling on bytes per second emitted in reply to unauthenticated
+    /// traffic, summed across every source.
+    ///
+    /// `rate_limit_per_sec` is keyed by source address, so source spoofing
+    /// defeats it: each forged address gets its own bucket. This ceiling is
+    /// keyed by nothing, so nothing an attacker controls grants a fresh
+    /// allowance. It counts bytes because amplification is a byte ratio.
+    #[serde(default = "default_probe_reply_bytes_per_sec")]
+    pub probe_reply_bytes_per_sec: u32,
+
     /// Which protocol to imitate: `"quic"`, `"dns"`, `"stun"`, `"sip"`, or `"auto"`.
     #[serde(default = "default_imitate_protocol")]
     pub imitate_protocol: String,
@@ -346,6 +356,13 @@ fn default_rate_limit() -> u32 {
     // opening the proxy to meaningful amplification.
     16
 }
+fn default_probe_reply_bytes_per_sec() -> u32 {
+    // Generous for camouflage, negligible as an amplifier. A DNS answer runs
+    // ~70-500 bytes, so 32 KiB/s serves roughly 60-450 probe replies per
+    // second across all sources -- far more than any genuine scanner sends --
+    // while capping worst-case amplified egress at 256 kbit/s.
+    32 * 1024
+}
 fn default_quic_handshake_enabled() -> bool {
     true
 }
@@ -401,6 +418,7 @@ impl Default for ProxyConfig {
             session_ttl_secs: default_session_ttl(),
             cleanup_interval_secs: default_cleanup_interval(),
             rate_limit_per_sec: default_rate_limit(),
+            probe_reply_bytes_per_sec: default_probe_reply_bytes_per_sec(),
             imitate_protocol: default_imitate_protocol(),
             quic_handshake_enabled: default_quic_handshake_enabled(),
             quic_certificate_domain: default_quic_certificate_domain(),
