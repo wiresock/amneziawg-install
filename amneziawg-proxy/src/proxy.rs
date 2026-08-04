@@ -1055,11 +1055,6 @@ impl Proxy {
                 let ringing_allowed = metrics
                     .as_ref()
                     .map_or(true, |metrics| metrics.try_acquire_probe());
-                // Deferred datagrams are emitted from a detached task long
-                // after the request was charged, so they must draw on the same
-                // budget or the timers become an uncounted egress path.
-                let ringing_allowed =
-                    ringing_allowed && probe_budget.try_consume(responder::SIP_MAX_RESPONSE_SIZE);
                 if ringing_allowed {
                     let sent_len = dialogs.get_mut(&client_addr).and_then(|mut d| {
                         if d.stage != SipDialogStage::Invited || d.call_id_value != expected_call_id
@@ -1068,6 +1063,17 @@ impl Proxy {
                         }
                         let pkt = responder::generate_sip_ringing(&d);
                         let len = pkt.len();
+                        // Deferred datagrams are emitted from a detached task long
+                        // after the request was charged, so they must draw on the
+                        // same budget or the timers become an uncounted egress
+                        // path. Charged here rather than before the stage check: a
+                        // dialog that has already moved on sends nothing, and
+                        // charging for it would let an attacker drain the ceiling
+                        // with INVITE/CANCEL pairs that never produce a datagram.
+                        if !probe_budget.try_consume(len) {
+                            debug!(%client_addr, "deferred SIP 180 Ringing suppressed by the global byte budget");
+                            return None;
+                        }
                         match frontend.try_send_to(&pkt, client_addr) {
                             Ok(_) => {
                                 d.stage = SipDialogStage::Ringing;
@@ -1108,8 +1114,6 @@ impl Proxy {
                 let ok_allowed = metrics
                     .as_ref()
                     .map_or(true, |metrics| metrics.try_acquire_probe());
-                let ok_allowed =
-                    ok_allowed && probe_budget.try_consume(responder::SIP_MAX_RESPONSE_SIZE);
                 if ok_allowed {
                     let sent_len = dialogs.get_mut(&client_addr).and_then(|mut d| {
                         if !matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
@@ -1119,6 +1123,13 @@ impl Proxy {
                         }
                         let pkt = responder::generate_sip_ok(&d);
                         let len = pkt.len();
+                        // Charged after the stage check, and for the real length
+                        // rather than the 512-byte maximum -- see the 180 Ringing
+                        // timer above.
+                        if !probe_budget.try_consume(len) {
+                            debug!(%client_addr, "deferred SIP 200 OK suppressed by the global byte budget");
+                            return None;
+                        }
                         match frontend.try_send_to(&pkt, client_addr) {
                             Ok(_) => {
                                 d.stage = SipDialogStage::Established;
@@ -3072,6 +3083,81 @@ Content-Length: 0\r\n\r\n";
         assert!(
             duplicate.is_err(),
             "deferred timer must not emit a second 180 after retransmit"
+        );
+    }
+
+    /// A deferred SIP timer that fires after its dialog has moved on sends
+    /// nothing, so it must not spend the global ceiling either. Charging before
+    /// the stage check let an attacker drain camouflage for everyone with
+    /// INVITE/retransmit pairs that never produce a datagram -- a phantom
+    /// charge, reported in review.
+    ///
+    /// Asserting on `bytes_admitted` is correct *here*, unlike in the send-path
+    /// tests: the question is precisely whether allowance was consumed, not
+    /// whether bytes reached the wire.
+    #[tokio::test]
+    async fn deferred_sip_timer_does_not_charge_the_budget_when_it_sends_nothing() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+
+        // Built by joining rather than with a line-continuation literal: this
+        // file is CRLF, and a bare CR inside a `\`-continued string is a parse
+        // error.
+        let invite = [
+            "INVITE sip:olivia@profi.ru SIP/2.0",
+            "Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport",
+            "From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4",
+            "To: Olivia <sip:olivia@profi.ru>",
+            "Call-ID: phantom-charge-call@192.168.224.194",
+            "CSeq: 95929 INVITE",
+            "Content-Length: 0",
+            "",
+            "",
+        ]
+        .join("\r\n");
+        let invite = invite.as_bytes();
+
+        // First INVITE arms the deferred 180/200 timers.
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+        let mut buf = [0u8; 1024];
+        tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+            .await
+            .expect("fresh INVITE should receive 100 Trying")
+            .unwrap();
+
+        // Retransmit drives the dialog past Invited, so both deferred timers
+        // will find it ineligible and send nothing.
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("retransmit should receive immediate responses")
+                .unwrap();
+        }
+
+        let before = proxy.probe_budget.bytes_admitted.load(Ordering::Relaxed);
+        // Window covers the 200 ms deferred 180 Ringing and stops short of the
+        // 800 ms deferred 200 OK. That second timer accepts `Invited | Ringing`,
+        // so after a retransmit it is still eligible and *does* legitimately
+        // send -- including it here would measure a real datagram, not a
+        // phantom charge.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after = proxy.probe_budget.bytes_admitted.load(Ordering::Relaxed);
+
+        assert_eq!(
+            before, after,
+            "deferred timers that send nothing must not consume the global ceiling"
         );
     }
 

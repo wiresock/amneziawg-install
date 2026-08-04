@@ -731,13 +731,7 @@ pub(crate) struct SipDialog {
 
 const SIP_SCAN_LIMIT: usize = 2048;
 /// Upper bound on a generated SIP response, enforced by `SipDialog::from_request`'s
-/// Via-byte and reflected-response gates. Crate-visible so the deferred-response
-/// path in `proxy` can charge the byte budget *before* generating the packet: the
-/// alternative is generating first and discovering the budget is spent, which
-/// wastes the work and makes the accounting depend on where in the closure the
-/// check sits. Deliberately not `pub` -- it is an internal invariant, not a
-/// contract for downstream crates.
-pub(crate) const SIP_MAX_RESPONSE_SIZE: usize = 512;
+const SIP_MAX_RESPONSE_SIZE: usize = 512;
 
 impl SipDialog {
     /// Create a new dialog by parsing a SIP request.  Returns `None` if the
