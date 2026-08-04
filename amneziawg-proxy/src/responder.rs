@@ -730,7 +730,6 @@ pub(crate) struct SipDialog {
 }
 
 const SIP_SCAN_LIMIT: usize = 2048;
-/// Upper bound on a generated SIP response, enforced by `SipDialog::from_request`'s
 const SIP_MAX_RESPONSE_SIZE: usize = 512;
 
 impl SipDialog {
