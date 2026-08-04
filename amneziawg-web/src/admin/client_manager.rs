@@ -1271,7 +1271,7 @@ pub fn remove_client(
             }
             if !file_type.is_dir() {
                 return Err(RemoveClientError::FileWrite(format!(
-                    "config path exists but is not a directory: {}",
+                    "AWG_CONFIG_DIR path exists but is not a directory: {}",
                     config_dir.display()
                 )));
             }
@@ -1368,7 +1368,7 @@ mod tests {
         assert!(matches!(
             error,
             RemoveClientError::FileWrite(message)
-                if message.contains("config path exists but is not a directory")
+                if message.contains("AWG_CONFIG_DIR path exists but is not a directory")
         ));
     }
 
