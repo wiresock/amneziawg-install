@@ -544,6 +544,23 @@ is_positive_integer() {
     [[ "${val}" =~ ^[0-9]+$ ]] && (( 10#${val} >= 1 ))
 }
 
+# Positive integer that also fits a Rust u32, for options the proxy parses as
+# one. Without the upper bound the installer happily writes e.g. 5000000000
+# into the TOML and the failure surfaces later, as a service that will not
+# start -- an install-time footgun with a run-time symptom.
+#
+# Length is checked before value on purpose: a number wider than bash's own
+# 64-bit arithmetic makes `(( 10#... ))` fail rather than compare, so digits
+# are counted first and only then converted.
+is_u32() {
+    local val="$1" trimmed
+    [[ "${val}" =~ ^[0-9]+$ ]] || return 1
+    trimmed="${val#"${val%%[!0]*}"}"
+    [[ -n "${trimmed}" ]] || return 1
+    (( ${#trimmed} <= 10 )) || return 1
+    (( 10#${trimmed} >= 1 && 10#${trimmed} <= 4294967295 ))
+}
+
 # Escape characters that are special in a sed replacement string: &, \, and |
 # (| is the delimiter used by the sed commands in install_service_unit).
 escape_sed_replacement() {
@@ -825,12 +842,12 @@ EOF
     while true; do
         prompt_default RATE_LIMIT "Max probe responses per client per second" "${RATE_LIMIT}"
         prompt_default PROBE_REPLY_BYTES "Max reply bytes/sec to unauthenticated traffic (all sources)" "${PROBE_REPLY_BYTES}"
-        if ! is_positive_integer "${RATE_LIMIT}"; then
-            warn "Rate limit must be a positive integer."
+        if ! is_u32 "${RATE_LIMIT}"; then
+            warn "Rate limit must be a positive integer no greater than 4294967295."
             continue
         fi
-        if ! is_positive_integer "${PROBE_REPLY_BYTES}"; then
-            warn "Probe reply byte ceiling must be a positive integer."
+        if ! is_u32 "${PROBE_REPLY_BYTES}"; then
+            warn "Probe reply byte ceiling must be a positive integer no greater than 4294967295."
             continue
         fi
         break
@@ -1178,12 +1195,12 @@ Re-run with: --listen-port <port>"
         die "Invalid --session-ttl: '${SESSION_TTL}'. Must be a positive integer (seconds)."
     fi
 
-    if ! is_positive_integer "${RATE_LIMIT}"; then
-        die "Invalid --rate-limit: '${RATE_LIMIT}'. Must be a positive integer."
+    if ! is_u32 "${RATE_LIMIT}"; then
+        die "Invalid --rate-limit: '${RATE_LIMIT}'. Must be a positive integer no greater than 4294967295."
     fi
 
-    if ! is_positive_integer "${PROBE_REPLY_BYTES}"; then
-        die "Invalid --probe-reply-bytes: '${PROBE_REPLY_BYTES}'. Must be a positive integer (bytes/sec)."
+    if ! is_u32 "${PROBE_REPLY_BYTES}"; then
+        die "Invalid --probe-reply-bytes: '${PROBE_REPLY_BYTES}'. Must be a positive integer (bytes/sec) no greater than 4294967295."
     fi
 
     # Validate configurable paths: must be absolute and contain no newlines.
