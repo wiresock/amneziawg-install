@@ -702,8 +702,32 @@ algorithm:
   packet is still forwarded to the backend)
 - The `MetricsStore` enforces the same `max_sessions` cap as the session table
 
-This prevents a DPI system from using the probe response mechanism to amplify
-traffic or exhaust proxy resources.
+This stops a single honest client from monopolising probe responses. It does
+**not** bound aggregate egress, because the bucket is keyed by source address:
+an attacker who spoofs the source gets a fresh bucket for every forged address,
+so the per-client limit never binds twice. Until `max_sessions` buckets exist,
+aggregate egress is `max_sessions x rate_limit_per_sec` replies per second,
+aimed at whatever address was forged.
+
+## Amplification ceiling
+
+`probe_reply_bytes_per_sec` (default 32768) is the control that does bound it.
+A `GlobalProbeBudget` is keyed by **nothing**, so no attacker-controlled input
+grants a fresh allowance, and it counts **bytes** rather than packets because
+amplification is a byte ratio -- which matters most with
+`dns_forward_enabled = true`, where the reply is a real upstream answer and can
+be several times the size of the query.
+
+Every path that replies to unauthenticated traffic charges it: the synthetic
+probe reply, the SIP fallback, each datagram of a multi-response SIP turn, both
+deferred SIP timers, the forwarded DNS answer, and each datagram of a QUIC
+handshake response. The allowance is *reset* each second rather than accrued,
+so a long-idle port cannot bank a burst.
+
+The relay datapath deliberately does not draw on this budget. An attacker who
+sustains enough probe traffic to drain it silences probe replies for everyone,
+degrading camouflage to the silence a bare WireGuard port would give -- but
+real client traffic is unaffected.
 
 ---
 

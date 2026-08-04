@@ -231,6 +231,11 @@ status_interval_secs = 5
 # forwarded to the backend but no probe response is sent.
 rate_limit_per_sec = 5
 
+# Aggregate ceiling on reply bytes/sec to unauthenticated traffic across all
+# sources. Unlike rate_limit_per_sec above, this is not keyed by source, so
+# spoofing cannot reset it. This is the amplification control.
+probe_reply_bytes_per_sec = 32768
+
 # ── I/O tuning ────────────────────────────────────────────────────────────────
 
 # Userspace recv() buffer size in bytes for the frontend listener (a single

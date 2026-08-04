@@ -48,6 +48,7 @@ readonly DEFAULT_BACKEND_PORT="51821"
 readonly DEFAULT_PROTOCOL="quic"
 readonly DEFAULT_SESSION_TTL="300"
 readonly DEFAULT_RATE_LIMIT="5"
+readonly DEFAULT_PROBE_REPLY_BYTES="32768"
 readonly DEFAULT_DNS_UPSTREAM="1.1.1.1:53"
 readonly DEFAULT_QUIC_DOMAIN="cloudflare.com"
 
@@ -100,6 +101,7 @@ BACKEND_PORT="${DEFAULT_BACKEND_PORT}"
 PROTOCOL="${DEFAULT_PROTOCOL}"
 SESSION_TTL="${DEFAULT_SESSION_TTL}"
 RATE_LIMIT="${DEFAULT_RATE_LIMIT}"
+PROBE_REPLY_BYTES="${DEFAULT_PROBE_REPLY_BYTES}"
 DNS_FORWARD_ENABLED=false
 DNS_UPSTREAM="${DEFAULT_DNS_UPSTREAM}"
 QUIC_HANDSHAKE_ENABLED=false
@@ -140,6 +142,8 @@ Proxy behaviour:
                             (default: ${DEFAULT_PROTOCOL})
   --session-ttl SECS        Idle session timeout in seconds (default: ${DEFAULT_SESSION_TTL})
   --rate-limit N            Max probe responses per client per second (default: ${DEFAULT_RATE_LIMIT})
+  --probe-reply-bytes N     Max reply bytes/sec to unauthenticated traffic, all
+                            sources combined (default: ${DEFAULT_PROBE_REPLY_BYTES})
   --dns-forward             Enable DNS query forwarding to an upstream resolver
   --dns-upstream ADDR       Upstream DNS resolver host:port (default: ${DEFAULT_DNS_UPSTREAM})
                             Implies --dns-forward when set.
@@ -241,6 +245,8 @@ parse_args() {
             --rate-limit)
                 [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 RATE_LIMIT="$2"; shift 2 ;;
+        --probe-reply-bytes)
+                PROBE_REPLY_BYTES="$2"; shift 2 ;;
             --dns-forward)
                 DNS_FORWARD_ENABLED=true; shift ;;
             --dns-upstream)
@@ -817,6 +823,7 @@ EOF
     done
     while true; do
         prompt_default RATE_LIMIT "Max probe responses per client per second" "${RATE_LIMIT}"
+        prompt_default PROBE_REPLY_BYTES "Max reply bytes/sec to unauthenticated traffic (all sources)" "${PROBE_REPLY_BYTES}"
         if ! is_positive_integer "${RATE_LIMIT}"; then
             warn "Rate limit must be a positive integer."
             continue
@@ -1400,7 +1407,23 @@ status_interval_secs = 5
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 
 # Maximum probe responses sent per client per second.
+#
+# Keyed by source address, so it does NOT bound aggregate egress under source
+# spoofing: each forged address gets its own bucket. Use it to stop one honest
+# client monopolising replies, not as an amplification control.
 rate_limit_per_sec = ${RATE_LIMIT}
+
+# Ceiling on bytes per second emitted in reply to unauthenticated traffic,
+# summed across every source.
+#
+# This is the amplification control. It is keyed by nothing, so no input an
+# attacker controls grants a fresh allowance, and it counts bytes because
+# amplification is a byte ratio -- relevant when dns_forward_enabled returns a
+# real upstream answer that is larger than the query.
+#
+# Draining it degrades camouflage to silence but never affects relayed client
+# traffic, which does not draw on this budget.
+probe_reply_bytes_per_sec = ${PROBE_REPLY_BYTES}
 
 # ── AmneziaWG obfuscation parameters ─────────────────────────────────────────
 

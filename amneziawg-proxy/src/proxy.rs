@@ -429,6 +429,19 @@ impl Proxy {
 
     async fn send_quic_responses(&self, responses: Vec<QuicResponse>) {
         for response in responses {
+            // Charged per datagram, not per handshake: one QUIC Initial can
+            // produce several responses carrying a ServerHello and a
+            // certificate chain, making this the largest unauthenticated reply
+            // the proxy emits. Stopping mid-sequence is safe -- a truncated
+            // handshake is indistinguishable from packet loss, which every
+            // real QUIC endpoint already tolerates.
+            if !self.probe_budget.try_consume(response.payload.len()) {
+                debug!(
+                    destination = %response.destination,
+                    "QUIC handshake response suppressed by the global byte budget"
+                );
+                break;
+            }
             if let Err(e) = self
                 .frontend
                 .send_to(&response.payload, response.destination)
@@ -2384,6 +2397,56 @@ mod tests {
         assert!(
             received < PROBES / 2,
             "budget did not bind on the send path: {received} of {PROBES} probes were answered"
+        );
+    }
+
+    /// The QUIC handshake responder emits a `Vec` of datagrams per Initial —
+    /// ServerHello plus a certificate chain — which makes it the largest
+    /// unauthenticated reply the proxy produces. It was missed in the first
+    /// pass of this ceiling and reported in review; this pins it.
+    #[tokio::test]
+    async fn global_byte_budget_binds_on_the_quic_handshake_path() {
+        const BUDGET: u32 = 512;
+
+        let victim = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let victim_addr = victim.local_addr().unwrap();
+
+        let config = ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: "127.0.0.1:1".into(),
+            rate_limit_per_sec: 100_000,
+            probe_reply_bytes_per_sec: BUDGET,
+            imitate_protocol: "quic".into(),
+            ..Default::default()
+        };
+        let proxy = Proxy::bind(config, None).await.unwrap();
+
+        // Ten 200-byte datagrams = 2000 bytes against a 512-byte ceiling.
+        let responses: Vec<QuicResponse> = (0..10)
+            .map(|_| QuicResponse {
+                destination: victim_addr,
+                payload: bytes::Bytes::from(vec![0u8; 200]),
+            })
+            .collect();
+        proxy.send_quic_responses(responses).await;
+
+        let mut received = 0usize;
+        let mut buf = [0u8; 2048];
+        while tokio::time::timeout(Duration::from_millis(50), victim.recv_from(&mut buf))
+            .await
+            .is_ok()
+        {
+            received += 1;
+        }
+
+        // 512 / 200 = 2 whole datagrams.
+        assert!(
+            received <= 4,
+            "QUIC handshake egress must be bounded by the ceiling, got {received} datagrams"
+        );
+        assert!(
+            received < 10,
+            "budget did not bind on the QUIC path: all 10 datagrams were sent"
         );
     }
 
