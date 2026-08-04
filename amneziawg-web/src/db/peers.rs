@@ -21,6 +21,8 @@ pub struct PeerRow {
     pub tx_bytes: i64,
     /// `1` if peer is administratively disabled, `0` otherwise.
     pub disabled: i64,
+    /// `1` if the peer is retained only as a disabled safety tombstone.
+    pub archived: i64,
     /// `1` if a matching client config file has been discovered, `0` otherwise.
     pub has_config: i64,
     /// `1` until a newly-created peer has been observed on the live interface.
@@ -83,9 +85,23 @@ pub struct UsageSnapshotRow {
 pub async fn list_all(pool: &SqlitePool) -> Result<Vec<PeerRow>, sqlx::Error> {
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
-                last_handshake_at, rx_bytes, tx_bytes, disabled, has_config, sync_pending,
+                last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
                 config_name, config_path, friendly_name, created_at, updated_at
          FROM   peers
+         ORDER  BY id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Return non-archived peers ordered by their integer ID.
+pub async fn list_visible(pool: &SqlitePool) -> Result<Vec<PeerRow>, sqlx::Error> {
+    sqlx::query_as::<_, PeerRow>(
+        "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
+                last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
+                config_name, config_path, friendly_name, created_at, updated_at
+         FROM   peers
+         WHERE  archived = 0
          ORDER  BY id",
     )
     .fetch_all(pool)
@@ -96,10 +112,27 @@ pub async fn list_all(pool: &SqlitePool) -> Result<Vec<PeerRow>, sqlx::Error> {
 pub async fn find_by_id(pool: &SqlitePool, id: i64) -> Result<Option<PeerRow>, sqlx::Error> {
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
-                last_handshake_at, rx_bytes, tx_bytes, disabled, has_config, sync_pending,
+                last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
                 config_name, config_path, friendly_name, created_at, updated_at
          FROM   peers
          WHERE  id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Return a non-archived peer by integer primary key.
+pub async fn find_visible_by_id(
+    pool: &SqlitePool,
+    id: i64,
+) -> Result<Option<PeerRow>, sqlx::Error> {
+    sqlx::query_as::<_, PeerRow>(
+        "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
+                last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
+                config_name, config_path, friendly_name, created_at, updated_at
+         FROM   peers
+         WHERE  id = ? AND archived = 0",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -113,7 +146,7 @@ pub async fn find_by_public_key(
 ) -> Result<Option<PeerRow>, sqlx::Error> {
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
-                last_handshake_at, rx_bytes, tx_bytes, disabled, has_config, sync_pending,
+                last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
                 config_name, config_path, friendly_name, created_at, updated_at
          FROM   peers
          WHERE  public_key = ?",
@@ -130,9 +163,10 @@ pub async fn find_by_public_key(
 pub async fn list_disabled_public_keys(
     pool: &SqlitePool,
 ) -> Result<std::collections::HashSet<String>, sqlx::Error> {
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT public_key FROM peers WHERE disabled = 1")
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT public_key FROM peers WHERE disabled = 1 OR archived = 1")
+            .fetch_all(pool)
+            .await?;
     Ok(rows.into_iter().map(|(pk,)| pk).collect())
 }
 
@@ -176,10 +210,12 @@ pub async fn find_all_snapshots_since(
     since_rfc3339: &str,
 ) -> Result<Vec<UsageSnapshotRow>, sqlx::Error> {
     sqlx::query_as::<_, UsageSnapshotRow>(
-        "SELECT public_key, rx_bytes, tx_bytes
-         FROM   snapshots
-         WHERE  captured_at >= ?
-         ORDER  BY public_key, captured_at ASC, id ASC",
+        "SELECT s.public_key, s.rx_bytes, s.tx_bytes
+         FROM   snapshots s
+         JOIN   peers p ON p.public_key = s.public_key
+         WHERE  s.captured_at >= ?
+           AND  p.archived = 0
+         ORDER  BY s.public_key, s.captured_at ASC, s.id ASC",
     )
     .bind(since_rfc3339)
     .fetch_all(pool)
@@ -205,6 +241,7 @@ pub fn stream_all_snapshots_since<'a>(
          FROM   snapshots s
          JOIN   peers p ON p.public_key = s.public_key
          WHERE  s.captured_at >= ?
+           AND  p.archived = 0
          ORDER  BY s.public_key, s.captured_at ASC, s.id ASC",
     )
     .bind(since_rfc3339)
@@ -258,6 +295,7 @@ pub async fn find_all_baseline_snapshots(
              FROM snapshots AS s
              JOIN peers AS p ON p.public_key = s.public_key
              WHERE s.captured_at < ?
+               AND p.archived = 0
              GROUP BY s.public_key
          ),
          latest_with_id AS (
@@ -317,10 +355,10 @@ pub async fn update_peer_metadata(
     display_name: Option<&str>,
     comment: Option<&str>,
 ) -> Result<Option<PeerRow>, sqlx::Error> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE peers
          SET    display_name = ?, comment = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE  id = ?",
+         WHERE  id = ? AND archived = 0",
     )
     .bind(display_name)
     .bind(comment)
@@ -328,7 +366,10 @@ pub async fn update_peer_metadata(
     .execute(pool)
     .await?;
 
-    find_by_id(pool, id).await
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    find_visible_by_id(pool, id).await
 }
 
 /// Insert or update the database row for a newly-created client.
@@ -356,7 +397,8 @@ pub async fn upsert_created_peer(
              config_name   = excluded.config_name,
              config_path   = excluded.config_path,
              friendly_name = excluded.friendly_name,
-             updated_at    = CURRENT_TIMESTAMP",
+             updated_at    = CURRENT_TIMESTAMP
+         WHERE peers.archived = 0",
     )
     .bind(metadata.public_key)
     .bind(metadata.comment)
@@ -367,20 +409,174 @@ pub async fn upsert_created_peer(
     .execute(pool)
     .await?;
 
-    find_by_public_key(pool, metadata.public_key)
-        .await?
-        .ok_or(sqlx::Error::RowNotFound)
+    match find_by_public_key(pool, metadata.public_key).await? {
+        Some(row) if row.archived == 0 => Ok(row),
+        _ => Err(sqlx::Error::RowNotFound),
+    }
 }
 
 /// Delete a peer row by integer ID.
 ///
 /// Returns `true` if a row was deleted, `false` if no peer with that ID exists.
 pub async fn delete_by_id(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM peers WHERE id = ?")
+    let result = sqlx::query("DELETE FROM peers WHERE id = ? AND archived = 0")
         .bind(id)
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Result of attempting to purge and archive a peer record.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ArchivePeerOutcome {
+    Archived {
+        public_key: String,
+        snapshots_deleted: u64,
+    },
+    NotFound,
+    AlreadyArchived,
+    Ineligible,
+}
+
+/// Purge a disabled, unlinked peer's panel data while retaining its key as a
+/// disabled safety tombstone.
+///
+/// The state transition, snapshot deletion, and audit event are committed in a
+/// single transaction. Audit history is retained intentionally; the new event
+/// records only the number of deleted snapshots and no purged metadata.
+/// Callers that can race with config discovery must hold
+/// [`crate::poller::acquire_config_mapping_lock`] across this operation.
+pub async fn archive_peer_data(
+    pool: &SqlitePool,
+    id: i64,
+    actor: &str,
+) -> Result<ArchivePeerOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // Make the guarded mutation the transaction's first statement. This
+    // obtains SQLite's write lock without a deferred read-to-write upgrade,
+    // while the predicate still revalidates every eligibility invariant.
+    let public_key: Option<String> = sqlx::query_scalar(
+        "UPDATE peers
+         SET display_name = NULL,
+             comment = NULL,
+             endpoint = NULL,
+             allowed_ips = '',
+             last_handshake_at = NULL,
+             rx_bytes = 0,
+             tx_bytes = 0,
+             disabled = 1,
+             archived = 1,
+             has_config = 0,
+             sync_pending = 0,
+             config_name = NULL,
+             config_path = NULL,
+             friendly_name = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?
+           AND disabled = 1
+           AND archived = 0
+           AND has_config = 0
+           AND sync_pending = 0
+         RETURNING public_key",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(public_key) = public_key else {
+        let archived: Option<i64> = sqlx::query_scalar("SELECT archived FROM peers WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        tx.rollback().await?;
+        return Ok(match archived {
+            None => ArchivePeerOutcome::NotFound,
+            Some(value) if value != 0 => ArchivePeerOutcome::AlreadyArchived,
+            Some(_) => ArchivePeerOutcome::Ineligible,
+        });
+    };
+
+    let snapshots_deleted = sqlx::query("DELETE FROM snapshots WHERE public_key = ?")
+        .bind(&public_key)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let detail = serde_json::json!({
+        "snapshots_deleted": snapshots_deleted,
+        "audit_history_retained": true,
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO events (actor, action, peer_id, target_key, detail)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(actor)
+    .bind(crate::db::events::EVT_PEER_ARCHIVED)
+    .bind(id)
+    .bind(&public_key)
+    .bind(&detail)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(ArchivePeerOutcome::Archived {
+        public_key,
+        snapshots_deleted,
+    })
+}
+
+/// Result of returning an archived tombstone to the normal peer list.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestorePeerOutcome {
+    Restored { public_key: String },
+    NotFound,
+    NotArchived,
+}
+
+/// Unhide an archived tombstone while deliberately keeping it disabled.
+pub async fn restore_archived_peer(
+    pool: &SqlitePool,
+    id: i64,
+    actor: &str,
+) -> Result<RestorePeerOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // As with archive, write first so concurrent poller activity cannot cause
+    // a deferred transaction upgrade failure after a stale read.
+    let public_key: Option<String> = sqlx::query_scalar(
+        "UPDATE peers
+         SET archived = 0, disabled = 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND archived = 1
+         RETURNING public_key",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(public_key) = public_key else {
+        let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM peers WHERE id = ?)")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.rollback().await?;
+        return Ok(if exists == 0 {
+            RestorePeerOutcome::NotFound
+        } else {
+            RestorePeerOutcome::NotArchived
+        });
+    };
+    sqlx::query(
+        "INSERT INTO events (actor, action, peer_id, target_key, detail)
+         VALUES (?, ?, ?, ?, NULL)",
+    )
+    .bind(actor)
+    .bind(crate::db::events::EVT_PEER_RESTORED)
+    .bind(id)
+    .bind(&public_key)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(RestorePeerOutcome::Restored { public_key })
 }
 
 /// Delete non-disabled, non-pending peers whose public keys are **not** in
@@ -407,6 +603,7 @@ pub async fn delete_stale_peers(
         "SELECT id, public_key
          FROM peers
          WHERE disabled = 0
+           AND archived = 0
            AND NOT (sync_pending = 1 AND has_config = 1)",
     )
     .fetch_all(pool)
@@ -434,6 +631,7 @@ pub async fn delete_stale_peers(
             "DELETE FROM peers
              WHERE id IN ({placeholders})
                AND disabled = 0
+               AND archived = 0
                AND NOT (sync_pending = 1 AND has_config = 1)"
         );
         let mut query = sqlx::query(&sql);
@@ -479,17 +677,20 @@ pub async fn update_peer_disabled(
     id: i64,
     disabled: bool,
 ) -> Result<Option<PeerRow>, sqlx::Error> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE peers
          SET    disabled = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE  id = ?",
+         WHERE  id = ? AND archived = 0",
     )
     .bind(disabled as i64)
     .bind(id)
     .execute(pool)
     .await?;
 
-    find_by_id(pool, id).await
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    find_visible_by_id(pool, id).await
 }
 
 ///
@@ -499,7 +700,9 @@ pub async fn update_peer_disabled(
 /// a matching config file.
 pub async fn clear_all_config_mappings(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE peers SET has_config = 0, config_name = NULL, config_path = NULL, friendly_name = NULL",
+        "UPDATE peers
+         SET has_config = 0, config_name = NULL, config_path = NULL, friendly_name = NULL
+         WHERE archived = 0",
     )
     .execute(pool)
     .await?;
@@ -523,7 +726,7 @@ pub async fn apply_config_mapping(
     let result = sqlx::query(
         "UPDATE peers
          SET    has_config = 1, config_name = ?, config_path = ?, friendly_name = ?
-         WHERE  public_key = ?",
+         WHERE  public_key = ? AND archived = 0",
     )
     .bind(config_name)
     .bind(config_path)
@@ -743,6 +946,8 @@ mod tests {
     #[tokio::test]
     async fn find_all_snapshots_since_returns_multiple_peers() {
         let db = test_db().await;
+        insert_peer(&db.pool, "KEY_ALL_A=", None).await;
+        insert_peer(&db.pool, "KEY_ALL_B=", None).await;
         // Use distinct rx_bytes to verify ordering (captured_at is not in UsageSnapshotRow).
         insert_snapshot_with_rx(&db.pool, "KEY_ALL_A=", "2026-01-05T00:00:00Z", 10).await;
         insert_snapshot_with_rx(&db.pool, "KEY_ALL_A=", "2026-01-10T00:00:00Z", 20).await;
@@ -1211,6 +1416,219 @@ mod tests {
         let db = test_db().await;
         let deleted = delete_by_id(&db.pool, 9999).await.expect("delete");
         assert!(!deleted);
+    }
+
+    // ── archive / restore ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn archive_peer_data_purges_metadata_and_snapshots_but_keeps_tombstone() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_ARCHIVE=", Some("Old Proton")).await;
+        sqlx::query(
+            "UPDATE peers
+             SET comment = 'old comment', endpoint = '198.51.100.4:51820',
+                 last_handshake_at = 1234, rx_bytes = 100, tx_bytes = 200,
+                 disabled = 1, config_name = 'old', config_path = '/old.conf',
+                 friendly_name = 'old-friendly'
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        insert_snapshot(&db.pool, "KEY_ARCHIVE=", "2026-01-01T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_ARCHIVE=", "2026-01-02T00:00:00Z").await;
+        sqlx::query(
+            "INSERT INTO events (actor, action, peer_id, target_key, detail)
+             VALUES ('admin', 'peer_updated', ?, 'KEY_ARCHIVE=', '{\"old_comment\":\"old comment\"}')",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let outcome = archive_peer_data(&db.pool, id, "admin")
+            .await
+            .expect("archive");
+        assert_eq!(
+            outcome,
+            ArchivePeerOutcome::Archived {
+                public_key: "KEY_ARCHIVE=".to_string(),
+                snapshots_deleted: 2,
+            }
+        );
+
+        let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(row.public_key, "KEY_ARCHIVE=");
+        assert_eq!(row.disabled, 1);
+        assert_eq!(row.archived, 1);
+        assert_eq!(row.display_name, None);
+        assert_eq!(row.comment, None);
+        assert_eq!(row.endpoint, None);
+        assert_eq!(row.allowed_ips, "");
+        assert_eq!(row.last_handshake_at, None);
+        assert_eq!(row.rx_bytes, 0);
+        assert_eq!(row.tx_bytes, 0);
+        assert_eq!(row.has_config, 0);
+        assert_eq!(row.sync_pending, 0);
+        assert_eq!(row.config_name, None);
+        assert_eq!(row.config_path, None);
+        assert_eq!(row.friendly_name, None);
+        assert!(find_visible_by_id(&db.pool, id).await.unwrap().is_none());
+        assert!(list_visible(&db.pool).await.unwrap().is_empty());
+        assert_eq!(list_all(&db.pool).await.unwrap().len(), 1);
+
+        let snapshots: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM snapshots WHERE public_key = ?")
+                .bind("KEY_ARCHIVE=")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(snapshots, 0);
+        let archived_events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE action = 'peer_archived'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(archived_events, 1);
+        let retained_detail: String =
+            sqlx::query_scalar("SELECT detail FROM events WHERE action = 'peer_updated'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(retained_detail.contains("old comment"));
+
+        assert!(list_disabled_public_keys(&db.pool)
+            .await
+            .unwrap()
+            .contains("KEY_ARCHIVE="));
+        assert!(update_peer_metadata(&db.pool, id, Some("new"), Some("new"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(update_peer_disabled(&db.pool, id, false)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!delete_by_id(&db.pool, id).await.unwrap());
+        assert!(!apply_config_mapping(
+            &db.pool,
+            "KEY_ARCHIVE=",
+            "reappeared",
+            "/etc/amnezia/amneziawg/reappeared.conf",
+            "reappeared",
+        )
+        .await
+        .unwrap());
+        let recreated = upsert_created_peer(
+            &db.pool,
+            &CreatedPeerMetadata {
+                public_key: "KEY_ARCHIVE=",
+                allowed_ips: "10.8.0.2/32",
+                comment: Some("must not return"),
+                config_name: "reappeared",
+                config_path: "/etc/amnezia/amneziawg/reappeared.conf",
+                friendly_name: "reappeared",
+            },
+        )
+        .await;
+        assert!(matches!(recreated, Err(sqlx::Error::RowNotFound)));
+    }
+
+    #[tokio::test]
+    async fn restore_archived_peer_keeps_it_disabled_and_history_empty() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_RESTORE=", None).await;
+        update_peer_disabled(&db.pool, id, true).await.unwrap();
+        insert_snapshot(&db.pool, "KEY_RESTORE=", "2026-01-01T00:00:00Z").await;
+        archive_peer_data(&db.pool, id, "admin").await.unwrap();
+
+        let outcome = restore_archived_peer(&db.pool, id, "admin")
+            .await
+            .expect("restore");
+        assert_eq!(
+            outcome,
+            RestorePeerOutcome::Restored {
+                public_key: "KEY_RESTORE=".to_string(),
+            }
+        );
+        let row = find_visible_by_id(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(row.archived, 0);
+        assert_eq!(row.disabled, 1);
+        assert!(find_snapshots(&db.pool, "KEY_RESTORE=", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let restored_events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE action = 'peer_restored'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(restored_events, 1);
+    }
+
+    #[tokio::test]
+    async fn archive_peer_data_rejects_ineligible_or_missing_rows() {
+        let db = test_db().await;
+        let enabled = insert_peer(&db.pool, "KEY_ENABLED_ARCHIVE=", None).await;
+        assert_eq!(
+            archive_peer_data(&db.pool, enabled, "admin").await.unwrap(),
+            ArchivePeerOutcome::Ineligible
+        );
+
+        let linked = insert_peer(&db.pool, "KEY_LINKED_ARCHIVE=", None).await;
+        sqlx::query("UPDATE peers SET disabled = 1, has_config = 1 WHERE id = ?")
+            .bind(linked)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            archive_peer_data(&db.pool, linked, "admin").await.unwrap(),
+            ArchivePeerOutcome::Ineligible
+        );
+
+        let pending = insert_peer(&db.pool, "KEY_PENDING_ARCHIVE=", None).await;
+        sqlx::query("UPDATE peers SET disabled = 1, sync_pending = 1 WHERE id = ?")
+            .bind(pending)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            archive_peer_data(&db.pool, pending, "admin").await.unwrap(),
+            ArchivePeerOutcome::Ineligible
+        );
+        assert_eq!(
+            archive_peer_data(&db.pool, 9999, "admin").await.unwrap(),
+            ArchivePeerOutcome::NotFound
+        );
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(events, 0);
+    }
+
+    #[tokio::test]
+    async fn archived_peer_is_preserved_even_if_disabled_flag_is_corrupted() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_ARCHIVED_STALE=", None).await;
+        update_peer_disabled(&db.pool, id, true).await.unwrap();
+        archive_peer_data(&db.pool, id, "admin").await.unwrap();
+        sqlx::query("UPDATE peers SET disabled = 0 WHERE id = ?")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let stale = delete_stale_peers(&db.pool, &std::collections::HashSet::new())
+            .await
+            .unwrap();
+        assert!(stale.is_empty());
+        assert!(find_by_id(&db.pool, id).await.unwrap().is_some());
+        assert!(list_disabled_public_keys(&db.pool)
+            .await
+            .unwrap()
+            .contains("KEY_ARCHIVED_STALE="));
     }
 
     // ── list_disabled_public_keys ───────────────────────────────────────

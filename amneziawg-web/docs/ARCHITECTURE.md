@@ -103,10 +103,14 @@ binary via `sqlx::migrate!("./migrations")`.
 A Tokio background task that wakes every `AWG_POLL_INTERVAL` seconds,
 calls `awg::show_all_dump()`, and:
 
-1. Inserts a row into `snapshots` for each peer.
-2. Upserts each peer into the `peers` table.
+1. Inserts a row into `snapshots` for each non-archived peer.
+2. Upserts each non-archived peer into the `peers` table.
 3. Handles counter resets (values are stored as-is; UI layer detects
    decreases).
+
+Both snapshot insertion and live-field upserts are SQL-guarded by the
+`archived` flag. This prevents an in-flight or later poll from repopulating a
+key whose panel data was cleared.
 
 ---
 
@@ -133,8 +137,8 @@ These will be wired up to web handlers in a later milestone.
 3. Helper validates `show-all` and executes: /usr/bin/awg show all dump
 4. Parses output into Vec<AwgInterface>
 5. For each peer:
-   a. INSERT INTO snapshots
-   b. UPSERT INTO peers
+   a. conditionally INSERT INTO snapshots when the key is not archived
+   b. UPSERT live fields only when the existing row is not archived
 6. HTTP handler reads from DB and returns JSON
 ```
 
@@ -147,11 +151,26 @@ SQLite is chosen for its zero-infrastructure footprint.  A single
 
 | Table        | Purpose                                         |
 |--------------|-------------------------------------------------|
-| `peers`      | Canonical peer records with display metadata     |
+| `peers`      | Canonical peer records, metadata, and archived disabled-key tombstones |
 | `snapshots`  | Time-series of per-poll stats                   |
 | `interfaces` | Discovered AWG interfaces                       |
 | `events`     | Audit log of admin actions                      |
 | `users`      | Application user accounts (admin/viewer roles)  |
+
+### Archived-key invariant
+
+An archived row retains its ID and public key, remains disabled, has no config
+mapping or pending lifecycle sync, and has no traffic snapshots. Archived rows
+are hidden from normal peer/detail/history/usage/config routes but remain in
+the disabled-key set used by interface enforcement. Config mapping and poller
+writes contain `archived = 0` guards.
+
+Archiving is serialized with the config clear-and-remap sequence, so its
+eligibility check cannot mistake a linked peer for an unlinked one during the
+mapping window. The archive state transition, snapshot deletion, and
+`peer_archived` audit event are one SQLite transaction. Existing audit rows
+are retained; returning an archived key records `peer_restored`, leaves it
+disabled, and does not restore deleted metadata or history.
 
 ---
 

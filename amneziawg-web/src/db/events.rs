@@ -19,6 +19,8 @@
 //! | Constant | Value | When logged |
 //! |---|---|---|
 //! | [`EVT_PEER_UPDATED`] | `"peer_updated"` | PATCH /api/peers/:id or POST /peers/:id |
+//! | [`EVT_PEER_ARCHIVED`] | `"peer_archived"` | peer data is purged and its disabled tombstone is hidden |
+//! | [`EVT_PEER_RESTORED`] | `"peer_restored"` | an archived tombstone is returned to the peer list |
 //! | [`EVT_LOGIN_SUCCESS`] | `"login_success"` | successful POST /login |
 //! | [`EVT_LOGIN_FAILED`]  | `"login_failed"`  | failed POST /login credential check |
 //! | [`EVT_LOGOUT`]        | `"logout"`        | POST /logout |
@@ -44,6 +46,10 @@ pub const EVT_LOGIN_FAILED: &str = "login_failed";
 pub const EVT_LOGOUT: &str = "logout";
 /// Audit event for enabling or disabling a peer.
 pub const EVT_PEER_DISABLED: &str = "peer_disabled";
+/// Audit event when a disabled peer's panel data is purged and archived.
+pub const EVT_PEER_ARCHIVED: &str = "peer_archived";
+/// Audit event when an archived peer tombstone is returned to the normal list.
+pub const EVT_PEER_RESTORED: &str = "peer_restored";
 /// Audit event when a user creation is requested.
 pub const EVT_USER_CREATE_REQUESTED: &str = "user_create_requested";
 /// Audit event when a user creation succeeds.

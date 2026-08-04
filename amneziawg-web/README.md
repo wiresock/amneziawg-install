@@ -46,6 +46,9 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
   each config file with its live peer by public key.
 - **Peer rename / comment** – `PATCH /api/peers/:id` (JSON) and
   `POST /peers/:id` (HTML form) with normalisation and field-level validation.
+- **Old-peer cleanup** – disabled peers with no linked client config can have
+  their saved metadata and traffic history deleted from the panel. The public
+  key remains archived and disabled so enforcement can continue.
 - **Traffic history** – counter-reset-safe per-snapshot deltas over 24 h / 7 d / 30 d.
 - **Proxy session visibility** – when `amneziawg-proxy` is enabled, reads its
   local status file and shows active remote client sessions on the peer list.
@@ -55,7 +58,8 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 - **CSRF protection** – per-session tokens on all write forms;
   short-lived single-use pre-login token on the login form.
 - **Login rate limiting** – 5 attempts per 5-minute window per client IP.
-- **Audit logging** – `peer_updated`, `login_success`, `login_failed`, `logout`,
+- **Audit logging** – `peer_updated`, `peer_archived`, `peer_restored`,
+  `login_success`, `login_failed`, `logout`,
   `user_create_requested`, `user_created`, `user_create_failed`,
   `user_remove_requested`, `user_removed`, `user_remove_failed`
   written to the `events` table; queryable via `GET /api/events`.
@@ -224,17 +228,20 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/` | Yes | HTML peer list + add user form |
+| `GET` | `/` | Yes | HTML peer list + add user form; `?show_archived=true` includes archived disabled keys |
 | `GET` | `/peers/:id` | Yes | HTML peer detail + edit form + remove user + activity |
+| `GET` | `/archived/peers/:id` | Yes | Minimal archived-key detail and retained audit activity |
 | `POST` | `/peers/:id` | Yes | HTML form update (PRG redirect) |
+| `POST` | `/admin/peers/:id/archive` | Yes | Delete an eligible disabled peer's saved metadata and traffic history, then hide its retained key |
+| `POST` | `/admin/peers/:id/restore` | Yes | Return an archived key to the normal list as a blank, still-disabled peer |
 | `POST` | `/admin/users/add` | Yes | HTML form: add new user (PRG redirect) |
 | `POST` | `/admin/users/:id/remove` | Yes | HTML form: remove user (PRG redirect) |
 | `GET` | `/login` | No | Login form |
 | `POST` | `/login` | No | Validate credentials, set cookie |
 | `POST` | `/logout` | No | Clear session cookie |
 | `GET` | `/api/health` | No | Liveness probe `{"status":"ok"}` |
-| `GET` | `/api/peers` | Yes | List all peers; peers connected through `amneziawg-proxy` carry the session's real remote address in `proxy_remote_addr` |
-| `GET` | `/api/peers/:id` | Yes | Peer detail (50 recent snapshots, `proxy_remote_addr` when proxied) |
+| `GET` | `/api/peers` | Yes | List normal peers; `?include_archived=true` also returns archived summaries with `archived: true`; proxied peers carry `proxy_remote_addr` |
+| `GET` | `/api/peers/:id` | Yes | Normal peer detail (50 recent snapshots, `proxy_remote_addr` when proxied); archived keys return `404` |
 | `PATCH` | `/api/peers/:id` | Yes | Update `display_name` and/or `comment` |
 | `GET` | `/api/peers/:id/history` | Yes | Traffic history (`?range=24h\|7d\|30d`) |
 | `GET` | `/api/system/status` | Yes | System time, boot time, and uptime context for current counters (`server_*` aliases are retained for compatibility) |
@@ -329,6 +336,20 @@ Peer status is split into two independent dimensions:
 | **Identity** (`identity_status`) | `linked`, `unlinked` | Config file mapping state |
 
 The legacy `status` field is still present in the API for backward compatibility.
+
+### Archived disabled keys
+
+The **Forget old peer data** action is available only when a peer is disabled,
+has no linked client configuration, and has finished lifecycle reconciliation.
+It atomically clears the current peer record's display metadata, observed
+network state, counters, config mapping, and traffic snapshots, then hides the
+row from normal lists and detail/data routes.
+
+The panel retains the peer ID, public key, disabled state, timestamps, and audit
+history. Audit payloads may contain earlier names or comments. AmneziaWG config
+files are not changed, and this feature is not forensic secure erasure. The
+archived key stays in disabled-key enforcement; returning it to the peer list
+does not recover deleted data and leaves it disabled.
 
 ---
 

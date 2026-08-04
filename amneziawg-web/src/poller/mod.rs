@@ -33,10 +33,12 @@ use crate::db::Database;
 use crate::domain::PublicKey;
 
 /// Serializes access to the clear-all + re-map sequence so that concurrent
-/// calls from the poller and on-demand `rescan_configs` cannot interleave.
+/// calls from the poller and on-demand `rescan_configs` cannot interleave, and
+/// archive eligibility checks cannot observe the transient cleared state.
 static CONFIG_MAPPING_LOCK: Mutex<()> = Mutex::const_new(());
 
-/// Serialize config discovery/mapping with newly-created peer persistence.
+/// Serialize config discovery/mapping with newly-created peer persistence and
+/// peer archival eligibility checks.
 ///
 /// The guard deliberately covers the directory scan as well as the database
 /// clear-and-remap sequence, so a scan cannot apply a pre-creation snapshot
@@ -108,7 +110,13 @@ impl Poller {
         for iface in &interfaces {
             for peer in &iface.peers {
                 match self.store_snapshot(&peer.public_key, peer, now).await {
-                    Ok(()) => snapshots_written += 1,
+                    Ok(true) => snapshots_written += 1,
+                    Ok(false) => {
+                        debug!(
+                            public_key = %peer.public_key,
+                            "snapshot skipped for archived peer"
+                        );
+                    }
                     Err(e) => {
                         error!(
                             public_key = %peer.public_key,
@@ -297,17 +305,20 @@ impl Poller {
         public_key: &PublicKey,
         peer: &awg::AwgPeer,
         captured_at: chrono::DateTime<chrono::Utc>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let endpoint = peer.endpoint.as_deref();
         let last_handshake = peer.last_handshake.map(|ts| ts.timestamp());
         let rx = saturating_u64_to_i64(peer.rx_bytes);
         let tx = saturating_u64_to_i64(peer.tx_bytes);
         let captured_str = captured_at.to_rfc3339_opts(SecondsFormat::Secs, true);
 
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO snapshots \
              (public_key, captured_at, endpoint, last_handshake_at, rx_bytes, tx_bytes) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             SELECT ?, ?, ?, ?, ?, ? \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM peers WHERE public_key = ? AND archived = 1 \
+             )",
         )
         .bind(&public_key.0)
         .bind(&captured_str)
@@ -315,10 +326,11 @@ impl Poller {
         .bind(last_handshake)
         .bind(rx)
         .bind(tx)
+        .bind(&public_key.0)
         .execute(&self.db.pool)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     async fn upsert_peer(&self, public_key: &PublicKey, peer: &awg::AwgPeer) -> anyhow::Result<()> {
@@ -338,7 +350,8 @@ impl Poller {
                  rx_bytes            = excluded.rx_bytes, \
                  tx_bytes            = excluded.tx_bytes, \
                  sync_pending        = 0, \
-                 updated_at          = CURRENT_TIMESTAMP",
+                 updated_at          = CURRENT_TIMESTAMP \
+             WHERE peers.archived = 0",
         )
         .bind(&public_key.0)
         .bind(endpoint)
@@ -447,7 +460,8 @@ pub async fn sync_peers_from_awg(db: &crate::db::Database) -> anyhow::Result<()>
                      last_handshake_at   = excluded.last_handshake_at, \
                      rx_bytes            = excluded.rx_bytes, \
                      tx_bytes            = excluded.tx_bytes, \
-                     updated_at          = CURRENT_TIMESTAMP",
+                     updated_at          = CURRENT_TIMESTAMP \
+                 WHERE peers.archived = 0",
             )
             .bind(&peer.public_key.0)
             .bind(endpoint)
@@ -490,7 +504,7 @@ async fn apply_config_mappings(
     crate::db::peers::clear_all_config_mappings(&db.pool).await?;
 
     // Load all peers from the DB for AllowedIPs fallback matching.
-    let all_peers = crate::db::peers::list_all(&db.pool).await?;
+    let all_peers = crate::db::peers::list_visible(&db.pool).await?;
 
     let mut mapped: usize = 0;
     let mut mapped_by_ip: usize = 0;
@@ -664,4 +678,73 @@ pub async fn rescan_configs(
     apply_config_mappings(db, &configs).await?;
     info!("on-demand config rescan complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[tokio::test]
+    async fn poller_writes_cannot_repopulate_an_archived_peer() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let public_key = PublicKey("KEY_ARCHIVED_POLLER=".to_string());
+        let id = sqlx::query(
+            "INSERT INTO peers (public_key, display_name, comment, allowed_ips, disabled) \
+             VALUES (?, 'Old name', 'Old comment', '10.8.0.2/32', 1)",
+        )
+        .bind(&public_key.0)
+        .execute(&db.pool)
+        .await
+        .expect("insert peer")
+        .last_insert_rowid();
+
+        let outcome = crate::db::peers::archive_peer_data(&db.pool, id, "admin")
+            .await
+            .expect("archive peer");
+        assert!(matches!(
+            outcome,
+            crate::db::peers::ArchivePeerOutcome::Archived { .. }
+        ));
+
+        let observed = awg::AwgPeer {
+            public_key: public_key.clone(),
+            endpoint: Some("198.51.100.9:51820".to_string()),
+            allowed_ips: vec!["10.8.0.2/32".to_string()],
+            last_handshake: Some(Utc::now()),
+            rx_bytes: 123,
+            tx_bytes: 456,
+        };
+        let poller = Poller::new(db.clone(), 30, PathBuf::from("."));
+
+        assert!(!poller
+            .store_snapshot(&public_key, &observed, Utc::now())
+            .await
+            .expect("store guarded snapshot"));
+        poller
+            .upsert_peer(&public_key, &observed)
+            .await
+            .expect("guarded peer upsert");
+
+        let row = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .expect("find peer")
+            .expect("archived tombstone");
+        assert_eq!(row.archived, 1);
+        assert_eq!(row.disabled, 1);
+        assert!(row.display_name.is_none());
+        assert!(row.comment.is_none());
+        assert!(row.endpoint.is_none());
+        assert!(row.allowed_ips.is_empty());
+        assert_eq!(row.rx_bytes, 0);
+        assert_eq!(row.tx_bytes, 0);
+
+        let snapshots: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM snapshots WHERE public_key = ?")
+                .bind(&public_key.0)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count snapshots");
+        assert_eq!(snapshots, 0);
+    }
 }
