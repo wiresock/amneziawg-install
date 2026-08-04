@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 
 # Privileged command gateway for amneziawg-web.
 #
@@ -20,14 +20,35 @@ umask 077
 
 readonly AWG_BIN="/usr/bin/awg"
 readonly AWG_QUICK_BIN="/usr/bin/awg-quick"
-readonly CAT_BIN="/usr/bin/cat"
-readonly CHMOD_BIN="/usr/bin/chmod"
-readonly CHOWN_BIN="/usr/bin/chown"
-readonly FLOCK_BIN="/usr/bin/flock"
-readonly MKTEMP_BIN="/usr/bin/mktemp"
-readonly MV_BIN="/usr/bin/mv"
-readonly RM_BIN="/usr/bin/rm"
-readonly STAT_BIN="/usr/bin/stat"
+
+# Debian 11 can use a non-merged /usr layout, where essential coreutils live
+# under /bin rather than /usr/bin. Resolve only through the fixed, root-owned
+# PATH above so the helper remains portable without trusting caller input.
+# Privileged Bash mode prevents imported functions from shadowing commands;
+# type -P additionally ignores shell functions and aliases during lookup.
+resolve_system_command() {
+    local resolved=""
+
+    resolved="$(type -P "$1" 2>/dev/null || true)"
+    case "${resolved}" in
+        /usr/sbin/*|/usr/bin/*|/sbin/*|/bin/*)
+            printf '%s\n' "${resolved}"
+            ;;
+        *)
+            printf '\n'
+            ;;
+    esac
+}
+
+CAT_BIN="$(resolve_system_command cat)"
+CHMOD_BIN="$(resolve_system_command chmod)"
+CHOWN_BIN="$(resolve_system_command chown)"
+FLOCK_BIN="$(resolve_system_command flock)"
+MKTEMP_BIN="$(resolve_system_command mktemp)"
+MV_BIN="$(resolve_system_command mv)"
+RM_BIN="$(resolve_system_command rm)"
+STAT_BIN="$(resolve_system_command stat)"
+readonly CAT_BIN CHMOD_BIN CHOWN_BIN FLOCK_BIN MKTEMP_BIN MV_BIN RM_BIN STAT_BIN
 readonly AWG_CONFIG_ROOT="/etc/amnezia/amneziawg"
 readonly AWG_PARAMS_PATH="${AWG_CONFIG_ROOT}/params"
 
@@ -35,6 +56,7 @@ TEMPORARY_FILE=""
 PEER_PUBLIC_KEY=""
 PEER_PRESHARED_KEY=""
 PEER_ALLOWED_IPS=""
+declare -A DISABLED_KEYS=()
 
 cleanup() {
     if [[ -n "${TEMPORARY_FILE}" ]]; then
@@ -71,7 +93,7 @@ require_arg_count() {
 require_executable() {
     local executable="$1"
 
-    if [[ ! -x "${executable}" ]]; then
+    if [[ "${executable}" != /* || ! -x "${executable}" ]]; then
         fail "required executable is missing or not executable: ${executable}"
     fi
 }
@@ -102,6 +124,31 @@ validate_public_key() {
     if [[ ! "${public_key}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
         fail "invalid peer public key: expected a 44-character WireGuard base64 key"
     fi
+}
+
+read_disabled_keys() {
+    local payload="" line
+    local count=0
+
+    # A disabled-key list is the only caller-controlled input accepted by the
+    # reconciliation operation. Read it before taking the interface lock and
+    # cap it at 64 KiB / 1024 peers to avoid an unbounded privileged process.
+    IFS= read -r -N 65537 payload || true
+    if (( ${#payload} > 65536 )); then
+        fail "disabled-key payload exceeds the 64 KiB limit"
+    fi
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ -z "${line}" ]]; then
+            continue
+        fi
+        validate_public_key "${line}"
+        DISABLED_KEYS["${line}"]=1
+        (( count += 1 ))
+        if (( count > 1024 )); then
+            fail "disabled-key payload contains more than 1024 entries"
+        fi
+    done < <(printf '%s' "${payload}")
 }
 
 validate_client_name() {
@@ -239,17 +286,6 @@ acquire_server_config_lock() {
         || fail "could not acquire server-config lock"
 }
 
-validate_read_path() {
-    local path="$1"
-
-    if [[ "${path}" == "${AWG_PARAMS_PATH}" ]]; then
-        reject_symlinks "${path}"
-        return 0
-    fi
-
-    validate_server_config_path "${path}"
-}
-
 read_peer_payload() {
     local client_name="$1"
     local payload="" line public_key preshared_key allowed_ips
@@ -300,6 +336,159 @@ read_peer_payload() {
     PEER_PUBLIC_KEY="${public_key}"
     PEER_PRESHARED_KEY="${preshared_key}"
     PEER_ALLOWED_IPS="${allowed_ips}"
+}
+
+show_sanitized_dump() {
+    local dump line interface
+    local -a fields=()
+    local -A seen_interfaces=()
+
+    require_executable "${AWG_BIN}"
+    if ! dump="$("${AWG_BIN}" show all dump 2>/dev/null)"; then
+        fail "could not read AWG interface state"
+    fi
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ -z "${line}" ]]; then
+            continue
+        fi
+        IFS=$'\t' read -r -a fields <<< "${line}"
+        if (( ${#fields[@]} < 5 )); then
+            fail "AWG dump contained a malformed record"
+        fi
+        interface="${fields[0]}"
+        validate_interface "${interface}"
+        if [[ -n "${seen_interfaces[${interface}]+present}" ]]; then
+            if (( ${#fields[@]} < 9 )); then
+                fail "AWG dump contained a malformed peer record"
+            fi
+            # A peer pre-shared key is field 3 (index 2).
+            fields[2]="(redacted)"
+        else
+            seen_interfaces["${interface}"]=1
+            # The interface private key is field 2 (index 1).
+            fields[1]="(redacted)"
+        fi
+        (IFS=$'\t'; printf '%s\n' "${fields[*]}")
+    done <<< "${dump}"
+}
+
+emit_safe_params() {
+    local line key
+
+    reject_symlinks "${AWG_PARAMS_PATH}"
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        key="${line%%=*}"
+        case "${key}" in
+            SERVER_PUB_IP|SERVER_AWG_NIC|SERVER_AWG_IPV4|SERVER_AWG_IPV6|\
+            SERVER_PORT|SERVER_PUB_KEY|CLIENT_DNS_1|CLIENT_DNS_2|ALLOWED_IPS|\
+            SERVER_AWG_JC|SERVER_AWG_JMIN|SERVER_AWG_JMAX|SERVER_AWG_S1|\
+            SERVER_AWG_S2|SERVER_AWG_S3|SERVER_AWG_S4|SERVER_AWG_H1|\
+            SERVER_AWG_H2|SERVER_AWG_H3|SERVER_AWG_H4)
+                printf '%s\n' "${line}"
+                ;;
+        esac
+    done < "${AWG_PARAMS_PATH}"
+}
+
+emit_safe_server_state() {
+    local interface="$1"
+    local path="${AWG_CONFIG_ROOT}/${interface}.conf"
+    local line trimmed value
+
+    validate_server_config_path "${path}"
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+
+        if [[ "${trimmed}" =~ ^\[(Interface|Peer)\]$ ]]; then
+            printf '[%s]\n' "${BASH_REMATCH[1]}"
+        elif [[ "${trimmed}" =~ ^###[[:space:]]Client[[:space:]]([A-Za-z0-9_-]{1,15})$ ]]; then
+            printf '### Client %s\n' "${BASH_REMATCH[1]}"
+        elif [[ "${trimmed}" =~ ^Address[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+            if [[ ! "${value}" =~ ^[0-9A-Fa-f:.,/[:space:]]+$ ]]; then
+                fail "server Address contains unexpected content"
+            fi
+            printf 'Address = %s\n' "${value}"
+        elif [[ "${trimmed}" =~ ^AllowedIPs[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+            if [[ ! "${value}" =~ ^[0-9A-Fa-f:.,/[:space:]]+$ ]]; then
+                fail "peer AllowedIPs contains unexpected content"
+            fi
+            printf 'AllowedIPs = %s\n' "${value}"
+        fi
+    done < "${path}"
+}
+
+reconcile_interface() {
+    local interface="$1"
+    local path="${AWG_CONFIG_ROOT}/${interface}.conf"
+    local stripped line trimmed key
+    local in_peer="false"
+    local peer_disabled="false"
+    local -a config_lines=() peer_lines=()
+
+    validate_server_config_path "${path}"
+    acquire_server_config_lock "${interface}"
+    validate_server_config_path "${path}"
+    require_executable "${AWG_QUICK_BIN}"
+    require_executable "${AWG_BIN}"
+    require_executable "${MKTEMP_BIN}"
+
+    if ! stripped="$("${AWG_QUICK_BIN}" strip "${interface}" 2>/dev/null)"; then
+        fail "could not strip the trusted interface config"
+    fi
+    mapfile -t config_lines <<< "${stripped}"
+
+    TEMPORARY_FILE="$("${MKTEMP_BIN}" "${AWG_CONFIG_ROOT}/.${interface}.sync.XXXXXX")" \
+        || fail "could not create a temporary sync config"
+
+    for line in "${config_lines[@]}"; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+
+        if [[ "${trimmed}" =~ ^\[[^]]+\]$ ]]; then
+            if [[ "${in_peer}" == "true" ]]; then
+                if [[ "${peer_disabled}" != "true" ]]; then
+                    printf '%s\n' "${peer_lines[@]}" >> "${TEMPORARY_FILE}"
+                fi
+                peer_lines=()
+                peer_disabled="false"
+            fi
+
+            if [[ "${trimmed,,}" == "[peer]" ]]; then
+                in_peer="true"
+                peer_lines=("${line}")
+                continue
+            fi
+            in_peer="false"
+            printf '%s\n' "${line}" >> "${TEMPORARY_FILE}"
+            continue
+        fi
+
+        if [[ "${in_peer}" == "true" ]]; then
+            peer_lines+=("${line}")
+            if [[ "${trimmed}" =~ ^PublicKey[[:space:]]*=[[:space:]]*([A-Za-z0-9+/]{43}=)[[:space:]]*$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                if [[ -n "${DISABLED_KEYS[${key}]+present}" ]]; then
+                    peer_disabled="true"
+                fi
+            fi
+        else
+            printf '%s\n' "${line}" >> "${TEMPORARY_FILE}"
+        fi
+    done
+
+    if [[ "${in_peer}" == "true" && "${peer_disabled}" != "true" ]]; then
+        printf '%s\n' "${peer_lines[@]}" >> "${TEMPORARY_FILE}"
+    fi
+
+    if ! "${AWG_BIN}" syncconf "${interface}" "${TEMPORARY_FILE}" >/dev/null 2>&1; then
+        fail "could not reconcile the running AWG interface"
+    fi
+    "${RM_BIN}" -f -- "${TEMPORARY_FILE}"
+    TEMPORARY_FILE=""
 }
 
 append_peer_block() {
@@ -439,8 +628,8 @@ main() {
     case "${subcommand}" in
         show-all)
             require_arg_count "${subcommand}" 0 "$#"
-            require_executable "${AWG_BIN}"
-            command=("${AWG_BIN}" show all dump)
+            show_sanitized_dump
+            return 0
             ;;
         remove-peer)
             require_arg_count "${subcommand}" 2 "$#"
@@ -449,23 +638,23 @@ main() {
             require_executable "${AWG_BIN}"
             command=("${AWG_BIN}" set "$1" peer "$2" remove)
             ;;
-        strip-interface)
+        reconcile-interface)
             require_arg_count "${subcommand}" 1 "$#"
             validate_interface "$1"
-            require_executable "${AWG_QUICK_BIN}"
-            command=("${AWG_QUICK_BIN}" strip "$1")
+            read_disabled_keys
+            reconcile_interface "$1"
+            return 0
             ;;
-        sync-interface)
+        read-params)
+            require_arg_count "${subcommand}" 0 "$#"
+            emit_safe_params
+            return 0
+            ;;
+        read-server-state)
             require_arg_count "${subcommand}" 1 "$#"
             validate_interface "$1"
-            require_executable "${AWG_BIN}"
-            command=("${AWG_BIN}" syncconf "$1" /dev/stdin)
-            ;;
-        read-file)
-            require_arg_count "${subcommand}" 1 "$#"
-            validate_read_path "$1"
-            require_executable "${CAT_BIN}"
-            command=("${CAT_BIN}" -- "$1")
+            emit_safe_server_state "$1"
+            return 0
             ;;
         append-peer)
             require_arg_count "${subcommand}" 2 "$#"
@@ -496,7 +685,9 @@ main() {
             ;;
     esac
 
-    exec "${command[@]}"
+    if ! "${command[@]}" >/dev/null 2>&1; then
+        fail "privileged AWG operation failed"
+    fi
 }
 
 main "$@"

@@ -12,11 +12,11 @@
 //!
 //! | Operation | Command |
 //! |-----------|---------|
-//! | Read params / server config | `…-privileged read-file <path>` |
+//! | Read safe params | `…-privileged read-params` |
+//! | Read sanitized server state | `…-privileged read-server-state <iface>` |
 //! | Append peer to server config | `…-privileged append-peer <iface> <name>` |
 //! | Remove managed peer block | `…-privileged remove-client <iface> <name>` |
-//! | Strip interface config | `…-privileged strip-interface <iface>` |
-//! | Sync interface | `…-privileged sync-interface <iface>` |
+//! | Reconcile live interface | `…-privileged reconcile-interface <iface>` |
 //!
 //! Key generation (`awg genkey`, `awg pubkey`, `awg genpsk`) does **not**
 //! require root privileges.
@@ -657,14 +657,11 @@ fn resolve_client_ips(
 /// free IP addresses are available.
 #[cfg(unix)]
 pub fn suggest_next_ips() -> Result<SuggestedIps, CreateClientError> {
-    let amneziawg_dir = Path::new("/etc/amnezia/amneziawg");
-
-    let params_content = awg::read_file_via_sudo(&amneziawg_dir.join("params"))
+    let params_content = awg::read_params_via_sudo()
         .map_err(|e| CreateClientError::ParamsRead(format!("failed to read params file: {e}")))?;
     let params = parse_params(&params_content)?;
 
-    let server_conf_path = amneziawg_dir.join(format!("{}.conf", params.server_awg_nic));
-    let server_config = awg::read_file_via_sudo(&server_conf_path)
+    let server_config = awg::read_server_state_via_sudo(&params.server_awg_nic)
         .map_err(|e| CreateClientError::ParamsRead(format!("failed to read server config: {e}")))?;
 
     let base_ipv4 = ipv4_base(&params.server_awg_ipv4);
@@ -986,15 +983,8 @@ pub fn create_client(
     // Step 1: Validate the client name.
     script_bridge::validate_client_name(name)?;
 
-    // Step 2: Use the fixed server config root that matches the sudoers rules.
-    //         AWG_CONFIG_DIR (config_dir) is configurable and may live outside
-    //         /etc, so we cannot rely on config_dir.parent() to locate the
-    //         params file and server config.
-    let amneziawg_dir = Path::new("/etc/amnezia/amneziawg");
-
     // Step 3: Read server parameters.
-    let params_path = amneziawg_dir.join("params");
-    let params_content = awg::read_file_via_sudo(&params_path)
+    let params_content = awg::read_params_via_sudo()
         .map_err(|e| CreateClientError::ParamsRead(format!("failed to read params file: {e}")))?;
     let params = parse_params(&params_content)?;
 
@@ -1112,8 +1102,7 @@ pub fn create_client(
         })?;
 
     // Step 4: Read server config to check for duplicates and find used IPs.
-    let server_conf_path = amneziawg_dir.join(format!("{}.conf", params.server_awg_nic));
-    let server_config = awg::read_file_via_sudo(&server_conf_path)
+    let server_config = awg::read_server_state_via_sudo(&params.server_awg_nic)
         .map_err(|e| CreateClientError::ParamsRead(format!("failed to read server config: {e}")))?;
 
     // Check for duplicate name (look for ### Client <name> marker).
@@ -1208,13 +1197,9 @@ pub fn create_client(
         Some(ipv6) => format!("{client_ipv4}/32,{ipv6}/128"),
         None => format!("{client_ipv4}/32"),
     };
-    if let Err(e) = awg::append_peer_via_sudo(
-        &params.server_awg_nic,
-        name,
-        &pub_key,
-        &psk,
-        &allowed_ips,
-    ) {
+    if let Err(e) =
+        awg::append_peer_via_sudo(&params.server_awg_nic, name, &pub_key, &psk, &allowed_ips)
+    {
         // Clean up the client config on failure.
         let _ = std::fs::remove_file(&client_conf_path);
         return Err(CreateClientError::FileWrite(format!(
@@ -1295,15 +1280,12 @@ pub fn remove_client(
         }
     }
 
-    let amneziawg_dir = Path::new("/etc/amnezia/amneziawg");
-    let params_path = amneziawg_dir.join("params");
-    let params_content = awg::read_file_via_sudo(&params_path)
+    let params_content = awg::read_params_via_sudo()
         .map_err(|e| RemoveClientError::ParamsRead(format!("failed to read params file: {e}")))?;
     let params =
         parse_params(&params_content).map_err(|e| RemoveClientError::ParamsRead(e.to_string()))?;
 
-    let server_conf_path = amneziawg_dir.join(format!("{}.conf", params.server_awg_nic));
-    let server_config = awg::read_file_via_sudo(&server_conf_path)
+    let server_config = awg::read_server_state_via_sudo(&params.server_awg_nic)
         .map_err(|e| RemoveClientError::ParamsRead(format!("failed to read server config: {e}")))?;
 
     if remove_client_block(&server_config, name).is_none() {

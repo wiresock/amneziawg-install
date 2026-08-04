@@ -165,17 +165,24 @@ available to root.  Rather than running the whole web service as root,
 we grant the service user passwordless sudo for one root-owned helper.  Its
 allow-listed operations provide:
 
-- `show-all` – read tunnel state through `awg show all dump`
+- `show-all` – read tunnel state with interface private keys and peer PSKs redacted
 - `remove-peer` – disable a validated peer on a validated interface
-- `strip-interface` and `sync-interface` – re-enable peers by syncing a sanitized config
-- `read-file` – read only the params file or a validated server config path through `cat`
+- `reconcile-interface` – derive the trusted stripped config inside the helper,
+  exclude a bounded list of validated disabled-peer keys, and sync it
+- `read-params` – expose only the non-secret parameters needed for client generation
+- `read-server-state` – expose only interface addresses, managed-client markers,
+  and peer AllowedIPs needed for allocation
 - `append-peer` – validate and atomically append one reconstructed managed-peer block
 - `remove-client` – atomically remove one exact, validated managed-client block
 
 Every operation has a fixed argument shape.  Unknown subcommands, malformed
 interface/client names, keys or AllowedIPs, unsafe configuration paths,
 symbolic/hard links, and non-regular files are rejected before a privileged
-command is invoked.  Config mutations share a stable per-interface lock.
+command is invoked. Existing root-owned server private keys and PSKs are never
+exposed to the service. Apart from the newly generated peer payload required by
+`append-peer`, the helper accepts no secrets; raw config files and
+caller-supplied `syncconf` content are never accepted. Config mutations and live
+reconciliation share a stable per-interface lock.
 
 This follows the principle of least privilege.
 

@@ -90,9 +90,11 @@ The service runs as `awg-web` (non-root) but needs to manage AWG interface
 state.  Install the validating helper as a root-owned, non-writable artifact,
 then allow only its exact path in sudoers.  The helper accepts only supported
 subcommands and validates argument counts, interface/client names, peer keys,
-AllowedIPs, and configuration paths.  Config mutations are limited to
-validated peer append/remove operations performed under a stable lock with an
-atomic replacement:
+AllowedIPs, and configuration paths. State reads are projected and redact
+private keys and PSKs; reconciliation derives the trusted config inside the
+helper instead of accepting raw `syncconf` input. Config mutations are limited
+to validated peer append/remove operations performed under a stable lock with
+an atomic replacement:
 
 ```bash
 sudo install -d -m 0755 -o root -g root /usr/local/libexec

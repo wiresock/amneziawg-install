@@ -46,7 +46,8 @@ tab-separated `show all dump` output into Rust structs.
   `/usr/local/libexec/amneziawg-web-privileged`.
 - The sudoers drop-in grants access only to that exact helper path; dynamic
   command arguments are not expressed as sudoers globs.
-- Private key fields in the output are read and immediately discarded.
+- The helper redacts interface private keys and peer PSKs before output crosses
+  into the service process.
 - Parsed output is never interpolated back into shell commands.
 
 **Assumptions / TODOs:**
@@ -63,12 +64,17 @@ Installed at `/usr/local/libexec/amneziawg-web-privileged` as
 `/etc/sudoers.d/amneziawg-web` for the `awg-web` service user.
 
 The helper allow-lists subcommands and validates each argument count,
-interface/client name, peer key, AllowedIPs value, and configuration path.  It
-rejects unsafe paths, symbolic links, hard links, and non-regular config files.
+interface/client name, peer key, and AllowedIPs value. It rejects unsafe
+paths, symbolic links, hard links, and non-regular config files. Parameter and
+server-state reads are semantic projections that omit private keys, PSKs, and
+privileged interface directives. Live reconciliation accepts only a bounded
+list of disabled public keys; the helper derives and filters the trusted
+root-owned config internally before invoking `awg syncconf`.
 Peer additions and removals are semantic operations: the helper holds a stable
 per-interface lock, reconstructs an approved peer block or removes one exact
 managed-client block, and atomically replaces the config.  Arbitrary config
-content and unknown operations are rejected rather than forwarded.
+content, raw file reads, arbitrary `syncconf` stdin, and unknown operations are
+rejected rather than forwarded.
 
 ---
 

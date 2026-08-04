@@ -37,6 +37,9 @@ esac
 # PATH is explicitly manipulated so that /sbin and /usr/sbin come before the
 # existing PATH entries. This ensures mocks take precedence over any real binaries.
 export PATH="/sbin:/usr/sbin:${PATH}"
+REAL_MV_BIN="$(type -P mv)"
+readonly REAL_MV_BIN
+export REAL_MV_BIN
 create_mock() {
 	local CMD="$1"
 	local BODY="$2"
@@ -64,7 +67,14 @@ case "$1" in
 		esac
 		;;
 	genpsk)   echo "cHNrMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnM=";;
-	syncconf) cat > /tmp/awg-syncconf-stdin; exit 0;;
+	syncconf)
+		if [[ -n "${3:-}" && "${3}" != "/dev/stdin" ]]; then
+			cat -- "${3}" > /tmp/awg-syncconf-stdin
+		else
+			cat > /tmp/awg-syncconf-stdin
+		fi
+		exit 0
+		;;
 	show)
 		if [[ "${2:-}" == "all" ]] && [[ "${3:-}" == "dump" ]]; then
 			# Tab-separated dump format used by the Rust poller.
@@ -73,7 +83,7 @@ case "$1" in
 			# 21 fields instead of the standard WireGuard 5.  The parser must
 			# handle both.
 			printf "awg0\tPRIVATE_KEY\tSVR_PUB_KEY_BASE64=\t51820\t8\t50\t1000\t107\t105\t62\t95321941292\t774489227\t1084244185\t1837068650\t(null)\t(null)\t(null)\t(null)\t(null)\t(null)\toff\n"
-			printf "awg0\tCLIENT1_PUB_KEY=\t(none)\t203.0.113.42:12345\t10.8.0.2/32\t1700000000\t1024\t2048\toff\n"
+			printf "awg0\tCLIENT1_PUB_KEY=\tPEER_PSK_SECRET=\t203.0.113.42:12345\t10.8.0.2/32\t1700000000\t1024\t2048\toff\n"
 		else
 			echo "interface: awg0"
 			echo "  public key: cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A="
@@ -95,7 +105,14 @@ esac
 create_mock "awg-quick" '
 printf "%s\n" "$*" >> /tmp/awg-quick-calls.log
 case "$1" in
-	strip) echo "[Interface]"; echo "PrivateKey = mock";;
+	strip)
+		if [[ -f /tmp/awg-quick-strip-output ]]; then
+			cat /tmp/awg-quick-strip-output
+		else
+			echo "[Interface]"
+			echo "PrivateKey = mock"
+		fi
+		;;
 	*)     exit 0;;
 esac
 '
@@ -208,6 +225,19 @@ case "$1" in
 		UNIT="${2:-}"
 		if [[ "$UNIT" == "amneziawg-web" ]]; then
 			rm -f /tmp/awg-web-mock-started
+		fi
+		exit 0
+		;;
+	restart)
+		UNIT="${2:-}"
+		if [[ "$UNIT" == "amneziawg-web" ]]; then
+			rm -f /tmp/awg-web-mock-started
+			if [[ "${FAIL_SYSTEMCTL_RESTART:-false}" == "true" ]]; then
+				exit 74
+			fi
+			if [[ "${RESTART_RETURNS_INACTIVE:-false}" != "true" ]]; then
+				touch /tmp/awg-web-mock-started
+			fi
 		fi
 		exit 0
 		;;
@@ -2156,29 +2186,47 @@ fi
 if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	VALID_HELPER_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 	VALID_HELPER_PSK="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+	SECOND_HELPER_KEY="CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="
 	HELPER_TEST_INTERFACE="helpertest"
 	HELPER_TEST_CONF="/etc/amnezia/amneziawg/${HELPER_TEST_INTERFACE}.conf"
 	HELPER_TEST_LOCK="/etc/amnezia/amneziawg/.${HELPER_TEST_INTERFACE}.web.lock"
-	SYNC_EXPECTED="/tmp/amneziawg-helper-sync-expected"
+	SHOW_ACTUAL="/tmp/amneziawg-helper-show-actual"
+	PARAMS_ACTUAL="/tmp/amneziawg-helper-params-actual"
 	READ_ACTUAL="/tmp/amneziawg-helper-read-actual"
-	rm -f "${HELPER_TEST_CONF}" "${HELPER_TEST_LOCK}" "${SYNC_EXPECTED}" \
-		"${READ_ACTUAL}" /tmp/awg-syncconf-stdin
-	printf '[Interface]\nPrivateKey = trusted\nPostUp = echo trusted\n' > "${HELPER_TEST_CONF}"
+	rm -f "${HELPER_TEST_CONF}" "${HELPER_TEST_LOCK}" "${SHOW_ACTUAL}" \
+		"${PARAMS_ACTUAL}" "${READ_ACTUAL}" /tmp/awg-syncconf-stdin \
+		/tmp/awg-quick-strip-output
+	printf '[Interface]\nPrivateKey = SERVER_PRIVATE_SECRET\nAddress = 10.66.66.1/24, fd42:0042:0042:0000::1/64\nPostUp = echo trusted\n\n### Client existing\n[Peer]\nPublicKey = %s\nPresharedKey = SERVER_PEER_PSK_SECRET\nAllowedIPs = 10.66.66.41/32\n' \
+		"${SECOND_HELPER_KEY}" > "${HELPER_TEST_CONF}"
 	chmod 0600 "${HELPER_TEST_CONF}"
 	chown root:root "${HELPER_TEST_CONF}"
-	printf '[Interface]\nPrivateKey = sync-test\n' > "${SYNC_EXPECTED}"
+	printf '[Interface]\nPrivateKey = SYNC_PRIVATE_SECRET\n\n[Peer]\nPublicKey = %s\nPresharedKey = DISABLED_PSK_SECRET\nAllowedIPs = 10.66.66.42/32\n\n[Peer]\nPublicKey = %s\nPresharedKey = ENABLED_PSK_SECRET\nAllowedIPs = 10.66.66.43/32\n' \
+		"${VALID_HELPER_KEY}" "${SECOND_HELPER_KEY}" > /tmp/awg-quick-strip-output
 
-	if "${PRIVILEGED_HELPER}" show-all >/dev/null && \
+	if "${PRIVILEGED_HELPER}" show-all > "${SHOW_ACTUAL}" && \
 	   "${PRIVILEGED_HELPER}" remove-peer awg0 "${VALID_HELPER_KEY}" >/dev/null && \
-	   "${PRIVILEGED_HELPER}" strip-interface awg0 >/dev/null && \
-	   "${PRIVILEGED_HELPER}" sync-interface awg0 < "${SYNC_EXPECTED}" && \
-	   cmp -s "${SYNC_EXPECTED}" /tmp/awg-syncconf-stdin && \
-	   "${PRIVILEGED_HELPER}" read-file /etc/amnezia/amneziawg/params > "${READ_ACTUAL}" && \
-	   cmp -s /etc/amnezia/amneziawg/params "${READ_ACTUAL}"; then
+	   printf '%s\n' "${VALID_HELPER_KEY}" | \
+		"${PRIVILEGED_HELPER}" reconcile-interface awg0 && \
+	   ! grep -Fq "${VALID_HELPER_KEY}" /tmp/awg-syncconf-stdin && \
+	   grep -Fq "${SECOND_HELPER_KEY}" /tmp/awg-syncconf-stdin && \
+	   "${PRIVILEGED_HELPER}" read-params > "${PARAMS_ACTUAL}" && \
+	   grep -q '^SERVER_AWG_NIC=' "${PARAMS_ACTUAL}" && \
+	   "${PRIVILEGED_HELPER}" read-server-state "${HELPER_TEST_INTERFACE}" > "${READ_ACTUAL}" && \
+	   grep -Fq '### Client existing' "${READ_ACTUAL}" && \
+	   grep -Fq 'AllowedIPs = 10.66.66.41/32' "${READ_ACTUAL}"; then
 		echo "OK: Privileged helper dispatches approved AWG operations"
 	else
 		echo "FAIL: Privileged helper rejected an approved AWG operation"
 		FAILED=$((FAILED + 1))
+	fi
+
+	if grep -Eq 'PRIVATE_KEY|PEER_PSK_SECRET' "${SHOW_ACTUAL}" || \
+		grep -q '^SERVER_PRIV_KEY=' "${PARAMS_ACTUAL}" || \
+		grep -Eq 'PrivateKey|PresharedKey|PostUp|SERVER_PRIVATE_SECRET|SERVER_PEER_PSK_SECRET' "${READ_ACTUAL}"; then
+		echo "FAIL: Privileged helper exposed a private key, pre-shared key, or privileged directive"
+		FAILED=$((FAILED + 1))
+	else
+		echo "OK: Privileged helper redacts runtime secrets and emits only semantic config state"
 	fi
 
 	if printf 'PublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n' \
@@ -2198,8 +2246,14 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	HELPER_REJECTION_FAILED=0
 	"${PRIVILEGED_HELPER}" show-all extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" remove-peer awg0 invalid-key >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
-	"${PRIVILEGED_HELPER}" sync-interface ../etc >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
-	"${PRIVILEGED_HELPER}" read-file /etc/amnezia/amneziawg/../../shadow.conf >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" reconcile-interface ../etc >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	printf '[Interface]\nPrivateKey = attacker\n' | \
+		"${PRIVILEGED_HELPER}" reconcile-interface awg0 >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" read-params extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" read-server-state ../etc >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" read-file /etc/amnezia/amneziawg/params >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" strip-interface awg0 >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" sync-interface awg0 >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" write-file /etc/sudoers >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" append-file /etc/sudoers >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" append-peer missing alice </dev/null >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
@@ -2218,10 +2272,10 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 			>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	rm -f /etc/amnezia/amneziawg/link.conf
 	ln -s /etc/passwd /etc/amnezia/amneziawg/link.conf
-	"${PRIVILEGED_HELPER}" read-file /etc/amnezia/amneziawg/link.conf >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" read-server-state link >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	rm -f /etc/amnezia/amneziawg/link.conf
 	ln "${HELPER_TEST_CONF}" /etc/amnezia/amneziawg/hardlink.conf
-	"${PRIVILEGED_HELPER}" read-file /etc/amnezia/amneziawg/hardlink.conf >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" read-server-state hardlink >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	rm -f /etc/amnezia/amneziawg/hardlink.conf
 
 	if "${PRIVILEGED_HELPER}" remove-client "${HELPER_TEST_INTERFACE}" alice && \
@@ -2268,9 +2322,190 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 		FAILED=$((FAILED + 1))
 	fi
 
-	rm -f "${HELPER_TEST_CONF}" "${HELPER_TEST_LOCK}" "${SYNC_EXPECTED}" \
-		"${READ_ACTUAL}" /tmp/awg-syncconf-stdin
+	rm -f "${HELPER_TEST_CONF}" "${HELPER_TEST_LOCK}" "${SHOW_ACTUAL}" \
+		"${PARAMS_ACTUAL}" "${READ_ACTUAL}" /tmp/awg-syncconf-stdin \
+		/tmp/awg-quick-strip-output
 fi
+
+echo ""
+echo "--- Web installer: failed sudoers validation preserves an active reinstall ---"
+
+INSTALL_VISUDO_DIR=$(mktemp -d /tmp/amneziawg-install-visudo-fail.XXXXXX)
+cat > "${INSTALL_VISUDO_DIR}/visudo" <<'INSTALLVISUDOEOF'
+#!/bin/bash
+echo "mock installer visudo rejection" >&2
+exit 1
+INSTALLVISUDOEOF
+chmod +x "${INSTALL_VISUDO_DIR}/visudo"
+
+INSTALL_PREFLIGHT_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+INSTALL_PREFLIGHT_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
+INSTALL_PREFLIGHT_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
+touch /tmp/awg-web-mock-started
+rm -f /tmp/systemctl-calls.log
+
+INSTALL_PREFLIGHT_RC=0
+INSTALL_PREFLIGHT_OUTPUT=$(PATH="${INSTALL_VISUDO_DIR}:${PATH}" \
+	bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive --force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-enable 2>&1) || INSTALL_PREFLIGHT_RC=$?
+
+INSTALL_PREFLIGHT_FAILED=0
+if [[ "${INSTALL_PREFLIGHT_RC}" -eq 0 ]] || \
+		[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != "${INSTALL_PREFLIGHT_BINARY_HASH}" ]] || \
+		[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != "${INSTALL_PREFLIGHT_HELPER_HASH}" ]] || \
+		[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != "${INSTALL_PREFLIGHT_SUDOERS_HASH}" ]]; then
+	INSTALL_PREFLIGHT_FAILED=1
+fi
+if grep -q "stop amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.install-tmp.*" >/dev/null || \
+		compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
+		compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null; then
+	INSTALL_PREFLIGHT_FAILED=1
+fi
+if [[ "${INSTALL_PREFLIGHT_FAILED}" -eq 0 ]]; then
+	echo "OK: Failed installer sudoers validation preserves live artifacts and service state"
+else
+	echo "FAIL: Failed installer sudoers validation changed the active install"
+	echo "  Output: ${INSTALL_PREFLIGHT_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+rm -rf "${INSTALL_VISUDO_DIR}"
+
+echo ""
+echo "--- Web installer: restart failure rolls back an active reinstall ---"
+
+INSTALL_RESTART_BINARY="/tmp/amneziawg-web-install-restart-failure"
+cat > "${INSTALL_RESTART_BINARY}" <<'INSTALLRESTARTEOF'
+#!/bin/bash
+echo "installer restart failure candidate"
+INSTALLRESTARTEOF
+chmod +x "${INSTALL_RESTART_BINARY}"
+
+for INSTALL_RESTART_ENV in FAIL_SYSTEMCTL_RESTART RESTART_RETURNS_INACTIVE; do
+	INSTALL_RESTART_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+	INSTALL_RESTART_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
+	INSTALL_RESTART_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
+	touch /tmp/awg-web-mock-started
+	rm -f /tmp/systemctl-calls.log
+
+	INSTALL_RESTART_RC=0
+	INSTALL_RESTART_OUTPUT=$(env "${INSTALL_RESTART_ENV}=true" \
+		bash "${WEB_INSTALLER_IMPL}" \
+		--non-interactive --force \
+		--binary-src "${INSTALL_RESTART_BINARY}" \
+		--install-dir "${WEB_TEST_INSTALL_DIR}" \
+		--data-dir "${WEB_TEST_DATA_DIR}" \
+		--env-file "${WEB_TEST_ENV_FILE}" \
+		--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+		--username testadmin \
+		--password-hash "${TEST_PASSWORD_HASH}" \
+		--no-enable 2>&1) || INSTALL_RESTART_RC=$?
+
+	INSTALL_RESTART_FAILED=0
+	if [[ "${INSTALL_RESTART_RC}" -eq 0 ]] || \
+			[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != "${INSTALL_RESTART_BINARY_HASH}" ]] || \
+			[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != "${INSTALL_RESTART_HELPER_HASH}" ]] || \
+			[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != "${INSTALL_RESTART_SUDOERS_HASH}" ]] || \
+			[[ ! -f /tmp/awg-web-mock-started ]]; then
+		INSTALL_RESTART_FAILED=1
+	fi
+	if ! grep -q "restart amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+			! grep -q "start amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+			compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.install-tmp.*" >/dev/null || \
+			compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.rollback.*" >/dev/null || \
+			compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
+			compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+			compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
+			compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null; then
+		INSTALL_RESTART_FAILED=1
+	fi
+	if [[ "${INSTALL_RESTART_FAILED}" -eq 0 ]]; then
+		echo "OK: Installer ${INSTALL_RESTART_ENV} failure restores artifacts and active service state"
+	else
+		echo "FAIL: Installer ${INSTALL_RESTART_ENV} failure left a partial runtime generation"
+		echo "  Output: ${INSTALL_RESTART_OUTPUT}"
+		FAILED=$((FAILED + 1))
+	fi
+done
+rm -f "${INSTALL_RESTART_BINARY}"
+
+echo ""
+echo "--- Web installer: signal after helper rename completes rollback despite a second signal ---"
+
+INSTALL_SIGNAL_BINARY="/tmp/amneziawg-web-install-signal"
+cat > "${INSTALL_SIGNAL_BINARY}" <<'INSTALLSIGNALEOF'
+#!/bin/bash
+echo "installer signal candidate"
+INSTALLSIGNALEOF
+chmod +x "${INSTALL_SIGNAL_BINARY}"
+
+INSTALL_SIGNAL_MV_DIR=$(mktemp -d /tmp/amneziawg-install-mv-signal.XXXXXX)
+cat > "${INSTALL_SIGNAL_MV_DIR}/mv" <<'INSTALLSIGNALMVEOF'
+#!/bin/bash
+last_arg="${!#}"
+if [[ "${last_arg}" == "${SIGNAL_AFTER_MV_DEST:-__no_signal_destination__}" ]]; then
+	"${REAL_MV_BIN}" "$@"
+	kill -TERM "${PPID}"
+	exit 0
+fi
+exec "${REAL_MV_BIN}" "$@"
+INSTALLSIGNALMVEOF
+chmod +x "${INSTALL_SIGNAL_MV_DIR}/mv"
+
+INSTALL_SIGNAL_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+INSTALL_SIGNAL_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
+INSTALL_SIGNAL_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
+touch /tmp/awg-web-mock-started
+rm -f /tmp/systemctl-calls.log
+
+INSTALL_SIGNAL_RC=0
+INSTALL_SIGNAL_OUTPUT=$(SIGNAL_AFTER_MV_DEST="${PRIVILEGED_HELPER}" \
+	PATH="${INSTALL_SIGNAL_MV_DIR}:${PATH}" \
+	bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive --force \
+	--binary-src "${INSTALL_SIGNAL_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-enable 2>&1) || INSTALL_SIGNAL_RC=$?
+
+INSTALL_SIGNAL_FAILED=0
+if [[ "${INSTALL_SIGNAL_RC}" -eq 0 ]] || \
+		[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != "${INSTALL_SIGNAL_BINARY_HASH}" ]] || \
+		[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != "${INSTALL_SIGNAL_HELPER_HASH}" ]] || \
+		[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != "${INSTALL_SIGNAL_SUDOERS_HASH}" ]] || \
+		[[ ! -f /tmp/awg-web-mock-started ]]; then
+	INSTALL_SIGNAL_FAILED=1
+fi
+if ! grep -q "start amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.install-tmp.*" >/dev/null || \
+		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.rollback.*" >/dev/null || \
+		compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
+		compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+		compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
+		compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null; then
+	INSTALL_SIGNAL_FAILED=1
+fi
+if [[ "${INSTALL_SIGNAL_FAILED}" -eq 0 ]]; then
+	echo "OK: Installer signal recovery restores the prior generation and active service"
+else
+	echo "FAIL: Installer signal recovery did not complete cleanly"
+	echo "  Output: ${INSTALL_SIGNAL_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+rm -f "${INSTALL_SIGNAL_BINARY}"
+rm -rf "${INSTALL_SIGNAL_MV_DIR}"
 
 # Verify the systemd unit does NOT contain NoNewPrivileges=yes
 # (this would prevent sudo from working)
@@ -2824,10 +3059,15 @@ ROLLBACK_MV_DIR=$(mktemp -d /tmp/amneziawg-mv-fail.XXXXXX)
 cat > "${ROLLBACK_MV_DIR}/mv" <<'MVEOF'
 #!/bin/bash
 last_arg="${!#}"
-if [[ "${last_arg}" == "${FAIL_MV_DEST:?}" ]]; then
+if [[ "${last_arg}" == "${FAIL_MV_DEST:-__no_failed_destination__}" ]]; then
 	exit 73
 fi
-exec /usr/bin/mv "$@"
+if [[ "${last_arg}" == "${SIGNAL_AFTER_MV_DEST:-__no_signal_destination__}" ]]; then
+	"${REAL_MV_BIN}" "$@"
+	kill -TERM "${PPID}"
+	exit 0
+fi
+exec "${REAL_MV_BIN}" "$@"
 MVEOF
 chmod +x "${ROLLBACK_MV_DIR}/mv"
 
@@ -2867,10 +3107,11 @@ if ! grep -q "stop amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
 	ROLLBACK_FAILED=1
 fi
 if compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
-		compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
-		compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
-		compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
-		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null; then
+	compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+	compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
+	compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
+	compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null || \
+	compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.rollback.*" >/dev/null; then
 	echo "FAIL: Binary commit rollback left a staged or rollback artifact behind"
 	ROLLBACK_FAILED=1
 fi
@@ -2919,10 +3160,11 @@ for EARLY_FAIL_DEST in "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
 		EARLY_FAILED=1
 	fi
 	if compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
-			compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
-			compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
-			compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
-			compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null; then
+		compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+		compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
+		compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
+		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null || \
+		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.rollback.*" >/dev/null; then
 		EARLY_FAILED=1
 	fi
 
@@ -2931,6 +3173,93 @@ for EARLY_FAIL_DEST in "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
 	else
 		echo "FAIL: Commit failure at ${EARLY_FAIL_DEST} was not recovered cleanly"
 		echo "  Output: ${EARLY_UPGRADE_OUTPUT}"
+		FAILED=$((FAILED + 1))
+	fi
+done
+
+echo ""
+echo "--- Web upgrader: signal after sudoers rename restores an identical binary generation ---"
+
+SIGNAL_BINARY="/tmp/amneziawg-web-upgrade-identical"
+cp -a "${WEB_TEST_INSTALL_DIR}/amneziawg-web" "${SIGNAL_BINARY}"
+printf '\n# pre-signal helper sentinel\n' >> "${PRIVILEGED_HELPER}"
+SIGNAL_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+SIGNAL_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
+SIGNAL_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
+touch /tmp/awg-web-mock-started
+rm -f /tmp/systemctl-calls.log
+
+SIGNAL_UPGRADE_RC=0
+SIGNAL_UPGRADE_OUTPUT=$(SIGNAL_AFTER_MV_DEST="${SUDOERS_FILE}" \
+	PATH="${ROLLBACK_MV_DIR}:${PATH}" \
+	bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${SIGNAL_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--force 2>&1) || SIGNAL_UPGRADE_RC=$?
+
+SIGNAL_FAILED=0
+if [[ "${SIGNAL_UPGRADE_RC}" -eq 0 ]] || \
+		[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != "${SIGNAL_BINARY_HASH}" ]] || \
+		[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != "${SIGNAL_HELPER_HASH}" ]] || \
+		[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != "${SIGNAL_SUDOERS_HASH}" ]]; then
+	SIGNAL_FAILED=1
+fi
+if ! grep -q "start amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+		compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+		compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
+		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.rollback.*" >/dev/null; then
+	SIGNAL_FAILED=1
+fi
+if [[ "${SIGNAL_FAILED}" -eq 0 ]]; then
+	echo "OK: Signal recovery uses rename state and restores the prior identical-binary generation"
+else
+	echo "FAIL: Signal during artifact commit was not recovered cleanly"
+	echo "  Output: ${SIGNAL_UPGRADE_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+rm -f "${SIGNAL_BINARY}"
+
+echo ""
+echo "--- Web upgrader: restart failure restores the previous runtime generation ---"
+
+for RESTART_UPGRADE_ENV in FAIL_SYSTEMCTL_RESTART RESTART_RETURNS_INACTIVE; do
+	RESTART_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+	RESTART_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
+	RESTART_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
+	touch /tmp/awg-web-mock-started
+	rm -f /tmp/systemctl-calls.log
+
+	RESTART_UPGRADE_RC=0
+	RESTART_UPGRADE_OUTPUT=$(env "${RESTART_UPGRADE_ENV}=true" \
+		bash "${WEB_UPGRADER_IMPL}" \
+		--binary "${ROLLBACK_BINARY}" \
+		--install-dir "${WEB_TEST_INSTALL_DIR}" \
+		--env-file "${WEB_TEST_ENV_FILE}" \
+		--data-dir "${WEB_TEST_DATA_DIR}" \
+		--force 2>&1) || RESTART_UPGRADE_RC=$?
+
+	RESTART_FAILED=0
+	if [[ "${RESTART_UPGRADE_RC}" -eq 0 ]] || \
+			[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != "${RESTART_BINARY_HASH}" ]] || \
+			[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != "${RESTART_HELPER_HASH}" ]] || \
+			[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != "${RESTART_SUDOERS_HASH}" ]] || \
+			[[ ! -f /tmp/awg-web-mock-started ]]; then
+		RESTART_FAILED=1
+	fi
+	if ! grep -q "restart amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+			! grep -q "start amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+			compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+			compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
+			compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.rollback.*" >/dev/null; then
+		RESTART_FAILED=1
+	fi
+	if [[ "${RESTART_FAILED}" -eq 0 ]]; then
+		echo "OK: Upgrader ${RESTART_UPGRADE_ENV} failure restores artifacts and active state"
+	else
+		echo "FAIL: Upgrader ${RESTART_UPGRADE_ENV} failure left a partial runtime generation"
+		echo "  Output: ${RESTART_UPGRADE_OUTPUT}"
 		FAILED=$((FAILED + 1))
 	fi
 done

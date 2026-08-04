@@ -17,9 +17,11 @@
 //! ```
 //!
 //! The helper strictly validates the requested operation, argument count,
-//! interface/client name, peer keys, AllowedIPs, and configuration path.
-//! Server-config mutations are semantic, locked, and atomic.  This avoids
-//! unsafe sudoers argument globs and works with both sudo.ws and sudo-rs.
+//! interface/client name, peer keys, and AllowedIPs. Reads are semantic and
+//! redact private and pre-shared keys; live reconciliation is derived inside
+//! the helper from the trusted root-owned config. Server-config mutations are
+//! locked and atomic. This avoids unsafe sudoers argument globs and works with
+//! both sudo.ws and sudo-rs.
 //!
 //! ## Output format assumptions
 //!
@@ -152,66 +154,41 @@ pub fn remove_peer(interface: &str, public_key: &str) -> Result<(), AwgError> {
     Ok(())
 }
 
-/// Obtain the stripped AWG config for a given interface.
-///
-/// Executes the helper's `strip-interface <interface>` operation and returns
-/// the config text with non-WG directives (Address, DNS, PostUp, etc.) removed.
-/// The `[Interface]` and `[Peer]` sections with their WireGuard/AWG-specific
-/// keys are preserved.
-pub fn strip_interface(interface: &str) -> Result<String, AwgError> {
-    let strip_output = Command::new(SUDO_BIN)
-        .args(["-n", PRIVILEGED_HELPER_BIN, "strip-interface", interface])
-        .output()?;
-
-    if !strip_output.status.success() {
-        let stderr = String::from_utf8_lossy(&strip_output.stderr).into_owned();
-        let code = strip_output.status.code().unwrap_or(-1);
-        return Err(AwgError::NonZeroExit {
-            status: code,
-            stderr,
-        });
-    }
-
-    Ok(String::from_utf8_lossy(&strip_output.stdout).into_owned())
-}
-
 /// Synchronise a running AWG interface with its on-disk config, excluding
 /// disabled peers.
 ///
-/// 1. Calls [`strip_interface`] to obtain the config with non-WG directives
-///    removed.
-/// 2. Filters out any `[Peer]` sections whose `PublicKey` appears in
-///    `disabled_keys`, so disabled peers are **never** piped into `syncconf`
-///    and cannot be temporarily reactivated.
-/// 3. Pipes the filtered config into
-///    the helper's `sync-interface <interface>` operation.  The helper pipes
-///    stdin to `awg syncconf <interface> /dev/stdin`, adding peers present in
-///    the config but missing from the running interface and updating peers
-///    whose settings have changed.  Peers already active on the interface but
-///    absent from the config file are left untouched.
+/// The service sends only a bounded list of disabled public keys to the
+/// helper's `reconcile-interface <interface>` operation. The root-owned helper
+/// obtains and filters the trusted stripped config itself, so caller-controlled
+/// stdin can never replace the interface private key, listen port, or peers.
 pub fn sync_interface(
     interface: &str,
     disabled_keys: &std::collections::HashSet<String>,
 ) -> Result<(), AwgError> {
-    // Step 1: obtain the stripped config.
-    let stripped_text = strip_interface(interface)?;
+    let mut sorted_keys: Vec<&str> = disabled_keys.iter().map(String::as_str).collect();
+    sorted_keys.sort_unstable();
+    let mut payload = sorted_keys.join("\n");
+    if !payload.is_empty() {
+        payload.push('\n');
+    }
 
-    // Step 2: filter out disabled peers so they are never re-added.
-    let filtered = filter_disabled_peers(&stripped_text, disabled_keys);
-
-    // Step 3: pipe the filtered config into `awg syncconf`.
     let mut child = Command::new(SUDO_BIN)
-        .args(["-n", PRIVILEGED_HELPER_BIN, "sync-interface", interface])
+        .args([
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "reconcile-interface",
+            interface,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(filtered.as_bytes()) {
+        if let Err(e) = stdin.write_all(payload.as_bytes()) {
             // The child may have exited early (e.g. bad interface name).
             // Log at debug level; the real error comes from wait_with_output.
-            tracing::debug!(error = %e, "stdin write to awg syncconf failed – checking exit status");
+            tracing::debug!(error = %e, "stdin write to reconciliation helper failed – checking exit status");
         }
     }
 
@@ -304,15 +281,33 @@ pub fn genpsk() -> Result<String, AwgError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Read an approved root-owned file through the privileged helper.
-///
-/// Used to read the params file and server config without granting the
-/// service user direct filesystem access to sensitive files.
+/// Read only the non-secret server parameters required for client generation.
 #[cfg_attr(not(unix), allow(dead_code))]
-pub fn read_file_via_sudo(path: &std::path::Path) -> Result<String, AwgError> {
+pub fn read_params_via_sudo() -> Result<String, AwgError> {
     let output = Command::new(SUDO_BIN)
-        .args(["-n", PRIVILEGED_HELPER_BIN, "read-file"])
-        .arg(path)
+        .args(["-n", PRIVILEGED_HELPER_BIN, "read-params"])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Read a sanitized server-config projection used for name/IP allocation.
+///
+/// The helper emits only section headers, managed client markers, interface
+/// addresses, and peer AllowedIPs. Private keys and pre-shared keys never
+/// cross into the unprivileged process.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn read_server_state_via_sudo(interface: &str) -> Result<String, AwgError> {
+    let output = Command::new(SUDO_BIN)
+        .args(["-n", PRIVILEGED_HELPER_BIN, "read-server-state", interface])
         .output()?;
 
     if !output.status.success() {
@@ -342,13 +337,7 @@ pub fn append_peer_via_sudo(
         "PublicKey = {public_key}\nPresharedKey = {preshared_key}\nAllowedIPs = {allowed_ips}\n"
     );
     let mut child = Command::new(SUDO_BIN)
-        .args([
-            "-n",
-            PRIVILEGED_HELPER_BIN,
-            "append-peer",
-            interface,
-            name,
-        ])
+        .args(["-n", PRIVILEGED_HELPER_BIN, "append-peer", interface, name])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -411,6 +400,7 @@ pub fn remove_client_via_sudo(interface: &str, name: &str) -> Result<(), AwgErro
 /// WireGuard INI-style config containing `[Interface]` and `[Peer]` sections.
 /// Sections are delimited by `[…]` headers; each `[Peer]` section may contain
 /// a `PublicKey = <base64>` line.
+#[cfg(test)]
 fn filter_disabled_peers(
     config: &str,
     disabled_keys: &std::collections::HashSet<String>,
@@ -459,6 +449,7 @@ fn filter_disabled_peers(
 }
 
 /// Check whether a `[Peer]` section's `PublicKey` value is in `disabled_keys`.
+#[cfg(test)]
 fn section_has_disabled_key(
     lines: &[&str],
     disabled_keys: &std::collections::HashSet<String>,
@@ -763,27 +754,11 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
 
     // ── sync_interface command construction tests ───────────────────
 
-    /// Verify `awg-quick strip` is delegated to the validating helper.
-    #[test]
-    fn awg_quick_strip_command_args() {
-        let mut cmd = Command::new(SUDO_BIN);
-        cmd.args(["-n", PRIVILEGED_HELPER_BIN, "strip-interface", "awg0"]);
-
-        let args: Vec<_> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert_eq!(
-            args,
-            vec!["-n", PRIVILEGED_HELPER_BIN, "strip-interface", "awg0"]
-        );
-    }
-
-    /// Verify `awg syncconf` is delegated to the validating helper.
+    /// Verify semantic reconciliation is delegated to the validating helper.
     #[test]
     fn syncconf_command_args() {
         let mut cmd = Command::new(SUDO_BIN);
-        cmd.args(["-n", PRIVILEGED_HELPER_BIN, "sync-interface", "awg0"]);
+        cmd.args(["-n", PRIVILEGED_HELPER_BIN, "reconcile-interface", "awg0"]);
 
         let args: Vec<_> = cmd
             .get_args()
@@ -791,54 +766,43 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
             .collect();
         assert_eq!(
             args,
-            vec!["-n", PRIVILEGED_HELPER_BIN, "sync-interface", "awg0"]
+            vec!["-n", PRIVILEGED_HELPER_BIN, "reconcile-interface", "awg0",]
         );
     }
 
     #[test]
     fn config_file_commands_use_privileged_helper() {
-        let mut read_cmd = Command::new(SUDO_BIN);
-        read_cmd.args([
-            "-n",
-            PRIVILEGED_HELPER_BIN,
-            "read-file",
-            "/etc/amnezia/amneziawg/params",
-        ]);
-        let read_args: Vec<_> = read_cmd
+        let mut params_cmd = Command::new(SUDO_BIN);
+        params_cmd.args(["-n", PRIVILEGED_HELPER_BIN, "read-params"]);
+        let params_args: Vec<_> = params_cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert_eq!(
-            read_args,
-            vec![
-                "-n",
-                PRIVILEGED_HELPER_BIN,
-                "read-file",
-                "/etc/amnezia/amneziawg/params",
-            ]
+            params_args,
+            vec!["-n", PRIVILEGED_HELPER_BIN, "read-params"]
+        );
+
+        let mut state_cmd = Command::new(SUDO_BIN);
+        state_cmd.args(["-n", PRIVILEGED_HELPER_BIN, "read-server-state", "awg0"]);
+        let state_args: Vec<_> = state_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            state_args,
+            vec!["-n", PRIVILEGED_HELPER_BIN, "read-server-state", "awg0",]
         );
 
         let mut append_cmd = Command::new(SUDO_BIN);
-        append_cmd.args([
-            "-n",
-            PRIVILEGED_HELPER_BIN,
-            "append-peer",
-            "awg0",
-            "alice",
-        ]);
+        append_cmd.args(["-n", PRIVILEGED_HELPER_BIN, "append-peer", "awg0", "alice"]);
         let append_args: Vec<_> = append_cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert_eq!(
             append_args,
-            vec![
-                "-n",
-                PRIVILEGED_HELPER_BIN,
-                "append-peer",
-                "awg0",
-                "alice",
-            ]
+            vec!["-n", PRIVILEGED_HELPER_BIN, "append-peer", "awg0", "alice",]
         );
 
         let mut cmd = Command::new(SUDO_BIN);
@@ -996,7 +960,13 @@ AllowedIPs = 10.0.0.3/32
         let disabled: std::collections::HashSet<String> =
             ["DISABLED_PEER=".to_string()].into_iter().collect();
         let result = filter_disabled_peers(config, &disabled);
-        assert!(!result.contains("DISABLED_PEER="), "lowercase publickey should be matched");
-        assert!(result.contains("ENABLED_PEER="), "non-disabled peer should be kept");
+        assert!(
+            !result.contains("DISABLED_PEER="),
+            "lowercase publickey should be matched"
+        );
+        assert!(
+            result.contains("ENABLED_PEER="),
+            "non-disabled peer should be kept"
+        );
     }
 }

@@ -90,20 +90,95 @@ ENABLE_SERVICE=true
 START_SERVICE=true
 FORCE=false               # overwrite existing env.conf without prompt
 
-# Exact temporary paths used while installing privilege-boundary artifacts.
-# Keeping them globally tracked lets the EXIT/signal traps remove an orphaned
-# file without touching an existing live helper or sudoers drop-in.
+# Exact transaction paths and rename state for the runtime generation.
+STAGED_BINARY=""
 STAGED_PRIVILEGED_HELPER=""
 STAGED_SUDOERS=""
+BINARY_DEST=""
+ROLLBACK_BINARY=""
+ROLLBACK_PRIVILEGED_HELPER=""
+ROLLBACK_SUDOERS=""
+HAD_LIVE_BINARY="false"
+HAD_LIVE_PRIVILEGED_HELPER="false"
+HAD_LIVE_SUDOERS="false"
+BINARY_COMMITTED="false"
+PRIVILEGED_HELPER_COMMITTED="false"
+SUDOERS_COMMITTED="false"
+BINARY_RENAME_STARTED="false"
+PRIVILEGED_HELPER_RENAME_STARTED="false"
+SUDOERS_RENAME_STARTED="false"
+INSTALL_TRANSACTION_ACTIVE="false"
+INSTALL_ACTIVATION_COMPLETE="false"
+INSTALL_ROLLBACK_FAILED="false"
+SERVICE_WAS_ACTIVE="false"
 
 cleanup_staged_privilege_artifacts() {
     local exit_code=$?
 
+    # Do not let a second signal interrupt transaction recovery.
+    trap '' HUP INT TERM
+    if [[ "${INSTALL_TRANSACTION_ACTIVE}" == "true" && \
+          "${INSTALL_ACTIVATION_COMPLETE}" != "true" ]]; then
+        refresh_install_commit_state
+        if [[ "${BINARY_COMMITTED}" == "true" || \
+              "${PRIVILEGED_HELPER_COMMITTED}" == "true" || \
+              "${SUDOERS_COMMITTED}" == "true" ]]; then
+            if systemctl stop "${SERVICE_NAME}" 2>/dev/null; then
+                if ! rollback_install_runtime_artifacts; then
+                    INSTALL_ROLLBACK_FAILED="true"
+                fi
+            else
+                warn "Could not stop ${SERVICE_NAME}; leaving rollback copies for manual recovery."
+                INSTALL_ROLLBACK_FAILED="true"
+            fi
+        fi
+        if [[ "${INSTALL_ROLLBACK_FAILED}" != "true" ]]; then
+            INSTALL_TRANSACTION_ACTIVE="false"
+        fi
+        if [[ "${exit_code}" -eq 0 ]]; then
+            exit_code=1
+        fi
+    fi
+
+    if [[ -n "${STAGED_BINARY}" ]]; then
+        rm -f -- "${STAGED_BINARY}" 2>/dev/null || true
+    fi
     if [[ -n "${STAGED_PRIVILEGED_HELPER}" ]]; then
         rm -f -- "${STAGED_PRIVILEGED_HELPER}" 2>/dev/null || true
     fi
     if [[ -n "${STAGED_SUDOERS}" ]]; then
         rm -f -- "${STAGED_SUDOERS}" 2>/dev/null || true
+    fi
+
+    if [[ -n "${ROLLBACK_BINARY}" ]] && \
+            [[ "${INSTALL_ROLLBACK_FAILED}" != "true" || "${BINARY_COMMITTED}" != "true" ]]; then
+        rm -f -- "${ROLLBACK_BINARY}" 2>/dev/null || true
+        ROLLBACK_BINARY=""
+    fi
+    if [[ -n "${ROLLBACK_PRIVILEGED_HELPER}" ]] && \
+            [[ "${INSTALL_ROLLBACK_FAILED}" != "true" || \
+               "${PRIVILEGED_HELPER_COMMITTED}" != "true" ]]; then
+        rm -f -- "${ROLLBACK_PRIVILEGED_HELPER}" 2>/dev/null || true
+        ROLLBACK_PRIVILEGED_HELPER=""
+    fi
+    if [[ -n "${ROLLBACK_SUDOERS}" ]] && \
+            [[ "${INSTALL_ROLLBACK_FAILED}" != "true" || "${SUDOERS_COMMITTED}" != "true" ]]; then
+        rm -f -- "${ROLLBACK_SUDOERS}" 2>/dev/null || true
+        ROLLBACK_SUDOERS=""
+    fi
+
+    if [[ "${exit_code}" -ne 0 && "${SERVICE_WAS_ACTIVE}" == "true" && \
+          "${INSTALL_ROLLBACK_FAILED}" != "true" ]]; then
+        if systemctl start "${SERVICE_NAME}" && \
+                systemctl is-active --quiet "${SERVICE_NAME}"; then
+            info "Restored the previously active service after installer failure."
+        else
+            warn "Previous runtime artifacts are intact, but ${SERVICE_NAME} could not be restarted."
+        fi
+    fi
+
+    if [[ "${INSTALL_ROLLBACK_FAILED}" == "true" ]]; then
+        report_retained_install_rollback_artifacts
     fi
 
     return "${exit_code}"
@@ -1296,12 +1371,20 @@ targeted permission grant."
 
 # ── Binary installation ────────────────────────────────────────────────────────
 
-install_binary() {
-    step "Installing binary"
+stage_binary() {
+    step "Staging binary"
 
-    local dest="${INSTALL_DIR}/amneziawg-web"
-    install -m 0755 "${BINARY_SRC}" "${dest}"
-    info "Installed binary: ${dest}"
+    BINARY_DEST="${INSTALL_DIR}/amneziawg-web"
+    if [[ -L "${BINARY_DEST}" ]] || \
+            { [[ -e "${BINARY_DEST}" ]] && [[ ! -f "${BINARY_DEST}" ]]; }; then
+        die "Refusing to replace unsafe binary destination: ${BINARY_DEST}"
+    fi
+    install -d -m 0755 -- "${INSTALL_DIR}"
+    STAGED_BINARY="$(mktemp "${BINARY_DEST}.install-tmp.XXXXXX")" \
+        || die "Could not create temporary application binary"
+    install -m 0755 -o root -g root -- "${BINARY_SRC}" "${STAGED_BINARY}" \
+        || die "Could not stage application binary"
+    info "Staged binary: ${BINARY_DEST}"
 }
 
 resolve_awg_install_script_path() {
@@ -1475,8 +1558,8 @@ install_awg_install_script() {
 
 # ── Privileged helper / sudoers drop-in ───────────────────────────────────────
 
-install_privileged_helper() {
-    step "Installing privileged AWG helper"
+stage_privileged_helper() {
+    step "Staging privileged AWG helper"
 
     local helper_src="${SCRIPT_DIR}/${PRIVILEGED_HELPER_NAME}"
     local helper_dir
@@ -1508,15 +1591,11 @@ install_privileged_helper() {
     if ! /bin/bash -n "${STAGED_PRIVILEGED_HELPER}"; then
         die "Staged privileged helper failed its Bash syntax check"
     fi
-    if ! mv -fT -- "${STAGED_PRIVILEGED_HELPER}" "${PRIVILEGED_HELPER_DEST}"; then
-        die "Could not atomically install privileged helper"
-    fi
-    STAGED_PRIVILEGED_HELPER=""
-    info "Installed privileged helper: ${PRIVILEGED_HELPER_DEST}"
+    info "Staged privileged helper: ${PRIVILEGED_HELPER_DEST}"
 }
 
-install_sudoers() {
-    step "Installing sudoers rule for AWG access"
+stage_sudoers() {
+    step "Staging sudoers rule for AWG access"
 
     # The web service runs as a non-root user but needs to:
     # 1. Read AWG interface state via `awg show all dump` (CAP_NET_ADMIN).
@@ -1568,12 +1647,170 @@ install_sudoers() {
         info "visudo not available; skipping syntax check."
     fi
 
-    if ! mv -fT -- "${STAGED_SUDOERS}" "${SUDOERS_FILE}"; then
-        die "Could not install sudoers drop-in: ${SUDOERS_FILE}"
-    fi
-    STAGED_SUDOERS=""
+    info "Staged sudoers drop-in: ${SUDOERS_FILE}"
+}
 
+stage_install_rollback_artifacts() {
+    if [[ -f "${BINARY_DEST}" ]]; then
+        ROLLBACK_BINARY="$(mktemp "${BINARY_DEST}.rollback.XXXXXX")" \
+            || die "Could not create application-binary rollback file"
+        cp -a -- "${BINARY_DEST}" "${ROLLBACK_BINARY}" \
+            || die "Could not back up the installed application binary"
+        HAD_LIVE_BINARY="true"
+    fi
+
+    if [[ -f "${PRIVILEGED_HELPER_DEST}" ]]; then
+        ROLLBACK_PRIVILEGED_HELPER="$(mktemp "${PRIVILEGED_HELPER_DEST}.rollback.XXXXXX")" \
+            || die "Could not create privileged-helper rollback file"
+        cp -a -- "${PRIVILEGED_HELPER_DEST}" "${ROLLBACK_PRIVILEGED_HELPER}" \
+            || die "Could not back up the installed privileged helper"
+        HAD_LIVE_PRIVILEGED_HELPER="true"
+    fi
+
+    if [[ -L "${SUDOERS_FILE}" ]] || \
+            { [[ -e "${SUDOERS_FILE}" ]] && [[ ! -f "${SUDOERS_FILE}" ]]; }; then
+        die "Refusing to replace unsafe sudoers destination: ${SUDOERS_FILE}"
+    fi
+    if [[ -f "${SUDOERS_FILE}" ]]; then
+        ROLLBACK_SUDOERS="$(mktemp "${SUDOERS_FILE}.rollback.XXXXXX")" \
+            || die "Could not create sudoers rollback file"
+        cp -a -- "${SUDOERS_FILE}" "${ROLLBACK_SUDOERS}" \
+            || die "Could not back up the installed sudoers drop-in"
+        HAD_LIVE_SUDOERS="true"
+    fi
+}
+
+refresh_install_commit_state() {
+    if [[ "${PRIVILEGED_HELPER_RENAME_STARTED}" == "true" ]] && \
+            [[ -n "${STAGED_PRIVILEGED_HELPER}" ]] && \
+            [[ ! -e "${STAGED_PRIVILEGED_HELPER}" ]] && \
+            [[ -e "${PRIVILEGED_HELPER_DEST}" ]]; then
+        PRIVILEGED_HELPER_COMMITTED="true"
+    fi
+    if [[ "${SUDOERS_RENAME_STARTED}" == "true" ]] && \
+            [[ -n "${STAGED_SUDOERS}" ]] && [[ ! -e "${STAGED_SUDOERS}" ]] && \
+            [[ -e "${SUDOERS_FILE}" ]]; then
+        SUDOERS_COMMITTED="true"
+    fi
+    if [[ "${BINARY_RENAME_STARTED}" == "true" ]] && \
+            [[ -n "${STAGED_BINARY}" ]] && [[ ! -e "${STAGED_BINARY}" ]] && \
+            [[ -e "${BINARY_DEST}" ]]; then
+        BINARY_COMMITTED="true"
+    fi
+}
+
+rollback_install_runtime_artifacts() {
+    local rollback_ok="true"
+
+    if [[ "${SUDOERS_COMMITTED}" == "true" ]]; then
+        if [[ "${HAD_LIVE_SUDOERS}" == "true" ]]; then
+            if mv -fT -- "${ROLLBACK_SUDOERS}" "${SUDOERS_FILE}"; then
+                ROLLBACK_SUDOERS=""
+                SUDOERS_COMMITTED="false"
+            else
+                rollback_ok="false"
+            fi
+        elif rm -f -- "${SUDOERS_FILE}"; then
+            SUDOERS_COMMITTED="false"
+        else
+            rollback_ok="false"
+        fi
+    fi
+
+    if [[ "${PRIVILEGED_HELPER_COMMITTED}" == "true" ]]; then
+        if [[ "${HAD_LIVE_PRIVILEGED_HELPER}" == "true" ]]; then
+            if mv -fT -- "${ROLLBACK_PRIVILEGED_HELPER}" "${PRIVILEGED_HELPER_DEST}"; then
+                ROLLBACK_PRIVILEGED_HELPER=""
+                PRIVILEGED_HELPER_COMMITTED="false"
+            else
+                rollback_ok="false"
+            fi
+        elif rm -f -- "${PRIVILEGED_HELPER_DEST}"; then
+            PRIVILEGED_HELPER_COMMITTED="false"
+        else
+            rollback_ok="false"
+        fi
+    fi
+
+    if [[ "${BINARY_COMMITTED}" == "true" ]]; then
+        if [[ "${HAD_LIVE_BINARY}" == "true" ]]; then
+            if mv -fT -- "${ROLLBACK_BINARY}" "${BINARY_DEST}"; then
+                ROLLBACK_BINARY=""
+                BINARY_COMMITTED="false"
+            else
+                rollback_ok="false"
+            fi
+        elif rm -f -- "${BINARY_DEST}"; then
+            BINARY_COMMITTED="false"
+        else
+            rollback_ok="false"
+        fi
+    fi
+
+    [[ "${rollback_ok}" == "true" ]]
+}
+
+report_retained_install_rollback_artifacts() {
+    if [[ -n "${ROLLBACK_BINARY}" && -e "${ROLLBACK_BINARY}" ]]; then
+        warn "Retained application-binary recovery copy: ${ROLLBACK_BINARY}"
+    fi
+    if [[ -n "${ROLLBACK_PRIVILEGED_HELPER}" && \
+          -e "${ROLLBACK_PRIVILEGED_HELPER}" ]]; then
+        warn "Retained privileged-helper recovery copy: ${ROLLBACK_PRIVILEGED_HELPER}"
+    fi
+    if [[ -n "${ROLLBACK_SUDOERS}" && -e "${ROLLBACK_SUDOERS}" ]]; then
+        warn "Retained sudoers recovery copy: ${ROLLBACK_SUDOERS}"
+    fi
+}
+
+discard_install_rollback_artifacts() {
+    local path
+    for path in "${ROLLBACK_BINARY}" "${ROLLBACK_PRIVILEGED_HELPER}" \
+            "${ROLLBACK_SUDOERS}"; do
+        if [[ -n "${path}" ]] && ! rm -f -- "${path}"; then
+            warn "Could not remove rollback file: ${path}"
+        fi
+    done
+    ROLLBACK_BINARY=""
+    ROLLBACK_PRIVILEGED_HELPER=""
+    ROLLBACK_SUDOERS=""
+}
+
+commit_install_runtime_artifacts() {
+    INSTALL_TRANSACTION_ACTIVE="true"
+
+    PRIVILEGED_HELPER_RENAME_STARTED="true"
+    if ! mv -fT -- "${STAGED_PRIVILEGED_HELPER}" "${PRIVILEGED_HELPER_DEST}"; then
+        die "Could not install staged privileged helper; the previous runtime generation will be restored."
+    fi
+    PRIVILEGED_HELPER_COMMITTED="true"
+    PRIVILEGED_HELPER_RENAME_STARTED="false"
+    STAGED_PRIVILEGED_HELPER=""
+    info "Installed privileged helper: ${PRIVILEGED_HELPER_DEST}"
+
+    SUDOERS_RENAME_STARTED="true"
+    if ! mv -fT -- "${STAGED_SUDOERS}" "${SUDOERS_FILE}"; then
+        die "Could not install staged sudoers drop-in; the previous runtime generation will be restored."
+    fi
+    SUDOERS_COMMITTED="true"
+    SUDOERS_RENAME_STARTED="false"
+    STAGED_SUDOERS=""
     info "Installed sudoers drop-in: ${SUDOERS_FILE}"
+
+    BINARY_RENAME_STARTED="true"
+    if ! mv -fT -- "${STAGED_BINARY}" "${BINARY_DEST}"; then
+        die "Could not install staged application binary; the previous runtime generation will be restored."
+    fi
+    BINARY_COMMITTED="true"
+    BINARY_RENAME_STARTED="false"
+    STAGED_BINARY=""
+    info "Installed binary: ${BINARY_DEST}"
+}
+
+finalize_install_transaction() {
+    INSTALL_ACTIVATION_COMPLETE="true"
+    INSTALL_TRANSACTION_ACTIVE="false"
+    discard_install_rollback_artifacts
 }
 
 # ── Environment file generation ───────────────────────────────────────────────
@@ -1859,15 +2096,6 @@ UNITEOF
     systemctl daemon-reload
     info "systemd daemon reloaded."
 
-    if [[ "${ENABLE_SERVICE}" == "true" ]]; then
-        systemctl enable "${SERVICE_NAME}"
-        info "Service enabled at boot."
-    fi
-
-    if [[ "${START_SERVICE}" == "true" ]]; then
-        systemctl restart "${SERVICE_NAME}"
-        info "Service started."
-    fi
 }
 
 # ── Post-install summary ───────────────────────────────────────────────────────
@@ -1979,13 +2207,45 @@ main() {
         interactive_setup
     fi
 
+    if systemctl is-active --quiet "${SERVICE_NAME}"; then
+        SERVICE_WAS_ACTIVE="true"
+    fi
+
     setup_filesystem
-    install_binary
+    stage_binary
+    stage_privileged_helper
+    stage_sudoers
     install_awg_install_script
-    install_privileged_helper
-    install_sudoers
     write_env_file
     install_service_unit
+    stage_install_rollback_artifacts
+
+    if [[ "${SERVICE_WAS_ACTIVE}" == "true" ]]; then
+        step "Stopping existing service for atomic runtime update"
+        if ! systemctl stop "${SERVICE_NAME}"; then
+            die "Could not stop ${SERVICE_NAME}; staged runtime artifacts were not installed."
+        fi
+    fi
+
+    commit_install_runtime_artifacts
+
+    if [[ "${START_SERVICE}" == "true" || "${SERVICE_WAS_ACTIVE}" == "true" ]]; then
+        step "Activating installed runtime generation"
+        if ! systemctl restart "${SERVICE_NAME}"; then
+            die "Could not restart ${SERVICE_NAME}; the previous runtime generation will be restored."
+        fi
+        if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
+            die "${SERVICE_NAME} restart returned success but the service is inactive; the previous runtime generation will be restored."
+        fi
+        info "Service started and active."
+    fi
+
+    finalize_install_transaction
+
+    if [[ "${ENABLE_SERVICE}" == "true" ]]; then
+        systemctl enable "${SERVICE_NAME}"
+        info "Service enabled at boot."
+    fi
     print_summary
 }
 

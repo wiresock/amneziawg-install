@@ -62,35 +62,51 @@ REFRESH_UNIT="false"
 STAGED_BINARY=""
 STAGED_HELPER=""
 STAGED_SUDOERS=""
+ROLLBACK_BINARY=""
 ROLLBACK_HELPER=""
 ROLLBACK_SUDOERS=""
+HAD_LIVE_BINARY="false"
 HAD_LIVE_HELPER="false"
 HAD_LIVE_SUDOERS="false"
 SERVICE_WAS_ACTIVE="false"
-SERVICE_STOPPED_BY_UPGRADE="false"
+BINARY_COMMITTED="false"
 HELPER_COMMITTED="false"
 SUDOERS_COMMITTED="false"
-COMMIT_IN_PROGRESS="false"
-COMMIT_COMPLETE="false"
+BINARY_RENAME_STARTED="false"
+HELPER_RENAME_STARTED="false"
+SUDOERS_RENAME_STARTED="false"
+TRANSACTION_ACTIVE="false"
+ACTIVATION_COMPLETE="false"
 ROLLBACK_FAILED="false"
 
 cleanup_staged_artifacts() {
     local exit_code=$?
 
-    # A signal can arrive between the three atomic renames.  If the new binary
-    # is not present, infer which privilege artifacts changed and restore only
-    # those artifacts before cleaning temporary files.
-    if [[ "${COMMIT_IN_PROGRESS}" == "true" && "${COMMIT_COMPLETE}" != "true" ]]; then
-        if [[ -f "${DEST_BINARY:-}" ]] && [[ -f "${BINARY_SRC:-}" ]] && \
-                cmp -s -- "${DEST_BINARY}" "${BINARY_SRC}"; then
-            COMMIT_COMPLETE="true"
-        else
-            refresh_commit_state
-            if ! rollback_privilege_artifacts; then
+    # Do not let a second signal interrupt recovery. A signal can arrive after
+    # an atomic rename but before Bash updates the corresponding state flag;
+    # refresh_commit_state resolves only that narrow window by checking that
+    # the staged pathname disappeared after its rename was explicitly started.
+    trap '' HUP INT TERM
+    if [[ "${TRANSACTION_ACTIVE}" == "true" && "${ACTIVATION_COMPLETE}" != "true" ]]; then
+        refresh_commit_state
+        if [[ "${BINARY_COMMITTED}" == "true" || \
+              "${HELPER_COMMITTED}" == "true" || \
+              "${SUDOERS_COMMITTED}" == "true" ]]; then
+            if systemctl stop "${SERVICE_NAME}" 2>/dev/null; then
+                if ! rollback_runtime_artifacts; then
+                    ROLLBACK_FAILED="true"
+                fi
+            else
+                warn "Could not stop ${SERVICE_NAME}; leaving rollback copies for manual recovery."
                 ROLLBACK_FAILED="true"
             fi
         fi
-        COMMIT_IN_PROGRESS="false"
+        if [[ "${ROLLBACK_FAILED}" != "true" ]]; then
+            TRANSACTION_ACTIVE="false"
+        fi
+        if [[ "${exit_code}" -eq 0 ]]; then
+            exit_code=1
+        fi
     fi
 
     if [[ -n "${STAGED_BINARY}" ]]; then
@@ -102,22 +118,27 @@ cleanup_staged_artifacts() {
     if [[ -n "${STAGED_SUDOERS}" ]]; then
         rm -f -- "${STAGED_SUDOERS}" 2>/dev/null || true
     fi
+    if [[ -n "${ROLLBACK_BINARY}" ]] && \
+            [[ "${ROLLBACK_FAILED}" != "true" || "${BINARY_COMMITTED}" != "true" ]]; then
+        rm -f -- "${ROLLBACK_BINARY}" 2>/dev/null || true
+        ROLLBACK_BINARY=""
+    fi
     if [[ -n "${ROLLBACK_HELPER}" ]] && \
-            [[ ! "${ROLLBACK_FAILED}" == "true" || "${HELPER_COMMITTED}" != "true" ]]; then
+            [[ "${ROLLBACK_FAILED}" != "true" || "${HELPER_COMMITTED}" != "true" ]]; then
         rm -f -- "${ROLLBACK_HELPER}" 2>/dev/null || true
         ROLLBACK_HELPER=""
     fi
     if [[ -n "${ROLLBACK_SUDOERS}" ]] && \
-            [[ ! "${ROLLBACK_FAILED}" == "true" || "${SUDOERS_COMMITTED}" != "true" ]]; then
+            [[ "${ROLLBACK_FAILED}" != "true" || "${SUDOERS_COMMITTED}" != "true" ]]; then
         rm -f -- "${ROLLBACK_SUDOERS}" 2>/dev/null || true
         ROLLBACK_SUDOERS=""
     fi
 
     if [[ "${exit_code}" -ne 0 ]] && \
-            [[ "${SERVICE_STOPPED_BY_UPGRADE}" == "true" ]] && \
+            [[ "${SERVICE_WAS_ACTIVE}" == "true" ]] && \
             [[ "${ROLLBACK_FAILED}" != "true" ]]; then
-        if systemctl start "${SERVICE_NAME}"; then
-            SERVICE_STOPPED_BY_UPGRADE="false"
+        if systemctl start "${SERVICE_NAME}" && \
+                systemctl is-active --quiet "${SERVICE_NAME}"; then
             info "Restored the previously active service after upgrade failure."
         else
             warn "Previous artifacts are intact, but ${SERVICE_NAME} could not be restarted."
@@ -711,6 +732,18 @@ stage_binary() {
 }
 
 stage_rollback_artifacts() {
+    if [[ -L "${DEST_BINARY}" ]] || \
+            { [[ -e "${DEST_BINARY}" ]] && [[ ! -f "${DEST_BINARY}" ]]; }; then
+        die "Refusing to replace unsafe binary destination: ${DEST_BINARY}"
+    fi
+    if [[ -f "${DEST_BINARY}" ]]; then
+        ROLLBACK_BINARY="$(mktemp "${DEST_BINARY}.rollback.XXXXXX")" \
+            || die "Could not create application-binary rollback file"
+        cp -a -- "${DEST_BINARY}" "${ROLLBACK_BINARY}" \
+            || die "Could not back up the installed application binary"
+        HAD_LIVE_BINARY="true"
+    fi
+
     if [[ -f "${PRIVILEGED_HELPER_DEST}" ]]; then
         ROLLBACK_HELPER="$(mktemp "${PRIVILEGED_HELPER_DEST}.rollback.XXXXXX")" \
             || die "Could not create privileged-helper rollback file"
@@ -732,7 +765,7 @@ stage_rollback_artifacts() {
     fi
 }
 
-rollback_privilege_artifacts() {
+rollback_runtime_artifacts() {
     local rollback_ok="true"
 
     # Restore authorization first so the old binary regains its original
@@ -767,40 +800,50 @@ rollback_privilege_artifacts() {
         fi
     fi
 
+    # Restore the old application last, after its matching authorization and
+    # helper are back in place. Fresh-install-style destinations are removed.
+    if [[ "${BINARY_COMMITTED}" == "true" ]]; then
+        if [[ "${HAD_LIVE_BINARY}" == "true" ]]; then
+            if mv -fT -- "${ROLLBACK_BINARY}" "${DEST_BINARY}"; then
+                ROLLBACK_BINARY=""
+                BINARY_COMMITTED="false"
+            else
+                rollback_ok="false"
+            fi
+        elif rm -f -- "${DEST_BINARY}"; then
+            BINARY_COMMITTED="false"
+        else
+            rollback_ok="false"
+        fi
+    fi
+
     [[ "${rollback_ok}" == "true" ]]
 }
 
 refresh_commit_state() {
-    if [[ "${HAD_LIVE_HELPER}" == "true" ]]; then
-        if [[ -n "${ROLLBACK_HELPER}" ]] && [[ -f "${ROLLBACK_HELPER}" ]] && \
-                [[ -f "${PRIVILEGED_HELPER_DEST}" ]] && \
-                cmp -s -- "${ROLLBACK_HELPER}" "${PRIVILEGED_HELPER_DEST}"; then
-            HELPER_COMMITTED="false"
-        else
-            HELPER_COMMITTED="true"
-        fi
-    elif [[ -e "${PRIVILEGED_HELPER_DEST}" || -L "${PRIVILEGED_HELPER_DEST}" ]]; then
+    if [[ "${HELPER_RENAME_STARTED}" == "true" ]] && \
+            [[ -n "${STAGED_HELPER}" ]] && [[ ! -e "${STAGED_HELPER}" ]] && \
+            [[ -e "${PRIVILEGED_HELPER_DEST}" ]]; then
         HELPER_COMMITTED="true"
-    else
-        HELPER_COMMITTED="false"
     fi
 
-    if [[ "${HAD_LIVE_SUDOERS}" == "true" ]]; then
-        if [[ -n "${ROLLBACK_SUDOERS}" ]] && [[ -f "${ROLLBACK_SUDOERS}" ]] && \
-                [[ -f "${SUDOERS_FILE}" ]] && \
-                cmp -s -- "${ROLLBACK_SUDOERS}" "${SUDOERS_FILE}"; then
-            SUDOERS_COMMITTED="false"
-        else
-            SUDOERS_COMMITTED="true"
-        fi
-    elif [[ -e "${SUDOERS_FILE}" || -L "${SUDOERS_FILE}" ]]; then
+    if [[ "${SUDOERS_RENAME_STARTED}" == "true" ]] && \
+            [[ -n "${STAGED_SUDOERS}" ]] && [[ ! -e "${STAGED_SUDOERS}" ]] && \
+            [[ -e "${SUDOERS_FILE}" ]]; then
         SUDOERS_COMMITTED="true"
-    else
-        SUDOERS_COMMITTED="false"
+    fi
+
+    if [[ "${BINARY_RENAME_STARTED}" == "true" ]] && \
+            [[ -n "${STAGED_BINARY}" ]] && [[ ! -e "${STAGED_BINARY}" ]] && \
+            [[ -e "${DEST_BINARY}" ]]; then
+        BINARY_COMMITTED="true"
     fi
 }
 
 report_retained_rollback_artifacts() {
+    if [[ -n "${ROLLBACK_BINARY}" ]] && [[ -e "${ROLLBACK_BINARY}" ]]; then
+        warn "Retained application-binary recovery copy: ${ROLLBACK_BINARY}"
+    fi
     if [[ -n "${ROLLBACK_HELPER}" ]] && [[ -e "${ROLLBACK_HELPER}" ]]; then
         warn "Retained helper recovery copy: ${ROLLBACK_HELPER}"
     fi
@@ -812,20 +855,17 @@ report_retained_rollback_artifacts() {
 abort_commit_with_rollback() {
     local reason="$1"
 
-    warn "${reason}; restoring the previous privilege artifacts."
-    refresh_commit_state
-    if rollback_privilege_artifacts; then
-        COMMIT_IN_PROGRESS="false"
-        die "${reason}; previous artifacts were restored."
-    fi
-
-    ROLLBACK_FAILED="true"
-    COMMIT_IN_PROGRESS="false"
-    report_retained_rollback_artifacts
-    die "${reason}; rollback was incomplete and the service was left stopped."
+    die "${reason}; the previous runtime generation will be restored."
 }
 
 discard_rollback_artifacts() {
+    if [[ -n "${ROLLBACK_BINARY}" ]]; then
+        if rm -f -- "${ROLLBACK_BINARY}"; then
+            ROLLBACK_BINARY=""
+        else
+            warn "Could not remove application-binary rollback file: ${ROLLBACK_BINARY}"
+        fi
+    fi
     if [[ -n "${ROLLBACK_HELPER}" ]]; then
         if rm -f -- "${ROLLBACK_HELPER}"; then
             ROLLBACK_HELPER=""
@@ -842,32 +882,42 @@ discard_rollback_artifacts() {
     fi
 }
 
+finalize_transaction() {
+    ACTIVATION_COMPLETE="true"
+    TRANSACTION_ACTIVE="false"
+    discard_rollback_artifacts
+}
+
 commit_staged_artifacts() {
-    COMMIT_IN_PROGRESS="true"
+    TRANSACTION_ACTIVE="true"
+    HELPER_RENAME_STARTED="true"
     if ! mv -fT -- "${STAGED_HELPER}" "${PRIVILEGED_HELPER_DEST}"; then
         abort_commit_with_rollback "Could not install staged privileged helper"
     fi
-    STAGED_HELPER=""
     HELPER_COMMITTED="true"
+    HELPER_RENAME_STARTED="false"
+    STAGED_HELPER=""
     info "Installed privileged helper: ${PRIVILEGED_HELPER_DEST}"
 
+    SUDOERS_RENAME_STARTED="true"
     if ! mv -fT -- "${STAGED_SUDOERS}" "${SUDOERS_FILE}"; then
         abort_commit_with_rollback "Could not install staged sudoers drop-in"
     fi
-    STAGED_SUDOERS=""
     SUDOERS_COMMITTED="true"
+    SUDOERS_RENAME_STARTED="false"
+    STAGED_SUDOERS=""
     info "Installed sudoers drop-in: ${SUDOERS_FILE}"
 
     # Commit the application last so it never runs without the matching
     # helper and authorization rule already in place.
+    BINARY_RENAME_STARTED="true"
     if ! mv -fT -- "${STAGED_BINARY}" "${DEST_BINARY}"; then
         abort_commit_with_rollback "Could not install staged application binary"
     fi
+    BINARY_COMMITTED="true"
+    BINARY_RENAME_STARTED="false"
     STAGED_BINARY=""
-    COMMIT_COMPLETE="true"
-    COMMIT_IN_PROGRESS="false"
     info "Replaced binary: ${DEST_BINARY}"
-    discard_rollback_artifacts
 }
 
 # ── Main upgrade ───────────────────────────────────────────────────────────────
@@ -895,7 +945,6 @@ main() {
     if [[ "${SERVICE_WAS_ACTIVE}" == "true" ]]; then
         info "Stopping service..."
         if systemctl stop "${SERVICE_NAME}"; then
-            SERVICE_STOPPED_BY_UPGRADE="true"
             info "Service stopped: ${SERVICE_NAME}"
         else
             die "Could not stop ${SERVICE_NAME}; staged artifacts were not installed."
@@ -1068,13 +1117,18 @@ main() {
     if should_restart; then
         info "Restarting service..."
         if systemctl restart "${SERVICE_NAME}"; then
-            SERVICE_STOPPED_BY_UPGRADE="false"
-            info "Service restarted: ${SERVICE_NAME}"
+            if systemctl is-active --quiet "${SERVICE_NAME}"; then
+                info "Service restarted and active: ${SERVICE_NAME}"
+                finalize_transaction
+            else
+                die "${SERVICE_NAME} restart returned success but the service is inactive."
+            fi
         else
-            warn "Could not restart ${SERVICE_NAME}"
+            die "Could not restart ${SERVICE_NAME}."
         fi
     else
         info "Service not restarted (was inactive; use --restart to force)."
+        finalize_transaction
     fi
 
     printf '\n'

@@ -31,6 +31,10 @@ jobs:
           cargo test
           cargo check --examples
 
+      - name: Run web-panel Rust tests
+        working-directory: amneziawg-web
+        run: cargo test
+
   proxy-rust-msrv:
     name: Proxy Rust Tests (MSRV 1.75)
     runs-on: ubuntu-latest

@@ -274,12 +274,14 @@ awg-web ALL=(root) NOPASSWD: /usr/local/libexec/amneziawg-web-privileged
 
 The helper accepts only the supported subcommands and validates argument
 counts, interface and client names, peer keys, AllowedIPs, and configuration
-paths.  Server-config mutations are semantic: it reconstructs only a validated
+paths. Server-config mutations are semantic: it reconstructs only a validated
 peer block or removes one exact managed-client block while holding a stable
-lock, then atomically replaces the file.  The service cannot submit arbitrary
-root-owned configuration content.  This keeps dynamic arguments out of
-sudoers while providing the AWG inspection, peer management, config sync, and
-lifecycle file access the panel requires.
+lock, then atomically replaces the file. State reads redact private keys and
+PSKs and expose only the fields the panel needs. Reconciliation accepts only
+validated disabled-peer keys and derives the trusted config inside the helper,
+so the service cannot read or submit arbitrary root-owned configuration
+content. This keeps dynamic arguments out of sudoers while providing the AWG
+inspection, peer management, and config synchronization the panel requires.
 Application invocations use `Command::new()` with explicit argument arrays —
 no shell interpolation.
 
