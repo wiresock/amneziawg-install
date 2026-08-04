@@ -1262,9 +1262,16 @@ pub fn remove_client(
     // the request fail only after the peer block had already been removed.
     match std::fs::symlink_metadata(config_dir) {
         Ok(sym_meta) => {
-            if sym_meta.file_type().is_symlink() {
+            let file_type = sym_meta.file_type();
+            if file_type.is_symlink() {
                 return Err(RemoveClientError::FileWrite(format!(
                     "AWG_CONFIG_DIR {} is a symbolic link; refusing to remove client configs from it",
+                    config_dir.display()
+                )));
+            }
+            if !file_type.is_dir() {
+                return Err(RemoveClientError::FileWrite(format!(
+                    "config path exists but is not a directory: {}",
                     config_dir.display()
                 )));
             }
@@ -1348,6 +1355,21 @@ mod tests {
     fn remove_client_block_returns_none_for_unknown_client() {
         let server = "[Interface]\nPrivateKey = S\n\n### Client alice\n[Peer]\nPublicKey = A\n";
         assert!(remove_client_block(server, "missing").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_client_rejects_non_directory_config_path() {
+        let config_file = tempfile::NamedTempFile::new().expect("temporary config file");
+
+        let error = remove_client(config_file.path(), "alice", &HashSet::new())
+            .expect_err("a non-directory config path must be rejected");
+
+        assert!(matches!(
+            error,
+            RemoveClientError::FileWrite(message)
+                if message.contains("config path exists but is not a directory")
+        ));
     }
 
     // ── parse_params ────────────────────────────────────────────────────
