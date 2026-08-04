@@ -175,9 +175,16 @@ pub struct GlobalProbeBudget {
     /// Packed: high 32 bits = bytes remaining this second, low 32 = timestamp.
     state: AtomicU64,
     max_bytes_per_sec: u32,
-    /// Observability: bytes actually emitted, and bytes refused by this budget.
-    pub bytes_sent: AtomicU64,
-    pub bytes_suppressed: AtomicU64,
+    /// Bytes this budget *admitted*, and bytes it refused.
+    ///
+    /// Deliberately not "bytes sent": admission is recorded when the
+    /// allowance is reserved, before the socket write, so a failed send still
+    /// counts here. Anything asserting on real egress must observe the wire,
+    /// not these counters -- a test that checked the admitted count passed
+    /// even with the gate deleted, because `try_consume` records the
+    /// reservation whether or not the caller honours the answer.
+    pub bytes_admitted: AtomicU64,
+    pub bytes_refused: AtomicU64,
 }
 
 impl GlobalProbeBudget {
@@ -185,8 +192,8 @@ impl GlobalProbeBudget {
         Self {
             state: AtomicU64::new(pack(max_bytes_per_sec, coarse_now_secs())),
             max_bytes_per_sec,
-            bytes_sent: AtomicU64::new(0),
-            bytes_suppressed: AtomicU64::new(0),
+            bytes_admitted: AtomicU64::new(0),
+            bytes_refused: AtomicU64::new(0),
         }
     }
 
@@ -205,7 +212,7 @@ impl GlobalProbeBudget {
         let want = match u32::try_from(bytes) {
             Ok(b) if b <= self.max_bytes_per_sec => b,
             _ => {
-                self.bytes_suppressed
+                self.bytes_refused
                     .fetch_add(bytes as u64, Ordering::Relaxed);
                 return false;
             }
@@ -229,8 +236,7 @@ impl GlobalProbeBudget {
                 let _ = self
                     .state
                     .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire);
-                self.bytes_suppressed
-                    .fetch_add(want as u64, Ordering::Relaxed);
+                self.bytes_refused.fetch_add(want as u64, Ordering::Relaxed);
                 return false;
             }
 
@@ -240,7 +246,8 @@ impl GlobalProbeBudget {
                 .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                self.bytes_sent.fetch_add(want as u64, Ordering::Relaxed);
+                self.bytes_admitted
+                    .fetch_add(want as u64, Ordering::Relaxed);
                 return true;
             }
             // Lost the race; recompute against the winner's state.
@@ -438,7 +445,7 @@ mod tests {
         assert!(b.try_consume_at(400, 100));
         // Exactly exhausted: the next byte must be refused.
         assert!(!b.try_consume_at(1, 100));
-        assert_eq!(b.bytes_sent.load(Ordering::Relaxed), 1000);
+        assert_eq!(b.bytes_admitted.load(Ordering::Relaxed), 1000);
     }
 
     #[test]
@@ -454,9 +461,17 @@ mod tests {
         // The whole point of the ceiling is that a long-idle port cannot
         // accumulate a burst. Ten idle seconds must still yield exactly one
         // second's worth.
+        // The earlier timestamp is the load-bearing part: without spending
+        // at t=100 first, this asserts nothing that
+        // `global_budget_bounds_bytes_within_a_second` does not already cover.
         let b = GlobalProbeBudget::new(1000);
-        assert!(b.try_consume_at(1000, 110));
-        assert!(!b.try_consume_at(1, 110));
+        assert!(b.try_consume_at(1000, 100), "second 100's allowance");
+        // Ten seconds idle. A bucket that accrued would now hold 10_000.
+        assert!(
+            b.try_consume_at(1000, 110),
+            "exactly one second's worth after the gap"
+        );
+        assert!(!b.try_consume_at(1, 110), "and not a byte more");
     }
 
     #[test]

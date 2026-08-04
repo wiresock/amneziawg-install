@@ -246,6 +246,7 @@ parse_args() {
                 [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 RATE_LIMIT="$2"; shift 2 ;;
         --probe-reply-bytes)
+                [[ $# -ge 2 ]] || { error "Missing value for option: $1"; usage; exit 1; }
                 PROBE_REPLY_BYTES="$2"; shift 2 ;;
             --dns-forward)
                 DNS_FORWARD_ENABLED=true; shift ;;
@@ -828,6 +829,10 @@ EOF
             warn "Rate limit must be a positive integer."
             continue
         fi
+        if ! is_positive_integer "${PROBE_REPLY_BYTES}"; then
+            warn "Probe reply byte ceiling must be a positive integer."
+            continue
+        fi
         break
     done
 
@@ -1175,6 +1180,10 @@ Re-run with: --listen-port <port>"
 
     if ! is_positive_integer "${RATE_LIMIT}"; then
         die "Invalid --rate-limit: '${RATE_LIMIT}'. Must be a positive integer."
+    fi
+
+    if ! is_positive_integer "${PROBE_REPLY_BYTES}"; then
+        die "Invalid --probe-reply-bytes: '${PROBE_REPLY_BYTES}'. Must be a positive integer (bytes/sec)."
     fi
 
     # Validate configurable paths: must be absolute and contain no newlines.
