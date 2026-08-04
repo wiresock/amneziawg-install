@@ -120,6 +120,9 @@ pub enum RemoveClientError {
     #[error("failed to load data from database: {0}")]
     DbRead(String),
 
+    #[error("invalid client config directory: {0}")]
+    InvalidConfigDir(String),
+
     #[error("failed to write config file: {0}")]
     FileWrite(String),
 
@@ -187,6 +190,7 @@ pub fn sanitized_remove_error_category(error: &RemoveClientError) -> &'static st
         RemoveClientError::ClientNotFound(_) => "client_not_found",
         RemoveClientError::ParamsRead(_) => "params_read_failed",
         RemoveClientError::DbRead(_) => "db_read_failed",
+        RemoveClientError::InvalidConfigDir(_) => "invalid_config_dir",
         RemoveClientError::FileWrite(_) => "file_write_failed",
         RemoveClientError::Awg(_) => "awg_command_failed",
         RemoveClientError::LockBusy => "lock_busy",
@@ -1264,13 +1268,13 @@ pub fn remove_client(
         Ok(sym_meta) => {
             let file_type = sym_meta.file_type();
             if file_type.is_symlink() {
-                return Err(RemoveClientError::FileWrite(format!(
+                return Err(RemoveClientError::InvalidConfigDir(format!(
                     "AWG_CONFIG_DIR {} is a symbolic link; refusing to remove client configs from it",
                     config_dir.display()
                 )));
             }
             if !file_type.is_dir() {
-                return Err(RemoveClientError::FileWrite(format!(
+                return Err(RemoveClientError::InvalidConfigDir(format!(
                     "AWG_CONFIG_DIR path exists but is not a directory: {}",
                     config_dir.display()
                 )));
@@ -1366,10 +1370,14 @@ mod tests {
             .expect_err("a non-directory config path must be rejected");
 
         assert!(matches!(
-            error,
-            RemoveClientError::FileWrite(message)
+            &error,
+            RemoveClientError::InvalidConfigDir(message)
                 if message.contains("AWG_CONFIG_DIR path exists but is not a directory")
         ));
+        assert_eq!(
+            sanitized_remove_error_category(&error),
+            "invalid_config_dir"
+        );
     }
 
     // ── parse_params ────────────────────────────────────────────────────
