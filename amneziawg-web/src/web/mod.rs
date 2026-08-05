@@ -367,6 +367,8 @@ pub struct PeerSummaryDto {
     pub friendly_name: Option<String>,
     /// Whether a matching client config file has been discovered.
     pub has_config: bool,
+    /// Whether this row is retained only as a hidden disabled-key tombstone.
+    pub archived: bool,
     /// Comma-separated list of allowed CIDRs.
     pub allowed_ips: String,
     pub endpoint: Option<String>,
@@ -424,6 +426,10 @@ pub struct PeerDetailDto {
     pub identity_status: IdentityStatus,
     pub disabled: bool,
     pub has_config: bool,
+    /// Internal reconciliation state used to decide when destructive panel
+    /// actions are safe. It is not part of the public peer-detail API.
+    #[serde(skip_serializing)]
+    pub sync_pending: bool,
     /// The 50 most-recent snapshots, newest first.
     pub recent_snapshots: Vec<SnapshotDto>,
 }
@@ -599,6 +605,14 @@ pub struct AddUserForm {
 #[derive(Debug, Default, Deserialize)]
 struct PeerListQuery {
     create_notice: Option<String>,
+    peer_notice: Option<String>,
+    show_archived: Option<bool>,
+}
+
+/// Query parameters for the peer-list JSON API.
+#[derive(Debug, Default, Deserialize)]
+struct ApiPeerListQuery {
+    include_archived: Option<bool>,
 }
 
 /// HTML form body for `POST /admin/users/:id/remove`.
@@ -607,6 +621,20 @@ pub struct RemoveUserForm {
     pub csrf_token: Option<String>,
     /// Confirmation field – must be "yes" to proceed.
     pub confirm: Option<String>,
+}
+
+/// HTML form body for purging and archiving an unmanaged peer record.
+#[derive(Debug, Deserialize)]
+pub struct ArchivePeerForm {
+    pub csrf_token: Option<String>,
+    /// Confirmation field – must be "yes" to perform the irreversible purge.
+    pub confirm: Option<String>,
+}
+
+/// HTML form body for returning an archived tombstone to the normal list.
+#[derive(Debug, Deserialize)]
+pub struct RestorePeerForm {
+    pub csrf_token: Option<String>,
 }
 
 // ── Conversion helpers ───────────────────────────────────────────────────────
@@ -869,6 +897,7 @@ fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
         config_name: row.config_name,
         friendly_name: row.friendly_name,
         has_config,
+        archived: row.archived != 0,
         allowed_ips: row.allowed_ips,
         endpoint: row.endpoint,
         proxy_remote_addr: None,
@@ -934,6 +963,7 @@ fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDt
         identity_status,
         disabled,
         has_config,
+        sync_pending: row.sync_pending != 0,
         recent_snapshots: snapshots.into_iter().map(snapshot_row_to_dto).collect(),
     }
 }
@@ -990,6 +1020,7 @@ pub fn router_with_proxy_sessions_file(
     let protected = Router::new()
         .route("/", get(page_peer_list))
         .route("/peers/:id", get(page_peer_detail).post(post_peer_edit))
+        .route("/archived/peers/:id", get(page_archived_peer_detail))
         .route("/api/peers", get(list_peers))
         .route("/api/peers/:id", get(get_peer).patch(patch_peer))
         .route("/api/peers/:id/history", get(get_peer_history))
@@ -1008,6 +1039,8 @@ pub fn router_with_proxy_sessions_file(
         .route("/api/admin/users/:id/remove", post(api_remove_user))
         .route("/admin/users/add", post(post_add_user_form))
         .route("/admin/users/:id/remove", post(post_remove_user_form))
+        .route("/admin/peers/:id/archive", post(post_archive_peer_form))
+        .route("/admin/peers/:id/restore", post(post_restore_peer_form))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -1284,12 +1317,23 @@ async fn list_events_handler(
     Ok(Json(dtos))
 }
 
-/// `GET /api/peers` – list all known peers with their current stats.
+/// `GET /api/peers` – list visible peers with their current stats.
+///
+/// Pass `include_archived=true` to include disabled safety tombstones whose panel
+/// metadata and traffic snapshots have been purged.
 ///
 /// Peers connected through amneziawg-proxy additionally carry the session's
 /// real remote address in `proxy_remote_addr`.
-async fn list_peers(State(state): State<AppState>) -> ApiResult<Json<Vec<PeerSummaryDto>>> {
-    let rows = crate::db::peers::list_all(&state.db.pool).await?;
+async fn list_peers(
+    State(state): State<AppState>,
+    Query(query): Query<ApiPeerListQuery>,
+) -> ApiResult<Json<Vec<PeerSummaryDto>>> {
+    let include_archived = query.include_archived.unwrap_or(false);
+    let rows = if include_archived {
+        crate::db::peers::list_all(&state.db.pool).await?
+    } else {
+        crate::db::peers::list_visible(&state.db.pool).await?
+    };
     let mut dtos: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
     annotate_peers_with_proxy_remote(&mut dtos, &proxy_sessions_status(&state).await);
     Ok(Json(dtos))
@@ -1302,7 +1346,7 @@ async fn list_peers(State(state): State<AppState>) -> ApiResult<Json<Vec<PeerSum
 /// only drops the annotation — the proxy status itself is still returned.
 async fn get_proxy_sessions(State(state): State<AppState>) -> Json<ProxySessionsDto> {
     let mut status = proxy_sessions_status(&state).await;
-    match crate::db::peers::list_all(&state.db.pool).await {
+    match crate::db::peers::list_visible(&state.db.pool).await {
         Ok(rows) => {
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             associate_proxy_sessions_with_peers(&mut status, &peers);
@@ -1320,7 +1364,7 @@ async fn get_peer(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+    let row = crate::db::peers::find_visible_by_id(&state.db.pool, id).await?;
     match row {
         None => Ok((
             StatusCode::NOT_FOUND,
@@ -1356,7 +1400,7 @@ async fn get_peer_history(
     Query(params): Query<HistoryQuery>,
 ) -> Result<Response, ApiError> {
     // Verify the peer exists
-    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+    let row = crate::db::peers::find_visible_by_id(&state.db.pool, id).await?;
     let peer = match row {
         None => {
             return Ok((
@@ -1404,7 +1448,7 @@ async fn get_peer_usage(
     Path(id): Path<i64>,
     Query(params): Query<UsageQuery>,
 ) -> Result<Response, ApiError> {
-    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+    let row = crate::db::peers::find_visible_by_id(&state.db.pool, id).await?;
     let peer = match row {
         None => {
             return Ok((
@@ -1467,7 +1511,7 @@ async fn get_peer_usage_summary(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+    let row = crate::db::peers::find_visible_by_id(&state.db.pool, id).await?;
     let peer = match row {
         None => {
             return Ok((
@@ -1561,7 +1605,7 @@ async fn get_all_usage(
     let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     // Fetch all peers and baseline snapshots (in-memory, O(peers) each).
-    let peers = crate::db::peers::list_all(&state.db.pool).await?;
+    let peers = crate::db::peers::list_visible(&state.db.pool).await?;
     let baseline_snapshots =
         crate::db::peers::find_all_baseline_snapshots(&state.db.pool, &since_str).await?;
 
@@ -1707,7 +1751,7 @@ async fn read_validated_config(
     state: &AppState,
     peer_id: i64,
 ) -> Result<(String, std::path::PathBuf), Response> {
-    let row = crate::db::peers::find_by_id(&state.db.pool, peer_id)
+    let row = crate::db::peers::find_visible_by_id(&state.db.pool, peer_id)
         .await
         .map_err(|e| ApiError(e.into()).into_response())?;
     let peer = match row {
@@ -1941,7 +1985,7 @@ async fn patch_peer(
     Json(body): Json<PatchPeerRequest>,
 ) -> Result<Response, ApiError> {
     // Load the existing peer so we can apply partial updates.
-    let existing = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
+    let existing = match crate::db::peers::find_visible_by_id(&state.db.pool, id).await? {
         Some(r) => r,
         None => {
             return Ok((
@@ -1970,10 +2014,26 @@ async fn patch_peer(
         new_comment.as_deref(),
     )
     .await?;
+    if updated.is_none() {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "peer was archived while the update was in progress" })),
+        )
+            .into_response());
+    }
 
     // Handle disabled flag if provided.
     if let Some(disabled) = body.disabled {
-        crate::db::peers::update_peer_disabled(&state.db.pool, id, disabled).await?;
+        if crate::db::peers::update_peer_disabled(&state.db.pool, id, disabled)
+            .await?
+            .is_none()
+        {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "peer was archived while the update was in progress" })),
+            )
+                .into_response());
+        }
         let old_disabled = existing.disabled != 0;
         if disabled != old_disabled {
             let detail = serde_json::json!({
@@ -2032,7 +2092,7 @@ async fn patch_peer(
             }
 
             // Re-read the peer to include the disabled update.
-            let final_row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+            let final_row = crate::db::peers::find_visible_by_id(&state.db.pool, id).await?;
             match final_row {
                 None => Ok((
                     StatusCode::NOT_FOUND,
@@ -2063,7 +2123,12 @@ async fn page_peer_list(
     headers: axum::http::HeaderMap,
     Query(query): Query<PeerListQuery>,
 ) -> Result<Response, ApiError> {
-    let rows = crate::db::peers::list_all(&state.db.pool).await?;
+    let show_archived = query.show_archived.unwrap_or(false);
+    let rows = if show_archived {
+        crate::db::peers::list_all(&state.db.pool).await?
+    } else {
+        crate::db::peers::list_visible(&state.db.pool).await?
+    };
     let mut peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
     let csrf = session_csrf_from_headers(&state, &headers);
     let status = system_status(&state);
@@ -2071,15 +2136,22 @@ async fn page_peer_list(
     associate_proxy_sessions_with_peers(&mut proxy_sessions, &peers);
     annotate_peers_with_proxy_remote(&mut peers, &proxy_sessions);
     let notice = query
-        .create_notice
+        .peer_notice
         .as_deref()
-        .and_then(create_user_notice_message);
+        .and_then(peer_archive_notice_message)
+        .or_else(|| {
+            query
+                .create_notice
+                .as_deref()
+                .and_then(create_user_notice_message)
+        });
     Ok(Html(render_peer_list(
         &peers,
         &csrf,
         &status,
         &proxy_sessions,
         notice,
+        show_archived,
     ))
     .into_response())
 }
@@ -2090,7 +2162,7 @@ async fn page_peer_detail(
     headers: axum::http::HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+    let row = crate::db::peers::find_visible_by_id(&state.db.pool, id).await?;
     match row {
         None => Ok((
             StatusCode::NOT_FOUND,
@@ -2107,6 +2179,133 @@ async fn page_peer_detail(
             let csrf = session_csrf_from_headers(&state, &headers);
             Ok(Html(render_peer_detail(&dto, &csrf, &events)).into_response())
         }
+    }
+}
+
+/// `GET /archived/peers/:id` – show a minimal disabled-key tombstone and its
+/// retained audit trail without exposing the normal edit/enable controls.
+async fn page_archived_peer_detail(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let row = crate::db::peers::find_by_id(&state.db.pool, id).await?;
+    match row {
+        Some(peer) if peer.archived != 0 => {
+            let events = list_events(&state.db.pool, Some(id), None, 20).await?;
+            let csrf = session_csrf_from_headers(&state, &headers);
+            Ok(Html(render_archived_peer_detail(&peer, &csrf, &events)).into_response())
+        }
+        _ => Ok((
+            StatusCode::NOT_FOUND,
+            Html("<h1>Archived peer not found</h1>".to_string()),
+        )
+            .into_response()),
+    }
+}
+
+/// `POST /admin/peers/:id/archive` – irreversibly clear panel metadata and
+/// traffic snapshots while retaining a disabled public-key tombstone.
+async fn post_archive_peer_form(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<ArchivePeerForm>,
+) -> Result<Response, ApiError> {
+    if state.auth.enabled {
+        let cookie_header = headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !validate_form_csrf(
+            &state,
+            cookie_header,
+            form.csrf_token.as_deref().unwrap_or(""),
+        ) {
+            return Ok(StatusCode::FORBIDDEN.into_response());
+        }
+    }
+    if form.confirm.as_deref() != Some("yes") {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Html("<h1>Explicit confirmation is required</h1>".to_string()),
+        )
+            .into_response());
+    }
+
+    // Config discovery clears every mapping before rebuilding them. Hold the
+    // same lock across the eligibility check and archive transaction so a
+    // linked peer cannot be archived during that brief clear/remap window.
+    let outcome = {
+        let _mapping_guard = crate::poller::acquire_config_mapping_lock().await;
+        crate::db::peers::archive_peer_data(&state.db.pool, id, &state.auth.username).await?
+    };
+
+    match outcome {
+        crate::db::peers::ArchivePeerOutcome::Archived { .. } => {
+            // The peer was already disabled before this operation. Avoid
+            // launching another delayed removal that could race a later
+            // return-and-enable action; the poller continues enforcing the
+            // retained disabled key.
+            Ok(Redirect::to("/?peer_notice=peer_archived").into_response())
+        }
+        crate::db::peers::ArchivePeerOutcome::NotFound => Ok((
+            StatusCode::NOT_FOUND,
+            Html("<h1>Peer not found</h1>".to_string()),
+        )
+            .into_response()),
+        crate::db::peers::ArchivePeerOutcome::AlreadyArchived => Ok((
+            StatusCode::CONFLICT,
+            Html("<h1>Peer data is already archived</h1>".to_string()),
+        )
+            .into_response()),
+        crate::db::peers::ArchivePeerOutcome::Ineligible => Ok((
+            StatusCode::CONFLICT,
+            Html(
+                "<h1>Disable the peer and unlink its client configuration first. If it was just changed, wait for the panel to finish syncing and try again.</h1>"
+                    .to_string(),
+            ),
+        )
+            .into_response()),
+    }
+}
+
+/// `POST /admin/peers/:id/restore` – return an archived tombstone to the
+/// normal list. The peer deliberately remains disabled.
+async fn post_restore_peer_form(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<RestorePeerForm>,
+) -> Result<Response, ApiError> {
+    if state.auth.enabled {
+        let cookie_header = headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !validate_form_csrf(
+            &state,
+            cookie_header,
+            form.csrf_token.as_deref().unwrap_or(""),
+        ) {
+            return Ok(StatusCode::FORBIDDEN.into_response());
+        }
+    }
+
+    match crate::db::peers::restore_archived_peer(&state.db.pool, id, &state.auth.username).await? {
+        crate::db::peers::RestorePeerOutcome::Restored { .. } => {
+            Ok(Redirect::to(&format!("/peers/{id}")).into_response())
+        }
+        crate::db::peers::RestorePeerOutcome::NotFound => Ok((
+            StatusCode::NOT_FOUND,
+            Html("<h1>Peer not found</h1>".to_string()),
+        )
+            .into_response()),
+        crate::db::peers::RestorePeerOutcome::NotArchived => Ok((
+            StatusCode::CONFLICT,
+            Html("<h1>Peer is not archived</h1>".to_string()),
+        )
+            .into_response()),
     }
 }
 
@@ -2134,7 +2333,7 @@ async fn post_peer_edit(
     }
 
     // 404 if the peer does not exist.
-    let existing = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
+    let existing = match crate::db::peers::find_visible_by_id(&state.db.pool, id).await? {
         Some(r) => r,
         None => {
             return Ok((
@@ -2151,19 +2350,36 @@ async fn post_peer_edit(
         .and_then(normalize_display_name);
     let comment = form.comment.as_deref().and_then(normalize_comment);
 
-    crate::db::peers::update_peer_metadata(
+    if crate::db::peers::update_peer_metadata(
         &state.db.pool,
         id,
         display_name.as_deref(),
         comment.as_deref(),
     )
-    .await?;
+    .await?
+    .is_none()
+    {
+        return Ok((
+            StatusCode::CONFLICT,
+            Html("<h1>Peer was archived while the update was in progress</h1>".to_string()),
+        )
+            .into_response());
+    }
 
     // Handle disabled checkbox: present with value "1" means disabled; absent means enabled.
     let new_disabled = form.disabled.as_deref() == Some("1");
     let old_disabled = existing.disabled != 0;
     if new_disabled != old_disabled {
-        crate::db::peers::update_peer_disabled(&state.db.pool, id, new_disabled).await?;
+        if crate::db::peers::update_peer_disabled(&state.db.pool, id, new_disabled)
+            .await?
+            .is_none()
+        {
+            return Ok((
+                StatusCode::CONFLICT,
+                Html("<h1>Peer was archived while the update was in progress</h1>".to_string()),
+            )
+                .into_response());
+        }
         let detail = serde_json::json!({
             "old_disabled": old_disabled,
             "new_disabled": new_disabled,
@@ -2238,6 +2454,7 @@ async fn api_next_ips() -> Result<Response, ApiError> {
 const CREATE_NOTICE_SYNC_REQUIRED: &str = "sync_required";
 const CREATE_NOTICE_METADATA_NOT_PERSISTED: &str = "metadata_not_persisted";
 const CREATE_NOTICE_SYNC_AND_METADATA: &str = "sync_and_metadata";
+const PEER_NOTICE_ARCHIVED: &str = "peer_archived";
 
 fn create_user_warning_codes(result: &crate::admin::CreateUserResult) -> Vec<&'static str> {
     let mut warnings = Vec::with_capacity(2);
@@ -2269,6 +2486,15 @@ fn create_user_notice_message(code: &str) -> Option<&'static str> {
         ),
         CREATE_NOTICE_SYNC_AND_METADATA => Some(
             "User created, but interface sync is still required and its metadata could not be saved. If you entered a comment, it was not persisted; do not add this user again.",
+        ),
+        _ => None,
+    }
+}
+
+fn peer_archive_notice_message(code: &str) -> Option<&'static str> {
+    match code {
+        PEER_NOTICE_ARCHIVED => Some(
+            "Old peer metadata and traffic history were deleted from the panel. Its disabled public key is available under Archived keys.",
         ),
         _ => None,
     }
@@ -2420,7 +2646,7 @@ async fn api_remove_user(
     Path(id): Path<i64>,
     Json(_body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
-    let peer = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
+    let peer = match crate::db::peers::find_visible_by_id(&state.db.pool, id).await? {
         Some(p) => p,
         None => {
             return Ok((
@@ -2498,7 +2724,7 @@ async fn post_add_user_form(
 ) -> Result<Response, ApiError> {
     #[cfg(test)]
     if headers.contains_key("x-test-force-create-user-failure") {
-        let rows = crate::db::peers::list_all(&state.db.pool).await?;
+        let rows = crate::db::peers::list_visible(&state.db.pool).await?;
         let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
         let csrf = session_csrf_from_headers(&state, &headers);
         let e = crate::admin::client_manager::CreateClientError::Internal(
@@ -2552,21 +2778,21 @@ async fn post_add_user_form(
         }
         Err(crate::admin::client_manager::CreateClientError::InvalidName(msg)) => {
             // Show the peer list page with an error message.
-            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let rows = crate::db::peers::list_visible(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             Ok(Html(render_peer_list_with_error(&peers, &csrf, &status, &msg)).into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::InvalidIp(ref msg)) => {
-            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let rows = crate::db::peers::list_visible(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             Ok(Html(render_peer_list_with_error(&peers, &csrf, &status, msg)).into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::IpInUse(ref ip)) => {
-            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let rows = crate::db::peers::list_visible(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let message = format!("IP address already in use: {ip}");
@@ -2577,7 +2803,7 @@ async fn post_add_user_form(
             .into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::LockBusy) => {
-            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let rows = crate::db::peers::list_visible(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let message =
@@ -2587,7 +2813,7 @@ async fn post_add_user_form(
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to create user via HTML form");
-            let rows = crate::db::peers::list_all(&state.db.pool).await?;
+            let rows = crate::db::peers::list_visible(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let message = create_user_diagnostic_message(&e);
@@ -2623,7 +2849,7 @@ async fn post_remove_user_form(
         return Ok(Redirect::to(&format!("/peers/{id}")).into_response());
     }
 
-    let peer = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
+    let peer = match crate::db::peers::find_visible_by_id(&state.db.pool, id).await? {
         Some(p) => p,
         None => {
             return Ok((
@@ -2679,7 +2905,7 @@ async fn post_remove_user_form(
                 }
             };
             // Re-fetch peer data to render the detail page with the error banner.
-            let peer_row = match crate::db::peers::find_by_id(&state.db.pool, id).await? {
+            let peer_row = match crate::db::peers::find_visible_by_id(&state.db.pool, id).await? {
                 Some(p) => p,
                 None => {
                     return Ok(Redirect::to("/").into_response());
@@ -3334,6 +3560,7 @@ fn render_peer_list(
     system_status: &SystemStatusDto,
     proxy_sessions: &ProxySessionsDto,
     notice: Option<&str>,
+    show_archived: bool,
 ) -> String {
     render_peer_list_inner(
         peers,
@@ -3342,6 +3569,7 @@ fn render_peer_list(
         Some(proxy_sessions),
         notice,
         None,
+        show_archived,
     )
 }
 
@@ -3351,7 +3579,15 @@ fn render_peer_list_with_error(
     system_status: &SystemStatusDto,
     error: &str,
 ) -> String {
-    render_peer_list_inner(peers, csrf_token, system_status, None, None, Some(error))
+    render_peer_list_inner(
+        peers,
+        csrf_token,
+        system_status,
+        None,
+        None,
+        Some(error),
+        false,
+    )
 }
 
 fn render_peer_list_inner(
@@ -3361,14 +3597,26 @@ fn render_peer_list_inner(
     proxy_sessions: Option<&ProxySessionsDto>,
     notice: Option<&str>,
     error: Option<&str>,
+    show_archived: bool,
 ) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
     let now = Utc::now();
     buf.push_str(&nav_bar(csrf_token));
     buf.push_str("<h1>AmneziaWG Peers</h1>\n");
     buf.push_str(&render_system_status(system_status));
+    let archive_toggle = if show_archived {
+        r#"<a href="/">Hide archived keys</a>"#
+    } else {
+        r#"<a href="/?show_archived=true">Show archived keys</a>"#
+    };
+    let api_href = if show_archived {
+        "/api/peers?include_archived=true"
+    } else {
+        "/api/peers"
+    };
     buf.push_str(&format!(
-        "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"/api/peers\">JSON API</a>\
+        "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"{api_href}\">JSON API</a>\
+         &nbsp;·&nbsp; {archive_toggle}\
          <span class=\"counter-scope\">Traffic period: since boot/interface restart</span></p>\n",
         peers.len()
     ));
@@ -3389,10 +3637,19 @@ fn render_peer_list_inner(
              <th>TX<span class=\"th-hint\">current period</span></th></tr>\n",
         );
         for p in peers {
+            let detail_href = if p.archived {
+                format!("/archived/peers/{}", p.id)
+            } else {
+                format!("/peers/{}", p.id)
+            };
+            let archived_note = if p.archived {
+                r#" <span class="warning">archived</span>"#
+            } else {
+                ""
+            };
             let name_link = format!(
-                r#"<a href="/peers/{id}">{name}</a>"#,
-                id = p.id,
-                name = esc(&p.name)
+                r#"<a href="{detail_href}">{name}</a>{archived_note}"#,
+                name = esc(&p.name),
             );
             let endpoint =
                 render_endpoint_cell(p.endpoint.as_deref(), p.proxy_remote_addr.as_deref());
@@ -3495,6 +3752,69 @@ fn render_peer_list_inner(
         open = add_user_open,
     ));
 
+    buf.push_str("</body></html>");
+    buf
+}
+
+fn render_archived_peer_detail(
+    peer: &PeerRow,
+    csrf_token: &str,
+    events: &[crate::db::events::EventRow],
+) -> String {
+    let mut buf = html_head("Archived disabled key");
+    buf.push_str(&nav_bar(csrf_token));
+    buf.push_str(
+        "<a class=\"back\" href=\"/?show_archived=true\">&larr; All peers</a>\n\
+         <h1>Archived disabled key</h1>\n\
+         <p class=\"creation-warning\" role=\"status\">The saved peer metadata and traffic history were deleted. \
+         The disabled public key remains so the web service can continue removing it from the running interface.</p>\n",
+    );
+    buf.push_str(&format!(
+        "<table>\n\
+         <tr><th>Public key</th><td><code>{}</code></td></tr>\n\
+         <tr><th>State</th><td><span style=\"color:red\">&#x25CF; archived and disabled</span></td></tr>\n\
+         <tr><th>Originally recorded</th><td>{}</td></tr>\n\
+         <tr><th>Last changed</th><td>{}</td></tr>\n\
+         </table>\n",
+        esc(&peer.public_key),
+        esc(&peer.created_at),
+        esc(&peer.updated_at),
+    ));
+    buf.push_str(&format!(
+        r#"<div class="edit-form">
+<h2>Return key to peer list</h2>
+<p>This creates a blank, still-disabled row in the normal peer list. Deleted data and traffic history are not restored.</p>
+<form method="POST" action="/admin/peers/{id}/restore">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <button type="submit">Return key to peer list</button>
+</form>
+</div>
+"#,
+        id = peer.id,
+        csrf = esc(csrf_token),
+    ));
+
+    buf.push_str(&format!(
+        "<h2>Retained audit activity ({})</h2>\n",
+        events.len()
+    ));
+    if events.is_empty() {
+        buf.push_str("<p>No recorded activity.</p>\n");
+    } else {
+        buf.push_str(
+            "<table>\n\
+             <tr><th>When</th><th>Event</th><th>Actor</th></tr>\n",
+        );
+        for event in events {
+            buf.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                esc(&event.created_at),
+                esc(&event.action),
+                esc(&event.actor),
+            ));
+        }
+        buf.push_str("</table>\n");
+    }
     buf.push_str("</body></html>");
     buf
 }
@@ -3634,6 +3954,31 @@ fn render_peer_detail_inner(
         cm = esc(current_comment),
         disabled_checked = if dto.disabled { " checked" } else { "" },
     ));
+
+    // Forget-data is intentionally separate from managed-user removal. It is
+    // available only after an unmanaged peer has been disabled and fully
+    // reconciled, and retains the public key as a hidden disabled tombstone.
+    if dto.disabled && !dto.has_config && !dto.sync_pending {
+        buf.push_str(&format!(
+            r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
+<h2 style="color:#c00">Forget old peer data</h2>
+<p>This removes the peer from the normal list and permanently deletes its saved name, comment, endpoint, counters, and traffic history from the panel database.
+AmneziaWG configuration files are not changed. The panel keeps a minimal disabled-key record, including the public key and record timestamps, so the web service can continue blocking it and removing it from the running interface.
+Audit-log entries are retained and may still contain earlier values.</p>
+<form method="POST" action="/admin/peers/{id}/archive">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <label for="confirm_forget" style="display:flex;align-items:center;gap:.4rem;margin-top:.5rem">
+    <input type="checkbox" id="confirm_forget" name="confirm" value="yes" required>
+    I understand that the saved peer metadata and traffic history will be permanently deleted.
+  </label>
+  <button type="submit" style="background:#c00;margin-top:.5rem">Forget old peer data</button>
+</form>
+</div>
+"#,
+            id = dto.id,
+            csrf = esc(csrf_token),
+        ));
+    }
 
     // Remove user form (only shown when the peer has a linked config and the
     // friendly name passes installer-managed name validation, i.e. it matches
@@ -4349,6 +4694,21 @@ mod tests {
             .await
             .expect("insert peer")
             .last_insert_rowid()
+    }
+
+    async fn archive_peer_for_test(db: &Database, id: i64) {
+        sqlx::query("UPDATE peers SET disabled = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .expect("disable peer");
+        let outcome = crate::db::peers::archive_peer_data(&db.pool, id, "test-admin")
+            .await
+            .expect("archive peer");
+        assert!(matches!(
+            outcome,
+            crate::db::peers::ArchivePeerOutcome::Archived { .. }
+        ));
     }
 
     async fn insert_snapshot_with_bytes(
@@ -6523,6 +6883,364 @@ mod tests {
         let html = std::str::from_utf8(&body).unwrap();
         assert!(html.contains("name=\"disabled\""));
         assert!(html.contains("value=\"1\""));
+    }
+
+    #[tokio::test]
+    async fn eligible_disabled_peer_shows_forget_action_with_retention_copy() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_FORGET_UI=", Some("Old peer")).await;
+        sqlx::query("UPDATE peers SET disabled = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let response = test_router(db)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Forget old peer data"));
+        assert!(html.contains(&format!("/admin/peers/{id}/archive")));
+        assert!(html.contains("Audit-log entries are retained"));
+        assert!(html.contains("name=\"confirm\""));
+    }
+
+    #[tokio::test]
+    async fn archived_peer_is_hidden_by_default_and_available_on_explicit_views() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_ARCHIVED_WEB=", Some("Old web peer")).await;
+        archive_peer_for_test(&db, id).await;
+        let app = test_router(db);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let peers: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(peers.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/peers?include_archived=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let peers: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["id"], id);
+        assert_eq!(peers[0]["archived"], true);
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Show archived keys"));
+        assert!(!html.contains(&format!("/archived/peers/{id}")));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/?show_archived=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Hide archived keys"));
+        assert!(html.contains(&format!("/archived/peers/{id}")));
+        assert!(html.contains("archived"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/archived/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Archived disabled key"));
+        assert!(html.contains("Return key to peer list"));
+        assert!(!html.contains("Download"));
+        assert!(!html.contains("JSON history"));
+    }
+
+    #[tokio::test]
+    async fn archived_peer_normal_detail_and_data_routes_return_404() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_ARCHIVED_ROUTES=", None).await;
+        archive_peer_for_test(&db, id).await;
+        let app = test_router(db);
+        let paths = [
+            format!("/peers/{id}"),
+            format!("/api/peers/{id}"),
+            format!("/api/peers/{id}/history"),
+            format!("/api/peers/{id}/usage"),
+            format!("/api/peers/{id}/usage/summary"),
+            format!("/api/peers/{id}/config"),
+            format!("/api/peers/{id}/qr"),
+        ];
+
+        for path in paths {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_form_requires_confirmation_then_purges_peer_data() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_ARCHIVE_FORM=", Some("Old form peer")).await;
+        sqlx::query(
+            "UPDATE peers
+             SET disabled = 1, comment = 'old note', endpoint = '198.51.100.2:51820',
+                 rx_bytes = 10, tx_bytes = 20
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        insert_snapshot_with_bytes(&db, "KEY_ARCHIVE_FORM=", "2026-01-01T00:00:00Z", 10, 20).await;
+        let app = test_router(db.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/peers/{id}/archive"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/peers/{id}/archive"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=yes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            "/?peer_notice=peer_archived"
+        );
+
+        let peer = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.archived, 1);
+        assert_eq!(peer.disabled, 1);
+        assert!(peer.display_name.is_none());
+        assert!(peer.comment.is_none());
+        assert!(peer.endpoint.is_none());
+        assert_eq!(peer.rx_bytes, 0);
+        assert_eq!(peer.tx_bytes, 0);
+        assert!(
+            crate::db::peers::find_snapshots(&db.pool, "KEY_ARCHIVE_FORM=", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_form_returns_blank_peer_but_keeps_it_disabled() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_RESTORE_FORM=", Some("Gone")).await;
+        archive_peer_for_test(&db, id).await;
+        let app = test_router(db.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/peers/{id}/restore"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response
+                .headers()
+                .get("location")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("/peers/{id}")
+        );
+
+        let peer = crate::db::peers::find_visible_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.archived, 0);
+        assert_eq!(peer.disabled, 1);
+        assert!(peer.display_name.is_none());
+        assert!(peer.comment.is_none());
+    }
+
+    #[tokio::test]
+    async fn archive_and_restore_forms_require_csrf_when_auth_is_enabled() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_ARCHIVE_CSRF=", None).await;
+        sqlx::query("UPDATE peers SET disabled = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let db_assert = db.clone();
+        let (app, _) = test_router_with_auth(db);
+        let login_response = do_login(app.clone(), "admin", "testpassword").await;
+        let session_value = session_cookie_value(&login_response);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/peers/{id}/archive"))
+                    .header("cookie", &session_value)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=yes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let peer = crate::db::peers::find_by_id(&db_assert.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.archived, 0);
+
+        archive_peer_for_test(&db_assert, id).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/peers/{id}/restore"))
+                    .header("cookie", &session_value)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let peer = crate::db::peers::find_by_id(&db_assert.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.archived, 1);
+    }
+
+    #[tokio::test]
+    async fn archive_waits_for_config_remap_and_rechecks_eligibility() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_ARCHIVE_MAPPING_RACE=", None).await;
+        sqlx::query("UPDATE peers SET disabled = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let app = test_router(db.clone());
+        let mapping_guard = crate::poller::acquire_config_mapping_lock().await;
+        let task = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/peers/{id}/archive"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=yes"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "archive must wait for the config remap lock"
+        );
+        assert!(crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_ARCHIVE_MAPPING_RACE=",
+            "existing-client",
+            "/etc/amnezia/amneziawg/existing-client.conf",
+            "existing-client",
+        )
+        .await
+        .unwrap());
+        drop(mapping_guard);
+
+        let response = task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let peer = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.archived, 0);
+        assert_eq!(peer.has_config, 1);
     }
 
     #[tokio::test]

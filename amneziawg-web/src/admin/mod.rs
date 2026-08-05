@@ -53,6 +53,9 @@ pub async fn execute_set_peer_enabled(
         Some(r) => r,
         None => return Ok(None),
     };
+    if existing.archived != 0 {
+        return Ok(None);
+    }
 
     let disabled = !cmd.enabled;
     let old_disabled = existing.disabled != 0;
@@ -62,7 +65,9 @@ pub async fn execute_set_peer_enabled(
         return Ok(Some(existing));
     }
 
-    let updated = update_peer_disabled(&db.pool, existing.id, disabled).await?;
+    let Some(updated) = update_peer_disabled(&db.pool, existing.id, disabled).await? else {
+        return Ok(None);
+    };
 
     {
         let detail = serde_json::json!({
@@ -81,7 +86,7 @@ pub async fn execute_set_peer_enabled(
         .await;
     }
 
-    Ok(updated)
+    Ok(Some(updated))
 }
 
 // ── User lifecycle (create / remove) ─────────────────────────────────────────
@@ -434,10 +439,11 @@ pub async fn execute_remove_user(
                 )));
             }
 
-            if let Err(e) = crate::db::peers::delete_by_id(&db.pool, peer_id).await {
+            let delete_result = crate::db::peers::delete_by_id(&db.pool, peer_id).await;
+            if !matches!(&delete_result, Ok(true)) {
                 tracing::error!(
                     peer_id = %peer_id,
-                    error = %e,
+                    result = ?delete_result,
                     "failed to delete removed peer row from database"
                 );
                 let detail = serde_json::json!({
@@ -456,7 +462,7 @@ pub async fn execute_remove_user(
                 )
                 .await;
                 return Err(RemoveClientError::Internal(format!(
-                    "client removed from WireGuard but failed to delete peer row: {e}"
+                    "client removed from WireGuard but failed to delete peer row: {delete_result:?}"
                 )));
             }
 

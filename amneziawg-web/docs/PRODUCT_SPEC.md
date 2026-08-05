@@ -38,6 +38,7 @@ The central entity, identified by `public_key` (WireGuard public key).
 | `tx_bytes`         | u64      | `awg show`      |
 | `status`           | enum     | derived         |
 | `disabled`         | bool     | DB (admin)      |
+| `archived`         | bool     | DB (admin)      |
 | `has_config`       | bool     | config scanner  |
 
 ### PeerStatus
@@ -56,6 +57,20 @@ A point-in-time record of a peer's stats, written every poll cycle.
 ### Event
 
 An audit log entry for every admin action.
+
+### Archived disabled key
+
+An operator may forget the saved data for an obsolete peer only after it is
+disabled, unlinked from a client config, and no longer waiting for lifecycle
+reconciliation. The operation deletes current metadata and all traffic
+snapshots, then hides the row from normal views while retaining its ID, public
+key, disabled state, timestamps, and audit history.
+
+Archived keys remain part of disabled-key enforcement and cannot be
+repopulated by polling or config discovery. Returning a key to the normal peer
+list creates a blank, still-disabled row; deleted metadata and history are not
+restored. Historical audit payloads may still contain earlier values, so this
+is an operational cleanup feature rather than forensic secure erasure.
 
 ---
 
