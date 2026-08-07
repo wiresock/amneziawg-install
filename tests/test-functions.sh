@@ -1176,6 +1176,7 @@ unset NIAC_BIN NIAC_PATHS NIAC_CC NIAC_SC_PEER
 echo "=== installKernelHeaders future-upgrade coverage ==="
 KERNEL_HEADER_TMP="$(mktemp -d)"
 KERNEL_HEADER_LOG="${KERNEL_HEADER_TMP}/apt-get.log"
+KERNEL_HEADER_ERR="${KERNEL_HEADER_TMP}/stderr.log"
 
 # A successful version-specific install must not short-circuit the Debian
 # architecture meta-package needed by the next kernel upgrade (#98).
@@ -1203,9 +1204,29 @@ assert_eq "2" "$(wc -l < "${KERNEL_HEADER_LOG}" | tr -d ' ')" "kernel headers: s
 	}
 	apt-get() { printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"; return 0; }
 	installKernelHeaders "6.8.0-1030-aws"
-) >/dev/null
+) >/dev/null 2> "${KERNEL_HEADER_ERR}"
 assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-6.8.0-1030-aws" "kernel headers: installs the running Ubuntu AWS kernel package"
 assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-aws" "kernel headers: installs the matching Ubuntu AWS meta-package"
+assert_not_contains "$(cat "${KERNEL_HEADER_ERR}")" "Could not determine a safe rolling kernel header meta-package" "kernel headers: resolved Ubuntu track emits no rolling-header warning"
+
+# Ambiguous installed tracks must not be guessed, but a successful exact-header
+# install must still warn that future kernel upgrades are not covered.
+: > "${KERNEL_HEADER_LOG}"
+(
+	OS=ubuntu
+	apt-cache() { return 1; }
+	dpkg-query() {
+		printf '%s\t%s\n' \
+			'linux-image-aws' 'install ok installed' \
+			'linux-image-aws-6.8' 'install ok installed'
+	}
+	apt-get() { printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"; return 0; }
+	installKernelHeaders "6.8.0-1051-aws"
+) >/dev/null 2> "${KERNEL_HEADER_ERR}"
+assert_contains "$(cat "${KERNEL_HEADER_ERR}")" "Could not determine a safe rolling kernel header meta-package for '6.8.0-1051-aws'" "kernel headers: unresolved rolling track warns even when exact headers install"
+assert_contains "$(cat "${KERNEL_HEADER_ERR}")" "future kernel upgrades may require installing matching headers manually" "kernel headers: unresolved rolling track explains the future-upgrade risk"
+assert_eq "1" "$(grep -Fc "Could not determine a safe rolling kernel header meta-package" "${KERNEL_HEADER_ERR}")" "kernel headers: unresolved rolling track warns exactly once"
+assert_eq "install -y linux-headers-6.8.0-1051-aws" "$(cat "${KERNEL_HEADER_LOG}")" "kernel headers: ambiguous Ubuntu tracks install only the exact package"
 
 _debian_cloud_header_meta() {
 	(
@@ -1489,7 +1510,7 @@ _debian_arm64_16k_header_meta() {
 assert_eq "linux-headers-arm64-16k" "$(_debian_arm64_16k_header_meta)" "kernel headers: Debian arm64-16k retains its flavor"
 
 rm -rf "${KERNEL_HEADER_TMP}"
-unset KERNEL_HEADER_TMP KERNEL_HEADER_LOG
+unset KERNEL_HEADER_TMP KERNEL_HEADER_LOG KERNEL_HEADER_ERR
 
 echo ""
 echo "=========================================="

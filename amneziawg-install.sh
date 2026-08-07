@@ -2352,7 +2352,13 @@ function installKernelHeaders() {
 		local META_HEADER_PKG=""
 		local META_ATTEMPTED=0
 
-		META_HEADER_PKG=$(getKernelHeaderMetaPackage "${KERNEL_VER}" 2>/dev/null) || META_HEADER_PKG=""
+		if META_HEADER_PKG=$(getKernelHeaderMetaPackage "${KERNEL_VER}" 2>/dev/null) && \
+				[[ -n "${META_HEADER_PKG}" ]]; then
+			:
+		else
+			META_HEADER_PKG=""
+			echo -e "${ORANGE}WARNING: Could not determine a safe rolling kernel header meta-package for '${KERNEL_VER}'. The installer will still try headers for the running kernel, but future kernel upgrades may require installing matching headers manually.${NC}" >&2
+		fi
 
 		if apt-get install -y "${CURRENT_HEADER_PKG}"; then
 			HEADER_INSTALLED=1
