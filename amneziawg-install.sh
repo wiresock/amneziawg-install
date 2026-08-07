@@ -2133,6 +2133,23 @@ function sanitizeAwgDkmsConf() {
 	done
 }
 
+function aptPackageIsInstalled() {
+	dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q '^install ok installed$'
+}
+
+# A header track may be represented by its header meta-package, its image-only
+# meta-package, or the complete image+headers meta-package. Treat any of those
+# as evidence that this is the administrator-selected kernel track.
+function kernelHeaderTrackIsInstalled() {
+	local HEADER_META_PKG="$1"
+	local TRACK="${HEADER_META_PKG#linux-headers-}"
+
+	[[ "${HEADER_META_PKG}" =~ ^linux-headers-[a-z0-9][a-z0-9.+-]*$ ]] || return 1
+	aptPackageIsInstalled "${HEADER_META_PKG}" || \
+		aptPackageIsInstalled "linux-image-${TRACK}" || \
+		aptPackageIsInstalled "linux-${TRACK}"
+}
+
 # Ask APT which header meta-package depends on the exact running-kernel
 # package. This correctly distinguishes Ubuntu GA/HWE/cloud families and
 # Debian flavors without guessing from architecture alone.
@@ -2153,9 +2170,10 @@ function getAptKernelHeaderMetaPackage() {
 	[[ "${#CANDIDATES[@]}" -gt 0 ]] || return 1
 
 	# Preserve an already selected kernel family when more than one meta-package
-	# points at the same ABI (for example normal and edge HWE tracks).
+	# points at the same ABI (for example normal and edge HWE tracks). The image
+	# meta is important when headers have not been installed yet.
 	for RDEPEND in "${CANDIDATES[@]}"; do
-		if dpkg-query -W -f='${Status}' "${RDEPEND}" 2>/dev/null | grep -q 'install ok installed'; then
+		if kernelHeaderTrackIsInstalled "${RDEPEND}"; then
 			printf '%s\n' "${RDEPEND}"
 			return 0
 		fi
@@ -2172,6 +2190,60 @@ function getAptKernelHeaderMetaPackage() {
 	printf '%s\n' "${CANDIDATES[0]}"
 }
 
+# Derive an Ubuntu header meta-package from an installed image meta-package.
+# Complete kernel meta-packages depend on their corresponding image metas, so
+# image metas cover both installation styles without matching ABI-specific
+# support packages. This remains reliable when apt-cache no longer exposes a
+# reverse dependency for the currently running (older) ABI after an index
+# refresh. Ambiguous multiple tracks are rejected rather than guessed.
+function getInstalledUbuntuKernelHeaderMetaPackage() {
+	local KERNEL_VER="${1:-$(uname -r)}"
+	local FLAVOR
+	local PACKAGE
+	local STATUS
+	local TRACK
+	local HEADER_META
+	local EXISTING
+	local SEEN
+	local -a CANDIDATES=()
+
+	case "${KERNEL_VER}" in
+		*-generic-64k) FLAVOR="generic-64k" ;;
+		*-generic) FLAVOR="generic" ;;
+		*-lowlatency) FLAVOR="lowlatency" ;;
+		*) return 1 ;;
+	esac
+
+	while IFS=$'\t' read -r PACKAGE STATUS; do
+		[[ "${STATUS}" == 'install ok installed' ]] || continue
+		PACKAGE="${PACKAGE%%:*}"
+		[[ "${PACKAGE}" == linux-image-* ]] || continue
+		TRACK="${PACKAGE#linux-image-}"
+
+		# Restrict the prefix glob to actual generic/low-latency image-meta
+		# naming schemes. In particular, generic must not accept generic-64k.
+		if [[ "${TRACK}" != "${FLAVOR}" ]] && \
+				! [[ "${TRACK}" =~ ^${FLAVOR}-(edge|(hwe|lts)-[0-9]{2}\.[0-9]{2}(-edge)?|[0-9]+\.[0-9]+)$ ]]; then
+			continue
+		fi
+		HEADER_META="linux-headers-${TRACK}"
+		[[ "${HEADER_META}" =~ ^linux-headers-[a-z0-9][a-z0-9.+-]*$ ]] || continue
+
+		SEEN=0
+		for EXISTING in "${CANDIDATES[@]}"; do
+			if [[ "${EXISTING}" == "${HEADER_META}" ]]; then
+				SEEN=1
+				break
+			fi
+		done
+		[[ "${SEEN}" -eq 1 ]] || CANDIDATES+=("${HEADER_META}")
+	done < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' \
+		"linux-image-${FLAVOR}*" 2>/dev/null)
+
+	[[ "${#CANDIDATES[@]}" -eq 1 ]] || return 1
+	printf '%s\n' "${CANDIDATES[0]}"
+}
+
 # Return a rolling header package when APT reverse-dependency metadata is not
 # available. Installing only linux-headers-$(uname -r) is enough for today's
 # DKMS build, but the rolling package is what keeps headers on APT's future
@@ -2179,6 +2251,7 @@ function getAptKernelHeaderMetaPackage() {
 function getKernelHeaderMetaPackage() {
 	local KERNEL_VER="${1:-$(uname -r)}"
 	local APT_META
+	local INSTALLED_META
 	local DEB_ARCH
 
 	if APT_META=$(getAptKernelHeaderMetaPackage "${KERNEL_VER}"); then
@@ -2211,10 +2284,15 @@ function getKernelHeaderMetaPackage() {
 				;;
 		esac
 	elif [[ "${OS}" == 'ubuntu' ]]; then
+		if INSTALLED_META=$(getInstalledUbuntuKernelHeaderMetaPackage "${KERNEL_VER}"); then
+			printf '%s\n' "${INSTALLED_META}"
+			return 0
+		fi
+
 		case "${KERNEL_VER}" in
-			*-generic-64k) printf '%s\n' "linux-headers-generic-64k" ;;
-			*-generic) printf '%s\n' "linux-headers-generic" ;;
-			*-lowlatency) printf '%s\n' "linux-headers-lowlatency" ;;
+			# Generic and low-latency names are shared by GA/HWE/edge
+			# tracks. Without package metadata, selecting one is unsafe.
+			*-generic-64k|*-generic|*-lowlatency) return 1 ;;
 			*-aws) printf '%s\n' "linux-headers-aws" ;;
 			*-azure) printf '%s\n' "linux-headers-azure" ;;
 			*-gcp) printf '%s\n' "linux-headers-gcp" ;;
