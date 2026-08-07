@@ -1190,12 +1190,17 @@ assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-6.12.3
 assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-amd64" "kernel headers: installs the Debian architecture meta-package"
 assert_eq "2" "$(wc -l < "${KERNEL_HEADER_LOG}" | tr -d ' ')" "kernel headers: successful Debian path needs exactly current and meta packages"
 
-# Ubuntu flavor-specific meta-packages should follow the running kernel family
-# instead of installing unrelated generic headers on cloud images.
+# Ubuntu cloud meta-packages should follow the installed kernel track instead
+# of installing unrelated generic or differently-versioned headers.
 : > "${KERNEL_HEADER_LOG}"
 (
 	OS=ubuntu
 	apt-cache() { return 1; }
+	dpkg-query() {
+		printf '%s\t%s\n' \
+			'linux-image-aws' \
+			'install ok installed'
+	}
 	apt-get() { printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"; return 0; }
 	installKernelHeaders "6.8.0-1030-aws"
 ) >/dev/null
@@ -1372,7 +1377,84 @@ _ubuntu_generic_64k_mismatch() {
 }
 assert_rc 1 _ubuntu_generic_64k_mismatch
 
-_ubuntu_aws_support_package_header_meta() {
+_ubuntu_versioned_azure_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() { return 1; }
+		dpkg-query() {
+			local ARG
+			local SAW_AZURE_GLOB=0
+			for ARG in "$@"; do
+				[[ "${ARG}" == 'linux-image-azure*' ]] && SAW_AZURE_GLOB=1
+				[[ "${ARG}" == 'linux-azure*' ]] && return 1
+			done
+			[[ "${SAW_AZURE_GLOB}" -eq 1 ]] || return 1
+			printf '%s\t%s\n' \
+				'linux-image-azure-6.8' \
+				'install ok installed'
+		}
+		getKernelHeaderMetaPackage "6.8.0-1062-azure"
+	)
+}
+assert_eq "linux-headers-azure-6.8" "$(_ubuntu_versioned_azure_header_meta)" "kernel headers: installed Ubuntu Azure image meta preserves its versioned track"
+
+_ubuntu_edge_gcp_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() { return 1; }
+		dpkg-query() {
+			printf '%s\t%s\n' \
+				'linux-image-gcp-edge' \
+				'install ok installed'
+		}
+		getKernelHeaderMetaPackage "6.8.0-1060-gcp"
+	)
+}
+assert_eq "linux-headers-gcp-edge" "$(_ubuntu_edge_gcp_header_meta)" "kernel headers: installed Ubuntu GCP image meta preserves its edge track"
+
+_ubuntu_ibm_classic_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() { return 1; }
+		dpkg-query() {
+			printf '%s\t%s\n' \
+				'linux-image-ibm-classic' \
+				'install ok installed'
+		}
+		getKernelHeaderMetaPackage "6.8.0-1057-ibm"
+	)
+}
+assert_eq "linux-headers-ibm-classic" "$(_ubuntu_ibm_classic_header_meta)" "kernel headers: installed Ubuntu IBM Classic image meta preserves its selected track"
+
+_ubuntu_ambiguous_aws_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() { return 1; }
+		dpkg-query() {
+			printf '%s\t%s\n' \
+				'linux-image-aws' 'install ok installed' \
+				'linux-image-aws-6.8' 'install ok installed'
+		}
+		getKernelHeaderMetaPackage "6.8.0-1051-aws"
+	)
+}
+assert_rc 1 _ubuntu_ambiguous_aws_header_meta
+
+_ubuntu_gcp_64k_sibling_not_meta() {
+	(
+		OS=ubuntu
+		apt-cache() { return 1; }
+		dpkg-query() {
+			printf '%s\t%s\n' \
+				'linux-image-gcp-64k-6.8' \
+				'install ok installed'
+		}
+		getKernelHeaderMetaPackage "6.8.0-1060-gcp"
+	)
+}
+assert_rc 1 _ubuntu_gcp_64k_sibling_not_meta
+
+_ubuntu_aws_support_package_not_meta() {
 	(
 		OS=ubuntu
 		apt-cache() { return 1; }
@@ -1384,7 +1466,7 @@ _ubuntu_aws_support_package_header_meta() {
 		getKernelHeaderMetaPackage "6.8.0-1051-aws"
 	)
 }
-assert_eq "linux-headers-aws" "$(_ubuntu_aws_support_package_header_meta)" "kernel headers: Ubuntu ABI support packages are not mistaken for meta-packages"
+assert_rc 1 _ubuntu_aws_support_package_not_meta
 
 _debian_ppc64el_header_meta() {
 	(

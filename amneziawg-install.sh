@@ -2235,6 +2235,14 @@ function getInstalledUbuntuKernelHeaderMetaPackage() {
 		*-generic-64k) FLAVORS=("generic-64k") ;;
 		*-generic) FLAVORS=("generic" "virtual") ;;
 		*-lowlatency) FLAVORS=("lowlatency") ;;
+		*-aws) FLAVORS=("aws") ;;
+		*-azure) FLAVORS=("azure") ;;
+		*-gcp) FLAVORS=("gcp") ;;
+		*-gke) FLAVORS=("gke") ;;
+		# ibm-classic installs the same *-ibm ABI under a distinct meta track.
+		*-ibm) FLAVORS=("ibm" "ibm-classic") ;;
+		*-kvm) FLAVORS=("kvm") ;;
+		*-oracle) FLAVORS=("oracle") ;;
 		*) return 1 ;;
 	esac
 	for FLAVOR in "${FLAVORS[@]}"; do
@@ -2321,16 +2329,10 @@ function getKernelHeaderMetaPackage() {
 		fi
 
 		case "${KERNEL_VER}" in
-			# Generic and low-latency names are shared by GA/HWE/edge
-			# tracks. Without package metadata, selecting one is unsafe.
-			*-generic-64k|*-generic|*-lowlatency) return 1 ;;
-			*-aws) printf '%s\n' "linux-headers-aws" ;;
-			*-azure) printf '%s\n' "linux-headers-azure" ;;
-			*-gcp) printf '%s\n' "linux-headers-gcp" ;;
-			*-gke) printf '%s\n' "linux-headers-gke" ;;
-			*-ibm) printf '%s\n' "linux-headers-ibm" ;;
-			*-kvm) printf '%s\n' "linux-headers-kvm" ;;
-			*-oracle) printf '%s\n' "linux-headers-oracle" ;;
+			# These suffixes are shared by unversioned, edge, HWE/LTS, and
+			# version-pinned tracks. Without package metadata, selecting one
+			# is unsafe.
+			*-generic-64k|*-generic|*-lowlatency|*-aws|*-azure|*-gcp|*-gke|*-ibm|*-kvm|*-oracle) return 1 ;;
 			*-raspi*) printf '%s\n' "linux-headers-raspi" ;;
 			*) return 1 ;;
 		esac
