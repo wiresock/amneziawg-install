@@ -36,6 +36,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="${SCRIPT_DIR}/amneziawg-web/scripts"
 BOOTSTRAP_DIR=""
+BOOTSTRAP_TMPDIR=""
 
 # ── Defaults (mirror inner scripts) ──────────────────────────────────────────
 
@@ -176,7 +177,15 @@ bootstrap_repo_if_needed() {
         fi
     fi
 
-    BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/amneziawg-install.XXXXXX")"
+    # Cargo writes most build artifacts below the cloned source tree. Prefer
+    # /var/tmp, which is normally disk-backed, so a standalone install does not
+    # exhaust RAM on hosts where /tmp is mounted as tmpfs. An explicit TMPDIR is
+    # still honored; /tmp remains a compatibility fallback.
+    local bootstrap_root="${TMPDIR:-/var/tmp}"
+    if [[ ! -d "${bootstrap_root}" ]] || [[ ! -w "${bootstrap_root}" ]]; then
+        bootstrap_root="/tmp"
+    fi
+    BOOTSTRAP_DIR="$(mktemp -d "${bootstrap_root%/}/amneziawg-install.XXXXXX")"
 
     echo "Required scripts not found locally. Cloning ${REPO_URL} (${REPO_REF}) into ${BOOTSTRAP_DIR} ..." >&2
     if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" "${BOOTSTRAP_DIR}" >&2; then
@@ -185,6 +194,8 @@ bootstrap_repo_if_needed() {
         exit 1
     fi
 
+    BOOTSTRAP_TMPDIR="${BOOTSTRAP_DIR}/.tmp"
+    mkdir -p "${BOOTSTRAP_TMPDIR}"
     SCRIPTS_DIR="${BOOTSTRAP_DIR}/amneziawg-web/scripts"
 }
 
@@ -205,7 +216,12 @@ run_inner_script() {
     fi
 
     local exit_code=0
-    bash "${target}" "$@" || exit_code=$?
+    if [[ -n "${BOOTSTRAP_TMPDIR}" ]]; then
+        # Keep rustc/linker scratch files beside the disk-backed clone as well.
+        TMPDIR="${BOOTSTRAP_TMPDIR}" bash "${target}" "$@" || exit_code=$?
+    else
+        bash "${target}" "$@" || exit_code=$?
+    fi
     exit "${exit_code}"
 }
 

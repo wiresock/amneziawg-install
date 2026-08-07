@@ -1173,6 +1173,94 @@ assert_not_contains "${NIAC_SC_PEER}" "::" "niac v4-only: server peer has no IPv
 rm -rf "${NIAC_BIN}"
 unset NIAC_BIN NIAC_PATHS NIAC_CC NIAC_SC_PEER
 
+echo "=== installKernelHeaders future-upgrade coverage ==="
+KERNEL_HEADER_TMP="$(mktemp -d)"
+KERNEL_HEADER_LOG="${KERNEL_HEADER_TMP}/apt-get.log"
+
+# A successful version-specific install must not short-circuit the Debian
+# architecture meta-package needed by the next kernel upgrade (#98).
+(
+	OS=debian
+	dpkg() { printf '%s\n' amd64; }
+	apt-cache() { return 1; }
+	apt-get() { printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"; return 0; }
+	installKernelHeaders "6.12.38+deb13-amd64"
+) >/dev/null
+assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-6.12.38+deb13-amd64" "kernel headers: installs the running Debian kernel package"
+assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-amd64" "kernel headers: installs the Debian architecture meta-package"
+assert_eq "2" "$(wc -l < "${KERNEL_HEADER_LOG}" | tr -d ' ')" "kernel headers: successful Debian path needs exactly current and meta packages"
+
+# Ubuntu flavor-specific meta-packages should follow the running kernel family
+# instead of installing unrelated generic headers on cloud images.
+: > "${KERNEL_HEADER_LOG}"
+(
+	OS=ubuntu
+	apt-cache() { return 1; }
+	apt-get() { printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"; return 0; }
+	installKernelHeaders "6.8.0-1030-aws"
+) >/dev/null
+assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-6.8.0-1030-aws" "kernel headers: installs the running Ubuntu AWS kernel package"
+assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-aws" "kernel headers: installs the matching Ubuntu AWS meta-package"
+
+_debian_cloud_header_meta() {
+	(
+		OS=debian
+		dpkg() { printf '%s\n' amd64; }
+		apt-cache() { return 1; }
+		getKernelHeaderMetaPackage "6.12.38+deb13-cloud-amd64"
+	)
+}
+assert_eq "linux-headers-cloud-amd64" "$(_debian_cloud_header_meta)" "kernel headers: Debian cloud kernels retain their flavor"
+
+_debian_arm64_header_meta() {
+	(
+		OS=debian
+		dpkg() { printf '%s\n' arm64; }
+		apt-cache() { return 1; }
+		getKernelHeaderMetaPackage "6.12.38+deb13-arm64"
+	)
+}
+assert_eq "linux-headers-arm64" "$(_debian_arm64_header_meta)" "kernel headers: Debian arm64 selects its architecture meta-package"
+
+_ubuntu_hwe_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() {
+			printf '%s\n' \
+				"linux-headers-6.8.0-90-generic" \
+				"Reverse Depends:" \
+				"  linux-headers-generic-hwe-22.04-edge" \
+				"  linux-headers-generic-hwe-22.04"
+		}
+		dpkg-query() { return 1; }
+		getKernelHeaderMetaPackage "6.8.0-90-generic"
+	)
+}
+assert_eq "linux-headers-generic-hwe-22.04" "$(_ubuntu_hwe_header_meta)" "kernel headers: APT metadata selects the stable Ubuntu HWE track"
+
+_debian_ppc64el_header_meta() {
+	(
+		OS=debian
+		dpkg() { printf '%s\n' ppc64el; }
+		apt-cache() { return 1; }
+		getKernelHeaderMetaPackage "6.12.38+deb13-powerpc64le"
+	)
+}
+assert_eq "linux-headers-powerpc64le" "$(_debian_ppc64el_header_meta)" "kernel headers: Debian ppc64el maps to its kernel flavor"
+
+_debian_arm64_16k_header_meta() {
+	(
+		OS=debian
+		dpkg() { printf '%s\n' arm64; }
+		apt-cache() { return 1; }
+		getKernelHeaderMetaPackage "6.12.38+deb13-arm64-16k"
+	)
+}
+assert_eq "linux-headers-arm64-16k" "$(_debian_arm64_16k_header_meta)" "kernel headers: Debian arm64-16k retains its flavor"
+
+rm -rf "${KERNEL_HEADER_TMP}"
+unset KERNEL_HEADER_TMP KERNEL_HEADER_LOG
+
 echo ""
 echo "=========================================="
 echo "Results: ${TESTS_PASSED}/${TESTS_RUN} passed, ${TESTS_FAILED} failed"

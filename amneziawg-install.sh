@@ -2133,40 +2133,146 @@ function sanitizeAwgDkmsConf() {
 	done
 }
 
-# Install kernel headers for the running kernel so DKMS can compile the module.
+# Ask APT which header meta-package depends on the exact running-kernel
+# package. This correctly distinguishes Ubuntu GA/HWE/cloud families and
+# Debian flavors without guessing from architecture alone.
+function getAptKernelHeaderMetaPackage() {
+	local CURRENT_HEADER_PKG="linux-headers-${1:-$(uname -r)}"
+	local RDEPEND
+	local -a CANDIDATES=()
+
+	command -v apt-cache &>/dev/null || return 1
+	while read -r RDEPEND; do
+		RDEPEND="${RDEPEND#|}"
+		if [[ "${RDEPEND}" != "${CURRENT_HEADER_PKG}" ]] && \
+				[[ "${RDEPEND}" =~ ^linux-headers-[a-z0-9][a-z0-9.+-]*$ ]]; then
+			CANDIDATES+=("${RDEPEND}")
+		fi
+	done < <(apt-cache rdepends "${CURRENT_HEADER_PKG}" 2>/dev/null)
+
+	[[ "${#CANDIDATES[@]}" -gt 0 ]] || return 1
+
+	# Preserve an already selected kernel family when more than one meta-package
+	# points at the same ABI (for example normal and edge HWE tracks).
+	for RDEPEND in "${CANDIDATES[@]}"; do
+		if dpkg-query -W -f='${Status}' "${RDEPEND}" 2>/dev/null | grep -q 'install ok installed'; then
+			printf '%s\n' "${RDEPEND}"
+			return 0
+		fi
+	done
+
+	# Otherwise prefer the stable track over an edge meta-package.
+	for RDEPEND in "${CANDIDATES[@]}"; do
+		if [[ "${RDEPEND}" != *-edge ]]; then
+			printf '%s\n' "${RDEPEND}"
+			return 0
+		fi
+	done
+
+	printf '%s\n' "${CANDIDATES[0]}"
+}
+
+# Return a rolling header package when APT reverse-dependency metadata is not
+# available. Installing only linux-headers-$(uname -r) is enough for today's
+# DKMS build, but the rolling package is what keeps headers on APT's future
+# kernel-upgrade path.
+function getKernelHeaderMetaPackage() {
+	local KERNEL_VER="${1:-$(uname -r)}"
+	local APT_META
+	local DEB_ARCH
+
+	if APT_META=$(getAptKernelHeaderMetaPackage "${KERNEL_VER}"); then
+		printf '%s\n' "${APT_META}"
+		return 0
+	fi
+
+	if [[ "${OS}" == 'debian' ]]; then
+		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) || return 1
+		case "${KERNEL_VER}" in
+			*+rpt-rpi-*|*-rpi-v[678]*) printf '%s\n' "raspberrypi-kernel-headers" ;;
+			*-rpi) printf '%s\n' "linux-headers-rpi" ;;
+			*-cloud-"${DEB_ARCH}") printf '%s\n' "linux-headers-cloud-${DEB_ARCH}" ;;
+			*-rt-"${DEB_ARCH}") printf '%s\n' "linux-headers-rt-${DEB_ARCH}" ;;
+			*-arm64-16k) printf '%s\n' "linux-headers-arm64-16k" ;;
+			*-powerpc64le-64k) printf '%s\n' "linux-headers-powerpc64le-64k" ;;
+			*-rt-armmp) printf '%s\n' "linux-headers-rt-armmp" ;;
+			*-armmp-lpae) printf '%s\n' "linux-headers-armmp-lpae" ;;
+			*-armmp) printf '%s\n' "linux-headers-armmp" ;;
+			*-686-pae) printf '%s\n' "linux-headers-686-pae" ;;
+			*-686) printf '%s\n' "linux-headers-686" ;;
+			*)
+				case "${DEB_ARCH}" in
+					amd64|arm64|riscv64|s390x) printf '%s\n' "linux-headers-${DEB_ARCH}" ;;
+					armhf) printf '%s\n' "linux-headers-armmp" ;;
+					ppc64el) printf '%s\n' "linux-headers-powerpc64le" ;;
+					i386) printf '%s\n' "linux-headers-686-pae" ;;
+					*) return 1 ;;
+				esac
+				;;
+		esac
+	elif [[ "${OS}" == 'ubuntu' ]]; then
+		case "${KERNEL_VER}" in
+			*-generic-64k) printf '%s\n' "linux-headers-generic-64k" ;;
+			*-generic) printf '%s\n' "linux-headers-generic" ;;
+			*-lowlatency) printf '%s\n' "linux-headers-lowlatency" ;;
+			*-aws) printf '%s\n' "linux-headers-aws" ;;
+			*-azure) printf '%s\n' "linux-headers-azure" ;;
+			*-gcp) printf '%s\n' "linux-headers-gcp" ;;
+			*-gke) printf '%s\n' "linux-headers-gke" ;;
+			*-ibm) printf '%s\n' "linux-headers-ibm" ;;
+			*-kvm) printf '%s\n' "linux-headers-kvm" ;;
+			*-oracle) printf '%s\n' "linux-headers-oracle" ;;
+			*-raspi*) printf '%s\n' "linux-headers-raspi" ;;
+			*) return 1 ;;
+		esac
+	else
+		return 1
+	fi
+}
+
+# Install headers for both the running kernel and future kernel upgrades.
 # $1 – kernel version string; defaults to the running kernel (uname -r).
 # For APT-based systems the caller must have already activated enable_apt_ipv4.
 function installKernelHeaders() {
 	local KERNEL_VER="${1:-$(uname -r)}"
-	if [[ "${OS}" == 'ubuntu' ]]; then
+	if [[ "${OS}" == 'ubuntu' ]] || [[ "${OS}" == 'debian' ]]; then
 		local HEADER_INSTALLED=0
-		local HEADER_CANDIDATES=("linux-headers-${KERNEL_VER}" "raspberrypi-kernel-headers" "linux-headers-generic")
-		local HDR_PKG
-		for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
-			if apt-get install -y "${HDR_PKG}"; then
-				HEADER_INSTALLED=1
-				break
-			else
-				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HDR_PKG}'. Trying next candidate...${NC}"
+		local CURRENT_HEADER_PKG="linux-headers-${KERNEL_VER}"
+		local META_HEADER_PKG=""
+		local META_ATTEMPTED=0
+
+		META_HEADER_PKG=$(getKernelHeaderMetaPackage "${KERNEL_VER}" 2>/dev/null) || META_HEADER_PKG=""
+
+		if apt-get install -y "${CURRENT_HEADER_PKG}"; then
+			HEADER_INSTALLED=1
+		else
+			echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${CURRENT_HEADER_PKG}'. Trying alternate header packages...${NC}"
+
+			# Raspberry Pi kernels commonly use one rolling header package instead
+			# of a versioned linux-headers-$(uname -r) package.
+			if [[ "${META_HEADER_PKG}" == 'raspberrypi-kernel-headers' ]]; then
+				META_ATTEMPTED=1
 			fi
-		done
-		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
-			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
+			if apt-get install -y raspberrypi-kernel-headers; then
+				HEADER_INSTALLED=1
+			else
+				echo -e "${ORANGE}WARNING: Failed to install kernel headers package 'raspberrypi-kernel-headers'.${NC}"
+			fi
 		fi
-	elif [[ "${OS}" == 'debian' ]]; then
-		local HEADER_INSTALLED=0
-		local HEADER_CANDIDATES=("linux-headers-${KERNEL_VER}" "raspberrypi-kernel-headers")
-		local DEB_ARCH
-		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) && HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
-		local HDR_PKG
-		for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
-			if apt-get install -y "${HDR_PKG}"; then
+
+		# This is deliberately independent of the running-kernel install above:
+		# even when the exact package succeeds, the meta-package is what pulls in
+		# matching headers during future APT kernel upgrades.
+		if [[ -n "${META_HEADER_PKG}" ]] && \
+				[[ "${META_HEADER_PKG}" != "${CURRENT_HEADER_PKG}" ]] && \
+				[[ "${META_ATTEMPTED}" -eq 0 ]]; then
+			if apt-get install -y "${META_HEADER_PKG}"; then
 				HEADER_INSTALLED=1
-				break
 			else
-				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HDR_PKG}'. Trying next candidate...${NC}"
+				echo -e "${ORANGE}WARNING: Failed to install kernel header meta-package '${META_HEADER_PKG}'. The current kernel may work, but a future kernel upgrade could require installing matching headers manually.${NC}"
 			fi
-		done
+		fi
+
 		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
 			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
 		fi

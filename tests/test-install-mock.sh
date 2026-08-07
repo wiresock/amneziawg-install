@@ -5127,12 +5127,20 @@ mkdir -p "${WEB_TEST_INSTALL_DIR}" "${WEB_TEST_DATA_DIR}" \
 
 # Create a mock git that simulates a successful bootstrap clone
 PHASE9_MOCK_GIT_DIR="$(mktemp -d /tmp/awg-mock-git-ph9.XXXXXX)"
+PHASE9_BOOTSTRAP_TARGET_LOG="${PHASE9_STANDALONE_DIR}/bootstrap-target.log"
+PHASE9_INNER_TMPDIR_LOG="${PHASE9_STANDALONE_DIR}/inner-tmpdir.log"
+PHASE9_TMPDIR_PROBE="${PHASE9_STANDALONE_DIR}/record-tmpdir.sh"
+cat > "${PHASE9_TMPDIR_PROBE}" <<PHASE9TMPDIRPROBEEOF
+printf '%s\n' "\${TMPDIR:-}" > "${PHASE9_INNER_TMPDIR_LOG}"
+PHASE9TMPDIRPROBEEOF
 cat > "${PHASE9_MOCK_GIT_DIR}/git" <<PHASE9GITMOCKEOF
 #!/bin/bash
 if [[ "\$1" == "clone" ]]; then
 	TARGET=""
 	for _a in "\$@"; do TARGET="\${_a}"; done
+	printf '%s\n' "\${TARGET}" > "${PHASE9_BOOTSTRAP_TARGET_LOG}"
 	cp -r "${PROJECT_ROOT}/." "\${TARGET}/"
+	sed -i "1r ${PHASE9_TMPDIR_PROBE}" "\${TARGET}/amneziawg-web/scripts/amneziawg-web-install.sh"
 	exit 0
 fi
 exit 0
@@ -5141,7 +5149,7 @@ chmod +x "${PHASE9_MOCK_GIT_DIR}/git"
 
 # Install via standalone unified script with mock git
 UNIFIED_BOOTSTRAP_RC=0
-UNIFIED_BOOTSTRAP_OUTPUT=$(PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
+UNIFIED_BOOTSTRAP_OUTPUT=$(env -u TMPDIR PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
 	bash "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh" install \
 	--non-interactive --force \
 	--binary-src "${STUB_BINARY}" \
@@ -5172,6 +5180,29 @@ if echo "${UNIFIED_BOOTSTRAP_OUTPUT}" | grep -qiE "cloning|clone|bootstrap"; the
 	echo "OK: Standalone unified install output mentions cloning/bootstrapping"
 else
 	echo "WARN: Standalone unified install output does not mention cloning (check stderr capture)"
+fi
+
+if [[ -d /var/tmp ]] && [[ -w /var/tmp ]]; then
+	PHASE9_BOOTSTRAP_TARGET="$(cat "${PHASE9_BOOTSTRAP_TARGET_LOG}" 2>/dev/null || true)"
+	if [[ "${PHASE9_BOOTSTRAP_TARGET}" == /var/tmp/amneziawg-install.* ]]; then
+		echo "OK: Standalone bootstrap uses disk-backed /var/tmp by default"
+	else
+		echo "FAIL: Standalone bootstrap should use /var/tmp, got '${PHASE9_BOOTSTRAP_TARGET}'"
+		FAILED=$((FAILED + 1))
+	fi
+	if [[ ! -e "${PHASE9_BOOTSTRAP_TARGET}" ]]; then
+		echo "OK: Standalone bootstrap directory is removed after use"
+	else
+		echo "FAIL: Standalone bootstrap directory was not cleaned up"
+		FAILED=$((FAILED + 1))
+	fi
+	PHASE9_INNER_TMPDIR="$(cat "${PHASE9_INNER_TMPDIR_LOG}" 2>/dev/null || true)"
+	if [[ "${PHASE9_INNER_TMPDIR}" == "${PHASE9_BOOTSTRAP_TARGET}/.tmp" ]]; then
+		echo "OK: Standalone bootstrap passes its disk-backed TMPDIR to the inner installer"
+	else
+		echo "FAIL: Inner installer TMPDIR should be inside the bootstrap directory, got '${PHASE9_INNER_TMPDIR}'"
+		FAILED=$((FAILED + 1))
+	fi
 fi
 
 rm -rf "${PHASE9_STANDALONE_DIR}" "${PHASE9_MOCK_GIT_DIR}"
