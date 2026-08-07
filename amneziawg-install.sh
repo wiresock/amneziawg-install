@@ -2137,17 +2137,38 @@ function aptPackageIsInstalled() {
 	dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q '^install ok installed$'
 }
 
+function ubuntuKernelTrackMatchesFlavor() {
+	local TRACK="$1"
+	local FLAVOR="$2"
+
+	[[ "${TRACK}" == "${FLAVOR}" ]] || \
+		[[ "${TRACK}" =~ ^${FLAVOR}-(edge|(hwe|lts)-[0-9]{2}\.[0-9]{2}(-edge)?|[0-9]+\.[0-9]+)$ ]]
+}
+
 # A header track may be represented by its header meta-package, its image-only
 # meta-package, or the complete image+headers meta-package. Treat any of those
 # as evidence that this is the administrator-selected kernel track.
 function kernelHeaderTrackIsInstalled() {
 	local HEADER_META_PKG="$1"
 	local TRACK="${HEADER_META_PKG#linux-headers-}"
+	local VIRTUAL_TRACK
 
 	[[ "${HEADER_META_PKG}" =~ ^linux-headers-[a-z0-9][a-z0-9.+-]*$ ]] || return 1
-	aptPackageIsInstalled "${HEADER_META_PKG}" || \
-		aptPackageIsInstalled "linux-image-${TRACK}" || \
-		aptPackageIsInstalled "linux-${TRACK}"
+	if aptPackageIsInstalled "${HEADER_META_PKG}" || \
+			aptPackageIsInstalled "linux-image-${TRACK}" || \
+			aptPackageIsInstalled "linux-${TRACK}"; then
+		return 0
+	fi
+
+	# Ubuntu virtual kernels use the generic ABI suffix. Treat their image/full
+	# meta-packages as evidence for the corresponding generic header track.
+	if [[ "${OS:-}" == 'ubuntu' ]] && ubuntuKernelTrackMatchesFlavor "${TRACK}" 'generic'; then
+		VIRTUAL_TRACK="virtual${TRACK#generic}"
+		aptPackageIsInstalled "linux-image-${VIRTUAL_TRACK}" || \
+			aptPackageIsInstalled "linux-${VIRTUAL_TRACK}"
+	else
+		return 1
+	fi
 }
 
 # Ask APT which header meta-package depends on the exact running-kernel
@@ -2204,15 +2225,21 @@ function getInstalledUbuntuKernelHeaderMetaPackage() {
 	local TRACK
 	local HEADER_META
 	local EXISTING
+	local MATCHED
 	local SEEN
+	local -a FLAVORS=()
+	local -a IMAGE_META_PATTERNS=()
 	local -a CANDIDATES=()
 
 	case "${KERNEL_VER}" in
-		*-generic-64k) FLAVOR="generic-64k" ;;
-		*-generic) FLAVOR="generic" ;;
-		*-lowlatency) FLAVOR="lowlatency" ;;
+		*-generic-64k) FLAVORS=("generic-64k") ;;
+		*-generic) FLAVORS=("generic" "virtual") ;;
+		*-lowlatency) FLAVORS=("lowlatency") ;;
 		*) return 1 ;;
 	esac
+	for FLAVOR in "${FLAVORS[@]}"; do
+		IMAGE_META_PATTERNS+=("linux-image-${FLAVOR}*")
+	done
 
 	while IFS=$'\t' read -r PACKAGE STATUS; do
 		[[ "${STATUS}" == 'install ok installed' ]] || continue
@@ -2220,12 +2247,16 @@ function getInstalledUbuntuKernelHeaderMetaPackage() {
 		[[ "${PACKAGE}" == linux-image-* ]] || continue
 		TRACK="${PACKAGE#linux-image-}"
 
-		# Restrict the prefix glob to actual generic/low-latency image-meta
-		# naming schemes. In particular, generic must not accept generic-64k.
-		if [[ "${TRACK}" != "${FLAVOR}" ]] && \
-				! [[ "${TRACK}" =~ ^${FLAVOR}-(edge|(hwe|lts)-[0-9]{2}\.[0-9]{2}(-edge)?|[0-9]+\.[0-9]+)$ ]]; then
-			continue
-		fi
+		# Restrict prefix globs to real compatible image-meta naming schemes.
+		# In particular, generic must not accept generic-64k.
+		MATCHED=0
+		for FLAVOR in "${FLAVORS[@]}"; do
+			if ubuntuKernelTrackMatchesFlavor "${TRACK}" "${FLAVOR}"; then
+				MATCHED=1
+				break
+			fi
+		done
+		[[ "${MATCHED}" -eq 1 ]] || continue
 		HEADER_META="linux-headers-${TRACK}"
 		[[ "${HEADER_META}" =~ ^linux-headers-[a-z0-9][a-z0-9.+-]*$ ]] || continue
 
@@ -2238,7 +2269,7 @@ function getInstalledUbuntuKernelHeaderMetaPackage() {
 		done
 		[[ "${SEEN}" -eq 1 ]] || CANDIDATES+=("${HEADER_META}")
 	done < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' \
-		"linux-image-${FLAVOR}*" 2>/dev/null)
+		"${IMAGE_META_PATTERNS[@]}" 2>/dev/null)
 
 	[[ "${#CANDIDATES[@]}" -eq 1 ]] || return 1
 	printf '%s\n' "${CANDIDATES[0]}"

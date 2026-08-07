@@ -1248,6 +1248,22 @@ _ubuntu_edge_hwe_header_meta() {
 }
 assert_eq "linux-headers-generic-hwe-22.04-edge" "$(_ubuntu_edge_hwe_header_meta)" "kernel headers: installed Ubuntu image meta preserves the edge HWE track"
 
+_ubuntu_virtual_edge_hwe_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() { _ubuntu_hwe_rdepends; }
+		dpkg-query() {
+			if [[ "${!#}" == 'linux-image-virtual-hwe-22.04-edge' ]]; then
+				printf '%s\n' 'install ok installed'
+			else
+				return 1
+			fi
+		}
+		getKernelHeaderMetaPackage "6.8.0-90-generic"
+	)
+}
+assert_eq "linux-headers-generic-hwe-22.04-edge" "$(_ubuntu_virtual_edge_hwe_header_meta)" "kernel headers: installed Ubuntu virtual image meta preserves the compatible edge HWE track"
+
 _ubuntu_stable_hwe_header_meta() {
 	(
 		OS=ubuntu
@@ -1271,11 +1287,15 @@ _ubuntu_installed_hwe_header_meta() {
 		dpkg-query() {
 			local ARG
 			local SAW_IMAGE_GLOB=0
+			local SAW_VIRTUAL_GLOB=0
 			for ARG in "$@"; do
 				[[ "${ARG}" == 'linux-image-generic*' ]] && SAW_IMAGE_GLOB=1
+				[[ "${ARG}" == 'linux-image-virtual*' ]] && SAW_VIRTUAL_GLOB=1
 				[[ "${ARG}" == 'linux-generic*' ]] && return 1
 			done
-			[[ "${SAW_IMAGE_GLOB}" -eq 1 ]] || return 1
+			if [[ "${SAW_IMAGE_GLOB}" -ne 1 ]] || [[ "${SAW_VIRTUAL_GLOB}" -ne 1 ]]; then
+				return 1
+			fi
 			printf '%s\t%s\n' \
 				'linux-image-generic-hwe-22.04' \
 				'install ok installed'
@@ -1284,6 +1304,31 @@ _ubuntu_installed_hwe_header_meta() {
 	)
 }
 assert_eq "linux-headers-generic-hwe-22.04" "$(_ubuntu_installed_hwe_header_meta)" "kernel headers: installed Ubuntu image meta recovers an older HWE track"
+
+_ubuntu_installed_virtual_hwe_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() {
+			printf '%s\n' \
+				'linux-headers-6.8.0-79-generic' \
+				'Reverse Depends:'
+		}
+		dpkg-query() {
+			local ARG
+			local SAW_VIRTUAL_GLOB=0
+			for ARG in "$@"; do
+				[[ "${ARG}" == 'linux-image-virtual*' ]] && SAW_VIRTUAL_GLOB=1
+				[[ "${ARG}" == 'linux-virtual*' ]] && return 1
+			done
+			[[ "${SAW_VIRTUAL_GLOB}" -eq 1 ]] || return 1
+			printf '%s\t%s\n' \
+				'linux-image-virtual-hwe-22.04' \
+				'install ok installed'
+		}
+		getKernelHeaderMetaPackage "6.8.0-79-generic"
+	)
+}
+assert_eq "linux-headers-virtual-hwe-22.04" "$(_ubuntu_installed_virtual_hwe_header_meta)" "kernel headers: installed Ubuntu virtual image meta recovers an older HWE track"
 
 _ubuntu_ambiguous_header_meta() {
 	(
@@ -1298,6 +1343,20 @@ _ubuntu_ambiguous_header_meta() {
 	)
 }
 assert_rc 1 _ubuntu_ambiguous_header_meta
+
+_ubuntu_ambiguous_virtual_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() { return 1; }
+		dpkg-query() {
+			printf '%s\t%s\n' \
+				'linux-image-generic-hwe-22.04' 'install ok installed' \
+				'linux-image-virtual-hwe-22.04' 'install ok installed'
+		}
+		getKernelHeaderMetaPackage "6.8.0-79-generic"
+	)
+}
+assert_rc 1 _ubuntu_ambiguous_virtual_header_meta
 
 _ubuntu_generic_64k_mismatch() {
 	(
