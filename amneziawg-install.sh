@@ -2177,14 +2177,24 @@ function kernelHeaderTrackIsInstalled() {
 function getAptKernelHeaderMetaPackage() {
 	local CURRENT_HEADER_PKG="linux-headers-${1:-$(uname -r)}"
 	local RDEPEND
+	local EXISTING
+	local SEEN
 	local -a CANDIDATES=()
+	local -a INSTALLED_CANDIDATES=()
 
 	command -v apt-cache &>/dev/null || return 1
 	while read -r RDEPEND; do
 		RDEPEND="${RDEPEND#|}"
 		if [[ "${RDEPEND}" != "${CURRENT_HEADER_PKG}" ]] && \
 				[[ "${RDEPEND}" =~ ^linux-headers-[a-z0-9][a-z0-9.+-]*$ ]]; then
-			CANDIDATES+=("${RDEPEND}")
+			SEEN=0
+			for EXISTING in "${CANDIDATES[@]}"; do
+				if [[ "${EXISTING}" == "${RDEPEND}" ]]; then
+					SEEN=1
+					break
+				fi
+			done
+			[[ "${SEEN}" -eq 1 ]] || CANDIDATES+=("${RDEPEND}")
 		fi
 	done < <(apt-cache rdepends "${CURRENT_HEADER_PKG}" 2>/dev/null)
 
@@ -2195,20 +2205,35 @@ function getAptKernelHeaderMetaPackage() {
 	# meta is important when headers have not been installed yet.
 	for RDEPEND in "${CANDIDATES[@]}"; do
 		if kernelHeaderTrackIsInstalled "${RDEPEND}"; then
-			printf '%s\n' "${RDEPEND}"
-			return 0
+			INSTALLED_CANDIDATES+=("${RDEPEND}")
 		fi
 	done
+	if [[ "${#INSTALLED_CANDIDATES[@]}" -gt 0 ]]; then
+		[[ "${#INSTALLED_CANDIDATES[@]}" -eq 1 ]] || return 1
+		printf '%s\n' "${INSTALLED_CANDIDATES[0]}"
+		return 0
+	fi
 
-	# Otherwise prefer the stable track over an edge meta-package.
-	for RDEPEND in "${CANDIDATES[@]}"; do
-		if [[ "${RDEPEND}" != *-edge ]]; then
-			printf '%s\n' "${RDEPEND}"
+	# Without installed evidence, select a unique candidate. Preserve the old
+	# stable preference only for the exact pair {X, X-edge}; any other set may
+	# span different kernel families and must not depend on apt-cache ordering.
+	if [[ "${#CANDIDATES[@]}" -eq 1 ]]; then
+		printf '%s\n' "${CANDIDATES[0]}"
+		return 0
+	fi
+	if [[ "${#CANDIDATES[@]}" -eq 2 ]]; then
+		if [[ "${CANDIDATES[0]}" != *-edge ]] && \
+				[[ "${CANDIDATES[1]}" == "${CANDIDATES[0]}-edge" ]]; then
+			printf '%s\n' "${CANDIDATES[0]}"
 			return 0
 		fi
-	done
-
-	printf '%s\n' "${CANDIDATES[0]}"
+		if [[ "${CANDIDATES[1]}" != *-edge ]] && \
+				[[ "${CANDIDATES[0]}" == "${CANDIDATES[1]}-edge" ]]; then
+			printf '%s\n' "${CANDIDATES[1]}"
+			return 0
+		fi
+	fi
+	return 1
 }
 
 # Derive an Ubuntu header meta-package from an installed image meta-package.

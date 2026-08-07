@@ -1300,6 +1300,93 @@ _ubuntu_stable_hwe_header_meta() {
 }
 assert_eq "linux-headers-generic-hwe-22.04" "$(_ubuntu_stable_hwe_header_meta)" "kernel headers: APT metadata defaults to the stable Ubuntu HWE track"
 
+_ubuntu_ga_hwe_rdepends() {
+	local ORDER="$1"
+	printf '%s\n' \
+		'linux-headers-5.15.0-25-generic' \
+		'Reverse Depends:'
+	if [[ "${ORDER}" == 'ga-first' ]]; then
+		printf '%s\n' \
+			'  linux-headers-generic' \
+			'  linux-headers-generic-hwe-22.04'
+	else
+		printf '%s\n' \
+			'  linux-headers-generic-hwe-22.04' \
+			'  linux-headers-generic'
+	fi
+}
+
+_ubuntu_ga_hwe_header_meta() {
+	local ORDER="$1"
+	local INSTALLED_TRACK="$2"
+	(
+		OS=ubuntu
+		apt-cache() { _ubuntu_ga_hwe_rdepends "${ORDER}"; }
+		dpkg-query() {
+			case "${INSTALLED_TRACK}:${!#}" in
+				ga:linux-image-generic|both:linux-image-generic|hwe:linux-image-generic-hwe-22.04|both:linux-image-generic-hwe-22.04)
+					printf '%s\n' 'install ok installed'
+					;;
+				*) return 1 ;;
+			esac
+		}
+		getAptKernelHeaderMetaPackage '5.15.0-25-generic'
+	)
+}
+assert_rc 1 _ubuntu_ga_hwe_header_meta ga-first none
+assert_rc 1 _ubuntu_ga_hwe_header_meta hwe-first none
+assert_eq 'linux-headers-generic-hwe-22.04' "$(_ubuntu_ga_hwe_header_meta ga-first hwe)" "kernel headers: installed HWE evidence resolves a shared GA/HWE ABI"
+assert_rc 1 _ubuntu_ga_hwe_header_meta ga-first both
+
+_ubuntu_duplicate_hwe_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() {
+			printf '%s\n' \
+				'linux-headers-6.8.0-90-generic' \
+				'Reverse Depends:' \
+				'  linux-headers-generic-hwe-22.04' \
+				'  linux-headers-generic-hwe-22.04' \
+				'  linux-headers-generic-hwe-22.04-edge'
+		}
+		dpkg-query() { return 1; }
+		getAptKernelHeaderMetaPackage '6.8.0-90-generic'
+	)
+}
+assert_eq 'linux-headers-generic-hwe-22.04' "$(_ubuntu_duplicate_hwe_header_meta)" "kernel headers: duplicate APT output does not create false ambiguity"
+
+_ubuntu_unrelated_edge_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() {
+			printf '%s\n' \
+				'linux-headers-6.8.0-90-generic' \
+				'Reverse Depends:' \
+				'  linux-headers-generic' \
+				'  linux-headers-generic-hwe-22.04-edge'
+		}
+		dpkg-query() { return 1; }
+		getAptKernelHeaderMetaPackage '6.8.0-90-generic'
+	)
+}
+assert_rc 1 _ubuntu_unrelated_edge_header_meta
+
+_ubuntu_edge_chain_header_meta() {
+	(
+		OS=ubuntu
+		apt-cache() {
+			printf '%s\n' \
+				'linux-headers-6.8.0-90-generic' \
+				'Reverse Depends:' \
+				'  linux-headers-generic-hwe-22.04-edge' \
+				'  linux-headers-generic-hwe-22.04-edge-edge'
+		}
+		dpkg-query() { return 1; }
+		getAptKernelHeaderMetaPackage '6.8.0-90-generic'
+	)
+}
+assert_rc 1 _ubuntu_edge_chain_header_meta
+
 _ubuntu_installed_hwe_header_meta() {
 	(
 		OS=ubuntu
