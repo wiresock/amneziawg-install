@@ -1180,11 +1180,28 @@ KERNEL_HEADER_ERR="${KERNEL_HEADER_TMP}/stderr.log"
 
 _mock_debian_kernel_image_source() {
 	local EXPECTED_IMAGE="linux-image-${DEB_TEST_KERNEL_VER}${DEB_TEST_IMAGE_SUFFIX:-}"
-	[[ "${!#}" == "${EXPECTED_IMAGE}" ]] || return 1
-	[[ "$*" == *'${source:Package}|${db:Status-Status}|${db:Status-Eflag}'* ]] || return 1
-	[[ -n "${DEB_TEST_SOURCE:-}" ]] || return 1
-	printf '%s|%s|%s\n' "${DEB_TEST_SOURCE}" \
-		"${DEB_TEST_STATUS:-installed}" "${DEB_TEST_ERROR_FLAG:-ok}"
+	local QUERY_PACKAGE="${!#}"
+
+	if [[ -n "${DEB_TEST_META_PACKAGE:-}" ]] && \
+			[[ "${QUERY_PACKAGE}" == "${DEB_TEST_META_PACKAGE}" ]] && \
+			[[ "$*" == *'${Version}|${db:Status-Want}|${db:Status-Status}|${db:Status-Eflag}'* ]] && \
+			[[ -n "${DEB_TEST_INSTALLED_META_VERSION:-}" ]]; then
+		printf '%s|%s|installed|ok\n' "${DEB_TEST_INSTALLED_META_VERSION}" \
+			"${DEB_TEST_META_WANT:-install}"
+		return 0
+	fi
+
+	[[ "${QUERY_PACKAGE}" == "${EXPECTED_IMAGE}" ]] || return 1
+	if [[ "$*" == *'${source:Package}|${db:Status-Status}|${db:Status-Eflag}'* ]]; then
+		[[ -n "${DEB_TEST_SOURCE:-}" ]] || return 1
+		printf '%s|%s|%s\n' "${DEB_TEST_SOURCE}" \
+			"${DEB_TEST_STATUS:-installed}" "${DEB_TEST_ERROR_FLAG:-ok}"
+	elif [[ "$*" == *'${Version}|${db:Status-Status}|${db:Status-Eflag}'* ]]; then
+		printf '%s|%s|%s\n' "${DEB_TEST_IMAGE_VERSION:-1.0}" \
+			"${DEB_TEST_STATUS:-installed}" "${DEB_TEST_ERROR_FLAG:-ok}"
+	else
+		return 1
+	fi
 }
 
 # A successful version-specific install must not short-circuit the Debian
@@ -1202,6 +1219,300 @@ _mock_debian_kernel_image_source() {
 assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-6.12.38+deb13-amd64" "kernel headers: installs the running Debian kernel package"
 assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-amd64" "kernel headers: installs the Debian architecture meta-package"
 assert_eq "2" "$(wc -l < "${KERNEL_HEADER_LOG}" | tr -d ' ')" "kernel headers: successful Debian path needs exactly current and meta packages"
+
+# Debian backports shares rolling meta-package names with stable, but its lower
+# APT priority means the suite must be preserved with an explicit version.
+: > "${KERNEL_HEADER_LOG}"
+DEBIAN_BACKPORT_RDEPENDS_OUTPUT="$(
+	(
+		OS=debian
+		DEB_TEST_KERNEL_VER='6.12.27+bpo-amd64'
+		DEB_TEST_SOURCE='linux-signed-amd64'
+		DEB_TEST_IMAGE_VERSION='6.12.27-1~bpo12+1'
+		dpkg() { printf '%s\n' amd64; }
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		apt-cache() {
+			case "$1" in
+				rdepends)
+					printf '%s\n' \
+						'linux-headers-6.12.27+bpo-amd64' \
+						'Reverse Depends:' \
+						'  linux-headers-amd64'
+					;;
+				madison)
+					case "$2" in
+						linux-image-6.12.27+bpo-amd64)
+							printf '%s\n' ' linux-image-6.12.27+bpo-amd64 | 6.12.27-1~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+							;;
+						linux-headers-amd64)
+							printf '%s\n' \
+								' linux-headers-amd64 | 6.1.153-1 | http://deb.debian.org/debian bookworm/main amd64 Packages' \
+								' linux-headers-amd64 | 6.12.95-1~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+							;;
+						*) return 1 ;;
+					esac
+					;;
+				*) return 1 ;;
+			esac
+		}
+		apt-get() { printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"; return 0; }
+		installKernelHeaders "${DEB_TEST_KERNEL_VER}"
+	) 2>&1
+)"
+assert_contains "$(cat "${KERNEL_HEADER_LOG}")" 'install -y linux-headers-6.12.27+bpo-amd64' "kernel headers: backports path installs the running ABI headers"
+assert_contains "$(cat "${KERNEL_HEADER_LOG}")" 'install -y linux-headers-amd64=6.12.95-1~bpo12+1' "kernel headers: reverse dependencies retain the explicit backports meta version"
+assert_eq '0' "$(grep -Fxc 'install -y linux-headers-amd64' "${KERNEL_HEADER_LOG}")" "kernel headers: reverse dependencies never install the unqualified shared Debian meta"
+assert_not_contains "${DEBIAN_BACKPORT_RDEPENDS_OUTPUT}" 'Could not determine a safe rolling kernel header meta-package' "kernel headers: resolved backports version emits no rolling-header warning"
+
+# The provenance fallback must apply the same version qualification when the
+# running ABI has aged out of APT reverse dependencies. Modern backports ABIs
+# use +debN names, so detection comes from the installed binary version.
+: > "${KERNEL_HEADER_LOG}"
+DEBIAN_BACKPORT_FALLBACK_OUTPUT="$(
+	(
+		OS=debian
+		DEB_TEST_KERNEL_VER='6.12.90+deb12-cloud-arm64'
+		DEB_TEST_SOURCE='linux'
+		DEB_TEST_IMAGE_SUFFIX='-unsigned'
+		DEB_TEST_IMAGE_VERSION='6.12.90-2~bpo12+1'
+		dpkg() { printf '%s\n' arm64; }
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		apt-cache() {
+			case "$1" in
+				rdepends) return 1 ;;
+				madison)
+					case "$2" in
+						linux-image-6.12.90+deb12-cloud-arm64-unsigned)
+							printf '%s\n' ' linux-image-6.12.90+deb12-cloud-arm64-unsigned | 6.12.90-2~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main arm64 Packages'
+							;;
+						linux-headers-cloud-arm64)
+							printf '%s\n' \
+								' linux-headers-cloud-arm64 | 6.1.153-1 | http://deb.debian.org/debian bookworm/main arm64 Packages' \
+								' linux-headers-cloud-arm64 | 6.12.95-1~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main arm64 Packages'
+							;;
+						*) return 1 ;;
+					esac
+					;;
+				*) return 1 ;;
+			esac
+		}
+		apt-get() { printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"; return 0; }
+		installKernelHeaders "${DEB_TEST_KERNEL_VER}"
+	) 2>&1
+)"
+assert_contains "$(cat "${KERNEL_HEADER_LOG}")" 'install -y linux-headers-cloud-arm64=6.12.95-1~bpo12+1' "kernel headers: stale unsigned backports ABI retains its current rolling version"
+assert_eq '0' "$(grep -Fxc 'install -y linux-headers-cloud-arm64' "${KERNEL_HEADER_LOG}")" "kernel headers: fallback never installs an unqualified backports cloud meta"
+assert_not_contains "${DEBIAN_BACKPORT_FALLBACK_OUTPUT}" 'Could not determine a safe rolling kernel header meta-package' "kernel headers: provenance fallback resolves the backports version"
+
+# Without one safe backports candidate, install only exact running-ABI headers
+# and keep the existing future-upgrade warning instead of guessing stable.
+: > "${KERNEL_HEADER_LOG}"
+DEBIAN_BACKPORT_UNRESOLVED_OUTPUT="$(
+	(
+		OS=debian
+		DEB_TEST_KERNEL_VER='6.12.90+deb12-amd64'
+		DEB_TEST_SOURCE='linux-signed-amd64'
+		DEB_TEST_IMAGE_VERSION='6.12.90-2~bpo12+1'
+		dpkg() { printf '%s\n' amd64; }
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		apt-cache() {
+			case "$1" in
+				rdepends) return 1 ;;
+				madison)
+					case "$2" in
+						linux-image-6.12.90+deb12-amd64)
+							printf '%s\n' ' linux-image-6.12.90+deb12-amd64 | 6.12.90-2~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+							;;
+						linux-headers-amd64)
+							printf '%s\n' ' linux-headers-amd64 | 6.1.153-1 | http://deb.debian.org/debian bookworm/main amd64 Packages'
+							;;
+						*) return 1 ;;
+					esac
+					;;
+				*) return 1 ;;
+			esac
+		}
+		apt-get() { printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"; return 0; }
+		installKernelHeaders "${DEB_TEST_KERNEL_VER}"
+	) 2>&1
+)"
+assert_contains "${DEBIAN_BACKPORT_UNRESOLVED_OUTPUT}" "Could not determine a safe rolling kernel header meta-package for '6.12.90+deb12-amd64'" "kernel headers: unavailable backports metadata warns about rolling coverage"
+assert_eq 'install -y linux-headers-6.12.90+deb12-amd64' "$(cat "${KERNEL_HEADER_LOG}")" "kernel headers: unresolved backports metadata installs only exact headers"
+
+_debian_ambiguous_backport_meta_spec() {
+	(
+		DEB_TEST_KERNEL_VER='6.12.90+deb12-amd64'
+		DEB_TEST_IMAGE_VERSION='6.12.90-2~bpo12+1'
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		apt-cache() {
+			case "$2" in
+				linux-image-6.12.90+deb12-amd64)
+					printf '%s\n' ' linux-image-6.12.90+deb12-amd64 | 6.12.90-2~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				linux-headers-amd64)
+					printf '%s\n' \
+						' linux-headers-amd64 | 6.12.95-1~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages' \
+						' linux-headers-amd64 | 6.12.95-1~bpo12+1 | http://deb.debian.org/debian bookworm-backports-sloppy/main amd64 Packages'
+					;;
+				*) return 1 ;;
+			esac
+		}
+		getDebianKernelHeaderMetaInstallSpec "${DEB_TEST_KERNEL_VER}" 'linux-headers-amd64'
+	)
+}
+assert_rc 1 _debian_ambiguous_backport_meta_spec
+
+_debian_missing_image_version_meta_spec() {
+	(
+		dpkg-query() { return 1; }
+		apt-cache() { return 1; }
+		getDebianKernelHeaderMetaInstallSpec '6.5.0-0.deb12.4-amd64' 'linux-headers-amd64'
+	)
+}
+assert_rc 1 _debian_missing_image_version_meta_spec
+
+_debian_installed_backport_meta_spec() {
+	(
+		DEB_TEST_KERNEL_VER='6.12.90+deb12-amd64'
+		DEB_TEST_IMAGE_VERSION='6.12.90-2~bpo12+1'
+		DEB_TEST_META_PACKAGE='linux-headers-amd64'
+		DEB_TEST_INSTALLED_META_VERSION='6.12.95-1~bpo12+1'
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		dpkg() { return 1; }
+		apt-cache() {
+			case "$2" in
+				linux-image-6.12.90+deb12-amd64)
+					printf '%s\n' ' linux-image-6.12.90+deb12-amd64 | 6.12.90-2~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				linux-headers-amd64)
+					printf '%s\n' ' linux-headers-amd64 | 6.12.95-1~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				*) return 1 ;;
+			esac
+		}
+		getDebianKernelHeaderMetaInstallSpec "${DEB_TEST_KERNEL_VER}" "${DEB_TEST_META_PACKAGE}"
+	)
+}
+assert_eq 'linux-headers-amd64=6.12.95-1~bpo12+1' "$(_debian_installed_backport_meta_spec)" "kernel headers: an installed backports meta keeps an explicit indexed version"
+
+_debian_held_backport_meta_is_not_claimed_as_rolling() {
+	(
+		DEB_TEST_KERNEL_VER='6.12.90+deb12-amd64'
+		DEB_TEST_IMAGE_VERSION='6.12.90-2~bpo12+1'
+		DEB_TEST_META_PACKAGE='linux-headers-amd64'
+		DEB_TEST_INSTALLED_META_VERSION='6.12.95-1~bpo12+1'
+		DEB_TEST_META_WANT='hold'
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		dpkg() { return 1; }
+		apt-cache() {
+			case "$2" in
+				linux-image-6.12.90+deb12-amd64)
+					printf '%s\n' ' linux-image-6.12.90+deb12-amd64 | 6.12.90-2~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				linux-headers-amd64)
+					printf '%s\n' ' linux-headers-amd64 | 6.12.95-1~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				*) return 1 ;;
+			esac
+		}
+		getDebianKernelHeaderMetaInstallSpec "${DEB_TEST_KERNEL_VER}" "${DEB_TEST_META_PACKAGE}"
+	)
+}
+assert_rc 1 _debian_held_backport_meta_is_not_claimed_as_rolling
+
+_debian_regular_backport_rejects_sloppy_meta() {
+	(
+		DEB_TEST_KERNEL_VER='6.12.90+deb12-amd64'
+		DEB_TEST_IMAGE_VERSION='6.12.90-2~bpo12+1'
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		apt-cache() {
+			case "$2" in
+				linux-image-6.12.90+deb12-amd64)
+					printf '%s\n' ' linux-image-6.12.90+deb12-amd64 | 6.12.90-2~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				linux-headers-amd64)
+					printf '%s\n' ' linux-headers-amd64 | 7.0.9-1~bpo12+1 | http://deb.debian.org/debian bookworm-backports-sloppy/main amd64 Packages'
+					;;
+				*) return 1 ;;
+			esac
+		}
+		getDebianKernelHeaderMetaInstallSpec "${DEB_TEST_KERNEL_VER}" 'linux-headers-amd64'
+	)
+}
+assert_rc 1 _debian_regular_backport_rejects_sloppy_meta
+
+_debian_newer_installed_meta_is_not_downgraded() {
+	(
+		DEB_TEST_KERNEL_VER='6.12.90+deb12-amd64'
+		DEB_TEST_IMAGE_VERSION='6.12.90-2~bpo12+1'
+		DEB_TEST_META_PACKAGE='linux-headers-amd64'
+		DEB_TEST_INSTALLED_META_VERSION='6.12.95-1'
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		dpkg() {
+			[[ "$1" == '--compare-versions' ]] && \
+				[[ "$2" == '6.12.95-1' ]] && [[ "$3" == 'gt' ]] && \
+				[[ "$4" == '6.12.95-1~bpo12+1' ]]
+		}
+		apt-cache() {
+			case "$2" in
+				linux-image-6.12.90+deb12-amd64)
+					printf '%s\n' ' linux-image-6.12.90+deb12-amd64 | 6.12.90-2~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				linux-headers-amd64)
+					printf '%s\n' ' linux-headers-amd64 | 6.12.95-1~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				*) return 1 ;;
+			esac
+		}
+		getDebianKernelHeaderMetaInstallSpec "${DEB_TEST_KERNEL_VER}" "${DEB_TEST_META_PACKAGE}"
+	)
+}
+assert_rc 1 _debian_newer_installed_meta_is_not_downgraded
+
+_debian_older_stable_meta_upgrades_to_backport() {
+	(
+		DEB_TEST_KERNEL_VER='6.12.90+deb12-amd64'
+		DEB_TEST_IMAGE_VERSION='6.12.90-2~bpo12+1'
+		DEB_TEST_META_PACKAGE='linux-headers-amd64'
+		DEB_TEST_INSTALLED_META_VERSION='6.1.153-1'
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		dpkg() { return 1; }
+		apt-cache() {
+			case "$2" in
+				linux-image-6.12.90+deb12-amd64)
+					printf '%s\n' ' linux-image-6.12.90+deb12-amd64 | 6.12.90-2~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				linux-headers-amd64)
+					printf '%s\n' ' linux-headers-amd64 | 6.12.95-1~bpo12+1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				*) return 1 ;;
+			esac
+		}
+		getDebianKernelHeaderMetaInstallSpec "${DEB_TEST_KERNEL_VER}" "${DEB_TEST_META_PACKAGE}"
+	)
+}
+assert_eq 'linux-headers-amd64=6.12.95-1~bpo12+1' "$(_debian_older_stable_meta_upgrades_to_backport)" "kernel headers: an older stable meta upgrades to the explicit backports track"
+
+_debian_policy_backport_update_meta_spec() {
+	(
+		DEB_TEST_KERNEL_VER='6.12.90+deb12-amd64'
+		DEB_TEST_IMAGE_VERSION='6.12.90-2~bpo12u1'
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		apt-cache() {
+			case "$2" in
+				linux-image-6.12.90+deb12-amd64)
+					printf '%s\n' ' linux-image-6.12.90+deb12-amd64 | 6.12.90-2~bpo12u1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				linux-headers-amd64)
+					printf '%s\n' ' linux-headers-amd64 | 6.12.95-1~bpo12u1 | http://deb.debian.org/debian bookworm-backports/main amd64 Packages'
+					;;
+				*) return 1 ;;
+			esac
+		}
+		getDebianKernelHeaderMetaInstallSpec "${DEB_TEST_KERNEL_VER}" 'linux-headers-amd64'
+	)
+}
+assert_eq 'linux-headers-amd64=6.12.95-1~bpo12u1' "$(_debian_policy_backport_update_meta_spec)" "kernel headers: Debian policy backport update suffix stays on its suite"
 
 # Ubuntu cloud meta-packages should follow the installed kernel track instead
 # of installing unrelated generic or differently-versioned headers.

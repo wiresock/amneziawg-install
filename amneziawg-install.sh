@@ -2351,6 +2351,167 @@ function getInstalledDebianKernelHeaderPrefix() {
 	return 1
 }
 
+# Return the installed exact Debian image package and its binary version. The
+# binary version (unlike a signed source-package version) can be compared with
+# header meta-package versions exposed by APT.
+function getInstalledDebianKernelImagePackageVersion() {
+	local KERNEL_VER="$1"
+	local IMAGE_PKG
+	local PACKAGE_INFO
+	local IMAGE_VERSION
+	local STATUS
+	local ERROR_FLAG
+
+	[[ "${KERNEL_VER}" =~ ^[a-z0-9][a-z0-9.+~-]*$ ]] || return 1
+
+	for IMAGE_PKG in "linux-image-${KERNEL_VER}" "linux-image-${KERNEL_VER}-unsigned"; do
+		if ! PACKAGE_INFO=$(dpkg-query -W \
+				-f='${Version}|${db:Status-Status}|${db:Status-Eflag}\n' \
+				"${IMAGE_PKG}" 2>/dev/null); then
+			continue
+		fi
+
+		IFS='|' read -r IMAGE_VERSION STATUS ERROR_FLAG <<< "${PACKAGE_INFO}"
+		[[ "${STATUS}" == 'installed' ]] && [[ "${ERROR_FLAG}" == 'ok' ]] || continue
+		[[ "${IMAGE_VERSION}" =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]*$ ]] || continue
+		printf '%s|%s\n' "${IMAGE_PKG}" "${IMAGE_VERSION}"
+		return 0
+	done
+
+	return 1
+}
+
+# A Debian backports kernel can share its rolling meta-package name with
+# stable, while backports has a lower default APT priority. Resolve the unique
+# available meta-package version from the same ~bpoN lineage and install that
+# version explicitly. If the lineage cannot be proven, decline to claim future
+# header tracking rather than allowing APT to choose the stable package.
+function getDebianKernelHeaderMetaInstallSpec() {
+	local KERNEL_VER="$1"
+	local HEADER_META_PKG="$2"
+	local IMAGE_INFO
+	local IMAGE_PKG
+	local IMAGE_VERSION
+	local BACKPORT_RELEASE
+	local PACKAGE_INFO
+	local INSTALLED_META_VERSION
+	local WANT
+	local STATUS
+	local ERROR_FLAG
+	local MADISON_PACKAGE
+	local MADISON_VERSION
+	local MADISON_SOURCE
+	local MADISON_SUITE
+	local ORIGIN_SUITE
+	local EXISTING
+	local SEEN
+	local -a IMAGE_SUITES=()
+	local -a META_SUITES=()
+	local -a CANDIDATE_VERSIONS=()
+
+	[[ "${HEADER_META_PKG}" =~ ^[a-z0-9][a-z0-9.+-]*$ ]] || return 1
+
+	if ! IMAGE_INFO=$(getInstalledDebianKernelImagePackageVersion "${KERNEL_VER}"); then
+		# Raspberry Pi OS tracks do not use Debian's shared stable/backports
+		# package names. Ordinary Debian metas require exact image provenance.
+		case "${HEADER_META_PKG}" in
+			raspberrypi-kernel-headers|linux-headers-rpi-v6|linux-headers-rpi-v7|linux-headers-rpi-v7l|linux-headers-rpi-v8|linux-headers-rpi-2712|linux-headers-rpi-v8-rt)
+				printf '%s\n' "${HEADER_META_PKG}"
+				return 0
+				;;
+			*) return 1 ;;
+		esac
+	fi
+	IMAGE_PKG="${IMAGE_INFO%%|*}"
+	IMAGE_VERSION="${IMAGE_INFO#*|}"
+
+	if [[ ! "${IMAGE_VERSION}" =~ ~bpo([0-9]+)([+u][0-9]+|$) ]]; then
+		printf '%s\n' "${HEADER_META_PKG}"
+		return 0
+	fi
+	BACKPORT_RELEASE="${BASH_REMATCH[1]}"
+
+	command -v apt-cache &>/dev/null || return 1
+	# First prove the exact suite that supplied the installed image. Regular
+	# backports and backports-sloppy share the same ~bpoN version lineage.
+	while IFS='|' read -r MADISON_PACKAGE MADISON_VERSION MADISON_SOURCE; do
+		MADISON_PACKAGE="${MADISON_PACKAGE#"${MADISON_PACKAGE%%[![:space:]]*}"}"
+		MADISON_PACKAGE="${MADISON_PACKAGE%"${MADISON_PACKAGE##*[![:space:]]}"}"
+		MADISON_VERSION="${MADISON_VERSION#"${MADISON_VERSION%%[![:space:]]*}"}"
+		MADISON_VERSION="${MADISON_VERSION%"${MADISON_VERSION##*[![:space:]]}"}"
+		[[ "${MADISON_PACKAGE}" == "${IMAGE_PKG}" ]] || continue
+		[[ "${MADISON_VERSION}" == "${IMAGE_VERSION}" ]] || continue
+		[[ "${MADISON_SOURCE}" =~ (^|[[:space:]])([a-z0-9][a-z0-9.+-]*-backports(-sloppy)?)/[a-z0-9][a-z0-9.+-]*([[:space:]]|$) ]] || continue
+		MADISON_SUITE="${BASH_REMATCH[2]}"
+
+		SEEN=0
+		for EXISTING in "${IMAGE_SUITES[@]}"; do
+			if [[ "${EXISTING}" == "${MADISON_SUITE}" ]]; then
+				SEEN=1
+				break
+			fi
+		done
+		[[ "${SEEN}" -eq 1 ]] || IMAGE_SUITES+=("${MADISON_SUITE}")
+	done < <(LC_ALL=C apt-cache madison "${IMAGE_PKG}" 2>/dev/null)
+
+	[[ "${#IMAGE_SUITES[@]}" -eq 1 ]] || return 1
+	ORIGIN_SUITE="${IMAGE_SUITES[0]}"
+
+	# Select one current meta version from that exact suite. Also count other
+	# backports suites so a shared version cannot hide regular/sloppy ambiguity.
+	while IFS='|' read -r MADISON_PACKAGE MADISON_VERSION MADISON_SOURCE; do
+		MADISON_PACKAGE="${MADISON_PACKAGE#"${MADISON_PACKAGE%%[![:space:]]*}"}"
+		MADISON_PACKAGE="${MADISON_PACKAGE%"${MADISON_PACKAGE##*[![:space:]]}"}"
+		MADISON_VERSION="${MADISON_VERSION#"${MADISON_VERSION%%[![:space:]]*}"}"
+		MADISON_VERSION="${MADISON_VERSION%"${MADISON_VERSION##*[![:space:]]}"}"
+		[[ "${MADISON_PACKAGE}" == "${HEADER_META_PKG}" ]] || continue
+		[[ "${MADISON_VERSION}" =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]*$ ]] || continue
+		[[ "${MADISON_VERSION}" =~ ~bpo${BACKPORT_RELEASE}([+u][0-9]+|$) ]] || continue
+		[[ "${MADISON_SOURCE}" =~ (^|[[:space:]])([a-z0-9][a-z0-9.+-]*-backports(-sloppy)?)/[a-z0-9][a-z0-9.+-]*([[:space:]]|$) ]] || continue
+		MADISON_SUITE="${BASH_REMATCH[2]}"
+
+		SEEN=0
+		for EXISTING in "${META_SUITES[@]}"; do
+			if [[ "${EXISTING}" == "${MADISON_SUITE}" ]]; then
+				SEEN=1
+				break
+			fi
+		done
+		[[ "${SEEN}" -eq 1 ]] || META_SUITES+=("${MADISON_SUITE}")
+
+		[[ "${MADISON_SUITE}" == "${ORIGIN_SUITE}" ]] || continue
+		SEEN=0
+		for EXISTING in "${CANDIDATE_VERSIONS[@]}"; do
+			if [[ "${EXISTING}" == "${MADISON_VERSION}" ]]; then
+				SEEN=1
+				break
+			fi
+		done
+		[[ "${SEEN}" -eq 1 ]] || CANDIDATE_VERSIONS+=("${MADISON_VERSION}")
+	done < <(LC_ALL=C apt-cache madison "${HEADER_META_PKG}" 2>/dev/null)
+
+	[[ "${#META_SUITES[@]}" -eq 1 ]] || return 1
+	[[ "${META_SUITES[0]}" == "${ORIGIN_SUITE}" ]] || return 1
+	[[ "${#CANDIDATE_VERSIONS[@]}" -eq 1 ]] || return 1
+
+	# Never claim future tracking for a held meta, or force an installed
+	# newer/different track backward. An older stable meta can still be upgraded
+	# to the proven backports candidate.
+	if PACKAGE_INFO=$(dpkg-query -W \
+			-f='${Version}|${db:Status-Want}|${db:Status-Status}|${db:Status-Eflag}\n' \
+			"${HEADER_META_PKG}" 2>/dev/null); then
+		IFS='|' read -r INSTALLED_META_VERSION WANT STATUS ERROR_FLAG <<< "${PACKAGE_INFO}"
+		[[ "${INSTALLED_META_VERSION}" =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]*$ ]] || return 1
+		if [[ "${STATUS}" == 'installed' ]] && [[ "${ERROR_FLAG}" == 'ok' ]]; then
+			[[ "${WANT}" == 'install' ]] || return 1
+			if dpkg --compare-versions "${INSTALLED_META_VERSION}" gt "${CANDIDATE_VERSIONS[0]}"; then
+				return 1
+			fi
+		fi
+	fi
+	printf '%s=%s\n' "${HEADER_META_PKG}" "${CANDIDATE_VERSIONS[0]}"
+}
+
 # Return a rolling header package when APT reverse-dependency metadata is not
 # available. Installing only linux-headers-$(uname -r) is enough for today's
 # DKMS build, but the rolling package is what keeps headers on APT's future
@@ -2486,13 +2647,22 @@ function installKernelHeaders() {
 		local CURRENT_HEADER_INSTALLED=0
 		local CURRENT_HEADER_PKG="linux-headers-${KERNEL_VER}"
 		local META_HEADER_PKG=""
+		local META_HEADER_INSTALL_SPEC=""
 		local META_ATTEMPTED=0
 		local ROLLING_HEADER_INSTALLED=0
 
 		if META_HEADER_PKG=$(getKernelHeaderMetaPackage "${KERNEL_VER}" 2>/dev/null) && \
 				[[ -n "${META_HEADER_PKG}" ]]; then
-			:
+			if [[ "${OS}" == 'debian' ]]; then
+				META_HEADER_INSTALL_SPEC=$(getDebianKernelHeaderMetaInstallSpec \
+					"${KERNEL_VER}" "${META_HEADER_PKG}" 2>/dev/null) || META_HEADER_INSTALL_SPEC=""
+			else
+				META_HEADER_INSTALL_SPEC="${META_HEADER_PKG}"
+			fi
 		else
+			META_HEADER_PKG=""
+		fi
+		if [[ -z "${META_HEADER_INSTALL_SPEC}" ]]; then
 			META_HEADER_PKG=""
 			echo -e "${ORANGE}WARNING: Could not determine a safe rolling kernel header meta-package for '${KERNEL_VER}'. The installer will still try headers for the running kernel, but future kernel upgrades may require installing matching headers manually.${NC}" >&2
 		fi
@@ -2520,10 +2690,10 @@ function installKernelHeaders() {
 		if [[ -n "${META_HEADER_PKG}" ]] && \
 				[[ "${META_HEADER_PKG}" != "${CURRENT_HEADER_PKG}" ]] && \
 				[[ "${META_ATTEMPTED}" -eq 0 ]]; then
-			if apt-get install -y "${META_HEADER_PKG}"; then
+			if apt-get install -y "${META_HEADER_INSTALL_SPEC}"; then
 				ROLLING_HEADER_INSTALLED=1
 			else
-				echo -e "${ORANGE}WARNING: Failed to install kernel header meta-package '${META_HEADER_PKG}'. The current kernel may work, but a future kernel upgrade could require installing matching headers manually.${NC}"
+				echo -e "${ORANGE}WARNING: Failed to install kernel header meta-package '${META_HEADER_INSTALL_SPEC}'. The current kernel may work, but a future kernel upgrade could require installing matching headers manually.${NC}"
 			fi
 		fi
 
