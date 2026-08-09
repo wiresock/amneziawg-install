@@ -1228,6 +1228,49 @@ assert_contains "$(cat "${KERNEL_HEADER_ERR}")" "future kernel upgrades may requ
 assert_eq "1" "$(grep -Fc "Could not determine a safe rolling kernel header meta-package" "${KERNEL_HEADER_ERR}")" "kernel headers: unresolved rolling track warns exactly once"
 assert_eq "install -y linux-headers-6.8.0-1051-aws" "$(cat "${KERNEL_HEADER_LOG}")" "kernel headers: ambiguous Ubuntu tracks install only the exact package"
 
+# Installing a rolling meta-package for a newer ABI must not masquerade as
+# usable headers for the older running kernel.
+: > "${KERNEL_HEADER_LOG}"
+KERNEL_HEADER_OUTPUT="$(
+	(
+		OS=ubuntu
+		getKernelHeaderMetaPackage() { printf '%s\n' 'linux-headers-generic'; }
+		kernelHeadersAreAvailableForVersion() { return 1; }
+		apt-get() {
+			printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"
+			[[ "${!#}" == 'linux-headers-generic' ]]
+		}
+		installKernelHeaders '6.8.0-79-generic'
+	) 2>&1
+)"
+assert_contains "${KERNEL_HEADER_OUTPUT}" "A rolling kernel header meta-package was installed, but headers for the running kernel (6.8.0-79-generic) remain unavailable" "kernel headers: rolling success does not hide missing running-ABI headers"
+assert_eq "2" "$(wc -l < "${KERNEL_HEADER_LOG}" | tr -d ' ')" "kernel headers: stale ABI attempts only exact and selected rolling packages"
+assert_not_contains "$(cat "${KERNEL_HEADER_LOG}")" "raspberrypi-kernel-headers" "kernel headers: non-Raspberry stale ABI skips the Raspberry fallback"
+
+_raspberry_rolling_header_install() {
+	local BUILD_READY="$1"
+	(
+		OS=debian
+		dpkg() { printf '%s\n' arm64; }
+		apt-cache() { return 1; }
+		kernelHeadersAreAvailableForVersion() { [[ "${BUILD_READY}" == 'yes' ]]; }
+		apt-get() { [[ "${!#}" == 'raspberrypi-kernel-headers' ]]; }
+		installKernelHeaders '6.1.21-v8+'
+	) 2>&1
+}
+assert_contains "$(_raspberry_rolling_header_install no)" "headers for the running kernel (6.1.21-v8+) remain unavailable" "kernel headers: Raspberry rolling success does not hide missing running-ABI headers"
+assert_not_contains "$(_raspberry_rolling_header_install yes)" "remain unavailable" "kernel headers: verified Raspberry build tree avoids a false current-header warning"
+
+_debian_legacy_rpi_header_meta() {
+	(
+		OS=debian
+		dpkg() { printf '%s\n' armhf; }
+		apt-cache() { return 1; }
+		getKernelHeaderMetaPackage '5.15.84-v7l+'
+	)
+}
+assert_eq 'raspberrypi-kernel-headers' "$(_debian_legacy_rpi_header_meta)" "kernel headers: legacy Raspberry Pi suffix selects its rolling headers"
+
 _debian_cloud_header_meta() {
 	(
 		OS=debian
@@ -1247,6 +1290,26 @@ _debian_arm64_header_meta() {
 	)
 }
 assert_eq "linux-headers-arm64" "$(_debian_arm64_header_meta)" "kernel headers: Debian arm64 selects its architecture meta-package"
+
+_debian_pve_header_meta() {
+	(
+		OS=debian
+		dpkg() { printf '%s\n' amd64; }
+		apt-cache() { return 1; }
+		getKernelHeaderMetaPackage '6.8.12-11-pve'
+	)
+}
+assert_rc 1 _debian_pve_header_meta
+
+_debian_rt_i386_header_meta() {
+	(
+		OS=debian
+		dpkg() { printf '%s\n' i386; }
+		apt-cache() { return 1; }
+		getKernelHeaderMetaPackage '6.1.0-49-rt-686-pae'
+	)
+}
+assert_eq 'linux-headers-rt-686-pae' "$(_debian_rt_i386_header_meta)" "kernel headers: Debian i386 RT kernels retain the RT flavor"
 
 _ubuntu_hwe_rdepends() {
 	printf '%s\n' \
