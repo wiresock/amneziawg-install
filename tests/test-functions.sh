@@ -1261,6 +1261,43 @@ _raspberry_rolling_header_install() {
 assert_contains "$(_raspberry_rolling_header_install no)" "headers for the running kernel (6.1.21-v8+) remain unavailable" "kernel headers: Raspberry rolling success does not hide missing running-ABI headers"
 assert_not_contains "$(_raspberry_rolling_header_install yes)" "remain unavailable" "kernel headers: verified Raspberry build tree avoids a false current-header warning"
 
+_debian_modern_rpi_header_meta() {
+	local KERNEL_VER="$1"
+	local ARCH="$2"
+	(
+		OS=debian
+		dpkg() { printf '%s\n' "${ARCH}"; }
+		apt-cache() { return 1; }
+		getKernelHeaderMetaPackage "${KERNEL_VER}"
+	)
+}
+assert_eq 'linux-headers-rpi-v6' "$(_debian_modern_rpi_header_meta '6.6.51+rpt-rpi-v6' armhf)" "kernel headers: modern Raspberry Pi v6 suffix selects its rolling headers"
+assert_eq 'linux-headers-rpi-v7' "$(_debian_modern_rpi_header_meta '6.6.51+rpt-rpi-v7' armhf)" "kernel headers: modern Raspberry Pi v7 suffix selects its rolling headers"
+assert_eq 'linux-headers-rpi-v7l' "$(_debian_modern_rpi_header_meta '6.6.51+rpt-rpi-v7l' armhf)" "kernel headers: modern Raspberry Pi v7l suffix selects its rolling headers"
+assert_eq 'linux-headers-rpi-v8' "$(_debian_modern_rpi_header_meta '6.6.51+rpt-rpi-v8' arm64)" "kernel headers: modern Raspberry Pi v8 suffix selects its rolling headers"
+assert_eq 'linux-headers-rpi-2712' "$(_debian_modern_rpi_header_meta '6.1.0-rpi8-rpi-2712' arm64)" "kernel headers: early Bookworm Raspberry Pi 2712 suffix selects its rolling headers"
+assert_eq 'linux-headers-rpi-v8-rt' "$(_debian_modern_rpi_header_meta '6.12.34+rpt-rpi-v8-rt' arm64)" "kernel headers: modern Raspberry Pi RT suffix selects its rolling headers"
+
+_debian_unknown_modern_rpi_header_meta() {
+	_debian_modern_rpi_header_meta '6.6.51+rpt-rpi-arm64' arm64
+}
+assert_rc 1 _debian_unknown_modern_rpi_header_meta
+
+_debian_incomplete_modern_rpi_header_meta() {
+	_debian_modern_rpi_header_meta '6.6.51+rpt-rpi' arm64
+}
+assert_rc 1 _debian_incomplete_modern_rpi_header_meta
+
+_debian_incomplete_early_rpi_header_meta() {
+	_debian_modern_rpi_header_meta '6.1.0-rpi8-rpi' arm64
+}
+assert_rc 1 _debian_incomplete_early_rpi_header_meta
+
+_debian_impostor_rpi_header_meta() {
+	_debian_modern_rpi_header_meta '6.6.51-acme-rpi-v8' arm64
+}
+assert_rc 1 _debian_impostor_rpi_header_meta
+
 _debian_legacy_rpi_header_meta() {
 	(
 		OS=debian
@@ -1270,6 +1307,29 @@ _debian_legacy_rpi_header_meta() {
 	)
 }
 assert_eq 'raspberrypi-kernel-headers' "$(_debian_legacy_rpi_header_meta)" "kernel headers: legacy Raspberry Pi suffix selects its rolling headers"
+
+# Modern Raspberry Pi OS tracks must install their matching linux-headers-rpi-*
+# meta-package instead of the frozen legacy raspberrypi-kernel-headers package.
+: > "${KERNEL_HEADER_LOG}"
+MODERN_RPI_HEADER_OUTPUT="$(
+	(
+		OS=debian
+		dpkg() { printf '%s\n' arm64; }
+		apt-cache() { return 1; }
+		kernelHeadersAreAvailableForVersion() { return 1; }
+		apt-get() {
+			printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"
+			[[ "${!#}" == 'linux-headers-rpi-v8' ]]
+		}
+		installKernelHeaders '6.6.51+rpt-rpi-v8'
+	) 2>&1
+)"
+assert_contains "$(cat "${KERNEL_HEADER_LOG}")" 'install -y linux-headers-6.6.51+rpt-rpi-v8' "kernel headers: modern Raspberry Pi path attempts the running ABI package"
+assert_contains "$(cat "${KERNEL_HEADER_LOG}")" 'install -y linux-headers-rpi-v8' "kernel headers: modern Raspberry Pi path installs its rolling meta-package"
+assert_not_contains "$(cat "${KERNEL_HEADER_LOG}")" 'raspberrypi-kernel-headers' "kernel headers: modern Raspberry Pi path skips the legacy header package"
+assert_eq '2' "$(wc -l < "${KERNEL_HEADER_LOG}" | tr -d ' ')" "kernel headers: modern Raspberry Pi path attempts only current and rolling packages"
+assert_not_contains "${MODERN_RPI_HEADER_OUTPUT}" 'Could not determine a safe rolling kernel header meta-package' "kernel headers: modern Raspberry Pi track resolves without an ambiguity warning"
+assert_contains "${MODERN_RPI_HEADER_OUTPUT}" 'headers for the running kernel (6.6.51+rpt-rpi-v8) remain unavailable' "kernel headers: modern Raspberry Pi rolling success still verifies running-ABI headers"
 
 _debian_cloud_header_meta() {
 	(

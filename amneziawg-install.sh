@@ -2317,6 +2317,7 @@ function getKernelHeaderMetaPackage() {
 	local APT_META
 	local INSTALLED_META
 	local DEB_ARCH
+	local RPI_FLAVOR
 
 	if APT_META=$(getAptKernelHeaderMetaPackage "${KERNEL_VER}"); then
 		printf '%s\n' "${APT_META}"
@@ -2325,8 +2326,20 @@ function getKernelHeaderMetaPackage() {
 
 	if [[ "${OS}" == 'debian' ]]; then
 		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) || return 1
+
+		# Raspberry Pi OS Bookworm tracks have per-flavor rolling headers.
+		# Accept only its current +rpt-rpi-* and early -rpiN-rpi-* release
+		# formats before applying the general Debian suffix fallbacks below.
+		if [[ "${KERNEL_VER}" =~ \+rpt-rpi-(v6|v7|v7l|v8|2712|v8-rt)$ ]] || \
+				[[ "${KERNEL_VER}" =~ -rpi[0-9]+-rpi-(v6|v7|v7l|v8|2712|v8-rt)$ ]]; then
+			RPI_FLAVOR="${BASH_REMATCH[1]}"
+			printf '%s\n' "linux-headers-rpi-${RPI_FLAVOR}"
+			return 0
+		fi
+
 		case "${KERNEL_VER}" in
-			*+rpt-rpi-*|*-rpi-v[678]*|*-v6+|*-v7+|*-v7l+|*-v8+) printf '%s\n' "raspberrypi-kernel-headers" ;;
+			*+rpt-rpi|*-rpi[0-9]*-rpi|*-rpi-*) return 1 ;;
+			*-v6+|*-v7+|*-v7l+|*-v8+) printf '%s\n' "raspberrypi-kernel-headers" ;;
 			*-rpi) printf '%s\n' "linux-headers-rpi" ;;
 			*-cloud-"${DEB_ARCH}") printf '%s\n' "linux-headers-cloud-${DEB_ARCH}" ;;
 			*-rt-"${DEB_ARCH}") printf '%s\n' "linux-headers-rt-${DEB_ARCH}" ;;
