@@ -169,6 +169,7 @@ create_bootstrap_dir() {
     local exec_probe
 
     [[ -d "${bootstrap_root}" ]] && [[ -w "${bootstrap_root}" ]] || return 1
+    bootstrap_root="$(cd -- "${bootstrap_root}" 2>/dev/null && pwd -P)" || return 1
     BOOTSTRAP_DIR="$(mktemp -d "${bootstrap_root%/}/amneziawg-install.XXXXXX")" || return 1
     if [[ "${requires_exec}" -ne 1 ]]; then
         return 0
@@ -259,8 +260,17 @@ run_inner_script() {
     local script_name="$1"
     shift
     local requires_exec=1
+    local caller_tmpdir
     if [[ "${script_name}" == "amneziawg-web-uninstall.sh" ]]; then
         requires_exec=0
+    fi
+
+    # Inner install/upgrade scripts change directory before invoking Cargo.
+    # Keep a caller-provided temporary directory stable across that change.
+    if [[ -n "${TMPDIR:-}" ]] && \
+            caller_tmpdir="$(cd -- "${TMPDIR}" 2>/dev/null && pwd -P)"; then
+        TMPDIR="${caller_tmpdir}"
+        export TMPDIR
     fi
 
     local target="${SCRIPTS_DIR}/${script_name}"

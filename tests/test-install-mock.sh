@@ -5229,6 +5229,53 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+# A valid relative TMPDIR must be made absolute before the inner installer
+# changes directory for Cargo. Include a space to verify path quoting as well.
+if [[ -n "${PHASE9_EXPECTED_BOOTSTRAP_ROOT}" ]]; then
+	PHASE9_RELATIVE_CWD="$(mktemp -d "${PHASE9_EXPECTED_BOOTSTRAP_ROOT%/}/awg-relative-cwd.XXXXXX")"
+	PHASE9_RELATIVE_TMPDIR_NAME='relative tmp'
+	mkdir -p "${PHASE9_RELATIVE_CWD}/${PHASE9_RELATIVE_TMPDIR_NAME}"
+	PHASE9_RELATIVE_TMPDIR_ROOT="$(cd "${PHASE9_RELATIVE_CWD}/${PHASE9_RELATIVE_TMPDIR_NAME}" && pwd -P)"
+	: > "${PHASE9_BOOTSTRAP_TARGET_LOG}"
+	: > "${PHASE9_INNER_TMPDIR_LOG}"
+	UNIFIED_RELATIVE_TMPDIR_RC=0
+	UNIFIED_RELATIVE_TMPDIR_OUTPUT=$(
+		cd "${PHASE9_RELATIVE_CWD}" && \
+		TMPDIR="${PHASE9_RELATIVE_TMPDIR_NAME}" PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
+			bash "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh" install \
+			--non-interactive --force \
+			--binary-src "${STUB_BINARY}" \
+			--install-dir "${WEB_TEST_INSTALL_DIR}" \
+			--data-dir "${WEB_TEST_DATA_DIR}" \
+			--env-file "${WEB_TEST_ENV_FILE}" \
+			--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+			--username testadmin \
+			--password-hash "${TEST_PASSWORD_HASH}" \
+			--no-start --no-enable 2>&1
+	) || UNIFIED_RELATIVE_TMPDIR_RC=$?
+	PHASE9_RELATIVE_TARGET="$(cat "${PHASE9_BOOTSTRAP_TARGET_LOG}" 2>/dev/null || true)"
+	PHASE9_RELATIVE_INNER_TMPDIR="$(cat "${PHASE9_INNER_TMPDIR_LOG}" 2>/dev/null || true)"
+	if [[ "${UNIFIED_RELATIVE_TMPDIR_RC}" -eq 0 ]] && \
+			[[ "${PHASE9_RELATIVE_TARGET}" == "${PHASE9_RELATIVE_TMPDIR_ROOT}"/amneziawg-install.* ]] && \
+			[[ "${PHASE9_RELATIVE_TARGET}" == /* ]] && \
+			[[ "${PHASE9_RELATIVE_INNER_TMPDIR}" == "${PHASE9_RELATIVE_TARGET}/.tmp" ]]; then
+		echo "OK: Standalone bootstrap canonicalizes a relative TMPDIR"
+	else
+		echo "FAIL: Relative TMPDIR was not propagated as an absolute bootstrap path (rc=${UNIFIED_RELATIVE_TMPDIR_RC}, target='${PHASE9_RELATIVE_TARGET}', tmpdir='${PHASE9_RELATIVE_INNER_TMPDIR}')"
+		echo "  Output tail: $(echo "${UNIFIED_RELATIVE_TMPDIR_OUTPUT}" | tail -10)"
+		FAILED=$((FAILED + 1))
+	fi
+	if [[ -n "${PHASE9_RELATIVE_TARGET}" ]] && [[ ! -e "${PHASE9_RELATIVE_TARGET}" ]]; then
+		echo "OK: Relative-TMPDIR bootstrap directory is removed after use"
+	else
+		echo "FAIL: Relative-TMPDIR bootstrap directory was not cleaned up"
+		FAILED=$((FAILED + 1))
+	fi
+	rm -rf "${PHASE9_RELATIVE_CWD}"
+else
+	echo "SKIP: No executable temporary filesystem is available for relative TMPDIR testing"
+fi
+
 # A writable but noexec TMPDIR cannot host Cargo build outputs. Exercise a real
 # noexec filesystem where the platform provides one and verify safe fallback.
 if [[ -d /dev/shm ]] && [[ -w /dev/shm ]] && \
