@@ -2308,6 +2308,49 @@ function getInstalledUbuntuKernelHeaderMetaPackage() {
 	printf '%s\n' "${CANDIDATES[0]}"
 }
 
+# Return the header-package prefix for the installed official Debian image that
+# owns a kernel release. Debian 11 also ships parallel versioned source tracks
+# such as linux-6.1 / linux-signed-6.1-amd64; preserve that series in the
+# corresponding linux-headers-6.1-* meta-package.
+function getInstalledDebianKernelHeaderPrefix() {
+	local KERNEL_VER="$1"
+	local DEB_ARCH="$2"
+	local IMAGE_PKG
+	local PACKAGE_INFO
+	local SOURCE_PKG
+	local STATUS
+	local ERROR_FLAG
+
+	# dpkg-query treats package names as patterns, so reject metacharacters and
+	# other characters that cannot occur in an official Debian kernel release.
+	[[ "${KERNEL_VER}" =~ ^[a-z0-9][a-z0-9.+~-]*$ ]] || return 1
+
+	for IMAGE_PKG in "linux-image-${KERNEL_VER}" "linux-image-${KERNEL_VER}-unsigned"; do
+		if ! PACKAGE_INFO=$(dpkg-query -W \
+				-f='${source:Package}|${db:Status-Status}|${db:Status-Eflag}\n' \
+				"${IMAGE_PKG}" 2>/dev/null); then
+			continue
+		fi
+
+		IFS='|' read -r SOURCE_PKG STATUS ERROR_FLAG <<< "${PACKAGE_INFO}"
+		[[ "${STATUS}" == 'installed' ]] && [[ "${ERROR_FLAG}" == 'ok' ]] || continue
+
+		if [[ "${SOURCE_PKG}" == 'linux' ]] || \
+				[[ "${SOURCE_PKG}" == "linux-signed-${DEB_ARCH}" ]]; then
+			printf '%s\n' 'linux-headers'
+			return 0
+		fi
+
+		if [[ "${SOURCE_PKG}" =~ ^linux-([0-9]+(\.[0-9]+)*)$ ]] || \
+				[[ "${SOURCE_PKG}" =~ ^linux-signed-([0-9]+(\.[0-9]+)*)-${DEB_ARCH}$ ]]; then
+			printf '%s\n' "linux-headers-${BASH_REMATCH[1]}"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
 # Return a rolling header package when APT reverse-dependency metadata is not
 # available. Installing only linux-headers-$(uname -r) is enough for today's
 # DKMS build, but the rolling package is what keeps headers on APT's future
@@ -2317,6 +2360,8 @@ function getKernelHeaderMetaPackage() {
 	local APT_META
 	local INSTALLED_META
 	local DEB_ARCH
+	local DEB_HEADER_FLAVOR
+	local DEB_HEADER_PREFIX
 	local RPI_FLAVOR
 
 	if APT_META=$(getAptKernelHeaderMetaPackage "${KERNEL_VER}"); then
@@ -2330,36 +2375,84 @@ function getKernelHeaderMetaPackage() {
 		# Raspberry Pi OS Bookworm tracks have per-flavor rolling headers.
 		# Accept only its current +rpt-rpi-* and early -rpiN-rpi-* release
 		# formats before applying the general Debian suffix fallbacks below.
-		if [[ "${KERNEL_VER}" =~ \+rpt-rpi-(v6|v7|v7l|v8|2712|v8-rt)$ ]] || \
-				[[ "${KERNEL_VER}" =~ -rpi[0-9]+-rpi-(v6|v7|v7l|v8|2712|v8-rt)$ ]]; then
+		if [[ "${KERNEL_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+rpt-rpi-(v6|v7|v7l|v8|2712|v8-rt)$ ]] || \
+				[[ "${KERNEL_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rpi[0-9]+-rpi-(v6|v7|v7l|v8|2712|v8-rt)$ ]]; then
 			RPI_FLAVOR="${BASH_REMATCH[1]}"
 			printf '%s\n' "linux-headers-rpi-${RPI_FLAVOR}"
 			return 0
 		fi
 
+		if [[ "${KERNEL_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-v(6|7|7l|8)\+$ ]]; then
+			printf '%s\n' 'raspberrypi-kernel-headers'
+			return 0
+		fi
+
 		case "${KERNEL_VER}" in
 			*+rpt-rpi|*-rpi[0-9]*-rpi|*-rpi-*) return 1 ;;
-			*-v6+|*-v7+|*-v7l+|*-v8+) printf '%s\n' "raspberrypi-kernel-headers" ;;
-			*-rpi) printf '%s\n' "linux-headers-rpi" ;;
-			*-cloud-"${DEB_ARCH}") printf '%s\n' "linux-headers-cloud-${DEB_ARCH}" ;;
-			*-rt-"${DEB_ARCH}") printf '%s\n' "linux-headers-rt-${DEB_ARCH}" ;;
-			*-arm64-16k) printf '%s\n' "linux-headers-arm64-16k" ;;
-			*-powerpc64le-64k) printf '%s\n' "linux-headers-powerpc64le-64k" ;;
-			*-powerpc64le) printf '%s\n' "linux-headers-powerpc64le" ;;
-			*-rt-armmp) printf '%s\n' "linux-headers-rt-armmp" ;;
-			*-armmp-lpae) printf '%s\n' "linux-headers-armmp-lpae" ;;
-			*-armmp) printf '%s\n' "linux-headers-armmp" ;;
-			*-rt-686-pae) printf '%s\n' "linux-headers-rt-686-pae" ;;
-			*-686-pae) printf '%s\n' "linux-headers-686-pae" ;;
-			*-686) printf '%s\n' "linux-headers-686" ;;
+			*-rpi)
+				[[ "${DEB_ARCH}" == 'armel' ]] || return 1
+				DEB_HEADER_FLAVOR='rpi'
+				;;
+			*-cloud-"${DEB_ARCH}")
+				case "${DEB_ARCH}" in
+					amd64|arm64) DEB_HEADER_FLAVOR="cloud-${DEB_ARCH}" ;;
+					*) return 1 ;;
+				esac
+				;;
+			*-rt-"${DEB_ARCH}")
+				case "${DEB_ARCH}" in
+					amd64|arm64) DEB_HEADER_FLAVOR="rt-${DEB_ARCH}" ;;
+					*) return 1 ;;
+				esac
+				;;
+			*-arm64-16k)
+				[[ "${DEB_ARCH}" == 'arm64' ]] || return 1
+				DEB_HEADER_FLAVOR='arm64-16k'
+				;;
+			*-powerpc64le-64k)
+				[[ "${DEB_ARCH}" == 'ppc64el' ]] || return 1
+				DEB_HEADER_FLAVOR='powerpc64le-64k'
+				;;
+			*-powerpc64le)
+				[[ "${DEB_ARCH}" == 'ppc64el' ]] || return 1
+				DEB_HEADER_FLAVOR='powerpc64le'
+				;;
+			*-rt-armmp)
+				[[ "${DEB_ARCH}" == 'armhf' ]] || return 1
+				DEB_HEADER_FLAVOR='rt-armmp'
+				;;
+			*-armmp-lpae)
+				[[ "${DEB_ARCH}" == 'armhf' ]] || return 1
+				DEB_HEADER_FLAVOR='armmp-lpae'
+				;;
+			*-armmp)
+				[[ "${DEB_ARCH}" == 'armhf' ]] || return 1
+				DEB_HEADER_FLAVOR='armmp'
+				;;
+			*-rt-686-pae)
+				[[ "${DEB_ARCH}" == 'i386' ]] || return 1
+				DEB_HEADER_FLAVOR='rt-686-pae'
+				;;
+			*-686-pae)
+				[[ "${DEB_ARCH}" == 'i386' ]] || return 1
+				DEB_HEADER_FLAVOR='686-pae'
+				;;
+			*-686)
+				[[ "${DEB_ARCH}" == 'i386' ]] || return 1
+				DEB_HEADER_FLAVOR='686'
+				;;
 			*-"${DEB_ARCH}")
 				case "${DEB_ARCH}" in
-					amd64|arm64|riscv64|s390x) printf '%s\n' "linux-headers-${DEB_ARCH}" ;;
+					amd64|arm64|riscv64|s390x) DEB_HEADER_FLAVOR="${DEB_ARCH}" ;;
 					*) return 1 ;;
 				esac
 				;;
 			*) return 1 ;;
 		esac
+
+		DEB_HEADER_PREFIX=$(getInstalledDebianKernelHeaderPrefix \
+			"${KERNEL_VER}" "${DEB_ARCH}") || return 1
+		printf '%s\n' "${DEB_HEADER_PREFIX}-${DEB_HEADER_FLAVOR}"
 	elif [[ "${OS}" == 'ubuntu' ]]; then
 		if INSTALLED_META=$(getInstalledUbuntuKernelHeaderMetaPackage "${KERNEL_VER}"); then
 			printf '%s\n' "${INSTALLED_META}"

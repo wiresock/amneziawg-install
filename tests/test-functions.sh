@@ -1178,14 +1178,26 @@ KERNEL_HEADER_TMP="$(mktemp -d)"
 KERNEL_HEADER_LOG="${KERNEL_HEADER_TMP}/apt-get.log"
 KERNEL_HEADER_ERR="${KERNEL_HEADER_TMP}/stderr.log"
 
+_mock_debian_kernel_image_source() {
+	local EXPECTED_IMAGE="linux-image-${DEB_TEST_KERNEL_VER}${DEB_TEST_IMAGE_SUFFIX:-}"
+	[[ "${!#}" == "${EXPECTED_IMAGE}" ]] || return 1
+	[[ "$*" == *'${source:Package}|${db:Status-Status}|${db:Status-Eflag}'* ]] || return 1
+	[[ -n "${DEB_TEST_SOURCE:-}" ]] || return 1
+	printf '%s|%s|%s\n' "${DEB_TEST_SOURCE}" \
+		"${DEB_TEST_STATUS:-installed}" "${DEB_TEST_ERROR_FLAG:-ok}"
+}
+
 # A successful version-specific install must not short-circuit the Debian
 # architecture meta-package needed by the next kernel upgrade (#98).
 (
 	OS=debian
+	DEB_TEST_KERNEL_VER='6.12.38+deb13-amd64'
+	DEB_TEST_SOURCE='linux-signed-amd64'
 	dpkg() { printf '%s\n' amd64; }
 	apt-cache() { return 1; }
+	dpkg-query() { _mock_debian_kernel_image_source "$@"; }
 	apt-get() { printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"; return 0; }
-	installKernelHeaders "6.12.38+deb13-amd64"
+	installKernelHeaders "${DEB_TEST_KERNEL_VER}"
 ) >/dev/null
 assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-6.12.38+deb13-amd64" "kernel headers: installs the running Debian kernel package"
 assert_contains "$(cat "${KERNEL_HEADER_LOG}")" "install -y linux-headers-amd64" "kernel headers: installs the Debian architecture meta-package"
@@ -1331,23 +1343,81 @@ assert_eq '2' "$(wc -l < "${KERNEL_HEADER_LOG}" | tr -d ' ')" "kernel headers: m
 assert_not_contains "${MODERN_RPI_HEADER_OUTPUT}" 'Could not determine a safe rolling kernel header meta-package' "kernel headers: modern Raspberry Pi track resolves without an ambiguity warning"
 assert_contains "${MODERN_RPI_HEADER_OUTPUT}" 'headers for the running kernel (6.6.51+rpt-rpi-v8) remain unavailable' "kernel headers: modern Raspberry Pi rolling success still verifies running-ABI headers"
 
-_debian_cloud_header_meta() {
+_debian_header_meta_with_source() {
+	local KERNEL_VER="$1"
+	local ARCH="$2"
+	local SOURCE="$3"
+	local IMAGE_SUFFIX="${4:-}"
+	local STATUS="${5:-installed}"
+	local ERROR_FLAG="${6:-ok}"
 	(
 		OS=debian
+		DEB_TEST_KERNEL_VER="${KERNEL_VER}"
+		DEB_TEST_SOURCE="${SOURCE}"
+		DEB_TEST_IMAGE_SUFFIX="${IMAGE_SUFFIX}"
+		DEB_TEST_STATUS="${STATUS}"
+		DEB_TEST_ERROR_FLAG="${ERROR_FLAG}"
+		dpkg() { printf '%s\n' "${ARCH}"; }
+		apt-cache() { return 1; }
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		getKernelHeaderMetaPackage "${KERNEL_VER}"
+	)
+}
+
+assert_eq 'linux-headers-amd64' "$(_debian_header_meta_with_source '5.10.0-45-amd64' amd64 linux-signed-amd64)" "kernel headers: Debian 11 signed image selects the stock rolling headers"
+assert_eq 'linux-headers-6.1-amd64' "$(_debian_header_meta_with_source '6.1.0-0.deb11.48-amd64' amd64 linux-signed-6.1-amd64)" "kernel headers: Debian 11 parallel source preserves its versioned track"
+assert_eq 'linux-headers-6.1-rt-armmp' "$(_debian_header_meta_with_source '6.1.0-0.deb11.48-rt-armmp' armhf linux-6.1)" "kernel headers: Debian versioned unsigned source preserves its RT ARM track"
+assert_eq 'linux-headers-cloud-arm64' "$(_debian_header_meta_with_source '6.1.0-50-cloud-arm64' arm64 linux -unsigned)" "kernel headers: Debian unsigned image selects its cloud rolling headers"
+assert_eq 'linux-headers-amd64' "$(_debian_header_meta_with_source '6.12.27+bpo-amd64' amd64 linux-signed-amd64)" "kernel headers: Debian transitional backport ABI is validated by image provenance"
+assert_eq 'linux-headers-arm64-16k' "$(_debian_header_meta_with_source '6.12.90+deb13+1-arm64-16k' arm64 linux -unsigned)" "kernel headers: Debian revision ABI retains the 16K flavor"
+assert_eq 'linux-headers-rpi' "$(_debian_header_meta_with_source '6.1.0-50-rpi' armel linux)" "kernel headers: stock Debian RPi image selects its armel rolling headers"
+assert_eq 'linux-headers-powerpc64le-64k' "$(_debian_header_meta_with_source '6.12.90+deb13-powerpc64le-64k' ppc64el linux)" "kernel headers: Debian ppc64el 64K image retains its flavor"
+
+_debian_liquorix_header_meta() {
+	_debian_header_meta_with_source '6.12.13-1-liquorix-amd64' amd64 linux-liquorix
+}
+assert_rc 1 _debian_liquorix_header_meta
+
+_debian_liquorix_rt_header_meta() {
+	_debian_header_meta_with_source '6.12.13-1-liquorix-rt-amd64' amd64 linux-liquorix
+}
+assert_rc 1 _debian_liquorix_rt_header_meta
+
+_debian_missing_image_header_meta() {
+	_debian_header_meta_with_source '6.1.0-50-amd64' amd64 ''
+}
+assert_rc 1 _debian_missing_image_header_meta
+
+_debian_removed_image_header_meta() {
+	_debian_header_meta_with_source '6.1.0-50-amd64' amd64 linux-signed-amd64 '' config-files
+}
+assert_rc 1 _debian_removed_image_header_meta
+
+# A third-party exact package may install successfully, but it must never make
+# an unrelated stock Debian rolling meta-package look safe.
+: > "${KERNEL_HEADER_LOG}"
+LIQUORIX_HEADER_OUTPUT="$(
+	(
+		OS=debian
+		DEB_TEST_KERNEL_VER='6.12.13-1-liquorix-amd64'
+		DEB_TEST_SOURCE='linux-liquorix'
 		dpkg() { printf '%s\n' amd64; }
 		apt-cache() { return 1; }
-		getKernelHeaderMetaPackage "6.12.38+deb13-cloud-amd64"
-	)
+		dpkg-query() { _mock_debian_kernel_image_source "$@"; }
+		apt-get() { printf '%s\n' "$*" >> "${KERNEL_HEADER_LOG}"; return 0; }
+		installKernelHeaders "${DEB_TEST_KERNEL_VER}"
+	) 2>&1
+)"
+assert_contains "${LIQUORIX_HEADER_OUTPUT}" "Could not determine a safe rolling kernel header meta-package for '6.12.13-1-liquorix-amd64'" "kernel headers: Liquorix install warns that rolling tracking is unresolved"
+assert_eq 'install -y linux-headers-6.12.13-1-liquorix-amd64' "$(cat "${KERNEL_HEADER_LOG}")" "kernel headers: Liquorix install attempts only the exact header package"
+
+_debian_cloud_header_meta() {
+	_debian_header_meta_with_source '6.12.38+deb13-cloud-amd64' amd64 linux-signed-amd64
 }
 assert_eq "linux-headers-cloud-amd64" "$(_debian_cloud_header_meta)" "kernel headers: Debian cloud kernels retain their flavor"
 
 _debian_arm64_header_meta() {
-	(
-		OS=debian
-		dpkg() { printf '%s\n' arm64; }
-		apt-cache() { return 1; }
-		getKernelHeaderMetaPackage "6.12.38+deb13-arm64"
-	)
+	_debian_header_meta_with_source '6.12.38+deb13-arm64' arm64 linux-signed-arm64
 }
 assert_eq "linux-headers-arm64" "$(_debian_arm64_header_meta)" "kernel headers: Debian arm64 selects its architecture meta-package"
 
@@ -1362,12 +1432,7 @@ _debian_pve_header_meta() {
 assert_rc 1 _debian_pve_header_meta
 
 _debian_rt_i386_header_meta() {
-	(
-		OS=debian
-		dpkg() { printf '%s\n' i386; }
-		apt-cache() { return 1; }
-		getKernelHeaderMetaPackage '6.1.0-49-rt-686-pae'
-	)
+	_debian_header_meta_with_source '6.1.0-49-rt-686-pae' i386 linux-signed-i386
 }
 assert_eq 'linux-headers-rt-686-pae' "$(_debian_rt_i386_header_meta)" "kernel headers: Debian i386 RT kernels retain the RT flavor"
 
@@ -1700,22 +1765,12 @@ _ubuntu_aws_support_package_not_meta() {
 assert_rc 1 _ubuntu_aws_support_package_not_meta
 
 _debian_ppc64el_header_meta() {
-	(
-		OS=debian
-		dpkg() { printf '%s\n' ppc64el; }
-		apt-cache() { return 1; }
-		getKernelHeaderMetaPackage "6.12.38+deb13-powerpc64le"
-	)
+	_debian_header_meta_with_source '6.12.38+deb13-powerpc64le' ppc64el linux
 }
 assert_eq "linux-headers-powerpc64le" "$(_debian_ppc64el_header_meta)" "kernel headers: Debian ppc64el maps to its kernel flavor"
 
 _debian_arm64_16k_header_meta() {
-	(
-		OS=debian
-		dpkg() { printf '%s\n' arm64; }
-		apt-cache() { return 1; }
-		getKernelHeaderMetaPackage "6.12.38+deb13-arm64-16k"
-	)
+	_debian_header_meta_with_source '6.12.38+deb13-arm64-16k' arm64 linux -unsigned
 }
 assert_eq "linux-headers-arm64-16k" "$(_debian_arm64_16k_header_meta)" "kernel headers: Debian arm64-16k retains its flavor"
 
