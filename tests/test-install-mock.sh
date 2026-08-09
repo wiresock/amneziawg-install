@@ -5127,12 +5127,21 @@ mkdir -p "${WEB_TEST_INSTALL_DIR}" "${WEB_TEST_DATA_DIR}" \
 
 # Create a mock git that simulates a successful bootstrap clone
 PHASE9_MOCK_GIT_DIR="$(mktemp -d /tmp/awg-mock-git-ph9.XXXXXX)"
+PHASE9_BOOTSTRAP_TARGET_LOG="${PHASE9_STANDALONE_DIR}/bootstrap-target.log"
+PHASE9_INNER_TMPDIR_LOG="${PHASE9_STANDALONE_DIR}/inner-tmpdir.log"
+PHASE9_TMPDIR_PROBE="${PHASE9_STANDALONE_DIR}/record-tmpdir.sh"
+cat > "${PHASE9_TMPDIR_PROBE}" <<PHASE9TMPDIRPROBEEOF
+printf '%s\n' "\${TMPDIR:-}" > "${PHASE9_INNER_TMPDIR_LOG}"
+PHASE9TMPDIRPROBEEOF
 cat > "${PHASE9_MOCK_GIT_DIR}/git" <<PHASE9GITMOCKEOF
 #!/bin/bash
 if [[ "\$1" == "clone" ]]; then
 	TARGET=""
 	for _a in "\$@"; do TARGET="\${_a}"; done
+	printf '%s\n' "\${TARGET}" > "${PHASE9_BOOTSTRAP_TARGET_LOG}"
 	cp -r "${PROJECT_ROOT}/." "\${TARGET}/"
+	sed -i "1r ${PHASE9_TMPDIR_PROBE}" "\${TARGET}/amneziawg-web/scripts/amneziawg-web-install.sh"
+	sed -i "1r ${PHASE9_TMPDIR_PROBE}" "\${TARGET}/amneziawg-web/scripts/amneziawg-web-uninstall.sh"
 	exit 0
 fi
 exit 0
@@ -5141,7 +5150,7 @@ chmod +x "${PHASE9_MOCK_GIT_DIR}/git"
 
 # Install via standalone unified script with mock git
 UNIFIED_BOOTSTRAP_RC=0
-UNIFIED_BOOTSTRAP_OUTPUT=$(PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
+UNIFIED_BOOTSTRAP_OUTPUT=$(env -u TMPDIR PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
 	bash "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh" install \
 	--non-interactive --force \
 	--binary-src "${STUB_BINARY}" \
@@ -5172,6 +5181,167 @@ if echo "${UNIFIED_BOOTSTRAP_OUTPUT}" | grep -qiE "cloning|clone|bootstrap"; the
 	echo "OK: Standalone unified install output mentions cloning/bootstrapping"
 else
 	echo "WARN: Standalone unified install output does not mention cloning (check stderr capture)"
+fi
+
+phase9_root_supports_exec() {
+	local ROOT="$1"
+	local PROBE_DIR
+	local PROBE
+	local RC=1
+	[[ -d "${ROOT}" ]] && [[ -w "${ROOT}" ]] || return 1
+	PROBE_DIR="$(mktemp -d "${ROOT%/}/awg-exec-probe.XXXXXX")" || return 1
+	PROBE="${PROBE_DIR}/probe"
+	if printf '%s\n' '#!/bin/sh' 'exit 0' > "${PROBE}" && \
+			chmod 700 "${PROBE}" && "${PROBE}" >/dev/null 2>&1; then
+		RC=0
+	fi
+	rm -rf "${PROBE_DIR}"
+	return "${RC}"
+}
+
+PHASE9_EXPECTED_BOOTSTRAP_ROOT=""
+for PHASE9_ROOT in /var/tmp /tmp; do
+	if phase9_root_supports_exec "${PHASE9_ROOT}"; then
+		PHASE9_EXPECTED_BOOTSTRAP_ROOT="${PHASE9_ROOT}"
+		break
+	fi
+done
+
+PHASE9_BOOTSTRAP_TARGET="$(cat "${PHASE9_BOOTSTRAP_TARGET_LOG}" 2>/dev/null || true)"
+if [[ -n "${PHASE9_EXPECTED_BOOTSTRAP_ROOT}" ]] && \
+		[[ "${PHASE9_BOOTSTRAP_TARGET}" == "${PHASE9_EXPECTED_BOOTSTRAP_ROOT}"/amneziawg-install.* ]]; then
+	echo "OK: Standalone bootstrap uses the preferred executable temporary filesystem"
+else
+	echo "FAIL: Standalone bootstrap should use '${PHASE9_EXPECTED_BOOTSTRAP_ROOT}', got '${PHASE9_BOOTSTRAP_TARGET}'"
+	FAILED=$((FAILED + 1))
+fi
+if [[ -n "${PHASE9_BOOTSTRAP_TARGET}" ]] && [[ ! -e "${PHASE9_BOOTSTRAP_TARGET}" ]]; then
+	echo "OK: Standalone bootstrap directory is removed after use"
+else
+	echo "FAIL: Standalone bootstrap directory was not cleaned up"
+	FAILED=$((FAILED + 1))
+fi
+PHASE9_INNER_TMPDIR="$(cat "${PHASE9_INNER_TMPDIR_LOG}" 2>/dev/null || true)"
+if [[ "${PHASE9_INNER_TMPDIR}" == "${PHASE9_BOOTSTRAP_TARGET}/.tmp" ]]; then
+	echo "OK: Standalone bootstrap passes its disk-backed TMPDIR to the inner installer"
+else
+	echo "FAIL: Inner installer TMPDIR should be inside the bootstrap directory, got '${PHASE9_INNER_TMPDIR}'"
+	FAILED=$((FAILED + 1))
+fi
+
+# A valid relative TMPDIR must be made absolute before the inner installer
+# changes directory for Cargo. Include a space to verify path quoting as well.
+if [[ -n "${PHASE9_EXPECTED_BOOTSTRAP_ROOT}" ]]; then
+	PHASE9_RELATIVE_CWD="$(mktemp -d "${PHASE9_EXPECTED_BOOTSTRAP_ROOT%/}/awg-relative-cwd.XXXXXX")"
+	PHASE9_RELATIVE_TMPDIR_NAME='relative tmp'
+	mkdir -p "${PHASE9_RELATIVE_CWD}/${PHASE9_RELATIVE_TMPDIR_NAME}"
+	PHASE9_RELATIVE_TMPDIR_ROOT="$(cd "${PHASE9_RELATIVE_CWD}/${PHASE9_RELATIVE_TMPDIR_NAME}" && pwd -P)"
+	: > "${PHASE9_BOOTSTRAP_TARGET_LOG}"
+	: > "${PHASE9_INNER_TMPDIR_LOG}"
+	UNIFIED_RELATIVE_TMPDIR_RC=0
+	UNIFIED_RELATIVE_TMPDIR_OUTPUT=$(
+		cd "${PHASE9_RELATIVE_CWD}" && \
+		TMPDIR="${PHASE9_RELATIVE_TMPDIR_NAME}" PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
+			bash "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh" install \
+			--non-interactive --force \
+			--binary-src "${STUB_BINARY}" \
+			--install-dir "${WEB_TEST_INSTALL_DIR}" \
+			--data-dir "${WEB_TEST_DATA_DIR}" \
+			--env-file "${WEB_TEST_ENV_FILE}" \
+			--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+			--username testadmin \
+			--password-hash "${TEST_PASSWORD_HASH}" \
+			--no-start --no-enable 2>&1
+	) || UNIFIED_RELATIVE_TMPDIR_RC=$?
+	PHASE9_RELATIVE_TARGET="$(cat "${PHASE9_BOOTSTRAP_TARGET_LOG}" 2>/dev/null || true)"
+	PHASE9_RELATIVE_INNER_TMPDIR="$(cat "${PHASE9_INNER_TMPDIR_LOG}" 2>/dev/null || true)"
+	if [[ "${UNIFIED_RELATIVE_TMPDIR_RC}" -eq 0 ]] && \
+			[[ "${PHASE9_RELATIVE_TARGET}" == "${PHASE9_RELATIVE_TMPDIR_ROOT}"/amneziawg-install.* ]] && \
+			[[ "${PHASE9_RELATIVE_TARGET}" == /* ]] && \
+			[[ "${PHASE9_RELATIVE_INNER_TMPDIR}" == "${PHASE9_RELATIVE_TARGET}/.tmp" ]]; then
+		echo "OK: Standalone bootstrap canonicalizes a relative TMPDIR"
+	else
+		echo "FAIL: Relative TMPDIR was not propagated as an absolute bootstrap path (rc=${UNIFIED_RELATIVE_TMPDIR_RC}, target='${PHASE9_RELATIVE_TARGET}', tmpdir='${PHASE9_RELATIVE_INNER_TMPDIR}')"
+		echo "  Output tail: $(echo "${UNIFIED_RELATIVE_TMPDIR_OUTPUT}" | tail -10)"
+		FAILED=$((FAILED + 1))
+	fi
+	if [[ -n "${PHASE9_RELATIVE_TARGET}" ]] && [[ ! -e "${PHASE9_RELATIVE_TARGET}" ]]; then
+		echo "OK: Relative-TMPDIR bootstrap directory is removed after use"
+	else
+		echo "FAIL: Relative-TMPDIR bootstrap directory was not cleaned up"
+		FAILED=$((FAILED + 1))
+	fi
+	rm -rf "${PHASE9_RELATIVE_CWD}"
+else
+	echo "SKIP: No executable temporary filesystem is available for relative TMPDIR testing"
+fi
+
+# A writable but noexec TMPDIR cannot host Cargo build outputs. Exercise a real
+# noexec filesystem where the platform provides one and verify safe fallback.
+if [[ -d /dev/shm ]] && [[ -w /dev/shm ]] && \
+		! phase9_root_supports_exec /dev/shm && \
+		[[ -n "${PHASE9_EXPECTED_BOOTSTRAP_ROOT}" ]]; then
+	: > "${PHASE9_BOOTSTRAP_TARGET_LOG}"
+	: > "${PHASE9_INNER_TMPDIR_LOG}"
+	UNIFIED_NOEXEC_RC=0
+	UNIFIED_NOEXEC_OUTPUT=$(TMPDIR=/dev/shm PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
+		bash "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh" install \
+		--non-interactive --force \
+		--binary-src "${STUB_BINARY}" \
+		--install-dir "${WEB_TEST_INSTALL_DIR}" \
+		--data-dir "${WEB_TEST_DATA_DIR}" \
+		--env-file "${WEB_TEST_ENV_FILE}" \
+		--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+		--username testadmin \
+		--password-hash "${TEST_PASSWORD_HASH}" \
+		--no-start --no-enable 2>&1) || UNIFIED_NOEXEC_RC=$?
+	PHASE9_NOEXEC_TARGET="$(cat "${PHASE9_BOOTSTRAP_TARGET_LOG}" 2>/dev/null || true)"
+	if [[ "${UNIFIED_NOEXEC_RC}" -eq 0 ]] && \
+			[[ "${PHASE9_NOEXEC_TARGET}" == "${PHASE9_EXPECTED_BOOTSTRAP_ROOT}"/amneziawg-install.* ]] && \
+			[[ "${PHASE9_NOEXEC_TARGET}" != /dev/shm/* ]]; then
+		echo "OK: Standalone bootstrap rejects a writable noexec TMPDIR"
+	else
+		echo "FAIL: Standalone bootstrap did not safely reject noexec TMPDIR (rc=${UNIFIED_NOEXEC_RC}, target='${PHASE9_NOEXEC_TARGET}')"
+		echo "  Output tail: $(echo "${UNIFIED_NOEXEC_OUTPUT}" | tail -10)"
+		FAILED=$((FAILED + 1))
+	fi
+	if [[ -n "${PHASE9_NOEXEC_TARGET}" ]] && [[ ! -e "${PHASE9_NOEXEC_TARGET}" ]]; then
+		echo "OK: Noexec fallback bootstrap directory is removed after use"
+	else
+		echo "FAIL: Noexec fallback bootstrap directory was not cleaned up"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# Uninstall delegates through bash and does not execute Cargo artifacts, so
+	# it should remain usable directly on a writable noexec temporary filesystem.
+	: > "${PHASE9_BOOTSTRAP_TARGET_LOG}"
+	: > "${PHASE9_INNER_TMPDIR_LOG}"
+	UNIFIED_NOEXEC_UNINSTALL_RC=0
+	UNIFIED_NOEXEC_UNINSTALL_OUTPUT=$(TMPDIR=/dev/shm PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
+		bash "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh" uninstall \
+		--install-dir "${WEB_TEST_INSTALL_DIR}" \
+		--data-dir "${WEB_TEST_DATA_DIR}" \
+		--env-file "${WEB_TEST_ENV_FILE}" \
+		--force 2>&1) || UNIFIED_NOEXEC_UNINSTALL_RC=$?
+	PHASE9_NOEXEC_UNINSTALL_TARGET="$(cat "${PHASE9_BOOTSTRAP_TARGET_LOG}" 2>/dev/null || true)"
+	PHASE9_NOEXEC_UNINSTALL_TMPDIR="$(cat "${PHASE9_INNER_TMPDIR_LOG}" 2>/dev/null || true)"
+	if [[ "${UNIFIED_NOEXEC_UNINSTALL_RC}" -eq 0 ]] && \
+			[[ "${PHASE9_NOEXEC_UNINSTALL_TARGET}" == /dev/shm/amneziawg-install.* ]] && \
+			[[ "${PHASE9_NOEXEC_UNINSTALL_TMPDIR}" == "${PHASE9_NOEXEC_UNINSTALL_TARGET}/.tmp" ]]; then
+		echo "OK: Standalone uninstall remains usable on a writable noexec TMPDIR"
+	else
+		echo "FAIL: Standalone uninstall should use writable noexec TMPDIR (rc=${UNIFIED_NOEXEC_UNINSTALL_RC}, target='${PHASE9_NOEXEC_UNINSTALL_TARGET}', tmpdir='${PHASE9_NOEXEC_UNINSTALL_TMPDIR}')"
+		echo "  Output tail: $(echo "${UNIFIED_NOEXEC_UNINSTALL_OUTPUT}" | tail -10)"
+		FAILED=$((FAILED + 1))
+	fi
+	if [[ -n "${PHASE9_NOEXEC_UNINSTALL_TARGET}" ]] && [[ ! -e "${PHASE9_NOEXEC_UNINSTALL_TARGET}" ]]; then
+		echo "OK: Noexec uninstall bootstrap directory is removed after use"
+	else
+		echo "FAIL: Noexec uninstall bootstrap directory was not cleaned up"
+		FAILED=$((FAILED + 1))
+	fi
+else
+	echo "SKIP: No writable noexec /dev/shm filesystem is available for bootstrap fallback testing"
 fi
 
 rm -rf "${PHASE9_STANDALONE_DIR}" "${PHASE9_MOCK_GIT_DIR}"

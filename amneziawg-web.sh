@@ -36,6 +36,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="${SCRIPT_DIR}/amneziawg-web/scripts"
 BOOTSTRAP_DIR=""
+BOOTSTRAP_TMPDIR=""
 
 # ── Defaults (mirror inner scripts) ──────────────────────────────────────────
 
@@ -162,8 +163,34 @@ install_git() {
 
 # ── Bootstrap ────────────────────────────────────────────────────────────────
 
+create_bootstrap_dir() {
+    local bootstrap_root="$1"
+    local requires_exec="$2"
+    local exec_probe
+
+    [[ -d "${bootstrap_root}" ]] && [[ -w "${bootstrap_root}" ]] || return 1
+    bootstrap_root="$(cd -- "${bootstrap_root}" 2>/dev/null && pwd -P)" || return 1
+    BOOTSTRAP_DIR="$(mktemp -d "${bootstrap_root%/}/amneziawg-install.XXXXXX")" || return 1
+    if [[ "${requires_exec}" -ne 1 ]]; then
+        return 0
+    fi
+    exec_probe="${BOOTSTRAP_DIR}/.exec-probe"
+
+    if printf '%s\n' '#!/bin/sh' 'exit 0' >"${exec_probe}" && \
+            chmod 700 "${exec_probe}" && \
+            "${exec_probe}" >/dev/null 2>&1 && \
+            rm -f "${exec_probe}"; then
+        return 0
+    fi
+
+    rm -rf "${BOOTSTRAP_DIR}"
+    BOOTSTRAP_DIR=""
+    return 1
+}
+
 bootstrap_repo_if_needed() {
     local target_script="$1"
+    local requires_exec="${2:-1}"
     if [[ -f "${target_script}" ]]; then
         return 0
     fi
@@ -176,7 +203,44 @@ bootstrap_repo_if_needed() {
         fi
     fi
 
-    BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/amneziawg-install.XXXXXX")"
+    # Cargo executes build scripts and procedural macros below the cloned source
+    # tree. Try an explicit TMPDIR first, then prefer disk-backed /var/tmp over
+    # /tmp, accepting a root only after a direct-execution probe succeeds.
+    local bootstrap_root
+    local existing_root
+    local root_seen
+    local -a bootstrap_roots=()
+    local -a tried_roots=()
+    if [[ -n "${TMPDIR:-}" ]]; then
+        bootstrap_roots+=("${TMPDIR}")
+    fi
+    bootstrap_roots+=("/var/tmp" "/tmp")
+
+    for bootstrap_root in "${bootstrap_roots[@]}"; do
+        root_seen=0
+        for existing_root in "${tried_roots[@]}"; do
+            if [[ "${existing_root}" == "${bootstrap_root}" ]]; then
+                root_seen=1
+                break
+            fi
+        done
+        [[ "${root_seen}" -eq 1 ]] && continue
+        tried_roots+=("${bootstrap_root}")
+        if create_bootstrap_dir "${bootstrap_root}" "${requires_exec}"; then
+            break
+        fi
+    done
+
+    if [[ -z "${BOOTSTRAP_DIR}" ]]; then
+        if [[ "${requires_exec}" -eq 1 ]]; then
+            echo "ERROR: No writable temporary filesystem permitting direct execution is available." >&2
+            echo "       Set TMPDIR to an executable, disk-backed filesystem with sufficient free space." >&2
+        else
+            echo "ERROR: No writable temporary filesystem is available." >&2
+            echo "       Set TMPDIR to a filesystem with sufficient free space." >&2
+        fi
+        exit 1
+    fi
 
     echo "Required scripts not found locally. Cloning ${REPO_URL} (${REPO_REF}) into ${BOOTSTRAP_DIR} ..." >&2
     if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" "${BOOTSTRAP_DIR}" >&2; then
@@ -185,6 +249,8 @@ bootstrap_repo_if_needed() {
         exit 1
     fi
 
+    BOOTSTRAP_TMPDIR="${BOOTSTRAP_DIR}/.tmp"
+    mkdir -p "${BOOTSTRAP_TMPDIR}"
     SCRIPTS_DIR="${BOOTSTRAP_DIR}/amneziawg-web/scripts"
 }
 
@@ -193,9 +259,22 @@ bootstrap_repo_if_needed() {
 run_inner_script() {
     local script_name="$1"
     shift
+    local requires_exec=1
+    local caller_tmpdir
+    if [[ "${script_name}" == "amneziawg-web-uninstall.sh" ]]; then
+        requires_exec=0
+    fi
+
+    # Inner install/upgrade scripts change directory before invoking Cargo.
+    # Keep a caller-provided temporary directory stable across that change.
+    if [[ -n "${TMPDIR:-}" ]] && \
+            caller_tmpdir="$(cd -- "${TMPDIR}" 2>/dev/null && pwd -P)"; then
+        TMPDIR="${caller_tmpdir}"
+        export TMPDIR
+    fi
 
     local target="${SCRIPTS_DIR}/${script_name}"
-    bootstrap_repo_if_needed "${target}"
+    bootstrap_repo_if_needed "${target}" "${requires_exec}"
     # Re-evaluate after bootstrap (SCRIPTS_DIR may have changed)
     target="${SCRIPTS_DIR}/${script_name}"
 
@@ -205,7 +284,12 @@ run_inner_script() {
     fi
 
     local exit_code=0
-    bash "${target}" "$@" || exit_code=$?
+    if [[ -n "${BOOTSTRAP_TMPDIR}" ]]; then
+        # Keep rustc/linker scratch files beside the disk-backed clone as well.
+        TMPDIR="${BOOTSTRAP_TMPDIR}" bash "${target}" "$@" || exit_code=$?
+    else
+        bash "${target}" "$@" || exit_code=$?
+    fi
     exit "${exit_code}"
 }
 

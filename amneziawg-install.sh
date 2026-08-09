@@ -2133,42 +2133,581 @@ function sanitizeAwgDkmsConf() {
 	done
 }
 
-# Install kernel headers for the running kernel so DKMS can compile the module.
+function aptPackageIsInstalled() {
+	dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q '^install ok installed$'
+}
+
+function ubuntuKernelTrackMatchesFlavor() {
+	local TRACK="$1"
+	local FLAVOR="$2"
+
+	[[ "${TRACK}" == "${FLAVOR}" ]] || \
+		[[ "${TRACK}" =~ ^${FLAVOR}-(edge|(hwe|lts)-[0-9]{2}\.[0-9]{2}(-edge)?|[0-9]+\.[0-9]+)$ ]]
+}
+
+# A header track may be represented by its header meta-package, its image-only
+# meta-package, or the complete image+headers meta-package. Treat any of those
+# as evidence that this is the administrator-selected kernel track.
+function kernelHeaderTrackIsInstalled() {
+	local HEADER_META_PKG="$1"
+	local TRACK="${HEADER_META_PKG#linux-headers-}"
+	local VIRTUAL_TRACK
+
+	[[ "${HEADER_META_PKG}" =~ ^linux-headers-[a-z0-9][a-z0-9.+-]*$ ]] || return 1
+	if aptPackageIsInstalled "${HEADER_META_PKG}" || \
+			aptPackageIsInstalled "linux-image-${TRACK}" || \
+			aptPackageIsInstalled "linux-${TRACK}"; then
+		return 0
+	fi
+
+	# Ubuntu virtual kernels use the generic ABI suffix. Treat their image/full
+	# meta-packages as evidence for the corresponding generic header track.
+	if [[ "${OS:-}" == 'ubuntu' ]] && ubuntuKernelTrackMatchesFlavor "${TRACK}" 'generic'; then
+		VIRTUAL_TRACK="virtual${TRACK#generic}"
+		aptPackageIsInstalled "linux-image-${VIRTUAL_TRACK}" || \
+			aptPackageIsInstalled "linux-${VIRTUAL_TRACK}"
+	else
+		return 1
+	fi
+}
+
+# Ask APT which header meta-package depends on the exact running-kernel
+# package. This correctly distinguishes Ubuntu GA/HWE/cloud families and
+# Debian flavors without guessing from architecture alone.
+function getAptKernelHeaderMetaPackage() {
+	local CURRENT_HEADER_PKG="linux-headers-${1:-$(uname -r)}"
+	local RDEPEND
+	local EXISTING
+	local SEEN
+	local -a CANDIDATES=()
+	local -a INSTALLED_CANDIDATES=()
+
+	command -v apt-cache &>/dev/null || return 1
+	while read -r RDEPEND; do
+		RDEPEND="${RDEPEND#|}"
+		if [[ "${RDEPEND}" != "${CURRENT_HEADER_PKG}" ]] && \
+				[[ "${RDEPEND}" =~ ^linux-headers-[a-z0-9][a-z0-9.+-]*$ ]]; then
+			SEEN=0
+			for EXISTING in "${CANDIDATES[@]}"; do
+				if [[ "${EXISTING}" == "${RDEPEND}" ]]; then
+					SEEN=1
+					break
+				fi
+			done
+			[[ "${SEEN}" -eq 1 ]] || CANDIDATES+=("${RDEPEND}")
+		fi
+	done < <(apt-cache rdepends "${CURRENT_HEADER_PKG}" 2>/dev/null)
+
+	[[ "${#CANDIDATES[@]}" -gt 0 ]] || return 1
+
+	# Preserve an already selected kernel family when more than one meta-package
+	# points at the same ABI (for example normal and edge HWE tracks). The image
+	# meta is important when headers have not been installed yet.
+	for RDEPEND in "${CANDIDATES[@]}"; do
+		if kernelHeaderTrackIsInstalled "${RDEPEND}"; then
+			INSTALLED_CANDIDATES+=("${RDEPEND}")
+		fi
+	done
+	if [[ "${#INSTALLED_CANDIDATES[@]}" -gt 0 ]]; then
+		[[ "${#INSTALLED_CANDIDATES[@]}" -eq 1 ]] || return 1
+		printf '%s\n' "${INSTALLED_CANDIDATES[0]}"
+		return 0
+	fi
+
+	# Without installed evidence, select a unique candidate. Preserve the old
+	# stable preference only for the exact pair {X, X-edge}; any other set may
+	# span different kernel families and must not depend on apt-cache ordering.
+	if [[ "${#CANDIDATES[@]}" -eq 1 ]]; then
+		printf '%s\n' "${CANDIDATES[0]}"
+		return 0
+	fi
+	if [[ "${#CANDIDATES[@]}" -eq 2 ]]; then
+		if [[ "${CANDIDATES[0]}" != *-edge ]] && \
+				[[ "${CANDIDATES[1]}" == "${CANDIDATES[0]}-edge" ]]; then
+			printf '%s\n' "${CANDIDATES[0]}"
+			return 0
+		fi
+		if [[ "${CANDIDATES[1]}" != *-edge ]] && \
+				[[ "${CANDIDATES[0]}" == "${CANDIDATES[1]}-edge" ]]; then
+			printf '%s\n' "${CANDIDATES[1]}"
+			return 0
+		fi
+	fi
+	return 1
+}
+
+# Derive an Ubuntu header meta-package from an installed image meta-package.
+# Complete kernel meta-packages depend on their corresponding image metas, so
+# image metas cover both installation styles without matching ABI-specific
+# support packages. This remains reliable when apt-cache no longer exposes a
+# reverse dependency for the currently running (older) ABI after an index
+# refresh. Ambiguous multiple tracks are rejected rather than guessed.
+function getInstalledUbuntuKernelHeaderMetaPackage() {
+	local KERNEL_VER="${1:-$(uname -r)}"
+	local FLAVOR
+	local PACKAGE
+	local STATUS
+	local TRACK
+	local HEADER_META
+	local EXISTING
+	local MATCHED
+	local SEEN
+	local -a FLAVORS=()
+	local -a IMAGE_META_PATTERNS=()
+	local -a CANDIDATES=()
+
+	case "${KERNEL_VER}" in
+		*-generic-64k) FLAVORS=("generic-64k") ;;
+		*-generic) FLAVORS=("generic" "virtual") ;;
+		*-lowlatency) FLAVORS=("lowlatency") ;;
+		*-aws) FLAVORS=("aws") ;;
+		*-azure) FLAVORS=("azure") ;;
+		*-gcp) FLAVORS=("gcp") ;;
+		*-gke) FLAVORS=("gke") ;;
+		# ibm-classic installs the same *-ibm ABI under a distinct meta track.
+		*-ibm) FLAVORS=("ibm" "ibm-classic") ;;
+		*-kvm) FLAVORS=("kvm") ;;
+		*-oracle) FLAVORS=("oracle") ;;
+		*) return 1 ;;
+	esac
+	for FLAVOR in "${FLAVORS[@]}"; do
+		IMAGE_META_PATTERNS+=("linux-image-${FLAVOR}*")
+	done
+
+	while IFS=$'\t' read -r PACKAGE STATUS; do
+		[[ "${STATUS}" == 'install ok installed' ]] || continue
+		PACKAGE="${PACKAGE%%:*}"
+		[[ "${PACKAGE}" == linux-image-* ]] || continue
+		TRACK="${PACKAGE#linux-image-}"
+
+		# Restrict prefix globs to real compatible image-meta naming schemes.
+		# In particular, generic must not accept generic-64k.
+		MATCHED=0
+		for FLAVOR in "${FLAVORS[@]}"; do
+			if ubuntuKernelTrackMatchesFlavor "${TRACK}" "${FLAVOR}"; then
+				MATCHED=1
+				break
+			fi
+		done
+		[[ "${MATCHED}" -eq 1 ]] || continue
+		HEADER_META="linux-headers-${TRACK}"
+		[[ "${HEADER_META}" =~ ^linux-headers-[a-z0-9][a-z0-9.+-]*$ ]] || continue
+
+		SEEN=0
+		for EXISTING in "${CANDIDATES[@]}"; do
+			if [[ "${EXISTING}" == "${HEADER_META}" ]]; then
+				SEEN=1
+				break
+			fi
+		done
+		[[ "${SEEN}" -eq 1 ]] || CANDIDATES+=("${HEADER_META}")
+	done < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' \
+		"${IMAGE_META_PATTERNS[@]}" 2>/dev/null)
+
+	[[ "${#CANDIDATES[@]}" -eq 1 ]] || return 1
+	printf '%s\n' "${CANDIDATES[0]}"
+}
+
+# Return the header-package prefix for the installed official Debian image that
+# owns a kernel release. Debian 11 also ships parallel versioned source tracks
+# such as linux-6.1 / linux-signed-6.1-amd64; preserve that series in the
+# corresponding linux-headers-6.1-* meta-package.
+function getInstalledDebianKernelHeaderPrefix() {
+	local KERNEL_VER="$1"
+	local DEB_ARCH="$2"
+	local IMAGE_PKG
+	local PACKAGE_INFO
+	local SOURCE_PKG
+	local STATUS
+	local ERROR_FLAG
+
+	# dpkg-query treats package names as patterns, so reject metacharacters and
+	# other characters that cannot occur in an official Debian kernel release.
+	[[ "${KERNEL_VER}" =~ ^[a-z0-9][a-z0-9.+~-]*$ ]] || return 1
+
+	for IMAGE_PKG in "linux-image-${KERNEL_VER}" "linux-image-${KERNEL_VER}-unsigned"; do
+		if ! PACKAGE_INFO=$(dpkg-query -W \
+				-f='${source:Package}|${db:Status-Status}|${db:Status-Eflag}\n' \
+				"${IMAGE_PKG}" 2>/dev/null); then
+			continue
+		fi
+
+		IFS='|' read -r SOURCE_PKG STATUS ERROR_FLAG <<< "${PACKAGE_INFO}"
+		[[ "${STATUS}" == 'installed' ]] && [[ "${ERROR_FLAG}" == 'ok' ]] || continue
+
+		if [[ "${SOURCE_PKG}" == 'linux' ]] || \
+				[[ "${SOURCE_PKG}" == "linux-signed-${DEB_ARCH}" ]]; then
+			printf '%s\n' 'linux-headers'
+			return 0
+		fi
+
+		if [[ "${SOURCE_PKG}" =~ ^linux-([0-9]+(\.[0-9]+)*)$ ]] || \
+				[[ "${SOURCE_PKG}" =~ ^linux-signed-([0-9]+(\.[0-9]+)*)-${DEB_ARCH}$ ]]; then
+			printf '%s\n' "linux-headers-${BASH_REMATCH[1]}"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+# Return the installed exact Debian image package and its binary version. The
+# binary version (unlike a signed source-package version) can be compared with
+# header meta-package versions exposed by APT.
+function getInstalledDebianKernelImagePackageVersion() {
+	local KERNEL_VER="$1"
+	local IMAGE_PKG
+	local PACKAGE_INFO
+	local IMAGE_VERSION
+	local STATUS
+	local ERROR_FLAG
+
+	[[ "${KERNEL_VER}" =~ ^[a-z0-9][a-z0-9.+~-]*$ ]] || return 1
+
+	for IMAGE_PKG in "linux-image-${KERNEL_VER}" "linux-image-${KERNEL_VER}-unsigned"; do
+		if ! PACKAGE_INFO=$(dpkg-query -W \
+				-f='${Version}|${db:Status-Status}|${db:Status-Eflag}\n' \
+				"${IMAGE_PKG}" 2>/dev/null); then
+			continue
+		fi
+
+		IFS='|' read -r IMAGE_VERSION STATUS ERROR_FLAG <<< "${PACKAGE_INFO}"
+		[[ "${STATUS}" == 'installed' ]] && [[ "${ERROR_FLAG}" == 'ok' ]] || continue
+		[[ "${IMAGE_VERSION}" =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]*$ ]] || continue
+		printf '%s|%s\n' "${IMAGE_PKG}" "${IMAGE_VERSION}"
+		return 0
+	done
+
+	return 1
+}
+
+# A Debian backports kernel can share its rolling meta-package name with
+# stable, while backports has a lower default APT priority. Resolve the unique
+# available meta-package version from the same ~bpoN lineage and install that
+# version explicitly. If the lineage cannot be proven, decline to claim future
+# header tracking rather than allowing APT to choose the stable package.
+function getDebianKernelHeaderMetaInstallSpec() {
+	local KERNEL_VER="$1"
+	local HEADER_META_PKG="$2"
+	local IMAGE_INFO
+	local IMAGE_PKG
+	local IMAGE_VERSION
+	local BACKPORT_RELEASE
+	local PACKAGE_INFO
+	local INSTALLED_META_VERSION
+	local WANT
+	local STATUS
+	local ERROR_FLAG
+	local MADISON_PACKAGE
+	local MADISON_VERSION
+	local MADISON_SOURCE
+	local MADISON_SUITE
+	local ORIGIN_SUITE
+	local EXISTING
+	local SEEN
+	local -a IMAGE_SUITES=()
+	local -a META_SUITES=()
+	local -a CANDIDATE_VERSIONS=()
+
+	[[ "${HEADER_META_PKG}" =~ ^[a-z0-9][a-z0-9.+-]*$ ]] || return 1
+
+	if ! IMAGE_INFO=$(getInstalledDebianKernelImagePackageVersion "${KERNEL_VER}"); then
+		# Raspberry Pi OS tracks do not use Debian's shared stable/backports
+		# package names. Ordinary Debian metas require exact image provenance.
+		case "${HEADER_META_PKG}" in
+			raspberrypi-kernel-headers|linux-headers-rpi-v6|linux-headers-rpi-v7|linux-headers-rpi-v7l|linux-headers-rpi-v8|linux-headers-rpi-2712|linux-headers-rpi-v8-rt)
+				printf '%s\n' "${HEADER_META_PKG}"
+				return 0
+				;;
+			*) return 1 ;;
+		esac
+	fi
+	IMAGE_PKG="${IMAGE_INFO%%|*}"
+	IMAGE_VERSION="${IMAGE_INFO#*|}"
+
+	if [[ ! "${IMAGE_VERSION}" =~ ~bpo([0-9]+)([+u][0-9]+|$) ]]; then
+		printf '%s\n' "${HEADER_META_PKG}"
+		return 0
+	fi
+	BACKPORT_RELEASE="${BASH_REMATCH[1]}"
+
+	command -v apt-cache &>/dev/null || return 1
+	# First prove the exact suite that supplied the installed image. Regular
+	# backports and backports-sloppy share the same ~bpoN version lineage.
+	while IFS='|' read -r MADISON_PACKAGE MADISON_VERSION MADISON_SOURCE; do
+		MADISON_PACKAGE="${MADISON_PACKAGE#"${MADISON_PACKAGE%%[![:space:]]*}"}"
+		MADISON_PACKAGE="${MADISON_PACKAGE%"${MADISON_PACKAGE##*[![:space:]]}"}"
+		MADISON_VERSION="${MADISON_VERSION#"${MADISON_VERSION%%[![:space:]]*}"}"
+		MADISON_VERSION="${MADISON_VERSION%"${MADISON_VERSION##*[![:space:]]}"}"
+		[[ "${MADISON_PACKAGE}" == "${IMAGE_PKG}" ]] || continue
+		[[ "${MADISON_VERSION}" == "${IMAGE_VERSION}" ]] || continue
+		[[ "${MADISON_SOURCE}" =~ (^|[[:space:]])([a-z0-9][a-z0-9.+-]*-backports(-sloppy)?)/[a-z0-9][a-z0-9.+-]*([[:space:]]|$) ]] || continue
+		MADISON_SUITE="${BASH_REMATCH[2]}"
+
+		SEEN=0
+		for EXISTING in "${IMAGE_SUITES[@]}"; do
+			if [[ "${EXISTING}" == "${MADISON_SUITE}" ]]; then
+				SEEN=1
+				break
+			fi
+		done
+		[[ "${SEEN}" -eq 1 ]] || IMAGE_SUITES+=("${MADISON_SUITE}")
+	done < <(LC_ALL=C apt-cache madison "${IMAGE_PKG}" 2>/dev/null)
+
+	[[ "${#IMAGE_SUITES[@]}" -eq 1 ]] || return 1
+	ORIGIN_SUITE="${IMAGE_SUITES[0]}"
+
+	# Select one current meta version from that exact suite. Also count other
+	# backports suites so a shared version cannot hide regular/sloppy ambiguity.
+	while IFS='|' read -r MADISON_PACKAGE MADISON_VERSION MADISON_SOURCE; do
+		MADISON_PACKAGE="${MADISON_PACKAGE#"${MADISON_PACKAGE%%[![:space:]]*}"}"
+		MADISON_PACKAGE="${MADISON_PACKAGE%"${MADISON_PACKAGE##*[![:space:]]}"}"
+		MADISON_VERSION="${MADISON_VERSION#"${MADISON_VERSION%%[![:space:]]*}"}"
+		MADISON_VERSION="${MADISON_VERSION%"${MADISON_VERSION##*[![:space:]]}"}"
+		[[ "${MADISON_PACKAGE}" == "${HEADER_META_PKG}" ]] || continue
+		[[ "${MADISON_VERSION}" =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]*$ ]] || continue
+		[[ "${MADISON_VERSION}" =~ ~bpo${BACKPORT_RELEASE}([+u][0-9]+|$) ]] || continue
+		[[ "${MADISON_SOURCE}" =~ (^|[[:space:]])([a-z0-9][a-z0-9.+-]*-backports(-sloppy)?)/[a-z0-9][a-z0-9.+-]*([[:space:]]|$) ]] || continue
+		MADISON_SUITE="${BASH_REMATCH[2]}"
+
+		SEEN=0
+		for EXISTING in "${META_SUITES[@]}"; do
+			if [[ "${EXISTING}" == "${MADISON_SUITE}" ]]; then
+				SEEN=1
+				break
+			fi
+		done
+		[[ "${SEEN}" -eq 1 ]] || META_SUITES+=("${MADISON_SUITE}")
+
+		[[ "${MADISON_SUITE}" == "${ORIGIN_SUITE}" ]] || continue
+		SEEN=0
+		for EXISTING in "${CANDIDATE_VERSIONS[@]}"; do
+			if [[ "${EXISTING}" == "${MADISON_VERSION}" ]]; then
+				SEEN=1
+				break
+			fi
+		done
+		[[ "${SEEN}" -eq 1 ]] || CANDIDATE_VERSIONS+=("${MADISON_VERSION}")
+	done < <(LC_ALL=C apt-cache madison "${HEADER_META_PKG}" 2>/dev/null)
+
+	[[ "${#META_SUITES[@]}" -eq 1 ]] || return 1
+	[[ "${META_SUITES[0]}" == "${ORIGIN_SUITE}" ]] || return 1
+	[[ "${#CANDIDATE_VERSIONS[@]}" -eq 1 ]] || return 1
+
+	# Never claim future tracking for a held meta, or force an installed
+	# newer/different track backward. An older stable meta can still be upgraded
+	# to the proven backports candidate.
+	if PACKAGE_INFO=$(dpkg-query -W \
+			-f='${Version}|${db:Status-Want}|${db:Status-Status}|${db:Status-Eflag}\n' \
+			"${HEADER_META_PKG}" 2>/dev/null); then
+		IFS='|' read -r INSTALLED_META_VERSION WANT STATUS ERROR_FLAG <<< "${PACKAGE_INFO}"
+		[[ "${INSTALLED_META_VERSION}" =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]*$ ]] || return 1
+		if [[ "${STATUS}" == 'installed' ]] && [[ "${ERROR_FLAG}" == 'ok' ]]; then
+			[[ "${WANT}" == 'install' ]] || return 1
+			if dpkg --compare-versions "${INSTALLED_META_VERSION}" gt "${CANDIDATE_VERSIONS[0]}"; then
+				return 1
+			fi
+		fi
+	fi
+	printf '%s=%s\n' "${HEADER_META_PKG}" "${CANDIDATE_VERSIONS[0]}"
+}
+
+# Return a rolling header package when APT reverse-dependency metadata is not
+# available. Installing only linux-headers-$(uname -r) is enough for today's
+# DKMS build, but the rolling package is what keeps headers on APT's future
+# kernel-upgrade path.
+function getKernelHeaderMetaPackage() {
+	local KERNEL_VER="${1:-$(uname -r)}"
+	local APT_META
+	local INSTALLED_META
+	local DEB_ARCH
+	local DEB_HEADER_FLAVOR
+	local DEB_HEADER_PREFIX
+	local RPI_FLAVOR
+
+	if APT_META=$(getAptKernelHeaderMetaPackage "${KERNEL_VER}"); then
+		printf '%s\n' "${APT_META}"
+		return 0
+	fi
+
+	if [[ "${OS}" == 'debian' ]]; then
+		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) || return 1
+
+		# Raspberry Pi OS Bookworm tracks have per-flavor rolling headers.
+		# Accept only its current +rpt-rpi-* and early -rpiN-rpi-* release
+		# formats before applying the general Debian suffix fallbacks below.
+		if [[ "${KERNEL_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+rpt-rpi-(v6|v7|v7l|v8|2712|v8-rt)$ ]] || \
+				[[ "${KERNEL_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rpi[0-9]+-rpi-(v6|v7|v7l|v8|2712|v8-rt)$ ]]; then
+			RPI_FLAVOR="${BASH_REMATCH[1]}"
+			printf '%s\n' "linux-headers-rpi-${RPI_FLAVOR}"
+			return 0
+		fi
+
+		if [[ "${KERNEL_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-v(6|7|7l|8)\+$ ]]; then
+			printf '%s\n' 'raspberrypi-kernel-headers'
+			return 0
+		fi
+
+		case "${KERNEL_VER}" in
+			*+rpt-rpi|*-rpi[0-9]*-rpi|*-rpi-*) return 1 ;;
+			*-rpi)
+				[[ "${DEB_ARCH}" == 'armel' ]] || return 1
+				DEB_HEADER_FLAVOR='rpi'
+				;;
+			*-cloud-"${DEB_ARCH}")
+				case "${DEB_ARCH}" in
+					amd64|arm64) DEB_HEADER_FLAVOR="cloud-${DEB_ARCH}" ;;
+					*) return 1 ;;
+				esac
+				;;
+			*-rt-"${DEB_ARCH}")
+				case "${DEB_ARCH}" in
+					amd64|arm64) DEB_HEADER_FLAVOR="rt-${DEB_ARCH}" ;;
+					*) return 1 ;;
+				esac
+				;;
+			*-arm64-16k)
+				[[ "${DEB_ARCH}" == 'arm64' ]] || return 1
+				DEB_HEADER_FLAVOR='arm64-16k'
+				;;
+			*-powerpc64le-64k)
+				[[ "${DEB_ARCH}" == 'ppc64el' ]] || return 1
+				DEB_HEADER_FLAVOR='powerpc64le-64k'
+				;;
+			*-powerpc64le)
+				[[ "${DEB_ARCH}" == 'ppc64el' ]] || return 1
+				DEB_HEADER_FLAVOR='powerpc64le'
+				;;
+			*-rt-armmp)
+				[[ "${DEB_ARCH}" == 'armhf' ]] || return 1
+				DEB_HEADER_FLAVOR='rt-armmp'
+				;;
+			*-armmp-lpae)
+				[[ "${DEB_ARCH}" == 'armhf' ]] || return 1
+				DEB_HEADER_FLAVOR='armmp-lpae'
+				;;
+			*-armmp)
+				[[ "${DEB_ARCH}" == 'armhf' ]] || return 1
+				DEB_HEADER_FLAVOR='armmp'
+				;;
+			*-rt-686-pae)
+				[[ "${DEB_ARCH}" == 'i386' ]] || return 1
+				DEB_HEADER_FLAVOR='rt-686-pae'
+				;;
+			*-686-pae)
+				[[ "${DEB_ARCH}" == 'i386' ]] || return 1
+				DEB_HEADER_FLAVOR='686-pae'
+				;;
+			*-686)
+				[[ "${DEB_ARCH}" == 'i386' ]] || return 1
+				DEB_HEADER_FLAVOR='686'
+				;;
+			*-"${DEB_ARCH}")
+				case "${DEB_ARCH}" in
+					amd64|arm64|riscv64|s390x) DEB_HEADER_FLAVOR="${DEB_ARCH}" ;;
+					*) return 1 ;;
+				esac
+				;;
+			*) return 1 ;;
+		esac
+
+		DEB_HEADER_PREFIX=$(getInstalledDebianKernelHeaderPrefix \
+			"${KERNEL_VER}" "${DEB_ARCH}") || return 1
+		printf '%s\n' "${DEB_HEADER_PREFIX}-${DEB_HEADER_FLAVOR}"
+	elif [[ "${OS}" == 'ubuntu' ]]; then
+		if INSTALLED_META=$(getInstalledUbuntuKernelHeaderMetaPackage "${KERNEL_VER}"); then
+			printf '%s\n' "${INSTALLED_META}"
+			return 0
+		fi
+
+		case "${KERNEL_VER}" in
+			# These suffixes are shared by unversioned, edge, HWE/LTS, and
+			# version-pinned tracks. Without package metadata, selecting one
+			# is unsafe.
+			*-generic-64k|*-generic|*-lowlatency|*-aws|*-azure|*-gcp|*-gke|*-ibm|*-kvm|*-oracle) return 1 ;;
+			*-raspi*) printf '%s\n' "linux-headers-raspi" ;;
+			*) return 1 ;;
+		esac
+	else
+		return 1
+	fi
+}
+
+function kernelHeadersAreAvailableForVersion() {
+	local KERNEL_VER="${1:-$(uname -r)}"
+	[[ -f "/lib/modules/${KERNEL_VER}/build/Makefile" ]]
+}
+
+# Install headers for both the running kernel and future kernel upgrades.
 # $1 – kernel version string; defaults to the running kernel (uname -r).
 # For APT-based systems the caller must have already activated enable_apt_ipv4.
 function installKernelHeaders() {
 	local KERNEL_VER="${1:-$(uname -r)}"
-	if [[ "${OS}" == 'ubuntu' ]]; then
-		local HEADER_INSTALLED=0
-		local HEADER_CANDIDATES=("linux-headers-${KERNEL_VER}" "raspberrypi-kernel-headers" "linux-headers-generic")
-		local HDR_PKG
-		for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
-			if apt-get install -y "${HDR_PKG}"; then
-				HEADER_INSTALLED=1
-				break
+	if [[ "${OS}" == 'ubuntu' ]] || [[ "${OS}" == 'debian' ]]; then
+		local CURRENT_HEADER_INSTALLED=0
+		local CURRENT_HEADER_PKG="linux-headers-${KERNEL_VER}"
+		local META_HEADER_PKG=""
+		local META_HEADER_INSTALL_SPEC=""
+		local META_ATTEMPTED=0
+		local ROLLING_HEADER_INSTALLED=0
+
+		if META_HEADER_PKG=$(getKernelHeaderMetaPackage "${KERNEL_VER}" 2>/dev/null) && \
+				[[ -n "${META_HEADER_PKG}" ]]; then
+			if [[ "${OS}" == 'debian' ]]; then
+				META_HEADER_INSTALL_SPEC=$(getDebianKernelHeaderMetaInstallSpec \
+					"${KERNEL_VER}" "${META_HEADER_PKG}" 2>/dev/null) || META_HEADER_INSTALL_SPEC=""
 			else
-				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HDR_PKG}'. Trying next candidate...${NC}"
+				META_HEADER_INSTALL_SPEC="${META_HEADER_PKG}"
 			fi
-		done
-		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
-			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
+		else
+			META_HEADER_PKG=""
 		fi
-	elif [[ "${OS}" == 'debian' ]]; then
-		local HEADER_INSTALLED=0
-		local HEADER_CANDIDATES=("linux-headers-${KERNEL_VER}" "raspberrypi-kernel-headers")
-		local DEB_ARCH
-		DEB_ARCH=$(dpkg --print-architecture 2>/dev/null) && HEADER_CANDIDATES+=("linux-headers-${DEB_ARCH}")
-		local HDR_PKG
-		for HDR_PKG in "${HEADER_CANDIDATES[@]}"; do
-			if apt-get install -y "${HDR_PKG}"; then
-				HEADER_INSTALLED=1
-				break
-			else
-				echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${HDR_PKG}'. Trying next candidate...${NC}"
+		if [[ -z "${META_HEADER_INSTALL_SPEC}" ]]; then
+			META_HEADER_PKG=""
+			echo -e "${ORANGE}WARNING: Could not determine a safe rolling kernel header meta-package for '${KERNEL_VER}'. The installer will still try headers for the running kernel, but future kernel upgrades may require installing matching headers manually.${NC}" >&2
+		fi
+
+		if apt-get install -y "${CURRENT_HEADER_PKG}"; then
+			CURRENT_HEADER_INSTALLED=1
+		else
+			echo -e "${ORANGE}WARNING: Failed to install kernel headers package '${CURRENT_HEADER_PKG}'. Trying alternate header packages...${NC}"
+
+			# Raspberry Pi kernels commonly use one rolling header package instead
+			# of a versioned linux-headers-$(uname -r) package.
+			if [[ "${META_HEADER_PKG}" == 'raspberrypi-kernel-headers' ]]; then
+				META_ATTEMPTED=1
+				if apt-get install -y raspberrypi-kernel-headers; then
+					ROLLING_HEADER_INSTALLED=1
+				else
+					echo -e "${ORANGE}WARNING: Failed to install kernel headers package 'raspberrypi-kernel-headers'.${NC}"
+				fi
 			fi
-		done
-		if [[ "${HEADER_INSTALLED}" -ne 1 ]]; then
-			echo -e "${ORANGE}WARNING: Failed to install any suitable kernel headers package. DKMS module build may fail; continuing, but the amneziawg kernel module might not be available until headers are installed and the module is rebuilt.${NC}"
+		fi
+
+		# This is deliberately independent of the running-kernel install above:
+		# even when the exact package succeeds, the meta-package is what pulls in
+		# matching headers during future APT kernel upgrades.
+		if [[ -n "${META_HEADER_PKG}" ]] && \
+				[[ "${META_HEADER_PKG}" != "${CURRENT_HEADER_PKG}" ]] && \
+				[[ "${META_ATTEMPTED}" -eq 0 ]]; then
+			if apt-get install -y "${META_HEADER_INSTALL_SPEC}"; then
+				ROLLING_HEADER_INSTALLED=1
+			else
+				echo -e "${ORANGE}WARNING: Failed to install kernel header meta-package '${META_HEADER_INSTALL_SPEC}'. The current kernel may work, but a future kernel upgrade could require installing matching headers manually.${NC}"
+			fi
+		fi
+
+		if [[ "${CURRENT_HEADER_INSTALLED}" -ne 1 ]] && \
+				kernelHeadersAreAvailableForVersion "${KERNEL_VER}"; then
+			CURRENT_HEADER_INSTALLED=1
+		fi
+
+		if [[ "${CURRENT_HEADER_INSTALLED}" -ne 1 ]]; then
+			if [[ "${ROLLING_HEADER_INSTALLED}" -eq 1 ]]; then
+				echo -e "${ORANGE}WARNING: A rolling kernel header meta-package was installed, but headers for the running kernel (${KERNEL_VER}) remain unavailable. DKMS module build may fail until matching headers are installed and the module is rebuilt.${NC}"
+			else
+				echo -e "${ORANGE}WARNING: Failed to install headers for the running kernel (${KERNEL_VER}). DKMS module build may fail; continuing, but the amneziawg kernel module might not be available until matching headers are installed and the module is rebuilt.${NC}"
+			fi
 		fi
 	elif [[ "${OS}" == 'fedora' ]] || [[ "${OS}" == 'centos' ]] || [[ "${OS}" == 'almalinux' ]] || [[ "${OS}" == 'rocky' ]]; then
 		if ! dnf install -y "kernel-devel-${KERNEL_VER}"; then
