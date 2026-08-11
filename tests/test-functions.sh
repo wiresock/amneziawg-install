@@ -1164,11 +1164,13 @@ NIAC_CUSTOM_CONFIG_DIR="${NIAC_WEB_ROOT}/custom-clients"
 NIAC_CUSTOM_STATE_DIR="${NIAC_WEB_ROOT}/custom-state"
 mkdir -p "${NIAC_CUSTOM_STATE_DIR}"
 cat > "${NIAC_WEB_ROOT}/custom.env" <<EOF
-AWG_WEB_DB=${NIAC_CUSTOM_STATE_DIR}/awg-web.db
+AWG_WEB_DB=sqlite://${NIAC_CUSTOM_STATE_DIR}/awg-web.db
 AWG_CONFIG_DIR=${NIAC_CUSTOM_CONFIG_DIR}
 EOF
 cat > "${NIAC_WEB_ROOT}/amneziawg-web.service" <<EOF
 [Service]
+Environment=AWG_WEB_DB=${NIAC_LOCK_DIR}/ignored.db
+Environment=AWG_CONFIG_DIR=${NIAC_LOCK_DIR}/ignored-clients
 EnvironmentFile=${NIAC_WEB_ROOT}/custom.env
 EOF
 WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_DIR}"
@@ -1189,12 +1191,35 @@ assert_rc 1 acquireClientLifecycleLock
 assert_eq "false" "$([[ -e "${NIAC_CUSTOM_STATE_DIR}" ]] && echo true || echo false)" \
 	"root CLI does not recreate a missing panel state directory"
 
+# Inline unit settings are supported too. Relative database paths resolve from
+# WorkingDirectory, and an unreferenced environment file is ignored.
+NIAC_INLINE_WORK_DIR="${NIAC_WEB_ROOT}/inline-work"
+NIAC_INLINE_STATE_DIR="${NIAC_INLINE_WORK_DIR}/relative-state"
+NIAC_INLINE_CONFIG_DIR="${NIAC_WEB_ROOT}/inline-clients"
+mkdir -p "${NIAC_INLINE_STATE_DIR}"
+WEB_PANEL_ENV_FILE="${NIAC_WEB_ROOT}/custom.env"
+cat > "${NIAC_WEB_ROOT}/amneziawg-web.service" <<EOF
+[Service]
+WorkingDirectory=${NIAC_INLINE_WORK_DIR}
+Environment="AWG_WEB_DB=sqlite:relative-state/awg-web.db"
+Environment=AWG_CONFIG_DIR=${NIAC_INLINE_CONFIG_DIR}
+EOF
+assert_eq "${NIAC_INLINE_STATE_DIR}" "$(resolveClientLifecycleLockDir)" \
+	"inline relative database path resolves from WorkingDirectory"
+assert_eq "${NIAC_INLINE_CONFIG_DIR}" "$(resolveWebPanelConfigDir)" \
+	"inline client config directory is discovered"
+exec {NIAC_HELD_LOCK_FD}< "${NIAC_INLINE_STATE_DIR}"
+flock -xn "${NIAC_HELD_LOCK_FD}"
+assert_rc 1 _client_lock_must_be_busy
+exec {NIAC_HELD_LOCK_FD}>&-
+
 WEB_PANEL_CONFIG_DIR="${NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR}"
 WEB_PANEL_ENV_FILE="${NIAC_ORIGINAL_WEB_PANEL_ENV_FILE}"
 WEB_PANEL_SYSTEMD_UNIT="${NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT}"
 rm -rf "${NIAC_LOCK_DIR}"
 rm -rf "${NIAC_WEB_ROOT}"
 unset NIAC_LOCK_DIR NIAC_LOCK_LINK NIAC_CUSTOM_CONFIG_DIR NIAC_CUSTOM_STATE_DIR NIAC_WEB_ROOT
+unset NIAC_INLINE_WORK_DIR NIAC_INLINE_STATE_DIR NIAC_INLINE_CONFIG_DIR
 unset NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_ORIGINAL_WEB_PANEL_ENV_FILE
 unset NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT NIAC_HELD_LOCK_FD
 unset -f _client_lock_must_be_busy

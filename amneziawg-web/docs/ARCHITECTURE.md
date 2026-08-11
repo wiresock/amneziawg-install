@@ -77,12 +77,14 @@ the same lock, and atomically replaces the config.  Arbitrary config
 content, raw file reads, arbitrary `syncconf` stdin, and unknown operations are
 rejected rather than forwarded.
 
-The web panel holds an advisory lock on the open client-config directory across
-the complete managed-client lifecycle, including database persistence and
-client-config cleanup. Supported installer `--add-client` and `--remove-client`
-operations lock the same directory descriptor, preventing an out-of-band
-same-name replacement from appearing inside a web lifecycle operation without
-introducing a mutable lock pathname in the service-writable directory.
+The web panel holds an advisory lock on its open persistent state directory
+(the parent of the SQLite database) across the complete managed-client
+lifecycle, including database persistence and client-config cleanup. Supported
+installer `--add-client` and `--remove-client` operations resolve and lock the
+same directory descriptor from the installed service configuration. This inode
+remains available when the client-config directory is absent, prevents an
+out-of-band same-name replacement during web lifecycle work, and avoids a
+mutable lock pathname in a service-writable directory.
 
 ---
 

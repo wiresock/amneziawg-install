@@ -1688,25 +1688,81 @@ function resolveWebPanelEnvFile() {
 	printf '%s\n' "${env_file}"
 }
 
-# Resolve the web panel's active config directory without sourcing its env file.
-function resolveWebPanelConfigDir() {
-	local env_file configured_dir
+# Read one web-panel setting without evaluating shell syntax. EnvironmentFile
+# values override inline Environment= values, matching systemd semantics.
+function readWebPanelSetting() {
+	local setting_name="$1"
+	local env_file inline_assignment value="" use_env_file=1
 	env_file="$(resolveWebPanelEnvFile)" || return 1
+	if [[ -f "${WEB_PANEL_SYSTEMD_UNIT}" ]] && \
+		! grep -q '^[[:space:]]*EnvironmentFile=' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null; then
+		use_env_file=0
+	fi
 
-	if [[ -f "${env_file}" ]]; then
-		configured_dir="$(sed -n 's/^AWG_CONFIG_DIR=//p' "${env_file}" 2>/dev/null | tail -n 1)"
-		configured_dir="${configured_dir#\"}"
-		configured_dir="${configured_dir%\"}"
-		configured_dir="${configured_dir#\'}"
-		configured_dir="${configured_dir%\'}"
-		if [[ -n "${configured_dir}" ]]; then
-			if [[ "${configured_dir}" != /* || "${configured_dir}" =~ [[:space:][:cntrl:]] ]]; then
-				echo "ERROR: refusing unsafe AWG_CONFIG_DIR '${configured_dir}'" >&2
+	if [[ "${use_env_file}" -eq 1 && -f "${env_file}" ]] && \
+		grep -q "^[[:space:]]*${setting_name}=" "${env_file}" 2>/dev/null; then
+		value="$(sed -n "s/^[[:space:]]*${setting_name}=//p" "${env_file}" 2>/dev/null | tail -n 1)"
+	else
+		while IFS= read -r inline_assignment; do
+			if [[ "${inline_assignment}" != *"${setting_name}="* ]]; then
+				continue
+			fi
+			inline_assignment="${inline_assignment#\"}"
+			inline_assignment="${inline_assignment%\"}"
+			inline_assignment="${inline_assignment#\'}"
+			inline_assignment="${inline_assignment%\'}"
+			if [[ "${inline_assignment}" != "${setting_name}="* ]]; then
+				echo "ERROR: unsupported inline ${setting_name} assignment in '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
 				return 1
 			fi
-			printf '%s\n' "${configured_dir%/}"
-			return 0
+			value="${inline_assignment#*=}"
+		done < <(sed -n 's/^[[:space:]]*Environment=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null)
+	fi
+
+	value="${value#\"}"
+	value="${value%\"}"
+	value="${value#\'}"
+	value="${value%\'}"
+	printf '%s\n' "${value}"
+}
+
+# Resolve the service working directory used for relative database paths.
+function resolveWebPanelWorkingDirectory() {
+	local working_dir=""
+	if [[ -f "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		working_dir="$(sed -n 's/^[[:space:]]*WorkingDirectory=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null | tail -n 1)"
+		working_dir="${working_dir#-}"
+		working_dir="${working_dir#\"}"
+		working_dir="${working_dir%\"}"
+		working_dir="${working_dir#\'}"
+		working_dir="${working_dir%\'}"
+		working_dir="${working_dir:-/}"
+	else
+		working_dir="${WEB_PANEL_DATA_DIR}"
+	fi
+
+	if [[ "${working_dir}" != /* || "${working_dir}" =~ [[:space:][:cntrl:]] ]]; then
+		echo "ERROR: refusing unsafe web panel WorkingDirectory '${working_dir}'" >&2
+		return 1
+	fi
+	if [[ "${working_dir}" != "/" ]]; then
+		working_dir="${working_dir%/}"
+	fi
+	printf '%s\n' "${working_dir}"
+}
+
+# Resolve the web panel's active config directory without sourcing its env file.
+function resolveWebPanelConfigDir() {
+	local configured_dir
+	configured_dir="$(readWebPanelSetting AWG_CONFIG_DIR)" || return 1
+
+	if [[ -n "${configured_dir}" ]]; then
+		if [[ "${configured_dir}" != /* || "${configured_dir}" =~ [[:space:][:cntrl:]] ]]; then
+			echo "ERROR: refusing unsafe AWG_CONFIG_DIR '${configured_dir}'" >&2
+			return 1
 		fi
+		printf '%s\n' "${configured_dir%/}"
+		return 0
 	fi
 
 	printf '%s\n' "${WEB_PANEL_CONFIG_DIR%/}"
@@ -1717,28 +1773,42 @@ function resolveWebPanelConfigDir() {
 # client has been created yet. Standalone installer use (no panel env file)
 # retains the config-directory fallback.
 function resolveClientLifecycleLockDir() {
-	local env_file database_path
+	local env_file database_path working_dir database_parent
 	env_file="$(resolveWebPanelEnvFile)" || return 1
 
-	if [[ -f "${env_file}" ]]; then
-		database_path="$(sed -n 's/^AWG_WEB_DB=//p' "${env_file}" 2>/dev/null | tail -n 1)"
-		database_path="${database_path#\"}"
-		database_path="${database_path%\"}"
-		database_path="${database_path#\'}"
-		database_path="${database_path%\'}"
-		if [[ -n "${database_path}" ]]; then
-			if [[ "${database_path}" != /* || "${database_path}" =~ [[:space:][:cntrl:]] ]]; then
-				echo "ERROR: refusing unsafe AWG_WEB_DB '${database_path}'" >&2
-				return 1
-			fi
-			dirname -- "${database_path}"
-			return 0
-		fi
-		printf '%s\n' "${WEB_PANEL_DATA_DIR%/}"
-		return 0
+	if [[ ! -f "${env_file}" && ! -e "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		resolveWebPanelConfigDir
+		return
 	fi
 
-	resolveWebPanelConfigDir
+	database_path="$(readWebPanelSetting AWG_WEB_DB)" || return 1
+	database_path="${database_path:-awg-web.db}"
+	if [[ "${database_path}" =~ [[:space:][:cntrl:]] ]]; then
+		echo "ERROR: refusing unsafe AWG_WEB_DB '${database_path}'" >&2
+		return 1
+	fi
+	case "${database_path}" in
+		sqlite://*) database_path="${database_path#sqlite://}" ;;
+		sqlite:*) database_path="${database_path#sqlite:}" ;;
+	esac
+	database_path="${database_path%%\?*}"
+	working_dir="$(resolveWebPanelWorkingDirectory)" || return 1
+
+	if [[ -z "${database_path}" || "${database_path}" == ":memory:" ]]; then
+		printf '%s\n' "${working_dir}"
+		return 0
+	fi
+	database_parent="$(dirname -- "${database_path}")"
+	if [[ "${database_path}" == /* ]]; then
+		if [[ "${database_parent}" != "/" ]]; then
+			database_parent="${database_parent%/}"
+		fi
+		printf '%s\n' "${database_parent}"
+	elif [[ "${database_parent}" == "." ]]; then
+		printf '%s\n' "${working_dir}"
+	else
+		printf '%s/%s\n' "${working_dir%/}" "${database_parent}"
+	fi
 }
 
 # Copy a client config file to the web panel config directory so the panel

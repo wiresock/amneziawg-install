@@ -6144,6 +6144,7 @@ mod tests {
 
         let app = test_router(db.clone());
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("PATCH")
@@ -6151,6 +6152,20 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"display_name":"Changed","comment":"Changed comment","expiration_days":0}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"display_name":"Changed","comment":"Changed comment"}"#,
                     ))
                     .unwrap(),
             )
@@ -6202,6 +6217,7 @@ mod tests {
 
         let app = test_router(db.clone());
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -6210,6 +6226,18 @@ mod tests {
                     .body(Body::from(
                         "display_name=Changed&comment=Changed+comment&expiration_days=0",
                     ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/peers/{id}"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("display_name=Changed&comment=Changed+comment"))
                     .unwrap(),
             )
             .await

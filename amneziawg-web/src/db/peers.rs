@@ -357,6 +357,7 @@ pub async fn find_snapshots(
 ///
 /// Returns the updated `PeerRow`, or `None` if no peer with the given `id`
 /// exists.
+#[cfg(test)]
 pub async fn update_peer_metadata(
     pool: &SqlitePool,
     id: i64,
@@ -393,18 +394,19 @@ pub async fn update_peer_details(
     expiration_update: Option<Option<&str>>,
     managed_client_name: Option<&str>,
 ) -> Result<Option<PeerRow>, sqlx::Error> {
-    let Some(expires_at) = expiration_update else {
-        return update_peer_metadata(pool, id, display_name, comment).await;
-    };
+    let update_expiration = expiration_update.is_some();
+    let expires_at = expiration_update.flatten();
     let result = sqlx::query(
         "UPDATE peers
-         SET display_name = ?, comment = ?, expires_at = ?,
+         SET display_name = ?, comment = ?,
+             expires_at = CASE WHEN ? THEN ? ELSE expires_at END,
              managed_client_name = COALESCE(?, managed_client_name),
              updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND archived = 0 AND removal_pending = 0",
     )
     .bind(display_name)
     .bind(comment)
+    .bind(update_expiration)
     .bind(expires_at)
     .bind(managed_client_name)
     .bind(id)
@@ -1382,6 +1384,47 @@ mod tests {
             .await
             .expect("no db error");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_peer_details_keeps_omitted_expiration_and_rejects_pending_removal() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_DETAILS_REMOVING=", Some("Original")).await;
+        update_peer_expiration(&db.pool, id, Some("2026-08-18T12:00:00Z"), Some("alice"))
+            .await
+            .unwrap()
+            .expect("set expiration");
+
+        let updated = update_peer_details(
+            &db.pool,
+            id,
+            Some("Before removal"),
+            Some("Before removal comment"),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("metadata-only update");
+        assert_eq!(updated.expires_at.as_deref(), Some("2026-08-18T12:00:00Z"));
+
+        assert!(mark_removal_pending(&db.pool, id).await.unwrap());
+        assert!(update_peer_details(
+            &db.pool,
+            id,
+            Some("Changed"),
+            Some("Changed comment"),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+        let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("Before removal"));
+        assert_eq!(row.comment.as_deref(), Some("Before removal comment"));
+        assert_eq!(row.expires_at.as_deref(), Some("2026-08-18T12:00:00Z"));
     }
 
     // ── expiration ──────────────────────────────────────────────────────────
