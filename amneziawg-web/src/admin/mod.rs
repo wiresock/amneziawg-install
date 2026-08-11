@@ -21,10 +21,10 @@ use crate::domain::{normalize_comment, PublicKey};
 
 use self::client_manager::{acquire_lifecycle_lock, RemoveClientError};
 
-/// Serializes expiration edits with automated expiration cleanup. The native
-/// lifecycle lock still protects server/config rewrites; this lock closes the
-/// smaller in-process race between revalidating a deadline and starting that
-/// rewrite.
+/// Serializes expiration edits with creation metadata persistence and
+/// automated expiration cleanup. The native lifecycle lock still protects
+/// server/config rewrites; this lock closes the smaller in-process races at
+/// the database/lifecycle boundary.
 static EXPIRATION_STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn map_lock_error(err: std::io::Error) -> RemoveClientError {
@@ -184,8 +184,8 @@ pub async fn execute_suggest_ips(
 /// 4. Logs `user_created` or `user_create_failed`.
 ///
 /// The caller is responsible for triggering a config rescan after success.
-// The test-only native-result injection adds an eighth parameter; production
-// retains the existing seven-argument lifecycle boundary.
+// Test-only native-result and lock-acquisition injections extend this
+// boundary; production retains the existing seven parameters.
 #[cfg_attr(test, allow(clippy::too_many_arguments))]
 pub async fn execute_create_user(
     db: &Database,
@@ -196,6 +196,7 @@ pub async fn execute_create_user(
     actor: &str,
     ip_override: &client_manager::IpOverride,
     #[cfg(test)] create_result_override: Option<client_manager::CreateClientResult>,
+    #[cfg(test)] expiration_lock_acquired: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<CreateUserResult, client_manager::CreateClientError> {
     // Pre-validate name (fail fast for the UI).
     script_bridge::validate_client_name(name)?;
@@ -241,7 +242,16 @@ pub async fn execute_create_user(
         }
     };
 
-    // Keep a single lifecycle lock held across native creation and expiration
+    // Expiration state always precedes the native lifecycle lock. Keep both
+    // held through metadata persistence so an edit cannot land on a
+    // poller-created row and then be overwritten by the creation upsert.
+    let _expiration_guard = EXPIRATION_STATE_LOCK.lock().await;
+    #[cfg(test)]
+    if let Some(acquired) = expiration_lock_acquired {
+        let _ = acquired.send(());
+    }
+
+    // Keep a single lifecycle lock held across native creation and metadata
     // persistence. If the database write fails, rollback runs under the same
     // lock, so no concurrent add/remove can strand or replace this client.
     #[cfg(test)]
@@ -918,6 +928,7 @@ mod tests {
             "test-admin",
             &client_manager::IpOverride::default(),
             Some(created_client_result(true)),
+            None,
         )
         .await
         .expect("durable creation must remain a success");
@@ -978,6 +989,7 @@ mod tests {
             "test-admin",
             &client_manager::IpOverride::default(),
             Some(created_client_result(true)),
+            None,
         )
         .await;
 
@@ -1094,5 +1106,84 @@ mod tests {
         assert_eq!(persisted.comment.as_deref(), Some("Serialized comment"));
         assert_eq!(persisted.has_config, 1);
         assert_eq!(persisted.sync_pending, 1);
+    }
+
+    #[tokio::test]
+    async fn expiration_edit_waits_for_creation_metadata_persistence() {
+        let db = Database::connect_for_test().await.expect("connect");
+        sqlx::query(
+            "INSERT INTO peers (public_key, allowed_ips)
+             VALUES ('CREATED_PUBLIC_KEY=', '10.66.66.2/32')",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("seed poller-created peer");
+        let peer = find_by_public_key(&db.pool, "CREATED_PUBLIC_KEY=")
+            .await
+            .expect("query peer")
+            .expect("seeded peer");
+
+        // Hold the config-mapping lock so creation pauses after taking the
+        // expiration lock but before its upsert can overwrite the seeded row.
+        let mapping_guard = crate::poller::acquire_config_mapping_lock().await;
+        let task_db = db.clone();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_path_buf();
+        let (lock_acquired_tx, lock_acquired_rx) = tokio::sync::oneshot::channel();
+        let create_task = tokio::spawn(async move {
+            let ip_override = client_manager::IpOverride::default();
+            execute_create_user(
+                &task_db,
+                &dir_path,
+                "alice",
+                None,
+                None,
+                "test-admin",
+                &ip_override,
+                Some(created_client_result(false)),
+                Some(lock_acquired_tx),
+            )
+            .await
+        });
+
+        lock_acquired_rx
+            .await
+            .expect("creation must acquire the expiration lock before persistence");
+
+        let update_db = db.clone();
+        let update_task = tokio::spawn(async move {
+            execute_update_peer_expiration(
+                &update_db,
+                peer.id,
+                Some("2026-08-18T12:00:00Z"),
+                Some("alice"),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !update_task.is_finished(),
+            "expiration edit must wait until creation metadata is durable"
+        );
+
+        drop(mapping_guard);
+        create_task
+            .await
+            .expect("creation task")
+            .expect("create user");
+        update_task
+            .await
+            .expect("expiration task")
+            .expect("update expiration")
+            .expect("updated peer");
+
+        let persisted = find_by_public_key(&db.pool, "CREATED_PUBLIC_KEY=")
+            .await
+            .expect("query peer")
+            .expect("persisted peer");
+        assert_eq!(
+            persisted.expires_at.as_deref(),
+            Some("2026-08-18T12:00:00Z")
+        );
     }
 }

@@ -15,7 +15,7 @@
 //! | Read safe params | `…-privileged read-params` |
 //! | Read sanitized server state | `…-privileged read-server-state <iface>` |
 //! | Append peer to server config | `…-privileged append-peer <iface> <name>` |
-//! | Remove managed peer block | `…-privileged remove-client <iface> <name>` |
+//! | Remove managed peer block | `…-privileged remove-client[-if-key] …` |
 //! | Reconcile live interface | `…-privileged reconcile-interface <iface>` |
 //!
 //! Key generation (`awg genkey`, `awg pubkey`, `awg genpsk`) does **not**
@@ -950,26 +950,6 @@ fn server_config_contains_public_key(server_config: &str, expected_public_key: &
     })
 }
 
-fn named_client_has_public_key(
-    server_config: &str,
-    name: &str,
-    expected_public_key: &str,
-) -> Option<bool> {
-    let marker = format!("### Client {name}");
-    let mut lines = server_config.lines();
-    lines.find(|line| line.trim() == marker)?;
-
-    Some(
-        lines
-            .take_while(|line| !line.trim_start().starts_with("### Client "))
-            .any(|line| {
-                line.split_once('=')
-                    .filter(|(key, _)| key.trim().eq_ignore_ascii_case("PublicKey"))
-                    .is_some_and(|(_, value)| value.trim() == expected_public_key)
-            }),
-    )
-}
-
 fn live_interfaces_contain_public_key(
     interfaces: &[awg::AwgInterface],
     expected_public_key: &str,
@@ -1394,13 +1374,15 @@ fn remove_client_inner(
         .map_err(|e| RemoveClientError::ParamsRead(format!("failed to read server config: {e}")))?;
 
     if remove_client_block(&server_config, name).is_some() {
-        if expected_public_key.is_some_and(|public_key| {
-            named_client_has_public_key(&server_config, name, public_key) != Some(true)
-        }) {
-            return Err(RemoveClientError::IdentityMismatch(name.to_string()));
+        match expected_public_key {
+            Some(public_key) => {
+                // The helper revalidates this identity while holding the
+                // server-config lock, closing the read/delete TOCTOU window.
+                awg::remove_client_if_key_via_sudo(&params.server_awg_nic, name, public_key)
+            }
+            None => awg::remove_client_via_sudo(&params.server_awg_nic, name),
         }
-        awg::remove_client_via_sudo(&params.server_awg_nic, name)
-            .map_err(|e| RemoveClientError::FileWrite(format!("remove from server config: {e}")))?;
+        .map_err(|e| RemoveClientError::FileWrite(format!("remove from server config: {e}")))?;
     } else if !allow_missing_server_block {
         return Err(RemoveClientError::ClientNotFound(name.to_string()));
     } else if expected_public_key
@@ -1525,21 +1507,9 @@ mod tests {
     }
 
     #[test]
-    fn resumable_removal_identity_helpers_detect_renamed_and_mismatched_peers() {
+    fn resumable_removal_identity_helpers_detect_keys_across_config_and_live_state() {
         let server = "[Interface]\nPrivateKey = S\n\n### Client renamed\n[Peer]\nPublicKey = ALICE_KEY=\n\n### Client bob\n[Peer]\nPublicKey = BOB_KEY=\n";
 
-        assert_eq!(
-            named_client_has_public_key(server, "renamed", "ALICE_KEY="),
-            Some(true)
-        );
-        assert_eq!(
-            named_client_has_public_key(server, "renamed", "BOB_KEY="),
-            Some(false)
-        );
-        assert_eq!(
-            named_client_has_public_key(server, "alice", "ALICE_KEY="),
-            None
-        );
         assert!(server_config_contains_public_key(server, "ALICE_KEY="));
         assert!(!server_config_contains_public_key(server, "MISSING_KEY="));
 

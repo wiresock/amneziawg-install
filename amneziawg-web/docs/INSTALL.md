@@ -175,6 +175,8 @@ allow-listed operations provide:
   lifecycle identity checks
 - `append-peer` – validate and atomically append one reconstructed managed-peer block
 - `remove-client` – atomically remove one exact, validated managed-client block
+- `remove-client-if-key` – atomically validate a managed client's public-key
+  identity and remove its exact block
 
 Every operation has a fixed argument shape.  Unknown subcommands, malformed
 interface/client names, keys or AllowedIPs, unsafe configuration paths,

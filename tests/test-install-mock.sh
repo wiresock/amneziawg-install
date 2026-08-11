@@ -2254,6 +2254,8 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 		"${PRIVILEGED_HELPER}" reconcile-interface awg0 >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" read-params extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" read-server-state ../etc >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" remove-client-if-key "${HELPER_TEST_INTERFACE}" alice invalid-key \
+		>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	printf '[Interface]\nAddress = 10.66.66.1/24\n\n[Peer]\nPublicKey = invalid-key\nAllowedIPs = 10.66.66.44/32\n' \
 		> "${HELPER_BAD_KEY_CONF}"
 	chmod 0600 "${HELPER_BAD_KEY_CONF}"
@@ -2287,15 +2289,28 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	"${PRIVILEGED_HELPER}" read-server-state hardlink >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	rm -f /etc/amnezia/amneziawg/hardlink.conf
 
-	if "${PRIVILEGED_HELPER}" remove-client "${HELPER_TEST_INTERFACE}" alice && \
+	# The expected identity is checked under the same lock as the rewrite. A
+	# replacement key must be rejected without changing any config bytes.
+	HELPER_CONFIG_HASH_BEFORE=$(sha256sum "${HELPER_TEST_CONF}" | awk '{print $1}')
+	"${PRIVILEGED_HELPER}" remove-client-if-key "${HELPER_TEST_INTERFACE}" alice \
+		"${SECOND_HELPER_KEY}" >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	HELPER_CONFIG_HASH_AFTER=$(sha256sum "${HELPER_TEST_CONF}" | awk '{print $1}')
+	if [[ "${HELPER_CONFIG_HASH_BEFORE}" != "${HELPER_CONFIG_HASH_AFTER}" ]] || \
+		! grep -Fq '### Client alice' "${HELPER_TEST_CONF}"; then
+		HELPER_REJECTION_FAILED=1
+	fi
+
+	if "${PRIVILEGED_HELPER}" remove-client-if-key "${HELPER_TEST_INTERFACE}" alice \
+		"${VALID_HELPER_KEY}" && \
 		! grep -Fq '### Client alice' "${HELPER_TEST_CONF}" && \
 		grep -Fq 'PostUp = echo trusted' "${HELPER_TEST_CONF}"; then
-		echo "OK: Privileged helper atomically removes only the validated client block"
+		echo "OK: Privileged helper atomically validates identity and removes only the managed client block"
 	else
-		echo "FAIL: Privileged helper failed semantic client removal"
+		echo "FAIL: Privileged helper failed identity-safe semantic client removal"
 		FAILED=$((FAILED + 1))
 	fi
-	"${PRIVILEGED_HELPER}" remove-client "${HELPER_TEST_INTERFACE}" alice \
+	"${PRIVILEGED_HELPER}" remove-client-if-key "${HELPER_TEST_INTERFACE}" alice \
+		"${VALID_HELPER_KEY}" \
 		>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 
 	# Refuse to remove only the fixed prefix of a block that has acquired an

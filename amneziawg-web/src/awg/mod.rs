@@ -393,6 +393,37 @@ pub fn remove_client_via_sudo(interface: &str, name: &str) -> Result<(), AwgErro
     Ok(())
 }
 
+/// Remove one installer-managed client block only if its public key still
+/// matches `expected_public_key`. The helper performs the identity check and
+/// config rewrite atomically while holding the per-interface lock.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn remove_client_if_key_via_sudo(
+    interface: &str,
+    name: &str,
+    expected_public_key: &str,
+) -> Result<(), AwgError> {
+    let output = Command::new(SUDO_BIN)
+        .args([
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "remove-client-if-key",
+            interface,
+            name,
+            expected_public_key,
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+
+    Ok(())
+}
+
 /// Remove `[Peer]` sections from a WireGuard stripped config whose
 /// `PublicKey` appears in `disabled_keys`.
 ///
@@ -825,6 +856,31 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
                 "remove-client",
                 "awg0",
                 "alice",
+            ]
+        );
+
+        let mut conditional_remove_cmd = Command::new(SUDO_BIN);
+        conditional_remove_cmd.args([
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "remove-client-if-key",
+            "awg0",
+            "alice",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        ]);
+        let conditional_remove_args: Vec<_> = conditional_remove_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            conditional_remove_args,
+            vec![
+                "-n",
+                PRIVILEGED_HELPER_BIN,
+                "remove-client-if-key",
+                "awg0",
+                "alice",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             ]
         );
     }

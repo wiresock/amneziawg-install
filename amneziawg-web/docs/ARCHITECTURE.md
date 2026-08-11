@@ -72,7 +72,8 @@ list of disabled public keys; the helper derives and filters the trusted
 root-owned config internally before invoking `awg syncconf`.
 Peer additions and removals are semantic operations: the helper holds a stable
 per-interface lock, reconstructs an approved peer block or removes one exact
-managed-client block, and atomically replaces the config.  Arbitrary config
+managed-client block, optionally after checking its expected public key under
+the same lock, and atomically replaces the config.  Arbitrary config
 content, raw file reads, arbitrary `syncconf` stdin, and unknown operations are
 rejected rather than forwarded.
 
