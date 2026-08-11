@@ -5702,7 +5702,78 @@ function manageMenu() {
 #
 # On error, prints a message to stderr and exits with a non-zero code.
 
-function nonInteractiveAddClient() {
+CLIENT_LIFECYCLE_LOCK_FD=""
+
+# Acquire the same non-blocking lifecycle lock used by amneziawg-web. The
+# caller runs in a subshell so the descriptor, and therefore the lock, is
+# released on every success, return, or exit path.
+function acquireClientLifecycleLock() {
+	local lock_dir="${WEB_PANEL_CONFIG_DIR}"
+	local lock_path="${lock_dir}/.create-client.lock"
+	local old_umask dir_identity lock_identity link_count
+
+	if ! command -v flock >/dev/null 2>&1; then
+		echo "ERROR: flock is required for serialized client lifecycle operations" >&2
+		return 1
+	fi
+	old_umask="$(umask)"
+	umask 077
+	mkdir -p "${lock_dir}" || {
+		umask "${old_umask}"
+		echo "ERROR: could not create client lifecycle directory '${lock_dir}'" >&2
+		return 1
+	}
+	umask "${old_umask}"
+	if [[ -L "${lock_dir}" || ! -d "${lock_dir}" ]]; then
+		echo "ERROR: refusing unsafe client lifecycle directory '${lock_dir}'" >&2
+		return 1
+	fi
+	if [[ -L "${lock_path}" ]] || { [[ -e "${lock_path}" ]] && [[ ! -f "${lock_path}" ]]; }; then
+		echo "ERROR: refusing unsafe client lifecycle lock '${lock_path}'" >&2
+		return 1
+	fi
+
+	old_umask="$(umask)"
+	umask 077
+	if ! exec {CLIENT_LIFECYCLE_LOCK_FD}> "${lock_path}"; then
+		umask "${old_umask}"
+		echo "ERROR: could not open client lifecycle lock '${lock_path}'" >&2
+		return 1
+	fi
+	umask "${old_umask}"
+
+	link_count="$(stat -c '%h' "${lock_path}" 2>/dev/null || true)"
+	if [[ "${link_count}" != "1" ]]; then
+		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
+		echo "ERROR: refusing client lifecycle lock with unexpected links '${lock_path}'" >&2
+		return 1
+	fi
+	dir_identity="$(stat -c '%u:%g' "${lock_dir}" 2>/dev/null || true)"
+	lock_identity="$(stat -c '%u:%g' "${lock_path}" 2>/dev/null || true)"
+	if [[ -z "${dir_identity}" || -z "${lock_identity}" ]]; then
+		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
+		echo "ERROR: could not validate client lifecycle lock ownership" >&2
+		return 1
+	fi
+	if [[ "${lock_identity}" != "${dir_identity}" ]] && \
+		! chown --reference="${lock_dir}" -- "${lock_path}"; then
+		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
+		echo "ERROR: could not align client lifecycle lock ownership" >&2
+		return 1
+	fi
+	if ! chmod 0600 -- "${lock_path}"; then
+		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
+		echo "ERROR: could not secure client lifecycle lock" >&2
+		return 1
+	fi
+	if ! flock -xn "${CLIENT_LIFECYCLE_LOCK_FD}"; then
+		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
+		echo "ERROR: another add/remove operation is already in progress" >&2
+		return 1
+	fi
+}
+
+function nonInteractiveAddClient() (
 	local CLIENT_NAME="$1"
 
 	# Validate the name format (same rules as interactive mode)
@@ -5718,6 +5789,7 @@ function nonInteractiveAddClient() {
 		echo "ERROR: client name must be at most 15 characters" >&2
 		exit 1
 	fi
+	acquireClientLifecycleLock || exit 1
 
 	# Ensure params are loaded and config path is set
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
@@ -5870,9 +5942,9 @@ AllowedIPs = ${PEER_ALLOWED_IPS}" >>"${SERVER_AWG_CONF}"
 
 	# Print the config path to stdout for the caller
 	echo "${client_conf}"
-}
+)
 
-function nonInteractiveRemoveClient() {
+function nonInteractiveRemoveClient() (
 	local CLIENT_NAME="$1"
 
 	if [[ -z "${CLIENT_NAME}" ]]; then
@@ -5887,6 +5959,7 @@ function nonInteractiveRemoveClient() {
 		echo "ERROR: client name must be at most 15 characters" >&2
 		exit 1
 	fi
+	acquireClientLifecycleLock || exit 1
 
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
@@ -5919,7 +5992,7 @@ function nonInteractiveRemoveClient() {
 	fi
 
 	echo "OK"
-}
+)
 
 function nonInteractiveListClients() {
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"

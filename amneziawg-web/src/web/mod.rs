@@ -2809,6 +2809,8 @@ async fn api_create_user(
         injected_create_result(&headers, &state, &name, &ip_override),
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
     .await
     {
@@ -3035,6 +3037,8 @@ async fn post_add_user_form(
         &ip_override,
         #[cfg(test)]
         injected_create_result(&headers, &state, &name, &ip_override),
+        #[cfg(test)]
+        None,
         #[cfg(test)]
         None,
     )

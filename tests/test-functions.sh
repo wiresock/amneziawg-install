@@ -1128,6 +1128,29 @@ echo "[Interface]"
 EOF
 chmod +x "${NIAC_BIN}/awg" "${NIAC_BIN}/awg-quick"
 
+# The installer CLI must contend on the exact lock used by the web panel so a
+# same-name recreate cannot land between server removal and config cleanup.
+NIAC_LOCK_DIR="$(mktemp -d)"
+NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR="${WEB_PANEL_CONFIG_DIR}"
+WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_DIR}"
+exec {NIAC_HELD_LOCK_FD}> "${NIAC_LOCK_DIR}/.create-client.lock"
+flock -xn "${NIAC_HELD_LOCK_FD}"
+_client_lock_must_be_busy() {
+	acquireClientLifecycleLock >/dev/null 2>&1
+}
+assert_rc 1 _client_lock_must_be_busy
+exec {NIAC_HELD_LOCK_FD}>&-
+assert_rc 0 acquireClientLifecycleLock
+assert_eq "600" "$(stat -c '%a' "${NIAC_LOCK_DIR}/.create-client.lock")" \
+	"client lifecycle lock uses restrictive permissions"
+if [[ -n "${CLIENT_LIFECYCLE_LOCK_FD:-}" ]]; then
+	exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
+fi
+WEB_PANEL_CONFIG_DIR="${NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR}"
+rm -rf "${NIAC_LOCK_DIR}"
+unset NIAC_LOCK_DIR NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_HELD_LOCK_FD
+unset -f _client_lock_must_be_busy
+
 # Run nonInteractiveAddClient in a subshell; echo "<clientconf>|||<serverconf>".
 _run_niac() {  # $1=ENABLE_IPV6 (y/n) $2=client name
 	local dir; dir="$(mktemp -d)"

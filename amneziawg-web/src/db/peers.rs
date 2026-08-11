@@ -513,6 +513,23 @@ pub async fn delete_by_id(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Erro
     Ok(result.rows_affected() > 0)
 }
 
+/// Persist that native removal is about to start for this peer.
+///
+/// The flag deliberately remains set after any partial failure. Successful
+/// removal deletes the row through [`delete_by_id`]; retaining the flag keeps
+/// poller stale cleanup from discarding the state needed for a later retry.
+pub async fn mark_removal_pending(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE peers
+         SET removal_pending = 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND archived = 0",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Result of attempting to purge and archive a peer record.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ArchivePeerOutcome {
@@ -560,12 +577,14 @@ pub async fn archive_peer_data(
              friendly_name = NULL,
              managed_client_name = NULL,
              expires_at = NULL,
+             removal_pending = 0,
              updated_at = CURRENT_TIMESTAMP
          WHERE id = ?
            AND disabled = 1
            AND archived = 0
            AND has_config = 0
            AND sync_pending = 0
+           AND removal_pending = 0
          RETURNING public_key",
     )
     .bind(id)
@@ -668,8 +687,8 @@ pub async fn restore_archived_peer(
     Ok(RestorePeerOutcome::Restored { public_key })
 }
 
-/// Delete non-disabled, non-pending peers whose public keys are **not** in
-/// `active_keys`.
+/// Delete non-disabled peers with no pending creation or removal whose public
+/// keys are **not** in `active_keys`.
 ///
 /// This removes "stale" peers that were deleted outside the web panel (e.g.
 /// via the install script's `--remove-client` flag). Disabled peers are
@@ -691,11 +710,13 @@ pub async fn delete_stale_peers(
     // rows retain the historical stale-cleanup behaviour. Only deadlines that
     // are already due are reserved for lifecycle cleanup, so a partial native
     // removal can retry without retaining future-expiring external deletions.
+    // Explicit removal retry state always wins over those inferred guards.
     let all: Vec<(i64, String)> = sqlx::query_as(
         "SELECT id, public_key
          FROM peers
          WHERE disabled = 0
            AND archived = 0
+           AND removal_pending = 0
            AND (expires_at IS NULL
                 OR julianday(expires_at) IS NULL
                 OR julianday(expires_at) > julianday(?))
@@ -728,6 +749,7 @@ pub async fn delete_stale_peers(
              WHERE id IN ({placeholders})
                AND disabled = 0
                AND archived = 0
+               AND removal_pending = 0
                AND (expires_at IS NULL
                     OR julianday(expires_at) IS NULL
                     OR julianday(expires_at) > julianday(?))
@@ -1455,6 +1477,46 @@ mod tests {
         assert!(find_by_id(&db.pool, id).await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn removal_pending_preserves_manual_and_future_expiration_retries() {
+        let db = test_db().await;
+        let manual_id = insert_peer(&db.pool, "KEY_MANUAL_REMOVAL_RETRY=", None).await;
+        let future_id = insert_peer(&db.pool, "KEY_FUTURE_REMOVAL_RETRY=", None).await;
+        update_peer_expiration(
+            &db.pool,
+            future_id,
+            Some("2026-08-12T12:00:00Z"),
+            Some("future-retry"),
+        )
+        .await
+        .unwrap();
+
+        assert!(mark_removal_pending(&db.pool, manual_id).await.unwrap());
+        assert!(mark_removal_pending(&db.pool, future_id).await.unwrap());
+        assert!(!mark_removal_pending(&db.pool, 9999).await.unwrap());
+
+        let stale = delete_stale_peers(
+            &db.pool,
+            &std::collections::HashSet::new(),
+            STALE_CLEANUP_NOW,
+        )
+        .await
+        .expect("stale cleanup");
+        assert!(stale.is_empty());
+        for id in [manual_id, future_id] {
+            let pending: i64 =
+                sqlx::query_scalar("SELECT removal_pending FROM peers WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(pending, 1);
+        }
+
+        // Successful lifecycle completion still removes pending rows normally.
+        assert!(delete_by_id(&db.pool, manual_id).await.unwrap());
+    }
+
     // ── upsert_created_peer ──────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1875,6 +1937,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             archive_peer_data(&db.pool, pending, "admin").await.unwrap(),
+            ArchivePeerOutcome::Ineligible
+        );
+
+        let removal_pending = insert_peer(&db.pool, "KEY_REMOVAL_PENDING_ARCHIVE=", None).await;
+        update_peer_disabled(&db.pool, removal_pending, true)
+            .await
+            .unwrap();
+        mark_removal_pending(&db.pool, removal_pending)
+            .await
+            .unwrap();
+        assert_eq!(
+            archive_peer_data(&db.pool, removal_pending, "admin")
+                .await
+                .unwrap(),
             ArchivePeerOutcome::Ineligible
         );
         assert_eq!(

@@ -1638,6 +1638,13 @@ echo "--- Web installer: successful non-interactive install ---"
 # Clean any previous partial run
 rm -f "${WEB_TEST_ENV_FILE}" "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
 rm -f "${WEB_AWG_SCRIPT_PATH}" "${WEB_AWG_SCRIPT_MARKER}"
+# Simulate the root-run AWG CLI having created the shared lifecycle lock before
+# the web panel. The installer must safely transfer it to the service user.
+WEB_TEST_LIFECYCLE_LOCK="${WEB_TEST_AWG_CONFIG_DIR}/.create-client.lock"
+rm -f "${WEB_TEST_LIFECYCLE_LOCK}"
+touch "${WEB_TEST_LIFECYCLE_LOCK}"
+chmod 0644 "${WEB_TEST_LIFECYCLE_LOCK}"
+chown root:root "${WEB_TEST_LIFECYCLE_LOCK}"
 
 WEB_INSTALL_RC=0
 WEB_INSTALL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
@@ -1656,6 +1663,23 @@ if [[ ${WEB_INSTALL_RC} -eq 0 ]]; then
 else
 	echo "FAIL: Installer exited with non-zero code ${WEB_INSTALL_RC}"
 	echo "  Output tail: $(echo "${WEB_INSTALL_OUTPUT}" | tail -20)"
+	FAILED=$((FAILED + 1))
+fi
+
+# Verify a pre-existing CLI-created lifecycle lock remains usable by the web
+# service after the config directory changes ownership.
+if [[ -f "${WEB_TEST_LIFECYCLE_LOCK}" && ! -L "${WEB_TEST_LIFECYCLE_LOCK}" ]]; then
+	LOCK_PERMS=$(stat -c "%a" "${WEB_TEST_LIFECYCLE_LOCK}")
+	LOCK_OWNER=$(stat -c "%u:%g" "${WEB_TEST_LIFECYCLE_LOCK}")
+	CONFIG_OWNER=$(stat -c "%u:%g" "${WEB_TEST_AWG_CONFIG_DIR}")
+	if [[ "${LOCK_PERMS}" == "600" && "${LOCK_OWNER}" == "${CONFIG_OWNER}" ]]; then
+		echo "OK: Existing shared lifecycle lock adopted by the web service"
+	else
+		echo "FAIL: Shared lifecycle lock mode/owner is ${LOCK_PERMS}/${LOCK_OWNER}, expected 600/${CONFIG_OWNER}"
+		FAILED=$((FAILED + 1))
+	fi
+else
+	echo "FAIL: Existing shared lifecycle lock was removed or replaced unsafely"
 	FAILED=$((FAILED + 1))
 fi
 

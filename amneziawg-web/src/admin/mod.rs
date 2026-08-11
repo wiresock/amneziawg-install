@@ -197,6 +197,7 @@ pub async fn execute_create_user(
     ip_override: &client_manager::IpOverride,
     #[cfg(test)] create_result_override: Option<client_manager::CreateClientResult>,
     #[cfg(test)] expiration_lock_acquired: Option<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(test)] expiration_lock_release: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<CreateUserResult, client_manager::CreateClientError> {
     // Pre-validate name (fail fast for the UI).
     script_bridge::validate_client_name(name)?;
@@ -249,6 +250,10 @@ pub async fn execute_create_user(
     #[cfg(test)]
     if let Some(acquired) = expiration_lock_acquired {
         let _ = acquired.send(());
+    }
+    #[cfg(test)]
+    if let Some(release) = expiration_lock_release {
+        let _ = release.await;
     }
 
     // Keep a single lifecycle lock held across native creation and metadata
@@ -583,6 +588,19 @@ async fn execute_remove_user_inner(
             return Err(err);
         }
     };
+
+    // From this point onward the native path may partially remove the server
+    // block, live peer, or client config. Persist retry ownership before the
+    // first external mutation so poller stale cleanup cannot discard the row.
+    let removal_marked = crate::db::peers::mark_removal_pending(&db.pool, peer_id)
+        .await
+        .map_err(|e| RemoveClientError::DbRead(e.to_string()))?;
+    if !removal_marked {
+        return Err(RemoveClientError::DbRead(
+            "peer disappeared before native removal could start".to_string(),
+        ));
+    }
+
     let dir = config_dir.to_path_buf();
     let name = client_name.to_string();
     let remove_result = tokio::task::spawn_blocking(move || {
@@ -929,6 +947,7 @@ mod tests {
             &client_manager::IpOverride::default(),
             Some(created_client_result(true)),
             None,
+            None,
         )
         .await
         .expect("durable creation must remain a success");
@@ -989,6 +1008,7 @@ mod tests {
             "test-admin",
             &client_manager::IpOverride::default(),
             Some(created_client_result(true)),
+            None,
             None,
         )
         .await;
@@ -1123,13 +1143,11 @@ mod tests {
             .expect("query peer")
             .expect("seeded peer");
 
-        // Hold the config-mapping lock so creation pauses after taking the
-        // expiration lock but before its upsert can overwrite the seeded row.
-        let mapping_guard = crate::poller::acquire_config_mapping_lock().await;
         let task_db = db.clone();
         let dir = tempfile::tempdir().expect("tempdir");
         let dir_path = dir.path().to_path_buf();
         let (lock_acquired_tx, lock_acquired_rx) = tokio::sync::oneshot::channel();
+        let (lock_release_tx, lock_release_rx) = tokio::sync::oneshot::channel();
         let create_task = tokio::spawn(async move {
             let ip_override = client_manager::IpOverride::default();
             execute_create_user(
@@ -1142,6 +1160,7 @@ mod tests {
                 &ip_override,
                 Some(created_client_result(false)),
                 Some(lock_acquired_tx),
+                Some(lock_release_rx),
             )
             .await
         });
@@ -1166,7 +1185,9 @@ mod tests {
             "expiration edit must wait until creation metadata is durable"
         );
 
-        drop(mapping_guard);
+        lock_release_tx
+            .send(())
+            .expect("release creation persistence");
         create_task
             .await
             .expect("creation task")
