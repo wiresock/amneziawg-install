@@ -35,6 +35,12 @@ pub struct PeerRow {
     /// Human-readable name derived from config filename (e.g. `"gramm"`
     /// from `"awg0-client-gramm.conf"`).
     pub friendly_name: Option<String>,
+    /// Stable installer client identifier used by lifecycle operations. Unlike
+    /// `friendly_name`, this is not cleared when config-file discovery misses.
+    pub managed_client_name: Option<String>,
+    /// RFC-3339 UTC timestamp after which the managed client must be removed.
+    /// `NULL` means the client is permanent.
+    pub expires_at: Option<String>,
     #[allow(dead_code)]
     pub created_at: String,
     #[allow(dead_code)]
@@ -52,6 +58,8 @@ pub struct CreatedPeerMetadata<'a> {
     pub config_name: &'a str,
     pub config_path: &'a str,
     pub friendly_name: &'a str,
+    pub managed_client_name: &'a str,
+    pub expires_at: Option<&'a str>,
 }
 
 /// A row fetched from the `snapshots` table.
@@ -86,7 +94,7 @@ pub async fn list_all(pool: &SqlitePool) -> Result<Vec<PeerRow>, sqlx::Error> {
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
                 last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
-                config_name, config_path, friendly_name, created_at, updated_at
+                config_name, config_path, friendly_name, managed_client_name, expires_at, created_at, updated_at
          FROM   peers
          ORDER  BY id",
     )
@@ -99,7 +107,7 @@ pub async fn list_visible(pool: &SqlitePool) -> Result<Vec<PeerRow>, sqlx::Error
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
                 last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
-                config_name, config_path, friendly_name, created_at, updated_at
+                config_name, config_path, friendly_name, managed_client_name, expires_at, created_at, updated_at
          FROM   peers
          WHERE  archived = 0
          ORDER  BY id",
@@ -113,7 +121,7 @@ pub async fn find_by_id(pool: &SqlitePool, id: i64) -> Result<Option<PeerRow>, s
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
                 last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
-                config_name, config_path, friendly_name, created_at, updated_at
+                config_name, config_path, friendly_name, managed_client_name, expires_at, created_at, updated_at
          FROM   peers
          WHERE  id = ?",
     )
@@ -130,7 +138,7 @@ pub async fn find_visible_by_id(
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
                 last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
-                config_name, config_path, friendly_name, created_at, updated_at
+                config_name, config_path, friendly_name, managed_client_name, expires_at, created_at, updated_at
          FROM   peers
          WHERE  id = ? AND archived = 0",
     )
@@ -147,7 +155,7 @@ pub async fn find_by_public_key(
     sqlx::query_as::<_, PeerRow>(
         "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
                 last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
-                config_name, config_path, friendly_name, created_at, updated_at
+                config_name, config_path, friendly_name, managed_client_name, expires_at, created_at, updated_at
          FROM   peers
          WHERE  public_key = ?",
     )
@@ -372,6 +380,81 @@ pub async fn update_peer_metadata(
     find_visible_by_id(pool, id).await
 }
 
+/// Set or clear a peer's UTC expiration timestamp.
+///
+/// `None` makes the peer permanent. The caller is responsible for validating
+/// and normalizing non-NULL values to RFC-3339 UTC.
+pub async fn update_peer_expiration(
+    pool: &SqlitePool,
+    id: i64,
+    expires_at: Option<&str>,
+    managed_client_name: Option<&str>,
+) -> Result<Option<PeerRow>, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE peers
+         SET expires_at = ?,
+             managed_client_name = COALESCE(?, managed_client_name),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND archived = 0",
+    )
+    .bind(expires_at)
+    .bind(managed_client_name)
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    find_visible_by_id(pool, id).await
+}
+
+/// Return visible peers whose configured expiration is at or before `now`.
+/// Invalid legacy values are ignored rather than treated as expired.
+pub async fn list_expired(
+    pool: &SqlitePool,
+    now_rfc3339: &str,
+) -> Result<Vec<PeerRow>, sqlx::Error> {
+    sqlx::query_as::<_, PeerRow>(
+        "SELECT id, public_key, display_name, comment, endpoint, allowed_ips,
+                last_handshake_at, rx_bytes, tx_bytes, disabled, archived, has_config, sync_pending,
+                config_name, config_path, friendly_name, managed_client_name, expires_at, created_at, updated_at
+         FROM peers
+         WHERE archived = 0
+           AND expires_at IS NOT NULL
+           AND julianday(expires_at) IS NOT NULL
+           AND julianday(expires_at) <= julianday(?)
+         ORDER BY expires_at, id",
+    )
+    .bind(now_rfc3339)
+    .fetch_all(pool)
+    .await
+}
+
+/// Revalidate an expiration cleanup candidate immediately before removal.
+pub async fn expiration_is_due(
+    pool: &SqlitePool,
+    id: i64,
+    expected_expires_at: &str,
+    now_rfc3339: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM peers
+             WHERE id = ?
+               AND archived = 0
+               AND expires_at = ?
+               AND julianday(expires_at) IS NOT NULL
+               AND julianday(expires_at) <= julianday(?)
+         )",
+    )
+    .bind(id)
+    .bind(expected_expires_at)
+    .bind(now_rfc3339)
+    .fetch_one(pool)
+    .await
+}
+
 /// Insert or update the database row for a newly-created client.
 ///
 /// The AWG poller may have already inserted the peer between interface sync and
@@ -386,9 +469,9 @@ pub async fn upsert_created_peer(
     sqlx::query(
         "INSERT INTO peers (
              public_key, comment, allowed_ips, has_config, sync_pending,
-             config_name, config_path, friendly_name
+             config_name, config_path, friendly_name, managed_client_name, expires_at
          )
-         VALUES (?, ?, ?, 1, 1, ?, ?, ?)
+         VALUES (?, ?, ?, 1, 1, ?, ?, ?, ?, ?)
          ON CONFLICT(public_key) DO UPDATE SET
              comment       = excluded.comment,
              allowed_ips   = excluded.allowed_ips,
@@ -397,6 +480,8 @@ pub async fn upsert_created_peer(
              config_name   = excluded.config_name,
              config_path   = excluded.config_path,
              friendly_name = excluded.friendly_name,
+             managed_client_name = excluded.managed_client_name,
+             expires_at    = excluded.expires_at,
              updated_at    = CURRENT_TIMESTAMP
          WHERE peers.archived = 0",
     )
@@ -406,6 +491,8 @@ pub async fn upsert_created_peer(
     .bind(metadata.config_name)
     .bind(metadata.config_path)
     .bind(metadata.friendly_name)
+    .bind(metadata.managed_client_name)
+    .bind(metadata.expires_at)
     .execute(pool)
     .await?;
 
@@ -471,6 +558,8 @@ pub async fn archive_peer_data(
              config_name = NULL,
              config_path = NULL,
              friendly_name = NULL,
+             managed_client_name = NULL,
+             expires_at = NULL,
              updated_at = CURRENT_TIMESTAMP
          WHERE id = ?
            AND disabled = 1
@@ -595,17 +684,24 @@ pub async fn restore_archived_peer(
 pub async fn delete_stale_peers(
     pool: &SqlitePool,
     active_keys: &std::collections::HashSet<String>,
+    now_rfc3339: &str,
 ) -> Result<Vec<(i64, String)>, sqlx::Error> {
     // The config mapping step runs before stale cleanup. A newly-created row is
     // protected only while its config is still present; ordinary config-linked
-    // rows retain the historical stale-cleanup behaviour.
+    // rows retain the historical stale-cleanup behaviour. Only deadlines that
+    // are already due are reserved for lifecycle cleanup, so a partial native
+    // removal can retry without retaining future-expiring external deletions.
     let all: Vec<(i64, String)> = sqlx::query_as(
         "SELECT id, public_key
          FROM peers
          WHERE disabled = 0
            AND archived = 0
+           AND (expires_at IS NULL
+                OR julianday(expires_at) IS NULL
+                OR julianday(expires_at) > julianday(?))
            AND NOT (sync_pending = 1 AND has_config = 1)",
     )
+    .bind(now_rfc3339)
     .fetch_all(pool)
     .await?;
 
@@ -632,12 +728,16 @@ pub async fn delete_stale_peers(
              WHERE id IN ({placeholders})
                AND disabled = 0
                AND archived = 0
+               AND (expires_at IS NULL
+                    OR julianday(expires_at) IS NULL
+                    OR julianday(expires_at) > julianday(?))
                AND NOT (sync_pending = 1 AND has_config = 1)"
         );
         let mut query = sqlx::query(&sql);
         for (id, _) in chunk {
             query = query.bind(id);
         }
+        query = query.bind(now_rfc3339);
         query.execute(pool).await?;
     }
 
@@ -740,6 +840,8 @@ pub async fn apply_config_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STALE_CLEANUP_NOW: &str = "2026-08-11T12:00:00Z";
 
     async fn test_db() -> crate::db::Database {
         let db = crate::db::Database::connect_for_test()
@@ -1203,6 +1305,137 @@ mod tests {
         assert!(result.is_none());
     }
 
+    // ── expiration ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn existing_peer_is_permanent_by_default() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_PERMANENT=", None).await;
+
+        let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
+        assert!(row.expires_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_peer_expiration_can_set_and_clear_deadline() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_EXPIRATION_EDIT=", None).await;
+
+        let row = update_peer_expiration(
+            &db.pool,
+            id,
+            Some("2026-08-18T12:00:00Z"),
+            Some("alice"),
+        )
+            .await
+            .expect("set expiration")
+            .expect("peer");
+        assert_eq!(row.expires_at.as_deref(), Some("2026-08-18T12:00:00Z"));
+
+        assert_eq!(row.managed_client_name.as_deref(), Some("alice"));
+
+        let row = update_peer_expiration(&db.pool, id, None, None)
+            .await
+            .expect("clear expiration")
+            .expect("peer");
+        assert!(row.expires_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_query_and_revalidation_ignore_permanent_future_and_changed_rows() {
+        let db = test_db().await;
+        let due_id = insert_peer(&db.pool, "KEY_DUE=", None).await;
+        let future_id = insert_peer(&db.pool, "KEY_FUTURE=", None).await;
+        let _permanent_id = insert_peer(&db.pool, "KEY_NO_EXPIRY=", None).await;
+        update_peer_expiration(
+            &db.pool,
+            due_id,
+            Some("2026-08-10T12:00:00Z"),
+            Some("due"),
+        )
+            .await
+            .unwrap();
+        update_peer_expiration(
+            &db.pool,
+            future_id,
+            Some("2026-08-12T12:00:00Z"),
+            Some("future"),
+        )
+            .await
+            .unwrap();
+
+        let now = "2026-08-11T12:00:00Z";
+        let expired = list_expired(&db.pool, now).await.expect("list expired");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, due_id);
+        assert!(expiration_is_due(&db.pool, due_id, "2026-08-10T12:00:00Z", now)
+            .await
+            .unwrap());
+        assert!(!expiration_is_due(&db.pool, due_id, "2026-08-09T12:00:00Z", now)
+            .await
+            .unwrap());
+
+        update_peer_expiration(
+            &db.pool,
+            due_id,
+            Some("2026-08-20T12:00:00Z"),
+            Some("due"),
+        )
+            .await
+            .unwrap();
+        assert!(!expiration_is_due(&db.pool, due_id, "2026-08-10T12:00:00Z", now)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_preserves_expiring_peer_for_lifecycle_retry() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_EXPIRATION_RETRY=", None).await;
+        update_peer_expiration(
+            &db.pool,
+            id,
+            Some("2026-08-10T12:00:00Z"),
+            Some("retry-user"),
+        )
+        .await
+        .unwrap();
+
+        let stale = delete_stale_peers(
+            &db.pool,
+            &std::collections::HashSet::new(),
+            STALE_CLEANUP_NOW,
+        )
+            .await
+            .expect("stale cleanup");
+        assert!(stale.is_empty());
+        assert!(find_by_id(&db.pool, id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_removes_externally_deleted_future_expiring_peer() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_FUTURE_STALE=", None).await;
+        update_peer_expiration(
+            &db.pool,
+            id,
+            Some("2026-08-12T12:00:00Z"),
+            Some("future-stale"),
+        )
+        .await
+        .unwrap();
+
+        let stale = delete_stale_peers(
+            &db.pool,
+            &std::collections::HashSet::new(),
+            STALE_CLEANUP_NOW,
+        )
+        .await
+        .expect("stale cleanup");
+        assert_eq!(stale, vec![(id, "KEY_FUTURE_STALE=".to_string())]);
+        assert!(find_by_id(&db.pool, id).await.unwrap().is_none());
+    }
+
     // ── upsert_created_peer ──────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1215,6 +1448,8 @@ mod tests {
             config_name: "awg0-client-alice",
             config_path: "/etc/amnezia/amneziawg/clients/awg0-client-alice.conf",
             friendly_name: "alice",
+            managed_client_name: "alice",
+            expires_at: Some("2026-08-18T12:00:00Z"),
         };
 
         let row = upsert_created_peer(&db.pool, &metadata)
@@ -1224,11 +1459,21 @@ mod tests {
         assert_eq!(row.public_key, metadata.public_key);
         assert_eq!(row.allowed_ips, metadata.allowed_ips);
         assert_eq!(row.comment.as_deref(), Some("Main phone"));
+        assert_eq!(row.expires_at, metadata.expires_at.map(str::to_string));
         assert_eq!(row.has_config, 1);
         assert_eq!(row.sync_pending, 1);
         assert_eq!(row.config_name.as_deref(), Some(metadata.config_name));
         assert_eq!(row.config_path.as_deref(), Some(metadata.config_path));
         assert_eq!(row.friendly_name.as_deref(), Some("alice"));
+        assert_eq!(row.managed_client_name.as_deref(), Some("alice"));
+
+        clear_all_config_mappings(&db.pool)
+            .await
+            .expect("clear transient config mappings");
+        let row = find_by_id(&db.pool, row.id).await.unwrap().unwrap();
+        assert!(row.friendly_name.is_none());
+        assert_eq!(row.managed_client_name.as_deref(), Some("alice"));
+        assert_eq!(row.expires_at.as_deref(), Some("2026-08-18T12:00:00Z"));
     }
 
     #[tokio::test]
@@ -1241,6 +1486,8 @@ mod tests {
             config_name: "awg0-client-bob",
             config_path: "/etc/amnezia/amneziawg/clients/awg0-client-bob.conf",
             friendly_name: "bob",
+            managed_client_name: "bob",
+            expires_at: None,
         };
 
         let row = upsert_created_peer(&db.pool, &metadata)
@@ -1278,6 +1525,8 @@ mod tests {
             config_name: "awg0-client-carol",
             config_path: "/etc/amnezia/amneziawg/clients/awg0-client-carol.conf",
             friendly_name: "carol",
+            managed_client_name: "carol",
+            expires_at: None,
         };
 
         let row = upsert_created_peer(&db.pool, &metadata)
@@ -1307,6 +1556,8 @@ mod tests {
             config_name: "awg0-client-erin",
             config_path: "/etc/amnezia/amneziawg/clients/awg0-client-erin.conf",
             friendly_name: "erin",
+            managed_client_name: "erin",
+            expires_at: None,
         };
         upsert_created_peer(&db.pool, &metadata)
             .await
@@ -1352,7 +1603,11 @@ mod tests {
         // Model the older full poll's stale cleanup. Its snapshot does not
         // contain the newly-created key, but the one-shot refresh above must
         // not have removed the pending guard.
-        let stale = delete_stale_peers(&db.pool, &std::collections::HashSet::new())
+        let stale = delete_stale_peers(
+            &db.pool,
+            &std::collections::HashSet::new(),
+            STALE_CLEANUP_NOW,
+        )
             .await
             .expect("stale cleanup with old snapshot");
         assert!(stale.is_empty());
@@ -1429,7 +1684,8 @@ mod tests {
              SET comment = 'old comment', endpoint = '198.51.100.4:51820',
                  last_handshake_at = 1234, rx_bytes = 100, tx_bytes = 200,
                  disabled = 1, config_name = 'old', config_path = '/old.conf',
-                 friendly_name = 'old-friendly'
+                 friendly_name = 'old-friendly', managed_client_name = 'old-managed',
+                 expires_at = '2026-08-18T12:00:00Z'
              WHERE id = ?",
         )
         .bind(id)
@@ -1474,6 +1730,8 @@ mod tests {
         assert_eq!(row.config_name, None);
         assert_eq!(row.config_path, None);
         assert_eq!(row.friendly_name, None);
+        assert_eq!(row.managed_client_name, None);
+        assert_eq!(row.expires_at, None);
         assert!(find_visible_by_id(&db.pool, id).await.unwrap().is_none());
         assert!(list_visible(&db.pool).await.unwrap().is_empty());
         assert_eq!(list_all(&db.pool).await.unwrap().len(), 1);
@@ -1529,6 +1787,8 @@ mod tests {
                 config_name: "reappeared",
                 config_path: "/etc/amnezia/amneziawg/reappeared.conf",
                 friendly_name: "reappeared",
+                managed_client_name: "reappeared",
+                expires_at: None,
             },
         )
         .await;
@@ -1620,7 +1880,11 @@ mod tests {
             .await
             .unwrap();
 
-        let stale = delete_stale_peers(&db.pool, &std::collections::HashSet::new())
+        let stale = delete_stale_peers(
+            &db.pool,
+            &std::collections::HashSet::new(),
+            STALE_CLEANUP_NOW,
+        )
             .await
             .unwrap();
         assert!(stale.is_empty());
@@ -1676,7 +1940,9 @@ mod tests {
         let active: std::collections::HashSet<String> =
             ["KEY_A=".to_string()].into_iter().collect();
 
-        let stale = delete_stale_peers(&db.pool, &active).await.expect("delete");
+        let stale = delete_stale_peers(&db.pool, &active, STALE_CLEANUP_NOW)
+            .await
+            .expect("delete");
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].1, "KEY_B=");
 
@@ -1696,7 +1962,9 @@ mod tests {
         // Neither peer is on the interface
         let active: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        let stale = delete_stale_peers(&db.pool, &active).await.expect("delete");
+        let stale = delete_stale_peers(&db.pool, &active, STALE_CLEANUP_NOW)
+            .await
+            .expect("delete");
         // Only the non-disabled peer should be removed
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].0, id_a);
@@ -1715,13 +1983,15 @@ mod tests {
             config_name: "awg0-client-dave",
             config_path: "/etc/amnezia/amneziawg/clients/awg0-client-dave.conf",
             friendly_name: "dave",
+            managed_client_name: "dave",
+            expires_at: None,
         };
         let inserted = upsert_created_peer(&db.pool, &metadata)
             .await
             .expect("insert config-linked peer");
 
         let active = std::collections::HashSet::new();
-        let stale = delete_stale_peers(&db.pool, &active)
+        let stale = delete_stale_peers(&db.pool, &active, STALE_CLEANUP_NOW)
             .await
             .expect("delete stale peers");
 
@@ -1749,7 +2019,11 @@ mod tests {
         .await
         .expect("apply config mapping");
 
-        let stale = delete_stale_peers(&db.pool, &std::collections::HashSet::new())
+        let stale = delete_stale_peers(
+            &db.pool,
+            &std::collections::HashSet::new(),
+            STALE_CLEANUP_NOW,
+        )
             .await
             .expect("delete stale peers");
 
@@ -1767,6 +2041,8 @@ mod tests {
             config_name: "awg0-client-gone",
             config_path: "/etc/amnezia/amneziawg/clients/awg0-client-gone.conf",
             friendly_name: "gone",
+            managed_client_name: "gone",
+            expires_at: None,
         };
         let row = upsert_created_peer(&db.pool, &metadata)
             .await
@@ -1775,7 +2051,11 @@ mod tests {
             .await
             .expect("clear removed config mapping");
 
-        let stale = delete_stale_peers(&db.pool, &std::collections::HashSet::new())
+        let stale = delete_stale_peers(
+            &db.pool,
+            &std::collections::HashSet::new(),
+            STALE_CLEANUP_NOW,
+        )
             .await
             .expect("delete stale peers");
 
@@ -1787,7 +2067,9 @@ mod tests {
     async fn delete_stale_peers_empty_db_is_noop() {
         let db = test_db().await;
         let active: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let stale = delete_stale_peers(&db.pool, &active).await.expect("delete");
+        let stale = delete_stale_peers(&db.pool, &active, STALE_CLEANUP_NOW)
+            .await
+            .expect("delete");
         assert!(stale.is_empty());
     }
 
@@ -1800,7 +2082,9 @@ mod tests {
         let active: std::collections::HashSet<String> =
             ["KEY_X=".to_string(), "KEY_Y=".to_string()].into_iter().collect();
 
-        let stale = delete_stale_peers(&db.pool, &active).await.expect("delete");
+        let stale = delete_stale_peers(&db.pool, &active, STALE_CLEANUP_NOW)
+            .await
+            .expect("delete");
         assert!(stale.is_empty());
 
         // Both peers should still exist

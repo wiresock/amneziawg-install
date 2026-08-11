@@ -19,6 +19,8 @@
 //!
 //! Errors within a single cycle step are logged and the cycle continues;
 //! the overall polling loop never stops due to a single-cycle failure.
+//! Expired managed users are removed before each AWG snapshot, including the
+//! poller's immediate first cycle at process startup.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -84,6 +86,21 @@ impl Poller {
     async fn poll_once(&self) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         debug!("poll cycle starting");
+
+        // ── Step 0: Expired-user cleanup ────────────────────────────────────
+        // The first interval tick fires immediately, so this also catches
+        // expirations missed while the web service was stopped. Running it
+        // before AWG discovery means cleanup is still attempted if AWG status
+        // collection fails later in the cycle.
+        match crate::admin::cleanup_expired_users(&self.db, &self.config_dir).await {
+            Ok(removed) if removed > 0 => {
+                info!(removed, "expired-user cleanup complete");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!(error = %e, "expired-user cleanup query failed – continuing");
+            }
+        }
 
         // ── Step 1–3: AWG data ───────────────────────────────────────────────
         let interfaces = match awg::show_all_dump() {
@@ -385,7 +402,9 @@ impl Poller {
             .flat_map(|iface| iface.peers.iter().map(|p| p.public_key.0.clone()))
             .collect();
 
-        let stale = crate::db::peers::delete_stale_peers(&self.db.pool, &active_keys).await?;
+        let now = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let stale =
+            crate::db::peers::delete_stale_peers(&self.db.pool, &active_keys, &now).await?;
 
         if !stale.is_empty() {
             for (id, ref public_key) in &stale {

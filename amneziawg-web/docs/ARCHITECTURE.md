@@ -103,9 +103,11 @@ binary via `sqlx::migrate!("./migrations")`.
 A Tokio background task that wakes every `AWG_POLL_INTERVAL` seconds,
 calls `awg::show_all_dump()`, and:
 
-1. Inserts a row into `snapshots` for each non-archived peer.
-2. Upserts each non-archived peer into the `peers` table.
-3. Handles counter resets (values are stored as-is; UI layer detects
+1. Removes due managed users through the same native lifecycle command used
+   by manual deletion. The first pass runs immediately at service startup.
+2. Inserts a row into `snapshots` for each non-archived peer.
+3. Upserts each non-archived peer into the `peers` table.
+4. Handles counter resets (values are stored as-is; UI layer detects
    decreases).
 
 Both snapshot insertion and live-field upserts are SQL-guarded by the
@@ -151,7 +153,7 @@ SQLite is chosen for its zero-infrastructure footprint.  A single
 
 | Table        | Purpose                                         |
 |--------------|-------------------------------------------------|
-| `peers`      | Canonical peer records, metadata, and archived disabled-key tombstones |
+| `peers`      | Canonical peer records, optional UTC expiration metadata, and archived disabled-key tombstones |
 | `snapshots`  | Time-series of per-poll stats                   |
 | `interfaces` | Discovered AWG interfaces                       |
 | `events`     | Audit log of admin actions                      |
