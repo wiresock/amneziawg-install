@@ -715,12 +715,8 @@ fn managed_client_name_for_expiration(row: &PeerRow) -> Option<&str> {
                 return None;
             }
             let config_name = row.config_name.as_deref()?;
-            let (interface_name, filename_client_name) = config_name.rsplit_once("-client-")?;
             let friendly_name = row.friendly_name.as_deref()?;
-            (!interface_name.is_empty()
-                && filename_client_name == friendly_name
-                && crate::admin::script_bridge::validate_client_name(friendly_name).is_ok())
-            .then_some(friendly_name)
+            crate::admin::script_bridge::managed_client_name_from_config(config_name, friendly_name)
         })
 }
 
@@ -6109,6 +6105,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expiration_edits_use_stable_identity_during_config_remap() {
+        let db = test_db().await;
+        let api_id = insert_peer(&db, "EXPIRY_REMAP_API_KEY=", Some("Alice")).await;
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "EXPIRY_REMAP_API_KEY=",
+            "awg0-client-alice",
+            "/etc/amnezia/amneziawg/clients/awg0-client-alice.conf",
+            "alice",
+            Some("alice"),
+        )
+        .await
+        .unwrap();
+        crate::db::peers::clear_all_config_mappings(&db.pool)
+            .await
+            .unwrap();
+
+        let html_id = insert_peer(&db, "EXPIRY_REMAP_HTML_KEY=", Some("Bob")).await;
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "EXPIRY_REMAP_HTML_KEY=",
+            "awg0-client-bob",
+            "/etc/amnezia/amneziawg/clients/awg0-client-bob.conf",
+            "bob",
+            Some("bob"),
+        )
+        .await
+        .unwrap();
+        crate::db::peers::clear_all_config_mappings(&db.pool)
+            .await
+            .unwrap();
+
+        let app = test_router(db.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{api_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expiration_days":7}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/peers/{html_id}"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("display_name=Bob&comment=&expiration_days=7"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        for (id, expected_name) in [(api_id, "alice"), (html_id, "bob")] {
+            let row = crate::db::peers::find_by_id(&db.pool, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.has_config, 0);
+            assert_eq!(row.managed_client_name.as_deref(), Some(expected_name));
+            assert!(row.expires_at.is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn patch_peer_rejects_expiration_for_unmanaged_peer() {
         let db = test_db().await;
         let id = insert_peer(&db, "UNMANAGED_EXPIRY_KEY=", None).await;
@@ -7314,6 +7382,7 @@ mod tests {
             "test-client",
             conf_path.to_str().unwrap(),
             "test-client",
+            None,
         )
         .await
         .unwrap();
@@ -7732,6 +7801,7 @@ mod tests {
             "existing-client",
             "/etc/amnezia/amneziawg/existing-client.conf",
             "existing-client",
+            None,
         )
         .await
         .unwrap());
@@ -7757,6 +7827,7 @@ mod tests {
             "test-dl",
             "/etc/awg/test-dl.conf",
             "test-dl",
+            None,
         )
         .await
         .unwrap();
@@ -8602,6 +8673,7 @@ mod tests {
             "test-qr",
             conf_path.to_str().unwrap(),
             "test-qr",
+            None,
         )
         .await
         .unwrap();
@@ -8664,6 +8736,7 @@ mod tests {
             "big-qr",
             conf_path.to_str().unwrap(),
             "big-qr",
+            None,
         )
         .await
         .unwrap();
@@ -8713,6 +8786,7 @@ mod tests {
             "test-qrui",
             "/etc/awg/test-qrui.conf",
             "test-qrui",
+            None,
         )
         .await
         .unwrap();
@@ -8822,6 +8896,7 @@ mod tests {
             "escaped",
             outside_conf.to_str().unwrap(),
             "escaped",
+            None,
         )
         .await
         .unwrap();
@@ -8859,6 +8934,7 @@ mod tests {
             "escaped-qr",
             outside_conf.to_str().unwrap(),
             "escaped-qr",
+            None,
         )
         .await
         .unwrap();
@@ -8900,6 +8976,7 @@ mod tests {
             "link",
             link_conf.to_str().unwrap(),
             "link",
+            None,
         )
         .await
         .unwrap();
@@ -8939,6 +9016,7 @@ mod tests {
             "link-qr",
             link_conf.to_str().unwrap(),
             "link-qr",
+            None,
         )
         .await
         .unwrap();

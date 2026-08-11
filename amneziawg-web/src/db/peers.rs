@@ -812,9 +812,11 @@ pub async fn clear_all_config_mappings(pool: &SqlitePool) -> Result<(), sqlx::Er
 /// Mark one peer as having a discovered config file.
 ///
 /// Sets `has_config = 1`, `config_name`, `config_path`, and `friendly_name`
-/// for the peer identified by `public_key`.  Returns `true` if a matching
-/// peer was found and updated, `false` if no peer with that public key
-/// exists (the config file may reference a key that does not correspond to
+/// for the peer identified by `public_key`. When config discovery proves the
+/// peer was created by the installer, `managed_client_name` stores that stable
+/// lifecycle identity if one has not already been recorded. Returns `true` if
+/// a matching peer was found and updated, `false` if no peer with that public
+/// key exists (the config file may reference a key that does not correspond to
 /// any known peer — for example the server's own public key).
 pub async fn apply_config_mapping(
     pool: &SqlitePool,
@@ -822,15 +824,21 @@ pub async fn apply_config_mapping(
     config_name: &str,
     config_path: &str,
     friendly_name: &str,
+    managed_client_name: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE peers
-         SET    has_config = 1, config_name = ?, config_path = ?, friendly_name = ?
+         SET    has_config = 1,
+                config_name = ?,
+                config_path = ?,
+                friendly_name = ?,
+                managed_client_name = COALESCE(managed_client_name, ?)
          WHERE  public_key = ? AND archived = 0",
     )
     .bind(config_name)
     .bind(config_path)
     .bind(friendly_name)
+    .bind(managed_client_name)
     .bind(public_key)
     .execute(pool)
     .await?;
@@ -1185,6 +1193,7 @@ mod tests {
             "awg0-client-gramm",
             "/etc/awg/awg0-client-gramm.conf",
             "gramm",
+            Some("gramm"),
         )
         .await
         .expect("apply mapping");
@@ -1198,6 +1207,14 @@ mod tests {
             Some("/etc/awg/awg0-client-gramm.conf")
         );
         assert_eq!(row.friendly_name.as_deref(), Some("gramm"));
+        assert_eq!(row.managed_client_name.as_deref(), Some("gramm"));
+
+        clear_all_config_mappings(&db.pool)
+            .await
+            .expect("clear transient mapping fields");
+        let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(row.has_config, 0);
+        assert_eq!(row.managed_client_name.as_deref(), Some("gramm"));
     }
 
     #[tokio::test]
@@ -1210,6 +1227,7 @@ mod tests {
             "ghost",
             "/etc/awg/ghost.conf",
             "ghost",
+            None,
         )
         .await
         .expect("should not error");
@@ -1230,6 +1248,7 @@ mod tests {
                 "idem-config",
                 "/etc/awg/idem.conf",
                 "idem-config",
+                None,
             )
             .await
             .unwrap();
@@ -1775,6 +1794,7 @@ mod tests {
             "reappeared",
             "/etc/amnezia/amneziawg/reappeared.conf",
             "reappeared",
+            None,
         )
         .await
         .unwrap());
@@ -2015,6 +2035,7 @@ mod tests {
             "awg0-client-stale",
             "/etc/amnezia/amneziawg/clients/awg0-client-stale.conf",
             "stale",
+            Some("stale"),
         )
         .await
         .expect("apply config mapping");

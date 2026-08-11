@@ -529,6 +529,10 @@ async fn apply_config_mappings(
     let mut mapped_by_ip: usize = 0;
     for config in configs {
         let path_str = config.path.to_string_lossy();
+        let managed_client_name = crate::admin::script_bridge::managed_client_name_from_config(
+            &config.name,
+            &config.friendly_name,
+        );
 
         // ── Strategy 1: exact public-key match ──────────────────
         //
@@ -544,6 +548,7 @@ async fn apply_config_mappings(
                 &config.name,
                 &path_str,
                 &config.friendly_name,
+                managed_client_name,
             )
             .await
             {
@@ -603,6 +608,7 @@ async fn apply_config_mappings(
                     &config.name,
                     &path_str,
                     &config.friendly_name,
+                    managed_client_name,
                 )
                 .await
                 {
