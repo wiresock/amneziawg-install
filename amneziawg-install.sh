@@ -10,6 +10,8 @@ NC='\033[0m'
 
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 WEB_PANEL_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
+WEB_PANEL_ENV_FILE="/etc/amneziawg-web/env.conf"
+WEB_PANEL_SYSTEMD_UNIT="/etc/systemd/system/amneziawg-web.service"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
@@ -1634,26 +1636,93 @@ function detectPublicIPv4() {
 	return 0
 }
 
+# Resolve the web panel's active config directory without sourcing its env file.
+# A custom web installer --env-file is recorded in the installed service unit,
+# while AWG_CONFIG_DIR itself is recorded in that root-controlled env file.
+function resolveWebPanelConfigDir() {
+	local env_file="${WEB_PANEL_ENV_FILE}"
+	local configured_env configured_dir env_file_required=0 env_file_optional=0
+
+	if [[ -L "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		echo "ERROR: refusing unsafe web panel service unit '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
+		return 1
+	fi
+	if [[ -e "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		if [[ ! -f "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+			echo "ERROR: refusing unsafe web panel service unit '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
+			return 1
+		fi
+		configured_env="$(sed -n 's/^[[:space:]]*EnvironmentFile=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null | tail -n 1)"
+		if [[ "${configured_env}" == -* ]]; then
+			env_file_optional=1
+			configured_env="${configured_env#-}"
+		fi
+		configured_env="${configured_env#\"}"
+		configured_env="${configured_env%\"}"
+		configured_env="${configured_env#\'}"
+		configured_env="${configured_env%\'}"
+		if [[ -n "${configured_env}" ]]; then
+			if [[ "${configured_env}" != /* || "${configured_env}" =~ [[:space:][:cntrl:]] ]]; then
+				echo "ERROR: refusing unsafe web panel environment path '${configured_env}'" >&2
+				return 1
+			fi
+			env_file="${configured_env}"
+			env_file_required=1
+		fi
+	fi
+
+	if [[ -L "${env_file}" ]]; then
+		echo "ERROR: refusing unsafe web panel environment file '${env_file}'" >&2
+		return 1
+	fi
+	if [[ -e "${env_file}" ]]; then
+		if [[ ! -f "${env_file}" ]]; then
+			echo "ERROR: refusing unsafe web panel environment file '${env_file}'" >&2
+			return 1
+		fi
+		configured_dir="$(sed -n 's/^AWG_CONFIG_DIR=//p' "${env_file}" 2>/dev/null | tail -n 1)"
+		configured_dir="${configured_dir#\"}"
+		configured_dir="${configured_dir%\"}"
+		configured_dir="${configured_dir#\'}"
+		configured_dir="${configured_dir%\'}"
+		if [[ -n "${configured_dir}" ]]; then
+			if [[ "${configured_dir}" != /* || "${configured_dir}" =~ [[:space:][:cntrl:]] ]]; then
+				echo "ERROR: refusing unsafe AWG_CONFIG_DIR '${configured_dir}'" >&2
+				return 1
+			fi
+			printf '%s\n' "${configured_dir%/}"
+			return 0
+		fi
+	elif [[ "${env_file_required}" -eq 1 && "${env_file_optional}" -eq 0 ]]; then
+		echo "ERROR: web panel environment file '${env_file}' does not exist" >&2
+		return 1
+	fi
+
+	printf '%s\n' "${WEB_PANEL_CONFIG_DIR%/}"
+}
+
 # Copy a client config file to the web panel config directory so the panel
 # can discover and display it.  This is a best-effort operation: if the web
 # panel is not installed (directory absent), the copy is silently skipped.
 function copyToWebPanelDir() {
 	local src_file="$1"
-	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && ! -L "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" && ! -L "${src_file}" ]]; then
+	local panel_config_dir
+	panel_config_dir="$(resolveWebPanelConfigDir)" || return 0
+	if [[ -d "${panel_config_dir}" && ! -L "${panel_config_dir}" && -f "${src_file}" && ! -L "${src_file}" ]]; then
 		local dest
-		dest="${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")"
+		dest="${panel_config_dir}/$(basename "${src_file}")"
 		# Avoid following or overwriting a pre-existing symlink at the destination.
 		if [[ -L "${dest}" ]]; then
 			# Best-effort: warn and skip rather than risk clobbering the symlink target.
 			echo "Warning: refusing to copy '${src_file}' to '${dest}' because destination is a symlink" >&2
 			return 0
 		fi
-		cp -f "${src_file}" "${WEB_PANEL_CONFIG_DIR}/" 2>/dev/null || true
+		cp -f "${src_file}" "${dest}" 2>/dev/null || true
 		# Only adjust ownership and permissions on a regular non-symlink file we just copied.
 		if [[ -f "${dest}" && ! -L "${dest}" ]]; then
 			# Determine the directory's group; use it if available, otherwise fall back to root.
 			local dir_group dest_group
-			dir_group="$(stat -c '%G' "${WEB_PANEL_CONFIG_DIR}" 2>/dev/null || true)"
+			dir_group="$(stat -c '%G' "${panel_config_dir}" 2>/dev/null || true)"
 			if [[ -n "${dir_group}" ]]; then
 				dest_group="${dir_group}"
 			else
@@ -1669,8 +1738,10 @@ function copyToWebPanelDir() {
 # Remove a client config file from the web panel config directory.
 function removeFromWebPanelDir() {
 	local filename="$1"
-	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && ! -L "${WEB_PANEL_CONFIG_DIR}" ]]; then
-		rm -f -- "${WEB_PANEL_CONFIG_DIR}/${filename}" 2>/dev/null || true
+	local panel_config_dir
+	panel_config_dir="$(resolveWebPanelConfigDir)" || return 0
+	if [[ -d "${panel_config_dir}" && ! -L "${panel_config_dir}" ]]; then
+		rm -f -- "${panel_config_dir}/${filename}" 2>/dev/null || true
 	fi
 }
 
@@ -5711,8 +5782,9 @@ CLIENT_LIFECYCLE_LOCK_FD=""
 # lock pathname. The caller runs in a subshell so the descriptor, and therefore
 # the lock, is released on every success, return, or exit path.
 function acquireClientLifecycleLock() {
-	local lock_dir="${WEB_PANEL_CONFIG_DIR}"
+	local lock_dir
 	local old_umask dir_identity descriptor_identity descriptor_path
+	lock_dir="$(resolveWebPanelConfigDir)" || return 1
 
 	if ! command -v flock >/dev/null 2>&1; then
 		echo "ERROR: flock is required for serialized client lifecycle operations" >&2

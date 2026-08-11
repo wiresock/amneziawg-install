@@ -2161,37 +2161,24 @@ async fn patch_peer(
             .into_response());
     }
 
-    let updated = crate::db::peers::update_peer_metadata(
-        &state.db.pool,
+    let updated = crate::admin::execute_update_peer_details(
+        &state.db,
         id,
         new_display_name.as_deref(),
         new_comment.as_deref(),
+        expiration_update.as_ref().map(|value| value.as_deref()),
+        expiration_update
+            .as_ref()
+            .and_then(|value| value.as_deref())
+            .and(managed_client_name),
     )
     .await?;
     if updated.is_none() {
         return Ok((
             StatusCode::CONFLICT,
-            Json(json!({ "error": "peer was archived while the update was in progress" })),
+            Json(json!({ "error": "peer removal or archival is already in progress" })),
         )
             .into_response());
-    }
-
-    if let Some(ref expires_at) = expiration_update {
-        if crate::admin::execute_update_peer_expiration(
-            &state.db,
-            id,
-            expires_at.as_deref(),
-            expires_at.as_deref().and(managed_client_name),
-        )
-        .await?
-        .is_none()
-        {
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(json!({ "error": "peer removal or archival is already in progress" })),
-            )
-                .into_response());
-        }
     }
 
     // Handle disabled flag if provided.
@@ -2560,38 +2547,25 @@ async fn post_peer_edit(
             .into_response());
     }
 
-    if crate::db::peers::update_peer_metadata(
-        &state.db.pool,
+    if crate::admin::execute_update_peer_details(
+        &state.db,
         id,
         display_name.as_deref(),
         comment.as_deref(),
+        expiration_update.as_ref().map(|value| value.as_deref()),
+        expiration_update
+            .as_ref()
+            .and_then(|value| value.as_deref())
+            .and(managed_client_name),
     )
     .await?
     .is_none()
     {
         return Ok((
             StatusCode::CONFLICT,
-            Html("<h1>Peer was archived while the update was in progress</h1>".to_string()),
+            Html("<h1>Peer removal or archival is already in progress</h1>".to_string()),
         )
             .into_response());
-    }
-
-    if let Some(ref expires_at) = expiration_update {
-        if crate::admin::execute_update_peer_expiration(
-            &state.db,
-            id,
-            expires_at.as_deref(),
-            expires_at.as_deref().and(managed_client_name),
-        )
-        .await?
-        .is_none()
-        {
-            return Ok((
-                StatusCode::CONFLICT,
-                Html("<h1>Peer removal or archival is already in progress</h1>".to_string()),
-            )
-                .into_response());
-        }
     }
 
     // Handle disabled checkbox: present with value "1" means disabled; absent means enabled.
@@ -6114,6 +6088,15 @@ mod tests {
     async fn patch_peer_cannot_cancel_expiration_removal_retry() {
         let db = test_db().await;
         let id = insert_peer(&db, "EXPIRY_REMOVAL_RETRY_KEY=", Some("Alice")).await;
+        crate::db::peers::update_peer_metadata(
+            &db.pool,
+            id,
+            Some("Alice"),
+            Some("Original comment"),
+        )
+        .await
+        .unwrap()
+        .expect("set original metadata");
         crate::db::peers::update_peer_expiration(
             &db.pool,
             id,
@@ -6134,7 +6117,9 @@ mod tests {
                     .method("PATCH")
                     .uri(format!("/api/peers/{id}"))
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"expiration_days":0}"#))
+                    .body(Body::from(
+                        r#"{"display_name":"Changed","comment":"Changed comment","expiration_days":0}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -6144,7 +6129,75 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("Alice"));
+        assert_eq!(row.comment.as_deref(), Some("Original comment"));
         assert_eq!(row.expires_at.as_deref(), Some("2026-08-10T12:00:00Z"));
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE peer_id = ? AND action = 'peer_updated'",
+        )
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0);
+    }
+
+    #[tokio::test]
+    async fn peer_edit_form_cannot_partially_update_expiration_removal_retry() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "FORM_EXPIRY_REMOVAL_RETRY_KEY=", Some("Alice")).await;
+        crate::db::peers::update_peer_metadata(
+            &db.pool,
+            id,
+            Some("Alice"),
+            Some("Original comment"),
+        )
+        .await
+        .unwrap()
+        .expect("set original metadata");
+        crate::db::peers::update_peer_expiration(
+            &db.pool,
+            id,
+            Some("2026-08-10T12:00:00Z"),
+            Some("alice"),
+        )
+        .await
+        .unwrap()
+        .expect("set expiration");
+        assert!(crate::db::peers::mark_removal_pending(&db.pool, id)
+            .await
+            .unwrap());
+
+        let app = test_router(db.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/peers/{id}"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "display_name=Changed&comment=Changed+comment&expiration_days=0",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let row = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("Alice"));
+        assert_eq!(row.comment.as_deref(), Some("Original comment"));
+        assert_eq!(row.expires_at.as_deref(), Some("2026-08-10T12:00:00Z"));
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE peer_id = ? AND action = 'peer_updated'",
+        )
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0);
     }
 
     #[tokio::test]

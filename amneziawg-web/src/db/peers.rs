@@ -380,6 +380,43 @@ pub async fn update_peer_metadata(
     find_visible_by_id(pool, id).await
 }
 
+/// Atomically update peer metadata and, when requested, its expiration.
+///
+/// `expiration_update = None` leaves the current deadline unchanged, while
+/// `Some(None)` makes the peer permanent. Expiration changes are rejected once
+/// native removal has started, and the metadata update is rejected with them.
+pub async fn update_peer_details(
+    pool: &SqlitePool,
+    id: i64,
+    display_name: Option<&str>,
+    comment: Option<&str>,
+    expiration_update: Option<Option<&str>>,
+    managed_client_name: Option<&str>,
+) -> Result<Option<PeerRow>, sqlx::Error> {
+    let Some(expires_at) = expiration_update else {
+        return update_peer_metadata(pool, id, display_name, comment).await;
+    };
+    let result = sqlx::query(
+        "UPDATE peers
+         SET display_name = ?, comment = ?, expires_at = ?,
+             managed_client_name = COALESCE(?, managed_client_name),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND archived = 0 AND removal_pending = 0",
+    )
+    .bind(display_name)
+    .bind(comment)
+    .bind(expires_at)
+    .bind(managed_client_name)
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+    find_visible_by_id(pool, id).await
+}
+
 /// Set or clear a peer's UTC expiration timestamp.
 ///
 /// `None` makes the peer permanent. The caller is responsible for validating

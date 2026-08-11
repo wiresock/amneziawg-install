@@ -464,6 +464,27 @@ pub async fn execute_update_peer_expiration(
     .await
 }
 
+/// Update metadata and an optional expiration as one guarded database change.
+pub async fn execute_update_peer_details(
+    db: &Database,
+    peer_id: i64,
+    display_name: Option<&str>,
+    comment: Option<&str>,
+    expiration_update: Option<Option<&str>>,
+    managed_client_name: Option<&str>,
+) -> Result<Option<PeerRow>, sqlx::Error> {
+    let _guard = EXPIRATION_STATE_LOCK.lock().await;
+    crate::db::peers::update_peer_details(
+        &db.pool,
+        peer_id,
+        display_name,
+        comment,
+        expiration_update,
+        managed_client_name,
+    )
+    .await
+}
+
 async fn execute_remove_user_inner(
     db: &Database,
     config_dir: &std::path::Path,

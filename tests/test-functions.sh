@@ -1132,7 +1132,12 @@ chmod +x "${NIAC_BIN}/awg" "${NIAC_BIN}/awg-quick"
 # same-name recreate cannot land between server removal and config cleanup.
 NIAC_LOCK_DIR="$(mktemp -d)"
 NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR="${WEB_PANEL_CONFIG_DIR}"
+NIAC_ORIGINAL_WEB_PANEL_ENV_FILE="${WEB_PANEL_ENV_FILE}"
+NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT="${WEB_PANEL_SYSTEMD_UNIT}"
+NIAC_WEB_ROOT="$(mktemp -d)"
 WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_DIR}"
+WEB_PANEL_ENV_FILE="${NIAC_WEB_ROOT}/missing-env.conf"
+WEB_PANEL_SYSTEMD_UNIT="${NIAC_WEB_ROOT}/missing.service"
 exec {NIAC_HELD_LOCK_FD}< "${NIAC_LOCK_DIR}"
 flock -xn "${NIAC_HELD_LOCK_FD}"
 _client_lock_must_be_busy() {
@@ -1151,9 +1156,35 @@ ln -s "${NIAC_LOCK_DIR}" "${NIAC_LOCK_LINK}"
 WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_LINK}"
 assert_rc 1 acquireClientLifecycleLock
 rm -f "${NIAC_LOCK_LINK}"
+
+# Custom web installer paths must resolve through the service unit and env file,
+# so root CLI lifecycle operations contend on the panel's actual config inode.
+NIAC_CUSTOM_LOCK_DIR="${NIAC_WEB_ROOT}/custom-clients"
+mkdir -p "${NIAC_CUSTOM_LOCK_DIR}"
+cat > "${NIAC_WEB_ROOT}/custom.env" <<EOF
+AWG_CONFIG_DIR=${NIAC_CUSTOM_LOCK_DIR}
+EOF
+cat > "${NIAC_WEB_ROOT}/amneziawg-web.service" <<EOF
+[Service]
+EnvironmentFile=${NIAC_WEB_ROOT}/custom.env
+EOF
+WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_DIR}"
+WEB_PANEL_SYSTEMD_UNIT="${NIAC_WEB_ROOT}/amneziawg-web.service"
+assert_eq "${NIAC_CUSTOM_LOCK_DIR}" "$(resolveWebPanelConfigDir)" \
+	"client lifecycle directory follows the web service EnvironmentFile"
+exec {NIAC_HELD_LOCK_FD}< "${NIAC_CUSTOM_LOCK_DIR}"
+flock -xn "${NIAC_HELD_LOCK_FD}"
+assert_rc 1 _client_lock_must_be_busy
+exec {NIAC_HELD_LOCK_FD}>&-
+
 WEB_PANEL_CONFIG_DIR="${NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR}"
+WEB_PANEL_ENV_FILE="${NIAC_ORIGINAL_WEB_PANEL_ENV_FILE}"
+WEB_PANEL_SYSTEMD_UNIT="${NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT}"
 rm -rf "${NIAC_LOCK_DIR}"
-unset NIAC_LOCK_DIR NIAC_LOCK_LINK NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_HELD_LOCK_FD
+rm -rf "${NIAC_WEB_ROOT}"
+unset NIAC_LOCK_DIR NIAC_LOCK_LINK NIAC_CUSTOM_LOCK_DIR NIAC_WEB_ROOT
+unset NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_ORIGINAL_WEB_PANEL_ENV_FILE
+unset NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT NIAC_HELD_LOCK_FD
 unset -f _client_lock_must_be_busy
 
 # Run nonInteractiveAddClient in a subshell; echo "<clientconf>|||<serverconf>".
@@ -1166,6 +1197,8 @@ _run_niac() {  # $1=ENABLE_IPV6 (y/n) $2=client name
 		PATH="${NIAC_BIN}:${PATH}"; export PATH
 		AMNEZIAWG_DIR="${dir}/amneziawg"
 		WEB_PANEL_CONFIG_DIR="${dir}/amneziawg/clients"
+		WEB_PANEL_ENV_FILE="${dir}/missing-env.conf"
+		WEB_PANEL_SYSTEMD_UNIT="${dir}/missing.service"
 		SERVER_AWG_NIC="awg0"; SERVER_AWG_IPV4="10.66.66.1"
 		SERVER_AWG_IPV6="fd42:42:42:0:0:0:0:1"; SERVER_PORT="51820"
 		SERVER_PUB_IP="198.51.100.1"; SERVER_PUB_KEY="SRVPUB"
