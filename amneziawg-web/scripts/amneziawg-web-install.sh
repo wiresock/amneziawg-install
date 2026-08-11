@@ -1096,22 +1096,6 @@ setup_filesystem() {
                     && info "Adjusted ownership of existing client configs in ${AWG_CONFIG_DIR} to ${SERVICE_USER}." \
                     || warn "Could not change ownership of existing client configs in ${AWG_CONFIG_DIR}. They may not be readable by ${SERVICE_USER}."
             fi
-            # The root-run AWG CLI and the web panel share this lifecycle lock.
-            # If the CLI created it before the panel was installed, adopt the
-            # existing safe regular file so the service can open it later.
-            local lifecycle_lock="${AWG_CONFIG_DIR}/.create-client.lock"
-            if [[ -e "${lifecycle_lock}" || -L "${lifecycle_lock}" ]]; then
-                local lifecycle_lock_links
-                lifecycle_lock_links="$(stat -c '%h' -- "${lifecycle_lock}" 2>/dev/null || echo "")"
-                if [[ -L "${lifecycle_lock}" || ! -f "${lifecycle_lock}" || "${lifecycle_lock_links}" != "1" ]]; then
-                    die "Unsafe client lifecycle lock at ${lifecycle_lock}; expected a regular, single-link file."
-                fi
-                chown "${SERVICE_USER}:${SERVICE_USER}" "${lifecycle_lock}" \
-                    || die "Could not change ownership of ${lifecycle_lock} to ${SERVICE_USER}."
-                chmod 0600 "${lifecycle_lock}" \
-                    || die "Could not set permissions of ${lifecycle_lock} to 0600."
-                info "Adjusted ownership of the shared client lifecycle lock to ${SERVICE_USER}."
-            fi
         else
             # Create the directory owned by the service user so it can write configs.
             mkdir -p "${AWG_CONFIG_DIR}"

@@ -1133,7 +1133,7 @@ chmod +x "${NIAC_BIN}/awg" "${NIAC_BIN}/awg-quick"
 NIAC_LOCK_DIR="$(mktemp -d)"
 NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR="${WEB_PANEL_CONFIG_DIR}"
 WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_DIR}"
-exec {NIAC_HELD_LOCK_FD}> "${NIAC_LOCK_DIR}/.create-client.lock"
+exec {NIAC_HELD_LOCK_FD}< "${NIAC_LOCK_DIR}"
 flock -xn "${NIAC_HELD_LOCK_FD}"
 _client_lock_must_be_busy() {
 	acquireClientLifecycleLock >/dev/null 2>&1
@@ -1141,14 +1141,19 @@ _client_lock_must_be_busy() {
 assert_rc 1 _client_lock_must_be_busy
 exec {NIAC_HELD_LOCK_FD}>&-
 assert_rc 0 acquireClientLifecycleLock
-assert_eq "600" "$(stat -c '%a' "${NIAC_LOCK_DIR}/.create-client.lock")" \
-	"client lifecycle lock uses restrictive permissions"
+assert_eq "" "$(find "${NIAC_LOCK_DIR}" -mindepth 1 -maxdepth 1 -print -quit)" \
+	"client lifecycle locking creates no service-writable lock file"
 if [[ -n "${CLIENT_LIFECYCLE_LOCK_FD:-}" ]]; then
 	exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
 fi
+NIAC_LOCK_LINK="${NIAC_LOCK_DIR}-link"
+ln -s "${NIAC_LOCK_DIR}" "${NIAC_LOCK_LINK}"
+WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_LINK}"
+assert_rc 1 acquireClientLifecycleLock
+rm -f "${NIAC_LOCK_LINK}"
 WEB_PANEL_CONFIG_DIR="${NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR}"
 rm -rf "${NIAC_LOCK_DIR}"
-unset NIAC_LOCK_DIR NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_HELD_LOCK_FD
+unset NIAC_LOCK_DIR NIAC_LOCK_LINK NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_HELD_LOCK_FD
 unset -f _client_lock_must_be_busy
 
 # Run nonInteractiveAddClient in a subshell; echo "<clientconf>|||<serverconf>".

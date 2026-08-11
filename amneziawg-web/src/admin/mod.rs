@@ -499,8 +499,7 @@ async fn execute_remove_user_inner(
     // config and syncing the interface.
     // Non-blocking (LOCK_NB) to avoid hanging web requests; returns an error
     // if another operation is in progress, matching create_client() behavior.
-    let lock_path = config_dir.join(".create-client.lock");
-    let lock_result = acquire_lifecycle_lock(&lock_path).map_err(map_lock_error);
+    let lock_result = acquire_lifecycle_lock(config_dir).map_err(map_lock_error);
     let _lock_file = match lock_result {
         Ok(f) => f,
         Err(e) => {

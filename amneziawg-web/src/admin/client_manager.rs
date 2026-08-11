@@ -161,13 +161,14 @@ pub fn sanitized_create_error_category(error: &CreateClientError) -> &'static st
 }
 
 #[cfg(unix)]
-pub(crate) fn acquire_lifecycle_lock(lock_path: &Path) -> Result<std::fs::File, std::io::Error> {
+pub(crate) fn acquire_lifecycle_lock(config_dir: &Path) -> Result<std::fs::File, std::io::Error> {
+    // Lock the already-existing directory itself. Keeping lifecycle
+    // serialization on this descriptor avoids creating or mutating a lock
+    // pathname inside the service-writable directory.
     let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(lock_path)?;
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(config_dir)?;
 
     use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -1071,8 +1072,7 @@ pub(crate) fn acquire_creation_lifecycle_lock(
     config_dir: &Path,
 ) -> Result<std::fs::File, CreateClientError> {
     prepare_client_config_dir(config_dir)?;
-    let lock_path = config_dir.join(".create-client.lock");
-    acquire_lifecycle_lock(&lock_path).map_err(|err| match err.raw_os_error() {
+    acquire_lifecycle_lock(config_dir).map_err(|err| match err.raw_os_error() {
         Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
             CreateClientError::LockBusy
         }
@@ -1489,6 +1489,30 @@ pub fn remove_client_resumable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_uses_directory_descriptor_and_rejects_symlinks() {
+        let parent = tempfile::tempdir().expect("temp parent");
+        let config_dir = parent.path().join("clients");
+        std::fs::create_dir(&config_dir).expect("create config dir");
+
+        let first = acquire_lifecycle_lock(&config_dir).expect("first lifecycle lock");
+        let second = acquire_lifecycle_lock(&config_dir).expect_err("lock must contend");
+        assert!(matches!(
+            second.raw_os_error(),
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+        ));
+        assert!(std::fs::read_dir(&config_dir)
+            .expect("read config dir")
+            .next()
+            .is_none());
+        drop(first);
+
+        let symlink = parent.path().join("clients-link");
+        std::os::unix::fs::symlink(&config_dir, &symlink).expect("create symlink");
+        assert!(acquire_lifecycle_lock(&symlink).is_err());
+    }
 
     #[test]
     fn remove_client_block_removes_only_target_client_section() {

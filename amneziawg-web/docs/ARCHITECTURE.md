@@ -77,11 +77,12 @@ the same lock, and atomically replaces the config.  Arbitrary config
 content, raw file reads, arbitrary `syncconf` stdin, and unknown operations are
 rejected rather than forwarded.
 
-The web panel holds `.create-client.lock` across the complete managed-client
-lifecycle, including database persistence and client-config cleanup. Supported
-installer `--add-client` and `--remove-client` operations take that same
-cross-process lock, preventing an out-of-band same-name replacement from
-appearing inside a web lifecycle operation.
+The web panel holds an advisory lock on the open client-config directory across
+the complete managed-client lifecycle, including database persistence and
+client-config cleanup. Supported installer `--add-client` and `--remove-client`
+operations lock the same directory descriptor, preventing an out-of-band
+same-name replacement from appearing inside a web lifecycle operation without
+introducing a mutable lock pathname in the service-writable directory.
 
 ---
 
@@ -186,8 +187,11 @@ disabled, and does not restore deleted metadata or history.
 Before the native removal path performs its first external mutation it sets a
 durable `removal_pending` flag. Stale-peer cleanup and archiving exclude those
 rows, preserving the identity and metadata needed to resume a partial manual
-or expiration removal. Successful removal uses the normal peer-row deletion
-path, so the retry marker cannot become stale state.
+or expiration removal. Expiration edits reject removal-pending rows so an
+administrator cannot cancel the automatic retry by clearing or extending its
+deadline. Manual retry actions use the durable managed client name even after
+config discovery fields are cleared. Successful removal uses the normal
+peer-row deletion path, so the retry marker cannot become stale state.
 
 ---
 

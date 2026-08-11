@@ -5705,12 +5705,14 @@ function manageMenu() {
 CLIENT_LIFECYCLE_LOCK_FD=""
 
 # Acquire the same non-blocking lifecycle lock used by amneziawg-web. The
-# caller runs in a subshell so the descriptor, and therefore the lock, is
-# released on every success, return, or exit path.
+# configuration directory itself is opened read-only, its descriptor identity
+# is revalidated against the path, and the descriptor is locked. The root-run
+# CLI therefore never creates, truncates, chowns, or chmods a service-writable
+# lock pathname. The caller runs in a subshell so the descriptor, and therefore
+# the lock, is released on every success, return, or exit path.
 function acquireClientLifecycleLock() {
 	local lock_dir="${WEB_PANEL_CONFIG_DIR}"
-	local lock_path="${lock_dir}/.create-client.lock"
-	local old_umask dir_identity lock_identity link_count
+	local old_umask dir_identity descriptor_identity descriptor_path
 
 	if ! command -v flock >/dev/null 2>&1; then
 		echo "ERROR: flock is required for serialized client lifecycle operations" >&2
@@ -5728,42 +5730,17 @@ function acquireClientLifecycleLock() {
 		echo "ERROR: refusing unsafe client lifecycle directory '${lock_dir}'" >&2
 		return 1
 	fi
-	if [[ -L "${lock_path}" ]] || { [[ -e "${lock_path}" ]] && [[ ! -f "${lock_path}" ]]; }; then
-		echo "ERROR: refusing unsafe client lifecycle lock '${lock_path}'" >&2
+	if ! exec {CLIENT_LIFECYCLE_LOCK_FD}< "${lock_dir}"; then
+		echo "ERROR: could not open client lifecycle directory '${lock_dir}'" >&2
 		return 1
 	fi
-
-	old_umask="$(umask)"
-	umask 077
-	if ! exec {CLIENT_LIFECYCLE_LOCK_FD}> "${lock_path}"; then
-		umask "${old_umask}"
-		echo "ERROR: could not open client lifecycle lock '${lock_path}'" >&2
-		return 1
-	fi
-	umask "${old_umask}"
-
-	link_count="$(stat -c '%h' "${lock_path}" 2>/dev/null || true)"
-	if [[ "${link_count}" != "1" ]]; then
+	descriptor_path="/proc/${BASHPID}/fd/${CLIENT_LIFECYCLE_LOCK_FD}"
+	dir_identity="$(stat -Lc '%d:%i' -- "${lock_dir}" 2>/dev/null || true)"
+	descriptor_identity="$(stat -Lc '%d:%i' -- "${descriptor_path}" 2>/dev/null || true)"
+	if [[ -L "${lock_dir}" || ! -d "${lock_dir}" || -z "${dir_identity}" || \
+		-z "${descriptor_identity}" || "${dir_identity}" != "${descriptor_identity}" ]]; then
 		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
-		echo "ERROR: refusing client lifecycle lock with unexpected links '${lock_path}'" >&2
-		return 1
-	fi
-	dir_identity="$(stat -c '%u:%g' "${lock_dir}" 2>/dev/null || true)"
-	lock_identity="$(stat -c '%u:%g' "${lock_path}" 2>/dev/null || true)"
-	if [[ -z "${dir_identity}" || -z "${lock_identity}" ]]; then
-		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
-		echo "ERROR: could not validate client lifecycle lock ownership" >&2
-		return 1
-	fi
-	if [[ "${lock_identity}" != "${dir_identity}" ]] && \
-		! chown --reference="${lock_dir}" -- "${lock_path}"; then
-		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
-		echo "ERROR: could not align client lifecycle lock ownership" >&2
-		return 1
-	fi
-	if ! chmod 0600 -- "${lock_path}"; then
-		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
-		echo "ERROR: could not secure client lifecycle lock" >&2
+		echo "ERROR: client lifecycle directory changed while it was opened" >&2
 		return 1
 	fi
 	if ! flock -xn "${CLIENT_LIFECYCLE_LOCK_FD}"; then

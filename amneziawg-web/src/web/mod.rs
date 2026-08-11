@@ -415,6 +415,9 @@ pub struct PeerDetailDto {
     pub comment: Option<String>,
     pub config_name: Option<String>,
     pub friendly_name: Option<String>,
+    /// Validated stable installer identity used to resume lifecycle removal.
+    #[serde(skip_serializing)]
+    pub managed_client_name: Option<String>,
     pub config_path: Option<String>,
     pub allowed_ips: String,
     pub endpoint: Option<String>,
@@ -706,7 +709,7 @@ fn parse_form_expiration_days(value: Option<&str>) -> Result<Option<i64>, String
         .map_err(|_| "lifetime must be a whole number of days".to_string())
 }
 
-fn managed_client_name_for_expiration(row: &PeerRow) -> Option<&str> {
+fn managed_client_name_for_lifecycle(row: &PeerRow) -> Option<&str> {
     row.managed_client_name
         .as_deref()
         .filter(|name| crate::admin::script_bridge::validate_client_name(name).is_ok())
@@ -1066,6 +1069,7 @@ fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDt
     let now = Utc::now();
     let expiration_status = format_expiration_status(expires_at, now);
     let expired = expires_at.is_some_and(|value| value <= now);
+    let managed_client_name = managed_client_name_for_lifecycle(&row).map(str::to_owned);
     PeerDetailDto {
         id: row.id,
         name,
@@ -1074,6 +1078,7 @@ fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDt
         comment: row.comment,
         config_name: row.config_name,
         friendly_name: row.friendly_name,
+        managed_client_name,
         config_path: row.config_path,
         allowed_ips: row.allowed_ips,
         endpoint: row.endpoint,
@@ -2145,7 +2150,7 @@ async fn patch_peer(
         },
         None => None,
     };
-    let managed_client_name = managed_client_name_for_expiration(&existing);
+    let managed_client_name = managed_client_name_for_lifecycle(&existing);
     if expiration_update.as_ref().is_some_and(Option::is_some)
         && managed_client_name.is_none()
     {
@@ -2183,7 +2188,7 @@ async fn patch_peer(
         {
             return Ok((
                 StatusCode::CONFLICT,
-                Json(json!({ "error": "peer was archived while the update was in progress" })),
+                Json(json!({ "error": "peer removal or archival is already in progress" })),
             )
                 .into_response());
         }
@@ -2544,7 +2549,7 @@ async fn post_peer_edit(
         },
         None => None,
     };
-    let managed_client_name = managed_client_name_for_expiration(&existing);
+    let managed_client_name = managed_client_name_for_lifecycle(&existing);
     if expiration_update.as_ref().is_some_and(Option::is_some)
         && managed_client_name.is_none()
     {
@@ -2583,7 +2588,7 @@ async fn post_peer_edit(
         {
             return Ok((
                 StatusCode::CONFLICT,
-                Html("<h1>Peer was archived while the update was in progress</h1>".to_string()),
+                Html("<h1>Peer removal or archival is already in progress</h1>".to_string()),
             )
                 .into_response());
         }
@@ -2898,23 +2903,21 @@ async fn api_remove_user(
         }
     };
 
-    // Determine the script-side client name from the peer's friendly_name
-    // (which is extracted from the config filename's `-client-<suffix>` pattern).
-    let client_name = match peer.friendly_name.as_deref() {
-        Some(n) if !n.is_empty() => n.to_string(),
+    // Prefer the stable identity persisted at creation/removal start. Migrated
+    // rows fall back to validated config discovery metadata while it exists.
+    let client_name = match managed_client_name_for_lifecycle(&peer) {
+        Some(name) => name.to_string(),
         _ => {
             return Ok((
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "peer has no associated client name (no config linked)" })),
+                Json(json!({ "error": "peer has no managed client identity" })),
             )
                 .into_response());
         }
     };
 
-    // Only peers whose friendly_name passes installer validation can be removed
-    // via the script.  Configs not matching the `*-client-<name>.conf` pattern
-    // (or with names that exceed the character/length constraints) are not
-    // managed by the installer and would always fail.
+    // Keep validation at the mutation boundary even though identity selection
+    // above already filters invalid names.
     if let Err(e) = crate::admin::script_bridge::validate_client_name(&client_name) {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -3135,8 +3138,8 @@ async fn post_remove_user_form(
         }
     };
 
-    let client_name = match peer.friendly_name.as_deref() {
-        Some(n) if !n.is_empty() => n.to_string(),
+    let client_name = match managed_client_name_for_lifecycle(&peer) {
+        Some(name) => name.to_string(),
         _ => {
             return Ok(Redirect::to(&format!("/peers/{id}")).into_response());
         }
@@ -4307,14 +4310,11 @@ Audit-log entries are retained and may still contain earlier values.</p>
         ));
     }
 
-    // Remove user form (only shown when the peer has a linked config and the
-    // friendly name passes installer-managed name validation, i.e. it matches
-    // the `-client-<name>` pattern and `[a-zA-Z0-9_-]{1,15}`).
-    if dto.has_config {
-        if let Some(ref fn_name) = dto.friendly_name {
-            if crate::admin::script_bridge::validate_client_name(fn_name).is_ok() {
-                buf.push_str(&format!(
-                    r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
+    // Keep the retry action available after a partial removal clears transient
+    // config discovery metadata; managed_client_name is the durable identity.
+    if let Some(ref managed_name) = dto.managed_client_name {
+        buf.push_str(&format!(
+            r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
 <h2 style="color:#c00">Remove user</h2>
 <p>This will permanently revoke the client <strong>{name}</strong> and delete its config file.
 Historical data (snapshots, events) will be preserved.</p>
@@ -4330,12 +4330,10 @@ Historical data (snapshots, events) will be preserved.</p>
 </form>
 </div>
 "#,
-                    id = dto.id,
-                    csrf = esc(csrf_token),
-                    name = esc(fn_name),
-                ));
-            }
-        }
+            id = dto.id,
+            csrf = esc(csrf_token),
+            name = esc(managed_name),
+        ));
     }
 
     // Traffic usage summary
@@ -6110,6 +6108,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.managed_client_name.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn patch_peer_cannot_cancel_expiration_removal_retry() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "EXPIRY_REMOVAL_RETRY_KEY=", Some("Alice")).await;
+        crate::db::peers::update_peer_expiration(
+            &db.pool,
+            id,
+            Some("2026-08-10T12:00:00Z"),
+            Some("alice"),
+        )
+        .await
+        .unwrap()
+        .expect("set expiration");
+        assert!(crate::db::peers::mark_removal_pending(&db.pool, id)
+            .await
+            .unwrap());
+
+        let app = test_router(db.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expiration_days":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let row = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.expires_at.as_deref(), Some("2026-08-10T12:00:00Z"));
     }
 
     #[tokio::test]
@@ -7980,6 +8015,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_detail_page_keeps_remove_retry_for_stable_managed_identity() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "REMOVE_RETRY_KEY==", Some("Retry user")).await;
+        sqlx::query(
+            "UPDATE peers
+             SET managed_client_name = 'retry-user', removal_pending = 1
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Remove user"));
+        assert!(html.contains("retry-user"));
+        assert!(html.contains(&format!("/admin/users/{id}/remove")));
+    }
+
+    #[tokio::test]
     async fn peer_detail_page_no_remove_when_name_not_installer_managed() {
         let db = test_db().await;
         let id = insert_peer(&db, "DOTNAME_KEY==", Some("custom.name")).await;
@@ -8553,7 +8621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_remove_user_form_invalid_installer_name_renders_validation_error() {
+    async fn post_remove_user_form_unmanaged_identity_redirects_without_mutation() {
         let db = test_db().await;
         let id = insert_peer(&db, "DOTNAME_REMOVE_KEY==", Some("custom.name")).await;
 
@@ -8579,16 +8647,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let html = std::str::from_utf8(&body).unwrap();
-        assert!(
-            html.contains("Remove failed: peer is not managed by installer"),
-            "HTML should include installer-managed validation error, got: {html}"
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            &format!("/peers/{id}")
         );
-        assert!(!html.contains("Remove failed: internal server error."));
     }
 
     #[test]

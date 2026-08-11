@@ -383,7 +383,8 @@ pub async fn update_peer_metadata(
 /// Set or clear a peer's UTC expiration timestamp.
 ///
 /// `None` makes the peer permanent. The caller is responsible for validating
-/// and normalizing non-NULL values to RFC-3339 UTC.
+/// and normalizing non-NULL values to RFC-3339 UTC. Once native removal has
+/// started, the deadline is immutable so automated retries cannot be canceled.
 pub async fn update_peer_expiration(
     pool: &SqlitePool,
     id: i64,
@@ -395,7 +396,7 @@ pub async fn update_peer_expiration(
          SET expires_at = ?,
              managed_client_name = COALESCE(?, managed_client_name),
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND archived = 0",
+         WHERE id = ? AND archived = 0 AND removal_pending = 0",
     )
     .bind(expires_at)
     .bind(managed_client_name)
@@ -1380,6 +1381,35 @@ mod tests {
             .expect("clear expiration")
             .expect("peer");
         assert!(row.expires_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_peer_expiration_rejects_removal_in_progress() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_EXPIRATION_REMOVING=", None).await;
+        update_peer_expiration(
+            &db.pool,
+            id,
+            Some("2026-08-10T12:00:00Z"),
+            Some("alice"),
+        )
+        .await
+        .unwrap()
+        .expect("set original expiration");
+        assert!(mark_removal_pending(&db.pool, id).await.unwrap());
+
+        assert!(update_peer_expiration(&db.pool, id, None, None)
+            .await
+            .unwrap()
+            .is_none());
+        let row = find_by_id(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(row.expires_at.as_deref(), Some("2026-08-10T12:00:00Z"));
+        assert_eq!(row.managed_client_name.as_deref(), Some("alice"));
+        let retry = list_expired(&db.pool, "2026-08-11T12:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].id, id);
     }
 
     #[tokio::test]
