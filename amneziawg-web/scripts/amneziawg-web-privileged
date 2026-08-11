@@ -411,6 +411,12 @@ emit_safe_server_state() {
                 fail "server Address contains unexpected content"
             fi
             printf 'Address = %s\n' "${value}"
+        elif [[ "${trimmed}" =~ ^PublicKey[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            validate_public_key "${value}"
+            printf 'PublicKey = %s\n' "${value}"
         elif [[ "${trimmed}" =~ ^AllowedIPs[[:space:]]*=[[:space:]]*(.*)$ ]]; then
             value="${BASH_REMATCH[1]}"
             if [[ ! "${value}" =~ ^[0-9A-Fa-f:.,/[:space:]]+$ ]]; then

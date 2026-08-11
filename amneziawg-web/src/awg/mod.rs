@@ -302,8 +302,8 @@ pub fn read_params_via_sudo() -> Result<String, AwgError> {
 /// Read a sanitized server-config projection used for name/IP allocation.
 ///
 /// The helper emits only section headers, managed client markers, interface
-/// addresses, and peer AllowedIPs. Private keys and pre-shared keys never
-/// cross into the unprivileged process.
+/// addresses, validated peer public keys, and peer AllowedIPs. Private keys
+/// and pre-shared keys never cross into the unprivileged process.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn read_server_state_via_sudo(interface: &str) -> Result<String, AwgError> {
     let output = Command::new(SUDO_BIN)
