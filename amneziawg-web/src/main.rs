@@ -19,7 +19,7 @@ use tracing::info;
 use crate::auth::AuthConfig;
 use crate::db::Database;
 use crate::poller::Poller;
-use crate::web::router_with_proxy_sessions_file;
+use crate::web::router_with_lifecycle_lock_dir;
 
 /// CLI arguments / environment variable configuration.
 #[derive(Parser, Debug)]
@@ -83,6 +83,35 @@ pub struct Config {
     /// Default is 86400 (24 hours).
     #[arg(long, env = "AUTH_SESSION_TTL_SECS", default_value_t = 86_400)]
     pub auth_session_ttl_secs: u64,
+}
+
+fn lifecycle_lock_dir(database_url: &str) -> anyhow::Result<std::path::PathBuf> {
+    let database_path = database_url
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.strip_prefix("sqlite:"))
+        .unwrap_or(database_url)
+        .split('?')
+        .next()
+        .unwrap_or(database_url);
+
+    let path = if database_path == ":memory:" || database_path.is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        std::path::PathBuf::from(database_path)
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let absolute = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve the database directory")?
+            .join(parent)
+    };
+
+    Ok(absolute)
 }
 
 #[tokio::main]
@@ -182,15 +211,45 @@ async fn main() -> anyhow::Result<()> {
     db.migrate().await.context("database migration failed")?;
     info!("database ready");
 
+    // The database directory is persistent, service-owned state that remains
+    // available even when AWG_CONFIG_DIR has not been created yet or was
+    // removed. Locking its descriptor lets the web process and root CLI share
+    // one stable lifecycle lock without creating a writable lock file.
+    let lifecycle_lock_dir = lifecycle_lock_dir(&config.database_url)?;
+    let lock_metadata = std::fs::symlink_metadata(&lifecycle_lock_dir).with_context(|| {
+        format!(
+            "cannot inspect lifecycle lock directory {}",
+            lifecycle_lock_dir.display()
+        )
+    })?;
+    if lock_metadata.file_type().is_symlink() || !lock_metadata.is_dir() {
+        anyhow::bail!(
+            "lifecycle lock path must be an existing non-symlink directory: {}",
+            lifecycle_lock_dir.display()
+        );
+    }
+    info!(path = %lifecycle_lock_dir.display(), "lifecycle lock directory validated");
+
     // --- Background poller --------------------------------------------------
     let config_dir = config.config_dir.clone();
-    let poller = Poller::new(db.clone(), config.poll_interval, config.config_dir);
+    let poller = Poller::new_with_lifecycle_lock_dir(
+        db.clone(),
+        config.poll_interval,
+        config.config_dir,
+        lifecycle_lock_dir.clone(),
+    );
     tokio::spawn(async move {
         poller.run().await;
     });
 
     // --- HTTP server --------------------------------------------------------
-    let app = router_with_proxy_sessions_file(db, auth, config_dir, config.proxy_sessions_file);
+    let app = router_with_lifecycle_lock_dir(
+        db,
+        auth,
+        config_dir,
+        lifecycle_lock_dir,
+        config.proxy_sessions_file,
+    );
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .context("failed to bind TCP listener")?;

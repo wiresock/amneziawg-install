@@ -1128,7 +1128,7 @@ echo "[Interface]"
 EOF
 chmod +x "${NIAC_BIN}/awg" "${NIAC_BIN}/awg-quick"
 
-# The installer CLI must contend on the exact lock used by the web panel so a
+# Without an installed panel, the CLI uses the client directory as its lock so a
 # same-name recreate cannot land between server removal and config cleanup.
 NIAC_LOCK_DIR="$(mktemp -d)"
 NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR="${WEB_PANEL_CONFIG_DIR}"
@@ -1157,12 +1157,15 @@ WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_LINK}"
 assert_rc 1 acquireClientLifecycleLock
 rm -f "${NIAC_LOCK_LINK}"
 
-# Custom web installer paths must resolve through the service unit and env file,
-# so root CLI lifecycle operations contend on the panel's actual config inode.
-NIAC_CUSTOM_LOCK_DIR="${NIAC_WEB_ROOT}/custom-clients"
-mkdir -p "${NIAC_CUSTOM_LOCK_DIR}"
+# Custom web installer paths must resolve through the service unit and env file.
+# The database directory is the stable lifecycle inode even when the configured
+# client directory does not exist yet.
+NIAC_CUSTOM_CONFIG_DIR="${NIAC_WEB_ROOT}/custom-clients"
+NIAC_CUSTOM_STATE_DIR="${NIAC_WEB_ROOT}/custom-state"
+mkdir -p "${NIAC_CUSTOM_STATE_DIR}"
 cat > "${NIAC_WEB_ROOT}/custom.env" <<EOF
-AWG_CONFIG_DIR=${NIAC_CUSTOM_LOCK_DIR}
+AWG_WEB_DB=${NIAC_CUSTOM_STATE_DIR}/awg-web.db
+AWG_CONFIG_DIR=${NIAC_CUSTOM_CONFIG_DIR}
 EOF
 cat > "${NIAC_WEB_ROOT}/amneziawg-web.service" <<EOF
 [Service]
@@ -1170,19 +1173,28 @@ EnvironmentFile=${NIAC_WEB_ROOT}/custom.env
 EOF
 WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_DIR}"
 WEB_PANEL_SYSTEMD_UNIT="${NIAC_WEB_ROOT}/amneziawg-web.service"
-assert_eq "${NIAC_CUSTOM_LOCK_DIR}" "$(resolveWebPanelConfigDir)" \
-	"client lifecycle directory follows the web service EnvironmentFile"
-exec {NIAC_HELD_LOCK_FD}< "${NIAC_CUSTOM_LOCK_DIR}"
+assert_eq "${NIAC_CUSTOM_CONFIG_DIR}" "$(resolveWebPanelConfigDir)" \
+	"client config directory follows the web service EnvironmentFile"
+assert_eq "${NIAC_CUSTOM_STATE_DIR}" "$(resolveClientLifecycleLockDir)" \
+	"client lifecycle directory follows the configured database"
+exec {NIAC_HELD_LOCK_FD}< "${NIAC_CUSTOM_STATE_DIR}"
 flock -xn "${NIAC_HELD_LOCK_FD}"
 assert_rc 1 _client_lock_must_be_busy
 exec {NIAC_HELD_LOCK_FD}>&-
+assert_eq "false" "$([[ -e "${NIAC_CUSTOM_CONFIG_DIR}" ]] && echo true || echo false)" \
+	"lifecycle locking does not create a missing client directory"
+
+rm -rf "${NIAC_CUSTOM_STATE_DIR}"
+assert_rc 1 acquireClientLifecycleLock
+assert_eq "false" "$([[ -e "${NIAC_CUSTOM_STATE_DIR}" ]] && echo true || echo false)" \
+	"root CLI does not recreate a missing panel state directory"
 
 WEB_PANEL_CONFIG_DIR="${NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR}"
 WEB_PANEL_ENV_FILE="${NIAC_ORIGINAL_WEB_PANEL_ENV_FILE}"
 WEB_PANEL_SYSTEMD_UNIT="${NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT}"
 rm -rf "${NIAC_LOCK_DIR}"
 rm -rf "${NIAC_WEB_ROOT}"
-unset NIAC_LOCK_DIR NIAC_LOCK_LINK NIAC_CUSTOM_LOCK_DIR NIAC_WEB_ROOT
+unset NIAC_LOCK_DIR NIAC_LOCK_LINK NIAC_CUSTOM_CONFIG_DIR NIAC_CUSTOM_STATE_DIR NIAC_WEB_ROOT
 unset NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_ORIGINAL_WEB_PANEL_ENV_FILE
 unset NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT NIAC_HELD_LOCK_FD
 unset -f _client_lock_must_be_busy

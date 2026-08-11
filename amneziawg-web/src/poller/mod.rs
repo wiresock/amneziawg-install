@@ -54,14 +54,27 @@ pub struct Poller {
     interval: Duration,
     /// Directory to scan for `*.conf` client config files.
     config_dir: PathBuf,
+    /// Persistent directory whose descriptor serializes client lifecycle work.
+    lifecycle_lock_dir: PathBuf,
 }
 
 impl Poller {
+    #[cfg(test)]
     pub fn new(db: Database, interval_secs: u64, config_dir: PathBuf) -> Self {
+        Self::new_with_lifecycle_lock_dir(db, interval_secs, config_dir.clone(), config_dir)
+    }
+
+    pub fn new_with_lifecycle_lock_dir(
+        db: Database,
+        interval_secs: u64,
+        config_dir: PathBuf,
+        lifecycle_lock_dir: PathBuf,
+    ) -> Self {
         Self {
             db,
             interval: Duration::from_secs(interval_secs),
             config_dir,
+            lifecycle_lock_dir,
         }
     }
 
@@ -92,7 +105,13 @@ impl Poller {
         // expirations missed while the web service was stopped. Running it
         // before AWG discovery means cleanup is still attempted if AWG status
         // collection fails later in the cycle.
-        match crate::admin::cleanup_expired_users(&self.db, &self.config_dir).await {
+        match crate::admin::cleanup_expired_users(
+            &self.db,
+            &self.config_dir,
+            &self.lifecycle_lock_dir,
+        )
+        .await
+        {
             Ok(removed) if removed > 0 => {
                 info!(removed, "expired-user cleanup complete");
             }

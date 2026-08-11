@@ -12,6 +12,7 @@ AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 WEB_PANEL_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
 WEB_PANEL_ENV_FILE="/etc/amneziawg-web/env.conf"
 WEB_PANEL_SYSTEMD_UNIT="/etc/systemd/system/amneziawg-web.service"
+WEB_PANEL_DATA_DIR="/var/lib/amneziawg-web"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
@@ -1636,12 +1637,11 @@ function detectPublicIPv4() {
 	return 0
 }
 
-# Resolve the web panel's active config directory without sourcing its env file.
-# A custom web installer --env-file is recorded in the installed service unit,
-# while AWG_CONFIG_DIR itself is recorded in that root-controlled env file.
-function resolveWebPanelConfigDir() {
+# Resolve the web panel's root-controlled environment file without sourcing it.
+# A custom installer --env-file is recorded in the installed service unit.
+function resolveWebPanelEnvFile() {
 	local env_file="${WEB_PANEL_ENV_FILE}"
-	local configured_env configured_dir env_file_required=0 env_file_optional=0
+	local configured_env env_file_required=0 env_file_optional=0
 
 	if [[ -L "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
 		echo "ERROR: refusing unsafe web panel service unit '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
@@ -1680,6 +1680,20 @@ function resolveWebPanelConfigDir() {
 			echo "ERROR: refusing unsafe web panel environment file '${env_file}'" >&2
 			return 1
 		fi
+	elif [[ "${env_file_required}" -eq 1 && "${env_file_optional}" -eq 0 ]]; then
+		echo "ERROR: web panel environment file '${env_file}' does not exist" >&2
+		return 1
+	fi
+
+	printf '%s\n' "${env_file}"
+}
+
+# Resolve the web panel's active config directory without sourcing its env file.
+function resolveWebPanelConfigDir() {
+	local env_file configured_dir
+	env_file="$(resolveWebPanelEnvFile)" || return 1
+
+	if [[ -f "${env_file}" ]]; then
 		configured_dir="$(sed -n 's/^AWG_CONFIG_DIR=//p' "${env_file}" 2>/dev/null | tail -n 1)"
 		configured_dir="${configured_dir#\"}"
 		configured_dir="${configured_dir%\"}"
@@ -1693,12 +1707,38 @@ function resolveWebPanelConfigDir() {
 			printf '%s\n' "${configured_dir%/}"
 			return 0
 		fi
-	elif [[ "${env_file_required}" -eq 1 && "${env_file_optional}" -eq 0 ]]; then
-		echo "ERROR: web panel environment file '${env_file}' does not exist" >&2
-		return 1
 	fi
 
 	printf '%s\n' "${WEB_PANEL_CONFIG_DIR%/}"
+}
+
+# Use the web database directory as the stable cross-process lifecycle lock.
+# Unlike AWG_CONFIG_DIR it exists for the panel's lifetime, including when no
+# client has been created yet. Standalone installer use (no panel env file)
+# retains the config-directory fallback.
+function resolveClientLifecycleLockDir() {
+	local env_file database_path
+	env_file="$(resolveWebPanelEnvFile)" || return 1
+
+	if [[ -f "${env_file}" ]]; then
+		database_path="$(sed -n 's/^AWG_WEB_DB=//p' "${env_file}" 2>/dev/null | tail -n 1)"
+		database_path="${database_path#\"}"
+		database_path="${database_path%\"}"
+		database_path="${database_path#\'}"
+		database_path="${database_path%\'}"
+		if [[ -n "${database_path}" ]]; then
+			if [[ "${database_path}" != /* || "${database_path}" =~ [[:space:][:cntrl:]] ]]; then
+				echo "ERROR: refusing unsafe AWG_WEB_DB '${database_path}'" >&2
+				return 1
+			fi
+			dirname -- "${database_path}"
+			return 0
+		fi
+		printf '%s\n' "${WEB_PANEL_DATA_DIR%/}"
+		return 0
+	fi
+
+	resolveWebPanelConfigDir
 }
 
 # Copy a client config file to the web panel config directory so the panel
@@ -5776,28 +5816,38 @@ function manageMenu() {
 CLIENT_LIFECYCLE_LOCK_FD=""
 
 # Acquire the same non-blocking lifecycle lock used by amneziawg-web. The
-# configuration directory itself is opened read-only, its descriptor identity
+# persistent state directory is opened read-only, its descriptor identity
 # is revalidated against the path, and the descriptor is locked. The root-run
 # CLI therefore never creates, truncates, chowns, or chmods a service-writable
 # lock pathname. The caller runs in a subshell so the descriptor, and therefore
 # the lock, is released on every success, return, or exit path.
 function acquireClientLifecycleLock() {
-	local lock_dir
+	local lock_dir env_file panel_installed=0
 	local old_umask dir_identity descriptor_identity descriptor_path
-	lock_dir="$(resolveWebPanelConfigDir)" || return 1
+	lock_dir="$(resolveClientLifecycleLockDir)" || return 1
+	env_file="$(resolveWebPanelEnvFile)" || return 1
+	if [[ -f "${env_file}" || -e "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		panel_installed=1
+	fi
 
 	if ! command -v flock >/dev/null 2>&1; then
 		echo "ERROR: flock is required for serialized client lifecycle operations" >&2
 		return 1
 	fi
-	old_umask="$(umask)"
-	umask 077
-	mkdir -p "${lock_dir}" || {
-		umask "${old_umask}"
-		echo "ERROR: could not create client lifecycle directory '${lock_dir}'" >&2
+	if [[ ! -e "${lock_dir}" && "${panel_installed}" -eq 1 ]]; then
+		echo "ERROR: web panel lifecycle directory '${lock_dir}' does not exist" >&2
 		return 1
-	}
-	umask "${old_umask}"
+	fi
+	if [[ ! -e "${lock_dir}" ]]; then
+		old_umask="$(umask)"
+		umask 077
+		mkdir -p "${lock_dir}" || {
+			umask "${old_umask}"
+			echo "ERROR: could not create client lifecycle directory '${lock_dir}'" >&2
+			return 1
+		}
+		umask "${old_umask}"
+	fi
 	if [[ -L "${lock_dir}" || ! -d "${lock_dir}" ]]; then
 		echo "ERROR: refusing unsafe client lifecycle directory '${lock_dir}'" >&2
 		return 1

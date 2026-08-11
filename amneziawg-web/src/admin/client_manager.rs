@@ -161,14 +161,14 @@ pub fn sanitized_create_error_category(error: &CreateClientError) -> &'static st
 }
 
 #[cfg(unix)]
-pub(crate) fn acquire_lifecycle_lock(config_dir: &Path) -> Result<std::fs::File, std::io::Error> {
-    // Lock the already-existing directory itself. Keeping lifecycle
-    // serialization on this descriptor avoids creating or mutating a lock
-    // pathname inside the service-writable directory.
+pub(crate) fn acquire_lifecycle_lock(lock_dir: &Path) -> Result<std::fs::File, std::io::Error> {
+    // Lock the already-existing persistent state directory itself. Keeping
+    // lifecycle serialization on this descriptor avoids creating or mutating
+    // a lock pathname and remains available when the client directory is gone.
     let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open(config_dir)?;
+        .open(lock_dir)?;
 
     use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -1070,21 +1070,25 @@ fn prepare_client_config_dir(config_dir: &Path) -> Result<(), CreateClientError>
 #[cfg(unix)]
 pub(crate) fn acquire_creation_lifecycle_lock(
     config_dir: &Path,
+    lifecycle_lock_dir: &Path,
 ) -> Result<std::fs::File, CreateClientError> {
+    let lock =
+        acquire_lifecycle_lock(lifecycle_lock_dir).map_err(|err| match err.raw_os_error() {
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+                CreateClientError::LockBusy
+            }
+            _ => CreateClientError::FileWrite(format!(
+                "failed to acquire lock for client creation: {err}"
+            )),
+        })?;
     prepare_client_config_dir(config_dir)?;
-    acquire_lifecycle_lock(config_dir).map_err(|err| match err.raw_os_error() {
-        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-            CreateClientError::LockBusy
-        }
-        _ => CreateClientError::FileWrite(format!(
-            "failed to acquire lock for client creation: {err}"
-        )),
-    })
+    Ok(lock)
 }
 
 #[cfg(not(unix))]
 pub(crate) fn acquire_creation_lifecycle_lock(
     _config_dir: &Path,
+    _lifecycle_lock_dir: &Path,
 ) -> Result<std::fs::File, CreateClientError> {
     Err(CreateClientError::Internal(
         "create_client is supported only on unix targets".to_string(),
@@ -1115,7 +1119,7 @@ pub fn create_client(
     ip_override: &IpOverride,
 ) -> Result<CreateClientResult, CreateClientError> {
     script_bridge::validate_client_name(name)?;
-    let _lock_file = acquire_creation_lifecycle_lock(config_dir)?;
+    let _lock_file = acquire_creation_lifecycle_lock(config_dir, config_dir)?;
     create_client_with_lifecycle_lock(config_dir, name, disabled_keys, ip_override)
 }
 
@@ -1492,26 +1496,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn lifecycle_lock_uses_directory_descriptor_and_rejects_symlinks() {
+    fn lifecycle_lock_uses_state_directory_descriptor_and_rejects_symlinks() {
         let parent = tempfile::tempdir().expect("temp parent");
-        let config_dir = parent.path().join("clients");
-        std::fs::create_dir(&config_dir).expect("create config dir");
+        let state_dir = parent.path().join("state");
+        std::fs::create_dir(&state_dir).expect("create state dir");
 
-        let first = acquire_lifecycle_lock(&config_dir).expect("first lifecycle lock");
-        let second = acquire_lifecycle_lock(&config_dir).expect_err("lock must contend");
+        let first = acquire_lifecycle_lock(&state_dir).expect("first lifecycle lock");
+        let second = acquire_lifecycle_lock(&state_dir).expect_err("lock must contend");
         assert!(matches!(
             second.raw_os_error(),
             Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
         ));
-        assert!(std::fs::read_dir(&config_dir)
-            .expect("read config dir")
+        assert!(std::fs::read_dir(&state_dir)
+            .expect("read state dir")
             .next()
             .is_none());
         drop(first);
 
-        let symlink = parent.path().join("clients-link");
-        std::os::unix::fs::symlink(&config_dir, &symlink).expect("create symlink");
+        let symlink = parent.path().join("state-link");
+        std::os::unix::fs::symlink(&state_dir, &symlink).expect("create symlink");
         assert!(acquire_lifecycle_lock(&symlink).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_does_not_require_client_directory() {
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let missing_config_dir = state_dir.path().join("missing-clients");
+
+        let _lock = acquire_lifecycle_lock(state_dir.path()).expect("lifecycle lock");
+
+        assert!(!missing_config_dir.exists());
     }
 
     #[test]

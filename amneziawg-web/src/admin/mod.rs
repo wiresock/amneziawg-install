@@ -185,11 +185,12 @@ pub async fn execute_suggest_ips(
 ///
 /// The caller is responsible for triggering a config rescan after success.
 // Test-only native-result and lock-acquisition injections extend this
-// boundary; production retains the existing seven parameters.
-#[cfg_attr(test, allow(clippy::too_many_arguments))]
+// boundary; production retains the lifecycle transaction parameters.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_create_user(
     db: &Database,
     config_dir: &std::path::Path,
+    lifecycle_lock_dir: &std::path::Path,
     name: &str,
     comment: Option<&str>,
     expires_at: Option<&str>,
@@ -199,11 +200,53 @@ pub async fn execute_create_user(
     #[cfg(test)] expiration_lock_acquired: Option<tokio::sync::oneshot::Sender<()>>,
     #[cfg(test)] expiration_lock_release: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<CreateUserResult, client_manager::CreateClientError> {
+    let task = tokio::spawn(execute_create_user_transaction(
+        db.clone(),
+        config_dir.to_path_buf(),
+        lifecycle_lock_dir.to_path_buf(),
+        name.to_string(),
+        comment.map(str::to_string),
+        expires_at.map(str::to_string),
+        actor.to_string(),
+        ip_override.clone(),
+        #[cfg(test)]
+        create_result_override,
+        #[cfg(test)]
+        expiration_lock_acquired,
+        #[cfg(test)]
+        expiration_lock_release,
+    ));
+
+    match task.await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(error = %error, "client creation transaction panicked or was cancelled");
+            Err(client_manager::CreateClientError::Internal(
+                "internal error while running client creation transaction".to_string(),
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_create_user_transaction(
+    db: Database,
+    config_dir: std::path::PathBuf,
+    lifecycle_lock_dir: std::path::PathBuf,
+    name: String,
+    comment: Option<String>,
+    expires_at: Option<String>,
+    actor: String,
+    ip_override: client_manager::IpOverride,
+    #[cfg(test)] create_result_override: Option<client_manager::CreateClientResult>,
+    #[cfg(test)] expiration_lock_acquired: Option<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(test)] expiration_lock_release: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<CreateUserResult, client_manager::CreateClientError> {
     // Pre-validate name (fail fast for the UI).
-    script_bridge::validate_client_name(name)?;
+    script_bridge::validate_client_name(&name)?;
     // Defensively enforce the domain boundary for all current and future
     // callers, even if the HTTP layer already normalized the value.
-    let comment = normalize_create_comment(comment);
+    let comment = normalize_create_comment(comment.as_deref());
 
     let detail = serde_json::json!({ "name": name }).to_string();
     log_event(
@@ -212,7 +255,7 @@ pub async fn execute_create_user(
         None,
         None,
         Some(&detail),
-        actor,
+        &actor,
     )
     .await;
 
@@ -234,7 +277,7 @@ pub async fn execute_create_user(
                 None,
                 None,
                 Some(&detail),
-                actor,
+                &actor,
             )
             .await;
             return Err(client_manager::CreateClientError::DbRead(
@@ -263,11 +306,11 @@ pub async fn execute_create_user(
     let lifecycle_lock_result = if create_result_override.is_some() {
         Ok(None)
     } else {
-        client_manager::acquire_creation_lifecycle_lock(config_dir).map(Some)
+        client_manager::acquire_creation_lifecycle_lock(&config_dir, &lifecycle_lock_dir).map(Some)
     };
     #[cfg(not(test))]
     let lifecycle_lock_result =
-        client_manager::acquire_creation_lifecycle_lock(config_dir).map(Some);
+        client_manager::acquire_creation_lifecycle_lock(&config_dir, &lifecycle_lock_dir).map(Some);
     let _lifecycle_lock = match lifecycle_lock_result {
         Ok(lock) => lock,
         Err(e) => {
@@ -283,15 +326,15 @@ pub async fn execute_create_user(
                 None,
                 None,
                 Some(&detail),
-                actor,
+                &actor,
             )
             .await;
             return Err(e);
         }
     };
 
-    let dir = config_dir.to_path_buf();
-    let client_name = name.to_string();
+    let dir = config_dir.clone();
+    let client_name = name.clone();
     let ip_ovr = ip_override.clone();
     let native_disabled_keys = disabled_keys.clone();
 
@@ -308,8 +351,14 @@ pub async fn execute_create_user(
 
     match result {
         Ok(r) => {
-            let metadata_persisted =
-                match persist_created_peer(db, &r, comment.as_deref(), expires_at).await {
+            let metadata_persisted = match persist_created_peer(
+                &db,
+                &r,
+                comment.as_deref(),
+                expires_at.as_deref(),
+            )
+            .await
+            {
                 Ok(_) => true,
                 Err(e) => {
                     tracing::error!(
@@ -322,13 +371,9 @@ pub async fn execute_create_user(
                     // behavior. An expiring client must fail closed so a lost
                     // deadline can never silently turn it into a permanent one.
                     if expires_at.is_some() {
-                        let rollback = rollback_created_expiring_client(
-                            db,
-                            config_dir,
-                            &r,
-                            &disabled_keys,
-                        )
-                        .await;
+                        let rollback =
+                            rollback_created_expiring_client(&db, &config_dir, &r, &disabled_keys)
+                                .await;
                         if let Err(rollback_error) = &rollback {
                             tracing::error!(
                                 error = %rollback_error,
@@ -349,7 +394,7 @@ pub async fn execute_create_user(
                             None,
                             Some(&r.public_key),
                             Some(&detail),
-                            actor,
+                            &actor,
                         )
                         .await;
                         return Err(client_manager::CreateClientError::DbRead(
@@ -380,7 +425,7 @@ pub async fn execute_create_user(
                 None,
                 Some(&r.public_key),
                 Some(&detail),
-                actor,
+                &actor,
             )
             .await;
             Ok(CreateUserResult {
@@ -407,7 +452,7 @@ pub async fn execute_create_user(
                 None,
                 None,
                 Some(&detail),
-                actor,
+                &actor,
             )
             .await;
             Err(e)
@@ -429,6 +474,7 @@ pub async fn execute_create_user(
 pub async fn execute_remove_user(
     db: &Database,
     config_dir: &std::path::Path,
+    lifecycle_lock_dir: &std::path::Path,
     peer_id: i64,
     client_name: &str,
     actor: &str,
@@ -436,6 +482,7 @@ pub async fn execute_remove_user(
     execute_remove_user_inner(
         db,
         config_dir,
+        lifecycle_lock_dir,
         peer_id,
         client_name,
         actor,
@@ -485,9 +532,11 @@ pub async fn execute_update_peer_details(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_remove_user_inner(
     db: &Database,
     config_dir: &std::path::Path,
+    lifecycle_lock_dir: &std::path::Path,
     peer_id: i64,
     client_name: &str,
     actor: &str,
@@ -495,7 +544,50 @@ async fn execute_remove_user_inner(
     expected_expires_at: Option<&str>,
     persist_attempt_events: bool,
 ) -> Result<bool, RemoveClientError> {
-    script_bridge::validate_client_name(client_name)?;
+    let task = tokio::spawn(execute_remove_user_transaction(
+        db.clone(),
+        config_dir.to_path_buf(),
+        lifecycle_lock_dir.to_path_buf(),
+        peer_id,
+        client_name.to_string(),
+        actor.to_string(),
+        reason.to_string(),
+        expected_expires_at.map(str::to_string),
+        persist_attempt_events,
+    ));
+
+    match task.await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(error = %error, "client removal transaction panicked or was cancelled");
+            Err(RemoveClientError::Internal(
+                "internal error while running client removal transaction".to_string(),
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_remove_user_transaction(
+    db: Database,
+    config_dir: std::path::PathBuf,
+    lifecycle_lock_dir: std::path::PathBuf,
+    peer_id: i64,
+    client_name: String,
+    actor: String,
+    reason: String,
+    expected_expires_at: Option<String>,
+    persist_attempt_events: bool,
+) -> Result<bool, RemoveClientError> {
+    script_bridge::validate_client_name(&client_name)?;
+
+    // Expiration revalidation and any following native/database cleanup must
+    // remain serialized even if the poller is cancelled during shutdown.
+    let _expiration_guard = if expected_expires_at.is_some() {
+        Some(EXPIRATION_STATE_LOCK.lock().await)
+    } else {
+        None
+    };
 
     if persist_attempt_events {
         let detail = serde_json::json!({
@@ -510,7 +602,7 @@ async fn execute_remove_user_inner(
             Some(peer_id),
             None,
             Some(&detail),
-            actor,
+            &actor,
         )
         .await;
     }
@@ -520,7 +612,7 @@ async fn execute_remove_user_inner(
     // config and syncing the interface.
     // Non-blocking (LOCK_NB) to avoid hanging web requests; returns an error
     // if another operation is in progress, matching create_client() behavior.
-    let lock_result = acquire_lifecycle_lock(config_dir).map_err(map_lock_error);
+    let lock_result = acquire_lifecycle_lock(&lifecycle_lock_dir).map_err(map_lock_error);
     let _lock_file = match lock_result {
         Ok(f) => f,
         Err(e) => {
@@ -542,7 +634,7 @@ async fn execute_remove_user_inner(
                     Some(peer_id),
                     None,
                     Some(&detail),
-                    actor,
+                    &actor,
                 )
                 .await;
             }
@@ -553,7 +645,7 @@ async fn execute_remove_user_inner(
     // Expiration cleanup revalidates the exact timestamp while holding the
     // lifecycle lock. If an administrator extended or cleared the expiration
     // after the candidate list was read, the client is left untouched.
-    if let Some(expected) = expected_expires_at {
+    if let Some(expected) = expected_expires_at.as_deref() {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let still_due = crate::db::peers::expiration_is_due(
             &db.pool,
@@ -601,7 +693,7 @@ async fn execute_remove_user_inner(
                     Some(peer_id),
                     None,
                     Some(&detail),
-                    actor,
+                    &actor,
                 )
                 .await;
             }
@@ -621,8 +713,8 @@ async fn execute_remove_user_inner(
         ));
     }
 
-    let dir = config_dir.to_path_buf();
-    let name = client_name.to_string();
+    let dir = config_dir.clone();
+    let name = client_name.clone();
     let remove_result = tokio::task::spawn_blocking(move || {
         client_manager::remove_client_resumable(
             &dir,
@@ -665,7 +757,7 @@ async fn execute_remove_user_inner(
                         Some(peer_id),
                         None,
                         Some(&detail),
-                        actor,
+                        &actor,
                     )
                     .await;
                 }
@@ -695,7 +787,7 @@ async fn execute_remove_user_inner(
                         Some(peer_id),
                         None,
                         Some(&detail),
-                        actor,
+                        &actor,
                     )
                     .await;
                 }
@@ -716,7 +808,7 @@ async fn execute_remove_user_inner(
                 None,
                 None,
                 Some(&detail),
-                actor,
+                &actor,
             )
             .await;
             Ok(true)
@@ -743,7 +835,7 @@ async fn execute_remove_user_inner(
                     Some(peer_id),
                     None,
                     Some(&detail),
-                    actor,
+                    &actor,
                 )
                 .await;
             }
@@ -820,6 +912,7 @@ async fn rollback_created_expiring_client(
 pub async fn cleanup_expired_users(
     db: &Database,
     config_dir: &std::path::Path,
+    lifecycle_lock_dir: &std::path::Path,
 ) -> Result<usize, sqlx::Error> {
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let expired = crate::db::peers::list_expired(&db.pool, &now).await?;
@@ -842,10 +935,10 @@ pub async fn cleanup_expired_users(
             continue;
         };
 
-        let _expiration_guard = EXPIRATION_STATE_LOCK.lock().await;
         match execute_remove_user_inner(
             db,
             config_dir,
+            lifecycle_lock_dir,
             peer.id,
             client_name,
             "system",
@@ -960,6 +1053,7 @@ mod tests {
         let outcome = execute_create_user(
             &db,
             dir.path(),
+            dir.path(),
             "alice",
             Some("Main phone"),
             None,
@@ -1022,6 +1116,7 @@ mod tests {
         let outcome = execute_create_user(
             &db,
             dir.path(),
+            dir.path(),
             "alice",
             Some("Main phone"),
             Some("2026-08-18T12:00:00Z"),
@@ -1074,13 +1169,11 @@ mod tests {
         .await
         .expect("seed expired peer");
 
-        let missing_config_dir = tempfile::tempdir()
-            .expect("tempdir")
-            .path()
-            .join("missing-clients");
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let missing_config_dir = state_dir.path().join("missing-clients");
         for _ in 0..2 {
             assert_eq!(
-                cleanup_expired_users(&db, &missing_config_dir)
+                cleanup_expired_users(&db, &missing_config_dir, state_dir.path())
                     .await
                     .expect("cleanup pass"),
                 0
@@ -1173,6 +1266,7 @@ mod tests {
             execute_create_user(
                 &task_db,
                 &dir_path,
+                &dir_path,
                 "alice",
                 None,
                 None,
@@ -1226,5 +1320,61 @@ mod tests {
             persisted.expires_at.as_deref(),
             Some("2026-08-18T12:00:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn creation_transaction_survives_caller_cancellation() {
+        let db = Database::connect_for_test().await.expect("connect");
+        let task_db = db.clone();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_path_buf();
+        let (lock_acquired_tx, lock_acquired_rx) = tokio::sync::oneshot::channel();
+        let (lock_release_tx, lock_release_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            let ip_override = client_manager::IpOverride::default();
+            execute_create_user(
+                &task_db,
+                &dir_path,
+                &dir_path,
+                "alice",
+                None,
+                Some("2026-08-18T12:00:00Z"),
+                "test-admin",
+                &ip_override,
+                Some(created_client_result(false)),
+                Some(lock_acquired_tx),
+                Some(lock_release_rx),
+            )
+            .await
+        });
+
+        lock_acquired_rx
+            .await
+            .expect("creation transaction must acquire its lock");
+        caller.abort();
+        let _ = caller.await;
+        lock_release_tx
+            .send(())
+            .expect("owned creation transaction must survive caller cancellation");
+
+        let persisted = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(peer) = find_by_public_key(&db.pool, "CREATED_PUBLIC_KEY=")
+                    .await
+                    .expect("query peer")
+                {
+                    break peer;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached creation transaction must finish persistence");
+
+        assert_eq!(
+            persisted.expires_at.as_deref(),
+            Some("2026-08-18T12:00:00Z")
+        );
+        assert_eq!(persisted.managed_client_name.as_deref(), Some("alice"));
     }
 }

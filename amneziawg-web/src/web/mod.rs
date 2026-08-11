@@ -54,6 +54,8 @@ pub struct AppState {
     pub rate_limiter: LoginRateLimiter,
     /// Directory where AWG client configs are stored (for rescan).
     pub config_dir: PathBuf,
+    /// Persistent directory whose descriptor serializes client lifecycle work.
+    pub lifecycle_lock_dir: PathBuf,
     /// Local JSON file written by amneziawg-proxy with active session status.
     pub proxy_sessions_file: PathBuf,
     /// Lazily-canonicalized `config_dir` for safe `starts_with` comparisons.
@@ -104,6 +106,7 @@ impl AppState {
         db: Database,
         auth: AuthConfig,
         config_dir: PathBuf,
+        lifecycle_lock_dir: PathBuf,
         proxy_sessions_file: PathBuf,
     ) -> Self {
         let cell = tokio::sync::OnceCell::new();
@@ -126,6 +129,7 @@ impl AppState {
             login_csrf: new_login_csrf_store(),
             rate_limiter: new_login_rate_limiter(),
             config_dir,
+            lifecycle_lock_dir,
             proxy_sessions_file,
             canonical_config_dir: std::sync::Arc::new(cell),
             logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1139,13 +1143,37 @@ fn normalize_period(period: &str) -> &'static str {
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Build the application router with an explicit proxy session status file.
+#[cfg(test)]
 pub fn router_with_proxy_sessions_file(
     db: Database,
     auth: AuthConfig,
     config_dir: PathBuf,
     proxy_sessions_file: PathBuf,
 ) -> Router {
-    let state = AppState::new(db, auth, config_dir, proxy_sessions_file);
+    router_with_lifecycle_lock_dir(
+        db,
+        auth,
+        config_dir.clone(),
+        config_dir,
+        proxy_sessions_file,
+    )
+}
+
+/// Build the application router with an independent persistent lifecycle lock directory.
+pub fn router_with_lifecycle_lock_dir(
+    db: Database,
+    auth: AuthConfig,
+    config_dir: PathBuf,
+    lifecycle_lock_dir: PathBuf,
+    proxy_sessions_file: PathBuf,
+) -> Router {
+    let state = AppState::new(
+        db,
+        auth,
+        config_dir,
+        lifecycle_lock_dir,
+        proxy_sessions_file,
+    );
 
     // Protected routes – all require a valid session.
     let protected = Router::new()
@@ -2779,6 +2807,7 @@ async fn api_create_user(
     match crate::admin::execute_create_user(
         &state.db,
         &state.config_dir,
+        &state.lifecycle_lock_dir,
         &name,
         comment.as_deref(),
         expires_at.as_deref(),
@@ -2903,6 +2932,7 @@ async fn api_remove_user(
     match crate::admin::execute_remove_user(
         &state.db,
         &state.config_dir,
+        &state.lifecycle_lock_dir,
         id,
         &client_name,
         &state.auth.username,
@@ -3007,6 +3037,7 @@ async fn post_add_user_form(
     match crate::admin::execute_create_user(
         &state.db,
         &state.config_dir,
+        &state.lifecycle_lock_dir,
         &name,
         comment.as_deref(),
         expires_at.as_deref(),
@@ -3136,6 +3167,7 @@ async fn post_remove_user_form(
     match crate::admin::execute_remove_user(
         &state.db,
         &state.config_dir,
+        &state.lifecycle_lock_dir,
         id,
         &client_name,
         &state.auth.username,
