@@ -1637,12 +1637,10 @@ function detectPublicIPv4() {
 	return 0
 }
 
-# Resolve the web panel's root-controlled environment file without sourcing it.
-# A custom installer --env-file is recorded in the installed service unit.
-function resolveWebPanelEnvFile() {
-	local env_file="${WEB_PANEL_ENV_FILE}"
-	local configured_env env_file_required=0 env_file_optional=0
-
+# Validate the configured unit path before asking systemd for its effective
+# properties. A missing fragment is allowed because PID 1 may still have the
+# loaded unit until the next daemon-reload.
+function validateWebPanelSystemdUnitPath() {
 	if [[ -L "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
 		echo "ERROR: refusing unsafe web panel service unit '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
 		return 1
@@ -1652,23 +1650,39 @@ function resolveWebPanelEnvFile() {
 			echo "ERROR: refusing unsafe web panel service unit '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
 			return 1
 		fi
-		configured_env="$(sed -n 's/^[[:space:]]*EnvironmentFile=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null | tail -n 1)"
-		if [[ "${configured_env}" == -* ]]; then
-			env_file_optional=1
-			configured_env="${configured_env#-}"
-		fi
-		configured_env="${configured_env#\"}"
-		configured_env="${configured_env%\"}"
-		configured_env="${configured_env#\'}"
-		configured_env="${configured_env%\'}"
-		if [[ -n "${configured_env}" ]]; then
-			if [[ "${configured_env}" != /* || "${configured_env}" =~ [[:space:][:cntrl:]] ]]; then
-				echo "ERROR: refusing unsafe web panel environment path '${configured_env}'" >&2
-				return 1
-			fi
-			env_file="${configured_env}"
-			env_file_required=1
-		fi
+	fi
+	return 0
+}
+
+# Read a normalized property from PID 1. systemd has already merged the unit
+# fragment and every drop-in, including list resets and filename precedence.
+# Matching FragmentPath prevents a same-named host unit from affecting tests or
+# callers that deliberately point WEB_PANEL_SYSTEMD_UNIT somewhere else.
+function readWebPanelEffectiveProperty() {
+	local property="$1"
+	local unit_name load_state fragment_path
+	validateWebPanelSystemdUnitPath || return 1
+	command -v systemctl >/dev/null 2>&1 || return 1
+	unit_name="$(basename -- "${WEB_PANEL_SYSTEMD_UNIT}")"
+	load_state="$(systemctl show "${unit_name}" --property=LoadState --value 2>/dev/null)" || return 1
+	[[ "${load_state}" == "loaded" ]] || return 1
+	fragment_path="$(systemctl show "${unit_name}" --property=FragmentPath --value 2>/dev/null)" || return 1
+	[[ "${fragment_path}" == "${WEB_PANEL_SYSTEMD_UNIT}" ]] || return 1
+
+	case "${property}" in
+		LoadState) printf '%s\n' "${load_state}" ;;
+		FragmentPath) printf '%s\n' "${fragment_path}" ;;
+		*) systemctl show "${unit_name}" --property="${property}" --value 2>/dev/null ;;
+	esac
+}
+
+function validateWebPanelEnvFile() {
+	local env_file="$1"
+	local required="$2"
+	local optional="$3"
+	if [[ "${env_file}" != /* || "${env_file}" =~ [[:space:][:cntrl:]] ]]; then
+		echo "ERROR: refusing unsafe web panel environment path '${env_file}'" >&2
+		return 1
 	fi
 
 	if [[ -L "${env_file}" ]]; then
@@ -1680,10 +1694,73 @@ function resolveWebPanelEnvFile() {
 			echo "ERROR: refusing unsafe web panel environment file '${env_file}'" >&2
 			return 1
 		fi
-	elif [[ "${env_file_required}" -eq 1 && "${env_file_optional}" -eq 0 ]]; then
+	elif [[ "${required}" -eq 1 && "${optional}" -eq 0 ]]; then
 		echo "ERROR: web panel environment file '${env_file}' does not exist" >&2
 		return 1
 	fi
+	return 0
+}
+
+# Print the ordered effective EnvironmentFile list as OPTIONAL<TAB>PATH. The
+# systemctl representation is one normalized "path (ignore_errors=yes|no)"
+# entry per line. The base-fragment parser remains as a compatibility fallback
+# when PID 1 is unavailable (for example in installer unit tests).
+function resolveWebPanelEnvFiles() {
+	local effective_files configured_env optional resolved_files=""
+	validateWebPanelSystemdUnitPath || return 1
+	if effective_files="$(readWebPanelEffectiveProperty EnvironmentFiles)"; then
+		while IFS= read -r configured_env; do
+			[[ -n "${configured_env}" ]] || continue
+			if [[ ! "${configured_env}" =~ ^(.*)[[:space:]]+\(ignore_errors=(yes|no)\)$ ]]; then
+				echo "ERROR: unsupported systemd EnvironmentFiles value '${configured_env}'" >&2
+				return 1
+			fi
+			configured_env="${BASH_REMATCH[1]}"
+			optional=0
+			[[ "${BASH_REMATCH[2]}" == "yes" ]] && optional=1
+			validateWebPanelEnvFile "${configured_env}" 1 "${optional}" || return 1
+			printf '%s\t%s\n' "${optional}" "${configured_env}"
+		done <<< "${effective_files}"
+		return 0
+	fi
+
+	if [[ -f "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		while IFS= read -r configured_env; do
+			optional=0
+			if [[ "${configured_env}" == -* ]]; then
+				optional=1
+				configured_env="${configured_env#-}"
+			fi
+			configured_env="${configured_env#\"}"
+			configured_env="${configured_env%\"}"
+			configured_env="${configured_env#\'}"
+			configured_env="${configured_env%\'}"
+			if [[ -z "${configured_env}" ]]; then
+				resolved_files=""
+				continue
+			fi
+			validateWebPanelEnvFile "${configured_env}" 1 "${optional}" || return 1
+			resolved_files+="${optional}"$'\t'"${configured_env}"$'\n'
+		done < <(sed -n 's/^[[:space:]]*EnvironmentFile=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null)
+		printf '%s' "${resolved_files}"
+		return 0
+	fi
+
+	validateWebPanelEnvFile "${WEB_PANEL_ENV_FILE}" 0 1 || return 1
+	if [[ -f "${WEB_PANEL_ENV_FILE}" ]]; then
+		printf '1\t%s\n' "${WEB_PANEL_ENV_FILE}"
+	fi
+}
+
+# Resolve the final web-panel environment file for legacy installed-panel
+# detection. Settings themselves are read from every effective file below.
+function resolveWebPanelEnvFile() {
+	local entries optional configured_env env_file="${WEB_PANEL_ENV_FILE}"
+	entries="$(resolveWebPanelEnvFiles)" || return 1
+	while IFS=$'\t' read -r optional configured_env; do
+		[[ -n "${configured_env}" ]] || continue
+		env_file="${configured_env}"
+	done <<< "${entries}"
 
 	printf '%s\n' "${env_file}"
 }
@@ -1692,32 +1769,42 @@ function resolveWebPanelEnvFile() {
 # values override inline Environment= values, matching systemd semantics.
 function readWebPanelSetting() {
 	local setting_name="$1"
-	local env_file inline_assignment value="" use_env_file=1
-	env_file="$(resolveWebPanelEnvFile)" || return 1
-	if [[ -f "${WEB_PANEL_SYSTEMD_UNIT}" ]] && \
-		! grep -q '^[[:space:]]*EnvironmentFile=' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null; then
-		use_env_file=0
-	fi
-
-	if [[ "${use_env_file}" -eq 1 && -f "${env_file}" ]] && \
-		grep -q "^[[:space:]]*${setting_name}=" "${env_file}" 2>/dev/null; then
-		value="$(sed -n "s/^[[:space:]]*${setting_name}=//p" "${env_file}" 2>/dev/null | tail -n 1)"
+	local effective_environment entries optional env_file inline_line inline_assignment value=""
+	local -a inline_assignments=()
+	if effective_environment="$(readWebPanelEffectiveProperty Environment)"; then
+		while IFS= read -r inline_line; do
+			read -r -a inline_assignments <<< "${inline_line}"
+			for inline_assignment in "${inline_assignments[@]}"; do
+				inline_assignment="${inline_assignment#\"}"
+				inline_assignment="${inline_assignment%\"}"
+				inline_assignment="${inline_assignment#\'}"
+				inline_assignment="${inline_assignment%\'}"
+				if [[ "${inline_assignment}" == "${setting_name}="* ]]; then
+					value="${inline_assignment#*=}"
+				fi
+			done
+		done <<< "${effective_environment}"
 	else
 		while IFS= read -r inline_assignment; do
-			if [[ "${inline_assignment}" != *"${setting_name}="* ]]; then
-				continue
-			fi
 			inline_assignment="${inline_assignment#\"}"
 			inline_assignment="${inline_assignment%\"}"
 			inline_assignment="${inline_assignment#\'}"
 			inline_assignment="${inline_assignment%\'}"
-			if [[ "${inline_assignment}" != "${setting_name}="* ]]; then
-				echo "ERROR: unsupported inline ${setting_name} assignment in '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
-				return 1
+			if [[ "${inline_assignment}" == "${setting_name}="* ]]; then
+				value="${inline_assignment#*=}"
 			fi
-			value="${inline_assignment#*=}"
 		done < <(sed -n 's/^[[:space:]]*Environment=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null)
 	fi
+
+	# EnvironmentFile values are applied after Environment= regardless of where
+	# the directives occur, and later files override earlier files.
+	entries="$(resolveWebPanelEnvFiles)" || return 1
+	while IFS=$'\t' read -r optional env_file; do
+		[[ -n "${env_file}" && -f "${env_file}" ]] || continue
+		if grep -q "^[[:space:]]*${setting_name}=" "${env_file}" 2>/dev/null; then
+			value="$(sed -n "s/^[[:space:]]*${setting_name}=//p" "${env_file}" 2>/dev/null | tail -n 1)"
+		fi
+	done <<< "${entries}"
 
 	value="${value#\"}"
 	value="${value%\"}"
@@ -1729,7 +1816,9 @@ function readWebPanelSetting() {
 # Resolve the service working directory used for relative database paths.
 function resolveWebPanelWorkingDirectory() {
 	local working_dir=""
-	if [[ -f "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+	if working_dir="$(readWebPanelEffectiveProperty WorkingDirectory)"; then
+		working_dir="${working_dir:-/}"
+	elif [[ -f "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
 		working_dir="$(sed -n 's/^[[:space:]]*WorkingDirectory=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null | tail -n 1)"
 		working_dir="${working_dir#-}"
 		working_dir="${working_dir#\"}"
@@ -1776,7 +1865,8 @@ function resolveClientLifecycleLockDir() {
 	local env_file database_path working_dir database_parent
 	env_file="$(resolveWebPanelEnvFile)" || return 1
 
-	if [[ ! -f "${env_file}" && ! -e "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+	if [[ ! -f "${env_file}" && ! -e "${WEB_PANEL_SYSTEMD_UNIT}" ]] && \
+		! readWebPanelEffectiveProperty LoadState >/dev/null; then
 		resolveWebPanelConfigDir
 		return
 	fi
@@ -5896,7 +5986,8 @@ function acquireClientLifecycleLock() {
 	local old_umask dir_identity descriptor_identity descriptor_path
 	lock_dir="$(resolveClientLifecycleLockDir)" || return 1
 	env_file="$(resolveWebPanelEnvFile)" || return 1
-	if [[ -f "${env_file}" || -e "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+	if [[ -f "${env_file}" || -e "${WEB_PANEL_SYSTEMD_UNIT}" ]] || \
+		readWebPanelEffectiveProperty LoadState >/dev/null; then
 		panel_installed=1
 	fi
 

@@ -1213,6 +1213,67 @@ flock -xn "${NIAC_HELD_LOCK_FD}"
 assert_rc 1 _client_lock_must_be_busy
 exec {NIAC_HELD_LOCK_FD}>&-
 
+# PID 1's normalized properties must win over the base fragment. This models a
+# drop-in that resets Environment=/EnvironmentFile= before replacing the web
+# paths; systemd has already applied those reset and filename-ordering rules.
+NIAC_EFFECTIVE_WORK_DIR="${NIAC_WEB_ROOT}/effective-work"
+NIAC_EFFECTIVE_STATE_DIR="${NIAC_EFFECTIVE_WORK_DIR}/effective-state"
+NIAC_EFFECTIVE_CONFIG_DIR="${NIAC_WEB_ROOT}/effective-clients"
+NIAC_EFFECTIVE_ENV_FIRST="${NIAC_WEB_ROOT}/effective-first.env"
+NIAC_EFFECTIVE_ENV_LAST="${NIAC_WEB_ROOT}/effective-last.env"
+mkdir -p "${NIAC_EFFECTIVE_STATE_DIR}" "${NIAC_WEB_ROOT}/amneziawg-web.service.d"
+cat > "${NIAC_EFFECTIVE_ENV_FIRST}" <<EOF
+AWG_WEB_DB=sqlite:ignored-state/awg-web.db
+AWG_CONFIG_DIR=${NIAC_LOCK_DIR}/ignored-from-first-file
+EOF
+cat > "${NIAC_EFFECTIVE_ENV_LAST}" <<EOF
+AWG_WEB_DB=sqlite:effective-state/awg-web.db
+AWG_CONFIG_DIR=${NIAC_EFFECTIVE_CONFIG_DIR}
+EOF
+cat > "${NIAC_WEB_ROOT}/amneziawg-web.service" <<EOF
+[Service]
+WorkingDirectory=${NIAC_INLINE_WORK_DIR}
+Environment=AWG_WEB_DB=${NIAC_LOCK_DIR}/ignored-from-fragment.db
+EnvironmentFile=${NIAC_WEB_ROOT}/custom.env
+EOF
+cat > "${NIAC_WEB_ROOT}/amneziawg-web.service.d/90-paths.conf" <<EOF
+[Service]
+WorkingDirectory=${NIAC_EFFECTIVE_WORK_DIR}
+Environment=
+Environment=AWG_WEB_DB=${NIAC_LOCK_DIR}/ignored-from-drop-in.db
+EnvironmentFile=
+EnvironmentFile=${NIAC_EFFECTIVE_ENV_FIRST}
+EnvironmentFile=${NIAC_EFFECTIVE_ENV_LAST}
+EOF
+systemctl() {
+	local argument property=""
+	for argument in "$@"; do
+		case "${argument}" in
+			--property=*) property="${argument#--property=}" ;;
+		esac
+	done
+	case "${property}" in
+		LoadState) printf '%s\n' "loaded" ;;
+		FragmentPath) printf '%s\n' "${WEB_PANEL_SYSTEMD_UNIT}" ;;
+		EnvironmentFiles)
+			printf '%s (ignore_errors=no)\n' "${NIAC_EFFECTIVE_ENV_FIRST}"
+			printf '%s (ignore_errors=no)\n' "${NIAC_EFFECTIVE_ENV_LAST}"
+			;;
+		Environment) printf 'AWG_WEB_DB=%s/ignored-effective.db\n' "${NIAC_LOCK_DIR}" ;;
+		WorkingDirectory) printf '%s\n' "${NIAC_EFFECTIVE_WORK_DIR}" ;;
+		*) return 1 ;;
+	esac
+}
+assert_eq "${NIAC_EFFECTIVE_STATE_DIR}" "$(resolveClientLifecycleLockDir)" \
+	"systemd effective database path overrides the base unit fragment"
+assert_eq "${NIAC_EFFECTIVE_CONFIG_DIR}" "$(resolveWebPanelConfigDir)" \
+	"later effective EnvironmentFile values take precedence"
+exec {NIAC_HELD_LOCK_FD}< "${NIAC_EFFECTIVE_STATE_DIR}"
+flock -xn "${NIAC_HELD_LOCK_FD}"
+assert_rc 1 _client_lock_must_be_busy
+exec {NIAC_HELD_LOCK_FD}>&-
+unset -f systemctl
+
 WEB_PANEL_CONFIG_DIR="${NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR}"
 WEB_PANEL_ENV_FILE="${NIAC_ORIGINAL_WEB_PANEL_ENV_FILE}"
 WEB_PANEL_SYSTEMD_UNIT="${NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT}"
@@ -1220,6 +1281,8 @@ rm -rf "${NIAC_LOCK_DIR}"
 rm -rf "${NIAC_WEB_ROOT}"
 unset NIAC_LOCK_DIR NIAC_LOCK_LINK NIAC_CUSTOM_CONFIG_DIR NIAC_CUSTOM_STATE_DIR NIAC_WEB_ROOT
 unset NIAC_INLINE_WORK_DIR NIAC_INLINE_STATE_DIR NIAC_INLINE_CONFIG_DIR
+unset NIAC_EFFECTIVE_WORK_DIR NIAC_EFFECTIVE_STATE_DIR NIAC_EFFECTIVE_CONFIG_DIR
+unset NIAC_EFFECTIVE_ENV_FIRST NIAC_EFFECTIVE_ENV_LAST
 unset NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_ORIGINAL_WEB_PANEL_ENV_FILE
 unset NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT NIAC_HELD_LOCK_FD
 unset -f _client_lock_must_be_busy

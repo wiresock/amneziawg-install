@@ -1068,19 +1068,29 @@ fn prepare_client_config_dir(config_dir: &Path) -> Result<(), CreateClientError>
 /// Prepare the client directory and acquire the lifecycle lock before native
 /// creation. Callers may retain the returned file across database persistence.
 #[cfg(unix)]
+fn acquire_creation_lock(lock_dir: &Path) -> Result<std::fs::File, CreateClientError> {
+    acquire_lifecycle_lock(lock_dir).map_err(|err| match err.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+            CreateClientError::LockBusy
+        }
+        _ => CreateClientError::FileWrite(format!(
+            "failed to acquire lock for client creation: {err}"
+        )),
+    })
+}
+
+#[cfg(unix)]
+fn acquire_standalone_creation_lock(config_dir: &Path) -> Result<std::fs::File, CreateClientError> {
+    prepare_client_config_dir(config_dir)?;
+    acquire_creation_lock(config_dir)
+}
+
+#[cfg(unix)]
 pub(crate) fn acquire_creation_lifecycle_lock(
     config_dir: &Path,
     lifecycle_lock_dir: &Path,
 ) -> Result<std::fs::File, CreateClientError> {
-    let lock =
-        acquire_lifecycle_lock(lifecycle_lock_dir).map_err(|err| match err.raw_os_error() {
-            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-                CreateClientError::LockBusy
-            }
-            _ => CreateClientError::FileWrite(format!(
-                "failed to acquire lock for client creation: {err}"
-            )),
-        })?;
+    let lock = acquire_creation_lock(lifecycle_lock_dir)?;
     prepare_client_config_dir(config_dir)?;
     Ok(lock)
 }
@@ -1119,7 +1129,11 @@ pub fn create_client(
     ip_override: &IpOverride,
 ) -> Result<CreateClientResult, CreateClientError> {
     script_bridge::validate_client_name(name)?;
-    let _lock_file = acquire_creation_lifecycle_lock(config_dir, config_dir)?;
+    // Standalone callers use the client directory itself as their lock inode,
+    // so restore the documented create-on-first-use behavior before opening it.
+    // The web path uses acquire_creation_lifecycle_lock with an independent,
+    // already-existing persistent state directory and therefore locks first.
+    let _lock_file = acquire_standalone_creation_lock(config_dir)?;
     create_client_with_lifecycle_lock(config_dir, name, disabled_keys, ip_override)
 }
 
@@ -1527,6 +1541,18 @@ mod tests {
         let _lock = acquire_lifecycle_lock(state_dir.path()).expect("lifecycle lock");
 
         assert!(!missing_config_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_creation_lock_prepares_missing_client_directory() {
+        let parent = tempfile::tempdir().expect("temp parent");
+        let missing_config_dir = parent.path().join("missing-clients");
+
+        let _lock = acquire_standalone_creation_lock(&missing_config_dir)
+            .expect("standalone creation lock");
+
+        assert!(missing_config_dir.is_dir());
     }
 
     #[test]
