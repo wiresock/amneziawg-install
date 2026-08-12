@@ -15,7 +15,7 @@
 //! | Read safe params | `…-privileged read-params` |
 //! | Read sanitized server state | `…-privileged read-server-state <iface>` |
 //! | Append peer to server config | `…-privileged append-peer <iface> <name>` |
-//! | Remove managed peer block | `…-privileged remove-client <iface> <name>` |
+//! | Remove managed peer block | `…-privileged remove-client[-if-key] …` |
 //! | Reconcile live interface | `…-privileged reconcile-interface <iface>` |
 //!
 //! Key generation (`awg genkey`, `awg pubkey`, `awg genpsk`) does **not**
@@ -35,7 +35,6 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::admin::script_bridge;
-#[cfg(unix)]
 use crate::awg;
 
 // ── Error type ──────────────────────────────────────────────────────────────
@@ -114,6 +113,9 @@ pub enum RemoveClientError {
     #[error("client '{0}' not found in server config")]
     ClientNotFound(String),
 
+    #[error("client '{0}' does not match the expected peer identity")]
+    IdentityMismatch(String),
+
     #[error("failed to read server parameters: {0}")]
     ParamsRead(String),
 
@@ -159,13 +161,14 @@ pub fn sanitized_create_error_category(error: &CreateClientError) -> &'static st
 }
 
 #[cfg(unix)]
-pub(crate) fn acquire_lifecycle_lock(lock_path: &Path) -> Result<std::fs::File, std::io::Error> {
+pub(crate) fn acquire_lifecycle_lock(lock_dir: &Path) -> Result<std::fs::File, std::io::Error> {
+    // Lock the already-existing persistent state directory itself. Keeping
+    // lifecycle serialization on this descriptor avoids creating or mutating
+    // a lock pathname and remains available when the client directory is gone.
     let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(lock_path)?;
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(lock_dir)?;
 
     use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -178,8 +181,7 @@ pub(crate) fn acquire_lifecycle_lock(lock_path: &Path) -> Result<std::fs::File, 
 
 #[cfg(not(unix))]
 pub(crate) fn acquire_lifecycle_lock(_lock_path: &Path) -> Result<std::fs::File, std::io::Error> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
+    Err(std::io::Error::other(
         "file locking for add/remove lifecycle is supported only on unix targets",
     ))
 }
@@ -188,6 +190,7 @@ pub fn sanitized_remove_error_category(error: &RemoveClientError) -> &'static st
     match error {
         RemoveClientError::InvalidName(_) => "invalid_name",
         RemoveClientError::ClientNotFound(_) => "client_not_found",
+        RemoveClientError::IdentityMismatch(_) => "identity_mismatch",
         RemoveClientError::ParamsRead(_) => "params_read_failed",
         RemoveClientError::DbRead(_) => "db_read_failed",
         RemoveClientError::InvalidConfigDir(_) => "invalid_config_dir",
@@ -940,6 +943,26 @@ fn remove_client_block(server_config: &str, name: &str) -> Option<String> {
     Some(out)
 }
 
+fn server_config_contains_public_key(server_config: &str, expected_public_key: &str) -> bool {
+    server_config.lines().any(|line| {
+        line.split_once('=')
+            .filter(|(key, _)| key.trim().eq_ignore_ascii_case("PublicKey"))
+            .is_some_and(|(_, value)| value.trim() == expected_public_key)
+    })
+}
+
+fn live_interfaces_contain_public_key(
+    interfaces: &[awg::AwgInterface],
+    expected_public_key: &str,
+) -> bool {
+    interfaces.iter().any(|interface| {
+        interface
+            .peers
+            .iter()
+            .any(|peer| peer.public_key.0 == expected_public_key)
+    })
+}
+
 // ── Client creation ─────────────────────────────────────────────────────────
 
 /// Result of a successful client creation.
@@ -959,6 +982,127 @@ pub struct CreateClientResult {
     pub allowed_ips: String,
     /// Whether the on-disk configs were written but the live interface sync failed.
     pub sync_required: bool,
+}
+
+#[cfg(unix)]
+fn prepare_client_config_dir(config_dir: &Path) -> Result<(), CreateClientError> {
+    // Reject a symlinked AWG_CONFIG_DIR to prevent redirection attacks.
+    match std::fs::symlink_metadata(config_dir) {
+        Ok(sym_meta) => {
+            if sym_meta.file_type().is_symlink() {
+                return Err(CreateClientError::FileWrite(format!(
+                    "AWG_CONFIG_DIR {} is a symbolic link; refusing to use it for client configs",
+                    config_dir.display()
+                )));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(CreateClientError::FileWrite(format!(
+                "cannot lstat {}: {e}",
+                config_dir.display()
+            )));
+        }
+    }
+
+    std::fs::create_dir_all(config_dir).map_err(|e| {
+        CreateClientError::FileWrite(format!("mkdir {}: {e}", config_dir.display()))
+    })?;
+
+    let cfg_meta = std::fs::symlink_metadata(config_dir).map_err(|e| {
+        CreateClientError::FileWrite(format!("cannot lstat {}: {e}", config_dir.display()))
+    })?;
+    let cfg_ftype = cfg_meta.file_type();
+    if cfg_ftype.is_symlink() {
+        return Err(CreateClientError::FileWrite(format!(
+            "AWG_CONFIG_DIR {} is a symbolic link; refusing to use it for client configs",
+            config_dir.display()
+        )));
+    }
+    if !cfg_ftype.is_dir() {
+        return Err(CreateClientError::FileWrite(format!(
+            "config path exists but is not a directory: {}",
+            config_dir.display()
+        )));
+    }
+
+    if let Err(e) = std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700)) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            let meta = std::fs::metadata(config_dir).map_err(|me| {
+                CreateClientError::FileWrite(format!("cannot stat {}: {me}", config_dir.display()))
+            })?;
+            let uid = unsafe { libc::getuid() };
+            let dir_uid = std::os::unix::fs::MetadataExt::uid(&meta);
+            let dir_mode = meta.permissions().mode();
+            const UNSAFE_WRITE_BITS: u32 = 0o022;
+            if dir_uid != uid {
+                return Err(CreateClientError::FileWrite(format!(
+                    "AWG_CONFIG_DIR {} is owned by uid {dir_uid}, not the service user (uid {uid}); \
+                     run: sudo chown awg-web:awg-web {}",
+                    config_dir.display(), config_dir.display(),
+                )));
+            }
+            if dir_mode & UNSAFE_WRITE_BITS != 0 {
+                return Err(CreateClientError::FileWrite(format!(
+                    "AWG_CONFIG_DIR {} has unsafe permissions {dir_mode:#o} (group/world writable); \
+                     run: sudo chmod 0700 {}",
+                    config_dir.display(), config_dir.display(),
+                )));
+            }
+            tracing::warn!(
+                dir = %config_dir.display(),
+                error = %e,
+                "chmod on config dir failed; verified directory is owned by service user \
+                 and not group/world-writable, proceeding",
+            );
+        } else {
+            return Err(CreateClientError::FileWrite(format!(
+                "chmod {}: {e}",
+                config_dir.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Prepare the client directory and acquire the lifecycle lock before native
+/// creation. Callers may retain the returned file across database persistence.
+#[cfg(unix)]
+fn acquire_creation_lock(lock_dir: &Path) -> Result<std::fs::File, CreateClientError> {
+    acquire_lifecycle_lock(lock_dir).map_err(|err| match err.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+            CreateClientError::LockBusy
+        }
+        _ => CreateClientError::FileWrite(format!(
+            "failed to acquire lock for client creation: {err}"
+        )),
+    })
+}
+
+#[cfg(unix)]
+fn acquire_standalone_creation_lock(config_dir: &Path) -> Result<std::fs::File, CreateClientError> {
+    prepare_client_config_dir(config_dir)?;
+    acquire_creation_lock(config_dir)
+}
+
+#[cfg(unix)]
+pub(crate) fn acquire_creation_lifecycle_lock(
+    config_dir: &Path,
+    lifecycle_lock_dir: &Path,
+) -> Result<std::fs::File, CreateClientError> {
+    let lock = acquire_creation_lock(lifecycle_lock_dir)?;
+    prepare_client_config_dir(config_dir)?;
+    Ok(lock)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn acquire_creation_lifecycle_lock(
+    _config_dir: &Path,
+    _lifecycle_lock_dir: &Path,
+) -> Result<std::fs::File, CreateClientError> {
+    Err(CreateClientError::Internal(
+        "create_client is supported only on unix targets".to_string(),
+    ))
 }
 
 /// Create a new AmneziaWG client directly, without the external install script.
@@ -984,6 +1128,23 @@ pub fn create_client(
     disabled_keys: &HashSet<String>,
     ip_override: &IpOverride,
 ) -> Result<CreateClientResult, CreateClientError> {
+    script_bridge::validate_client_name(name)?;
+    // Standalone callers use the client directory itself as their lock inode,
+    // so restore the documented create-on-first-use behavior before opening it.
+    // The web path uses acquire_creation_lifecycle_lock with an independent,
+    // already-existing persistent state directory and therefore locks first.
+    let _lock_file = acquire_standalone_creation_lock(config_dir)?;
+    create_client_with_lifecycle_lock(config_dir, name, disabled_keys, ip_override)
+}
+
+/// Native creation variant for a caller that already holds the lifecycle lock.
+#[cfg(unix)]
+pub(crate) fn create_client_with_lifecycle_lock(
+    config_dir: &Path,
+    name: &str,
+    disabled_keys: &HashSet<String>,
+    ip_override: &IpOverride,
+) -> Result<CreateClientResult, CreateClientError> {
     // Step 1: Validate the client name.
     script_bridge::validate_client_name(name)?;
 
@@ -993,117 +1154,6 @@ pub fn create_client(
     let params = parse_params(&params_content)?;
 
     debug!(nic = %params.server_awg_nic, "server params loaded");
-
-    // Reject a symlinked AWG_CONFIG_DIR to prevent redirection attacks:
-    // a symlink swap between validation and use could redirect client
-    // configs and the lock file to an attacker-controlled location.
-    // Use symlink_metadata directly (no exists() pre-check) to avoid TOCTOU.
-    match std::fs::symlink_metadata(config_dir) {
-        Ok(sym_meta) => {
-            if sym_meta.file_type().is_symlink() {
-                return Err(CreateClientError::FileWrite(format!(
-                    "AWG_CONFIG_DIR {} is a symbolic link; refusing to use it for client configs",
-                    config_dir.display()
-                )));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Path does not exist yet — will be created below.
-        }
-        Err(e) => {
-            return Err(CreateClientError::FileWrite(format!(
-                "cannot lstat {}: {e}",
-                config_dir.display()
-            )));
-        }
-    }
-
-    // Ensure the clients directory exists with restrictive permissions (0700).
-    // Tolerate pre-existing paths (including those created by another process),
-    // then re-validate using symlink_metadata to avoid TOCTOU symlink swaps.
-    std::fs::create_dir_all(config_dir).map_err(|e| {
-        CreateClientError::FileWrite(format!("mkdir {}: {e}", config_dir.display()))
-    })?;
-
-    let cfg_meta = std::fs::symlink_metadata(config_dir).map_err(|e| {
-        CreateClientError::FileWrite(format!("cannot lstat {}: {e}", config_dir.display()))
-    })?;
-    let cfg_ftype = cfg_meta.file_type();
-    if cfg_ftype.is_symlink() {
-        return Err(CreateClientError::FileWrite(format!(
-            "AWG_CONFIG_DIR {} is a symbolic link; refusing to use it for client configs",
-            config_dir.display()
-        )));
-    }
-
-    // Reject non-directory paths (e.g. regular file) before we attempt to set
-    // permissions or create the lock file inside it.
-    if !cfg_ftype.is_dir() {
-        return Err(CreateClientError::FileWrite(format!(
-            "config path exists but is not a directory: {}",
-            config_dir.display()
-        )));
-    }
-    // Best-effort: ensure correct permissions (fix pre-existing directories too).
-    // On upgrades from older installs the directory may be root-owned, in which
-    // case chmod will fail with EPERM.
-    if let Err(e) = std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700)) {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            // Verify the directory is safe to use despite the chmod failure:
-            // it must be owned by the current (service) user and not writable
-            // by group or other.  Refuse to proceed otherwise to prevent
-            // symlink/race attacks and secret disclosure.
-            let meta = std::fs::metadata(config_dir).map_err(|me| {
-                CreateClientError::FileWrite(format!("cannot stat {}: {me}", config_dir.display()))
-            })?;
-            // SAFETY: getuid() is a trivial syscall that always succeeds.
-            let uid = unsafe { libc::getuid() };
-            let dir_uid = std::os::unix::fs::MetadataExt::uid(&meta);
-            let dir_mode = meta.permissions().mode();
-            if dir_uid != uid {
-                return Err(CreateClientError::FileWrite(format!(
-                    "AWG_CONFIG_DIR {} is owned by uid {dir_uid}, not the service user (uid {uid}); \
-                     run: sudo chown awg-web:awg-web {}",
-                    config_dir.display(), config_dir.display(),
-                )));
-            }
-            // S_IWGRP | S_IWOTH — reject group/world-writable directories.
-            const UNSAFE_WRITE_BITS: u32 = 0o022;
-            if dir_mode & UNSAFE_WRITE_BITS != 0 {
-                return Err(CreateClientError::FileWrite(format!(
-                    "AWG_CONFIG_DIR {} has unsafe permissions {dir_mode:#o} (group/world writable); \
-                     run: sudo chmod 0700 {}",
-                    config_dir.display(), config_dir.display(),
-                )));
-            }
-            tracing::warn!(
-                dir = %config_dir.display(),
-                error = %e,
-                "chmod on config dir failed; verified directory is owned by service user \
-                 and not group/world-writable, proceeding",
-            );
-        } else {
-            return Err(CreateClientError::FileWrite(format!(
-                "chmod {}: {e}",
-                config_dir.display()
-            )));
-        }
-    }
-
-    // Acquire an exclusive lock on the clients directory to prevent concurrent
-    // create_client calls from allocating the same IP or appending duplicate
-    // peer blocks.  The lock is held for the read→allocate→append sequence
-    // and released automatically when `_lock_file` is dropped.
-    let lock_path = config_dir.join(".create-client.lock");
-    let _lock_file =
-        acquire_lifecycle_lock(&lock_path).map_err(|err| match err.raw_os_error() {
-            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
-                CreateClientError::LockBusy
-            }
-            _ => CreateClientError::FileWrite(format!(
-                "failed to acquire lock for client creation: {err}"
-            )),
-        })?;
 
     // Step 4: Read server config to check for duplicates and find used IPs.
     let server_config = awg::read_server_state_via_sudo(&params.server_awg_nic)
@@ -1259,6 +1309,48 @@ pub fn remove_client(
     name: &str,
     disabled_keys: &HashSet<String>,
 ) -> Result<(), RemoveClientError> {
+    remove_client_inner(config_dir, name, None, disabled_keys, false)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn create_client_with_lifecycle_lock(
+    config_dir: &Path,
+    name: &str,
+    disabled_keys: &HashSet<String>,
+    ip_override: &IpOverride,
+) -> Result<CreateClientResult, CreateClientError> {
+    create_client(config_dir, name, disabled_keys, ip_override)
+}
+
+/// Remove or resume removal of a database-linked managed client.
+///
+/// The named server block must contain `expected_public_key`. If the block is
+/// already absent, cleanup can resume only when that key is also absent from
+/// the server config. This makes partial retries safe without treating a
+/// renamed or mismatched live peer as successfully removed.
+#[cfg(unix)]
+pub fn remove_client_resumable(
+    config_dir: &Path,
+    name: &str,
+    expected_public_key: &str,
+    disabled_keys: &HashSet<String>,
+) -> Result<(), RemoveClientError> {
+    remove_client_inner(
+        config_dir,
+        name,
+        Some(expected_public_key),
+        disabled_keys,
+        true,
+    )
+}
+
+fn remove_client_inner(
+    config_dir: &Path,
+    name: &str,
+    expected_public_key: Option<&str>,
+    disabled_keys: &HashSet<String>,
+    allow_missing_server_block: bool,
+) -> Result<(), RemoveClientError> {
     script_bridge::validate_client_name(name)?;
 
     // Validate the unprivileged client-config directory before changing the
@@ -1299,32 +1391,91 @@ pub fn remove_client(
     let server_config = awg::read_server_state_via_sudo(&params.server_awg_nic)
         .map_err(|e| RemoveClientError::ParamsRead(format!("failed to read server config: {e}")))?;
 
-    if remove_client_block(&server_config, name).is_none() {
+    if remove_client_block(&server_config, name).is_some() {
+        match expected_public_key {
+            Some(public_key) => {
+                // The helper revalidates this identity while holding the
+                // server-config lock, closing the read/delete TOCTOU window.
+                awg::remove_client_if_key_via_sudo(&params.server_awg_nic, name, public_key)
+            }
+            None => awg::remove_client_via_sudo(&params.server_awg_nic, name),
+        }
+        .map_err(|e| RemoveClientError::FileWrite(format!("remove from server config: {e}")))?;
+    } else if !allow_missing_server_block {
         return Err(RemoveClientError::ClientNotFound(name.to_string()));
+    } else if expected_public_key
+        .is_some_and(|public_key| server_config_contains_public_key(&server_config, public_key))
+    {
+        return Err(RemoveClientError::IdentityMismatch(name.to_string()));
     }
 
-    awg::remove_client_via_sudo(&params.server_awg_nic, name)
-        .map_err(|e| RemoveClientError::FileWrite(format!("remove from server config: {e}")))?;
+    // Always sync after the persistent server config has been removed (or was
+    // already absent). This is the step that makes retries repair a previous
+    // remove-then-sync failure and evicts the peer from the live interface.
+    awg::sync_interface(&params.server_awg_nic, disabled_keys)?;
 
-    if let Ok(entries) = std::fs::read_dir(config_dir) {
-        let suffix = format!("-client-{name}.conf");
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            if let Some(n) = file_name.to_str() {
-                if n.ends_with(&suffix) {
-                    if let Err(e) = std::fs::remove_file(entry.path()) {
-                        tracing::warn!(
-                            path = %entry.path().display(),
-                            error = %e,
-                            "failed to remove client config from config_dir"
-                        );
+    // A missing named block alone cannot prove that removal is complete: the
+    // database may be linked to a different interface or an out-of-band edit
+    // may have renamed the marker. Fail closed until the expected peer key is
+    // absent from every live interface. Client files and database state remain
+    // available for a later retry or manual diagnosis when this check fails.
+    if let Some(expected_public_key) = expected_public_key {
+        let interfaces = awg::show_all_dump()?;
+        if live_interfaces_contain_public_key(&interfaces, expected_public_key) {
+            return Err(RemoveClientError::IdentityMismatch(name.to_string()));
+        }
+    }
+
+    let mut config_cleanup_error = None;
+    match std::fs::read_dir(config_dir) {
+        Ok(entries) => {
+            let suffix = format!("-client-{name}.conf");
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let file_name = entry.file_name();
+                        if file_name
+                            .to_str()
+                            .is_some_and(|file_name| file_name.ends_with(&suffix))
+                        {
+                            if let Err(e) = std::fs::remove_file(entry.path()) {
+                                tracing::warn!(
+                                    path = %entry.path().display(),
+                                    error = %e,
+                                    "failed to remove client config from config_dir"
+                                );
+                                config_cleanup_error.get_or_insert_with(|| {
+                                    RemoveClientError::FileWrite(format!(
+                                        "remove client config {}: {e}",
+                                        entry.path().display()
+                                    ))
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        config_cleanup_error.get_or_insert_with(|| {
+                            RemoveClientError::FileWrite(format!(
+                                "read entry in {}: {e}",
+                                config_dir.display()
+                            ))
+                        });
                     }
                 }
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            config_cleanup_error = Some(RemoveClientError::FileWrite(format!(
+                "read client config directory {}: {e}",
+                config_dir.display()
+            )));
+        }
     }
 
-    awg::sync_interface(&params.server_awg_nic, disabled_keys)?;
+    if let Some(error) = config_cleanup_error {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -1339,11 +1490,70 @@ pub fn remove_client(
     ))
 }
 
+#[cfg(not(unix))]
+pub fn remove_client_resumable(
+    _config_dir: &Path,
+    _name: &str,
+    _expected_public_key: &str,
+    _disabled_keys: &HashSet<String>,
+) -> Result<(), RemoveClientError> {
+    Err(RemoveClientError::Internal(
+        "remove_client is supported only on unix targets".to_string(),
+    ))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_uses_state_directory_descriptor_and_rejects_symlinks() {
+        let parent = tempfile::tempdir().expect("temp parent");
+        let state_dir = parent.path().join("state");
+        std::fs::create_dir(&state_dir).expect("create state dir");
+
+        let first = acquire_lifecycle_lock(&state_dir).expect("first lifecycle lock");
+        let second = acquire_lifecycle_lock(&state_dir).expect_err("lock must contend");
+        assert!(matches!(
+            second.raw_os_error(),
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+        ));
+        assert!(std::fs::read_dir(&state_dir)
+            .expect("read state dir")
+            .next()
+            .is_none());
+        drop(first);
+
+        let symlink = parent.path().join("state-link");
+        std::os::unix::fs::symlink(&state_dir, &symlink).expect("create symlink");
+        assert!(acquire_lifecycle_lock(&symlink).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_does_not_require_client_directory() {
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let missing_config_dir = state_dir.path().join("missing-clients");
+
+        let _lock = acquire_lifecycle_lock(state_dir.path()).expect("lifecycle lock");
+
+        assert!(!missing_config_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_creation_lock_prepares_missing_client_directory() {
+        let parent = tempfile::tempdir().expect("temp parent");
+        let missing_config_dir = parent.path().join("missing-clients");
+
+        let _lock = acquire_standalone_creation_lock(&missing_config_dir)
+            .expect("standalone creation lock");
+
+        assert!(missing_config_dir.is_dir());
+    }
 
     #[test]
     fn remove_client_block_removes_only_target_client_section() {
@@ -1359,6 +1569,36 @@ mod tests {
     fn remove_client_block_returns_none_for_unknown_client() {
         let server = "[Interface]\nPrivateKey = S\n\n### Client alice\n[Peer]\nPublicKey = A\n";
         assert!(remove_client_block(server, "missing").is_none());
+    }
+
+    #[test]
+    fn resumable_removal_identity_helpers_detect_keys_across_config_and_live_state() {
+        let server = "[Interface]\nPrivateKey = S\n\n### Client renamed\n[Peer]\nPublicKey = ALICE_KEY=\n\n### Client bob\n[Peer]\nPublicKey = BOB_KEY=\n";
+
+        assert!(server_config_contains_public_key(server, "ALICE_KEY="));
+        assert!(!server_config_contains_public_key(server, "MISSING_KEY="));
+
+        let interfaces = vec![awg::AwgInterface {
+            name: "awg0".to_string(),
+            public_key: crate::domain::PublicKey("SERVER_KEY=".to_string()),
+            listen_port: Some(51820),
+            peers: vec![awg::AwgPeer {
+                public_key: crate::domain::PublicKey("ALICE_KEY=".to_string()),
+                endpoint: None,
+                allowed_ips: vec!["10.66.66.2/32".to_string()],
+                last_handshake: None,
+                rx_bytes: 0,
+                tx_bytes: 0,
+            }],
+        }];
+        assert!(live_interfaces_contain_public_key(
+            &interfaces,
+            "ALICE_KEY="
+        ));
+        assert!(!live_interfaces_contain_public_key(
+            &interfaces,
+            "MISSING_KEY="
+        ));
     }
 
     #[cfg(unix)]

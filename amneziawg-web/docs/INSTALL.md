@@ -171,9 +171,12 @@ allow-listed operations provide:
   exclude a bounded list of validated disabled-peer keys, and sync it
 - `read-params` – expose only the non-secret parameters needed for client generation
 - `read-server-state` – expose only interface addresses, managed-client markers,
-  and peer AllowedIPs needed for allocation
+  validated peer public keys, and peer AllowedIPs needed for allocation and
+  lifecycle identity checks
 - `append-peer` – validate and atomically append one reconstructed managed-peer block
 - `remove-client` – atomically remove one exact, validated managed-client block
+- `remove-client-if-key` – atomically validate a managed client's public-key
+  identity and remove its exact block
 
 Every operation has a fixed argument shape.  Unknown subcommands, malformed
 interface/client names, keys or AllowedIPs, unsafe configuration paths,

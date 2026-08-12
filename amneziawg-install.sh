@@ -10,6 +10,9 @@ NC='\033[0m'
 
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 WEB_PANEL_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
+WEB_PANEL_ENV_FILE="/etc/amneziawg-web/env.conf"
+WEB_PANEL_SYSTEMD_UNIT="/etc/systemd/system/amneziawg-web.service"
+WEB_PANEL_DATA_DIR="/var/lib/amneziawg-web"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
@@ -1634,26 +1637,429 @@ function detectPublicIPv4() {
 	return 0
 }
 
+# Validate the configured unit path before asking systemd for its effective
+# properties. A missing fragment is allowed because PID 1 may still have the
+# loaded unit until the next daemon-reload.
+function validateWebPanelSystemdUnitPath() {
+	if [[ -L "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		echo "ERROR: refusing unsafe web panel service unit '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
+		return 1
+	fi
+	if [[ -e "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		if [[ ! -f "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+			echo "ERROR: refusing unsafe web panel service unit '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
+			return 1
+		fi
+	fi
+	return 0
+}
+
+# Read a normalized property from PID 1. systemd has already merged the unit
+# fragment and every drop-in, including list resets and filename precedence.
+# Matching FragmentPath prevents a same-named host unit from affecting tests or
+# callers that deliberately point WEB_PANEL_SYSTEMD_UNIT somewhere else.
+function readWebPanelEffectiveProperty() {
+	local property="$1"
+	local unit_name load_state fragment_path
+	validateWebPanelSystemdUnitPath || return 1
+	command -v systemctl >/dev/null 2>&1 || return 1
+	unit_name="$(basename -- "${WEB_PANEL_SYSTEMD_UNIT}")"
+	load_state="$(systemctl show "${unit_name}" --property=LoadState --value 2>/dev/null)" || return 1
+	[[ "${load_state}" == "loaded" ]] || return 1
+	fragment_path="$(systemctl show "${unit_name}" --property=FragmentPath --value 2>/dev/null)" || return 1
+	[[ "${fragment_path}" == "${WEB_PANEL_SYSTEMD_UNIT}" ]] || return 1
+
+	case "${property}" in
+		LoadState) printf '%s\n' "${load_state}" ;;
+		FragmentPath) printf '%s\n' "${fragment_path}" ;;
+		*) systemctl show "${unit_name}" --property="${property}" --value 2>/dev/null ;;
+	esac
+}
+
+function validateWebPanelEnvFile() {
+	local env_file="$1"
+	local required="$2"
+	local optional="$3"
+	if [[ "${env_file}" != /* || "${env_file}" =~ [[:space:][:cntrl:]] ]]; then
+		echo "ERROR: refusing unsafe web panel environment path '${env_file}'" >&2
+		return 1
+	fi
+
+	if [[ -L "${env_file}" ]]; then
+		echo "ERROR: refusing unsafe web panel environment file '${env_file}'" >&2
+		return 1
+	fi
+	if [[ -e "${env_file}" ]]; then
+		if [[ ! -f "${env_file}" ]]; then
+			echo "ERROR: refusing unsafe web panel environment file '${env_file}'" >&2
+			return 1
+		fi
+	elif [[ "${required}" -eq 1 && "${optional}" -eq 0 ]]; then
+		echo "ERROR: web panel environment file '${env_file}' does not exist" >&2
+		return 1
+	fi
+	return 0
+}
+
+# Print the ordered effective EnvironmentFile list as OPTIONAL<TAB>PATH. The
+# systemctl representation is one normalized "path (ignore_errors=yes|no)"
+# entry per line. The base-fragment parser remains as a compatibility fallback
+# when PID 1 is unavailable (for example in installer unit tests).
+function resolveWebPanelEnvFiles() {
+	local effective_files configured_env env_file_metadata optional resolved_files="" index
+	local -a env_file_fields=()
+	validateWebPanelSystemdUnitPath || return 1
+	if effective_files="$(readWebPanelEffectiveProperty EnvironmentFiles)"; then
+		while IFS= read -r configured_env; do
+			[[ -n "${configured_env}" ]] || continue
+			read -r -a env_file_fields <<< "${configured_env}"
+			if [[ "${#env_file_fields[@]}" -eq 0 ]] || (( ${#env_file_fields[@]} % 2 != 0 )); then
+				echo "ERROR: unsupported systemd EnvironmentFiles value '${configured_env}'" >&2
+				return 1
+			fi
+			for ((index = 0; index < ${#env_file_fields[@]}; index += 2)); do
+				configured_env="${env_file_fields[index]}"
+				env_file_metadata="${env_file_fields[index + 1]}"
+				if [[ ! "${env_file_metadata}" =~ ^\(ignore_errors=(yes|no)\)$ ]]; then
+					echo "ERROR: unsupported systemd EnvironmentFiles value '${configured_env} ${env_file_metadata}'" >&2
+					return 1
+				fi
+				optional=0
+				[[ "${BASH_REMATCH[1]}" == "yes" ]] && optional=1
+				validateWebPanelEnvFile "${configured_env}" 1 "${optional}" || return 1
+				printf '%s\t%s\n' "${optional}" "${configured_env}"
+			done
+		done <<< "${effective_files}"
+		return 0
+	fi
+
+	if [[ -f "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		while IFS= read -r configured_env; do
+			optional=0
+			if [[ "${configured_env}" == -* ]]; then
+				optional=1
+				configured_env="${configured_env#-}"
+			fi
+			configured_env="${configured_env#\"}"
+			configured_env="${configured_env%\"}"
+			configured_env="${configured_env#\'}"
+			configured_env="${configured_env%\'}"
+			if [[ -z "${configured_env}" ]]; then
+				resolved_files=""
+				continue
+			fi
+			validateWebPanelEnvFile "${configured_env}" 1 "${optional}" || return 1
+			resolved_files+="${optional}"$'\t'"${configured_env}"$'\n'
+		done < <(sed -n 's/^[[:space:]]*EnvironmentFile=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null)
+		printf '%s' "${resolved_files}"
+		return 0
+	fi
+
+	validateWebPanelEnvFile "${WEB_PANEL_ENV_FILE}" 0 1 || return 1
+	if [[ -f "${WEB_PANEL_ENV_FILE}" ]]; then
+		printf '1\t%s\n' "${WEB_PANEL_ENV_FILE}"
+	fi
+}
+
+# Resolve the final web-panel environment file for legacy installed-panel
+# detection. Settings themselves are read from every effective file below.
+function resolveWebPanelEnvFile() {
+	local entries optional configured_env env_file="${WEB_PANEL_ENV_FILE}"
+	entries="$(resolveWebPanelEnvFiles)" || return 1
+	while IFS=$'\t' read -r optional configured_env; do
+		[[ -n "${configured_env}" ]] || continue
+		env_file="${configured_env}"
+	done <<< "${entries}"
+
+	printf '%s\n' "${env_file}"
+}
+
+# Read one web-panel setting without evaluating shell syntax. EnvironmentFile
+# values override inline Environment= values, matching systemd semantics.
+function readWebPanelSetting() {
+	local setting_name="$1"
+	local effective_environment entries optional env_file inline_line inline_assignment value=""
+	local -a inline_assignments=()
+	if effective_environment="$(readWebPanelEffectiveProperty Environment)"; then
+		while IFS= read -r inline_line; do
+			read -r -a inline_assignments <<< "${inline_line}"
+			for inline_assignment in "${inline_assignments[@]}"; do
+				inline_assignment="${inline_assignment#\"}"
+				inline_assignment="${inline_assignment%\"}"
+				inline_assignment="${inline_assignment#\'}"
+				inline_assignment="${inline_assignment%\'}"
+				if [[ "${inline_assignment}" == "${setting_name}="* ]]; then
+					value="${inline_assignment#*=}"
+				fi
+			done
+		done <<< "${effective_environment}"
+	else
+		while IFS= read -r inline_assignment; do
+			inline_assignment="${inline_assignment#\"}"
+			inline_assignment="${inline_assignment%\"}"
+			inline_assignment="${inline_assignment#\'}"
+			inline_assignment="${inline_assignment%\'}"
+			if [[ "${inline_assignment}" == "${setting_name}="* ]]; then
+				value="${inline_assignment#*=}"
+			fi
+		done < <(sed -n 's/^[[:space:]]*Environment=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null)
+	fi
+
+	# EnvironmentFile values are applied after Environment= regardless of where
+	# the directives occur, and later files override earlier files.
+	entries="$(resolveWebPanelEnvFiles)" || return 1
+	while IFS=$'\t' read -r optional env_file; do
+		[[ -n "${env_file}" && -f "${env_file}" ]] || continue
+		if grep -q "^[[:space:]]*${setting_name}=" "${env_file}" 2>/dev/null; then
+			value="$(sed -n "s/^[[:space:]]*${setting_name}=//p" "${env_file}" 2>/dev/null | tail -n 1)"
+		fi
+	done <<< "${entries}"
+
+	value="${value#\"}"
+	value="${value%\"}"
+	value="${value#\'}"
+	value="${value%\'}"
+	printf '%s\n' "${value}"
+}
+
+# Resolve the service working directory used for relative database paths.
+function resolveWebPanelWorkingDirectory() {
+	local working_dir=""
+	if working_dir="$(readWebPanelEffectiveProperty WorkingDirectory)"; then
+		working_dir="${working_dir:-/}"
+	elif [[ -f "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		working_dir="$(sed -n 's/^[[:space:]]*WorkingDirectory=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null | tail -n 1)"
+		working_dir="${working_dir#-}"
+		working_dir="${working_dir#\"}"
+		working_dir="${working_dir%\"}"
+		working_dir="${working_dir#\'}"
+		working_dir="${working_dir%\'}"
+		working_dir="${working_dir:-/}"
+	else
+		working_dir="${WEB_PANEL_DATA_DIR}"
+	fi
+
+	if [[ "${working_dir}" != /* || "${working_dir}" =~ [[:space:][:cntrl:]] ]]; then
+		echo "ERROR: refusing unsafe web panel WorkingDirectory '${working_dir}'" >&2
+		return 1
+	fi
+	if [[ "${working_dir}" != "/" ]]; then
+		working_dir="${working_dir%/}"
+	fi
+	printf '%s\n' "${working_dir}"
+}
+
+# Print the effective ExecStart argv without evaluating unit-file shell syntax.
+# PID 1 exposes the already-merged command as a normalized argv[] property. The
+# base-fragment parser is only a compatibility fallback when systemd is absent.
+function resolveWebPanelExecStartArgv() {
+	local effective_exec line argv resolved_argv="" exec_count=0
+	if effective_exec="$(readWebPanelEffectiveProperty ExecStart)"; then
+		while IFS= read -r line; do
+			[[ -n "${line}" ]] || continue
+			if [[ "${line}" != *" argv[]="*" ; ignore_errors="* ]]; then
+				echo "ERROR: unsupported systemd ExecStart value '${line}'" >&2
+				return 2
+			fi
+			argv="${line#* argv[]=}"
+			argv="${argv%% ; ignore_errors=*}"
+			[[ -n "${argv}" ]] || continue
+			resolved_argv="${argv}"
+			exec_count=$((exec_count + 1))
+		done <<< "${effective_exec}"
+	elif [[ -f "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		while IFS= read -r line; do
+			if [[ -z "${line}" ]]; then
+				resolved_argv=""
+				exec_count=0
+				continue
+			fi
+			resolved_argv="${line}"
+			exec_count=$((exec_count + 1))
+		done < <(sed -n 's/^[[:space:]]*ExecStart=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null)
+	else
+		return 1
+	fi
+
+	if [[ "${exec_count}" -eq 0 ]]; then
+		return 1
+	fi
+	if [[ "${exec_count}" -ne 1 ]]; then
+		echo "ERROR: expected one effective ExecStart for '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
+		return 2
+	fi
+	printf '%s\n' "${resolved_argv}"
+}
+
+# Read one long-option value from the effective ExecStart. Every argument after
+# argv[0] must be an option/value pair; this deliberately fails closed if the
+# text representation is ambiguous (for example, an argument containing spaces).
+function readWebPanelExecStartSetting() {
+	local requested_option="$1"
+	local exec_argv token option_name option_value value="" found=0 index=1
+	local -a exec_args=()
+	exec_argv="$(resolveWebPanelExecStartArgv)" || return $?
+	read -r -a exec_args <<< "${exec_argv}"
+	[[ "${#exec_args[@]}" -gt 0 ]] || return 1
+
+	while [[ "${index}" -lt "${#exec_args[@]}" ]]; do
+		token="${exec_args[index]}"
+		token="${token#\"}"
+		token="${token%\"}"
+		token="${token#\'}"
+		token="${token%\'}"
+		if [[ "${token}" != --* ]]; then
+			echo "ERROR: unsupported positional argument in web panel ExecStart" >&2
+			return 2
+		fi
+
+		case "${token%%=*}" in
+			--auth-enabled|--auth-secure-cookie)
+				if [[ "${token}" == *=* ]]; then
+					echo "ERROR: unsupported value for boolean option '${token%%=*}' in web panel ExecStart" >&2
+					return 2
+				fi
+				index=$((index + 1))
+				continue
+				;;
+			--listen|--database-url|--config-dir|--poll-interval|--proxy-sessions-file|\
+			--auth-username|--auth-password-hash|--auth-api-token|--auth-session-ttl-secs)
+				;;
+			*)
+				echo "ERROR: unsupported option '${token%%=*}' in web panel ExecStart" >&2
+				return 2
+				;;
+		esac
+
+		if [[ "${token}" == *=* ]]; then
+			option_name="${token%%=*}"
+			option_value="${token#*=}"
+			index=$((index + 1))
+		else
+			option_name="${token}"
+			index=$((index + 1))
+			if [[ "${index}" -ge "${#exec_args[@]}" || "${exec_args[index]}" == --* ]]; then
+				echo "ERROR: missing value for '${option_name}' in web panel ExecStart" >&2
+				return 2
+			fi
+			option_value="${exec_args[index]}"
+			option_value="${option_value#\"}"
+			option_value="${option_value%\"}"
+			option_value="${option_value#\'}"
+			option_value="${option_value%\'}"
+			index=$((index + 1))
+		fi
+
+		if [[ "${option_name}" == "${requested_option}" ]]; then
+			value="${option_value}"
+			found=1
+		fi
+	done
+
+	[[ "${found}" -eq 1 ]] || return 1
+	if [[ "${value}" == *'$'* || "${value}" == *'%'* ]]; then
+		echo "ERROR: unsupported variable or specifier in ${requested_option} ExecStart value" >&2
+		return 2
+	fi
+	printf '%s\n' "${value}"
+}
+
+# Resolve the web panel's active config directory without sourcing its env file.
+# Command-line arguments take precedence over environment values, as in Clap.
+function resolveWebPanelConfigDir() {
+	local configured_dir exec_config_dir exec_setting_rc
+	configured_dir="$(readWebPanelSetting AWG_CONFIG_DIR)" || return 1
+	if exec_config_dir="$(readWebPanelExecStartSetting --config-dir)"; then
+		configured_dir="${exec_config_dir}"
+	else
+		exec_setting_rc=$?
+		[[ "${exec_setting_rc}" -eq 1 ]] || return "${exec_setting_rc}"
+	fi
+
+	if [[ -n "${configured_dir}" ]]; then
+		if [[ "${configured_dir}" != /* || "${configured_dir}" =~ [[:space:][:cntrl:]] ]]; then
+			echo "ERROR: refusing unsafe AWG_CONFIG_DIR '${configured_dir}'" >&2
+			return 1
+		fi
+		printf '%s\n' "${configured_dir%/}"
+		return 0
+	fi
+
+	printf '%s\n' "${WEB_PANEL_CONFIG_DIR%/}"
+}
+
+# Use the web database directory as the stable cross-process lifecycle lock.
+# Unlike AWG_CONFIG_DIR it exists for the panel's lifetime, including when no
+# client has been created yet. Standalone installer use (no panel env file)
+# retains the config-directory fallback.
+function resolveClientLifecycleLockDir() {
+	local env_file database_path exec_database_path exec_setting_rc working_dir database_parent
+	env_file="$(resolveWebPanelEnvFile)" || return 1
+
+	if [[ ! -f "${env_file}" && ! -e "${WEB_PANEL_SYSTEMD_UNIT}" ]] && \
+		! readWebPanelEffectiveProperty LoadState >/dev/null; then
+		resolveWebPanelConfigDir
+		return
+	fi
+
+	database_path="$(readWebPanelSetting AWG_WEB_DB)" || return 1
+	database_path="${database_path:-awg-web.db}"
+	if exec_database_path="$(readWebPanelExecStartSetting --database-url)"; then
+		database_path="${exec_database_path}"
+	else
+		exec_setting_rc=$?
+		[[ "${exec_setting_rc}" -eq 1 ]] || return "${exec_setting_rc}"
+	fi
+	if [[ "${database_path}" =~ [[:space:][:cntrl:]] ]]; then
+		echo "ERROR: refusing unsafe AWG_WEB_DB '${database_path}'" >&2
+		return 1
+	fi
+	case "${database_path}" in
+		sqlite://*) database_path="${database_path#sqlite://}" ;;
+		sqlite:*) database_path="${database_path#sqlite:}" ;;
+	esac
+	database_path="${database_path%%\?*}"
+	working_dir="$(resolveWebPanelWorkingDirectory)" || return 1
+
+	if [[ -z "${database_path}" || "${database_path}" == ":memory:" ]]; then
+		printf '%s\n' "${working_dir}"
+		return 0
+	fi
+	database_parent="$(dirname -- "${database_path}")"
+	if [[ "${database_path}" == /* ]]; then
+		if [[ "${database_parent}" != "/" ]]; then
+			database_parent="${database_parent%/}"
+		fi
+		printf '%s\n' "${database_parent}"
+	elif [[ "${database_parent}" == "." ]]; then
+		printf '%s\n' "${working_dir}"
+	else
+		printf '%s/%s\n' "${working_dir%/}" "${database_parent}"
+	fi
+}
+
 # Copy a client config file to the web panel config directory so the panel
 # can discover and display it.  This is a best-effort operation: if the web
 # panel is not installed (directory absent), the copy is silently skipped.
 function copyToWebPanelDir() {
 	local src_file="$1"
-	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && ! -L "${WEB_PANEL_CONFIG_DIR}" && -f "${src_file}" && ! -L "${src_file}" ]]; then
+	local panel_config_dir
+	panel_config_dir="$(resolveWebPanelConfigDir)" || return 0
+	if [[ -d "${panel_config_dir}" && ! -L "${panel_config_dir}" && -f "${src_file}" && ! -L "${src_file}" ]]; then
 		local dest
-		dest="${WEB_PANEL_CONFIG_DIR}/$(basename "${src_file}")"
+		dest="${panel_config_dir}/$(basename "${src_file}")"
 		# Avoid following or overwriting a pre-existing symlink at the destination.
 		if [[ -L "${dest}" ]]; then
 			# Best-effort: warn and skip rather than risk clobbering the symlink target.
 			echo "Warning: refusing to copy '${src_file}' to '${dest}' because destination is a symlink" >&2
 			return 0
 		fi
-		cp -f "${src_file}" "${WEB_PANEL_CONFIG_DIR}/" 2>/dev/null || true
+		cp -f "${src_file}" "${dest}" 2>/dev/null || true
 		# Only adjust ownership and permissions on a regular non-symlink file we just copied.
 		if [[ -f "${dest}" && ! -L "${dest}" ]]; then
 			# Determine the directory's group; use it if available, otherwise fall back to root.
 			local dir_group dest_group
-			dir_group="$(stat -c '%G' "${WEB_PANEL_CONFIG_DIR}" 2>/dev/null || true)"
+			dir_group="$(stat -c '%G' "${panel_config_dir}" 2>/dev/null || true)"
 			if [[ -n "${dir_group}" ]]; then
 				dest_group="${dir_group}"
 			else
@@ -1669,8 +2075,10 @@ function copyToWebPanelDir() {
 # Remove a client config file from the web panel config directory.
 function removeFromWebPanelDir() {
 	local filename="$1"
-	if [[ -d "${WEB_PANEL_CONFIG_DIR}" && ! -L "${WEB_PANEL_CONFIG_DIR}" ]]; then
-		rm -f -- "${WEB_PANEL_CONFIG_DIR}/${filename}" 2>/dev/null || true
+	local panel_config_dir
+	panel_config_dir="$(resolveWebPanelConfigDir)" || return 0
+	if [[ -d "${panel_config_dir}" && ! -L "${panel_config_dir}" ]]; then
+		rm -f -- "${panel_config_dir}/${filename}" 2>/dev/null || true
 	fi
 }
 
@@ -5702,7 +6110,67 @@ function manageMenu() {
 #
 # On error, prints a message to stderr and exits with a non-zero code.
 
-function nonInteractiveAddClient() {
+CLIENT_LIFECYCLE_LOCK_FD=""
+
+# Acquire the same non-blocking lifecycle lock used by amneziawg-web. The
+# persistent state directory is opened read-only, its descriptor identity
+# is revalidated against the path, and the descriptor is locked. The root-run
+# CLI therefore never creates, truncates, chowns, or chmods a service-writable
+# lock pathname. The caller runs in a subshell so the descriptor, and therefore
+# the lock, is released on every success, return, or exit path.
+function acquireClientLifecycleLock() {
+	local lock_dir env_file panel_installed=0
+	local old_umask dir_identity descriptor_identity descriptor_path
+	lock_dir="$(resolveClientLifecycleLockDir)" || return 1
+	env_file="$(resolveWebPanelEnvFile)" || return 1
+	if [[ -f "${env_file}" || -e "${WEB_PANEL_SYSTEMD_UNIT}" ]] || \
+		readWebPanelEffectiveProperty LoadState >/dev/null; then
+		panel_installed=1
+	fi
+
+	if ! command -v flock >/dev/null 2>&1; then
+		echo "ERROR: flock is required for serialized client lifecycle operations" >&2
+		return 1
+	fi
+	if [[ ! -e "${lock_dir}" && "${panel_installed}" -eq 1 ]]; then
+		echo "ERROR: web panel lifecycle directory '${lock_dir}' does not exist" >&2
+		return 1
+	fi
+	if [[ ! -e "${lock_dir}" ]]; then
+		old_umask="$(umask)"
+		umask 077
+		mkdir -p "${lock_dir}" || {
+			umask "${old_umask}"
+			echo "ERROR: could not create client lifecycle directory '${lock_dir}'" >&2
+			return 1
+		}
+		umask "${old_umask}"
+	fi
+	if [[ -L "${lock_dir}" || ! -d "${lock_dir}" ]]; then
+		echo "ERROR: refusing unsafe client lifecycle directory '${lock_dir}'" >&2
+		return 1
+	fi
+	if ! exec {CLIENT_LIFECYCLE_LOCK_FD}< "${lock_dir}"; then
+		echo "ERROR: could not open client lifecycle directory '${lock_dir}'" >&2
+		return 1
+	fi
+	descriptor_path="/proc/${BASHPID}/fd/${CLIENT_LIFECYCLE_LOCK_FD}"
+	dir_identity="$(stat -Lc '%d:%i' -- "${lock_dir}" 2>/dev/null || true)"
+	descriptor_identity="$(stat -Lc '%d:%i' -- "${descriptor_path}" 2>/dev/null || true)"
+	if [[ -L "${lock_dir}" || ! -d "${lock_dir}" || -z "${dir_identity}" || \
+		-z "${descriptor_identity}" || "${dir_identity}" != "${descriptor_identity}" ]]; then
+		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
+		echo "ERROR: client lifecycle directory changed while it was opened" >&2
+		return 1
+	fi
+	if ! flock -xn "${CLIENT_LIFECYCLE_LOCK_FD}"; then
+		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
+		echo "ERROR: another add/remove operation is already in progress" >&2
+		return 1
+	fi
+}
+
+function nonInteractiveAddClient() (
 	local CLIENT_NAME="$1"
 
 	# Validate the name format (same rules as interactive mode)
@@ -5718,6 +6186,7 @@ function nonInteractiveAddClient() {
 		echo "ERROR: client name must be at most 15 characters" >&2
 		exit 1
 	fi
+	acquireClientLifecycleLock || exit 1
 
 	# Ensure params are loaded and config path is set
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
@@ -5870,9 +6339,9 @@ AllowedIPs = ${PEER_ALLOWED_IPS}" >>"${SERVER_AWG_CONF}"
 
 	# Print the config path to stdout for the caller
 	echo "${client_conf}"
-}
+)
 
-function nonInteractiveRemoveClient() {
+function nonInteractiveRemoveClient() (
 	local CLIENT_NAME="$1"
 
 	if [[ -z "${CLIENT_NAME}" ]]; then
@@ -5887,6 +6356,7 @@ function nonInteractiveRemoveClient() {
 		echo "ERROR: client name must be at most 15 characters" >&2
 		exit 1
 	fi
+	acquireClientLifecycleLock || exit 1
 
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
@@ -5919,7 +6389,7 @@ function nonInteractiveRemoveClient() {
 	fi
 
 	echo "OK"
-}
+)
 
 function nonInteractiveListClients() {
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"

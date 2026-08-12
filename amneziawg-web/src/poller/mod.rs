@@ -19,6 +19,8 @@
 //!
 //! Errors within a single cycle step are logged and the cycle continues;
 //! the overall polling loop never stops due to a single-cycle failure.
+//! Expired managed users are removed before each AWG snapshot, including the
+//! poller's immediate first cycle at process startup.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -52,14 +54,27 @@ pub struct Poller {
     interval: Duration,
     /// Directory to scan for `*.conf` client config files.
     config_dir: PathBuf,
+    /// Persistent directory whose descriptor serializes client lifecycle work.
+    lifecycle_lock_dir: PathBuf,
 }
 
 impl Poller {
+    #[cfg(test)]
     pub fn new(db: Database, interval_secs: u64, config_dir: PathBuf) -> Self {
+        Self::new_with_lifecycle_lock_dir(db, interval_secs, config_dir.clone(), config_dir)
+    }
+
+    pub fn new_with_lifecycle_lock_dir(
+        db: Database,
+        interval_secs: u64,
+        config_dir: PathBuf,
+        lifecycle_lock_dir: PathBuf,
+    ) -> Self {
         Self {
             db,
             interval: Duration::from_secs(interval_secs),
             config_dir,
+            lifecycle_lock_dir,
         }
     }
 
@@ -84,6 +99,27 @@ impl Poller {
     async fn poll_once(&self) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         debug!("poll cycle starting");
+
+        // ── Step 0: Expired-user cleanup ────────────────────────────────────
+        // The first interval tick fires immediately, so this also catches
+        // expirations missed while the web service was stopped. Running it
+        // before AWG discovery means cleanup is still attempted if AWG status
+        // collection fails later in the cycle.
+        match crate::admin::cleanup_expired_users(
+            &self.db,
+            &self.config_dir,
+            &self.lifecycle_lock_dir,
+        )
+        .await
+        {
+            Ok(removed) if removed > 0 => {
+                info!(removed, "expired-user cleanup complete");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!(error = %e, "expired-user cleanup query failed – continuing");
+            }
+        }
 
         // ── Step 1–3: AWG data ───────────────────────────────────────────────
         let interfaces = match awg::show_all_dump() {
@@ -385,7 +421,9 @@ impl Poller {
             .flat_map(|iface| iface.peers.iter().map(|p| p.public_key.0.clone()))
             .collect();
 
-        let stale = crate::db::peers::delete_stale_peers(&self.db.pool, &active_keys).await?;
+        let now = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let stale =
+            crate::db::peers::delete_stale_peers(&self.db.pool, &active_keys, &now).await?;
 
         if !stale.is_empty() {
             for (id, ref public_key) in &stale {
@@ -510,6 +548,10 @@ async fn apply_config_mappings(
     let mut mapped_by_ip: usize = 0;
     for config in configs {
         let path_str = config.path.to_string_lossy();
+        let managed_client_name = crate::admin::script_bridge::managed_client_name_from_config(
+            &config.name,
+            &config.friendly_name,
+        );
 
         // ── Strategy 1: exact public-key match ──────────────────
         //
@@ -525,6 +567,7 @@ async fn apply_config_mappings(
                 &config.name,
                 &path_str,
                 &config.friendly_name,
+                managed_client_name,
             )
             .await
             {
@@ -584,6 +627,7 @@ async fn apply_config_mappings(
                     &config.name,
                     &path_str,
                     &config.friendly_name,
+                    managed_client_name,
                 )
                 .await
                 {

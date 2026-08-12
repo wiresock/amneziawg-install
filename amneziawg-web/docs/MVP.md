@@ -27,7 +27,7 @@
 |21 | 232 unit + integration tests              | Auth, domain, DB, config, history, web handler, lifecycle/admin layers    |
 |22 | User create (native Rust)                 | `POST /api/admin/users`, HTML form at `/admin/users/add`; validates name; allocates IPs; writes configs; syncs AWG directly |
 |23 | User remove (native Rust)                 | `POST /api/admin/users/:id/remove`, HTML form at `/admin/users/:id/remove`; confirmation required; rewrites server config and syncs AWG directly |
-|24 | Lifecycle locking + validation             | Shared add/remove lock (`.create-client.lock`) and installer-name validation for managed user actions |
+|24 | Lifecycle locking + validation             | Cross-process add/remove lock on the persistent database state directory shared with installer CLI operations, plus installer-name validation for managed user actions |
 |25 | User lifecycle audit events               | `user_create_requested`, `user_created`, `user_create_failed`, `user_remove_requested`, `user_removed`, `user_remove_failed` |
 |26 | Post-action config rescan                 | `poller::rescan_configs()` called after create/remove; no manual restart needed |
 

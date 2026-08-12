@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
     Form, Json, Router,
 };
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path as FsPath, PathBuf};
@@ -54,6 +54,8 @@ pub struct AppState {
     pub rate_limiter: LoginRateLimiter,
     /// Directory where AWG client configs are stored (for rescan).
     pub config_dir: PathBuf,
+    /// Persistent directory whose descriptor serializes client lifecycle work.
+    pub lifecycle_lock_dir: PathBuf,
     /// Local JSON file written by amneziawg-proxy with active session status.
     pub proxy_sessions_file: PathBuf,
     /// Lazily-canonicalized `config_dir` for safe `starts_with` comparisons.
@@ -95,6 +97,7 @@ impl SystemUptimeBaseline {
 const SYSTEM_VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 const MAX_REASONABLE_UPTIME_SECS: f64 = 3_153_600_000.0; // 100 years
 const PROXY_STATUS_STALE_AFTER_SECS: i64 = 30;
+const MAX_EXPIRATION_DAYS: i64 = 36_500; // 100 years
 const STATISTICS_COUNTER_NOTE: &str =
     "Traffic counters below are live interface counters since the last system boot or interface restart.";
 
@@ -103,6 +106,7 @@ impl AppState {
         db: Database,
         auth: AuthConfig,
         config_dir: PathBuf,
+        lifecycle_lock_dir: PathBuf,
         proxy_sessions_file: PathBuf,
     ) -> Self {
         let cell = tokio::sync::OnceCell::new();
@@ -125,6 +129,7 @@ impl AppState {
             login_csrf: new_login_csrf_store(),
             rate_limiter: new_login_rate_limiter(),
             config_dir,
+            lifecycle_lock_dir,
             proxy_sessions_file,
             canonical_config_dir: std::sync::Arc::new(cell),
             logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -369,6 +374,11 @@ pub struct PeerSummaryDto {
     pub has_config: bool,
     /// Whether this row is retained only as a hidden disabled-key tombstone.
     pub archived: bool,
+    /// UTC removal deadline. `None` means this peer is permanent.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Human-readable status such as "Never expires" or "Expires in 6 days".
+    pub expiration_status: String,
+    pub expired: bool,
     /// Comma-separated list of allowed CIDRs.
     pub allowed_ips: String,
     pub endpoint: Option<String>,
@@ -409,6 +419,9 @@ pub struct PeerDetailDto {
     pub comment: Option<String>,
     pub config_name: Option<String>,
     pub friendly_name: Option<String>,
+    /// Validated stable installer identity used to resume lifecycle removal.
+    #[serde(skip_serializing)]
+    pub managed_client_name: Option<String>,
     pub config_path: Option<String>,
     pub allowed_ips: String,
     pub endpoint: Option<String>,
@@ -426,6 +439,10 @@ pub struct PeerDetailDto {
     pub identity_status: IdentityStatus,
     pub disabled: bool,
     pub has_config: bool,
+    /// UTC removal deadline. `None` means this peer is permanent.
+    pub expires_at: Option<DateTime<Utc>>,
+    pub expiration_status: String,
+    pub expired: bool,
     /// Internal reconciliation state used to decide when destructive panel
     /// actions are safe. It is not part of the public peer-detail API.
     #[serde(skip_serializing)]
@@ -513,7 +530,7 @@ pub struct PeerUsageSummaryDto {
 
 /// Request body for `PATCH /api/peers/:id`.
 ///
-/// Both fields are optional.  If a field is absent the existing value is kept.
+/// All fields are optional. If a field is absent the existing value is kept.
 /// If a field is provided with an empty or blank string, the value is cleared
 /// (set to NULL).
 #[derive(Debug, Deserialize)]
@@ -522,6 +539,10 @@ pub struct PatchPeerRequest {
     pub comment: Option<String>,
     /// When present, enables (`false`) or disables (`true`) the peer.
     pub disabled: Option<bool>,
+    /// New lifetime measured from this update. Omit to keep the existing
+    /// deadline, use `0` to make the peer permanent, or a positive number of
+    /// days to set a new UTC expiration.
+    pub expiration_days: Option<i64>,
 }
 
 /// URL-encoded form body submitted by the HTML edit form on `POST /peers/:id`.
@@ -533,6 +554,9 @@ pub struct PeerEditForm {
     pub csrf_token: Option<String>,
     /// Checkbox: present with value `"1"` when checked, absent when unchecked.
     pub disabled: Option<String>,
+    /// Blank keeps the current deadline, `0` makes the peer permanent, and a
+    /// positive value sets a new lifetime from now.
+    pub expiration_days: Option<String>,
 }
 
 /// URL-encoded form body submitted by the login page.
@@ -586,6 +610,8 @@ pub struct CreateUserRequest {
     pub ipv4_address: Option<String>,
     /// Optional full IPv6 address for the client (e.g. `"fd42:42:42::ff"`).
     pub ipv6_address: Option<String>,
+    /// Optional lifetime in days. Omitted or `0` creates a permanent user.
+    pub expiration_days: Option<i64>,
 }
 
 /// HTML form body for `POST /admin/users/add`.
@@ -599,6 +625,8 @@ pub struct AddUserForm {
     pub ipv4_address: Option<String>,
     /// Optional full IPv6 address for the client.
     pub ipv6_address: Option<String>,
+    /// Lifetime in days. `0` (the form default) creates a permanent user.
+    pub expiration_days: Option<String>,
 }
 
 /// Fixed notice code accepted by the peer-list page after a create redirect.
@@ -648,6 +676,97 @@ fn trim_optional_string(s: Option<&str>) -> Option<String> {
 
 fn epoch_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
     ts.and_then(|t| Utc.timestamp_opt(t, 0).single())
+}
+
+fn parse_stored_expiration(raw: Option<&str>) -> Option<DateTime<Utc>> {
+    raw.and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn expiration_from_days(
+    days: i64,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, String> {
+    if !(0..=MAX_EXPIRATION_DAYS).contains(&days) {
+        return Err(format!(
+            "expiration_days must be between 0 and {MAX_EXPIRATION_DAYS}"
+        ));
+    }
+    if days == 0 {
+        return Ok(None);
+    }
+    let expires_at = now
+        .checked_add_signed(chrono::Duration::days(days))
+        .ok_or_else(|| "expiration date is out of range".to_string())?;
+    Ok(Some(
+        expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+    ))
+}
+
+fn parse_form_expiration_days(value: Option<&str>) -> Result<Option<i64>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    value
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| "lifetime must be a whole number of days".to_string())
+}
+
+fn managed_client_name_for_lifecycle(row: &PeerRow) -> Option<&str> {
+    row.managed_client_name
+        .as_deref()
+        .filter(|name| crate::admin::script_bridge::validate_client_name(name).is_ok())
+        .or_else(|| {
+            if row.has_config == 0 {
+                return None;
+            }
+            let config_name = row.config_name.as_deref()?;
+            let friendly_name = row.friendly_name.as_deref()?;
+            crate::admin::script_bridge::managed_client_name_from_config(config_name, friendly_name)
+        })
+}
+
+fn format_expiration_status(
+    expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> String {
+    let Some(expires_at) = expires_at else {
+        return "Never expires".to_string();
+    };
+    let seconds = expires_at.signed_duration_since(now).num_seconds();
+    if seconds <= 0 {
+        return "Expired".to_string();
+    }
+
+    if seconds < 3_600 {
+        let minutes = (seconds + 59) / 60;
+        return format!(
+            "Expires in {minutes} minute{}",
+            if minutes == 1 { "" } else { "s" }
+        );
+    }
+    if seconds < 86_400 {
+        let hours = (seconds + 3_599) / 3_600;
+        return format!(
+            "Expires in {hours} hour{}",
+            if hours == 1 { "" } else { "s" }
+        );
+    }
+
+    let days = (seconds + 86_399) / 86_400;
+    if days <= 30 {
+        return format!(
+            "Expires in {days} day{}",
+            if days == 1 { "" } else { "s" }
+        );
+    }
+
+    format!(
+        "Expires on {} {}",
+        expires_at.day(),
+        expires_at.format("%b %Y")
+    )
 }
 
 fn unix_millis_to_utc(ts: u64) -> Option<DateTime<Utc>> {
@@ -889,6 +1008,10 @@ fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
         row.config_name.as_deref(),
         &row.public_key,
     );
+    let expires_at = parse_stored_expiration(row.expires_at.as_deref());
+    let now = Utc::now();
+    let expiration_status = format_expiration_status(expires_at, now);
+    let expired = expires_at.is_some_and(|value| value <= now);
     PeerSummaryDto {
         id: row.id,
         name,
@@ -898,6 +1021,9 @@ fn peer_row_to_summary(row: PeerRow) -> PeerSummaryDto {
         friendly_name: row.friendly_name,
         has_config,
         archived: row.archived != 0,
+        expires_at,
+        expiration_status,
+        expired,
         allowed_ips: row.allowed_ips,
         endpoint: row.endpoint,
         proxy_remote_addr: None,
@@ -943,6 +1069,11 @@ fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDt
         row.config_name.as_deref(),
         &row.public_key,
     );
+    let expires_at = parse_stored_expiration(row.expires_at.as_deref());
+    let now = Utc::now();
+    let expiration_status = format_expiration_status(expires_at, now);
+    let expired = expires_at.is_some_and(|value| value <= now);
+    let managed_client_name = managed_client_name_for_lifecycle(&row).map(str::to_owned);
     PeerDetailDto {
         id: row.id,
         name,
@@ -951,6 +1082,7 @@ fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDt
         comment: row.comment,
         config_name: row.config_name,
         friendly_name: row.friendly_name,
+        managed_client_name,
         config_path: row.config_path,
         allowed_ips: row.allowed_ips,
         endpoint: row.endpoint,
@@ -963,6 +1095,9 @@ fn peer_row_to_detail(row: PeerRow, snapshots: Vec<SnapshotRow>) -> PeerDetailDt
         identity_status,
         disabled,
         has_config,
+        expires_at,
+        expiration_status,
+        expired,
         sync_pending: row.sync_pending != 0,
         recent_snapshots: snapshots.into_iter().map(snapshot_row_to_dto).collect(),
     }
@@ -1008,13 +1143,37 @@ fn normalize_period(period: &str) -> &'static str {
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Build the application router with an explicit proxy session status file.
+#[cfg(test)]
 pub fn router_with_proxy_sessions_file(
     db: Database,
     auth: AuthConfig,
     config_dir: PathBuf,
     proxy_sessions_file: PathBuf,
 ) -> Router {
-    let state = AppState::new(db, auth, config_dir, proxy_sessions_file);
+    router_with_lifecycle_lock_dir(
+        db,
+        auth,
+        config_dir.clone(),
+        config_dir,
+        proxy_sessions_file,
+    )
+}
+
+/// Build the application router with an independent persistent lifecycle lock directory.
+pub fn router_with_lifecycle_lock_dir(
+    db: Database,
+    auth: AuthConfig,
+    config_dir: PathBuf,
+    lifecycle_lock_dir: PathBuf,
+    proxy_sessions_file: PathBuf,
+) -> Router {
+    let state = AppState::new(
+        db,
+        auth,
+        config_dir,
+        lifecycle_lock_dir,
+        proxy_sessions_file,
+    );
 
     // Protected routes – all require a valid session.
     let protected = Router::new()
@@ -2006,18 +2165,46 @@ async fn patch_peer(
         Some(ref v) => normalize_comment(v),
         None => existing.comment.clone(),
     };
+    let expiration_update = match body.expiration_days {
+        Some(days) => match expiration_from_days(days, Utc::now()) {
+            Ok(value) => Some(value),
+            Err(message) => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": message })),
+                )
+                    .into_response())
+            }
+        },
+        None => None,
+    };
+    let managed_client_name = managed_client_name_for_lifecycle(&existing);
+    if expiration_update.as_ref().is_some_and(Option::is_some)
+        && managed_client_name.is_none()
+    {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "only installer-managed users with a linked config can expire" })),
+        )
+            .into_response());
+    }
 
-    let updated = crate::db::peers::update_peer_metadata(
-        &state.db.pool,
+    let updated = crate::admin::execute_update_peer_details(
+        &state.db,
         id,
         new_display_name.as_deref(),
         new_comment.as_deref(),
+        expiration_update.as_ref().map(|value| value.as_deref()),
+        expiration_update
+            .as_ref()
+            .and_then(|value| value.as_deref())
+            .and(managed_client_name),
     )
     .await?;
     if updated.is_none() {
         return Ok((
             StatusCode::CONFLICT,
-            Json(json!({ "error": "peer was archived while the update was in progress" })),
+            Json(json!({ "error": "peer removal or archival is already in progress" })),
         )
             .into_response());
     }
@@ -2072,12 +2259,17 @@ async fn patch_peer(
             .into_response()),
         Some(peer_row) => {
             // Fire-and-forget audit log for metadata changes.
-            if body.display_name.is_some() || body.comment.is_some() {
+            if body.display_name.is_some()
+                || body.comment.is_some()
+                || expiration_update.is_some()
+            {
                 let detail = serde_json::json!({
                     "old_display_name": existing.display_name,
                     "new_display_name": new_display_name,
                     "old_comment": existing.comment,
                     "new_comment": new_comment,
+                    "old_expires_at": &existing.expires_at,
+                    "new_expires_at": expiration_update.as_ref().unwrap_or(&existing.expires_at),
                 })
                 .to_string();
                 log_event(
@@ -2349,19 +2541,57 @@ async fn post_peer_edit(
         .as_deref()
         .and_then(normalize_display_name);
     let comment = form.comment.as_deref().and_then(normalize_comment);
+    let expiration_days = match parse_form_expiration_days(form.expiration_days.as_deref()) {
+        Ok(value) => value,
+        Err(message) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Html(format!("<h1>Invalid expiration</h1><p>{}</p>", esc(&message))),
+            )
+                .into_response())
+        }
+    };
+    let expiration_update = match expiration_days {
+        Some(days) => match expiration_from_days(days, Utc::now()) {
+            Ok(value) => Some(value),
+            Err(message) => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Html(format!("<h1>Invalid expiration</h1><p>{}</p>", esc(&message))),
+                )
+                    .into_response())
+            }
+        },
+        None => None,
+    };
+    let managed_client_name = managed_client_name_for_lifecycle(&existing);
+    if expiration_update.as_ref().is_some_and(Option::is_some)
+        && managed_client_name.is_none()
+    {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Html("<h1>Invalid expiration</h1><p>Only installer-managed users with a linked config can expire.</p>".to_string()),
+        )
+            .into_response());
+    }
 
-    if crate::db::peers::update_peer_metadata(
-        &state.db.pool,
+    if crate::admin::execute_update_peer_details(
+        &state.db,
         id,
         display_name.as_deref(),
         comment.as_deref(),
+        expiration_update.as_ref().map(|value| value.as_deref()),
+        expiration_update
+            .as_ref()
+            .and_then(|value| value.as_deref())
+            .and(managed_client_name),
     )
     .await?
     .is_none()
     {
         return Ok((
             StatusCode::CONFLICT,
-            Html("<h1>Peer was archived while the update was in progress</h1>".to_string()),
+            Html("<h1>Peer removal or archival is already in progress</h1>".to_string()),
         )
             .into_response());
     }
@@ -2413,6 +2643,8 @@ async fn post_peer_edit(
         "new_display_name": display_name,
         "old_comment": existing.comment,
         "new_comment": comment,
+        "old_expires_at": &existing.expires_at,
+        "new_expires_at": expiration_update.as_ref().unwrap_or(&existing.expires_at),
     })
     .to_string();
     log_event(
@@ -2562,15 +2794,31 @@ async fn api_create_user(
         ipv4_address: trim_optional_string(body.ipv4_address.as_deref()),
         ipv6_address: trim_optional_string(body.ipv6_address.as_deref()),
     };
+    let expires_at = match expiration_from_days(body.expiration_days.unwrap_or(0), Utc::now()) {
+        Ok(value) => value,
+        Err(message) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": message })),
+            )
+                .into_response())
+        }
+    };
     match crate::admin::execute_create_user(
         &state.db,
         &state.config_dir,
+        &state.lifecycle_lock_dir,
         &name,
         comment.as_deref(),
+        expires_at.as_deref(),
         &state.auth.username,
         &ip_override,
         #[cfg(test)]
         injected_create_result(&headers, &state, &name, &ip_override),
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
     )
     .await
     {
@@ -2581,6 +2829,7 @@ async fn api_create_user(
                 "name": result.client_name,
                 "config_path": result.config_path,
                 "comment": comment,
+                "expires_at": expires_at,
                 "sync_required": result.sync_required,
                 "metadata_persisted": result.metadata_persisted,
                 "warnings": warning_codes,
@@ -2657,23 +2906,21 @@ async fn api_remove_user(
         }
     };
 
-    // Determine the script-side client name from the peer's friendly_name
-    // (which is extracted from the config filename's `-client-<suffix>` pattern).
-    let client_name = match peer.friendly_name.as_deref() {
-        Some(n) if !n.is_empty() => n.to_string(),
+    // Prefer the stable identity persisted at creation/removal start. Migrated
+    // rows fall back to validated config discovery metadata while it exists.
+    let client_name = match managed_client_name_for_lifecycle(&peer) {
+        Some(name) => name.to_string(),
         _ => {
             return Ok((
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "peer has no associated client name (no config linked)" })),
+                Json(json!({ "error": "peer has no managed client identity" })),
             )
                 .into_response());
         }
     };
 
-    // Only peers whose friendly_name passes installer validation can be removed
-    // via the script.  Configs not matching the `*-client-<name>.conf` pattern
-    // (or with names that exceed the character/length constraints) are not
-    // managed by the installer and would always fail.
+    // Keep validation at the mutation boundary even though identity selection
+    // above already filters invalid names.
     if let Err(e) = crate::admin::script_bridge::validate_client_name(&client_name) {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -2685,6 +2932,7 @@ async fn api_remove_user(
     match crate::admin::execute_remove_user(
         &state.db,
         &state.config_dir,
+        &state.lifecycle_lock_dir,
         id,
         &client_name,
         &state.auth.username,
@@ -2757,15 +3005,50 @@ async fn post_add_user_form(
         ipv4_address,
         ipv6_address,
     };
+    let expiration_days = match parse_form_expiration_days(form.expiration_days.as_deref()) {
+        Ok(Some(days)) => days,
+        Ok(None) => 0,
+        Err(message) => {
+            let rows = crate::db::peers::list_visible(&state.db.pool).await?;
+            let peers: Vec<PeerSummaryDto> =
+                rows.into_iter().map(peer_row_to_summary).collect();
+            let csrf = session_csrf_from_headers(&state, &headers);
+            let status = system_status(&state);
+            return Ok(Html(render_peer_list_with_error(
+                &peers, &csrf, &status, &message,
+            ))
+            .into_response());
+        }
+    };
+    let expires_at = match expiration_from_days(expiration_days, Utc::now()) {
+        Ok(value) => value,
+        Err(message) => {
+            let rows = crate::db::peers::list_visible(&state.db.pool).await?;
+            let peers: Vec<PeerSummaryDto> =
+                rows.into_iter().map(peer_row_to_summary).collect();
+            let csrf = session_csrf_from_headers(&state, &headers);
+            let status = system_status(&state);
+            return Ok(Html(render_peer_list_with_error(
+                &peers, &csrf, &status, &message,
+            ))
+            .into_response());
+        }
+    };
     match crate::admin::execute_create_user(
         &state.db,
         &state.config_dir,
+        &state.lifecycle_lock_dir,
         &name,
         comment.as_deref(),
+        expires_at.as_deref(),
         &state.auth.username,
         &ip_override,
         #[cfg(test)]
         injected_create_result(&headers, &state, &name, &ip_override),
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
     )
     .await
     {
@@ -2860,8 +3143,8 @@ async fn post_remove_user_form(
         }
     };
 
-    let client_name = match peer.friendly_name.as_deref() {
-        Some(n) if !n.is_empty() => n.to_string(),
+    let client_name = match managed_client_name_for_lifecycle(&peer) {
+        Some(name) => name.to_string(),
         _ => {
             return Ok(Redirect::to(&format!("/peers/{id}")).into_response());
         }
@@ -2884,6 +3167,7 @@ async fn post_remove_user_form(
     match crate::admin::execute_remove_user(
         &state.db,
         &state.config_dir,
+        &state.lifecycle_lock_dir,
         id,
         &client_name,
         &state.auth.username,
@@ -3416,7 +3700,7 @@ fn html_head(title: &str) -> String {
   .add-user-panel summary {{ cursor: pointer; font-weight: 700; font-size: 1.05rem; }}
   .add-user-panel[open] summary {{ margin-bottom: .75rem; }}
   .edit-form label {{ display: block; font-weight: bold; margin-bottom: .25rem; margin-top: .75rem; }}
-  .edit-form input[type=text], .edit-form input[type=password], .edit-form textarea {{ width: 100%; padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 3px; font-family: inherit; font-size: .95rem; box-sizing: border-box; }}
+  .edit-form input[type=text], .edit-form input[type=password], .edit-form input[type=number], .edit-form textarea {{ width: 100%; padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 3px; font-family: inherit; font-size: .95rem; box-sizing: border-box; }}
   .edit-form textarea {{ resize: vertical; min-height: 4rem; }}
   .edit-form button[type=submit] {{ margin-top: 1rem; padding: .4rem 1.1rem; background: #0066cc; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .95rem; }}
   .edit-form button[type=submit]:hover {{ background: #0055aa; }}
@@ -3554,6 +3838,26 @@ fn render_endpoint_cell(endpoint: Option<&str>, proxy_remote_addr: Option<&str>)
     }
 }
 
+fn render_expiration_cell(
+    status: &str,
+    expires_at: Option<DateTime<Utc>>,
+    expired: bool,
+) -> String {
+    let status = if expired {
+        format!(r#"<span class="warning">{}</span>"#, esc(status))
+    } else {
+        esc(status)
+    };
+    match expires_at {
+        Some(value) => format!(
+            "{status}<span class=\"th-hint\">{} {} UTC</span>",
+            value.day(),
+            value.format("%b %Y %H:%M")
+        ),
+        None => status,
+    }
+}
+
 fn render_peer_list(
     peers: &[PeerSummaryDto],
     csrf_token: &str,
@@ -3633,7 +3937,7 @@ fn render_peer_list_inner(
         buf.push_str(
             "<table>\n\
              <tr><th>Name</th><th>Connection</th><th>Identity</th><th>Endpoint</th>\
-             <th>Comment</th><th>Last handshake</th><th>RX<span class=\"th-hint\">current period</span></th>\
+             <th>Comment</th><th>Expiration</th><th>Last handshake</th><th>RX<span class=\"th-hint\">current period</span></th>\
              <th>TX<span class=\"th-hint\">current period</span></th></tr>\n",
         );
         for p in peers {
@@ -3663,9 +3967,11 @@ fn render_peer_list_inner(
                 .filter(|comment| !comment.is_empty())
                 .map(esc)
                 .unwrap_or_else(|| "–".to_string());
+            let expiration =
+                render_expiration_cell(&p.expiration_status, p.expires_at, p.expired);
             buf.push_str(&format!(
                 "<tr><td>{name_link}</td><td>{conn}</td><td>{ident}</td><td>{endpoint}</td>\
-                 <td class=\"comment-cell\">{comment}</td><td>{handshake}</td><td>{rx}</td><td>{tx}</td></tr>\n",
+                 <td class=\"comment-cell\">{comment}</td><td>{expiration}</td><td>{handshake}</td><td>{rx}</td><td>{tx}</td></tr>\n",
                 conn = connection_badge(&p.connection_status),
                 ident = identity_badge(&p.identity_status),
                 rx = fmt_bytes(p.rx_bytes),
@@ -3705,6 +4011,18 @@ fn render_peer_list_inner(
   <label for="add_user_comment">Comment <span class="meta">(optional)</span></label>
   <textarea id="add_user_comment" name="comment" maxlength="512"
             placeholder="e.g. Primary phone"></textarea>
+  <label for="add_user_expiration_days">Lifetime in days</label>
+  <input type="number" id="add_user_expiration_days" name="expiration_days"
+         value="0" min="0" max="36500" step="1" list="expiration_lifetime_presets">
+  <datalist id="expiration_lifetime_presets">
+    <option value="0" label="Never expires"></option>
+    <option value="1" label="1 day"></option>
+    <option value="7" label="7 days"></option>
+    <option value="30" label="30 days"></option>
+    <option value="90" label="90 days"></option>
+    <option value="365" label="1 year"></option>
+  </datalist>
+  <p class="meta" style="margin-top:.25rem">Use 0 for no expiration, or enter any lifetime up to 36500 days.</p>
   <button type="submit">Add user</button>
 </form>
 </details>
@@ -3925,6 +4243,10 @@ fn render_peer_detail_inner(
     if let Some(ref cm) = dto.comment {
         buf.push_str(&format!("<tr><th>Comment</th><td>{}</td></tr>\n", esc(cm)));
     }
+    buf.push_str(&format!(
+        "<tr><th>Expiration</th><td>{}</td></tr>\n",
+        render_expiration_cell(&dto.expiration_status, dto.expires_at, dto.expired)
+    ));
     buf.push_str("</table>\n");
 
     // Edit form
@@ -3941,6 +4263,19 @@ fn render_peer_detail_inner(
   <label for="comment">Comment</label>
   <textarea id="comment" name="comment" maxlength="512"
             placeholder="Optional note about this peer">{cm}</textarea>
+  <label for="expiration_days">Change lifetime in days</label>
+  <input type="number" id="expiration_days" name="expiration_days"
+         min="0" max="36500" step="1" list="edit_expiration_lifetime_presets"
+         placeholder="Leave unchanged">
+  <datalist id="edit_expiration_lifetime_presets">
+    <option value="0" label="Never expires"></option>
+    <option value="1" label="1 day from now"></option>
+    <option value="7" label="7 days from now"></option>
+    <option value="30" label="30 days from now"></option>
+    <option value="90" label="90 days from now"></option>
+    <option value="365" label="1 year from now"></option>
+  </datalist>
+  <p class="meta" style="margin-top:.25rem">Current: {expiration_status}. Leave blank to keep it, use 0 for permanent, or enter a new lifetime from now.</p>
   <label style="margin-top:.75rem;display:flex;align-items:center;gap:.4rem;font-weight:bold">
     <input type="checkbox" name="disabled" value="1"{disabled_checked}> Disabled
   </label>
@@ -3952,6 +4287,7 @@ fn render_peer_detail_inner(
         csrf = esc(csrf_token),
         dn = esc(current_display_name),
         cm = esc(current_comment),
+        expiration_status = esc(&dto.expiration_status),
         disabled_checked = if dto.disabled { " checked" } else { "" },
     ));
 
@@ -3980,14 +4316,11 @@ Audit-log entries are retained and may still contain earlier values.</p>
         ));
     }
 
-    // Remove user form (only shown when the peer has a linked config and the
-    // friendly name passes installer-managed name validation, i.e. it matches
-    // the `-client-<name>` pattern and `[a-zA-Z0-9_-]{1,15}`).
-    if dto.has_config {
-        if let Some(ref fn_name) = dto.friendly_name {
-            if crate::admin::script_bridge::validate_client_name(fn_name).is_ok() {
-                buf.push_str(&format!(
-                    r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
+    // Keep the retry action available after a partial removal clears transient
+    // config discovery metadata; managed_client_name is the durable identity.
+    if let Some(ref managed_name) = dto.managed_client_name {
+        buf.push_str(&format!(
+            r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
 <h2 style="color:#c00">Remove user</h2>
 <p>This will permanently revoke the client <strong>{name}</strong> and delete its config file.
 Historical data (snapshots, events) will be preserved.</p>
@@ -4003,12 +4336,10 @@ Historical data (snapshots, events) will be preserved.</p>
 </form>
 </div>
 "#,
-                    id = dto.id,
-                    csrf = esc(csrf_token),
-                    name = esc(fn_name),
-                ));
-            }
-        }
+            id = dto.id,
+            csrf = esc(csrf_token),
+            name = esc(managed_name),
+        ));
     }
 
     // Traffic usage summary
@@ -4832,6 +5163,42 @@ mod tests {
         assert_eq!(fmt_duration_hms(86_400), "1 day 00:00:00");
         assert_eq!(fmt_duration_hms(172_800), "2 days 00:00:00");
         assert_eq!(fmt_duration_hms(3_725), "01:02:05");
+    }
+
+    #[test]
+    fn expiration_helpers_cover_permanent_relative_exact_and_invalid_values() {
+        let now = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(expiration_from_days(0, now), Ok(None));
+        assert_eq!(
+            expiration_from_days(7, now),
+            Ok(Some("2026-08-18T12:00:00Z".to_string()))
+        );
+        assert!(expiration_from_days(-1, now).is_err());
+        assert!(expiration_from_days(MAX_EXPIRATION_DAYS + 1, now).is_err());
+
+        assert_eq!(format_expiration_status(None, now), "Never expires");
+        assert_eq!(
+            format_expiration_status(Some(now + chrono::Duration::seconds(30)), now),
+            "Expires in 1 minute"
+        );
+        assert_eq!(
+            format_expiration_status(Some(now + chrono::Duration::hours(6)), now),
+            "Expires in 6 hours"
+        );
+        assert_eq!(
+            format_expiration_status(Some(now + chrono::Duration::days(6)), now),
+            "Expires in 6 days"
+        );
+        assert_eq!(
+            format_expiration_status(Some(now + chrono::Duration::days(90)), now),
+            "Expires on 9 Nov 2026"
+        );
+        assert_eq!(
+            format_expiration_status(Some(now - chrono::Duration::seconds(1)), now),
+            "Expired"
+        );
     }
 
     #[tokio::test]
@@ -5658,6 +6025,365 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_peer_can_set_and_clear_managed_user_expiration() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "EXPIRY_PATCH_KEY=", Some("Alice")).await;
+        sqlx::query(
+            "UPDATE peers
+             SET has_config = 1,
+                 config_name = 'awg0-client-alice',
+                 friendly_name = 'alice'
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let app = test_router(db.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expiration_days":7}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["expires_at"].as_str().is_some());
+        assert_eq!(json["expiration_status"], "Expires in 7 days");
+        let row = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.expires_at.is_some());
+        assert_eq!(row.managed_client_name.as_deref(), Some("alice"));
+
+        sqlx::query("UPDATE peers SET friendly_name = 'renamed-file' WHERE id = ?")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expiration_days":30}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let row = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.managed_client_name.as_deref(), Some("alice"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expiration_days":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["expires_at"].is_null());
+        assert_eq!(json["expiration_status"], "Never expires");
+        let row = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.managed_client_name.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn patch_peer_cannot_cancel_expiration_removal_retry() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "EXPIRY_REMOVAL_RETRY_KEY=", Some("Alice")).await;
+        crate::db::peers::update_peer_metadata(
+            &db.pool,
+            id,
+            Some("Alice"),
+            Some("Original comment"),
+        )
+        .await
+        .unwrap()
+        .expect("set original metadata");
+        crate::db::peers::update_peer_expiration(
+            &db.pool,
+            id,
+            Some("2026-08-10T12:00:00Z"),
+            Some("alice"),
+        )
+        .await
+        .unwrap()
+        .expect("set expiration");
+        assert!(crate::db::peers::mark_removal_pending(&db.pool, id)
+            .await
+            .unwrap());
+
+        let app = test_router(db.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"display_name":"Changed","comment":"Changed comment","expiration_days":0}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"display_name":"Changed","comment":"Changed comment"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let row = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("Alice"));
+        assert_eq!(row.comment.as_deref(), Some("Original comment"));
+        assert_eq!(row.expires_at.as_deref(), Some("2026-08-10T12:00:00Z"));
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE peer_id = ? AND action = 'peer_updated'",
+        )
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0);
+    }
+
+    #[tokio::test]
+    async fn peer_edit_form_cannot_partially_update_expiration_removal_retry() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "FORM_EXPIRY_REMOVAL_RETRY_KEY=", Some("Alice")).await;
+        crate::db::peers::update_peer_metadata(
+            &db.pool,
+            id,
+            Some("Alice"),
+            Some("Original comment"),
+        )
+        .await
+        .unwrap()
+        .expect("set original metadata");
+        crate::db::peers::update_peer_expiration(
+            &db.pool,
+            id,
+            Some("2026-08-10T12:00:00Z"),
+            Some("alice"),
+        )
+        .await
+        .unwrap()
+        .expect("set expiration");
+        assert!(crate::db::peers::mark_removal_pending(&db.pool, id)
+            .await
+            .unwrap());
+
+        let app = test_router(db.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/peers/{id}"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "display_name=Changed&comment=Changed+comment&expiration_days=0",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/peers/{id}"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("display_name=Changed&comment=Changed+comment"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let row = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("Alice"));
+        assert_eq!(row.comment.as_deref(), Some("Original comment"));
+        assert_eq!(row.expires_at.as_deref(), Some("2026-08-10T12:00:00Z"));
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE peer_id = ? AND action = 'peer_updated'",
+        )
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 0);
+    }
+
+    #[tokio::test]
+    async fn expiration_edits_use_stable_identity_during_config_remap() {
+        let db = test_db().await;
+        let api_id = insert_peer(&db, "EXPIRY_REMAP_API_KEY=", Some("Alice")).await;
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "EXPIRY_REMAP_API_KEY=",
+            "awg0-client-alice",
+            "/etc/amnezia/amneziawg/clients/awg0-client-alice.conf",
+            "alice",
+            Some("alice"),
+        )
+        .await
+        .unwrap();
+        crate::db::peers::clear_all_config_mappings(&db.pool)
+            .await
+            .unwrap();
+
+        let html_id = insert_peer(&db, "EXPIRY_REMAP_HTML_KEY=", Some("Bob")).await;
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "EXPIRY_REMAP_HTML_KEY=",
+            "awg0-client-bob",
+            "/etc/amnezia/amneziawg/clients/awg0-client-bob.conf",
+            "bob",
+            Some("bob"),
+        )
+        .await
+        .unwrap();
+        crate::db::peers::clear_all_config_mappings(&db.pool)
+            .await
+            .unwrap();
+
+        let app = test_router(db.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{api_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expiration_days":7}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/peers/{html_id}"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("display_name=Bob&comment=&expiration_days=7"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        for (id, expected_name) in [(api_id, "alice"), (html_id, "bob")] {
+            let row = crate::db::peers::find_by_id(&db.pool, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.has_config, 0);
+            assert_eq!(row.managed_client_name.as_deref(), Some(expected_name));
+            assert!(row.expires_at.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_peer_rejects_expiration_for_unmanaged_peer() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "UNMANAGED_EXPIRY_KEY=", None).await;
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expiration_days":7}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn patch_peer_rejects_generic_config_filename_as_unmanaged() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "GENERIC_CONFIG_EXPIRY_KEY=", None).await;
+        sqlx::query(
+            "UPDATE peers
+             SET has_config = 1,
+                 config_name = 'phone',
+                 friendly_name = 'phone'
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/peers/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"expiration_days":7}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn patch_peer_clears_name_with_blank_string() {
         let db = test_db().await;
         let id = insert_peer(&db, "CLEARKEY1234567890==", Some("ToBeCleared")).await;
@@ -5783,6 +6509,8 @@ mod tests {
         assert!(html.contains(&format!("action=\"/peers/{id}\"")));
         assert!(html.contains("name=\"display_name\""));
         assert!(html.contains("name=\"comment\""));
+        assert!(html.contains("name=\"expiration_days\""));
+        assert!(html.contains("Current: Never expires"));
         // Existing name must be pre-filled
         assert!(html.contains("Editable"));
     }
@@ -6810,6 +7538,7 @@ mod tests {
             "test-client",
             conf_path.to_str().unwrap(),
             "test-client",
+            None,
         )
         .await
         .unwrap();
@@ -7228,6 +7957,7 @@ mod tests {
             "existing-client",
             "/etc/amnezia/amneziawg/existing-client.conf",
             "existing-client",
+            None,
         )
         .await
         .unwrap());
@@ -7253,6 +7983,7 @@ mod tests {
             "test-dl",
             "/etc/awg/test-dl.conf",
             "test-dl",
+            None,
         )
         .await
         .unwrap();
@@ -7312,6 +8043,10 @@ mod tests {
             html.contains("maxlength=\"512\""),
             "comment input should expose the server-side length limit"
         );
+        assert!(html.contains("name=\"expiration_days\""));
+        assert!(html.contains("Never expires"));
+        assert!(html.contains("value=\"7\""));
+        assert!(html.contains("value=\"30\""));
         let comment_position = html
             .find("id=\"add_user_comment\"")
             .expect("comment field position");
@@ -7390,6 +8125,39 @@ mod tests {
             !html.contains("Remove user"),
             "detail page should NOT show 'Remove user' when config is not linked"
         );
+    }
+
+    #[tokio::test]
+    async fn peer_detail_page_keeps_remove_retry_for_stable_managed_identity() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "REMOVE_RETRY_KEY==", Some("Retry user")).await;
+        sqlx::query(
+            "UPDATE peers
+             SET managed_client_name = 'retry-user', removal_pending = 1
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let app = test_router(db);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Remove user"));
+        assert!(html.contains("retry-user"));
+        assert!(html.contains(&format!("/admin/users/{id}/remove")));
     }
 
     #[tokio::test]
@@ -7572,17 +8340,43 @@ mod tests {
     #[test]
     fn create_user_request_accepts_comment_and_omission() {
         let with_comment: CreateUserRequest = serde_json::from_str(
-            r#"{"name":"alice","comment":"Primary phone","ipv4_address":"10.66.66.100"}"#,
+            r#"{"name":"alice","comment":"Primary phone","ipv4_address":"10.66.66.100","expiration_days":7}"#,
         )
         .expect("request with comment should deserialize");
         assert_eq!(with_comment.name, "alice");
         assert_eq!(with_comment.comment.as_deref(), Some("Primary phone"));
         assert_eq!(with_comment.ipv4_address.as_deref(), Some("10.66.66.100"));
+        assert_eq!(with_comment.expiration_days, Some(7));
 
         let without_comment: CreateUserRequest =
             serde_json::from_str(r#"{"name":"bob"}"#).expect("legacy request should deserialize");
         assert_eq!(without_comment.name, "bob");
         assert!(without_comment.comment.is_none());
+        assert!(without_comment.expiration_days.is_none());
+    }
+
+    #[tokio::test]
+    async fn api_create_user_rejects_invalid_lifetime_before_native_creation() {
+        let app = test_router(test_db().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"alice","expiration_days":36501}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("expiration_days"));
     }
 
     #[tokio::test]
@@ -7632,7 +8426,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("x-test-force-create-user-success", "1")
                     .body(Body::from(
-                        r#"{"name":"alice","comment":"  Primary <phone> & tablet  ","ipv4_address":"10.66.66.100","ipv6_address":"fd42:42:42::100"}"#,
+                        r#"{"name":"alice","comment":"  Primary <phone> & tablet  ","ipv4_address":"10.66.66.100","ipv6_address":"fd42:42:42::100","expiration_days":7}"#,
                     ))
                     .unwrap(),
             )
@@ -7647,6 +8441,7 @@ mod tests {
         assert_eq!(payload["metadata_persisted"], true);
         assert_eq!(payload["sync_required"], false);
         assert_eq!(payload["warnings"], json!([]));
+        assert!(payload["expires_at"].as_str().is_some());
 
         let row = crate::db::peers::find_by_public_key(&db.pool, "TEST_CREATE_alice_PUBLIC_KEY=")
             .await
@@ -7654,6 +8449,7 @@ mod tests {
             .expect("created peer");
         assert_eq!(row.comment.as_deref(), Some("Primary <phone> & tablet"));
         assert_eq!(row.has_config, 1);
+        assert!(row.expires_at.is_some());
 
         let list_response = app
             .clone()
@@ -7670,6 +8466,8 @@ mod tests {
             .unwrap();
         let peers: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
         assert_eq!(peers[0]["comment"], "Primary <phone> & tablet");
+        assert_eq!(peers[0]["expiration_status"], "Expires in 7 days");
+        assert_eq!(peers[0]["expired"], false);
 
         for _ in 0..2 {
             let page_response = app
@@ -7682,6 +8480,8 @@ mod tests {
                 .unwrap();
             let html = std::str::from_utf8(&page_body).unwrap();
             assert!(html.contains("<th>Comment</th>"));
+            assert!(html.contains("<th>Expiration</th>"));
+            assert!(html.contains("Expires in 7 days"));
             assert!(html.contains("Primary &lt;phone&gt; &amp; tablet"));
             assert!(!html.contains("Primary <phone> & tablet"));
         }
@@ -7719,6 +8519,7 @@ mod tests {
             .expect("query created peer")
             .expect("created peer");
         assert!(row.comment.is_none());
+        assert!(row.expires_at.is_none());
 
         let page_response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -7933,7 +8734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_remove_user_form_invalid_installer_name_renders_validation_error() {
+    async fn post_remove_user_form_unmanaged_identity_redirects_without_mutation() {
         let db = test_db().await;
         let id = insert_peer(&db, "DOTNAME_REMOVE_KEY==", Some("custom.name")).await;
 
@@ -7959,16 +8760,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let html = std::str::from_utf8(&body).unwrap();
-        assert!(
-            html.contains("Remove failed: peer is not managed by installer"),
-            "HTML should include installer-managed validation error, got: {html}"
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            &format!("/peers/{id}")
         );
-        assert!(!html.contains("Remove failed: internal server error."));
     }
 
     #[test]
@@ -8061,6 +8857,7 @@ mod tests {
             "test-qr",
             conf_path.to_str().unwrap(),
             "test-qr",
+            None,
         )
         .await
         .unwrap();
@@ -8123,6 +8920,7 @@ mod tests {
             "big-qr",
             conf_path.to_str().unwrap(),
             "big-qr",
+            None,
         )
         .await
         .unwrap();
@@ -8172,6 +8970,7 @@ mod tests {
             "test-qrui",
             "/etc/awg/test-qrui.conf",
             "test-qrui",
+            None,
         )
         .await
         .unwrap();
@@ -8281,6 +9080,7 @@ mod tests {
             "escaped",
             outside_conf.to_str().unwrap(),
             "escaped",
+            None,
         )
         .await
         .unwrap();
@@ -8318,6 +9118,7 @@ mod tests {
             "escaped-qr",
             outside_conf.to_str().unwrap(),
             "escaped-qr",
+            None,
         )
         .await
         .unwrap();
@@ -8359,6 +9160,7 @@ mod tests {
             "link",
             link_conf.to_str().unwrap(),
             "link",
+            None,
         )
         .await
         .unwrap();
@@ -8398,6 +9200,7 @@ mod tests {
             "link-qr",
             link_conf.to_str().unwrap(),
             "link-qr",
+            None,
         )
         .await
         .unwrap();

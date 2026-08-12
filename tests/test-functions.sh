@@ -1128,6 +1128,179 @@ echo "[Interface]"
 EOF
 chmod +x "${NIAC_BIN}/awg" "${NIAC_BIN}/awg-quick"
 
+# Without an installed panel, the CLI uses the client directory as its lock so a
+# same-name recreate cannot land between server removal and config cleanup.
+NIAC_LOCK_DIR="$(mktemp -d)"
+NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR="${WEB_PANEL_CONFIG_DIR}"
+NIAC_ORIGINAL_WEB_PANEL_ENV_FILE="${WEB_PANEL_ENV_FILE}"
+NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT="${WEB_PANEL_SYSTEMD_UNIT}"
+NIAC_WEB_ROOT="$(mktemp -d)"
+WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_DIR}"
+WEB_PANEL_ENV_FILE="${NIAC_WEB_ROOT}/missing-env.conf"
+WEB_PANEL_SYSTEMD_UNIT="${NIAC_WEB_ROOT}/missing.service"
+exec {NIAC_HELD_LOCK_FD}< "${NIAC_LOCK_DIR}"
+flock -xn "${NIAC_HELD_LOCK_FD}"
+_client_lock_must_be_busy() {
+	acquireClientLifecycleLock >/dev/null 2>&1
+}
+assert_rc 1 _client_lock_must_be_busy
+exec {NIAC_HELD_LOCK_FD}>&-
+assert_rc 0 acquireClientLifecycleLock
+assert_eq "" "$(find "${NIAC_LOCK_DIR}" -mindepth 1 -maxdepth 1 -print -quit)" \
+	"client lifecycle locking creates no service-writable lock file"
+if [[ -n "${CLIENT_LIFECYCLE_LOCK_FD:-}" ]]; then
+	exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
+fi
+NIAC_LOCK_LINK="${NIAC_LOCK_DIR}-link"
+ln -s "${NIAC_LOCK_DIR}" "${NIAC_LOCK_LINK}"
+WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_LINK}"
+assert_rc 1 acquireClientLifecycleLock
+rm -f "${NIAC_LOCK_LINK}"
+
+# Custom web installer paths must resolve through the service unit and env file.
+# The database directory is the stable lifecycle inode even when the configured
+# client directory does not exist yet.
+NIAC_CUSTOM_CONFIG_DIR="${NIAC_WEB_ROOT}/custom-clients"
+NIAC_CUSTOM_STATE_DIR="${NIAC_WEB_ROOT}/custom-state"
+mkdir -p "${NIAC_CUSTOM_STATE_DIR}"
+cat > "${NIAC_WEB_ROOT}/custom.env" <<EOF
+AWG_WEB_DB=sqlite://${NIAC_CUSTOM_STATE_DIR}/awg-web.db
+AWG_CONFIG_DIR=${NIAC_CUSTOM_CONFIG_DIR}
+EOF
+cat > "${NIAC_WEB_ROOT}/amneziawg-web.service" <<EOF
+[Service]
+Environment=AWG_WEB_DB=${NIAC_LOCK_DIR}/ignored.db
+Environment=AWG_CONFIG_DIR=${NIAC_LOCK_DIR}/ignored-clients
+EnvironmentFile=${NIAC_WEB_ROOT}/custom.env
+EOF
+WEB_PANEL_CONFIG_DIR="${NIAC_LOCK_DIR}"
+WEB_PANEL_SYSTEMD_UNIT="${NIAC_WEB_ROOT}/amneziawg-web.service"
+assert_eq "${NIAC_CUSTOM_CONFIG_DIR}" "$(resolveWebPanelConfigDir)" \
+	"client config directory follows the web service EnvironmentFile"
+assert_eq "${NIAC_CUSTOM_STATE_DIR}" "$(resolveClientLifecycleLockDir)" \
+	"client lifecycle directory follows the configured database"
+exec {NIAC_HELD_LOCK_FD}< "${NIAC_CUSTOM_STATE_DIR}"
+flock -xn "${NIAC_HELD_LOCK_FD}"
+assert_rc 1 _client_lock_must_be_busy
+exec {NIAC_HELD_LOCK_FD}>&-
+assert_eq "false" "$([[ -e "${NIAC_CUSTOM_CONFIG_DIR}" ]] && echo true || echo false)" \
+	"lifecycle locking does not create a missing client directory"
+
+rm -rf "${NIAC_CUSTOM_STATE_DIR}"
+assert_rc 1 acquireClientLifecycleLock
+assert_eq "false" "$([[ -e "${NIAC_CUSTOM_STATE_DIR}" ]] && echo true || echo false)" \
+	"root CLI does not recreate a missing panel state directory"
+
+# Inline unit settings are supported too. Relative database paths resolve from
+# WorkingDirectory, and an unreferenced environment file is ignored.
+NIAC_INLINE_WORK_DIR="${NIAC_WEB_ROOT}/inline-work"
+NIAC_INLINE_STATE_DIR="${NIAC_INLINE_WORK_DIR}/relative-state"
+NIAC_INLINE_CONFIG_DIR="${NIAC_WEB_ROOT}/inline-clients"
+mkdir -p "${NIAC_INLINE_STATE_DIR}"
+WEB_PANEL_ENV_FILE="${NIAC_WEB_ROOT}/custom.env"
+cat > "${NIAC_WEB_ROOT}/amneziawg-web.service" <<EOF
+[Service]
+WorkingDirectory=${NIAC_INLINE_WORK_DIR}
+Environment="AWG_WEB_DB=sqlite:relative-state/awg-web.db"
+Environment=AWG_CONFIG_DIR=${NIAC_INLINE_CONFIG_DIR}
+EOF
+assert_eq "${NIAC_INLINE_STATE_DIR}" "$(resolveClientLifecycleLockDir)" \
+	"inline relative database path resolves from WorkingDirectory"
+assert_eq "${NIAC_INLINE_CONFIG_DIR}" "$(resolveWebPanelConfigDir)" \
+	"inline client config directory is discovered"
+exec {NIAC_HELD_LOCK_FD}< "${NIAC_INLINE_STATE_DIR}"
+flock -xn "${NIAC_HELD_LOCK_FD}"
+assert_rc 1 _client_lock_must_be_busy
+exec {NIAC_HELD_LOCK_FD}>&-
+
+# PID 1's normalized properties must win over the base fragment. This models a
+# drop-in that resets Environment=/EnvironmentFile= before replacing the web
+# paths; systemd has already applied those reset and filename-ordering rules.
+NIAC_EFFECTIVE_WORK_DIR="${NIAC_WEB_ROOT}/effective-work"
+NIAC_EFFECTIVE_STATE_DIR="${NIAC_EFFECTIVE_WORK_DIR}/effective-state"
+NIAC_EFFECTIVE_CONFIG_DIR="${NIAC_WEB_ROOT}/effective-clients"
+NIAC_EXEC_STATE_DIR="${NIAC_EFFECTIVE_WORK_DIR}/exec-state"
+NIAC_EXEC_CONFIG_DIR="${NIAC_WEB_ROOT}/exec-clients"
+NIAC_EFFECTIVE_EXEC_START="{ path=/usr/local/bin/amneziawg-web ; argv[]=/usr/local/bin/amneziawg-web --auth-enabled --database-url=sqlite:exec-state/awg-web.db --auth-secure-cookie --config-dir ${NIAC_EXEC_CONFIG_DIR} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+NIAC_EFFECTIVE_ENV_FIRST="${NIAC_WEB_ROOT}/effective-first.env"
+NIAC_EFFECTIVE_ENV_LAST="${NIAC_WEB_ROOT}/effective-last.env"
+mkdir -p "${NIAC_EFFECTIVE_STATE_DIR}" "${NIAC_EXEC_STATE_DIR}" \
+	"${NIAC_WEB_ROOT}/amneziawg-web.service.d"
+cat > "${NIAC_EFFECTIVE_ENV_FIRST}" <<EOF
+AWG_WEB_DB=sqlite:ignored-state/awg-web.db
+AWG_CONFIG_DIR=${NIAC_LOCK_DIR}/ignored-from-first-file
+EOF
+cat > "${NIAC_EFFECTIVE_ENV_LAST}" <<EOF
+AWG_WEB_DB=sqlite:effective-state/awg-web.db
+AWG_CONFIG_DIR=${NIAC_EFFECTIVE_CONFIG_DIR}
+EOF
+cat > "${NIAC_WEB_ROOT}/amneziawg-web.service" <<EOF
+[Service]
+WorkingDirectory=${NIAC_INLINE_WORK_DIR}
+Environment=AWG_WEB_DB=${NIAC_LOCK_DIR}/ignored-from-fragment.db
+EnvironmentFile=${NIAC_WEB_ROOT}/custom.env
+EOF
+cat > "${NIAC_WEB_ROOT}/amneziawg-web.service.d/90-paths.conf" <<EOF
+[Service]
+WorkingDirectory=${NIAC_EFFECTIVE_WORK_DIR}
+Environment=
+Environment=AWG_WEB_DB=${NIAC_LOCK_DIR}/ignored-from-drop-in.db
+EnvironmentFile=
+EnvironmentFile=${NIAC_EFFECTIVE_ENV_FIRST}
+EnvironmentFile=${NIAC_EFFECTIVE_ENV_LAST}
+EOF
+systemctl() {
+	local argument property=""
+	for argument in "$@"; do
+		case "${argument}" in
+			--property=*) property="${argument#--property=}" ;;
+		esac
+	done
+	case "${property}" in
+		LoadState) printf '%s\n' "loaded" ;;
+		FragmentPath) printf '%s\n' "${WEB_PANEL_SYSTEMD_UNIT}" ;;
+		EnvironmentFiles)
+			printf '%s (ignore_errors=no) %s (ignore_errors=no)\n' \
+				"${NIAC_EFFECTIVE_ENV_FIRST}" "${NIAC_EFFECTIVE_ENV_LAST}"
+			;;
+		Environment) printf 'AWG_WEB_DB=%s/ignored-effective.db\n' "${NIAC_LOCK_DIR}" ;;
+		WorkingDirectory) printf '%s\n' "${NIAC_EFFECTIVE_WORK_DIR}" ;;
+		ExecStart) printf '%s\n' "${NIAC_EFFECTIVE_EXEC_START}" ;;
+		*) return 1 ;;
+	esac
+}
+assert_eq "$(printf '0\t%s\n0\t%s' "${NIAC_EFFECTIVE_ENV_FIRST}" "${NIAC_EFFECTIVE_ENV_LAST}")" \
+	"$(resolveWebPanelEnvFiles)" \
+	"single-line systemd EnvironmentFiles output preserves every ordered tuple"
+assert_eq "${NIAC_EFFECTIVE_CONFIG_DIR}" "$(readWebPanelSetting AWG_CONFIG_DIR)" \
+	"later effective EnvironmentFile values take precedence before CLI overrides"
+assert_eq "${NIAC_EXEC_STATE_DIR}" "$(resolveClientLifecycleLockDir)" \
+	"effective ExecStart database override wins over environment and base unit values"
+assert_eq "${NIAC_EXEC_CONFIG_DIR}" "$(resolveWebPanelConfigDir)" \
+	"effective ExecStart handles boolean flags and overrides ordered EnvironmentFile values"
+exec {NIAC_HELD_LOCK_FD}< "${NIAC_EXEC_STATE_DIR}"
+flock -xn "${NIAC_HELD_LOCK_FD}"
+assert_rc 1 _client_lock_must_be_busy
+exec {NIAC_HELD_LOCK_FD}>&-
+NIAC_EFFECTIVE_EXEC_START="{ path=/usr/local/bin/amneziawg-web ; argv[]=/usr/local/bin/amneziawg-web --config-dir ${NIAC_EXEC_CONFIG_DIR} unexpected ; ignore_errors=no }"
+assert_rc 2 resolveWebPanelConfigDir
+unset -f systemctl
+
+WEB_PANEL_CONFIG_DIR="${NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR}"
+WEB_PANEL_ENV_FILE="${NIAC_ORIGINAL_WEB_PANEL_ENV_FILE}"
+WEB_PANEL_SYSTEMD_UNIT="${NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT}"
+rm -rf "${NIAC_LOCK_DIR}"
+rm -rf "${NIAC_WEB_ROOT}"
+unset NIAC_LOCK_DIR NIAC_LOCK_LINK NIAC_CUSTOM_CONFIG_DIR NIAC_CUSTOM_STATE_DIR NIAC_WEB_ROOT
+unset NIAC_INLINE_WORK_DIR NIAC_INLINE_STATE_DIR NIAC_INLINE_CONFIG_DIR
+unset NIAC_EFFECTIVE_WORK_DIR NIAC_EFFECTIVE_STATE_DIR NIAC_EFFECTIVE_CONFIG_DIR
+unset NIAC_EXEC_STATE_DIR NIAC_EXEC_CONFIG_DIR
+unset NIAC_EFFECTIVE_EXEC_START
+unset NIAC_EFFECTIVE_ENV_FIRST NIAC_EFFECTIVE_ENV_LAST
+unset NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_ORIGINAL_WEB_PANEL_ENV_FILE
+unset NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT NIAC_HELD_LOCK_FD
+unset -f _client_lock_must_be_busy
+
 # Run nonInteractiveAddClient in a subshell; echo "<clientconf>|||<serverconf>".
 _run_niac() {  # $1=ENABLE_IPV6 (y/n) $2=client name
 	local dir; dir="$(mktemp -d)"
@@ -1138,6 +1311,8 @@ _run_niac() {  # $1=ENABLE_IPV6 (y/n) $2=client name
 		PATH="${NIAC_BIN}:${PATH}"; export PATH
 		AMNEZIAWG_DIR="${dir}/amneziawg"
 		WEB_PANEL_CONFIG_DIR="${dir}/amneziawg/clients"
+		WEB_PANEL_ENV_FILE="${dir}/missing-env.conf"
+		WEB_PANEL_SYSTEMD_UNIT="${dir}/missing.service"
 		SERVER_AWG_NIC="awg0"; SERVER_AWG_IPV4="10.66.66.1"
 		SERVER_AWG_IPV6="fd42:42:42:0:0:0:0:1"; SERVER_PORT="51820"
 		SERVER_PUB_IP="198.51.100.1"; SERVER_PUB_KEY="SRVPUB"

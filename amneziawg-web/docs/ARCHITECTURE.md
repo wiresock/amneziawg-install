@@ -72,9 +72,19 @@ list of disabled public keys; the helper derives and filters the trusted
 root-owned config internally before invoking `awg syncconf`.
 Peer additions and removals are semantic operations: the helper holds a stable
 per-interface lock, reconstructs an approved peer block or removes one exact
-managed-client block, and atomically replaces the config.  Arbitrary config
+managed-client block, optionally after checking its expected public key under
+the same lock, and atomically replaces the config.  Arbitrary config
 content, raw file reads, arbitrary `syncconf` stdin, and unknown operations are
 rejected rather than forwarded.
+
+The web panel holds an advisory lock on its open persistent state directory
+(the parent of the SQLite database) across the complete managed-client
+lifecycle, including database persistence and client-config cleanup. Supported
+installer `--add-client` and `--remove-client` operations resolve and lock the
+same directory descriptor from the installed service configuration. This inode
+remains available when the client-config directory is absent, prevents an
+out-of-band same-name replacement during web lifecycle work, and avoids a
+mutable lock pathname in a service-writable directory.
 
 ---
 
@@ -103,9 +113,11 @@ binary via `sqlx::migrate!("./migrations")`.
 A Tokio background task that wakes every `AWG_POLL_INTERVAL` seconds,
 calls `awg::show_all_dump()`, and:
 
-1. Inserts a row into `snapshots` for each non-archived peer.
-2. Upserts each non-archived peer into the `peers` table.
-3. Handles counter resets (values are stored as-is; UI layer detects
+1. Removes due managed users through the same native lifecycle command used
+   by manual deletion. The first pass runs immediately at service startup.
+2. Inserts a row into `snapshots` for each non-archived peer.
+3. Upserts each non-archived peer into the `peers` table.
+4. Handles counter resets (values are stored as-is; UI layer detects
    decreases).
 
 Both snapshot insertion and live-field upserts are SQL-guarded by the
@@ -151,7 +163,7 @@ SQLite is chosen for its zero-infrastructure footprint.  A single
 
 | Table        | Purpose                                         |
 |--------------|-------------------------------------------------|
-| `peers`      | Canonical peer records, metadata, and archived disabled-key tombstones |
+| `peers`      | Canonical peer records, optional UTC expiration metadata, and archived disabled-key tombstones |
 | `snapshots`  | Time-series of per-poll stats                   |
 | `interfaces` | Discovered AWG interfaces                       |
 | `events`     | Audit log of admin actions                      |
@@ -171,6 +183,17 @@ mapping window. The archive state transition, snapshot deletion, and
 `peer_archived` audit event are one SQLite transaction. Existing audit rows
 are retained; returning an archived key records `peer_restored`, leaves it
 disabled, and does not restore deleted metadata or history.
+
+### Removal retry invariant
+
+Before the native removal path performs its first external mutation it sets a
+durable `removal_pending` flag. Stale-peer cleanup and archiving exclude those
+rows, preserving the identity and metadata needed to resume a partial manual
+or expiration removal. Expiration edits reject removal-pending rows so an
+administrator cannot cancel the automatic retry by clearing or extending its
+deadline. Manual retry actions use the durable managed client name even after
+config discovery fields are cleared. Successful removal uses the normal
+peer-row deletion path, so the retry marker cannot become stale state.
 
 ---
 

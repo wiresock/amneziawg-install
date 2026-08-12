@@ -411,6 +411,12 @@ emit_safe_server_state() {
                 fail "server Address contains unexpected content"
             fi
             printf 'Address = %s\n' "${value}"
+        elif [[ "${trimmed}" =~ ^PublicKey[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            validate_public_key "${value}"
+            printf 'PublicKey = %s\n' "${value}"
         elif [[ "${trimmed}" =~ ^AllowedIPs[[:space:]]*=[[:space:]]*(.*)$ ]]; then
             value="${BASH_REMATCH[1]}"
             if [[ ! "${value}" =~ ^[0-9A-Fa-f:.,/[:space:]]+$ ]]; then
@@ -533,11 +539,16 @@ append_peer_block() {
 remove_client_block() {
     local path="$1"
     local client_name="$2"
+    local expected_public_key="${3:-}"
+    local actual_public_key=""
     local marker_index=-1 marker_count=0 start end index
     local interface_seen=false marker_after_interface=false
     local -a config_lines=()
 
     validate_client_name "${client_name}"
+    if [[ -n "${expected_public_key}" ]]; then
+        validate_public_key "${expected_public_key}"
+    fi
     mapfile -t config_lines < "${path}"
 
     for index in "${!config_lines[@]}"; do
@@ -566,10 +577,16 @@ remove_client_block() {
 
     if (( marker_index + 4 >= ${#config_lines[@]} )) || \
             [[ ! "${config_lines[marker_index + 1]}" =~ ^[[:space:]]*\[Peer\][[:space:]]*$ ]] || \
-            [[ ! "${config_lines[marker_index + 2]}" =~ ^[[:space:]]*PublicKey[[:space:]]*= ]] || \
             [[ ! "${config_lines[marker_index + 3]}" =~ ^[[:space:]]*PresharedKey[[:space:]]*= ]] || \
             [[ ! "${config_lines[marker_index + 4]}" =~ ^[[:space:]]*AllowedIPs[[:space:]]*= ]]; then
         fail "managed client block has an unexpected shape: ${client_name}"
+    fi
+    if [[ ! "${config_lines[marker_index + 2]}" =~ ^[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*([A-Za-z0-9+/]{43}=)[[:space:]]*$ ]]; then
+        fail "managed client block has an invalid public key: ${client_name}"
+    fi
+    actual_public_key="${BASH_REMATCH[1]}"
+    if [[ -n "${expected_public_key}" && "${actual_public_key}" != "${expected_public_key}" ]]; then
+        fail "managed client public key does not match the expected identity: ${client_name}"
     fi
 
     # The web panel creates an exact five-line managed block.  Refuse to
@@ -678,6 +695,18 @@ main() {
             acquire_server_config_lock "$1"
             validate_server_config_path "${remove_path}"
             remove_client_block "${remove_path}" "$2"
+            return 0
+            ;;
+        remove-client-if-key)
+            require_arg_count "${subcommand}" 3 "$#"
+            validate_interface "$1"
+            validate_client_name "$2"
+            validate_public_key "$3"
+            local conditional_remove_path="${AWG_CONFIG_ROOT}/$1.conf"
+            validate_server_config_path "${conditional_remove_path}"
+            acquire_server_config_lock "$1"
+            validate_server_config_path "${conditional_remove_path}"
+            remove_client_block "${conditional_remove_path}" "$2" "$3"
             return 0
             ;;
         *)

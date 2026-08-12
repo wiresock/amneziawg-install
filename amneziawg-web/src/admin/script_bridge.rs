@@ -138,6 +138,22 @@ pub fn validate_client_name(name: &str) -> Result<(), ScriptError> {
     Ok(())
 }
 
+/// Return the stable installer client name encoded by a discovered config.
+///
+/// Installer-created configs use `<interface>-client-<name>.conf`. Generic
+/// config filenames must not be treated as lifecycle-managed users, even when
+/// their friendly name happens to be a valid client name.
+pub fn managed_client_name_from_config<'a>(
+    config_name: &str,
+    friendly_name: &'a str,
+) -> Option<&'a str> {
+    let (interface_name, filename_client_name) = config_name.rsplit_once("-client-")?;
+    (!interface_name.is_empty()
+        && filename_client_name == friendly_name
+        && validate_client_name(friendly_name).is_ok())
+    .then_some(friendly_name)
+}
+
 // ── Script bridge ────────────────────────────────────────────────────────────
 
 /// Bridge to the `amneziawg-install.sh` script for client lifecycle actions.
@@ -384,6 +400,23 @@ mod tests {
     fn reject_dot_names() {
         assert!(validate_client_name(".").is_err());
         assert!(validate_client_name("..").is_err());
+    }
+
+    #[test]
+    fn managed_client_name_requires_installer_filename_shape() {
+        assert_eq!(
+            managed_client_name_from_config("awg0-client-alice", "alice"),
+            Some("alice")
+        );
+        assert_eq!(managed_client_name_from_config("alice", "alice"), None);
+        assert_eq!(
+            managed_client_name_from_config("awg0-client-alice", "bob"),
+            None
+        );
+        assert_eq!(
+            managed_client_name_from_config("awg0-client-invalid.name", "invalid.name"),
+            None
+        );
     }
 
     // ── build_args ───────────────────────────────────────────────────────
