@@ -1219,9 +1219,13 @@ exec {NIAC_HELD_LOCK_FD}>&-
 NIAC_EFFECTIVE_WORK_DIR="${NIAC_WEB_ROOT}/effective-work"
 NIAC_EFFECTIVE_STATE_DIR="${NIAC_EFFECTIVE_WORK_DIR}/effective-state"
 NIAC_EFFECTIVE_CONFIG_DIR="${NIAC_WEB_ROOT}/effective-clients"
+NIAC_EXEC_STATE_DIR="${NIAC_EFFECTIVE_WORK_DIR}/exec-state"
+NIAC_EXEC_CONFIG_DIR="${NIAC_WEB_ROOT}/exec-clients"
+NIAC_EFFECTIVE_EXEC_START="{ path=/usr/local/bin/amneziawg-web ; argv[]=/usr/local/bin/amneziawg-web --database-url=sqlite:exec-state/awg-web.db --config-dir ${NIAC_EXEC_CONFIG_DIR} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
 NIAC_EFFECTIVE_ENV_FIRST="${NIAC_WEB_ROOT}/effective-first.env"
 NIAC_EFFECTIVE_ENV_LAST="${NIAC_WEB_ROOT}/effective-last.env"
-mkdir -p "${NIAC_EFFECTIVE_STATE_DIR}" "${NIAC_WEB_ROOT}/amneziawg-web.service.d"
+mkdir -p "${NIAC_EFFECTIVE_STATE_DIR}" "${NIAC_EXEC_STATE_DIR}" \
+	"${NIAC_WEB_ROOT}/amneziawg-web.service.d"
 cat > "${NIAC_EFFECTIVE_ENV_FIRST}" <<EOF
 AWG_WEB_DB=sqlite:ignored-state/awg-web.db
 AWG_CONFIG_DIR=${NIAC_LOCK_DIR}/ignored-from-first-file
@@ -1261,17 +1265,22 @@ systemctl() {
 			;;
 		Environment) printf 'AWG_WEB_DB=%s/ignored-effective.db\n' "${NIAC_LOCK_DIR}" ;;
 		WorkingDirectory) printf '%s\n' "${NIAC_EFFECTIVE_WORK_DIR}" ;;
+		ExecStart) printf '%s\n' "${NIAC_EFFECTIVE_EXEC_START}" ;;
 		*) return 1 ;;
 	esac
 }
-assert_eq "${NIAC_EFFECTIVE_STATE_DIR}" "$(resolveClientLifecycleLockDir)" \
-	"systemd effective database path overrides the base unit fragment"
-assert_eq "${NIAC_EFFECTIVE_CONFIG_DIR}" "$(resolveWebPanelConfigDir)" \
-	"later effective EnvironmentFile values take precedence"
-exec {NIAC_HELD_LOCK_FD}< "${NIAC_EFFECTIVE_STATE_DIR}"
+assert_eq "${NIAC_EFFECTIVE_CONFIG_DIR}" "$(readWebPanelSetting AWG_CONFIG_DIR)" \
+	"later effective EnvironmentFile values take precedence before CLI overrides"
+assert_eq "${NIAC_EXEC_STATE_DIR}" "$(resolveClientLifecycleLockDir)" \
+	"effective ExecStart database override wins over environment and base unit values"
+assert_eq "${NIAC_EXEC_CONFIG_DIR}" "$(resolveWebPanelConfigDir)" \
+	"effective ExecStart config override wins over ordered EnvironmentFile values"
+exec {NIAC_HELD_LOCK_FD}< "${NIAC_EXEC_STATE_DIR}"
 flock -xn "${NIAC_HELD_LOCK_FD}"
 assert_rc 1 _client_lock_must_be_busy
 exec {NIAC_HELD_LOCK_FD}>&-
+NIAC_EFFECTIVE_EXEC_START="{ path=/usr/local/bin/amneziawg-web ; argv[]=/usr/local/bin/amneziawg-web --config-dir ${NIAC_EXEC_CONFIG_DIR} unexpected ; ignore_errors=no }"
+assert_rc 2 resolveWebPanelConfigDir
 unset -f systemctl
 
 WEB_PANEL_CONFIG_DIR="${NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR}"
@@ -1282,6 +1291,8 @@ rm -rf "${NIAC_WEB_ROOT}"
 unset NIAC_LOCK_DIR NIAC_LOCK_LINK NIAC_CUSTOM_CONFIG_DIR NIAC_CUSTOM_STATE_DIR NIAC_WEB_ROOT
 unset NIAC_INLINE_WORK_DIR NIAC_INLINE_STATE_DIR NIAC_INLINE_CONFIG_DIR
 unset NIAC_EFFECTIVE_WORK_DIR NIAC_EFFECTIVE_STATE_DIR NIAC_EFFECTIVE_CONFIG_DIR
+unset NIAC_EXEC_STATE_DIR NIAC_EXEC_CONFIG_DIR
+unset NIAC_EFFECTIVE_EXEC_START
 unset NIAC_EFFECTIVE_ENV_FIRST NIAC_EFFECTIVE_ENV_LAST
 unset NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_ORIGINAL_WEB_PANEL_ENV_FILE
 unset NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT NIAC_HELD_LOCK_FD

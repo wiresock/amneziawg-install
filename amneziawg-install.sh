@@ -1840,10 +1840,114 @@ function resolveWebPanelWorkingDirectory() {
 	printf '%s\n' "${working_dir}"
 }
 
+# Print the effective ExecStart argv without evaluating unit-file shell syntax.
+# PID 1 exposes the already-merged command as a normalized argv[] property. The
+# base-fragment parser is only a compatibility fallback when systemd is absent.
+function resolveWebPanelExecStartArgv() {
+	local effective_exec line argv resolved_argv="" exec_count=0
+	if effective_exec="$(readWebPanelEffectiveProperty ExecStart)"; then
+		while IFS= read -r line; do
+			[[ -n "${line}" ]] || continue
+			if [[ "${line}" != *" argv[]="*" ; ignore_errors="* ]]; then
+				echo "ERROR: unsupported systemd ExecStart value '${line}'" >&2
+				return 2
+			fi
+			argv="${line#* argv[]=}"
+			argv="${argv%% ; ignore_errors=*}"
+			[[ -n "${argv}" ]] || continue
+			resolved_argv="${argv}"
+			exec_count=$((exec_count + 1))
+		done <<< "${effective_exec}"
+	elif [[ -f "${WEB_PANEL_SYSTEMD_UNIT}" ]]; then
+		while IFS= read -r line; do
+			if [[ -z "${line}" ]]; then
+				resolved_argv=""
+				exec_count=0
+				continue
+			fi
+			resolved_argv="${line}"
+			exec_count=$((exec_count + 1))
+		done < <(sed -n 's/^[[:space:]]*ExecStart=//p' "${WEB_PANEL_SYSTEMD_UNIT}" 2>/dev/null)
+	else
+		return 1
+	fi
+
+	if [[ "${exec_count}" -eq 0 ]]; then
+		return 1
+	fi
+	if [[ "${exec_count}" -ne 1 ]]; then
+		echo "ERROR: expected one effective ExecStart for '${WEB_PANEL_SYSTEMD_UNIT}'" >&2
+		return 2
+	fi
+	printf '%s\n' "${resolved_argv}"
+}
+
+# Read one long-option value from the effective ExecStart. Every argument after
+# argv[0] must be an option/value pair; this deliberately fails closed if the
+# text representation is ambiguous (for example, an argument containing spaces).
+function readWebPanelExecStartSetting() {
+	local requested_option="$1"
+	local exec_argv token option_name option_value value="" found=0 index=1
+	local -a exec_args=()
+	exec_argv="$(resolveWebPanelExecStartArgv)" || return $?
+	read -r -a exec_args <<< "${exec_argv}"
+	[[ "${#exec_args[@]}" -gt 0 ]] || return 1
+
+	while [[ "${index}" -lt "${#exec_args[@]}" ]]; do
+		token="${exec_args[index]}"
+		token="${token#\"}"
+		token="${token%\"}"
+		token="${token#\'}"
+		token="${token%\'}"
+		if [[ "${token}" != --* ]]; then
+			echo "ERROR: unsupported positional argument in web panel ExecStart" >&2
+			return 2
+		fi
+
+		if [[ "${token}" == *=* ]]; then
+			option_name="${token%%=*}"
+			option_value="${token#*=}"
+			index=$((index + 1))
+		else
+			option_name="${token}"
+			index=$((index + 1))
+			if [[ "${index}" -ge "${#exec_args[@]}" || "${exec_args[index]}" == --* ]]; then
+				echo "ERROR: missing value for '${option_name}' in web panel ExecStart" >&2
+				return 2
+			fi
+			option_value="${exec_args[index]}"
+			option_value="${option_value#\"}"
+			option_value="${option_value%\"}"
+			option_value="${option_value#\'}"
+			option_value="${option_value%\'}"
+			index=$((index + 1))
+		fi
+
+		if [[ "${option_name}" == "${requested_option}" ]]; then
+			value="${option_value}"
+			found=1
+		fi
+	done
+
+	[[ "${found}" -eq 1 ]] || return 1
+	if [[ "${value}" == *'$'* || "${value}" == *'%'* ]]; then
+		echo "ERROR: unsupported variable or specifier in ${requested_option} ExecStart value" >&2
+		return 2
+	fi
+	printf '%s\n' "${value}"
+}
+
 # Resolve the web panel's active config directory without sourcing its env file.
+# Command-line arguments take precedence over environment values, as in Clap.
 function resolveWebPanelConfigDir() {
-	local configured_dir
+	local configured_dir exec_config_dir exec_setting_rc
 	configured_dir="$(readWebPanelSetting AWG_CONFIG_DIR)" || return 1
+	if exec_config_dir="$(readWebPanelExecStartSetting --config-dir)"; then
+		configured_dir="${exec_config_dir}"
+	else
+		exec_setting_rc=$?
+		[[ "${exec_setting_rc}" -eq 1 ]] || return "${exec_setting_rc}"
+	fi
 
 	if [[ -n "${configured_dir}" ]]; then
 		if [[ "${configured_dir}" != /* || "${configured_dir}" =~ [[:space:][:cntrl:]] ]]; then
@@ -1862,7 +1966,7 @@ function resolveWebPanelConfigDir() {
 # client has been created yet. Standalone installer use (no panel env file)
 # retains the config-directory fallback.
 function resolveClientLifecycleLockDir() {
-	local env_file database_path working_dir database_parent
+	local env_file database_path exec_database_path exec_setting_rc working_dir database_parent
 	env_file="$(resolveWebPanelEnvFile)" || return 1
 
 	if [[ ! -f "${env_file}" && ! -e "${WEB_PANEL_SYSTEMD_UNIT}" ]] && \
@@ -1873,6 +1977,12 @@ function resolveClientLifecycleLockDir() {
 
 	database_path="$(readWebPanelSetting AWG_WEB_DB)" || return 1
 	database_path="${database_path:-awg-web.db}"
+	if exec_database_path="$(readWebPanelExecStartSetting --database-url)"; then
+		database_path="${exec_database_path}"
+	else
+		exec_setting_rc=$?
+		[[ "${exec_setting_rc}" -eq 1 ]] || return "${exec_setting_rc}"
+	fi
 	if [[ "${database_path}" =~ [[:space:][:cntrl:]] ]]; then
 		echo "ERROR: refusing unsafe AWG_WEB_DB '${database_path}'" >&2
 		return 1
