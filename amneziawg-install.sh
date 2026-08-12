@@ -1706,20 +1706,29 @@ function validateWebPanelEnvFile() {
 # entry per line. The base-fragment parser remains as a compatibility fallback
 # when PID 1 is unavailable (for example in installer unit tests).
 function resolveWebPanelEnvFiles() {
-	local effective_files configured_env optional resolved_files=""
+	local effective_files configured_env env_file_metadata optional resolved_files="" index
+	local -a env_file_fields=()
 	validateWebPanelSystemdUnitPath || return 1
 	if effective_files="$(readWebPanelEffectiveProperty EnvironmentFiles)"; then
 		while IFS= read -r configured_env; do
 			[[ -n "${configured_env}" ]] || continue
-			if [[ ! "${configured_env}" =~ ^(.*)[[:space:]]+\(ignore_errors=(yes|no)\)$ ]]; then
+			read -r -a env_file_fields <<< "${configured_env}"
+			if [[ "${#env_file_fields[@]}" -eq 0 ]] || (( ${#env_file_fields[@]} % 2 != 0 )); then
 				echo "ERROR: unsupported systemd EnvironmentFiles value '${configured_env}'" >&2
 				return 1
 			fi
-			configured_env="${BASH_REMATCH[1]}"
-			optional=0
-			[[ "${BASH_REMATCH[2]}" == "yes" ]] && optional=1
-			validateWebPanelEnvFile "${configured_env}" 1 "${optional}" || return 1
-			printf '%s\t%s\n' "${optional}" "${configured_env}"
+			for ((index = 0; index < ${#env_file_fields[@]}; index += 2)); do
+				configured_env="${env_file_fields[index]}"
+				env_file_metadata="${env_file_fields[index + 1]}"
+				if [[ ! "${env_file_metadata}" =~ ^\(ignore_errors=(yes|no)\)$ ]]; then
+					echo "ERROR: unsupported systemd EnvironmentFiles value '${configured_env} ${env_file_metadata}'" >&2
+					return 1
+				fi
+				optional=0
+				[[ "${BASH_REMATCH[1]}" == "yes" ]] && optional=1
+				validateWebPanelEnvFile "${configured_env}" 1 "${optional}" || return 1
+				printf '%s\t%s\n' "${optional}" "${configured_env}"
+			done
 		done <<< "${effective_files}"
 		return 0
 	fi
@@ -1903,6 +1912,24 @@ function readWebPanelExecStartSetting() {
 			echo "ERROR: unsupported positional argument in web panel ExecStart" >&2
 			return 2
 		fi
+
+		case "${token%%=*}" in
+			--auth-enabled|--auth-secure-cookie)
+				if [[ "${token}" == *=* ]]; then
+					echo "ERROR: unsupported value for boolean option '${token%%=*}' in web panel ExecStart" >&2
+					return 2
+				fi
+				index=$((index + 1))
+				continue
+				;;
+			--listen|--database-url|--config-dir|--poll-interval|--proxy-sessions-file|\
+			--auth-username|--auth-password-hash|--auth-api-token|--auth-session-ttl-secs)
+				;;
+			*)
+				echo "ERROR: unsupported option '${token%%=*}' in web panel ExecStart" >&2
+				return 2
+				;;
+		esac
 
 		if [[ "${token}" == *=* ]]; then
 			option_name="${token%%=*}"

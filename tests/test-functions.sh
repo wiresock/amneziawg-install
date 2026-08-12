@@ -1221,7 +1221,7 @@ NIAC_EFFECTIVE_STATE_DIR="${NIAC_EFFECTIVE_WORK_DIR}/effective-state"
 NIAC_EFFECTIVE_CONFIG_DIR="${NIAC_WEB_ROOT}/effective-clients"
 NIAC_EXEC_STATE_DIR="${NIAC_EFFECTIVE_WORK_DIR}/exec-state"
 NIAC_EXEC_CONFIG_DIR="${NIAC_WEB_ROOT}/exec-clients"
-NIAC_EFFECTIVE_EXEC_START="{ path=/usr/local/bin/amneziawg-web ; argv[]=/usr/local/bin/amneziawg-web --database-url=sqlite:exec-state/awg-web.db --config-dir ${NIAC_EXEC_CONFIG_DIR} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+NIAC_EFFECTIVE_EXEC_START="{ path=/usr/local/bin/amneziawg-web ; argv[]=/usr/local/bin/amneziawg-web --auth-enabled --database-url=sqlite:exec-state/awg-web.db --auth-secure-cookie --config-dir ${NIAC_EXEC_CONFIG_DIR} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
 NIAC_EFFECTIVE_ENV_FIRST="${NIAC_WEB_ROOT}/effective-first.env"
 NIAC_EFFECTIVE_ENV_LAST="${NIAC_WEB_ROOT}/effective-last.env"
 mkdir -p "${NIAC_EFFECTIVE_STATE_DIR}" "${NIAC_EXEC_STATE_DIR}" \
@@ -1260,8 +1260,8 @@ systemctl() {
 		LoadState) printf '%s\n' "loaded" ;;
 		FragmentPath) printf '%s\n' "${WEB_PANEL_SYSTEMD_UNIT}" ;;
 		EnvironmentFiles)
-			printf '%s (ignore_errors=no)\n' "${NIAC_EFFECTIVE_ENV_FIRST}"
-			printf '%s (ignore_errors=no)\n' "${NIAC_EFFECTIVE_ENV_LAST}"
+			printf '%s (ignore_errors=no) %s (ignore_errors=no)\n' \
+				"${NIAC_EFFECTIVE_ENV_FIRST}" "${NIAC_EFFECTIVE_ENV_LAST}"
 			;;
 		Environment) printf 'AWG_WEB_DB=%s/ignored-effective.db\n' "${NIAC_LOCK_DIR}" ;;
 		WorkingDirectory) printf '%s\n' "${NIAC_EFFECTIVE_WORK_DIR}" ;;
@@ -1269,12 +1269,15 @@ systemctl() {
 		*) return 1 ;;
 	esac
 }
+assert_eq "$(printf '0\t%s\n0\t%s' "${NIAC_EFFECTIVE_ENV_FIRST}" "${NIAC_EFFECTIVE_ENV_LAST}")" \
+	"$(resolveWebPanelEnvFiles)" \
+	"single-line systemd EnvironmentFiles output preserves every ordered tuple"
 assert_eq "${NIAC_EFFECTIVE_CONFIG_DIR}" "$(readWebPanelSetting AWG_CONFIG_DIR)" \
 	"later effective EnvironmentFile values take precedence before CLI overrides"
 assert_eq "${NIAC_EXEC_STATE_DIR}" "$(resolveClientLifecycleLockDir)" \
 	"effective ExecStart database override wins over environment and base unit values"
 assert_eq "${NIAC_EXEC_CONFIG_DIR}" "$(resolveWebPanelConfigDir)" \
-	"effective ExecStart config override wins over ordered EnvironmentFile values"
+	"effective ExecStart handles boolean flags and overrides ordered EnvironmentFile values"
 exec {NIAC_HELD_LOCK_FD}< "${NIAC_EXEC_STATE_DIR}"
 flock -xn "${NIAC_HELD_LOCK_FD}"
 assert_rc 1 _client_lock_must_be_busy
