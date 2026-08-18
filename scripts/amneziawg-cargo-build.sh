@@ -319,11 +319,80 @@ _awg_build_cgroup_v2_dir() {
     printf '%s\n' "${dir}"
 }
 
+_awg_build_mountinfo_path() {
+    local path="$1"
+    path="${path//\\040/ }"
+    path="${path//\\011/$'\t'}"
+    path="${path//\\012/$'\n'}"
+    path="${path//\\134/\\}"
+    printf '%s\n' "${path}"
+}
+
+_awg_build_cgroup_v1_memory_mounts() {
+    local mountinfo_file="$1"
+    [[ -r "${mountinfo_file}" ]] || return 1
+
+    LC_ALL=C awk '
+        function has_option(options, wanted, count, item, values) {
+            count = split(options, values, ",")
+            for (item = 1; item <= count; item++) {
+                if (values[item] == wanted) return 1
+            }
+            return 0
+        }
+        {
+            separator = 0
+            for (field = 7; field <= NF; field++) {
+                if ($field == "-") {
+                    separator = field
+                    break
+                }
+            }
+            if (!separator || $(separator + 1) != "cgroup") next
+            if (!has_option($(separator + 3), "memory")) next
+            print $4 "\t" $5
+        }
+    ' "${mountinfo_file}"
+}
+
+# Optional file arguments allow fixture-based tests of host-specific proc data.
+# shellcheck disable=SC2120
 _awg_build_cgroup_v1_dir() {
-    local relative base dir
-    [[ -r /proc/self/cgroup ]] || return 1
-    relative="$(awk -F: '$2 ~ /(^|,)memory(,|$)/ { print $3; exit }' /proc/self/cgroup)"
+    local cgroup_file="${1:-/proc/self/cgroup}"
+    local mountinfo_file="${2:-/proc/self/mountinfo}"
+    local relative mount_root mount_point suffix dir base
+    [[ -r "${cgroup_file}" ]] || return 1
+    relative="$(awk -F: '$2 ~ /(^|,)memory(,|$)/ { print $3; exit }' "${cgroup_file}")"
     [[ -n "${relative}" && "${relative}" == /* ]] || return 1
+
+    while IFS=$'\t' read -r mount_root mount_point; do
+        [[ -n "${mount_root}" && -n "${mount_point}" ]] || continue
+        mount_root="$(_awg_build_mountinfo_path "${mount_root}")"
+        mount_point="$(_awg_build_mountinfo_path "${mount_point}")"
+
+        if [[ "${mount_root}" == "/" ]]; then
+            suffix="${relative}"
+        elif [[ "${relative}" == "${mount_root}" ]]; then
+            suffix=""
+        elif [[ "${relative}" == "${mount_root%/}/"* ]]; then
+            suffix="${relative#"${mount_root%/}"}"
+        else
+            continue
+        fi
+
+        if [[ -n "${suffix}" ]]; then
+            dir="${mount_point%/}${suffix}"
+        else
+            dir="${mount_point}"
+        fi
+        if [[ -r "${dir}/memory.limit_in_bytes" ]]; then
+            printf '%s\n' "${dir}"
+            return 0
+        fi
+    done < <(_awg_build_cgroup_v1_memory_mounts "${mountinfo_file}")
+
+    # Retain the conventional paths as a compatibility fallback for unusual
+    # systems where mountinfo is unavailable or hides the controller mount.
     for base in /sys/fs/cgroup/memory /sys/fs/cgroup; do
         dir="${base}${relative}"
         if [[ -r "${dir}/memory.limit_in_bytes" ]]; then

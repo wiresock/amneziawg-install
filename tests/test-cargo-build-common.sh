@@ -97,6 +97,31 @@ test_cgroup_v2_remaining_memory() {
     [[ "$(_awg_build_cgroup_v2_available_memory_kb "${cgroup_dir}")" == "1048576" ]]
 }
 
+test_cgroup_v1_combined_mount_and_ancestor_limit() {
+    load_build_helper
+    local cgroup_file mountinfo_file mount_point mountinfo_mount_point cgroup_dir
+    TEST_ROOT="$(mktemp -d)"
+    trap 'rm -rf -- "${TEST_ROOT}"' EXIT
+    cgroup_file="${TEST_ROOT}/cgroup"
+    mountinfo_file="${TEST_ROOT}/mountinfo"
+    mount_point="${TEST_ROOT}/sys fs/cgroup/cpu,cpuacct,memory"
+    mountinfo_mount_point="${mount_point// /\\040}"
+    cgroup_dir="${mount_point}/workload/leaf"
+    mkdir -p "${cgroup_dir}"
+
+    printf '7:cpu,cpuacct,memory:/tenant/workload/leaf\n' > "${cgroup_file}"
+    printf '36 29 0:32 /tenant %s rw,nosuid,nodev,noexec,relatime - cgroup cgroup rw,cpu,cpuacct,memory\n' \
+        "${mountinfo_mount_point}" > "${mountinfo_file}"
+
+    printf '4294967296\n' > "${cgroup_dir}/memory.limit_in_bytes"
+    printf '0\n' > "${cgroup_dir}/memory.usage_in_bytes"
+    printf '1073741824\n' > "${mount_point}/workload/memory.limit_in_bytes"
+    printf '268435456\n' > "${mount_point}/workload/memory.usage_in_bytes"
+
+    [[ "$(_awg_build_cgroup_v1_dir "${cgroup_file}" "${mountinfo_file}")" == "${cgroup_dir}" ]]
+    [[ "$(_awg_build_cgroup_v1_available_memory_kb "${cgroup_dir}")" == "786432" ]]
+}
+
 test_candidate_resource_rejections() {
     load_build_helper
     TEST_ROOT="$(mktemp -d)"
@@ -307,6 +332,7 @@ run_test "one CPU or low memory is constrained" test_constrained_classification
 run_test "cgroup memory limits cap host-wide memory estimates" test_cgroup_memory_caps_host_estimate
 run_test "zero proc memory remains a constrained reading" test_zero_proc_memory_is_constrained
 run_test "cgroup v2 memory and swap hierarchy is calculated independently" test_cgroup_v2_remaining_memory
+run_test "cgroup v1 combined mounts honor mount roots and ancestor limits" test_cgroup_v1_combined_mount_and_ancestor_limit
 run_test "noexec, disk-space, and inode shortages are rejected" test_candidate_resource_rejections
 run_test "normal crate target is retained and temp files are cleaned" test_normal_target_and_cleanup
 run_test "small source filesystem falls back to an owned external target" test_external_target_fallback_and_cleanup

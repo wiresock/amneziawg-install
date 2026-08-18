@@ -25,6 +25,7 @@ jobs:
           bash tests/test-cargo-build-common.sh
           bash tests/test-ubuntu-ppa.sh
           bash tests/test-proxy-scripts.sh
+          sudo bash tests/test-proxy-bootstrap.sh
 
       - name: Run proxy Rust tests
         working-directory: amneziawg-proxy
