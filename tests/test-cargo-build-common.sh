@@ -270,6 +270,12 @@ test_cross_target_release_path() {
     CARGO_BUILD_TARGET="aarch64-unknown-linux-gnu"
     export CARGO_BUILD_TARGET
     [[ "$(awg_cargo_release_binary app)" == "/build/target/aarch64-unknown-linux-gnu/release/app" ]]
+
+    CARGO_BUILD_TARGET="/targets/custom-device.json"
+    [[ "$(awg_cargo_release_binary app)" == "/build/target/custom-device/release/app" ]]
+
+    CARGO_BUILD_TARGET="targets/board.v1.json"
+    [[ "$(awg_cargo_release_binary app)" == "/build/target/board.v1/release/app" ]]
 }
 
 test_constrained_defaults_and_operator_jobs() {
@@ -339,7 +345,7 @@ run_test "small source filesystem falls back to an owned external target" test_e
 run_test "explicit build root takes precedence over the source filesystem" test_explicit_build_root_wins
 run_test "relative explicit Cargo target is resolved and retained" test_relative_explicit_target_is_preserved
 run_test "invalid explicit Cargo target fails without fallback" test_explicit_target_failure_does_not_fallback
-run_test "cross-target release binary path is resolved" test_cross_target_release_path
+run_test "triple and custom JSON target release paths are resolved" test_cross_target_release_path
 run_test "constrained defaults preserve Cargo linker configuration and overrides" test_constrained_defaults_and_operator_jobs
 run_test "cleanup refuses paths it did not name" test_cleanup_rejects_unowned_names
 run_test "all web and proxy source-build paths use the helper" test_all_source_build_paths_use_helper

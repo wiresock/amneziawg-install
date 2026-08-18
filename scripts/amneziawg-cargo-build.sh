@@ -679,8 +679,12 @@ awg_prepare_cargo_build() {
 awg_cargo_release_binary() {
     local binary_name="$1"
     local release_dir="${AWG_CARGO_TARGET_DIR}"
-    if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
-        release_dir+="/${CARGO_BUILD_TARGET}"
+    local cargo_target="${CARGO_BUILD_TARGET:-}"
+    if [[ -n "${cargo_target}" ]]; then
+        if [[ "${cargo_target}" == *.json ]]; then
+            cargo_target="$(basename -- "${cargo_target}" .json)"
+        fi
+        release_dir+="/${cargo_target}"
     fi
     printf '%s/release/%s\n' "${release_dir}" "${binary_name}"
 }
