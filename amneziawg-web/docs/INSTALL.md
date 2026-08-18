@@ -55,6 +55,7 @@ for all options.
 |---|---|---|
 | Linux | Any modern kernel | x86_64 or aarch64 |
 | Rust toolchain | 1.75+ | Install via [rustup](https://rustup.rs/) or use `--install-rust` |
+| Build space | 2 GiB | Required only when compiling from source |
 | AmneziaWG | Any release | `awg` binary must be at `/usr/bin/awg` |
 | SQLite | 3.x | No separate install needed — embedded in binary via sqlx |
 | Reverse proxy | nginx ≥ 1.18 or Caddy 2 | Required for TLS in production |
@@ -64,6 +65,11 @@ for all options.
 > **Note:** If you use `--source-dir` to build from source, Rust must be installed.
 > The installer can install Rust for you with `--install-rust`. If you use `--binary-src`
 > to provide a pre-built binary, Rust is not required on the target host.
+
+For source builds, the installer automatically moves Cargo artifacts away from
+a small or noexec source filesystem and limits Cargo to one job on a one-vCPU
+or low-memory host. Set `AMNEZIAWG_BUILD_ROOT` to an existing writable directory
+on an executable filesystem if you need to select the build disk explicitly.
 
 ---
 

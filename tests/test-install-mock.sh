@@ -3602,6 +3602,7 @@ echo "=== Phase 6: Source-build mode ==="
 # Create a fake source directory with a Cargo.toml to satisfy source-dir checks
 MOCK_SOURCE_DIR="/tmp/awg-web-source-test"
 mkdir -p "${MOCK_SOURCE_DIR}"
+rm -rf "${MOCK_SOURCE_DIR}/target"
 cat > "${MOCK_SOURCE_DIR}/Cargo.toml" <<'CARGOEOF'
 [package]
 name = "amneziawg-web"
@@ -3617,12 +3618,13 @@ cat > "${MOCK_CARGO}" <<'MOCKCARGOEOF'
 if [[ "$1" == "build" ]]; then
     # Find the directory we're running in (working dir set by cd in the script)
     BUILD_DIR="$(pwd)"
-    mkdir -p "${BUILD_DIR}/target/release"
-    cat > "${BUILD_DIR}/target/release/amneziawg-web" <<'STUBBIN'
+    BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-${BUILD_DIR}/target}"
+    mkdir -p "${BUILD_TARGET_DIR}/release"
+    cat > "${BUILD_TARGET_DIR}/release/amneziawg-web" <<'STUBBIN'
 #!/bin/bash
 echo "amneziawg-web stub v0.1.0-source-build-test"
 STUBBIN
-    chmod +x "${BUILD_DIR}/target/release/amneziawg-web"
+    chmod +x "${BUILD_TARGET_DIR}/release/amneziawg-web"
     exit 0
 fi
 if [[ "$1" == "--version" ]]; then
@@ -3649,6 +3651,10 @@ exit 0
 MOCKFAILEOF
 chmod +x "${MOCK_CARGO_FAIL}"
 
+# Use a Cargo target outside the source tree to exercise the same binary-path
+# handling used when the source filesystem is too small.
+WEB_TEST_CARGO_TARGET="$(mktemp -d /var/tmp/awg-web-cargo-target.XXXXXX)"
+
 # We need to reinstall a clean state first (Phase 4/5 may have uninstalled)
 # But first clean up artifacts from prior phases
 rm -f "${WEB_TEST_INSTALL_DIR}/amneziawg-web"
@@ -3667,7 +3673,7 @@ ln -sf "${MOCK_CARGO}" /tmp/cargo
 export PATH="/tmp:${SAVED_PATH}"
 
 WEB_SRC_INSTALL_RC=0
-WEB_SRC_INSTALL_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+WEB_SRC_INSTALL_OUTPUT=$(CARGO_TARGET_DIR="${WEB_TEST_CARGO_TARGET}" bash "${WEB_INSTALLER_IMPL}" \
 	--non-interactive \
 	--source-dir "${MOCK_SOURCE_DIR}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
@@ -3699,6 +3705,14 @@ if [[ -x "${WEB_TEST_INSTALL_DIR}/amneziawg-web" ]]; then
 	echo "OK: Source-built binary is executable"
 else
 	echo "FAIL: Source-built binary is not executable"
+	FAILED=$((FAILED + 1))
+fi
+
+if [[ -f "${WEB_TEST_CARGO_TARGET}/release/amneziawg-web" ]] && \
+		[[ ! -e "${MOCK_SOURCE_DIR}/target" ]]; then
+	echo "OK: Source-build installer resolves an external Cargo target"
+else
+	echo "FAIL: Source-build installer did not use the external Cargo target"
 	FAILED=$((FAILED + 1))
 fi
 
@@ -3891,7 +3905,7 @@ touch /tmp/awg-web-mock-started
 rm -rf "${MOCK_SOURCE_DIR}/target"
 
 WEB_SRC_UPGRADE_RC=0
-WEB_SRC_UPGRADE_OUTPUT=$(bash "${WEB_UPGRADER_IMPL}" \
+WEB_SRC_UPGRADE_OUTPUT=$(CARGO_TARGET_DIR="${WEB_TEST_CARGO_TARGET}" bash "${WEB_UPGRADER_IMPL}" \
 	--source-dir "${MOCK_SOURCE_DIR}" \
 	--install-dir "${WEB_TEST_INSTALL_DIR}" \
 	--env-file "${WEB_TEST_ENV_FILE}" \
@@ -3966,6 +3980,7 @@ fi
 
 # Restore original PATH
 export PATH="${SAVED_PATH}"
+rm -rf "${WEB_TEST_CARGO_TARGET}"
 
 echo ""
 echo "=== Phase 6: Source-build tests complete ==="
@@ -5251,6 +5266,46 @@ if [[ "${PHASE9_INNER_TMPDIR}" == "${PHASE9_BOOTSTRAP_TARGET}/.tmp" ]]; then
 else
 	echo "FAIL: Inner installer TMPDIR should be inside the bootstrap directory, got '${PHASE9_INNER_TMPDIR}'"
 	FAILED=$((FAILED + 1))
+fi
+
+# The documented build-root override must also be usable for the standalone
+# bootstrap itself; otherwise hardened noexec temporary mounts prevent the
+# inner installer from ever seeing the override.
+if [[ -n "${PHASE9_EXPECTED_BOOTSTRAP_ROOT}" ]]; then
+	PHASE9_EXPLICIT_BUILD_ROOT="$(mktemp -d "${PHASE9_EXPECTED_BOOTSTRAP_ROOT%/}/awg-explicit-build.XXXXXX")"
+	: > "${PHASE9_BOOTSTRAP_TARGET_LOG}"
+	: > "${PHASE9_INNER_TMPDIR_LOG}"
+	UNIFIED_BUILD_ROOT_RC=0
+	UNIFIED_BUILD_ROOT_OUTPUT=$(AMNEZIAWG_BUILD_ROOT="${PHASE9_EXPLICIT_BUILD_ROOT}" \
+		TMPDIR=/dev/shm PATH="${PHASE9_MOCK_GIT_DIR}:${PATH}" \
+		bash "${PHASE9_STANDALONE_DIR}/amneziawg-web.sh" install \
+		--non-interactive --force \
+		--binary-src "${STUB_BINARY}" \
+		--install-dir "${WEB_TEST_INSTALL_DIR}" \
+		--data-dir "${WEB_TEST_DATA_DIR}" \
+		--env-file "${WEB_TEST_ENV_FILE}" \
+		--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+		--username testadmin \
+		--password-hash "${TEST_PASSWORD_HASH}" \
+		--no-start --no-enable 2>&1) || UNIFIED_BUILD_ROOT_RC=$?
+	PHASE9_BUILD_ROOT_TARGET="$(cat "${PHASE9_BOOTSTRAP_TARGET_LOG}" 2>/dev/null || true)"
+	if [[ "${UNIFIED_BUILD_ROOT_RC}" -eq 0 ]] && \
+			[[ "${PHASE9_BUILD_ROOT_TARGET}" == "${PHASE9_EXPLICIT_BUILD_ROOT}"/amneziawg-install.* ]]; then
+		echo "OK: Standalone bootstrap honors AMNEZIAWG_BUILD_ROOT"
+	else
+		echo "FAIL: Standalone bootstrap ignored AMNEZIAWG_BUILD_ROOT (rc=${UNIFIED_BUILD_ROOT_RC}, target='${PHASE9_BUILD_ROOT_TARGET}')"
+		echo "  Output tail: $(echo "${UNIFIED_BUILD_ROOT_OUTPUT}" | tail -10)"
+		FAILED=$((FAILED + 1))
+	fi
+	if [[ -n "${PHASE9_BUILD_ROOT_TARGET}" ]] && [[ ! -e "${PHASE9_BUILD_ROOT_TARGET}" ]]; then
+		echo "OK: Build-root bootstrap directory is removed after use"
+	else
+		echo "FAIL: Build-root bootstrap directory was not cleaned up"
+		FAILED=$((FAILED + 1))
+	fi
+	rm -rf "${PHASE9_EXPLICIT_BUILD_ROOT}"
+else
+	echo "SKIP: No executable temporary filesystem is available for build-root bootstrap testing"
 fi
 
 # A valid relative TMPDIR must be made absolute before the inner installer

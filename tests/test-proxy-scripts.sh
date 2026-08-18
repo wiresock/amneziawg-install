@@ -710,6 +710,51 @@ assert_niv_rc 1 "DNS_UPSTREAM" 'not-valid' \
     "--dns-upstream invalid value rejected when DNS forwarding enabled" \
     "DNS_FORWARD_ENABLED" "true" "PROTOCOL" "dns"
 
+# ── External Cargo target source builds ───────────────────────────────────────
+
+echo "=== external Cargo target source builds ==="
+
+_run_proxy_source_build() {
+    local script="$1"
+    (
+        set --
+        # shellcheck disable=SC1090
+        source "${script}"
+        PROXY_BUILD_TEST_ROOT="$(mktemp -d)"
+        trap 'awg_cleanup_cargo_build; rm -rf -- "${PROXY_BUILD_TEST_ROOT}"' EXIT
+        SOURCE_DIR="${PROXY_BUILD_TEST_ROOT}/source"
+        PROXY_BUILD_TEST_TARGET="${PROXY_BUILD_TEST_ROOT}/external-target"
+        mkdir -p "${SOURCE_DIR}" "${PROXY_BUILD_TEST_TARGET}"
+        printf '[package]\nname="amneziawg-proxy"\nversion="0.0.0"\n' > "${SOURCE_DIR}/Cargo.toml"
+
+        info() { :; }
+        warn() { :; }
+        step() { :; }
+        ensure_rust_toolchain() { :; }
+        confirm() { return 0; }
+        awg_prepare_cargo_build() {
+            AWG_CARGO_TARGET_DIR="${PROXY_BUILD_TEST_TARGET}"
+            CARGO_TARGET_DIR="${PROXY_BUILD_TEST_TARGET}"
+            export CARGO_TARGET_DIR
+        }
+        cargo() {
+            if [[ "${1:-}" == "build" ]]; then
+                mkdir -p "${CARGO_TARGET_DIR}/release"
+                printf '#!/bin/sh\nexit 0\n' > "${CARGO_TARGET_DIR}/release/amneziawg-proxy"
+                chmod +x "${CARGO_TARGET_DIR}/release/amneziawg-proxy"
+            fi
+        }
+
+        build_from_source
+        [[ "${BINARY_SRC}" == "${PROXY_BUILD_TEST_TARGET}/release/amneziawg-proxy" ]] &&
+            [[ -x "${BINARY_SRC}" ]] &&
+            [[ ! -e "${SOURCE_DIR}/target" ]]
+    )
+}
+
+assert_rc 0 _run_proxy_source_build "${INSTALL_SCRIPT}"
+assert_rc 0 _run_proxy_source_build "${UPGRADE_SCRIPT}"
+
 # ── --help exits 0 ────────────────────────────────────────────────────────────
 
 echo "=== --help exits 0 ==="

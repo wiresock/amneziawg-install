@@ -399,7 +399,24 @@ Temporarily disabled:
 
 Reason: verified AmneziaWG 2.0 packages are not currently available for these RPM-based distributions. Please watch this repository's releases and README for support status updates.
 
-2 GB of free space required for temporary build files.
+Source builds require approximately 2 GiB of free space for `amneziawg-web`
+and 1 GiB for `amneziawg-proxy`. Their install and upgrade scripts inspect the
+Cargo target filesystem, free inodes, CPU count, and available memory before
+building. On constrained hosts they use one Cargo job and, when the source
+filesystem is too small, place build artifacts on a suitable disk-backed
+filesystem automatically.
+
+To select a specific build filesystem, create a writable directory on an
+executable mount and pass it explicitly:
+
+```bash
+sudo env AMNEZIAWG_BUILD_ROOT=/path/with/free-space ./amneziawg-web.sh upgrade
+sudo env AMNEZIAWG_BUILD_ROOT=/path/with/free-space ./amneziawg-proxy.sh upgrade
+```
+
+An explicit `CARGO_TARGET_DIR` is also supported, but is treated as strict: the
+operation fails with a diagnostic if that target does not meet the build
+requirements.
 
 ---
 
