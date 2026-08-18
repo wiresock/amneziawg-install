@@ -556,6 +556,10 @@ awg_build_is_constrained() {
     return 1
 }
 
+_awg_build_rustc_host() {
+    rustc -vV 2>/dev/null | awk '$1 == "host:" { host = $2 } END { if (host) print host }'
+}
+
 _awg_build_configure_jobs_and_linker() {
     local cpu_count available_memory_kb
     local memory_threshold_kb=2097152
@@ -577,7 +581,7 @@ _awg_build_configure_jobs_and_linker() {
         AWG_CARGO_JOBS_POLICY="${CARGO_BUILD_JOBS} (operator override)"
     fi
 
-    host="$(rustc -vV 2>/dev/null | awk '$1 == "host:" { host = $2 } END { if (host) print host }')"
+    host="$(_awg_build_rustc_host)"
     if [[ -n "${host}" ]]; then
         normalized="$(printf '%s' "${host}" | tr '[:lower:]-.' '[:upper:]__')"
         linker_var="CARGO_TARGET_${normalized}_LINKER"
@@ -681,7 +685,13 @@ awg_cargo_release_binary() {
     local release_dir="${AWG_CARGO_TARGET_DIR}"
     local cargo_target="${CARGO_BUILD_TARGET:-}"
     if [[ -n "${cargo_target}" ]]; then
-        if [[ "${cargo_target}" == *.json ]]; then
+        if [[ "${cargo_target}" == "host-tuple" ]]; then
+            cargo_target="$(_awg_build_rustc_host)"
+            if [[ -z "${cargo_target}" ]]; then
+                _awg_build_warn "Unable to resolve Cargo's host-tuple target from rustc -vV."
+                return 1
+            fi
+        elif [[ "${cargo_target}" == *.json ]]; then
             cargo_target="$(basename -- "${cargo_target}" .json)"
         fi
         release_dir+="/${cargo_target}"
