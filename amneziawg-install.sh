@@ -6473,6 +6473,84 @@ function collectActiveAwgClientConfigs() {
 	done
 }
 
+# Confirm that one server/client configuration contains exactly the protocol
+# fields described by the already-validated persisted params. Field order and
+# harmless surrounding whitespace are ignored, but duplicate, missing, stale,
+# or mismatched values require a repair transaction.
+function awgProtocolConfigMatchesPersistedState() {
+	local CONFIG_FILE="$1"
+	local LINE KEY VALUE EXPECTED_KEY
+	local -A EXPECTED_FIELDS=() SEEN_FIELDS=()
+
+	[[ -f "${CONFIG_FILE}" && ! -L "${CONFIG_FILE}" && -r "${CONFIG_FILE}" ]] || return 2
+
+	if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
+		EXPECTED_FIELDS[HeaderProtectionKey]="${AWG_HEADER_PROTECTION_KEY}"
+		[[ -z "${AWG_CONTENT_PADDING_ADDITION:-}" ]] || EXPECTED_FIELDS[ContentPaddingAddition]="${AWG_CONTENT_PADDING_ADDITION}"
+		[[ -z "${AWG_REKEY_AFTER_TIME:-}" ]] || EXPECTED_FIELDS[RekeyAfterTime]="${AWG_REKEY_AFTER_TIME}"
+		[[ -z "${AWG_REKEY_TIMEOUT:-}" ]] || EXPECTED_FIELDS[RekeyTimeout]="${AWG_REKEY_TIMEOUT}"
+		[[ -z "${AWG_REJECT_AFTER_TIME:-}" ]] || EXPECTED_FIELDS[RejectAfterTime]="${AWG_REJECT_AFTER_TIME}"
+		[[ -z "${AWG_KEEPALIVE_TIMEOUT:-}" ]] || EXPECTED_FIELDS[KeepaliveTimeout]="${AWG_KEEPALIVE_TIMEOUT}"
+	elif [[ "${AWG_PROTOCOL_VERSION}" != "${AWG_PROTOCOL_VERSION_2}" ]]; then
+		return 2
+	fi
+
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		if [[ "${LINE}" =~ ^[[:space:]]*(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+			KEY="${BASH_REMATCH[1]}"
+			VALUE="$(trimWhitespace "${BASH_REMATCH[2]}")"
+			[[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]] || return 1
+			[[ -n "${EXPECTED_FIELDS[${KEY}]+present}" ]] || return 1
+			[[ -z "${SEEN_FIELDS[${KEY}]+present}" ]] || return 1
+			[[ "${VALUE}" == "${EXPECTED_FIELDS[${KEY}]}" ]] || return 1
+			SEEN_FIELDS["${KEY}"]=1
+		fi
+	done <"${CONFIG_FILE}"
+
+	for EXPECTED_KEY in "${!EXPECTED_FIELDS[@]}"; do
+		[[ -n "${SEEN_FIELDS[${EXPECTED_KEY}]+present}" ]] || return 1
+	done
+	return 0
+}
+
+# Return 0 only when persisted protocol state and every recoverable active
+# config agree. Return 1 for a repairable mismatch and 2 when the complete
+# active-client set cannot be verified safely.
+function awgProtocolConfigsMatchPersistedState() {
+	local -a CLIENT_PATHS=()
+	local CLIENT_PATH CONFIG_STATE_RC
+
+	case "${AWG_PROTOCOL_VERSION}" in
+		"${AWG_PROTOCOL_VERSION_2}")
+			# Explicit AWG 2.0 state should not retain dormant secrets or settings.
+			if [[ -n "${AWG_HEADER_PROTECTION_KEY:-}${AWG_CONTENT_PADDING_ADDITION:-}${AWG_REKEY_AFTER_TIME:-}${AWG_REKEY_TIMEOUT:-}${AWG_REJECT_AFTER_TIME:-}${AWG_KEEPALIVE_TIMEOUT:-}" ]]; then
+				return 1
+			fi
+			;;
+		"${AWG_PROTOCOL_VERSION_3}") ;;
+		*) return 2 ;;
+	esac
+
+	collectActiveAwgClientConfigs CLIENT_PATHS || return 2
+	if awgProtocolConfigMatchesPersistedState "${SERVER_AWG_CONF}"; then
+		:
+	else
+		CONFIG_STATE_RC=$?
+		(( CONFIG_STATE_RC == 2 )) && return 2
+		return 1
+	fi
+	for CLIENT_PATH in "${CLIENT_PATHS[@]}"; do
+		if awgProtocolConfigMatchesPersistedState "${CLIENT_PATH}"; then
+			:
+		else
+			CONFIG_STATE_RC=$?
+			(( CONFIG_STATE_RC == 2 )) && return 2
+			return 1
+		fi
+	done
+	return 0
+}
+
 # Validate the interface section of every staged config with both awg-quick and
 # the running module. Peer/address data is unchanged by this migration; limiting
 # setconf to [Interface] also avoids DNS resolution for hostname endpoints.
@@ -6718,7 +6796,7 @@ function setAwgProtocolMode() (
 	local TARGET_MODE="$1"
 	local ORIGINAL_PROTOCOL ORIGINAL_KEY ORIGINAL_CONTENT ORIGINAL_REKEY_AFTER
 	local ORIGINAL_REKEY_TIMEOUT ORIGINAL_REJECT ORIGINAL_KEEPALIVE
-	local NEW_KEY
+	local NEW_KEY CONFIG_STATE_RC=0 REPAIRING_SAME_MODE=0
 
 	case "${TARGET_MODE}" in
 		2|3) ;;
@@ -6741,10 +6819,20 @@ function setAwgProtocolMode() (
 	fi
 	normalizeAwgProtocolVersion || return 1
 	if [[ "${AWG_PROTOCOL_VERSION}" == "${TARGET_MODE}" ]]; then
-		echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is already active."
-		return 0
+		if awgProtocolConfigsMatchPersistedState; then
+			echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is already active and consistent."
+			return 0
+		else
+			CONFIG_STATE_RC=$?
+		fi
+		if (( CONFIG_STATE_RC == 2 )); then
+			echo "ERROR: could not verify every active client config before repairing AWG protocol mode ${TARGET_MODE}.0" >&2
+			return 1
+		fi
+		REPAIRING_SAME_MODE=1
+		echo "WARNING: persisted AWG protocol mode ${TARGET_MODE}.0 does not match every server/client config; repairing the transaction." >&2
 	fi
-	if [[ "${TARGET_MODE}" == "3" ]] && awg2StateNeedsLegacyMigration; then
+	if (( REPAIRING_SAME_MODE == 0 )) && [[ "${TARGET_MODE}" == "3" ]] && awg2StateNeedsLegacyMigration; then
 		echo "ERROR: this installation needs AWG 2.0 compatibility normalization before AWG 3.0 can be enabled." >&2
 		echo "Run amneziawg-install.sh interactively, complete any prompted migration, and then retry." >&2
 		return 1
@@ -6757,7 +6845,11 @@ function setAwgProtocolMode() (
 	ORIGINAL_REJECT="${AWG_REJECT_AFTER_TIME:-}"
 	ORIGINAL_KEEPALIVE="${AWG_KEEPALIVE_TIMEOUT:-}"
 
-	if [[ "${TARGET_MODE}" == "3" ]]; then
+	if (( REPAIRING_SAME_MODE )); then
+		# AWG 3.0 repairs deliberately retain the existing shared key. AWG 2.0
+		# repairs also purge dormant 3.0-only values from persisted params.
+		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_2}" ]] && clearAwg3Params
+	elif [[ "${TARGET_MODE}" == "3" ]]; then
 		NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
 		ensureAmneziawgKernelModule >/dev/null 2>&1 || true
 		if ! probeAwg3Capability "${NEW_KEY}"; then
@@ -6786,7 +6878,11 @@ function setAwgProtocolMode() (
 		return 1
 	fi
 
-	echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is now active."
+	if (( REPAIRING_SAME_MODE )); then
+		echo "AmneziaWG protocol mode ${TARGET_MODE}.0 state was repaired successfully."
+	else
+		echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is now active."
+	fi
 	echo "All client configuration files were updated; redistribute them before reconnecting clients."
 )
 

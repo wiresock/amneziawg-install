@@ -294,6 +294,46 @@ else
 	not_ok "protocol changes lock and reload persisted state before deciding a toggle is a no-op"
 fi
 
+SAME_MODE_REPAIR_LOG="${TEST_ROOT}/same-mode-repair.log"
+: >"${SAME_MODE_REPAIR_LOG}"
+if (
+	AWG_PROTOCOL_VERSION=3
+	AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
+	AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+	AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+	AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+	AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+	AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${SAME_MODE_REPAIR_LOG}"; }
+	loadParams() { printf 'load-%s-%s\n' "${1:-}" "${2:-}" >>"${SAME_MODE_REPAIR_LOG}"; }
+	awgProtocolConfigsMatchPersistedState() { printf 'verify\n' >>"${SAME_MODE_REPAIR_LOG}"; return 1; }
+	probeAwg3Capability() { printf 'unexpected-probe\n' >>"${SAME_MODE_REPAIR_LOG}"; return 1; }
+	applyAwgProtocolTransaction() {
+		printf 'apply-%s-%s\n' "${AWG_PROTOCOL_VERSION}" "${AWG_HEADER_PROTECTION_KEY}" >>"${SAME_MODE_REPAIR_LOG}"
+	}
+	setAwgProtocolMode 3 >/dev/null 2>&1
+) && [[ "$(paste -sd, "${SAME_MODE_REPAIR_LOG}")" == "lock,load-0-1,verify,apply-3-${MOCK_KEY}" ]]; then
+	ok "same-mode AWG 3.0 requests repair inconsistent configs without rotating the key"
+else
+	not_ok "same-mode AWG 3.0 requests repair inconsistent configs without rotating the key"
+fi
+
+SAME_MODE_NOOP_LOG="${TEST_ROOT}/same-mode-noop.log"
+: >"${SAME_MODE_NOOP_LOG}"
+if (
+	AWG_PROTOCOL_VERSION=2
+	clearAwg3Params
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${SAME_MODE_NOOP_LOG}"; }
+	loadParams() { printf 'load\n' >>"${SAME_MODE_NOOP_LOG}"; }
+	awgProtocolConfigsMatchPersistedState() { printf 'verify\n' >>"${SAME_MODE_NOOP_LOG}"; return 0; }
+	applyAwgProtocolTransaction() { printf 'unexpected-apply\n' >>"${SAME_MODE_NOOP_LOG}"; return 1; }
+	setAwgProtocolMode 2 >/dev/null 2>&1
+) && [[ "$(paste -sd, "${SAME_MODE_NOOP_LOG}")" == "lock,load,verify" ]]; then
+	ok "same-mode requests remain no-ops when persisted state and configs agree"
+else
+	not_ok "same-mode requests remain no-ops when persisted state and configs agree"
+fi
+
 : >"${AWG3_TEST_IP_LOG}"
 if probeAwg3Capability "${MOCK_KEY}"; then
 	if grep -q '^link add dev awgp' "${AWG3_TEST_IP_LOG}" && \
@@ -411,6 +451,30 @@ chmod 640 "${CLIENT_CONF}"
 serializeParams "${AMNEZIAWG_DIR}/params"
 chmod 600 "${AMNEZIAWG_DIR}/params"
 
+if awgProtocolConfigsMatchPersistedState; then
+	ok "AWG 2.0 consistency verification accepts matching server and client configs"
+else
+	not_ok "AWG 2.0 consistency verification accepts matching server and client configs"
+fi
+
+AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
+if awgProtocolConfigsMatchPersistedState >/dev/null 2>&1; then
+	not_ok "AWG 2.0 consistency verification rejects dormant AWG 3.0 params"
+else
+	ok "AWG 2.0 consistency verification rejects dormant AWG 3.0 params"
+fi
+clearAwg3Params
+
+CLIENT_CONSISTENCY_BACKUP="${TEST_ROOT}/client-consistency.backup"
+cp -p "${CLIENT_CONF}" "${CLIENT_CONSISTENCY_BACKUP}"
+printf '\nHeaderProtectionKey = %s\n' "${MOCK_KEY}" >>"${CLIENT_CONF}"
+if awgProtocolConfigsMatchPersistedState >/dev/null 2>&1; then
+	not_ok "AWG 2.0 consistency verification rejects stale client protocol fields"
+else
+	ok "AWG 2.0 consistency verification rejects stale client protocol fields"
+fi
+cp -p "${CLIENT_CONSISTENCY_BACKUP}" "${CLIENT_CONF}"
+
 SERVER_MANAGED_BACKUP="${TEST_ROOT}/server-managed.backup"
 cp -p "${SERVER_AWG_CONF}" "${SERVER_MANAGED_BACKUP}"
 printf '\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.66.66.99/32\n' \
@@ -463,6 +527,22 @@ if applyAwgProtocolTransaction && \
 else
 	not_ok "AWG 3.0 transaction updates params, server, and every active client"
 fi
+
+if awgProtocolConfigsMatchPersistedState; then
+	ok "AWG 3.0 consistency verification accepts matching server and client fields"
+else
+	not_ok "AWG 3.0 consistency verification accepts matching server and client fields"
+fi
+
+CLIENT_AWG3_CONSISTENCY_BACKUP="${TEST_ROOT}/client-awg3-consistency.backup"
+cp -p "${CLIENT_CONF}" "${CLIENT_AWG3_CONSISTENCY_BACKUP}"
+sed -i 's/^RekeyTimeout = .*/RekeyTimeout = 99/' "${CLIENT_CONF}"
+if awgProtocolConfigsMatchPersistedState >/dev/null 2>&1; then
+	not_ok "AWG 3.0 consistency verification rejects a mismatched client field"
+else
+	ok "AWG 3.0 consistency verification rejects a mismatched client field"
+fi
+cp -p "${CLIENT_AWG3_CONSISTENCY_BACKUP}" "${CLIENT_CONF}"
 
 AWG_PROTOCOL_VERSION=2
 clearAwg3Params
