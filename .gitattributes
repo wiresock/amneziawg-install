@@ -1,4 +1,6 @@
+.gitattributes text eol=lf
 *.sh text eol=lf
+amneziawg-web/scripts/amneziawg-web-privileged text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.md text eol=auto

@@ -359,6 +359,33 @@ sudo ./amneziawg-install.sh --list-clients
 
 ---
 
+## 🔐 Optional AWG 3.0 Mode
+
+Fresh installs and parameter files created by earlier releases use AWG 2.0 by
+default. Installing or upgrading this project never changes an existing
+interface's protocol mode.
+
+```bash
+# Missing protocol state is reported as 2.0
+sudo ./amneziawg-install.sh --protocol-status
+
+# Probe userspace + running kernel support, then migrate the server and clients
+sudo ./amneziawg-install.sh --enable-awg3
+
+# Atomically remove AWG 3.0-only fields and return every config to AWG 2.0
+sudo ./amneziawg-install.sh --disable-awg3
+```
+
+AWG 3.0 header protection is interface-wide and cannot communicate with AWG
+2.0 clients on the same interface. Enabling it creates one shared header key,
+validates all generated configs, and updates the server plus every recoverable
+client config as one transaction. If capability validation, file replacement,
+service restart, or the process itself fails, the previous state is restored.
+Redistribute every client config after either migration. The web panel exposes
+the same confirmed operations under **AWG protocol**.
+
+---
+
 ## 📦 Requirements
 
 Supported Linux distributions:

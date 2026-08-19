@@ -433,6 +433,19 @@ if [[ -f /etc/amnezia/amneziawg/params ]]; then
 		echo "  FAIL: SERVER_AWG_IPV4 is '${SERVER_AWG_IPV4}' (expected '10.66.66.1')"
 		FAILED=$((FAILED + 1))
 	fi
+
+	if [[ "${AWG_PROTOCOL_VERSION:-}" == "2" ]] && \
+		[[ -z "${AWG_HEADER_PROTECTION_KEY:-}" ]] && \
+		[[ -z "${AWG_CONTENT_PADDING_ADDITION:-}" ]] && \
+		[[ -z "${AWG_REKEY_AFTER_TIME:-}" ]] && \
+		[[ -z "${AWG_REKEY_TIMEOUT:-}" ]] && \
+		[[ -z "${AWG_REJECT_AFTER_TIME:-}" ]] && \
+		[[ -z "${AWG_KEEPALIVE_TIMEOUT:-}" ]]; then
+		echo "  OK: Fresh install persists AWG 2.0 mode with no AWG 3.0 state"
+	else
+		echo "  FAIL: Fresh install did not preserve the AWG 2.0 compatibility default"
+		FAILED=$((FAILED + 1))
+	fi
 else
 	echo "FAIL: params file missing"
 	FAILED=$((FAILED + 1))
@@ -463,6 +476,12 @@ if [[ -f "${SERVER_CONF}" ]]; then
 			FAILED=$((FAILED + 1))
 		fi
 	done
+	if grep -Eq '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout) = ' "${SERVER_CONF}"; then
+		echo "  FAIL: Fresh AWG 2.0 server config contains AWG 3.0-only fields"
+		FAILED=$((FAILED + 1))
+	else
+		echo "  OK: Fresh AWG 2.0 server config omits AWG 3.0-only fields"
+	fi
 
 	# Verify the native nftables firewall rules were generated (issue #79).
 	# The installer should emit nft rules — not iptables — on nf_tables hosts.
@@ -543,6 +562,12 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 			FAILED=$((FAILED + 1))
 		fi
 	done
+	if grep -Eq '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout) = ' "${CLIENT_CONF}"; then
+		echo "  FAIL: Fresh AWG 2.0 client config contains AWG 3.0-only fields"
+		FAILED=$((FAILED + 1))
+	else
+		echo "  OK: Fresh AWG 2.0 client config omits AWG 3.0-only fields"
+	fi
 
 	# Verify Address line contains both a valid IPv4/32 and IPv6/128 entry
 	# Regression test: the interactive path previously skipped IPv6 assignment
@@ -2213,6 +2238,7 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	   grep -Fq "${SECOND_HELPER_KEY}" /tmp/awg-syncconf-stdin && \
 	   "${PRIVILEGED_HELPER}" read-params > "${PARAMS_ACTUAL}" && \
 	   grep -q '^SERVER_AWG_NIC=' "${PARAMS_ACTUAL}" && \
+	   [[ "$("${PRIVILEGED_HELPER}" protocol-status)" == "2" ]] && \
 	   "${PRIVILEGED_HELPER}" read-server-state "${HELPER_TEST_INTERFACE}" > "${READ_ACTUAL}" && \
 	   grep -Fq '### Client existing' "${READ_ACTUAL}" && \
 	   grep -Fq "PublicKey = ${SECOND_HELPER_KEY}" "${READ_ACTUAL}" && \
@@ -2220,6 +2246,53 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 		echo "OK: Privileged helper dispatches approved AWG operations"
 	else
 		echo "FAIL: Privileged helper rejected an approved AWG operation"
+		FAILED=$((FAILED + 1))
+	fi
+
+	HELPER_PARAMS_BACKUP="/tmp/amneziawg-helper-params-backup"
+	cp -p /etc/amnezia/amneziawg/params "${HELPER_PARAMS_BACKUP}"
+	printf '%s\n' \
+		"AWG_PROTOCOL_VERSION='3'" \
+		"AWG_HEADER_PROTECTION_KEY='${VALID_HELPER_KEY}'" \
+		"AWG_CONTENT_PADDING_ADDITION='10-100'" \
+		"AWG_REKEY_AFTER_TIME='100-120'" \
+		"AWG_REKEY_TIMEOUT='3-7'" \
+		"AWG_REJECT_AFTER_TIME='150-180'" \
+		"AWG_KEEPALIVE_TIMEOUT='5-15'" >> /etc/amnezia/amneziawg/params
+	if [[ "$("${PRIVILEGED_HELPER}" protocol-status)" == "3" ]] && \
+		"${PRIVILEGED_HELPER}" read-params > "${PARAMS_ACTUAL}" && \
+		grep -Fqx "AWG_HEADER_PROTECTION_KEY='${VALID_HELPER_KEY}'" "${PARAMS_ACTUAL}" && \
+		grep -Fqx "AWG_KEEPALIVE_TIMEOUT='5-15'" "${PARAMS_ACTUAL}"; then
+		echo "OK: Privileged helper exposes validated AWG 3.0 client-generation state"
+	else
+		echo "FAIL: Privileged helper did not expose AWG 3.0 protocol state"
+		FAILED=$((FAILED + 1))
+	fi
+	cp -p "${HELPER_PARAMS_BACKUP}" /etc/amnezia/amneziawg/params
+	rm -f "${HELPER_PARAMS_BACKUP}"
+
+	HELPER_INSTALL_SCRIPT="$(head -n 1 "${WEB_AWG_SCRIPT_MARKER}")"
+	HELPER_SCRIPT_BACKUP="/tmp/amneziawg-helper-script-backup"
+	HELPER_PROTOCOL_CALLS="/tmp/amneziawg-helper-protocol-calls"
+	cp -p "${HELPER_INSTALL_SCRIPT}" "${HELPER_SCRIPT_BACKUP}"
+	printf '#!/bin/bash\nprintf "%%s\\n" "$1" >> %s\n' \
+		"${HELPER_PROTOCOL_CALLS}" > "${HELPER_INSTALL_SCRIPT}"
+	chmod 0755 "${HELPER_INSTALL_SCRIPT}"
+	chown root:root "${HELPER_INSTALL_SCRIPT}"
+	rm -f "${HELPER_PROTOCOL_CALLS}"
+	HELPER_PROTOCOL_DISPATCH_OK=0
+	if "${PRIVILEGED_HELPER}" enable-awg3 && \
+		"${PRIVILEGED_HELPER}" disable-awg3 && \
+		[[ "$(sed -n '1p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg3" ]] && \
+		[[ "$(sed -n '2p' "${HELPER_PROTOCOL_CALLS}")" == "--disable-awg3" ]]; then
+		HELPER_PROTOCOL_DISPATCH_OK=1
+	fi
+	cp -p "${HELPER_SCRIPT_BACKUP}" "${HELPER_INSTALL_SCRIPT}"
+	rm -f "${HELPER_SCRIPT_BACKUP}" "${HELPER_PROTOCOL_CALLS}"
+	if [[ "${HELPER_PROTOCOL_DISPATCH_OK}" -eq 1 ]]; then
+		echo "OK: Privileged helper dispatches only fixed protocol migration flags"
+	else
+		echo "FAIL: Privileged helper did not dispatch protocol migration flags"
 		FAILED=$((FAILED + 1))
 	fi
 
@@ -2253,6 +2326,8 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	printf '[Interface]\nPrivateKey = attacker\n' | \
 		"${PRIVILEGED_HELPER}" reconcile-interface awg0 >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" read-params extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" protocol-status extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" enable-awg3 extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" read-server-state ../etc >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" remove-client-if-key "${HELPER_TEST_INTERFACE}" alice invalid-key \
 		>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
