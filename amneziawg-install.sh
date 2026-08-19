@@ -6334,6 +6334,7 @@ function rewriteAwgProtocolConfig() {
 	local OUTPUT_FILE="$2"
 	local FIELD_FILE="$3"
 	local LINE INSERTED=0
+	local -a PENDING_BLANK_LINES=()
 
 	(
 		umask 077
@@ -6341,17 +6342,34 @@ function rewriteAwgProtocolConfig() {
 			if [[ "${LINE}" =~ ^[[:space:]]*(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout)[[:space:]]*= ]]; then
 				continue
 			fi
+			# Hold only the blank separator immediately before the first peer.
+			# AWG 3.0 fields belong before that existing separator; otherwise a
+			# newly inserted blank line would survive downgrade and accumulate on
+			# every protocol round trip.
+			if (( INSERTED == 0 )) && [[ "${LINE}" =~ ^[[:space:]]*$ ]]; then
+				PENDING_BLANK_LINES+=("${LINE}")
+				continue
+			fi
 			if (( INSERTED == 0 )) && { [[ "${LINE}" =~ ^[[:space:]]*\[Peer\][[:space:]]*$ ]] || [[ "${LINE}" =~ ^[[:space:]]*###[[:space:]]+Client([[:space:]]|$) ]]; }; then
 				if [[ -s "${FIELD_FILE}" ]]; then
 					cat -- "${FIELD_FILE}" || exit 1
-					printf '\n'
+				fi
+				if (( ${#PENDING_BLANK_LINES[@]} > 0 )); then
+					printf '%s\n' "${PENDING_BLANK_LINES[@]}"
+					PENDING_BLANK_LINES=()
 				fi
 				INSERTED=1
+			elif (( ${#PENDING_BLANK_LINES[@]} > 0 )); then
+				printf '%s\n' "${PENDING_BLANK_LINES[@]}"
+				PENDING_BLANK_LINES=()
 			fi
 			printf '%s\n' "${LINE}"
 		done <"${INPUT_FILE}"
 		if (( INSERTED == 0 )) && [[ -s "${FIELD_FILE}" ]]; then
 			cat -- "${FIELD_FILE}" || exit 1
+		fi
+		if (( ${#PENDING_BLANK_LINES[@]} > 0 )); then
+			printf '%s\n' "${PENDING_BLANK_LINES[@]}"
 		fi
 	) >"${OUTPUT_FILE}" || return 1
 }

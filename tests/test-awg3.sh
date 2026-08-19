@@ -444,6 +444,9 @@ fi
 unset AWG3_TEST_CUSTOM_HOME
 rm -rf -- "${CUSTOM_HOME}"
 
+ROUND_TRIP_SERVER_BEFORE="$(sha256sum "${SERVER_AWG_CONF}")"
+ROUND_TRIP_PARAMS_BEFORE="$(sha256sum "${AMNEZIAWG_DIR}/params")"
+ROUND_TRIP_CLIENT_BEFORE="$(sha256sum "${CLIENT_CONF}")"
 AWG_PROTOCOL_VERSION=3
 AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
 AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
@@ -471,12 +474,15 @@ if applyAwgProtocolTransaction && \
 	grep -q "^AWG_PROTOCOL_VERSION='2'$" "${AMNEZIAWG_DIR}/params" && \
 	! grep -q '^HeaderProtectionKey = ' "${SERVER_AWG_CONF}" && \
 	! grep -q '^HeaderProtectionKey = ' "${CLIENT_CONF}" && \
+	[[ "$(sha256sum "${SERVER_AWG_CONF}")" == "${ROUND_TRIP_SERVER_BEFORE}" ]] && \
+	[[ "$(sha256sum "${AMNEZIAWG_DIR}/params")" == "${ROUND_TRIP_PARAMS_BEFORE}" ]] && \
+	[[ "$(sha256sum "${CLIENT_CONF}")" == "${ROUND_TRIP_CLIENT_BEFORE}" ]] && \
 	[[ -e "${AWG3_TEST_MANUAL_STATE}" ]] && \
 	[[ "$(sed -n '1p' "${AWG3_TEST_AWG_QUICK_LOG}")" == "down ${SERVER_AWG_CONF}" ]] && \
 	[[ "$(sed -n '2p' "${AWG3_TEST_AWG_QUICK_LOG}")" == "up ${SERVER_AWG_CONF}" ]]; then
-	ok "AWG 2.0 downgrade recreates a manually active interface and removes AWG 3.0-only fields"
+	ok "AWG 2.0 downgrade is byte-identical and recreates a manually active interface"
 else
-	not_ok "AWG 2.0 downgrade recreates a manually active interface and removes AWG 3.0-only fields"
+	not_ok "AWG 2.0 downgrade is byte-identical and recreates a manually active interface"
 fi
 unset AWG3_TEST_MANUAL_STATE
 
