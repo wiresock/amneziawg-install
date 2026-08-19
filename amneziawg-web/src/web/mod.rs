@@ -696,10 +696,7 @@ fn parse_stored_expiration(raw: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
-fn expiration_from_days(
-    days: i64,
-    now: DateTime<Utc>,
-) -> Result<Option<String>, String> {
+fn expiration_from_days(days: i64, now: DateTime<Utc>) -> Result<Option<String>, String> {
     if !(0..=MAX_EXPIRATION_DAYS).contains(&days) {
         return Err(format!(
             "expiration_days must be between 0 and {MAX_EXPIRATION_DAYS}"
@@ -711,9 +708,7 @@ fn expiration_from_days(
     let expires_at = now
         .checked_add_signed(chrono::Duration::days(days))
         .ok_or_else(|| "expiration date is out of range".to_string())?;
-    Ok(Some(
-        expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
-    ))
+    Ok(Some(expires_at.to_rfc3339_opts(SecondsFormat::Secs, true)))
 }
 
 fn parse_form_expiration_days(value: Option<&str>) -> Result<Option<i64>, String> {
@@ -740,10 +735,7 @@ fn managed_client_name_for_lifecycle(row: &PeerRow) -> Option<&str> {
         })
 }
 
-fn format_expiration_status(
-    expires_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> String {
+fn format_expiration_status(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     let Some(expires_at) = expires_at else {
         return "Never expires".to_string();
     };
@@ -769,10 +761,7 @@ fn format_expiration_status(
 
     let days = (seconds + 86_399) / 86_400;
     if days <= 30 {
-        return format!(
-            "Expires in {days} day{}",
-            if days == 1 { "" } else { "s" }
-        );
+        return format!("Expires in {days} day{}", if days == 1 { "" } else { "s" });
     }
 
     format!(
@@ -1214,14 +1203,8 @@ pub fn router_with_lifecycle_lock_dir(
         .route("/admin/users/:id/remove", post(post_remove_user_form))
         .route("/admin/peers/:id/archive", post(post_archive_peer_form))
         .route("/admin/peers/:id/restore", post(post_restore_peer_form))
-        .route(
-            "/admin/protocol/enable-awg3",
-            post(post_enable_awg3_form),
-        )
-        .route(
-            "/admin/protocol/disable-awg3",
-            post(post_disable_awg3_form),
-        )
+        .route("/admin/protocol/enable-awg3", post(post_enable_awg3_form))
+        .route("/admin/protocol/disable-awg3", post(post_disable_awg3_form))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -2061,8 +2044,7 @@ async fn get_peer_config(
         .and_then(|n| n.to_str())
         .unwrap_or("client.conf")
         // Sanitise for use inside a quoted Content-Disposition filename.
-        .replace('\\', "_")
-        .replace('"', "_");
+        .replace(['\\', '"'], "_");
 
     let disposition = format!("attachment; filename=\"{}\"", filename);
 
@@ -2093,7 +2075,7 @@ const QR_NO_CACHE_HEADERS: [(axum::http::header::HeaderName, &str); 2] = [
 fn with_qr_no_cache(mut resp: Response) -> Response {
     let headers = resp.headers_mut();
     for (name, value) in &QR_NO_CACHE_HEADERS {
-        headers.insert(name.clone(), axum::http::HeaderValue::from_static(*value));
+        headers.insert(name.clone(), axum::http::HeaderValue::from_static(value));
     }
     resp
 }
@@ -2191,22 +2173,20 @@ async fn patch_peer(
         Some(days) => match expiration_from_days(days, Utc::now()) {
             Ok(value) => Some(value),
             Err(message) => {
-                return Ok((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": message })),
+                return Ok(
+                    (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
                 )
-                    .into_response())
             }
         },
         None => None,
     };
     let managed_client_name = managed_client_name_for_lifecycle(&existing);
-    if expiration_update.as_ref().is_some_and(Option::is_some)
-        && managed_client_name.is_none()
-    {
+    if expiration_update.as_ref().is_some_and(Option::is_some) && managed_client_name.is_none() {
         return Ok((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "only installer-managed users with a linked config can expire" })),
+            Json(
+                json!({ "error": "only installer-managed users with a linked config can expire" }),
+            ),
         )
             .into_response());
     }
@@ -2281,9 +2261,7 @@ async fn patch_peer(
             .into_response()),
         Some(peer_row) => {
             // Fire-and-forget audit log for metadata changes.
-            if body.display_name.is_some()
-                || body.comment.is_some()
-                || expiration_update.is_some()
+            if body.display_name.is_some() || body.comment.is_some() || expiration_update.is_some()
             {
                 let detail = serde_json::json!({
                     "old_display_name": existing.display_name,
@@ -2574,7 +2552,10 @@ async fn post_peer_edit(
         Err(message) => {
             return Ok((
                 StatusCode::BAD_REQUEST,
-                Html(format!("<h1>Invalid expiration</h1><p>{}</p>", esc(&message))),
+                Html(format!(
+                    "<h1>Invalid expiration</h1><p>{}</p>",
+                    esc(&message)
+                )),
             )
                 .into_response())
         }
@@ -2585,7 +2566,10 @@ async fn post_peer_edit(
             Err(message) => {
                 return Ok((
                     StatusCode::BAD_REQUEST,
-                    Html(format!("<h1>Invalid expiration</h1><p>{}</p>", esc(&message))),
+                    Html(format!(
+                        "<h1>Invalid expiration</h1><p>{}</p>",
+                        esc(&message)
+                    )),
                 )
                     .into_response())
             }
@@ -2593,9 +2577,7 @@ async fn post_peer_edit(
         None => None,
     };
     let managed_client_name = managed_client_name_for_lifecycle(&existing);
-    if expiration_update.as_ref().is_some_and(Option::is_some)
-        && managed_client_name.is_none()
-    {
+    if expiration_update.as_ref().is_some_and(Option::is_some) && managed_client_name.is_none() {
         return Ok((
             StatusCode::BAD_REQUEST,
             Html("<h1>Invalid expiration</h1><p>Only installer-managed users with a linked config can expire.</p>".to_string()),
@@ -2814,10 +2796,9 @@ async fn post_protocol_change(
             .into_response());
     }
 
-    let result = tokio::task::spawn_blocking(move || {
-        crate::awg::set_protocol_mode_via_sudo(enable_awg3)
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || crate::awg::set_protocol_mode_via_sudo(enable_awg3))
+            .await;
     let notice = match result {
         Ok(Ok(())) => {
             let version = if enable_awg3 { "3.0" } else { "2.0" };
@@ -2930,11 +2911,7 @@ async fn api_create_user(
     let expires_at = match expiration_from_days(body.expiration_days.unwrap_or(0), Utc::now()) {
         Ok(value) => value,
         Err(message) => {
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": message })),
-            )
-                .into_response())
+            return Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response())
         }
     };
     match crate::admin::execute_create_user(
@@ -3143,8 +3120,7 @@ async fn post_add_user_form(
         Ok(None) => 0,
         Err(message) => {
             let rows = crate::db::peers::list_visible(&state.db.pool).await?;
-            let peers: Vec<PeerSummaryDto> =
-                rows.into_iter().map(peer_row_to_summary).collect();
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             return Ok(Html(render_peer_list_with_error(
@@ -3157,8 +3133,7 @@ async fn post_add_user_form(
         Ok(value) => value,
         Err(message) => {
             let rows = crate::db::peers::list_visible(&state.db.pool).await?;
-            let peers: Vec<PeerSummaryDto> =
-                rows.into_iter().map(peer_row_to_summary).collect();
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             return Ok(Html(render_peer_list_with_error(
@@ -4148,8 +4123,7 @@ fn render_peer_list_inner(
                 .filter(|comment| !comment.is_empty())
                 .map(esc)
                 .unwrap_or_else(|| "–".to_string());
-            let expiration =
-                render_expiration_cell(&p.expiration_status, p.expires_at, p.expired);
+            let expiration = render_expiration_cell(&p.expiration_status, p.expires_at, p.expired);
             buf.push_str(&format!(
                 "<tr><td>{name_link}</td><td>{conn}</td><td>{ident}</td><td>{endpoint}</td>\
                  <td class=\"comment-cell\">{comment}</td><td>{expiration}</td><td>{handshake}</td><td>{rx}</td><td>{tx}</td></tr>\n",
@@ -8579,9 +8553,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/admin/users")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"name":"alice","expiration_days":36501}"#,
-                    ))
+                    .body(Body::from(r#"{"name":"alice","expiration_days":36501}"#))
                     .unwrap(),
             )
             .await

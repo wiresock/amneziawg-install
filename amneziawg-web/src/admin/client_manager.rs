@@ -277,10 +277,7 @@ fn validate_awg3_range(name: &str, value: &str) -> Result<(), CreateClientError>
         None => (value, value),
     };
     let parse_bound = |bound: &str| -> Result<u16, CreateClientError> {
-        if bound.is_empty()
-            || bound.len() > 5
-            || !bound.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if bound.is_empty() || bound.len() > 5 || !bound.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(CreateClientError::ParamsRead(format!(
                 "{name} must contain uint16 values"
             )));
@@ -335,9 +332,9 @@ fn validate_awg3_params(params: &ServerParams) -> Result<(), CreateClientError> 
         ("SERVER_AWG_S3", &params.s3),
         ("SERVER_AWG_S4", &params.s4),
     ] {
-        let padding = value.parse::<u16>().map_err(|_| {
-            CreateClientError::ParamsRead(format!("{name} must be a uint16 value"))
-        })?;
+        let padding = value
+            .parse::<u16>()
+            .map_err(|_| CreateClientError::ParamsRead(format!("{name} must be a uint16 value")))?;
         if padding < 12 {
             return Err(CreateClientError::ParamsRead(format!(
                 "{name} must be at least 12 for AWG 3.0"
@@ -605,8 +602,7 @@ fn find_existing_ipv6_normalized(server_config: &str) -> HashSet<String> {
         if let Some(val) = parse_kv(trimmed, "AllowedIPs") {
             for cidr in val.split(',') {
                 let cidr = cidr.trim();
-                if cidr.ends_with("/128") {
-                    let ip = &cidr[..cidr.len() - 4];
+                if let Some(ip) = cidr.strip_suffix("/128") {
                     if let Ok(normalized) = normalize_ipv6(ip) {
                         set.insert(normalized);
                     }
@@ -667,11 +663,7 @@ fn server_interface_has_ipv6_address(server_config: &str) -> bool {
             continue;
         }
         if let Some(value) = parse_kv(trimmed, "Address") {
-            let uncommented = value
-                .split(|ch| ch == '#' || ch == ';')
-                .next()
-                .unwrap_or_default()
-                .trim();
+            let uncommented = value.split(['#', ';']).next().unwrap_or_default().trim();
             if uncommented.split(',').map(str::trim).any(|cidr| {
                 cidr.split('/')
                     .next()
@@ -2324,8 +2316,7 @@ AllowedIPs = 10.66.66.2/32
 
         let mut awg3_params = params.clone();
         awg3_params.protocol_version = AwgProtocolVersion::V3;
-        awg3_params.header_protection_key =
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into();
+        awg3_params.header_protection_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into();
         awg3_params.content_padding_addition = "10-100".into();
         awg3_params.rekey_after_time = "100-120".into();
         awg3_params.rekey_timeout = "3-7".into();
@@ -2341,9 +2332,8 @@ AllowedIPs = 10.66.66.2/32
             "1.2.3.4:51820",
         )
         .unwrap();
-        assert!(awg3_config.contains(
-            "HeaderProtectionKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-        ));
+        assert!(awg3_config
+            .contains("HeaderProtectionKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
         assert!(awg3_config.contains("ContentPaddingAddition = 10-100"));
         assert!(awg3_config.contains("KeepaliveTimeout = 5-15"));
     }
