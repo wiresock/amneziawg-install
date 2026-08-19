@@ -22,8 +22,10 @@ jobs:
       - name: Run unit tests
         run: |
           bash tests/test-functions.sh
+          bash tests/test-cargo-build-common.sh
           bash tests/test-ubuntu-ppa.sh
           bash tests/test-proxy-scripts.sh
+          sudo bash tests/test-proxy-bootstrap.sh
 
       - name: Run proxy Rust tests
         working-directory: amneziawg-proxy
@@ -79,6 +81,8 @@ jobs:
         run: |
           bash -n amneziawg-install.sh
           bash -n amneziawg-web.sh
+          bash -n amneziawg-proxy.sh
+          bash -n scripts/amneziawg-cargo-build.sh
 
       - name: Run integration test in Docker
         run: |

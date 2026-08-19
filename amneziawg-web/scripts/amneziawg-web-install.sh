@@ -32,6 +32,7 @@ readonly AWG_INSTALL_SCRIPT_DEST="/usr/local/bin/amneziawg-install.sh"
 readonly AWG_INSTALL_SCRIPT_MARKER_NAME="installed-awg-script.path"
 readonly PRIVILEGED_HELPER_NAME="amneziawg-web-privileged"
 readonly PRIVILEGED_HELPER_DEST="/usr/local/libexec/${PRIVILEGED_HELPER_NAME}"
+readonly BUILD_MIN_FREE_KB="2097152"
 
 # Default paths
 readonly DEFAULT_BINARY_SRC="./target/release/amneziawg-web"
@@ -48,6 +49,9 @@ readonly DEFAULT_USERNAME="admin"
 
 # Script location (for finding the service unit file relative to the repo)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=../../scripts/amneziawg-cargo-build.sh
+. "${SCRIPT_DIR}/../../scripts/amneziawg-cargo-build.sh"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 
@@ -181,6 +185,7 @@ cleanup_staged_privilege_artifacts() {
         report_retained_install_rollback_artifacts
     fi
 
+    awg_cleanup_cargo_build
     return "${exit_code}"
 }
 
@@ -407,6 +412,10 @@ Expected the amneziawg-web Rust crate directory."
 
     ensure_rust_toolchain
 
+    if ! awg_prepare_cargo_build "${SOURCE_DIR}" "amneziawg-web" "${BUILD_MIN_FREE_KB}"; then
+        die "No suitable build environment is available for amneziawg-web."
+    fi
+
     info "Building in: ${SOURCE_DIR}"
     info "Running: cargo build --release --locked"
 
@@ -415,7 +424,8 @@ Expected the amneziawg-web Rust crate directory."
 Ensure build dependencies are installed (gcc, pkg-config, libssl-dev or equivalent)."
     fi
 
-    local built_binary="${SOURCE_DIR}/target/release/amneziawg-web"
+    local built_binary
+    built_binary="$(awg_cargo_release_binary "amneziawg-web")"
     if [[ ! -f "${built_binary}" ]]; then
         die "Build completed but binary not found at: ${built_binary}"
     fi

@@ -211,6 +211,9 @@ bootstrap_repo_if_needed() {
     local root_seen
     local -a bootstrap_roots=()
     local -a tried_roots=()
+    if [[ -n "${AMNEZIAWG_BUILD_ROOT:-}" ]]; then
+        bootstrap_roots+=("${AMNEZIAWG_BUILD_ROOT}")
+    fi
     if [[ -n "${TMPDIR:-}" ]]; then
         bootstrap_roots+=("${TMPDIR}")
     fi

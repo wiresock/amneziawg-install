@@ -51,6 +51,7 @@ readonly DEFAULT_RATE_LIMIT="5"
 readonly DEFAULT_PROBE_REPLY_BYTES="32768"
 readonly DEFAULT_DNS_UPSTREAM="1.1.1.1:53"
 readonly DEFAULT_QUIC_DOMAIN="cloudflare.com"
+readonly BUILD_MIN_FREE_KB="1048576"
 
 # Script location (for finding the service unit file relative to the repo)
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -58,6 +59,10 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # Source shared helpers (validate_params_file, etc.)
 # shellcheck source=amneziawg-proxy-common.sh
 . "${SCRIPT_DIR}/amneziawg-proxy-common.sh"
+# shellcheck source=../../scripts/amneziawg-cargo-build.sh
+. "${SCRIPT_DIR}/../../scripts/amneziawg-cargo-build.sh"
+
+trap awg_cleanup_cargo_build EXIT
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 
@@ -446,6 +451,10 @@ Expected the amneziawg-proxy Rust crate directory."
 
     ensure_rust_toolchain
 
+    if ! awg_prepare_cargo_build "${SOURCE_DIR}" "amneziawg-proxy" "${BUILD_MIN_FREE_KB}"; then
+        die "No suitable build environment is available for amneziawg-proxy."
+    fi
+
     info "Building in: ${SOURCE_DIR}"
     info "Running: cargo build --release --locked"
 
@@ -454,7 +463,8 @@ Expected the amneziawg-proxy Rust crate directory."
 Ensure build dependencies are installed (gcc, pkg-config, libssl-dev or equivalent)."
     fi
 
-    local built_binary="${SOURCE_DIR}/target/release/amneziawg-proxy"
+    local built_binary
+    built_binary="$(awg_cargo_release_binary "amneziawg-proxy")"
     if [[ ! -f "${built_binary}" ]]; then
         die "Build completed but binary not found at: ${built_binary}"
     fi

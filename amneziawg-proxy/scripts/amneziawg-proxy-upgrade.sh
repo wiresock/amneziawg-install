@@ -32,8 +32,14 @@ readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_CONFIG_FILE="/etc/amneziawg-proxy/proxy.toml"
 readonly DEFAULT_DATA_DIR="/var/lib/amneziawg-proxy"
 readonly BINARY_NAME="amneziawg-proxy"
+readonly BUILD_MIN_FREE_KB="1048576"
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# shellcheck source=../../scripts/amneziawg-cargo-build.sh
+. "${SCRIPT_DIR}/../../scripts/amneziawg-cargo-build.sh"
+
+trap awg_cleanup_cargo_build EXIT
 
 # -- Defaults -----------------------------------------------------------------
 
@@ -303,6 +309,10 @@ Expected the amneziawg-proxy Rust crate directory."
 
     ensure_rust_toolchain
 
+    if ! awg_prepare_cargo_build "${SOURCE_DIR}" "amneziawg-proxy" "${BUILD_MIN_FREE_KB}"; then
+        die "No suitable build environment is available for amneziawg-proxy."
+    fi
+
     info "Building in: ${SOURCE_DIR}"
     info "Running: cargo build --release --locked"
 
@@ -311,7 +321,8 @@ Expected the amneziawg-proxy Rust crate directory."
 Ensure build dependencies are installed (gcc, pkg-config, libssl-dev or equivalent)."
     fi
 
-    local built_binary="${SOURCE_DIR}/target/release/${BINARY_NAME}"
+    local built_binary
+    built_binary="$(awg_cargo_release_binary "${BINARY_NAME}")"
     if [[ ! -f "${built_binary}" ]]; then
         die "Build completed but binary not found at: ${built_binary}"
     fi

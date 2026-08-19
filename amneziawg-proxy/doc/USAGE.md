@@ -27,6 +27,13 @@
 - **AmneziaWG** already installed and a working `awg0` interface
 - **Rust toolchain ≥ 1.75** (only needed for a source build; the installer
   can install it automatically via `rustup`)
+- Approximately **1 GiB of free build space** when compiling from source
+
+The installer and upgrader inspect available disk space, inodes, CPUs, and
+memory before starting Cargo. They automatically use one build job on a
+constrained host and can move Cargo artifacts away from a small `/tmp`. Set
+`AMNEZIAWG_BUILD_ROOT` to an existing writable directory on an executable
+filesystem to choose the build disk explicitly.
 
 ---
 
