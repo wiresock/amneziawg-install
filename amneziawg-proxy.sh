@@ -19,8 +19,9 @@
 
 set -euo pipefail
 
-# This script always requires root; env overrides are never honored to prevent
-# privilege-escalation via environment injection.
+# This script always requires root. Repository source settings stay fixed to
+# prevent environment-based redirection; TMPDIR and AMNEZIAWG_BUILD_ROOT are
+# honored only when choosing temporary bootstrap and Cargo build filesystems.
 readonly REPO_URL="https://github.com/wiresock/amneziawg-install.git"
 readonly REPO_REF="main"
 
