@@ -6583,7 +6583,9 @@ function applyAwgProtocolTransaction() (
 	}
 	chmod 700 "${TRANSACTION_DIR}"
 	FIELDS_FILE="${TRANSACTION_DIR}/protocol-fields"
-	SERVER_STAGE="${TRANSACTION_DIR}/server.new"
+	# awg-quick requires the input basename to be a valid interface-style
+	# `<name>.conf`, even when it is used only for `strip` validation.
+	SERVER_STAGE="${TRANSACTION_DIR}/server.conf"
 	PARAMS_STAGE="${TRANSACTION_DIR}/params.new"
 	SERVER_BACKUP="${TRANSACTION_DIR}/server.backup"
 	PARAMS_BACKUP="${TRANSACTION_DIR}/params.backup"
@@ -6602,7 +6604,7 @@ function applyAwgProtocolTransaction() (
 
 	for INDEX in "${!CLIENT_PATHS[@]}"; do
 		CLIENT_PATH="${CLIENT_PATHS[${INDEX}]}"
-		CLIENT_STAGES[${INDEX}]="${TRANSACTION_DIR}/client-${INDEX}.new"
+		CLIENT_STAGES[${INDEX}]="${TRANSACTION_DIR}/client-${INDEX}.conf"
 		CLIENT_BACKUPS[${INDEX}]="${TRANSACTION_DIR}/client-${INDEX}.backup"
 		if ! cp -p -- "${CLIENT_PATH}" "${CLIENT_BACKUPS[${INDEX}]}" || \
 			! rewriteAwgProtocolConfig "${CLIENT_PATH}" "${CLIENT_STAGES[${INDEX}]}" "${FIELDS_FILE}"; then

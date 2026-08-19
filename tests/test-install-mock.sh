@@ -3170,7 +3170,11 @@ exec "${REAL_MV_BIN}" "$@"
 MVEOF
 chmod +x "${ROLLBACK_MV_DIR}/mv"
 
+# Make the installed lifecycle script byte-distinct from the repository copy.
+# Every failed upgrade below must restore this legacy generation exactly.
+printf '\n# legacy lifecycle script sentinel\n' >> "${WEB_AWG_SCRIPT_PATH}"
 ROLLBACK_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+ROLLBACK_AWG_SCRIPT_HASH=$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')
 ROLLBACK_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
 ROLLBACK_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
 touch /tmp/awg-web-mock-started
@@ -3193,6 +3197,8 @@ if [[ "${WEB_UPGRADE_ROLLBACK_RC}" -eq 0 ]]; then
 fi
 if [[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != \
 		"${ROLLBACK_BINARY_HASH}" ]] || \
+		[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')" != \
+		"${ROLLBACK_AWG_SCRIPT_HASH}" ]] || \
 		[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != \
 		"${ROLLBACK_HELPER_HASH}" ]] || \
 		[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != \
@@ -3207,6 +3213,8 @@ if ! grep -q "stop amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
 fi
 if compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
 	compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+	compgen -G "${WEB_AWG_SCRIPT_PATH}.upgrade-tmp.*" >/dev/null || \
+	compgen -G "${WEB_AWG_SCRIPT_PATH}.rollback.*" >/dev/null || \
 	compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
 	compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
 	compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null || \
@@ -3221,14 +3229,15 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# The first and second rename failures must not attempt to overwrite the
+# Early rename failures must not attempt to overwrite the
 # unchanged failing destination during rollback.  For the sudoers case, make
 # the old helper byte-distinct so its successful first commit must be undone.
-for EARLY_FAIL_DEST in "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
+for EARLY_FAIL_DEST in "${WEB_AWG_SCRIPT_PATH}" "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
 	if [[ "${EARLY_FAIL_DEST}" == "${SUDOERS_FILE}" ]]; then
 		printf '\n# rollback sentinel\n' >> "${PRIVILEGED_HELPER}"
 	fi
 	EARLY_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+	EARLY_AWG_SCRIPT_HASH=$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')
 	EARLY_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
 	EARLY_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
 	touch /tmp/awg-web-mock-started
@@ -3248,6 +3257,8 @@ for EARLY_FAIL_DEST in "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
 	if [[ "${EARLY_UPGRADE_RC}" -eq 0 ]] || \
 			[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != \
 			"${EARLY_BINARY_HASH}" ]] || \
+			[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')" != \
+			"${EARLY_AWG_SCRIPT_HASH}" ]] || \
 			[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != \
 			"${EARLY_HELPER_HASH}" ]] || \
 			[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != \
@@ -3260,6 +3271,8 @@ for EARLY_FAIL_DEST in "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
 	fi
 	if compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
 		compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+		compgen -G "${WEB_AWG_SCRIPT_PATH}.upgrade-tmp.*" >/dev/null || \
+		compgen -G "${WEB_AWG_SCRIPT_PATH}.rollback.*" >/dev/null || \
 		compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
 		compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
 		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null || \
@@ -3283,6 +3296,7 @@ SIGNAL_BINARY="/tmp/amneziawg-web-upgrade-identical"
 cp -a "${WEB_TEST_INSTALL_DIR}/amneziawg-web" "${SIGNAL_BINARY}"
 printf '\n# pre-signal helper sentinel\n' >> "${PRIVILEGED_HELPER}"
 SIGNAL_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+SIGNAL_AWG_SCRIPT_HASH=$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')
 SIGNAL_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
 SIGNAL_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
 touch /tmp/awg-web-mock-started
@@ -3301,11 +3315,13 @@ SIGNAL_UPGRADE_OUTPUT=$(SIGNAL_AFTER_MV_DEST="${SUDOERS_FILE}" \
 SIGNAL_FAILED=0
 if [[ "${SIGNAL_UPGRADE_RC}" -eq 0 ]] || \
 		[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != "${SIGNAL_BINARY_HASH}" ]] || \
+		[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')" != "${SIGNAL_AWG_SCRIPT_HASH}" ]] || \
 		[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != "${SIGNAL_HELPER_HASH}" ]] || \
 		[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != "${SIGNAL_SUDOERS_HASH}" ]]; then
 	SIGNAL_FAILED=1
 fi
 if ! grep -q "start amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+		compgen -G "${WEB_AWG_SCRIPT_PATH}.rollback.*" >/dev/null || \
 		compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
 		compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
 		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.rollback.*" >/dev/null; then
@@ -3325,6 +3341,7 @@ echo "--- Web upgrader: restart failure restores the previous runtime generation
 
 for RESTART_UPGRADE_ENV in FAIL_SYSTEMCTL_RESTART RESTART_RETURNS_INACTIVE; do
 	RESTART_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+	RESTART_AWG_SCRIPT_HASH=$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')
 	RESTART_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
 	RESTART_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
 	touch /tmp/awg-web-mock-started
@@ -3342,6 +3359,7 @@ for RESTART_UPGRADE_ENV in FAIL_SYSTEMCTL_RESTART RESTART_RETURNS_INACTIVE; do
 	RESTART_FAILED=0
 	if [[ "${RESTART_UPGRADE_RC}" -eq 0 ]] || \
 			[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != "${RESTART_BINARY_HASH}" ]] || \
+			[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')" != "${RESTART_AWG_SCRIPT_HASH}" ]] || \
 			[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != "${RESTART_HELPER_HASH}" ]] || \
 			[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != "${RESTART_SUDOERS_HASH}" ]] || \
 			[[ ! -f /tmp/awg-web-mock-started ]]; then
@@ -3349,6 +3367,7 @@ for RESTART_UPGRADE_ENV in FAIL_SYSTEMCTL_RESTART RESTART_RETURNS_INACTIVE; do
 	fi
 	if ! grep -q "restart amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
 			! grep -q "start amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+			compgen -G "${WEB_AWG_SCRIPT_PATH}.rollback.*" >/dev/null || \
 			compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
 			compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
 			compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.rollback.*" >/dev/null; then
@@ -3438,6 +3457,13 @@ if cmp -s "${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-privileged" \
 	echo "OK: Upgrader refreshed the privileged helper"
 else
 	echo "FAIL: Upgrader did not install the current privileged helper"
+	FAILED=$((FAILED + 1))
+fi
+
+if cmp -s "${PROJECT_ROOT}/amneziawg-install.sh" "${WEB_AWG_SCRIPT_PATH}"; then
+	echo "OK: Upgrader refreshed the AWG lifecycle script"
+else
+	echo "FAIL: Upgrader did not replace the legacy AWG lifecycle script"
 	FAILED=$((FAILED + 1))
 fi
 

@@ -106,6 +106,7 @@ cat >"${BIN_DIR}/awg-quick" <<'EOF'
 case "${1:-}" in
 	strip)
 		[[ -f "${2:-}" ]] || exit 1
+		[[ "$(basename -- "${2}")" =~ ^[a-zA-Z0-9_=+.-]{1,15}\.conf$ ]] || exit 1
 		sed -E '/^(Address|DNS|PostUp|PostDown)[[:space:]]*=/d' "$2"
 		;;
 	down)
