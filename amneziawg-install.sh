@@ -6271,9 +6271,16 @@ function quietIPv6Rewrite() {
 
 function loadParams() {
 	local ALLOW_INVALID_AWG3_FOR_DOWNGRADE="${1:-0}"
+	local SKIP_LEGACY_MIGRATIONS="${2:-0}"
 	if ! validateParamsFile "${ALLOW_INVALID_AWG3_FOR_DOWNGRADE}"; then
 		echo -e "${RED}Failed to validate params file. Aborting parameter loading.${NC}" >&2
 		exit 1
+	fi
+	# The explicit AWG 2.0 recovery path must not mutate params or configs before
+	# the protocol transaction has captured its backups. Any legacy normalization
+	# can run on a later ordinary management invocation after the downgrade.
+	if [[ "${SKIP_LEGACY_MIGRATIONS}" == "1" ]]; then
+		return 0
 	fi
 
 	local NEEDS_UPDATE=0
@@ -6333,13 +6340,13 @@ function rewriteAwgProtocolConfig() {
 }
 
 # Return every regular, non-symlink client config in the known installer/web
-# locations. Search roots are derived only from root-controlled configuration;
-# caller environment cannot redirect a privileged migration to arbitrary files.
+# locations. Search roots come from managed server state, the system account
+# database, and root-controlled web configuration.
 function collectAwgClientConfigCandidates() {
 	local OUTPUT_NAME="$1"
 	local -n OUTPUT_REF="${OUTPUT_NAME}"
 	local -a SEARCH_ROOTS=()
-	local ROOT CANDIDATE CANONICAL PANEL_DIR HOME_PATH
+	local ROOT CANDIDATE CANONICAL PANEL_DIR HOME_PATH CLIENT_NAME
 	local NULLGLOB_WAS_SET=0
 	local -A SEEN_PATHS=()
 
@@ -6348,6 +6355,16 @@ function collectAwgClientConfigCandidates() {
 	for HOME_PATH in /home/*; do
 		[[ -d "${HOME_PATH}" && ! -L "${HOME_PATH}" ]] && SEARCH_ROOTS+=("${HOME_PATH}")
 	done
+	# getHomeDirForClient supports NSS/LDAP accounts whose homes are outside
+	# /home. Resolve each root-controlled managed marker so configs originally
+	# written to paths such as /srv/alice remain part of an all-client migration.
+	while IFS= read -r CLIENT_NAME; do
+		[[ -n "${CLIENT_NAME}" ]] || continue
+		HOME_PATH="$(getHomeDirForClient "${CLIENT_NAME}")" || return 1
+		if [[ "${HOME_PATH}" == /* && -d "${HOME_PATH}" && ! -L "${HOME_PATH}" ]]; then
+			SEARCH_ROOTS+=("${HOME_PATH}")
+		fi
+	done < <(grep -E '^### Client [A-Za-z0-9_-]{1,15}$' "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
 	PANEL_DIR="$(resolveWebPanelConfigDir 2>/dev/null || true)"
 	[[ -z "${PANEL_DIR}" ]] || SEARCH_ROOTS+=("${PANEL_DIR}")
 
@@ -6520,6 +6537,19 @@ function applyAwgProtocolTransaction() (
 	local CLIENT_PATH INDEX SERVICE_WAS_ACTIVE=0 MANUAL_INTERFACE_ACTIVE=0 APPLY_FAILED=0
 	local TRANSACTION_READY=0 TRANSACTION_APPLY_STARTED=0
 
+	# A config that omits AWG 3.0 fields cannot clear those live attributes via
+	# syncconf. Cycle a manually managed interface so the kernel receives a fresh
+	# setconf from the selected protocol configuration.
+	function restartManualAwgInterface() {
+		if ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
+			awg-quick down "${SERVER_AWG_CONF}" >/dev/null 2>&1 || true
+			if ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
+				ip link delete dev "${SERVER_AWG_NIC}" >/dev/null 2>&1 || return 1
+			fi
+		fi
+		awg-quick up "${SERVER_AWG_CONF}"
+	}
+
 	function rollbackAwgProtocolOnSignal() {
 		local EXIT_CODE="$1"
 		local RESTORE_FAILED=0
@@ -6534,8 +6564,7 @@ function applyAwgProtocolTransaction() (
 			if (( SERVICE_WAS_ACTIVE )); then
 				systemctl restart "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 || true
 			elif (( MANUAL_INTERFACE_ACTIVE )); then
-				awg syncconf "${SERVER_AWG_NIC}" \
-					<(awg-quick strip "${SERVER_AWG_CONF}") >/dev/null 2>&1 || true
+				restartManualAwgInterface >/dev/null 2>&1 || true
 			fi
 		fi
 		if (( RESTORE_FAILED == 0 )) && [[ -n "${TRANSACTION_DIR:-}" ]]; then
@@ -6599,6 +6628,12 @@ function applyAwgProtocolTransaction() (
 	TRANSACTION_APPLY_STARTED=1
 	if (( SERVICE_WAS_ACTIVE )) && ! systemctl stop "awg-quick@${SERVER_AWG_NIC}"; then
 		echo "ERROR: could not stop the AWG service before protocol migration" >&2
+		systemctl restart "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 || true
+		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	elif (( MANUAL_INTERFACE_ACTIVE )) && ! awg-quick down "${SERVER_AWG_CONF}"; then
+		echo "ERROR: could not stop the manually active AWG interface before protocol migration" >&2
+		restartManualAwgInterface >/dev/null 2>&1 || true
 		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
 		return 1
 	fi
@@ -6619,7 +6654,7 @@ function applyAwgProtocolTransaction() (
 	if (( APPLY_FAILED == 0 && SERVICE_WAS_ACTIVE )); then
 		systemctl restart "awg-quick@${SERVER_AWG_NIC}" || APPLY_FAILED=1
 	elif (( APPLY_FAILED == 0 && MANUAL_INTERFACE_ACTIVE )); then
-		awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_CONF}") || APPLY_FAILED=1
+		awg-quick up "${SERVER_AWG_CONF}" || APPLY_FAILED=1
 	fi
 
 	if (( APPLY_FAILED != 0 )); then
@@ -6631,7 +6666,7 @@ function applyAwgProtocolTransaction() (
 		if (( SERVICE_WAS_ACTIVE )); then
 			systemctl restart "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 || true
 		elif (( MANUAL_INTERFACE_ACTIVE )); then
-			awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_CONF}") >/dev/null 2>&1 || true
+			restartManualAwgInterface >/dev/null 2>&1 || true
 		fi
 		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
 		return 1
@@ -6642,18 +6677,12 @@ function applyAwgProtocolTransaction() (
 	return 0
 )
 
-function setAwgProtocolMode() {
+function setAwgProtocolMode() (
 	local TARGET_MODE="$1"
-	local ORIGINAL_PROTOCOL="${AWG_PROTOCOL_VERSION:-${AWG_PROTOCOL_VERSION_2}}"
-	local ORIGINAL_KEY="${AWG_HEADER_PROTECTION_KEY:-}"
-	local ORIGINAL_CONTENT="${AWG_CONTENT_PADDING_ADDITION:-}"
-	local ORIGINAL_REKEY_AFTER="${AWG_REKEY_AFTER_TIME:-}"
-	local ORIGINAL_REKEY_TIMEOUT="${AWG_REKEY_TIMEOUT:-}"
-	local ORIGINAL_REJECT="${AWG_REJECT_AFTER_TIME:-}"
-	local ORIGINAL_KEEPALIVE="${AWG_KEEPALIVE_TIMEOUT:-}"
+	local ORIGINAL_PROTOCOL ORIGINAL_KEY ORIGINAL_CONTENT ORIGINAL_REKEY_AFTER
+	local ORIGINAL_REKEY_TIMEOUT ORIGINAL_REJECT ORIGINAL_KEEPALIVE
 	local NEW_KEY
 
-	normalizeAwgProtocolVersion || return 1
 	case "${TARGET_MODE}" in
 		2|3) ;;
 		*)
@@ -6661,11 +6690,27 @@ function setAwgProtocolMode() {
 			return 1
 			;;
 	esac
+	# Params must be read only after this process owns the same lifecycle lock as
+	# web-native add/remove operations and other protocol changes. Otherwise a
+	# concurrent opposite toggle can make an already-active check use stale state.
+	acquireClientLifecycleLock || return 1
+	if [[ "${TARGET_MODE}" == "2" ]]; then
+		loadParams 1 1
+	else
+		loadParams
+	fi
+	normalizeAwgProtocolVersion || return 1
 	if [[ "${AWG_PROTOCOL_VERSION}" == "${TARGET_MODE}" ]]; then
 		echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is already active."
 		return 0
 	fi
-	acquireClientLifecycleLock || return 1
+	ORIGINAL_PROTOCOL="${AWG_PROTOCOL_VERSION}"
+	ORIGINAL_KEY="${AWG_HEADER_PROTECTION_KEY:-}"
+	ORIGINAL_CONTENT="${AWG_CONTENT_PADDING_ADDITION:-}"
+	ORIGINAL_REKEY_AFTER="${AWG_REKEY_AFTER_TIME:-}"
+	ORIGINAL_REKEY_TIMEOUT="${AWG_REKEY_TIMEOUT:-}"
+	ORIGINAL_REJECT="${AWG_REJECT_AFTER_TIME:-}"
+	ORIGINAL_KEEPALIVE="${AWG_KEEPALIVE_TIMEOUT:-}"
 
 	if [[ "${TARGET_MODE}" == "3" ]]; then
 		NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
@@ -6698,7 +6743,7 @@ function setAwgProtocolMode() {
 
 	echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is now active."
 	echo "All client configuration files were updated; redistribute them before reconnecting clients."
-}
+)
 
 function changeAwgProtocolInteractively() {
 	local TARGET_MODE RESPONSE
@@ -7090,13 +7135,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
 				exit 1
 			fi
-			if [[ "$1" == "--disable-awg3" ]]; then
-				loadParams 1
-			else
-				loadParams
-			fi
 			case "$1" in
 				--protocol-status)
+					loadParams
 					printf '%s\n' "${AWG_PROTOCOL_VERSION}"
 					;;
 				--enable-awg3)

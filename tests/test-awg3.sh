@@ -87,7 +87,15 @@ cat >"${BIN_DIR}/ip" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${AWG3_TEST_IP_LOG}"
 if [[ "${1:-}" == "link" && "${2:-}" == "show" ]]; then
+	if [[ "${4:-}" == "${AWG3_TEST_SERVER_INTERFACE:-}" && \
+		-n "${AWG3_TEST_MANUAL_STATE:-}" && -e "${AWG3_TEST_MANUAL_STATE}" ]]; then
+		exit 0
+	fi
 	exit 1
+fi
+if [[ "${1:-}" == "link" && "${2:-}" == "delete" && \
+	"${4:-}" == "${AWG3_TEST_SERVER_INTERFACE:-}" && -n "${AWG3_TEST_MANUAL_STATE:-}" ]]; then
+	rm -f -- "${AWG3_TEST_MANUAL_STATE}"
 fi
 exit 0
 EOF
@@ -95,10 +103,37 @@ chmod +x "${BIN_DIR}/ip"
 
 cat >"${BIN_DIR}/awg-quick" <<'EOF'
 #!/usr/bin/env bash
-[[ "${1:-}" == "strip" && -f "${2:-}" ]] || exit 1
-sed -E '/^(Address|DNS|PostUp|PostDown)[[:space:]]*=/d' "$2"
+case "${1:-}" in
+	strip)
+		[[ -f "${2:-}" ]] || exit 1
+		sed -E '/^(Address|DNS|PostUp|PostDown)[[:space:]]*=/d' "$2"
+		;;
+	down)
+		printf 'down %s\n' "${2:-}" >>"${AWG3_TEST_AWG_QUICK_LOG}"
+		[[ "${AWG3_TEST_FAIL_MANUAL_DOWN:-0}" != "1" ]] || exit 1
+		[[ -z "${AWG3_TEST_MANUAL_STATE:-}" ]] || rm -f -- "${AWG3_TEST_MANUAL_STATE}"
+		;;
+	up)
+		printf 'up %s\n' "${2:-}" >>"${AWG3_TEST_AWG_QUICK_LOG}"
+		[[ "${AWG3_TEST_FAIL_MANUAL_UP:-0}" != "1" ]] || exit 1
+		if [[ -n "${AWG3_TEST_MANUAL_STATE:-}" ]]; then
+			: >"${AWG3_TEST_MANUAL_STATE}"
+		fi
+		;;
+	*) exit 1 ;;
+esac
 EOF
 chmod +x "${BIN_DIR}/awg-quick"
+
+cat >"${BIN_DIR}/getent" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "passwd" && "${2:-}" == "alice" && -n "${AWG3_TEST_CUSTOM_HOME:-}" ]]; then
+	printf 'alice:x:1001:1001:Alice:%s:/bin/bash\n' "${AWG3_TEST_CUSTOM_HOME}"
+	exit 0
+fi
+exit 2
+EOF
+chmod +x "${BIN_DIR}/getent"
 
 cat >"${BIN_DIR}/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -122,6 +157,7 @@ chmod +x "${BIN_DIR}/systemctl"
 export PATH="${BIN_DIR}:${PATH}"
 export TMPDIR="${TEST_TMPDIR}"
 export AWG3_TEST_IP_LOG="${TEST_ROOT}/ip.log"
+export AWG3_TEST_AWG_QUICK_LOG="${TEST_ROOT}/awg-quick.log"
 
 echo "=== AWG 3.0 compatibility and capability helpers ==="
 
@@ -197,6 +233,42 @@ else
 fi
 AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
 
+RECOVERY_MIGRATION_LOG="${TEST_ROOT}/recovery-migrations.log"
+: >"${RECOVERY_MIGRATION_LOG}"
+if (
+	validateParamsFile() { return 0; }
+	migrateS3S4() { printf 's3s4\n' >>"${RECOVERY_MIGRATION_LOG}"; return 0; }
+	migrateH1H4() { printf 'h1h4\n' >>"${RECOVERY_MIGRATION_LOG}"; return 0; }
+	persistMigration() { printf 'persist\n' >>"${RECOVERY_MIGRATION_LOG}"; }
+	quietIPv6Rewrite() { printf 'ipv6\n' >>"${RECOVERY_MIGRATION_LOG}"; }
+	loadParams 1 1
+) && [[ ! -s "${RECOVERY_MIGRATION_LOG}" ]]; then
+	ok "AWG 2.0 recovery loading does not mutate legacy protocol state before the transaction"
+else
+	not_ok "AWG 2.0 recovery loading does not mutate legacy protocol state before the transaction"
+fi
+
+PROTOCOL_LOCK_ORDER="${TEST_ROOT}/protocol-lock-order.log"
+: >"${PROTOCOL_LOCK_ORDER}"
+if (
+	AWG_PROTOCOL_VERSION=2
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${PROTOCOL_LOCK_ORDER}"; }
+	loadParams() {
+		printf 'load\n' >>"${PROTOCOL_LOCK_ORDER}"
+		AWG_PROTOCOL_VERSION=3
+		AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
+	}
+	applyAwgProtocolTransaction() {
+		printf 'apply-%s\n' "${AWG_PROTOCOL_VERSION}" >>"${PROTOCOL_LOCK_ORDER}"
+		[[ "${AWG_PROTOCOL_VERSION}" == "2" ]]
+	}
+	setAwgProtocolMode 2 >/dev/null
+) && [[ "$(paste -sd, "${PROTOCOL_LOCK_ORDER}")" == "lock,load,apply-2" ]]; then
+	ok "protocol changes lock and reload persisted state before deciding a toggle is a no-op"
+else
+	not_ok "protocol changes lock and reload persisted state before deciding a toggle is a no-op"
+fi
+
 : >"${AWG3_TEST_IP_LOG}"
 if probeAwg3Capability "${MOCK_KEY}"; then
 	if grep -q '^link add dev awgp' "${AWG3_TEST_IP_LOG}" && \
@@ -242,6 +314,7 @@ unset AWG3_TEST_CONTENT_READBACK
 AMNEZIAWG_DIR="${TEST_ROOT}/state"
 WEB_PANEL_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
 SERVER_AWG_NIC="awgt0"
+export AWG3_TEST_SERVER_INTERFACE="${SERVER_AWG_NIC}"
 SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 mkdir -p "${AMNEZIAWG_DIR}/clients"
 SERVER_PUB_IP="198.51.100.10"
@@ -325,6 +398,27 @@ else
 fi
 cp -p "${SERVER_MANAGED_BACKUP}" "${SERVER_AWG_CONF}"
 
+CUSTOM_HOME="${TEST_ROOT}/custom-home"
+CUSTOM_CLIENT_CONF="${CUSTOM_HOME}/${SERVER_AWG_NIC}-client-alice.conf"
+mkdir -p "${CUSTOM_HOME}"
+cp -p "${CLIENT_CONF}" "${CUSTOM_CLIENT_CONF}"
+export AWG3_TEST_CUSTOM_HOME="${CUSTOM_HOME}"
+declare -a CUSTOM_HOME_CANDIDATES=()
+CUSTOM_CLIENT_CANONICAL="$(readlink -f -- "${CUSTOM_CLIENT_CONF}")"
+CUSTOM_HOME_FOUND=0
+if collectAwgClientConfigCandidates CUSTOM_HOME_CANDIDATES; then
+	for CANDIDATE in "${CUSTOM_HOME_CANDIDATES[@]}"; do
+		[[ "${CANDIDATE}" == "${CUSTOM_CLIENT_CANONICAL}" ]] && CUSTOM_HOME_FOUND=1
+	done
+fi
+if (( CUSTOM_HOME_FOUND )); then
+	ok "protocol migration discovers managed client configs in NSS custom home directories"
+else
+	not_ok "protocol migration discovers managed client configs in NSS custom home directories"
+fi
+unset AWG3_TEST_CUSTOM_HOME
+rm -rf -- "${CUSTOM_HOME}"
+
 AWG_PROTOCOL_VERSION=3
 AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
 AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
@@ -344,14 +438,22 @@ fi
 
 AWG_PROTOCOL_VERSION=2
 clearAwg3Params
+: >"${AWG3_TEST_AWG_QUICK_LOG}"
+AWG3_TEST_MANUAL_STATE="${TEST_ROOT}/manual-interface.active"
+export AWG3_TEST_MANUAL_STATE
+: >"${AWG3_TEST_MANUAL_STATE}"
 if applyAwgProtocolTransaction && \
 	grep -q "^AWG_PROTOCOL_VERSION='2'$" "${AMNEZIAWG_DIR}/params" && \
 	! grep -q '^HeaderProtectionKey = ' "${SERVER_AWG_CONF}" && \
-	! grep -q '^HeaderProtectionKey = ' "${CLIENT_CONF}"; then
-	ok "AWG 2.0 downgrade transaction removes all AWG 3.0-only fields"
+	! grep -q '^HeaderProtectionKey = ' "${CLIENT_CONF}" && \
+	[[ -e "${AWG3_TEST_MANUAL_STATE}" ]] && \
+	[[ "$(sed -n '1p' "${AWG3_TEST_AWG_QUICK_LOG}")" == "down ${SERVER_AWG_CONF}" ]] && \
+	[[ "$(sed -n '2p' "${AWG3_TEST_AWG_QUICK_LOG}")" == "up ${SERVER_AWG_CONF}" ]]; then
+	ok "AWG 2.0 downgrade recreates a manually active interface and removes AWG 3.0-only fields"
 else
-	not_ok "AWG 2.0 downgrade transaction removes all AWG 3.0-only fields"
+	not_ok "AWG 2.0 downgrade recreates a manually active interface and removes AWG 3.0-only fields"
 fi
+unset AWG3_TEST_MANUAL_STATE
 
 SERVER_BEFORE="$(sha256sum "${SERVER_AWG_CONF}")"
 PARAMS_BEFORE="$(sha256sum "${AMNEZIAWG_DIR}/params")"
