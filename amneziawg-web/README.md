@@ -158,9 +158,10 @@ To upgrade with a pre-built binary:
 sudo ./amneziawg-web.sh upgrade --binary ./target/release/amneziawg-web
 ```
 
-The upgrade script replaces the binary and root-owned privileged helper, then restarts
-the service if it was running. Configuration, data, and the systemd unit are preserved
-by default.
+The upgrade script replaces the binary, root-owned privileged helper, and the AWG
+lifecycle script when its installer ownership marker is present, then restarts the
+service if it was running. Unmarked operator-managed lifecycle scripts, configuration,
+data, and the systemd unit are preserved by default.
 See [docs/INSTALL.md](docs/INSTALL.md) for full details.
 
 ### Uninstalling

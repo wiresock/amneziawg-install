@@ -249,6 +249,30 @@ else
 	not_ok "AWG 2.0 recovery loading does not mutate legacy protocol state before the transaction"
 fi
 
+ENABLE_LEGACY_ORDER="${TEST_ROOT}/enable-legacy-order.log"
+: >"${ENABLE_LEGACY_ORDER}"
+if (
+	AWG_PROTOCOL_VERSION=2
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${ENABLE_LEGACY_ORDER}"; }
+	loadParams() {
+		printf 'load-%s-%s\n' "${1:-}" "${2:-}" >>"${ENABLE_LEGACY_ORDER}"
+		AWG_PROTOCOL_VERSION=2
+	}
+	awg2StateNeedsLegacyMigration() {
+		printf 'legacy\n' >>"${ENABLE_LEGACY_ORDER}"
+		return 0
+	}
+	probeAwg3Capability() { printf 'probe\n' >>"${ENABLE_LEGACY_ORDER}"; }
+	applyAwgProtocolTransaction() { printf 'apply\n' >>"${ENABLE_LEGACY_ORDER}"; }
+	if setAwgProtocolMode 3 >/dev/null 2>&1; then
+		exit 1
+	fi
+) && [[ "$(paste -sd, "${ENABLE_LEGACY_ORDER}")" == "lock,load-0-1,legacy" ]]; then
+	ok "AWG 3.0 enablement rejects pending AWG 2.0 migration before capability probing or writes"
+else
+	not_ok "AWG 3.0 enablement rejects pending AWG 2.0 migration before capability probing or writes"
+fi
+
 PROTOCOL_LOCK_ORDER="${TEST_ROOT}/protocol-lock-order.log"
 : >"${PROTOCOL_LOCK_ORDER}"
 if (

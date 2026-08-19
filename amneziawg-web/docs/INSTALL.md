@@ -536,13 +536,14 @@ fetched on demand when missing.
 
 ### Default behavior
 
-The upgrade script stages and validates the application and both privilege
-artifacts before it stops an active service:
+The upgrade script stages and validates the application, any installer-managed
+lifecycle script, and both privilege artifacts before it stops an active service:
 
 | Action | What happens |
 |---|---|
 | **Built** | *(source mode)* compiled from source via `cargo build --release` |
 | **Replaced** | installed binary (`/usr/local/bin/amneziawg-web`) |
+| **Replaced** | installer-managed AWG lifecycle script recorded by `/etc/amneziawg-web/installed-awg-script.path` |
 | **Replaced** | privileged helper (`/usr/local/libexec/amneziawg-web-privileged`) |
 | **Regenerated** | sudoers drop-in (`/etc/sudoers.d/amneziawg-web`), validated before replacement |
 | **Restarted** | service (only if it was active before upgrade) |
@@ -550,6 +551,7 @@ artifacts before it stops an active service:
 | **Preserved** | data directory (`/var/lib/amneziawg-web/`) |
 | **Preserved** | systemd unit file (unless `--refresh-unit` is given) |
 | **Preserved** | service user (`awg-web`) |
+| **Preserved** | unmarked/operator-managed AWG lifecycle script; re-run the installer with `--force` to replace and register it for AWG protocol controls |
 
 ### Restart behavior
 

@@ -6309,6 +6309,23 @@ function loadParams() {
 	fi
 }
 
+# Return success when an older AWG 2.0 installation still needs the ordinary
+# compatibility migration performed by loadParams. Run the migration probes in
+# a subshell so generated replacement values never escape into the protocol
+# transaction before the operator has accepted that compatibility migration.
+function awg2StateNeedsLegacyMigration() (
+	if [[ "${_MIGRATE_ORIG_IPV6}" != "${SERVER_AWG_IPV6}" ]]; then
+		return 0
+	fi
+	if migrateS3S4; then
+		return 0
+	fi
+	if migrateH1H4; then
+		return 0
+	fi
+	return 1
+)
+
 # Rewrite only AWG 3.0 interface fields, preserving all addresses, keys, peers,
 # routes, DNS settings, comments, and firewall hooks byte-for-line otherwise.
 # The field file is private because it contains HeaderProtectionKey in mode 3.
@@ -6696,15 +6713,23 @@ function setAwgProtocolMode() (
 	# web-native add/remove operations and other protocol changes. Otherwise a
 	# concurrent opposite toggle can make an already-active check use stale state.
 	acquireClientLifecycleLock || return 1
+	# Neither protocol direction may run the older compatibility migrations
+	# before the protocol transaction has captured its complete rollback set.
+	# Damaged AWG 3.0-only state remains recoverable only through mode 2.
 	if [[ "${TARGET_MODE}" == "2" ]]; then
 		loadParams 1 1
 	else
-		loadParams
+		loadParams 0 1
 	fi
 	normalizeAwgProtocolVersion || return 1
 	if [[ "${AWG_PROTOCOL_VERSION}" == "${TARGET_MODE}" ]]; then
 		echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is already active."
 		return 0
+	fi
+	if [[ "${TARGET_MODE}" == "3" ]] && awg2StateNeedsLegacyMigration; then
+		echo "ERROR: this installation needs AWG 2.0 compatibility normalization before AWG 3.0 can be enabled." >&2
+		echo "Run amneziawg-install.sh interactively, complete any prompted migration, and then retry." >&2
+		return 1
 	fi
 	ORIGINAL_PROTOCOL="${AWG_PROTOCOL_VERSION}"
 	ORIGINAL_KEY="${AWG_HEADER_PROTECTION_KEY:-}"
@@ -7139,7 +7164,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 			fi
 			case "$1" in
 				--protocol-status)
-					loadParams
+					# Status is a read-only query and must never prompt for or persist
+					# an unrelated legacy compatibility migration.
+					loadParams 0 1
 					printf '%s\n' "${AWG_PROTOCOL_VERSION}"
 					;;
 				--enable-awg3)

@@ -3078,6 +3078,62 @@ else
 fi
 
 echo ""
+echo "--- Web upgrader: preserve unmanaged AWG lifecycle script ---"
+
+UNMANAGED_UPGRADE_BINARY="/tmp/amneziawg-web-upgrade-unmanaged"
+cat > "${UNMANAGED_UPGRADE_BINARY}" <<'UNMANAGEDEOF'
+#!/bin/bash
+echo "amneziawg-web unmanaged-script upgrade test"
+UNMANAGEDEOF
+chmod +x "${UNMANAGED_UPGRADE_BINARY}"
+cat > "${WEB_AWG_SCRIPT_PATH}" <<'UNMANAGEDAWGEOF'
+#!/bin/bash
+echo operator-managed-awg-script
+UNMANAGEDAWGEOF
+chmod 0755 "${WEB_AWG_SCRIPT_PATH}"
+rm -f "${WEB_AWG_SCRIPT_MARKER}"
+UNMANAGED_AWG_HASH=$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')
+
+WEB_UPGRADE_UNMANAGED_RC=0
+WEB_UPGRADE_UNMANAGED_OUTPUT=$(bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${UNMANAGED_UPGRADE_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--force 2>&1) || WEB_UPGRADE_UNMANAGED_RC=$?
+
+if [[ "${WEB_UPGRADE_UNMANAGED_RC}" -eq 0 ]] && \
+		[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')" == "${UNMANAGED_AWG_HASH}" ]] && \
+		[[ ! -e "${WEB_AWG_SCRIPT_MARKER}" ]] && \
+		echo "${WEB_UPGRADE_UNMANAGED_OUTPUT}" | grep -qi "preserving unmanaged"; then
+	echo "OK: Upgrader preserves an unmarked operator-managed AWG lifecycle script"
+else
+	echo "FAIL: Upgrader changed or claimed an unmarked operator-managed AWG lifecycle script"
+	echo "  Output: ${WEB_UPGRADE_UNMANAGED_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+rm -f "${UNMANAGED_UPGRADE_BINARY}"
+
+# Restore the installer-managed lifecycle generation used by the remaining
+# transactional upgrade tests.
+WEB_RESTORE_MANAGED_RC=0
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1 || WEB_RESTORE_MANAGED_RC=$?
+if [[ "${WEB_RESTORE_MANAGED_RC}" -ne 0 || ! -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
+	echo "FAIL: Could not restore installer-managed AWG lifecycle test fixture"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
 echo "--- Web upgrader: failed sudoers preflight preserves live install ---"
 
 PREFLIGHT_BINARY="/tmp/amneziawg-web-upgrade-preflight"

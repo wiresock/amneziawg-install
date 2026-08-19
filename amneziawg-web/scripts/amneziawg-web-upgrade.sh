@@ -606,6 +606,7 @@ fi
 
 resolve_awg_install_script_refresh() {
     local marker_path
+    local marker_managed="false"
     local resolved_path="${DEFAULT_AWG_INSTALL_SCRIPT_DEST}"
     local configured_path=""
     local script_dir=""
@@ -620,6 +621,7 @@ resolve_awg_install_script_refresh() {
         die "AWG lifecycle-script marker is not a safe regular file: ${marker_path}"
     fi
     if [[ -f "${marker_path}" && ! -L "${marker_path}" ]]; then
+        marker_managed="true"
         resolved_path="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
         if tail -n +2 "${marker_path}" 2>/dev/null | grep -q '[^[:space:]]'; then
             die "AWG lifecycle-script marker has unexpected trailing content: ${marker_path}"
@@ -631,6 +633,20 @@ resolve_awg_install_script_refresh() {
         if [[ -n "${configured_path}" ]]; then
             resolved_path="${configured_path}"
         fi
+    fi
+
+    AWG_INSTALL_SCRIPT_DEST="${resolved_path}"
+    AWG_INSTALL_SCRIPT_SRC="${SCRIPT_DIR}/../../amneziawg-install.sh"
+
+    # The installer deliberately leaves no marker when it preserves an
+    # operator-managed script. Without that explicit ownership record, the
+    # upgrader must not take ownership or overwrite the path, even when the
+    # repository contains a newer lifecycle script.
+    if [[ "${marker_managed}" != "true" ]]; then
+        warn "No installer ownership marker found; preserving unmanaged AWG lifecycle script: ${AWG_INSTALL_SCRIPT_DEST}"
+        warn "AWG protocol controls require an installer-managed lifecycle script; re-run the web installer with --force to replace and register it."
+        REFRESH_AWG_INSTALL_SCRIPT="false"
+        return 0
     fi
 
     if [[ "${resolved_path}" != /* ]] || [[ "${resolved_path}" =~ [[:space:],] ]]; then
@@ -664,8 +680,6 @@ resolve_awg_install_script_refresh() {
         die "AWG lifecycle-script destination is not a safe regular file: ${resolved_path}"
     fi
 
-    AWG_INSTALL_SCRIPT_DEST="${resolved_path}"
-    AWG_INSTALL_SCRIPT_SRC="${SCRIPT_DIR}/../../amneziawg-install.sh"
     if [[ -f "${AWG_INSTALL_SCRIPT_SRC}" && ! -L "${AWG_INSTALL_SCRIPT_SRC}" ]]; then
         REFRESH_AWG_INSTALL_SCRIPT="true"
         return 0
