@@ -2274,7 +2274,10 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	HELPER_INSTALL_SCRIPT="$(head -n 1 "${WEB_AWG_SCRIPT_MARKER}")"
 	HELPER_SCRIPT_BACKUP="/tmp/amneziawg-helper-script-backup"
 	HELPER_PROTOCOL_CALLS="/tmp/amneziawg-helper-protocol-calls"
+	HELPER_UNIT_BACKUP="/tmp/amneziawg-helper-unit-backup"
+	HELPER_CUSTOM_ENV_ROOT="/opt/amneziawg-web-helper-test"
 	cp -p "${HELPER_INSTALL_SCRIPT}" "${HELPER_SCRIPT_BACKUP}"
+	cp -p /etc/systemd/system/amneziawg-web.service "${HELPER_UNIT_BACKUP}"
 	printf '#!/bin/bash\nprintf "%%s\\n" "$1" >> %s\n' \
 		"${HELPER_PROTOCOL_CALLS}" > "${HELPER_INSTALL_SCRIPT}"
 	chmod 0755 "${HELPER_INSTALL_SCRIPT}"
@@ -2287,8 +2290,41 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 		[[ "$(sed -n '2p' "${HELPER_PROTOCOL_CALLS}")" == "--disable-awg3" ]]; then
 		HELPER_PROTOCOL_DISPATCH_OK=1
 	fi
+
+	# The installer supports root-controlled custom --env-file locations. The
+	# privileged helper must find the ownership marker beside that effective
+	# EnvironmentFile without weakening its directory/file checks.
+	rm -rf "${HELPER_CUSTOM_ENV_ROOT}"
+	install -d -m 0700 -o root -g root "${HELPER_CUSTOM_ENV_ROOT}"
+	install -m 0600 -o root -g root "${WEB_TEST_ENV_FILE}" \
+		"${HELPER_CUSTOM_ENV_ROOT}/env.conf"
+	install -m 0600 -o root -g root "${WEB_AWG_SCRIPT_MARKER}" \
+		"${HELPER_CUSTOM_ENV_ROOT}/installed-awg-script.path"
+	sed -i "s#^EnvironmentFile=.*#EnvironmentFile=${HELPER_CUSTOM_ENV_ROOT}/env.conf#" \
+		/etc/systemd/system/amneziawg-web.service
+	HELPER_CUSTOM_ENV_OK=0
+	if grep -Fqx "EnvironmentFile=${HELPER_CUSTOM_ENV_ROOT}/env.conf" \
+			/etc/systemd/system/amneziawg-web.service && \
+		"${PRIVILEGED_HELPER}" enable-awg3 && \
+		[[ "$(sed -n '3p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg3" ]]; then
+		HELPER_CUSTOM_ENV_OK=1
+	fi
+	chmod 0777 "${HELPER_CUSTOM_ENV_ROOT}"
+	if "${PRIVILEGED_HELPER}" disable-awg3 >/dev/null 2>&1; then
+		HELPER_CUSTOM_ENV_OK=0
+	fi
+	chmod 0700 "${HELPER_CUSTOM_ENV_ROOT}"
+	cp -p "${HELPER_UNIT_BACKUP}" /etc/systemd/system/amneziawg-web.service
+	rm -rf "${HELPER_CUSTOM_ENV_ROOT}"
+	if [[ "${HELPER_CUSTOM_ENV_OK}" -eq 1 ]]; then
+		echo "OK: Privileged helper supports secure custom EnvironmentFile directories"
+	else
+		echo "FAIL: Privileged helper did not safely support a custom EnvironmentFile directory"
+		FAILED=$((FAILED + 1))
+	fi
+
 	cp -p "${HELPER_SCRIPT_BACKUP}" "${HELPER_INSTALL_SCRIPT}"
-	rm -f "${HELPER_SCRIPT_BACKUP}" "${HELPER_PROTOCOL_CALLS}"
+	rm -f "${HELPER_SCRIPT_BACKUP}" "${HELPER_PROTOCOL_CALLS}" "${HELPER_UNIT_BACKUP}"
 	if [[ "${HELPER_PROTOCOL_DISPATCH_OK}" -eq 1 ]]; then
 		echo "OK: Privileged helper dispatches only fixed protocol migration flags"
 	else

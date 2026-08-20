@@ -477,8 +477,12 @@ resolve_awg_install_script() {
     require_executable "${STAT_BIN}"
     validate_root_owned_file "${WEB_SYSTEMD_UNIT}" false
     while IFS= read -r unit_line || [[ -n "${unit_line}" ]]; do
-        if [[ "${unit_line}" =~ ^EnvironmentFile=-?(/etc/[A-Za-z0-9_./-]+)$ ]]; then
-            environment_file="${BASH_REMATCH[1]}"
+        if [[ "${unit_line}" == EnvironmentFile=* ]]; then
+            if [[ "${unit_line}" =~ ^EnvironmentFile=-?(/[A-Za-z0-9_./-]+)$ ]]; then
+                environment_file="${BASH_REMATCH[1]}"
+            else
+                fail "service unit contains an unsupported environment-file path"
+            fi
         fi
     done < "${WEB_SYSTEMD_UNIT}"
     if [[ -n "${environment_file}" ]]; then
@@ -486,8 +490,9 @@ resolve_awg_install_script() {
             fail "service unit contains an unsafe environment-file path"
         fi
         web_config_root="${environment_file%/*}"
+        [[ -n "${web_config_root}" ]] || web_config_root="/"
     fi
-    marker_path="${web_config_root}/installed-awg-script.path"
+    marker_path="${web_config_root%/}/installed-awg-script.path"
 
     validate_root_owned_directory "${web_config_root}"
     validate_root_owned_file "${marker_path}" false
