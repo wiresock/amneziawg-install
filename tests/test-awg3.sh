@@ -306,16 +306,42 @@ if (
 	AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
 	acquireClientLifecycleLock() { printf 'lock\n' >>"${SAME_MODE_REPAIR_LOG}"; }
 	loadParams() { printf 'load-%s-%s\n' "${1:-}" "${2:-}" >>"${SAME_MODE_REPAIR_LOG}"; }
+	ensureAmneziawgKernelModule() { printf 'ensure-module\n' >>"${SAME_MODE_REPAIR_LOG}"; }
 	awgProtocolConfigsMatchPersistedState() { printf 'verify\n' >>"${SAME_MODE_REPAIR_LOG}"; return 1; }
-	probeAwg3Capability() { printf 'unexpected-probe\n' >>"${SAME_MODE_REPAIR_LOG}"; return 1; }
+	probeAwg3Capability() { printf 'probe-%s\n' "$1" >>"${SAME_MODE_REPAIR_LOG}"; }
 	applyAwgProtocolTransaction() {
 		printf 'apply-%s-%s\n' "${AWG_PROTOCOL_VERSION}" "${AWG_HEADER_PROTECTION_KEY}" >>"${SAME_MODE_REPAIR_LOG}"
 	}
 	setAwgProtocolMode 3 >/dev/null 2>&1
-) && [[ "$(paste -sd, "${SAME_MODE_REPAIR_LOG}")" == "lock,load-0-1,verify,apply-3-${MOCK_KEY}" ]]; then
-	ok "same-mode AWG 3.0 requests repair inconsistent configs without rotating the key"
+) && [[ "$(paste -sd, "${SAME_MODE_REPAIR_LOG}")" == "lock,load-0-1,ensure-module,probe-${MOCK_KEY},verify,apply-3-${MOCK_KEY}" ]]; then
+	ok "same-mode AWG 3.0 requests re-probe support and repair without rotating the key"
 else
-	not_ok "same-mode AWG 3.0 requests repair inconsistent configs without rotating the key"
+	not_ok "same-mode AWG 3.0 requests re-probe support and repair without rotating the key"
+fi
+
+SAME_MODE_AWG3_PROBE_LOG="${TEST_ROOT}/same-mode-awg3-probe.log"
+: >"${SAME_MODE_AWG3_PROBE_LOG}"
+if (
+	AWG_PROTOCOL_VERSION=3
+	AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
+	AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+	AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+	AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+	AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+	AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
+	loadParams() { printf 'load\n' >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
+	ensureAmneziawgKernelModule() { printf 'ensure-module\n' >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
+	probeAwg3Capability() { printf 'probe-%s\n' "$1" >>"${SAME_MODE_AWG3_PROBE_LOG}"; return 1; }
+	awgProtocolConfigsMatchPersistedState() { printf 'unexpected-verify\n' >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
+	applyAwgProtocolTransaction() { printf 'unexpected-apply\n' >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
+	if setAwgProtocolMode 3 >/dev/null 2>&1; then
+		exit 1
+	fi
+) && [[ "$(paste -sd, "${SAME_MODE_AWG3_PROBE_LOG}")" == "lock,load,ensure-module,probe-${MOCK_KEY}" ]]; then
+	ok "same-mode AWG 3.0 requests fail closed when the current kernel probe fails"
+else
+	not_ok "same-mode AWG 3.0 requests fail closed when the current kernel probe fails"
 fi
 
 SAME_MODE_NOOP_LOG="${TEST_ROOT}/same-mode-noop.log"

@@ -6819,6 +6819,15 @@ function setAwgProtocolMode() (
 	fi
 	normalizeAwgProtocolVersion || return 1
 	if [[ "${AWG_PROTOCOL_VERSION}" == "${TARGET_MODE}" ]]; then
+		# A persisted AWG 3.0 mode is not enough to prove that the currently
+		# installed userspace and running kernel still support it. Kernel/package
+		# changes can invalidate a previously successful migration, so every
+		# explicit enable request must repeat the complete readback probe without
+		# rotating the shared key.
+		if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
+			ensureAmneziawgKernelModule >/dev/null 2>&1 || true
+			probeAwg3Capability "${AWG_HEADER_PROTECTION_KEY}" || return 1
+		fi
 		if awgProtocolConfigsMatchPersistedState; then
 			echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is already active and consistent."
 			return 0
