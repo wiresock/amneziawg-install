@@ -1,6 +1,6 @@
 # AmneziaWG Installer
 
-Set up an [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscated VPN on any supported Linux server in under 2 minutes — with an optional web panel and an optional traffic-obfuscation proxy.
+Set up an [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscated VPN on any supported Linux server in under 2 minutes — with backward-compatible AWG 2.0 defaults, optional AWG 3.0 support, an optional web panel, and an optional traffic-obfuscation proxy.
 
 ```
 VPN install → (optional) Web panel → (optional) Obfuscation proxy → Manage clients
@@ -10,12 +10,12 @@ VPN install → (optional) Web panel → (optional) Obfuscation proxy → Manage
 
 ## 📖 Background
 
-This project started as a fork of [RomikB/amneziawg-install](https://github.com/RomikB/amneziawg-install). I needed a reliable way to stand up **AmneziaWG 2.0** servers for testing [WireSock Secure Connect](https://www.wiresock.net/), and the upstream script predated the 2.0 release — so I took it and extended it to generate and manage the new 2.0 obfuscation parameters (S3/S4 padding and the H1–H4 header ranges).
+This project started as a fork of [RomikB/amneziawg-install](https://github.com/RomikB/amneziawg-install). I needed a reliable way to stand up **AmneziaWG 2.0** servers for testing [WireSock Secure Connect](https://www.wiresock.net/), and the upstream script predated the 2.0 release — so I took it and extended it to generate and manage the new 2.0 obfuscation parameters (S3/S4 padding and the H1–H4 header ranges). It now also supports an explicit, capability-checked migration to **AmneziaWG 3.0** while preserving AWG 2.0 as the default for new and existing installations.
 
 Once the installer was solid, it was hard to stop:
 
-1. **`amneziawg-install.sh`** — the original script, extended for AmneziaWG 2.0 (S3/S4, H1–H4, migration from pre-2.0 installs).
-2. **`amneziawg-web.sh`** — a web panel for managing clients without touching the CLI.
+1. **`amneziawg-install.sh`** — the original script, extended for AmneziaWG 2.0 (S3/S4, H1–H4, migration from pre-2.0 installs) and optional AmneziaWG 3.0 header protection.
+2. **`amneziawg-web.sh`** — a web panel for managing clients and explicit AWG 2.0/AWG 3.0 migrations without touching the CLI.
 3. **`amneziawg-proxy.sh`** — a UDP obfuscation proxy that takes traffic camouflage to the next level: it wraps AmneziaWG so the datagrams on the wire look like a legitimate QUIC, DNS, STUN, or SIP service to Deep Packet Inspection (DPI).
 
 > **⚠️ amneziawg-proxy is most powerful with WireSock Secure Connect 3.5+.**
@@ -58,6 +58,7 @@ sudo ./amneziawg-proxy.sh
 
 ✅ **After installation:**
 - VPN server is running
+- AWG 2.0 remains active by default; [AWG 3.0](#-optional-awg-30-mode) is enabled only by an explicit migration after userspace and kernel capability checks pass
 - A client config file is generated at `~/awg0-client-<name>.conf`
 - (If installed) Web panel listens on `127.0.0.1:8080` by default — access it on the server at `http://127.0.0.1:8080`, or change `AWG_WEB_LISTEN` / use a reverse proxy for remote access
 
@@ -65,7 +66,7 @@ sudo ./amneziawg-proxy.sh
 
 ## 🧠 How It Works
 
-- **`amneziawg-install.sh`** — **required.** Installs the VPN server, generates obfuscation parameters, and creates client configs.
+- **`amneziawg-install.sh`** — **required.** Installs the VPN server, generates obfuscation parameters, creates client configs, and can transactionally enable AWG 3.0 after capability checks or return the installation to AWG 2.0.
 - **`amneziawg-web.sh`** — **optional.** Unified script for:
   - `install` — install the web panel
   - `upgrade` — upgrade the binary
