@@ -273,6 +273,27 @@ else
 	not_ok "AWG 3.0 enablement rejects pending AWG 2.0 migration before capability probing or writes"
 fi
 
+ENABLE_MODULE_ONLY_LOG="${TEST_ROOT}/enable-module-only.log"
+: >"${ENABLE_MODULE_ONLY_LOG}"
+if (
+	AWG_PROTOCOL_VERSION=2
+	clearAwg3Params
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${ENABLE_MODULE_ONLY_LOG}"; }
+	loadParams() {
+		printf 'load\n' >>"${ENABLE_MODULE_ONLY_LOG}"
+		AWG_PROTOCOL_VERSION=2
+	}
+	awg2StateNeedsLegacyMigration() { return 1; }
+	ensureAmneziawgKernelModule() { printf 'ensure-module-%s\n' "${1:-}" >>"${ENABLE_MODULE_ONLY_LOG}"; }
+	probeAwg3Capability() { printf 'probe\n' >>"${ENABLE_MODULE_ONLY_LOG}"; }
+	applyAwgProtocolTransaction() { printf 'apply\n' >>"${ENABLE_MODULE_ONLY_LOG}"; }
+	setAwgProtocolMode 3 >/dev/null 2>&1
+) && [[ "$(paste -sd, "${ENABLE_MODULE_ONLY_LOG}")" == "lock,load,ensure-module-0,probe,apply" ]]; then
+	ok "AWG 3.0 transitions prepare the module without starting the managed service"
+else
+	not_ok "AWG 3.0 transitions prepare the module without starting the managed service"
+fi
+
 PROTOCOL_LOCK_ORDER="${TEST_ROOT}/protocol-lock-order.log"
 : >"${PROTOCOL_LOCK_ORDER}"
 if (
@@ -336,14 +357,14 @@ if (
 	AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
 	acquireClientLifecycleLock() { printf 'lock\n' >>"${SAME_MODE_REPAIR_LOG}"; }
 	loadParams() { printf 'load-%s-%s\n' "${1:-}" "${2:-}" >>"${SAME_MODE_REPAIR_LOG}"; }
-	ensureAmneziawgKernelModule() { printf 'ensure-module\n' >>"${SAME_MODE_REPAIR_LOG}"; }
+	ensureAmneziawgKernelModule() { printf 'ensure-module-%s\n' "${1:-}" >>"${SAME_MODE_REPAIR_LOG}"; }
 	awgProtocolConfigsMatchPersistedState() { printf 'verify\n' >>"${SAME_MODE_REPAIR_LOG}"; return 1; }
 	probeAwg3Capability() { printf 'probe-%s\n' "$1" >>"${SAME_MODE_REPAIR_LOG}"; }
 	applyAwgProtocolTransaction() {
 		printf 'apply-%s-%s\n' "${AWG_PROTOCOL_VERSION}" "${AWG_HEADER_PROTECTION_KEY}" >>"${SAME_MODE_REPAIR_LOG}"
 	}
 	setAwgProtocolMode 3 >/dev/null 2>&1
-) && [[ "$(paste -sd, "${SAME_MODE_REPAIR_LOG}")" == "lock,load-0-1,ensure-module,probe-${MOCK_KEY},verify,apply-3-${MOCK_KEY}" ]]; then
+) && [[ "$(paste -sd, "${SAME_MODE_REPAIR_LOG}")" == "lock,load-0-1,ensure-module-0,probe-${MOCK_KEY},verify,apply-3-${MOCK_KEY}" ]]; then
 	ok "same-mode AWG 3.0 requests re-probe support and repair without rotating the key"
 else
 	not_ok "same-mode AWG 3.0 requests re-probe support and repair without rotating the key"
@@ -361,14 +382,14 @@ if (
 	AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
 	acquireClientLifecycleLock() { printf 'lock\n' >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
 	loadParams() { printf 'load\n' >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
-	ensureAmneziawgKernelModule() { printf 'ensure-module\n' >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
+	ensureAmneziawgKernelModule() { printf 'ensure-module-%s\n' "${1:-}" >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
 	probeAwg3Capability() { printf 'probe-%s\n' "$1" >>"${SAME_MODE_AWG3_PROBE_LOG}"; return 1; }
 	awgProtocolConfigsMatchPersistedState() { printf 'unexpected-verify\n' >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
 	applyAwgProtocolTransaction() { printf 'unexpected-apply\n' >>"${SAME_MODE_AWG3_PROBE_LOG}"; }
 	if setAwgProtocolMode 3 >/dev/null 2>&1; then
 		exit 1
 	fi
-) && [[ "$(paste -sd, "${SAME_MODE_AWG3_PROBE_LOG}")" == "lock,load,ensure-module,probe-${MOCK_KEY}" ]]; then
+) && [[ "$(paste -sd, "${SAME_MODE_AWG3_PROBE_LOG}")" == "lock,load,ensure-module-0,probe-${MOCK_KEY}" ]]; then
 	ok "same-mode AWG 3.0 requests fail closed when the current kernel probe fails"
 else
 	not_ok "same-mode AWG 3.0 requests fail closed when the current kernel probe fails"

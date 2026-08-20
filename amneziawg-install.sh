@@ -3365,18 +3365,27 @@ function ensureAwgQuickRunning() {
 #   2. Runs dkms autoinstall for the current kernel
 #   3. Rebuilds the module dependency cache (depmod -a)
 #   4. Loads the module with modprobe
-#   5. Starts the awg-quick service if it was not already running
+#   5. Starts the awg-quick service if it was not already running, unless the
+#      optional first argument is 0 (module-only preparation for probes)
 #
 # If everything is already fine the function returns immediately (idempotent).
 # If repair fails, it prints diagnostic information and exits with code 1.
 function ensureAmneziawgKernelModule() {
 	local KERNEL_VER
+	local START_AWG_QUICK="${1:-1}"
+	case "${START_AWG_QUICK}" in
+		0|1) ;;
+		*)
+			echo -e "${RED}ERROR: ensureAmneziawgKernelModule expects service-start mode 0 or 1.${NC}" >&2
+			return 1
+			;;
+	esac
 	KERNEL_VER="$(uname -r)"
 
 	# Fast-path: if the module is already loaded, ensure the VPN service is also
-	# running before returning.
+	# running before returning unless this is a module-only capability probe.
 	if lsmod 2>/dev/null | grep -q '^amneziawg '; then
-		ensureAwgQuickRunning
+		[[ "${START_AWG_QUICK}" == "0" ]] || ensureAwgQuickRunning
 		return 0
 	fi
 
@@ -3384,8 +3393,9 @@ function ensureAmneziawgKernelModule() {
 	# falling back to the full repair path.
 	if [ -n "$(find "/lib/modules/${KERNEL_VER}" -name 'amneziawg.ko*' -print -quit 2>/dev/null)" ]; then
 		if modprobe amneziawg 2>/dev/null && lsmod 2>/dev/null | grep -q '^amneziawg '; then
-			# Module loaded successfully; start the VPN service if it was not running.
-			ensureAwgQuickRunning
+			# Module loaded successfully; start the VPN service unless the caller is
+			# preserving an intentionally stopped or manually managed interface.
+			[[ "${START_AWG_QUICK}" == "0" ]] || ensureAwgQuickRunning
 			return 0
 		fi
 	fi
@@ -3465,11 +3475,12 @@ function ensureAmneziawgKernelModule() {
 
 	echo -e "${GREEN}amneziawg module loaded successfully for kernel ${KERNEL_VER}.${NC}"
 
-	# The module was just loaded — start the VPN service if it was not running.
+	# The module was just loaded — start the VPN service if it was not running
+	# unless the caller requested module-only preparation.
 	# After a kernel upgrade the service fails at boot because ExecStartPre
 	# (modprobe amneziawg) returns an error; now that the module is available
 	# we restart it so the awg interface exists for subsequent awg syncconf calls.
-	ensureAwgQuickRunning
+	[[ "${START_AWG_QUICK}" == "0" ]] || ensureAwgQuickRunning
 }
 
 function readJminAndJmax() {
@@ -6825,7 +6836,9 @@ function setAwgProtocolMode() (
 		# explicit enable request must repeat the complete readback probe without
 		# rotating the shared key.
 		if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
-			ensureAmneziawgKernelModule >/dev/null 2>&1 || true
+			# The capability probe needs only the module. Do not start an
+			# intentionally stopped service or collide with a manual interface.
+			ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
 			probeAwg3Capability "${AWG_HEADER_PROTECTION_KEY}" || return 1
 		fi
 		if awgProtocolConfigsMatchPersistedState; then
@@ -6860,7 +6873,7 @@ function setAwgProtocolMode() (
 		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_2}" ]] && clearAwg3Params
 	elif [[ "${TARGET_MODE}" == "3" ]]; then
 		NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
-		ensureAmneziawgKernelModule >/dev/null 2>&1 || true
+		ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
 		if ! probeAwg3Capability "${NEW_KEY}"; then
 			return 1
 		fi
