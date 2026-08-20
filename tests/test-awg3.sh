@@ -143,6 +143,16 @@ case "${1:-}" in
 		[[ "${AWG3_TEST_SERVICE_ACTIVE:-0}" == "1" ]]
 		;;
 	restart)
+		if [[ -n "${AWG3_TEST_SYSTEMCTL_LOG:-}" ]]; then
+			printf 'restart %s\n' "${2:-}" >>"${AWG3_TEST_SYSTEMCTL_LOG}"
+		fi
+		if [[ -n "${AWG3_TEST_RESTART_FAIL_STATE:-}" && -f "${AWG3_TEST_RESTART_FAIL_STATE}" ]]; then
+			remaining="$(cat "${AWG3_TEST_RESTART_FAIL_STATE}" 2>/dev/null || printf '0')"
+			if [[ "${remaining}" =~ ^[0-9]+$ ]] && (( remaining > 0 )); then
+				printf '%s\n' "$((remaining - 1))" >"${AWG3_TEST_RESTART_FAIL_STATE}"
+				exit 1
+			fi
+		fi
 		[[ "${AWG3_TEST_RESTART_FAIL:-0}" != "1" ]]
 		;;
 	stop)
@@ -653,17 +663,40 @@ AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
 AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
 AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
 AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
-export AWG3_TEST_SERVICE_ACTIVE=1 AWG3_TEST_RESTART_FAIL=1
+AWG3_TEST_RESTART_FAIL_STATE="${TEST_ROOT}/restart-fail-state"
+AWG3_TEST_SYSTEMCTL_LOG="${TEST_ROOT}/systemctl.log"
+printf '1\n' >"${AWG3_TEST_RESTART_FAIL_STATE}"
+: >"${AWG3_TEST_SYSTEMCTL_LOG}"
+export AWG3_TEST_SERVICE_ACTIVE=1 AWG3_TEST_RESTART_FAIL_STATE AWG3_TEST_SYSTEMCTL_LOG
 if applyAwgProtocolTransaction >/dev/null 2>&1; then
 	not_ok "failed service apply triggers rollback"
 elif [[ "$(sha256sum "${SERVER_AWG_CONF}")" == "${SERVER_BEFORE}" ]] && \
 	[[ "$(sha256sum "${AMNEZIAWG_DIR}/params")" == "${PARAMS_BEFORE}" ]] && \
-	[[ "$(sha256sum "${CLIENT_CONF}")" == "${CLIENT_BEFORE}" ]]; then
-	ok "failed service apply restores params, server, and client files"
+	[[ "$(sha256sum "${CLIENT_CONF}")" == "${CLIENT_BEFORE}" ]] && \
+	[[ "$(grep -c '^restart ' "${AWG3_TEST_SYSTEMCTL_LOG}")" == "2" ]] && \
+	! compgen -G "${AMNEZIAWG_DIR}/.awg-protocol.*" >/dev/null; then
+	ok "failed service apply restores files and reactivates the previous service"
 else
-	not_ok "failed service apply restores params, server, and client files"
+	not_ok "failed service apply restores files and reactivates the previous service"
 fi
-unset AWG3_TEST_SERVICE_ACTIVE AWG3_TEST_RESTART_FAIL
+unset AWG3_TEST_SERVICE_ACTIVE
+
+printf '2\n' >"${AWG3_TEST_RESTART_FAIL_STATE}"
+: >"${AWG3_TEST_SYSTEMCTL_LOG}"
+export AWG3_TEST_SERVICE_ACTIVE=1 AWG3_TEST_RESTART_FAIL_STATE AWG3_TEST_SYSTEMCTL_LOG
+ROLLBACK_OUTPUT="$(applyAwgProtocolTransaction 2>&1 || true)"
+mapfile -t RETAINED_TRANSACTIONS < <(compgen -G "${AMNEZIAWG_DIR}/.awg-protocol.*" || true)
+if [[ "${ROLLBACK_OUTPUT}" == *"could not reactivate the previous AWG runtime"* ]] && \
+	[[ "${#RETAINED_TRANSACTIONS[@]}" -eq 1 ]] && \
+	[[ "$(grep -c '^restart ' "${AWG3_TEST_SYSTEMCTL_LOG}")" == "2" ]]; then
+	ok "failed rollback reactivation is reported and retains recovery files"
+else
+	not_ok "failed rollback reactivation is reported and retains recovery files"
+fi
+for RETAINED_TRANSACTION in "${RETAINED_TRANSACTIONS[@]}"; do
+	cleanupAwgProtocolTransactionDir "${RETAINED_TRANSACTION}"
+done
+unset AWG3_TEST_SERVICE_ACTIVE AWG3_TEST_RESTART_FAIL_STATE AWG3_TEST_SYSTEMCTL_LOG
 
 SERVER_BEFORE="$(sha256sum "${SERVER_AWG_CONF}")"
 PARAMS_BEFORE="$(sha256sum "${AMNEZIAWG_DIR}/params")"

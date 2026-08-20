@@ -6671,7 +6671,22 @@ function applyAwgProtocolTransaction() (
 				ip link delete dev "${SERVER_AWG_NIC}" >/dev/null 2>&1 || return 1
 			fi
 		fi
-		awg-quick up "${SERVER_AWG_CONF}"
+		awg-quick up "${SERVER_AWG_CONF}" || return 1
+		ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1
+	}
+
+	# A file rollback is complete only when the runtime state that existed before
+	# the transaction is restored as well. Keep command output private here and
+	# let each caller report the transaction directory retained for recovery.
+	function restorePreviousAwgRuntime() {
+		if (( SERVICE_WAS_ACTIVE )); then
+			systemctl restart "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 && \
+				systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"
+		elif (( MANUAL_INTERFACE_ACTIVE )); then
+			restartManualAwgInterface >/dev/null 2>&1
+		else
+			return 0
+		fi
 	}
 
 	function rollbackAwgProtocolOnSignal() {
@@ -6685,10 +6700,10 @@ function applyAwgProtocolTransaction() (
 				RESTORE_FAILED=1
 				echo "ERROR: interrupted rollback was incomplete; recovery files remain in ${TRANSACTION_DIR}" >&2
 			fi
-			if (( SERVICE_WAS_ACTIVE )); then
-				systemctl restart "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 || true
-			elif (( MANUAL_INTERFACE_ACTIVE )); then
-				restartManualAwgInterface >/dev/null 2>&1 || true
+			if ! restorePreviousAwgRuntime; then
+				RESTORE_FAILED=1
+				echo "ERROR: interrupted rollback could not reactivate the previous AWG runtime" >&2
+				echo "       Recovery files remain in ${TRANSACTION_DIR}" >&2
 			fi
 		fi
 		if (( RESTORE_FAILED == 0 )) && [[ -n "${TRANSACTION_DIR:-}" ]]; then
@@ -6754,12 +6769,18 @@ function applyAwgProtocolTransaction() (
 	TRANSACTION_APPLY_STARTED=1
 	if (( SERVICE_WAS_ACTIVE )) && ! systemctl stop "awg-quick@${SERVER_AWG_NIC}"; then
 		echo "ERROR: could not stop the AWG service before protocol migration" >&2
-		systemctl restart "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 || true
+		if ! restorePreviousAwgRuntime; then
+			echo "ERROR: the previous AWG service could not be restored; recovery files remain in ${TRANSACTION_DIR}" >&2
+			return 1
+		fi
 		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
 		return 1
 	elif (( MANUAL_INTERFACE_ACTIVE )) && ! awg-quick down "${SERVER_AWG_CONF}"; then
 		echo "ERROR: could not stop the manually active AWG interface before protocol migration" >&2
-		restartManualAwgInterface >/dev/null 2>&1 || true
+		if ! restorePreviousAwgRuntime; then
+			echo "ERROR: the previous manually managed AWG interface could not be restored; recovery files remain in ${TRANSACTION_DIR}" >&2
+			return 1
+		fi
 		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
 		return 1
 	fi
@@ -6789,10 +6810,10 @@ function applyAwgProtocolTransaction() (
 			echo "ERROR: automatic rollback was incomplete; recovery files remain in ${TRANSACTION_DIR}" >&2
 			return 1
 		fi
-		if (( SERVICE_WAS_ACTIVE )); then
-			systemctl restart "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 || true
-		elif (( MANUAL_INTERFACE_ACTIVE )); then
-			restartManualAwgInterface >/dev/null 2>&1 || true
+		if ! restorePreviousAwgRuntime; then
+			echo "ERROR: automatic rollback restored files but could not reactivate the previous AWG runtime" >&2
+			echo "       Recovery files remain in ${TRANSACTION_DIR}" >&2
+			return 1
 		fi
 		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
 		return 1
