@@ -1322,6 +1322,7 @@ _run_niac() {  # $1=ENABLE_IPV6 (y/n) $2=client name
 		SERVER_AWG_H1="5-10"; SERVER_AWG_H2="11-20"; SERVER_AWG_H3="21-30"; SERVER_AWG_H4="31-40"
 		ALLOWED_IPS="0.0.0.0/0,::/0"; ENABLE_IPV6="$1"
 		# Neutralize side-effecting helpers for the unit test.
+		loadParams() { :; }
 		ensureAmneziawgKernelModule() { :; }
 		copyToWebPanelDir() { :; }
 		nonInteractiveAddClient "$2" >/dev/null 2>&1

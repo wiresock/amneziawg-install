@@ -6914,6 +6914,17 @@ function changeAwgProtocolInteractively() {
 	setAwgProtocolMode "${TARGET_MODE}"
 }
 
+# Interactive management can remain open while the web panel or another CLI
+# changes protocol state. Reload persisted params only after taking the shared
+# lifecycle lock, and keep the lock through the complete mutation so a staged
+# protocol transaction can never overwrite the result.
+function runLockedManagementOperation() (
+	local OPERATION="$1"
+	acquireClientLifecycleLock || return 1
+	loadParams
+	"${OPERATION}"
+)
+
 function manageMenu() {
 	local MENU_OPTION=""
 	echo "AmneziaWG server installer (https://github.com/wiresock/amneziawg-install)"
@@ -6937,22 +6948,22 @@ function manageMenu() {
 	done
 	case "${MENU_OPTION}" in
 	1)
-		newClient
+		runLockedManagementOperation newClient
 		;;
 	2)
 		listClients
 		;;
 	3)
-		revokeClient
+		runLockedManagementOperation revokeClient
 		;;
 	4)
-		regenerateClients
+		runLockedManagementOperation regenerateClients
 		;;
 	5)
 		changeAwgProtocolInteractively
 		;;
 	6)
-		uninstallAmneziaWG
+		runLockedManagementOperation uninstallAmneziaWG
 		;;
 	7)
 		exit 0
@@ -6979,8 +6990,8 @@ CLIENT_LIFECYCLE_LOCK_FD=""
 # persistent state directory is opened read-only, its descriptor identity
 # is revalidated against the path, and the descriptor is locked. The root-run
 # CLI therefore never creates, truncates, chowns, or chmods a service-writable
-# lock pathname. The caller runs in a subshell so the descriptor, and therefore
-# the lock, is released on every success, return, or exit path.
+# lock pathname. Mutating callers run in a subshell so the descriptor is closed
+# automatically; the interactive menu preloader releases it explicitly.
 function acquireClientLifecycleLock() {
 	local lock_dir env_file panel_installed=0
 	local old_umask dir_identity descriptor_identity descriptor_path
@@ -7028,9 +7039,27 @@ function acquireClientLifecycleLock() {
 	fi
 	if ! flock -xn "${CLIENT_LIFECYCLE_LOCK_FD}"; then
 		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
-		echo "ERROR: another add/remove operation is already in progress" >&2
+		echo "ERROR: another client or protocol management operation is already in progress" >&2
 		return 1
 	fi
+}
+
+function releaseClientLifecycleLock() {
+	if [[ -n "${CLIENT_LIFECYCLE_LOCK_FD:-}" ]]; then
+		exec {CLIENT_LIFECYCLE_LOCK_FD}>&- 2>/dev/null || true
+		CLIENT_LIFECYCLE_LOCK_FD=""
+	fi
+}
+
+# The initial interactive menu needs loaded values for display, but must not
+# hold the lifecycle lock while waiting for input. Mutating menu actions reload
+# again under their own lock through runLockedManagementOperation.
+function loadParamsForManagementMenu() {
+	local RC=0
+	acquireClientLifecycleLock || return 1
+	loadParams || RC=$?
+	releaseClientLifecycleLock
+	return "${RC}"
 }
 
 function nonInteractiveAddClient() (
@@ -7050,8 +7079,11 @@ function nonInteractiveAddClient() (
 		exit 1
 	fi
 	acquireClientLifecycleLock || exit 1
+	# Reload only after locking: a protocol transaction may have completed after
+	# this CLI process started but before it acquired the lifecycle lock.
+	loadParams
 
-	# Ensure params are loaded and config path is set
+	# Ensure the config path follows the freshly loaded interface name.
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
 	# Check for duplicate name
@@ -7223,6 +7255,7 @@ function nonInteractiveRemoveClient() (
 		exit 1
 	fi
 	acquireClientLifecycleLock || exit 1
+	loadParams
 
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
@@ -7257,10 +7290,12 @@ function nonInteractiveRemoveClient() (
 	echo "OK"
 )
 
-function nonInteractiveListClients() {
+function nonInteractiveListClients() (
+	acquireClientLifecycleLock || exit 1
+	loadParams
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 	grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3 || true
-}
+)
 
 # Only run main logic when executed directly (not when sourced for testing)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -7311,7 +7346,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
 				exit 1
 			fi
-			loadParams
 			nonInteractiveAddClient "$2"
 			exit $?
 			;;
@@ -7325,7 +7359,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
 				exit 1
 			fi
-			loadParams
 			nonInteractiveRemoveClient "$2"
 			exit $?
 			;;
@@ -7335,7 +7368,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
 				exit 1
 			fi
-			loadParams
 			nonInteractiveListClients
 			exit $?
 			;;
@@ -7350,7 +7382,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 		if [[ "${OS}" == "ubuntu" ]]; then
 			refreshConfiguredUbuntuAmneziaPpa
 		fi
-		loadParams
+		loadParamsForManagementMenu || exit 1
 		manageMenu
 	else
 		installAmneziaWG

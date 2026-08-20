@@ -294,6 +294,36 @@ else
 	not_ok "protocol changes lock and reload persisted state before deciding a toggle is a no-op"
 fi
 
+MANAGEMENT_LOCK_ORDER="${TEST_ROOT}/management-lock-order.log"
+: >"${MANAGEMENT_LOCK_ORDER}"
+if (
+	AWG_PROTOCOL_VERSION=2
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${MANAGEMENT_LOCK_ORDER}"; }
+	loadParams() {
+		printf 'load\n' >>"${MANAGEMENT_LOCK_ORDER}"
+		AWG_PROTOCOL_VERSION=3
+	}
+	_testManagementMutation() { printf 'mutate-%s\n' "${AWG_PROTOCOL_VERSION}" >>"${MANAGEMENT_LOCK_ORDER}"; }
+	runLockedManagementOperation _testManagementMutation
+) && [[ "$(paste -sd, "${MANAGEMENT_LOCK_ORDER}")" == "lock,load,mutate-3" ]]; then
+	ok "interactive mutations lock and reload current protocol state before writing"
+else
+	not_ok "interactive mutations lock and reload current protocol state before writing"
+fi
+
+MENU_LOAD_LOCK_ORDER="${TEST_ROOT}/menu-load-lock-order.log"
+: >"${MENU_LOAD_LOCK_ORDER}"
+if (
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${MENU_LOAD_LOCK_ORDER}"; }
+	loadParams() { printf 'load\n' >>"${MENU_LOAD_LOCK_ORDER}"; }
+	releaseClientLifecycleLock() { printf 'release\n' >>"${MENU_LOAD_LOCK_ORDER}"; }
+	loadParamsForManagementMenu
+) && [[ "$(paste -sd, "${MENU_LOAD_LOCK_ORDER}")" == "lock,load,release" ]]; then
+	ok "interactive menu preload releases the lifecycle lock before waiting for input"
+else
+	not_ok "interactive menu preload releases the lifecycle lock before waiting for input"
+fi
+
 SAME_MODE_REPAIR_LOG="${TEST_ROOT}/same-mode-repair.log"
 : >"${SAME_MODE_REPAIR_LOG}"
 if (
