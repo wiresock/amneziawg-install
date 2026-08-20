@@ -7,9 +7,9 @@
 //! 1. Calls `awg::show_all_dump()` – reads current AWG state.
 //! 2. Writes a snapshot row per peer into `snapshots`.
 //! 3. Upserts each peer into the `peers` table.
-//! 3b. Removes disabled peers from the running AWG interface
-//!     (`awg set <iface> peer <key> remove`).  This is a self-healing
-//!     safety net; immediate removal also happens at toggle time.
+//!    3b. Removes disabled peers from the running AWG interface
+//!    (`awg set <iface> peer <key> remove`).  This is a self-healing
+//!    safety net; immediate removal also happens at toggle time.
 //! 4. Scans the config directory for `*.conf` files.
 //! 5. Applies config-to-peer mapping (sets `has_config`, `config_name`,
 //!    `config_path` on matching peers).
@@ -422,8 +422,7 @@ impl Poller {
             .collect();
 
         let now = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-        let stale =
-            crate::db::peers::delete_stale_peers(&self.db.pool, &active_keys, &now).await?;
+        let stale = crate::db::peers::delete_stale_peers(&self.db.pool, &active_keys, &now).await?;
 
         if !stale.is_empty() {
             for (id, ref public_key) in &stale {
@@ -438,10 +437,7 @@ impl Poller {
                     );
                 }
             }
-            info!(
-                removed = stale.len(),
-                "stale peers removed from database"
-            );
+            info!(removed = stale.len(), "stale peers removed from database");
         }
 
         Ok(())

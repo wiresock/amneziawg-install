@@ -29,8 +29,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info, warn};
 
 /// Default absolute path to the install script on a standard system-wide install.

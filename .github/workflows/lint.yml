@@ -27,6 +27,7 @@ jobs:
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-upgrade.sh
           bash -n tests/test-cargo-build-common.sh
+          bash -n tests/test-awg3.sh
           bash -n tests/test-proxy-bootstrap.sh
           bash -n tests/test-ubuntu-ppa.sh
           bash -n tests/test-ubuntu-resolute-live.sh
@@ -55,6 +56,7 @@ jobs:
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-upgrade.sh
           shellcheck --severity=warning tests/test-cargo-build-common.sh
+          shellcheck --severity=warning tests/test-awg3.sh
           shellcheck --severity=warning tests/test-proxy-bootstrap.sh
           shellcheck --severity=warning tests/test-ubuntu-ppa.sh
           shellcheck --severity=warning tests/test-ubuntu-resolute-live.sh

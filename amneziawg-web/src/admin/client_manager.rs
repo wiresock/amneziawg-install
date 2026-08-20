@@ -226,6 +226,12 @@ impl From<script_bridge::ScriptError> for RemoveClientError {
 /// The params file (`/etc/amnezia/amneziawg/params`) is a shell-sourceable
 /// KEY='VALUE' file written by the install script.  It contains all the
 /// settings needed to generate new client configs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AwgProtocolVersion {
+    V2,
+    V3,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerParams {
     pub server_pub_ip: String,
@@ -248,6 +254,103 @@ pub struct ServerParams {
     pub h2: String,
     pub h3: String,
     pub h4: String,
+    pub protocol_version: AwgProtocolVersion,
+    pub header_protection_key: String,
+    pub content_padding_addition: String,
+    pub rekey_after_time: String,
+    pub rekey_timeout: String,
+    pub reject_after_time: String,
+    pub keepalive_timeout: String,
+}
+
+fn validate_awg3_range(name: &str, value: &str) -> Result<(), CreateClientError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let (low, high) = match value.split_once('-') {
+        Some((low, high)) if !high.contains('-') => (low, high),
+        Some(_) => {
+            return Err(CreateClientError::ParamsRead(format!(
+                "{name} must be an integer or inclusive range"
+            )))
+        }
+        None => (value, value),
+    };
+    let parse_bound = |bound: &str| -> Result<u16, CreateClientError> {
+        if bound.is_empty() || bound.len() > 5 || !bound.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(CreateClientError::ParamsRead(format!(
+                "{name} must contain uint16 values"
+            )));
+        }
+        bound.parse::<u16>().map_err(|_| {
+            CreateClientError::ParamsRead(format!("{name} must contain uint16 values"))
+        })
+    };
+    let low = parse_bound(low)?;
+    let high = parse_bound(high)?;
+    if low > high {
+        return Err(CreateClientError::ParamsRead(format!(
+            "{name} range must be ordered"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_awg3_params(params: &ServerParams) -> Result<(), CreateClientError> {
+    let key = params.header_protection_key.as_bytes();
+    if key.len() != 44
+        || key[43] != b'='
+        || !matches!(
+            key[42],
+            b'A' | b'E'
+                | b'I'
+                | b'M'
+                | b'Q'
+                | b'U'
+                | b'Y'
+                | b'c'
+                | b'g'
+                | b'k'
+                | b'o'
+                | b's'
+                | b'w'
+                | b'0'
+                | b'4'
+                | b'8'
+        )
+        || !key[..43]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'+' || *byte == b'/')
+    {
+        return Err(CreateClientError::ParamsRead(
+            "invalid AWG 3.0 HeaderProtectionKey".to_string(),
+        ));
+    }
+    for (name, value) in [
+        ("SERVER_AWG_S1", &params.s1),
+        ("SERVER_AWG_S2", &params.s2),
+        ("SERVER_AWG_S3", &params.s3),
+        ("SERVER_AWG_S4", &params.s4),
+    ] {
+        let padding = value
+            .parse::<u16>()
+            .map_err(|_| CreateClientError::ParamsRead(format!("{name} must be a uint16 value")))?;
+        if padding < 12 {
+            return Err(CreateClientError::ParamsRead(format!(
+                "{name} must be at least 12 for AWG 3.0"
+            )));
+        }
+    }
+    for (name, value) in [
+        ("ContentPaddingAddition", &params.content_padding_addition),
+        ("RekeyAfterTime", &params.rekey_after_time),
+        ("RekeyTimeout", &params.rekey_timeout),
+        ("RejectAfterTime", &params.reject_after_time),
+        ("KeepaliveTimeout", &params.keepalive_timeout),
+    ] {
+        validate_awg3_range(name, value)?;
+    }
+    Ok(())
 }
 
 /// Parse params file content (KEY='VALUE' format) into [`ServerParams`].
@@ -298,6 +401,16 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
 
     let get_opt = |key: &str| -> String { map.get(key).cloned().unwrap_or_default() };
 
+    let protocol_version = match get_opt("AWG_PROTOCOL_VERSION").as_str() {
+        "" | "2" | "2.0" => AwgProtocolVersion::V2,
+        "3" | "3.0" => AwgProtocolVersion::V3,
+        value => {
+            return Err(CreateClientError::ParamsRead(format!(
+                "unsupported AWG protocol version: {value}"
+            )))
+        }
+    };
+
     let params = ServerParams {
         server_pub_ip: get("SERVER_PUB_IP")?,
         server_awg_nic: get("SERVER_AWG_NIC")?,
@@ -319,6 +432,13 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
         h2: get("SERVER_AWG_H2")?,
         h3: get("SERVER_AWG_H3")?,
         h4: get("SERVER_AWG_H4")?,
+        protocol_version,
+        header_protection_key: get_opt("AWG_HEADER_PROTECTION_KEY"),
+        content_padding_addition: get_opt("AWG_CONTENT_PADDING_ADDITION"),
+        rekey_after_time: get_opt("AWG_REKEY_AFTER_TIME"),
+        rekey_timeout: get_opt("AWG_REKEY_TIMEOUT"),
+        reject_after_time: get_opt("AWG_REJECT_AFTER_TIME"),
+        keepalive_timeout: get_opt("AWG_KEEPALIVE_TIMEOUT"),
     };
 
     // Validate server_awg_nic: must be a safe interface name (alphanumeric,
@@ -326,6 +446,9 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
     // This prevents path-traversal when constructing filesystem paths and
     // option-injection when the name is passed as a command argument.
     validate_interface_name(&params.server_awg_nic)?;
+    if params.protocol_version == AwgProtocolVersion::V3 {
+        validate_awg3_params(&params)?;
+    }
 
     Ok(params)
 }
@@ -479,8 +602,7 @@ fn find_existing_ipv6_normalized(server_config: &str) -> HashSet<String> {
         if let Some(val) = parse_kv(trimmed, "AllowedIPs") {
             for cidr in val.split(',') {
                 let cidr = cidr.trim();
-                if cidr.ends_with("/128") {
-                    let ip = &cidr[..cidr.len() - 4];
+                if let Some(ip) = cidr.strip_suffix("/128") {
                     if let Ok(normalized) = normalize_ipv6(ip) {
                         set.insert(normalized);
                     }
@@ -541,11 +663,7 @@ fn server_interface_has_ipv6_address(server_config: &str) -> bool {
             continue;
         }
         if let Some(value) = parse_kv(trimmed, "Address") {
-            let uncommented = value
-                .split(|ch| ch == '#' || ch == ';')
-                .next()
-                .unwrap_or_default()
-                .trim();
+            let uncommented = value.split(['#', ';']).next().unwrap_or_default().trim();
             if uncommented.split(',').map(str::trim).any(|cidr| {
                 cidr.split('/')
                     .next()
@@ -877,6 +995,36 @@ fn build_client_config(
     };
     let allowed_ips =
         prepare_client_allowed_ips(&params.allowed_ips, client_ipv6_display.is_some())?;
+    let protocol_fields = match params.protocol_version {
+        AwgProtocolVersion::V2 => String::new(),
+        AwgProtocolVersion::V3 => {
+            validate_awg3_params(params)?;
+            [
+                Some(format!(
+                    "HeaderProtectionKey = {}",
+                    params.header_protection_key
+                )),
+                (!params.content_padding_addition.is_empty()).then(|| {
+                    format!(
+                        "ContentPaddingAddition = {}",
+                        params.content_padding_addition
+                    )
+                }),
+                (!params.rekey_after_time.is_empty())
+                    .then(|| format!("RekeyAfterTime = {}", params.rekey_after_time)),
+                (!params.rekey_timeout.is_empty())
+                    .then(|| format!("RekeyTimeout = {}", params.rekey_timeout)),
+                (!params.reject_after_time.is_empty())
+                    .then(|| format!("RejectAfterTime = {}", params.reject_after_time)),
+                (!params.keepalive_timeout.is_empty())
+                    .then(|| format!("KeepaliveTimeout = {}", params.keepalive_timeout)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n")
+        }
+    };
 
     Ok(format!(
         "\
@@ -895,6 +1043,7 @@ H1 = {h1}
 H2 = {h2}
 H3 = {h3}
 H4 = {h4}
+{protocol_fields}
 
 [Peer]
 PublicKey = {server_pub_key}
@@ -1660,6 +1809,72 @@ SERVER_AWG_H4='1837068650'
         assert_eq!(params.allowed_ips, "0.0.0.0/0, ::/0");
         assert_eq!(params.jc, "8");
         assert_eq!(params.h4, "1837068650");
+        assert_eq!(params.protocol_version, AwgProtocolVersion::V2);
+    }
+
+    #[test]
+    fn parse_params_accepts_and_validates_awg3_state() {
+        let legacy = "\
+SERVER_PUB_IP='203.0.113.42'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42::1'
+SERVER_PORT='51820'
+SERVER_PUB_KEY='PUBLIC_KEY='
+CLIENT_DNS_1='1.1.1.1'
+ALLOWED_IPS='0.0.0.0/0'
+SERVER_AWG_JC='8'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='107'
+SERVER_AWG_S2='105'
+SERVER_AWG_S3='62'
+SERVER_AWG_S4='95'
+SERVER_AWG_H1='1'
+SERVER_AWG_H2='2'
+SERVER_AWG_H3='3'
+SERVER_AWG_H4='4'
+";
+        let content = format!(
+            "{legacy}AWG_PROTOCOL_VERSION='3'\n\
+             AWG_HEADER_PROTECTION_KEY='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='\n\
+             AWG_CONTENT_PADDING_ADDITION='10-100'\n\
+             AWG_REKEY_AFTER_TIME='100-120'\n\
+             AWG_REKEY_TIMEOUT='3-7'\n\
+             AWG_REJECT_AFTER_TIME='150-180'\n\
+             AWG_KEEPALIVE_TIMEOUT='5-15'\n"
+        );
+        let params = parse_params(&content).unwrap();
+        assert_eq!(params.protocol_version, AwgProtocolVersion::V3);
+        assert_eq!(params.rekey_timeout, "3-7");
+    }
+
+    #[test]
+    fn parse_params_rejects_incomplete_awg3_but_ignores_awg3_fields_in_v2() {
+        let base = "\
+SERVER_PUB_IP='203.0.113.42'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42::1'
+SERVER_PORT='51820'
+SERVER_PUB_KEY='PUBLIC_KEY='
+CLIENT_DNS_1='1.1.1.1'
+ALLOWED_IPS='0.0.0.0/0'
+SERVER_AWG_JC='8'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='107'
+SERVER_AWG_S2='105'
+SERVER_AWG_S3='62'
+SERVER_AWG_S4='95'
+SERVER_AWG_H1='1'
+SERVER_AWG_H2='2'
+SERVER_AWG_H3='3'
+SERVER_AWG_H4='4'
+AWG_HEADER_PROTECTION_KEY='invalid'
+";
+        assert!(parse_params(&format!("{base}AWG_PROTOCOL_VERSION='3'\n")).is_err());
+        assert!(parse_params(&format!("{base}AWG_PROTOCOL_VERSION='2'\n")).is_ok());
     }
 
     #[test]
@@ -2070,6 +2285,13 @@ AllowedIPs = 10.66.66.2/32
             h2: "774489227".into(),
             h3: "1084244185".into(),
             h4: "1837068650".into(),
+            protocol_version: AwgProtocolVersion::V2,
+            header_protection_key: String::new(),
+            content_padding_addition: String::new(),
+            rekey_after_time: String::new(),
+            rekey_timeout: String::new(),
+            reject_after_time: String::new(),
+            keepalive_timeout: String::new(),
         };
         let config = build_client_config(
             &params,
@@ -2090,6 +2312,30 @@ AllowedIPs = 10.66.66.2/32
         assert!(config.contains("PresharedKey = PSK_KEY="));
         assert!(config.contains("Endpoint = 1.2.3.4:51820"));
         assert!(config.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
+        assert!(!config.contains("HeaderProtectionKey"));
+
+        let mut awg3_params = params.clone();
+        awg3_params.protocol_version = AwgProtocolVersion::V3;
+        awg3_params.header_protection_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into();
+        awg3_params.content_padding_addition = "10-100".into();
+        awg3_params.rekey_after_time = "100-120".into();
+        awg3_params.rekey_timeout = "3-7".into();
+        awg3_params.reject_after_time = "150-180".into();
+        awg3_params.keepalive_timeout = "5-15".into();
+        let awg3_config = build_client_config(
+            &awg3_params,
+            "PRIV_KEY=",
+            "10.66.66.2",
+            Some("fd42:42:42::2"),
+            "PSK_KEY=",
+            "1.1.1.1,1.0.0.1",
+            "1.2.3.4:51820",
+        )
+        .unwrap();
+        assert!(awg3_config
+            .contains("HeaderProtectionKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+        assert!(awg3_config.contains("ContentPaddingAddition = 10-100"));
+        assert!(awg3_config.contains("KeepaliveTimeout = 5-15"));
     }
 
     #[test]
@@ -2115,6 +2361,13 @@ AllowedIPs = 10.66.66.2/32
             h2: "774489227".into(),
             h3: "1084244185".into(),
             h4: "1837068650".into(),
+            protocol_version: AwgProtocolVersion::V2,
+            header_protection_key: String::new(),
+            content_padding_addition: String::new(),
+            rekey_after_time: String::new(),
+            rekey_timeout: String::new(),
+            reject_after_time: String::new(),
+            keepalive_timeout: String::new(),
         };
         let config = build_client_config(
             &params,
@@ -2156,6 +2409,13 @@ AllowedIPs = 10.66.66.2/32
             h2: "774489227".into(),
             h3: "1084244185".into(),
             h4: "1837068650".into(),
+            protocol_version: AwgProtocolVersion::V2,
+            header_protection_key: String::new(),
+            content_padding_addition: String::new(),
+            rekey_after_time: String::new(),
+            rekey_timeout: String::new(),
+            reject_after_time: String::new(),
+            keepalive_timeout: String::new(),
         };
 
         let err = build_client_config(

@@ -299,6 +299,51 @@ pub fn read_params_via_sudo() -> Result<String, AwgError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Read the persisted AWG protocol mode. Missing state is normalized by the
+/// privileged helper to version 2 for compatibility with existing installs.
+pub fn protocol_status_via_sudo() -> Result<u8, AwgError> {
+    let output = Command::new(SUDO_BIN)
+        .args(["-n", PRIVILEGED_HELPER_BIN, "protocol-status"])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "2" => Ok(2),
+        "3" => Ok(3),
+        value => Err(AwgError::Parse(format!(
+            "privileged helper returned unsupported protocol version: {value}"
+        ))),
+    }
+}
+
+/// Explicitly migrate the server and all recoverable clients to one protocol
+/// mode through the root-owned helper and install script transaction.
+pub fn set_protocol_mode_via_sudo(enable_awg3: bool) -> Result<(), AwgError> {
+    let operation = if enable_awg3 {
+        "enable-awg3"
+    } else {
+        "disable-awg3"
+    };
+    let output = Command::new(SUDO_BIN)
+        .args(["-n", PRIVILEGED_HELPER_BIN, operation])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr,
+        });
+    }
+    Ok(())
+}
+
 /// Read a sanitized server-config projection used for name/IP allocation.
 ///
 /// The helper emits only section headers, managed client markers, interface
@@ -883,6 +928,19 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             ]
         );
+    }
+
+    #[test]
+    fn protocol_commands_use_privileged_helper() {
+        for operation in ["protocol-status", "enable-awg3", "disable-awg3"] {
+            let mut cmd = Command::new(SUDO_BIN);
+            cmd.args(["-n", PRIVILEGED_HELPER_BIN, operation]);
+            let args: Vec<_> = cmd
+                .get_args()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect();
+            assert_eq!(args, vec!["-n", PRIVILEGED_HELPER_BIN, operation]);
+        }
     }
 
     // ── filter_disabled_peers tests ─────────────────────────────────

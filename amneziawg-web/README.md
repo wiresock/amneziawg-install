@@ -158,9 +158,10 @@ To upgrade with a pre-built binary:
 sudo ./amneziawg-web.sh upgrade --binary ./target/release/amneziawg-web
 ```
 
-The upgrade script replaces the binary and root-owned privileged helper, then restarts
-the service if it was running. Configuration, data, and the systemd unit are preserved
-by default.
+The upgrade script replaces the binary, root-owned privileged helper, and the AWG
+lifecycle script when its installer ownership marker is present, then restarts the
+service if it was running. Unmarked operator-managed lifecycle scripts, configuration,
+data, and the systemd unit are preserved by default.
 See [docs/INSTALL.md](docs/INSTALL.md) for full details.
 
 ### Uninstalling
@@ -236,6 +237,8 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `POST` | `/admin/peers/:id/restore` | Yes | Return an archived key to the normal list as a blank, still-disabled peer |
 | `POST` | `/admin/users/add` | Yes | HTML form: add new user (PRG redirect) |
 | `POST` | `/admin/users/:id/remove` | Yes | HTML form: remove user (PRG redirect) |
+| `POST` | `/admin/protocol/enable-awg3` | Yes | Confirmed HTML form: probe support and atomically migrate the interface plus all clients to AWG 3.0 |
+| `POST` | `/admin/protocol/disable-awg3` | Yes | Confirmed HTML form: atomically return the interface plus all clients to AWG 2.0 |
 | `GET` | `/login` | No | Login form |
 | `POST` | `/login` | No | Validate credentials, set cookie |
 | `POST` | `/logout` | No | Clear session cookie |
@@ -249,6 +252,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `GET` | `/api/events` | Yes | Audit log (`?peer_id=`, `?event_type=`, `?limit=`) |
 | `POST` | `/api/admin/users` | Yes | JSON API: create user `{"name":"...","comment":"optional note"}` (`comment` optional, max 512 characters) |
 | `POST` | `/api/admin/users/:id/remove` | Yes | JSON API: remove user |
+| `GET` | `/api/admin/protocol` | Yes | Normalized protocol status (`2.0` for legacy/missing state, otherwise `3.0`) |
 
 ---
 
@@ -262,7 +266,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | XSS | All HTML output escaped via `esc()` |
 | CSRF | Per-session token on write forms; short-lived pre-login token |
 | Rate limiting | 5 login attempts per 5-minute window per IP; `429` on excess |
-| Audit log | Every peer write, login, and logout recorded |
+| Audit log | Every peer write, protocol migration, login, and logout recorded |
 | No shell injection | The helper is called via `Command::new()` with explicit arguments and invokes fixed absolute binaries without shell interpolation |
 | AWG access | The sudoers rule allows only a root-owned validating helper; no command-argument globs are granted |
 
@@ -291,6 +295,14 @@ content. This keeps dynamic arguments out of sudoers while providing the AWG
 inspection, peer management, and config synchronization the panel requires.
 Application invocations use `Command::new()` with explicit argument arrays —
 no shell interpolation.
+
+Protocol migration is also routed through the helper. It resolves only the
+root-owned lifecycle script recorded beside the service's configured
+environment file, accepts only fixed enable/disable operations, and suppresses
+script output. The header-protection key is provided to the unprivileged
+process only through the existing safe-parameter projection needed to create
+AWG 3.0 client configs; it is never rendered in HTML, returned by the status
+API, or written to application logs.
 
 **Troubleshooting:** If peer polling fails with "Operation not permitted",
 verify the sudoers file exists and is correct:

@@ -807,8 +807,7 @@ pub async fn delete_stale_peers(
     // SELECT and DELETE above. The DELETE guards prevent their removal, but
     // they would still be in the `stale` list.
     // Re-check which IDs still exist to return only actually-deleted peers.
-    let mut surviving_ids: std::collections::HashSet<i64> =
-        std::collections::HashSet::new();
+    let mut surviving_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let stale_ids: Vec<i64> = stale.iter().map(|(id, _)| *id).collect();
     for chunk in stale_ids.chunks(MAX_SQLITE_PARAMS) {
         let placeholders: String = std::iter::repeat("?")
@@ -1443,12 +1442,7 @@ mod tests {
         let db = test_db().await;
         let id = insert_peer(&db.pool, "KEY_EXPIRATION_EDIT=", None).await;
 
-        let row = update_peer_expiration(
-            &db.pool,
-            id,
-            Some("2026-08-18T12:00:00Z"),
-            Some("alice"),
-        )
+        let row = update_peer_expiration(&db.pool, id, Some("2026-08-18T12:00:00Z"), Some("alice"))
             .await
             .expect("set expiration")
             .expect("peer");
@@ -1467,15 +1461,10 @@ mod tests {
     async fn update_peer_expiration_rejects_removal_in_progress() {
         let db = test_db().await;
         let id = insert_peer(&db.pool, "KEY_EXPIRATION_REMOVING=", None).await;
-        update_peer_expiration(
-            &db.pool,
-            id,
-            Some("2026-08-10T12:00:00Z"),
-            Some("alice"),
-        )
-        .await
-        .unwrap()
-        .expect("set original expiration");
+        update_peer_expiration(&db.pool, id, Some("2026-08-10T12:00:00Z"), Some("alice"))
+            .await
+            .unwrap()
+            .expect("set original expiration");
         assert!(mark_removal_pending(&db.pool, id).await.unwrap());
 
         assert!(update_peer_expiration(&db.pool, id, None, None)
@@ -1498,12 +1487,7 @@ mod tests {
         let due_id = insert_peer(&db.pool, "KEY_DUE=", None).await;
         let future_id = insert_peer(&db.pool, "KEY_FUTURE=", None).await;
         let _permanent_id = insert_peer(&db.pool, "KEY_NO_EXPIRY=", None).await;
-        update_peer_expiration(
-            &db.pool,
-            due_id,
-            Some("2026-08-10T12:00:00Z"),
-            Some("due"),
-        )
+        update_peer_expiration(&db.pool, due_id, Some("2026-08-10T12:00:00Z"), Some("due"))
             .await
             .unwrap();
         update_peer_expiration(
@@ -1512,31 +1496,32 @@ mod tests {
             Some("2026-08-12T12:00:00Z"),
             Some("future"),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let now = "2026-08-11T12:00:00Z";
         let expired = list_expired(&db.pool, now).await.expect("list expired");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, due_id);
-        assert!(expiration_is_due(&db.pool, due_id, "2026-08-10T12:00:00Z", now)
-            .await
-            .unwrap());
-        assert!(!expiration_is_due(&db.pool, due_id, "2026-08-09T12:00:00Z", now)
-            .await
-            .unwrap());
+        assert!(
+            expiration_is_due(&db.pool, due_id, "2026-08-10T12:00:00Z", now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !expiration_is_due(&db.pool, due_id, "2026-08-09T12:00:00Z", now)
+                .await
+                .unwrap()
+        );
 
-        update_peer_expiration(
-            &db.pool,
-            due_id,
-            Some("2026-08-20T12:00:00Z"),
-            Some("due"),
-        )
+        update_peer_expiration(&db.pool, due_id, Some("2026-08-20T12:00:00Z"), Some("due"))
             .await
             .unwrap();
-        assert!(!expiration_is_due(&db.pool, due_id, "2026-08-10T12:00:00Z", now)
-            .await
-            .unwrap());
+        assert!(
+            !expiration_is_due(&db.pool, due_id, "2026-08-10T12:00:00Z", now)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1557,8 +1542,8 @@ mod tests {
             &std::collections::HashSet::new(),
             STALE_CLEANUP_NOW,
         )
-            .await
-            .expect("stale cleanup");
+        .await
+        .expect("stale cleanup");
         assert!(stale.is_empty());
         assert!(find_by_id(&db.pool, id).await.unwrap().is_some());
     }
@@ -1614,12 +1599,11 @@ mod tests {
         .expect("stale cleanup");
         assert!(stale.is_empty());
         for id in [manual_id, future_id] {
-            let pending: i64 =
-                sqlx::query_scalar("SELECT removal_pending FROM peers WHERE id = ?")
-                    .bind(id)
-                    .fetch_one(&db.pool)
-                    .await
-                    .unwrap();
+            let pending: i64 = sqlx::query_scalar("SELECT removal_pending FROM peers WHERE id = ?")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
             assert_eq!(pending, 1);
         }
 
@@ -1799,8 +1783,8 @@ mod tests {
             &std::collections::HashSet::new(),
             STALE_CLEANUP_NOW,
         )
-            .await
-            .expect("stale cleanup with old snapshot");
+        .await
+        .expect("stale cleanup with old snapshot");
         assert!(stale.is_empty());
         assert!(find_by_public_key(&db.pool, metadata.public_key)
             .await
@@ -2091,8 +2075,8 @@ mod tests {
             &std::collections::HashSet::new(),
             STALE_CLEANUP_NOW,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert!(stale.is_empty());
         assert!(find_by_id(&db.pool, id).await.unwrap().is_some());
         assert!(list_disabled_public_keys(&db.pool)
@@ -2155,7 +2139,10 @@ mod tests {
         // KEY_A should still exist
         assert!(find_by_id(&db.pool, id_a).await.unwrap().is_some());
         // KEY_B should be gone
-        assert!(find_by_public_key(&db.pool, "KEY_B=").await.unwrap().is_none());
+        assert!(find_by_public_key(&db.pool, "KEY_B=")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2231,8 +2218,8 @@ mod tests {
             &std::collections::HashSet::new(),
             STALE_CLEANUP_NOW,
         )
-            .await
-            .expect("delete stale peers");
+        .await
+        .expect("delete stale peers");
 
         assert_eq!(stale, vec![(id, "KEY_CONFIG_STALE=".to_string())]);
         assert!(find_by_id(&db.pool, id).await.unwrap().is_none());
@@ -2263,8 +2250,8 @@ mod tests {
             &std::collections::HashSet::new(),
             STALE_CLEANUP_NOW,
         )
-            .await
-            .expect("delete stale peers");
+        .await
+        .expect("delete stale peers");
 
         assert_eq!(stale, vec![(row.id, metadata.public_key.to_string())]);
         assert!(find_by_id(&db.pool, row.id).await.unwrap().is_none());
@@ -2287,7 +2274,9 @@ mod tests {
         insert_peer(&db.pool, "KEY_Y=", None).await;
 
         let active: std::collections::HashSet<String> =
-            ["KEY_X=".to_string(), "KEY_Y=".to_string()].into_iter().collect();
+            ["KEY_X=".to_string(), "KEY_Y=".to_string()]
+                .into_iter()
+                .collect();
 
         let stale = delete_stale_peers(&db.pool, &active, STALE_CLEANUP_NOW)
             .await

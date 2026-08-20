@@ -433,6 +433,19 @@ if [[ -f /etc/amnezia/amneziawg/params ]]; then
 		echo "  FAIL: SERVER_AWG_IPV4 is '${SERVER_AWG_IPV4}' (expected '10.66.66.1')"
 		FAILED=$((FAILED + 1))
 	fi
+
+	if [[ "${AWG_PROTOCOL_VERSION:-}" == "2" ]] && \
+		[[ -z "${AWG_HEADER_PROTECTION_KEY:-}" ]] && \
+		[[ -z "${AWG_CONTENT_PADDING_ADDITION:-}" ]] && \
+		[[ -z "${AWG_REKEY_AFTER_TIME:-}" ]] && \
+		[[ -z "${AWG_REKEY_TIMEOUT:-}" ]] && \
+		[[ -z "${AWG_REJECT_AFTER_TIME:-}" ]] && \
+		[[ -z "${AWG_KEEPALIVE_TIMEOUT:-}" ]]; then
+		echo "  OK: Fresh install persists AWG 2.0 mode with no AWG 3.0 state"
+	else
+		echo "  FAIL: Fresh install did not preserve the AWG 2.0 compatibility default"
+		FAILED=$((FAILED + 1))
+	fi
 else
 	echo "FAIL: params file missing"
 	FAILED=$((FAILED + 1))
@@ -463,6 +476,12 @@ if [[ -f "${SERVER_CONF}" ]]; then
 			FAILED=$((FAILED + 1))
 		fi
 	done
+	if grep -Eq '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout) = ' "${SERVER_CONF}"; then
+		echo "  FAIL: Fresh AWG 2.0 server config contains AWG 3.0-only fields"
+		FAILED=$((FAILED + 1))
+	else
+		echo "  OK: Fresh AWG 2.0 server config omits AWG 3.0-only fields"
+	fi
 
 	# Verify the native nftables firewall rules were generated (issue #79).
 	# The installer should emit nft rules — not iptables — on nf_tables hosts.
@@ -543,6 +562,12 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 			FAILED=$((FAILED + 1))
 		fi
 	done
+	if grep -Eq '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout) = ' "${CLIENT_CONF}"; then
+		echo "  FAIL: Fresh AWG 2.0 client config contains AWG 3.0-only fields"
+		FAILED=$((FAILED + 1))
+	else
+		echo "  OK: Fresh AWG 2.0 client config omits AWG 3.0-only fields"
+	fi
 
 	# Verify Address line contains both a valid IPv4/32 and IPv6/128 entry
 	# Regression test: the interactive path previously skipped IPv6 assignment
@@ -2213,6 +2238,7 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	   grep -Fq "${SECOND_HELPER_KEY}" /tmp/awg-syncconf-stdin && \
 	   "${PRIVILEGED_HELPER}" read-params > "${PARAMS_ACTUAL}" && \
 	   grep -q '^SERVER_AWG_NIC=' "${PARAMS_ACTUAL}" && \
+	   [[ "$("${PRIVILEGED_HELPER}" protocol-status)" == "2" ]] && \
 	   "${PRIVILEGED_HELPER}" read-server-state "${HELPER_TEST_INTERFACE}" > "${READ_ACTUAL}" && \
 	   grep -Fq '### Client existing' "${READ_ACTUAL}" && \
 	   grep -Fq "PublicKey = ${SECOND_HELPER_KEY}" "${READ_ACTUAL}" && \
@@ -2220,6 +2246,89 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 		echo "OK: Privileged helper dispatches approved AWG operations"
 	else
 		echo "FAIL: Privileged helper rejected an approved AWG operation"
+		FAILED=$((FAILED + 1))
+	fi
+
+	HELPER_PARAMS_BACKUP="/tmp/amneziawg-helper-params-backup"
+	cp -p /etc/amnezia/amneziawg/params "${HELPER_PARAMS_BACKUP}"
+	printf '%s\n' \
+		"AWG_PROTOCOL_VERSION='3'" \
+		"AWG_HEADER_PROTECTION_KEY='${VALID_HELPER_KEY}'" \
+		"AWG_CONTENT_PADDING_ADDITION='10-100'" \
+		"AWG_REKEY_AFTER_TIME='100-120'" \
+		"AWG_REKEY_TIMEOUT='3-7'" \
+		"AWG_REJECT_AFTER_TIME='150-180'" \
+		"AWG_KEEPALIVE_TIMEOUT='5-15'" >> /etc/amnezia/amneziawg/params
+	if [[ "$("${PRIVILEGED_HELPER}" protocol-status)" == "3" ]] && \
+		"${PRIVILEGED_HELPER}" read-params > "${PARAMS_ACTUAL}" && \
+		grep -Fqx "AWG_HEADER_PROTECTION_KEY='${VALID_HELPER_KEY}'" "${PARAMS_ACTUAL}" && \
+		grep -Fqx "AWG_KEEPALIVE_TIMEOUT='5-15'" "${PARAMS_ACTUAL}"; then
+		echo "OK: Privileged helper exposes validated AWG 3.0 client-generation state"
+	else
+		echo "FAIL: Privileged helper did not expose AWG 3.0 protocol state"
+		FAILED=$((FAILED + 1))
+	fi
+	cp -p "${HELPER_PARAMS_BACKUP}" /etc/amnezia/amneziawg/params
+	rm -f "${HELPER_PARAMS_BACKUP}"
+
+	HELPER_INSTALL_SCRIPT="$(head -n 1 "${WEB_AWG_SCRIPT_MARKER}")"
+	HELPER_SCRIPT_BACKUP="/tmp/amneziawg-helper-script-backup"
+	HELPER_PROTOCOL_CALLS="/tmp/amneziawg-helper-protocol-calls"
+	HELPER_UNIT_BACKUP="/tmp/amneziawg-helper-unit-backup"
+	HELPER_CUSTOM_ENV_ROOT="/opt/amneziawg-web-helper-test"
+	cp -p "${HELPER_INSTALL_SCRIPT}" "${HELPER_SCRIPT_BACKUP}"
+	cp -p /etc/systemd/system/amneziawg-web.service "${HELPER_UNIT_BACKUP}"
+	printf '#!/bin/bash\nprintf "%%s\\n" "$1" >> %s\n' \
+		"${HELPER_PROTOCOL_CALLS}" > "${HELPER_INSTALL_SCRIPT}"
+	chmod 0755 "${HELPER_INSTALL_SCRIPT}"
+	chown root:root "${HELPER_INSTALL_SCRIPT}"
+	rm -f "${HELPER_PROTOCOL_CALLS}"
+	HELPER_PROTOCOL_DISPATCH_OK=0
+	if "${PRIVILEGED_HELPER}" enable-awg3 && \
+		"${PRIVILEGED_HELPER}" disable-awg3 && \
+		[[ "$(sed -n '1p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg3" ]] && \
+		[[ "$(sed -n '2p' "${HELPER_PROTOCOL_CALLS}")" == "--disable-awg3" ]]; then
+		HELPER_PROTOCOL_DISPATCH_OK=1
+	fi
+
+	# The installer supports root-controlled custom --env-file locations. The
+	# privileged helper must find the ownership marker beside that effective
+	# EnvironmentFile without weakening its directory/file checks.
+	rm -rf "${HELPER_CUSTOM_ENV_ROOT}"
+	install -d -m 0700 -o root -g root "${HELPER_CUSTOM_ENV_ROOT}"
+	install -m 0600 -o root -g root "${WEB_TEST_ENV_FILE}" \
+		"${HELPER_CUSTOM_ENV_ROOT}/env.conf"
+	install -m 0600 -o root -g root "${WEB_AWG_SCRIPT_MARKER}" \
+		"${HELPER_CUSTOM_ENV_ROOT}/installed-awg-script.path"
+	sed -i "s#^EnvironmentFile=.*#EnvironmentFile=${HELPER_CUSTOM_ENV_ROOT}/env.conf#" \
+		/etc/systemd/system/amneziawg-web.service
+	HELPER_CUSTOM_ENV_OK=0
+	if grep -Fqx "EnvironmentFile=${HELPER_CUSTOM_ENV_ROOT}/env.conf" \
+			/etc/systemd/system/amneziawg-web.service && \
+		"${PRIVILEGED_HELPER}" enable-awg3 && \
+		[[ "$(sed -n '3p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg3" ]]; then
+		HELPER_CUSTOM_ENV_OK=1
+	fi
+	chmod 0777 "${HELPER_CUSTOM_ENV_ROOT}"
+	if "${PRIVILEGED_HELPER}" disable-awg3 >/dev/null 2>&1; then
+		HELPER_CUSTOM_ENV_OK=0
+	fi
+	chmod 0700 "${HELPER_CUSTOM_ENV_ROOT}"
+	cp -p "${HELPER_UNIT_BACKUP}" /etc/systemd/system/amneziawg-web.service
+	rm -rf "${HELPER_CUSTOM_ENV_ROOT}"
+	if [[ "${HELPER_CUSTOM_ENV_OK}" -eq 1 ]]; then
+		echo "OK: Privileged helper supports secure custom EnvironmentFile directories"
+	else
+		echo "FAIL: Privileged helper did not safely support a custom EnvironmentFile directory"
+		FAILED=$((FAILED + 1))
+	fi
+
+	cp -p "${HELPER_SCRIPT_BACKUP}" "${HELPER_INSTALL_SCRIPT}"
+	rm -f "${HELPER_SCRIPT_BACKUP}" "${HELPER_PROTOCOL_CALLS}" "${HELPER_UNIT_BACKUP}"
+	if [[ "${HELPER_PROTOCOL_DISPATCH_OK}" -eq 1 ]]; then
+		echo "OK: Privileged helper dispatches only fixed protocol migration flags"
+	else
+		echo "FAIL: Privileged helper did not dispatch protocol migration flags"
 		FAILED=$((FAILED + 1))
 	fi
 
@@ -2253,6 +2362,8 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	printf '[Interface]\nPrivateKey = attacker\n' | \
 		"${PRIVILEGED_HELPER}" reconcile-interface awg0 >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" read-params extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" protocol-status extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" enable-awg3 extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" read-server-state ../etc >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" remove-client-if-key "${HELPER_TEST_INTERFACE}" alice invalid-key \
 		>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
@@ -3003,6 +3114,62 @@ else
 fi
 
 echo ""
+echo "--- Web upgrader: preserve unmanaged AWG lifecycle script ---"
+
+UNMANAGED_UPGRADE_BINARY="/tmp/amneziawg-web-upgrade-unmanaged"
+cat > "${UNMANAGED_UPGRADE_BINARY}" <<'UNMANAGEDEOF'
+#!/bin/bash
+echo "amneziawg-web unmanaged-script upgrade test"
+UNMANAGEDEOF
+chmod +x "${UNMANAGED_UPGRADE_BINARY}"
+cat > "${WEB_AWG_SCRIPT_PATH}" <<'UNMANAGEDAWGEOF'
+#!/bin/bash
+echo operator-managed-awg-script
+UNMANAGEDAWGEOF
+chmod 0755 "${WEB_AWG_SCRIPT_PATH}"
+rm -f "${WEB_AWG_SCRIPT_MARKER}"
+UNMANAGED_AWG_HASH=$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')
+
+WEB_UPGRADE_UNMANAGED_RC=0
+WEB_UPGRADE_UNMANAGED_OUTPUT=$(bash "${WEB_UPGRADER_IMPL}" \
+	--binary "${UNMANAGED_UPGRADE_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--force 2>&1) || WEB_UPGRADE_UNMANAGED_RC=$?
+
+if [[ "${WEB_UPGRADE_UNMANAGED_RC}" -eq 0 ]] && \
+		[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')" == "${UNMANAGED_AWG_HASH}" ]] && \
+		[[ ! -e "${WEB_AWG_SCRIPT_MARKER}" ]] && \
+		echo "${WEB_UPGRADE_UNMANAGED_OUTPUT}" | grep -qi "preserving unmanaged"; then
+	echo "OK: Upgrader preserves an unmarked operator-managed AWG lifecycle script"
+else
+	echo "FAIL: Upgrader changed or claimed an unmarked operator-managed AWG lifecycle script"
+	echo "  Output: ${WEB_UPGRADE_UNMANAGED_OUTPUT}"
+	FAILED=$((FAILED + 1))
+fi
+rm -f "${UNMANAGED_UPGRADE_BINARY}"
+
+# Restore the installer-managed lifecycle generation used by the remaining
+# transactional upgrade tests.
+WEB_RESTORE_MANAGED_RC=0
+bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable >/dev/null 2>&1 || WEB_RESTORE_MANAGED_RC=$?
+if [[ "${WEB_RESTORE_MANAGED_RC}" -ne 0 || ! -f "${WEB_AWG_SCRIPT_MARKER}" ]]; then
+	echo "FAIL: Could not restore installer-managed AWG lifecycle test fixture"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
 echo "--- Web upgrader: failed sudoers preflight preserves live install ---"
 
 PREFLIGHT_BINARY="/tmp/amneziawg-web-upgrade-preflight"
@@ -3095,7 +3262,11 @@ exec "${REAL_MV_BIN}" "$@"
 MVEOF
 chmod +x "${ROLLBACK_MV_DIR}/mv"
 
+# Make the installed lifecycle script byte-distinct from the repository copy.
+# Every failed upgrade below must restore this legacy generation exactly.
+printf '\n# legacy lifecycle script sentinel\n' >> "${WEB_AWG_SCRIPT_PATH}"
 ROLLBACK_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+ROLLBACK_AWG_SCRIPT_HASH=$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')
 ROLLBACK_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
 ROLLBACK_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
 touch /tmp/awg-web-mock-started
@@ -3118,6 +3289,8 @@ if [[ "${WEB_UPGRADE_ROLLBACK_RC}" -eq 0 ]]; then
 fi
 if [[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != \
 		"${ROLLBACK_BINARY_HASH}" ]] || \
+		[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')" != \
+		"${ROLLBACK_AWG_SCRIPT_HASH}" ]] || \
 		[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != \
 		"${ROLLBACK_HELPER_HASH}" ]] || \
 		[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != \
@@ -3132,6 +3305,8 @@ if ! grep -q "stop amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
 fi
 if compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
 	compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+	compgen -G "${WEB_AWG_SCRIPT_PATH}.upgrade-tmp.*" >/dev/null || \
+	compgen -G "${WEB_AWG_SCRIPT_PATH}.rollback.*" >/dev/null || \
 	compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
 	compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
 	compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null || \
@@ -3146,14 +3321,15 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
-# The first and second rename failures must not attempt to overwrite the
+# Early rename failures must not attempt to overwrite the
 # unchanged failing destination during rollback.  For the sudoers case, make
 # the old helper byte-distinct so its successful first commit must be undone.
-for EARLY_FAIL_DEST in "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
+for EARLY_FAIL_DEST in "${WEB_AWG_SCRIPT_PATH}" "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
 	if [[ "${EARLY_FAIL_DEST}" == "${SUDOERS_FILE}" ]]; then
 		printf '\n# rollback sentinel\n' >> "${PRIVILEGED_HELPER}"
 	fi
 	EARLY_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+	EARLY_AWG_SCRIPT_HASH=$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')
 	EARLY_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
 	EARLY_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
 	touch /tmp/awg-web-mock-started
@@ -3173,6 +3349,8 @@ for EARLY_FAIL_DEST in "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
 	if [[ "${EARLY_UPGRADE_RC}" -eq 0 ]] || \
 			[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != \
 			"${EARLY_BINARY_HASH}" ]] || \
+			[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')" != \
+			"${EARLY_AWG_SCRIPT_HASH}" ]] || \
 			[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != \
 			"${EARLY_HELPER_HASH}" ]] || \
 			[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != \
@@ -3185,6 +3363,8 @@ for EARLY_FAIL_DEST in "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}"; do
 	fi
 	if compgen -G '/usr/local/libexec/amneziawg-web-privileged.tmp.*' >/dev/null || \
 		compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
+		compgen -G "${WEB_AWG_SCRIPT_PATH}.upgrade-tmp.*" >/dev/null || \
+		compgen -G "${WEB_AWG_SCRIPT_PATH}.rollback.*" >/dev/null || \
 		compgen -G '/etc/sudoers.d/amneziawg-web.tmp.*' >/dev/null || \
 		compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
 		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.upgrade-tmp.*" >/dev/null || \
@@ -3208,6 +3388,7 @@ SIGNAL_BINARY="/tmp/amneziawg-web-upgrade-identical"
 cp -a "${WEB_TEST_INSTALL_DIR}/amneziawg-web" "${SIGNAL_BINARY}"
 printf '\n# pre-signal helper sentinel\n' >> "${PRIVILEGED_HELPER}"
 SIGNAL_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+SIGNAL_AWG_SCRIPT_HASH=$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')
 SIGNAL_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
 SIGNAL_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
 touch /tmp/awg-web-mock-started
@@ -3226,11 +3407,13 @@ SIGNAL_UPGRADE_OUTPUT=$(SIGNAL_AFTER_MV_DEST="${SUDOERS_FILE}" \
 SIGNAL_FAILED=0
 if [[ "${SIGNAL_UPGRADE_RC}" -eq 0 ]] || \
 		[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != "${SIGNAL_BINARY_HASH}" ]] || \
+		[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')" != "${SIGNAL_AWG_SCRIPT_HASH}" ]] || \
 		[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != "${SIGNAL_HELPER_HASH}" ]] || \
 		[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != "${SIGNAL_SUDOERS_HASH}" ]]; then
 	SIGNAL_FAILED=1
 fi
 if ! grep -q "start amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+		compgen -G "${WEB_AWG_SCRIPT_PATH}.rollback.*" >/dev/null || \
 		compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
 		compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
 		compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.rollback.*" >/dev/null; then
@@ -3250,6 +3433,7 @@ echo "--- Web upgrader: restart failure restores the previous runtime generation
 
 for RESTART_UPGRADE_ENV in FAIL_SYSTEMCTL_RESTART RESTART_RETURNS_INACTIVE; do
 	RESTART_BINARY_HASH=$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')
+	RESTART_AWG_SCRIPT_HASH=$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')
 	RESTART_HELPER_HASH=$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')
 	RESTART_SUDOERS_HASH=$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')
 	touch /tmp/awg-web-mock-started
@@ -3267,6 +3451,7 @@ for RESTART_UPGRADE_ENV in FAIL_SYSTEMCTL_RESTART RESTART_RETURNS_INACTIVE; do
 	RESTART_FAILED=0
 	if [[ "${RESTART_UPGRADE_RC}" -eq 0 ]] || \
 			[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" | awk '{print $1}')" != "${RESTART_BINARY_HASH}" ]] || \
+			[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}" | awk '{print $1}')" != "${RESTART_AWG_SCRIPT_HASH}" ]] || \
 			[[ "$(sha256sum "${PRIVILEGED_HELPER}" | awk '{print $1}')" != "${RESTART_HELPER_HASH}" ]] || \
 			[[ "$(sha256sum "${SUDOERS_FILE}" | awk '{print $1}')" != "${RESTART_SUDOERS_HASH}" ]] || \
 			[[ ! -f /tmp/awg-web-mock-started ]]; then
@@ -3274,6 +3459,7 @@ for RESTART_UPGRADE_ENV in FAIL_SYSTEMCTL_RESTART RESTART_RETURNS_INACTIVE; do
 	fi
 	if ! grep -q "restart amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
 			! grep -q "start amneziawg-web" /tmp/systemctl-calls.log 2>/dev/null || \
+			compgen -G "${WEB_AWG_SCRIPT_PATH}.rollback.*" >/dev/null || \
 			compgen -G '/usr/local/libexec/amneziawg-web-privileged.rollback.*' >/dev/null || \
 			compgen -G '/etc/sudoers.d/amneziawg-web.rollback.*' >/dev/null || \
 			compgen -G "${WEB_TEST_INSTALL_DIR}/amneziawg-web.rollback.*" >/dev/null; then
@@ -3363,6 +3549,13 @@ if cmp -s "${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-privileged" \
 	echo "OK: Upgrader refreshed the privileged helper"
 else
 	echo "FAIL: Upgrader did not install the current privileged helper"
+	FAILED=$((FAILED + 1))
+fi
+
+if cmp -s "${PROJECT_ROOT}/amneziawg-install.sh" "${WEB_AWG_SCRIPT_PATH}"; then
+	echo "OK: Upgrader refreshed the AWG lifecycle script"
+else
+	echo "FAIL: Upgrader did not replace the legacy AWG lifecycle script"
 	FAILED=$((FAILED + 1))
 fi
 

@@ -62,6 +62,8 @@ pub const EVT_USER_REMOVE_REQUESTED: &str = "user_remove_requested";
 pub const EVT_USER_REMOVED: &str = "user_removed";
 /// Audit event when a user removal fails.
 pub const EVT_USER_REMOVE_FAILED: &str = "user_remove_failed";
+/// Audit event for a completed AWG 2.0/3.0 interface migration.
+pub const EVT_AWG_PROTOCOL_CHANGED: &str = "awg_protocol_changed";
 
 /// Maximum number of events that can be returned in a single [`list_events`] call.
 pub const MAX_EVENTS_LIMIT: i64 = 200;
@@ -164,10 +166,7 @@ pub async fn list_events(
 ///
 /// This preserves audit rows while allowing the peer row itself to be deleted.
 /// Returns the number of events that were updated.
-pub async fn clear_peer_id_references(
-    pool: &SqlitePool,
-    peer_id: i64,
-) -> Result<u64, sqlx::Error> {
+pub async fn clear_peer_id_references(pool: &SqlitePool, peer_id: i64) -> Result<u64, sqlx::Error> {
     let result = sqlx::query("UPDATE events SET peer_id = NULL WHERE peer_id = ?")
         .bind(peer_id)
         .execute(pool)
@@ -524,7 +523,15 @@ mod tests {
         let db = test_db().await;
         let pid = insert_peer(&db.pool, "CLR_PID==").await;
 
-        log_event(&db.pool, EVT_PEER_UPDATED, Some(pid), Some("CLR_PID=="), None, "admin").await;
+        log_event(
+            &db.pool,
+            EVT_PEER_UPDATED,
+            Some(pid),
+            Some("CLR_PID=="),
+            None,
+            "admin",
+        )
+        .await;
         log_event(&db.pool, EVT_LOGIN_SUCCESS, None, None, None, "admin").await;
 
         let changed = clear_peer_id_references(&db.pool, pid)

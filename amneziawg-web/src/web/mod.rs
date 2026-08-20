@@ -26,8 +26,8 @@ use crate::auth::{
     RATE_LIMIT_MAX_ATTEMPTS, RATE_LIMIT_WINDOW,
 };
 use crate::db::events::{
-    list_events, log_event, EVT_LOGIN_FAILED, EVT_LOGIN_SUCCESS, EVT_LOGOUT, EVT_PEER_DISABLED,
-    EVT_PEER_UPDATED,
+    list_events, log_event, EVT_AWG_PROTOCOL_CHANGED, EVT_LOGIN_FAILED, EVT_LOGIN_SUCCESS,
+    EVT_LOGOUT, EVT_PEER_DISABLED, EVT_PEER_UPDATED,
 };
 use crate::db::peers::{PeerRow, SnapshotRow};
 use crate::db::Database;
@@ -629,11 +629,24 @@ pub struct AddUserForm {
     pub expiration_days: Option<String>,
 }
 
+/// Confirmation form for an interface-wide AWG protocol migration.
+#[derive(Debug, Deserialize)]
+pub struct ProtocolChangeForm {
+    pub csrf_token: Option<String>,
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProtocolStatusDto {
+    pub version: String,
+}
+
 /// Fixed notice code accepted by the peer-list page after a create redirect.
 #[derive(Debug, Default, Deserialize)]
 struct PeerListQuery {
     create_notice: Option<String>,
     peer_notice: Option<String>,
+    protocol_notice: Option<String>,
     show_archived: Option<bool>,
 }
 
@@ -683,10 +696,7 @@ fn parse_stored_expiration(raw: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
-fn expiration_from_days(
-    days: i64,
-    now: DateTime<Utc>,
-) -> Result<Option<String>, String> {
+fn expiration_from_days(days: i64, now: DateTime<Utc>) -> Result<Option<String>, String> {
     if !(0..=MAX_EXPIRATION_DAYS).contains(&days) {
         return Err(format!(
             "expiration_days must be between 0 and {MAX_EXPIRATION_DAYS}"
@@ -698,9 +708,7 @@ fn expiration_from_days(
     let expires_at = now
         .checked_add_signed(chrono::Duration::days(days))
         .ok_or_else(|| "expiration date is out of range".to_string())?;
-    Ok(Some(
-        expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
-    ))
+    Ok(Some(expires_at.to_rfc3339_opts(SecondsFormat::Secs, true)))
 }
 
 fn parse_form_expiration_days(value: Option<&str>) -> Result<Option<i64>, String> {
@@ -727,10 +735,7 @@ fn managed_client_name_for_lifecycle(row: &PeerRow) -> Option<&str> {
         })
 }
 
-fn format_expiration_status(
-    expires_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> String {
+fn format_expiration_status(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     let Some(expires_at) = expires_at else {
         return "Never expires".to_string();
     };
@@ -756,10 +761,7 @@ fn format_expiration_status(
 
     let days = (seconds + 86_399) / 86_400;
     if days <= 30 {
-        return format!(
-            "Expires in {days} day{}",
-            if days == 1 { "" } else { "s" }
-        );
+        return format!("Expires in {days} day{}", if days == 1 { "" } else { "s" });
     }
 
     format!(
@@ -1196,10 +1198,13 @@ pub fn router_with_lifecycle_lock_dir(
         .route("/api/admin/next-ips", get(api_next_ips))
         .route("/api/admin/users", post(api_create_user))
         .route("/api/admin/users/:id/remove", post(api_remove_user))
+        .route("/api/admin/protocol", get(api_protocol_status))
         .route("/admin/users/add", post(post_add_user_form))
         .route("/admin/users/:id/remove", post(post_remove_user_form))
         .route("/admin/peers/:id/archive", post(post_archive_peer_form))
         .route("/admin/peers/:id/restore", post(post_restore_peer_form))
+        .route("/admin/protocol/enable-awg3", post(post_enable_awg3_form))
+        .route("/admin/protocol/disable-awg3", post(post_disable_awg3_form))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -2039,8 +2044,7 @@ async fn get_peer_config(
         .and_then(|n| n.to_str())
         .unwrap_or("client.conf")
         // Sanitise for use inside a quoted Content-Disposition filename.
-        .replace('\\', "_")
-        .replace('"', "_");
+        .replace(['\\', '"'], "_");
 
     let disposition = format!("attachment; filename=\"{}\"", filename);
 
@@ -2071,7 +2075,7 @@ const QR_NO_CACHE_HEADERS: [(axum::http::header::HeaderName, &str); 2] = [
 fn with_qr_no_cache(mut resp: Response) -> Response {
     let headers = resp.headers_mut();
     for (name, value) in &QR_NO_CACHE_HEADERS {
-        headers.insert(name.clone(), axum::http::HeaderValue::from_static(*value));
+        headers.insert(name.clone(), axum::http::HeaderValue::from_static(value));
     }
     resp
 }
@@ -2169,22 +2173,20 @@ async fn patch_peer(
         Some(days) => match expiration_from_days(days, Utc::now()) {
             Ok(value) => Some(value),
             Err(message) => {
-                return Ok((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": message })),
+                return Ok(
+                    (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
                 )
-                    .into_response())
             }
         },
         None => None,
     };
     let managed_client_name = managed_client_name_for_lifecycle(&existing);
-    if expiration_update.as_ref().is_some_and(Option::is_some)
-        && managed_client_name.is_none()
-    {
+    if expiration_update.as_ref().is_some_and(Option::is_some) && managed_client_name.is_none() {
         return Ok((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "only installer-managed users with a linked config can expire" })),
+            Json(
+                json!({ "error": "only installer-managed users with a linked config can expire" }),
+            ),
         )
             .into_response());
     }
@@ -2259,9 +2261,7 @@ async fn patch_peer(
             .into_response()),
         Some(peer_row) => {
             // Fire-and-forget audit log for metadata changes.
-            if body.display_name.is_some()
-                || body.comment.is_some()
-                || expiration_update.is_some()
+            if body.display_name.is_some() || body.comment.is_some() || expiration_update.is_some()
             {
                 let detail = serde_json::json!({
                     "old_display_name": existing.display_name,
@@ -2336,6 +2336,12 @@ async fn page_peer_list(
                 .create_notice
                 .as_deref()
                 .and_then(create_user_notice_message)
+        })
+        .or_else(|| {
+            query
+                .protocol_notice
+                .as_deref()
+                .and_then(protocol_notice_message)
         });
     Ok(Html(render_peer_list(
         &peers,
@@ -2546,7 +2552,10 @@ async fn post_peer_edit(
         Err(message) => {
             return Ok((
                 StatusCode::BAD_REQUEST,
-                Html(format!("<h1>Invalid expiration</h1><p>{}</p>", esc(&message))),
+                Html(format!(
+                    "<h1>Invalid expiration</h1><p>{}</p>",
+                    esc(&message)
+                )),
             )
                 .into_response())
         }
@@ -2557,7 +2566,10 @@ async fn post_peer_edit(
             Err(message) => {
                 return Ok((
                     StatusCode::BAD_REQUEST,
-                    Html(format!("<h1>Invalid expiration</h1><p>{}</p>", esc(&message))),
+                    Html(format!(
+                        "<h1>Invalid expiration</h1><p>{}</p>",
+                        esc(&message)
+                    )),
                 )
                     .into_response())
             }
@@ -2565,9 +2577,7 @@ async fn post_peer_edit(
         None => None,
     };
     let managed_client_name = managed_client_name_for_lifecycle(&existing);
-    if expiration_update.as_ref().is_some_and(Option::is_some)
-        && managed_client_name.is_none()
-    {
+    if expiration_update.as_ref().is_some_and(Option::is_some) && managed_client_name.is_none() {
         return Ok((
             StatusCode::BAD_REQUEST,
             Html("<h1>Invalid expiration</h1><p>Only installer-managed users with a linked config can expire.</p>".to_string()),
@@ -2687,6 +2697,9 @@ const CREATE_NOTICE_SYNC_REQUIRED: &str = "sync_required";
 const CREATE_NOTICE_METADATA_NOT_PERSISTED: &str = "metadata_not_persisted";
 const CREATE_NOTICE_SYNC_AND_METADATA: &str = "sync_and_metadata";
 const PEER_NOTICE_ARCHIVED: &str = "peer_archived";
+const PROTOCOL_NOTICE_AWG3_ENABLED: &str = "awg3_enabled";
+const PROTOCOL_NOTICE_AWG2_ENABLED: &str = "awg2_enabled";
+const PROTOCOL_NOTICE_FAILED: &str = "protocol_failed";
 
 fn create_user_warning_codes(result: &crate::admin::CreateUserResult) -> Vec<&'static str> {
     let mut warnings = Vec::with_capacity(2);
@@ -2730,6 +2743,107 @@ fn peer_archive_notice_message(code: &str) -> Option<&'static str> {
         ),
         _ => None,
     }
+}
+
+fn protocol_notice_message(code: &str) -> Option<&'static str> {
+    match code {
+        PROTOCOL_NOTICE_AWG3_ENABLED => Some(
+            "AWG 3.0 is active. Redistribute every regenerated client config before reconnecting clients.",
+        ),
+        PROTOCOL_NOTICE_AWG2_ENABLED => Some(
+            "The interface and all recoverable client configs were returned to AWG 2.0.",
+        ),
+        PROTOCOL_NOTICE_FAILED => Some(
+            "The protocol change failed. Existing server and client configs were left unchanged or restored.",
+        ),
+        _ => None,
+    }
+}
+
+/// `GET /api/admin/protocol` – report the normalized interface protocol mode.
+async fn api_protocol_status() -> Result<Response, ApiError> {
+    let version = tokio::task::spawn_blocking(crate::awg::protocol_status_via_sudo).await??;
+    Ok(Json(ProtocolStatusDto {
+        version: format!("{version}.0"),
+    })
+    .into_response())
+}
+
+async fn post_protocol_change(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: ProtocolChangeForm,
+    enable_awg3: bool,
+) -> Result<Response, ApiError> {
+    if state.auth.enabled {
+        let cookie_header = headers
+            .get("cookie")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if !validate_form_csrf(
+            state,
+            cookie_header,
+            form.csrf_token.as_deref().unwrap_or(""),
+        ) {
+            return Ok(StatusCode::FORBIDDEN.into_response());
+        }
+    }
+    if form.confirm.as_deref() != Some("yes") {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            "Confirm that all client configurations will be replaced.",
+        )
+            .into_response());
+    }
+
+    let result =
+        tokio::task::spawn_blocking(move || crate::awg::set_protocol_mode_via_sudo(enable_awg3))
+            .await;
+    let notice = match result {
+        Ok(Ok(())) => {
+            let version = if enable_awg3 { "3.0" } else { "2.0" };
+            let detail = json!({ "version": version }).to_string();
+            log_event(
+                &state.db.pool,
+                EVT_AWG_PROTOCOL_CHANGED,
+                None,
+                None,
+                Some(&detail),
+                &state.auth.username,
+            )
+            .await;
+            if enable_awg3 {
+                PROTOCOL_NOTICE_AWG3_ENABLED
+            } else {
+                PROTOCOL_NOTICE_AWG2_ENABLED
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "AWG protocol migration failed");
+            PROTOCOL_NOTICE_FAILED
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "AWG protocol migration task failed");
+            PROTOCOL_NOTICE_FAILED
+        }
+    };
+    Ok(Redirect::to(&format!("/?protocol_notice={notice}")).into_response())
+}
+
+async fn post_enable_awg3_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProtocolChangeForm>,
+) -> Result<Response, ApiError> {
+    post_protocol_change(&state, &headers, form, true).await
+}
+
+async fn post_disable_awg3_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProtocolChangeForm>,
+) -> Result<Response, ApiError> {
+    post_protocol_change(&state, &headers, form, false).await
 }
 
 #[cfg(test)]
@@ -2797,11 +2911,7 @@ async fn api_create_user(
     let expires_at = match expiration_from_days(body.expiration_days.unwrap_or(0), Utc::now()) {
         Ok(value) => value,
         Err(message) => {
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": message })),
-            )
-                .into_response())
+            return Ok((StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response())
         }
     };
     match crate::admin::execute_create_user(
@@ -3010,8 +3120,7 @@ async fn post_add_user_form(
         Ok(None) => 0,
         Err(message) => {
             let rows = crate::db::peers::list_visible(&state.db.pool).await?;
-            let peers: Vec<PeerSummaryDto> =
-                rows.into_iter().map(peer_row_to_summary).collect();
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             return Ok(Html(render_peer_list_with_error(
@@ -3024,8 +3133,7 @@ async fn post_add_user_form(
         Ok(value) => value,
         Err(message) => {
             let rows = crate::db::peers::list_visible(&state.db.pool).await?;
-            let peers: Vec<PeerSummaryDto> =
-                rows.into_iter().map(peer_row_to_summary).collect();
+            let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             return Ok(Html(render_peer_list_with_error(
@@ -3894,6 +4002,53 @@ fn render_peer_list_with_error(
     )
 }
 
+fn render_protocol_controls(csrf_token: &str) -> String {
+    format!(
+        r#"<details class="edit-form protocol-panel">
+<summary>AWG protocol</summary>
+<p id="protocol-current" class="meta" role="status">Current mode: loading…</p>
+<section id="protocol-enable-awg3">
+  <p class="creation-warning"><strong>AWG 3.0 is not compatible with AWG 2.0 clients on the same interface.</strong> The server first probes kernel support, then atomically updates the server and every recoverable client config.</p>
+  <form method="POST" action="/admin/protocol/enable-awg3">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
+    <button type="submit">Enable AWG 3.0</button>
+  </form>
+</section>
+<section id="protocol-disable-awg3">
+  <p>Downgrade the interface and all recoverable client configs to AWG 2.0. AWG 3.0-only fields and the shared header-protection key are removed.</p>
+  <form method="POST" action="/admin/protocol/disable-awg3">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
+    <button type="submit">Return to AWG 2.0</button>
+  </form>
+</section>
+</details>
+<script>
+(function() {{
+  var current = document.getElementById('protocol-current');
+  var enable = document.getElementById('protocol-enable-awg3');
+  var disable = document.getElementById('protocol-disable-awg3');
+  fetch('/api/admin/protocol', {{ credentials: 'same-origin' }})
+    .then(function(response) {{
+      if (!response.ok) throw new Error('status unavailable');
+      return response.json();
+    }})
+    .then(function(data) {{
+      current.textContent = 'Current mode: AWG ' + data.version;
+      enable.hidden = data.version === '3.0';
+      disable.hidden = data.version !== '3.0';
+    }})
+    .catch(function() {{
+      current.textContent = 'Current mode unavailable. No change occurs until a confirmed action succeeds.';
+    }});
+}})();
+</script>
+"#,
+        csrf = esc(csrf_token),
+    )
+}
+
 fn render_peer_list_inner(
     peers: &[PeerSummaryDto],
     csrf_token: &str,
@@ -3930,6 +4085,7 @@ fn render_peer_list_inner(
             esc(notice)
         ));
     }
+    buf.push_str(&render_protocol_controls(csrf_token));
 
     if peers.is_empty() {
         buf.push_str("<p>No peers found. The poller may not have run yet.</p>\n");
@@ -3967,8 +4123,7 @@ fn render_peer_list_inner(
                 .filter(|comment| !comment.is_empty())
                 .map(esc)
                 .unwrap_or_else(|| "–".to_string());
-            let expiration =
-                render_expiration_cell(&p.expiration_status, p.expires_at, p.expired);
+            let expiration = render_expiration_cell(&p.expiration_status, p.expires_at, p.expired);
             buf.push_str(&format!(
                 "<tr><td>{name_link}</td><td>{conn}</td><td>{ident}</td><td>{endpoint}</td>\
                  <td class=\"comment-cell\">{comment}</td><td>{expiration}</td><td>{handshake}</td><td>{rx}</td><td>{tx}</td></tr>\n",
@@ -8008,6 +8163,40 @@ mod tests {
 
     // ── User lifecycle UI tests ──────────────────────────────────────────
 
+    #[test]
+    fn protocol_controls_require_confirmation_and_never_render_key_state() {
+        let html = render_protocol_controls("protocol-csrf");
+        assert!(html.contains("/admin/protocol/enable-awg3"));
+        assert!(html.contains("/admin/protocol/disable-awg3"));
+        assert!(html.contains("name=\"confirm\" value=\"yes\" required"));
+        assert!(html.contains("name=\"csrf_token\" value=\"protocol-csrf\""));
+        assert!(html.contains("/api/admin/protocol"));
+        assert!(!html.contains("AWG_HEADER_PROTECTION_KEY"));
+    }
+
+    #[tokio::test]
+    async fn protocol_change_form_rejects_missing_confirmation_before_dispatch() {
+        let app = test_router(test_db().await);
+        for path in [
+            "/admin/protocol/enable-awg3",
+            "/admin/protocol/disable-awg3",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
     #[tokio::test]
     async fn peer_list_page_contains_add_user_form() {
         let app = test_router(test_db().await);
@@ -8364,9 +8553,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/admin/users")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"name":"alice","expiration_days":36501}"#,
-                    ))
+                    .body(Body::from(r#"{"name":"alice","expiration_days":36501}"#))
                     .unwrap(),
             )
             .await

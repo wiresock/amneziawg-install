@@ -14,6 +14,17 @@ WEB_PANEL_ENV_FILE="/etc/amneziawg-web/env.conf"
 WEB_PANEL_SYSTEMD_UNIT="/etc/systemd/system/amneziawg-web.service"
 WEB_PANEL_DATA_DIR="/var/lib/amneziawg-web"
 
+# Protocol state is deliberately independent from package/tool versions. A
+# missing value in an older params file always means AWG 2.0; AWG 3.0 is only
+# entered through the explicit, capability-gated migration path.
+AWG_PROTOCOL_VERSION_2="2"
+AWG_PROTOCOL_VERSION_3="3"
+AWG3_DEFAULT_CONTENT_PADDING_ADDITION="10-100"
+AWG3_DEFAULT_REKEY_AFTER_TIME="100-120"
+AWG3_DEFAULT_REKEY_TIMEOUT="3-7"
+AWG3_DEFAULT_REJECT_AFTER_TIME="150-180"
+AWG3_DEFAULT_KEEPALIVE_TIMEOUT="5-15"
+
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
 # Only adjust PATH when the script is executed directly, not when sourced.
@@ -1492,6 +1503,203 @@ function safeQuoteParam() {
 	printf "'%s'\n" "${ESCAPED}"
 }
 
+# Clear every AWG 3.0-only value before loading persistent state. This is a
+# security boundary: exported environment variables must never opt an AWG 2.0
+# installation into header protection or alter its generated client configs.
+function clearAwg3Params() {
+	AWG_HEADER_PROTECTION_KEY=""
+	AWG_CONTENT_PADDING_ADDITION=""
+	AWG_REKEY_AFTER_TIME=""
+	AWG_REKEY_TIMEOUT=""
+	AWG_REJECT_AFTER_TIME=""
+	AWG_KEEPALIVE_TIMEOUT=""
+}
+
+# Normalize persisted aliases while preserving the compatibility rule that a
+# missing protocol version is AWG 2.0.
+function normalizeAwgProtocolVersion() {
+	case "${AWG_PROTOCOL_VERSION:-}" in
+		""|2|2.0)
+			AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_2}"
+			;;
+		3|3.0)
+			AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_3}"
+			;;
+		*)
+			echo "ERROR: unsupported AWG_PROTOCOL_VERSION in params; expected 2 or 3" >&2
+			return 1
+			;;
+	esac
+}
+
+# AWG 3.0 range fields are encoded as one uint16 value or an inclusive
+# uint16 range (for example, 10 or 10-100). Empty values are allowed because
+# every timing/content-padding field is optional upstream.
+function validateAwg3Range() {
+	local NAME="$1"
+	local VALUE="$2"
+	local LOW HIGH
+
+	[[ -n "${VALUE}" ]] || return 0
+	if ! [[ "${VALUE}" =~ ^([0-9]{1,5})(-([0-9]{1,5}))?$ ]]; then
+		echo "ERROR: ${NAME} must be an integer or inclusive range (for example, 10-20)" >&2
+		return 1
+	fi
+	LOW=$((10#${BASH_REMATCH[1]}))
+	HIGH="${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}"
+	HIGH=$((10#${HIGH}))
+	if (( LOW > 65535 || HIGH > 65535 || LOW > HIGH )); then
+		echo "ERROR: ${NAME} must be an ordered range between 0 and 65535" >&2
+		return 1
+	fi
+}
+
+# Validate persisted/generated AWG 3.0 state without ever echoing the header
+# key. S1-S4 supply the 12-byte nonce prefix required by header protection.
+function validateAwg3Params() {
+	local PADDING_NAME PADDING_VALUE
+
+	if ! [[ "${AWG_HEADER_PROTECTION_KEY:-}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+		echo "ERROR: HeaderProtectionKey must be a 32-byte base64 key" >&2
+		return 1
+	fi
+	if command -v awg >/dev/null 2>&1 && \
+		! printf '%s\n' "${AWG_HEADER_PROTECTION_KEY}" | awg pubkey >/dev/null 2>&1; then
+		echo "ERROR: HeaderProtectionKey is not accepted by the installed awg tool" >&2
+		return 1
+	fi
+
+	for PADDING_NAME in SERVER_AWG_S1 SERVER_AWG_S2 SERVER_AWG_S3 SERVER_AWG_S4; do
+		PADDING_VALUE="${!PADDING_NAME:-}"
+		if ! [[ "${PADDING_VALUE}" =~ ^[0-9]{1,5}$ ]] || \
+			(( 10#${PADDING_VALUE} < 12 || 10#${PADDING_VALUE} > 65535 )); then
+			echo "ERROR: ${PADDING_NAME} must be at least 12 when AWG 3.0 header protection is enabled" >&2
+			return 1
+		fi
+	done
+
+	validateAwg3Range "ContentPaddingAddition" "${AWG_CONTENT_PADDING_ADDITION:-}" || return 1
+	validateAwg3Range "RekeyAfterTime" "${AWG_REKEY_AFTER_TIME:-}" || return 1
+	validateAwg3Range "RekeyTimeout" "${AWG_REKEY_TIMEOUT:-}" || return 1
+	validateAwg3Range "RejectAfterTime" "${AWG_REJECT_AFTER_TIME:-}" || return 1
+	validateAwg3Range "KeepaliveTimeout" "${AWG_KEEPALIVE_TIMEOUT:-}" || return 1
+}
+
+# Invalid AWG 3.0-only state normally fails closed. The sole exception is the
+# explicit downgrade command, which must remain able to remove damaged 3.0
+# fields and restore an otherwise valid installation to AWG 2.0.
+function validatePersistedAwgProtocolState() {
+	local ALLOW_INVALID_AWG3_FOR_DOWNGRADE="${1:-0}"
+
+	normalizeAwgProtocolVersion || return 1
+	if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]] && ! validateAwg3Params; then
+		if [[ "${ALLOW_INVALID_AWG3_FOR_DOWNGRADE}" == "1" ]]; then
+			echo "WARNING: invalid AWG 3.0 state will be removed by the requested AWG 2.0 downgrade" >&2
+			return 0
+		fi
+		echo "ERROR: invalid AWG 3.0 protocol state in persisted params" >&2
+		return 1
+	fi
+}
+
+# Emit only the protocol-specific [Interface] lines. Callers must redirect
+# stdout into a mode-0600 configuration file because the output contains the
+# shared HeaderProtectionKey in AWG 3.0 mode.
+function renderAwgProtocolFields() {
+	normalizeAwgProtocolVersion || return 1
+	[[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]] || return 0
+	validateAwg3Params || return 1
+
+	printf 'HeaderProtectionKey = %s\n' "${AWG_HEADER_PROTECTION_KEY}"
+	[[ -z "${AWG_CONTENT_PADDING_ADDITION:-}" ]] || printf 'ContentPaddingAddition = %s\n' "${AWG_CONTENT_PADDING_ADDITION}"
+	[[ -z "${AWG_REKEY_AFTER_TIME:-}" ]] || printf 'RekeyAfterTime = %s\n' "${AWG_REKEY_AFTER_TIME}"
+	[[ -z "${AWG_REKEY_TIMEOUT:-}" ]] || printf 'RekeyTimeout = %s\n' "${AWG_REKEY_TIMEOUT}"
+	[[ -z "${AWG_REJECT_AFTER_TIME:-}" ]] || printf 'RejectAfterTime = %s\n' "${AWG_REJECT_AFTER_TIME}"
+	[[ -z "${AWG_KEEPALIVE_TIMEOUT:-}" ]] || printf 'KeepaliveTimeout = %s\n' "${AWG_KEEPALIVE_TIMEOUT}"
+}
+
+# Exercise the complete userspace -> generic-netlink -> running-kernel path.
+# Version strings are intentionally ignored: distributions can ship a new awg
+# binary alongside an older loaded module (or the reverse). The probe succeeds
+# only when every AWG 3.0 field can be applied and read back unchanged.
+function probeAwg3Capability() {
+	local PROBE_KEY="${1:-}"
+	local PROBE_DIR PROBE_CONF PROBE_INTERFACE
+	local READ_KEY READ_CONTENT READ_REKEY_AFTER READ_REKEY_TIMEOUT
+	local READ_REJECT READ_KEEPALIVE
+	local RC=1 INTERFACE_CREATED=0
+
+	if [[ -z "${PROBE_KEY}" ]]; then
+		PROBE_KEY="$(awg genkey 2>/dev/null)" || PROBE_KEY=""
+	fi
+	if ! [[ "${PROBE_KEY}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+		echo "ERROR: the installed awg tool could not generate an AWG 3.0 probe key" >&2
+		return 1
+	fi
+	if ! command -v ip >/dev/null 2>&1 || ! command -v awg >/dev/null 2>&1; then
+		echo "ERROR: AWG 3.0 capability probing requires both ip and awg" >&2
+		return 1
+	fi
+
+	PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/awg3-probe.XXXXXX")" || {
+		echo "ERROR: could not create the private AWG 3.0 probe directory" >&2
+		return 1
+	}
+	chmod 700 "${PROBE_DIR}"
+	PROBE_CONF="${PROBE_DIR}/probe.conf"
+	PROBE_INTERFACE="awgp$((BASHPID % 100000000))"
+
+	(
+		umask 077
+		cat >"${PROBE_CONF}" <<EOF
+[Interface]
+S1 = 12
+S2 = 13
+S3 = 14
+S4 = 15
+HeaderProtectionKey = ${PROBE_KEY}
+ContentPaddingAddition = 11-13
+RekeyAfterTime = 101-103
+RekeyTimeout = 5-7
+RejectAfterTime = 181-183
+KeepaliveTimeout = 9-11
+EOF
+	) || RC=1
+
+	if [[ -s "${PROBE_CONF}" ]] && ip link add dev "${PROBE_INTERFACE}" type amneziawg >/dev/null 2>&1; then
+		INTERFACE_CREATED=1
+		if awg setconf "${PROBE_INTERFACE}" "${PROBE_CONF}" >/dev/null 2>&1; then
+			READ_KEY="$(WG_HIDE_KEYS=never awg show "${PROBE_INTERFACE}" header-protection-key 2>/dev/null || true)"
+			READ_CONTENT="$(awg show "${PROBE_INTERFACE}" content-padding-addition 2>/dev/null || true)"
+			READ_REKEY_AFTER="$(awg show "${PROBE_INTERFACE}" rekey-after-time 2>/dev/null || true)"
+			READ_REKEY_TIMEOUT="$(awg show "${PROBE_INTERFACE}" rekey-timeout 2>/dev/null || true)"
+			READ_REJECT="$(awg show "${PROBE_INTERFACE}" reject-after-time 2>/dev/null || true)"
+			READ_KEEPALIVE="$(awg show "${PROBE_INTERFACE}" keepalive-timeout 2>/dev/null || true)"
+			if [[ "${READ_KEY}" == "${PROBE_KEY}" ]] && \
+				[[ "${READ_CONTENT}" == "11-13" ]] && \
+				[[ "${READ_REKEY_AFTER}" == "101-103" ]] && \
+				[[ "${READ_REKEY_TIMEOUT}" == "5-7" ]] && \
+				[[ "${READ_REJECT}" == "181-183" ]] && \
+				[[ "${READ_KEEPALIVE}" == "9-11" ]]; then
+				RC=0
+			fi
+		fi
+	fi
+
+	if (( INTERFACE_CREATED )); then
+		ip link delete dev "${PROBE_INTERFACE}" >/dev/null 2>&1 || RC=1
+	fi
+	rm -f -- "${PROBE_CONF}"
+	rmdir -- "${PROBE_DIR}" 2>/dev/null || true
+
+	if (( RC != 0 )); then
+		echo "ERROR: AWG 3.0 is not supported by both the installed awg tool and the running kernel module" >&2
+		echo "       The temporary interface could not apply and read back every AWG 3.0 field." >&2
+		return 1
+	fi
+	return 0
+}
+
 # Optional self-test for safeQuoteParam; run by setting SAFE_QUOTE_PARAM_SELFTEST=1
 if [[ "${SAFE_QUOTE_PARAM_SELFTEST:-0}" == "1" ]]; then
 	TEST_VALUE="O'Reilly"
@@ -2121,6 +2329,13 @@ SERVER_AWG_H1=$(safeQuoteParam "${SERVER_AWG_H1}")
 SERVER_AWG_H2=$(safeQuoteParam "${SERVER_AWG_H2}")
 SERVER_AWG_H3=$(safeQuoteParam "${SERVER_AWG_H3}")
 SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")
+AWG_PROTOCOL_VERSION=$(safeQuoteParam "${AWG_PROTOCOL_VERSION:-${AWG_PROTOCOL_VERSION_2}}")
+AWG_HEADER_PROTECTION_KEY=$(safeQuoteParam "${AWG_HEADER_PROTECTION_KEY:-}")
+AWG_CONTENT_PADDING_ADDITION=$(safeQuoteParam "${AWG_CONTENT_PADDING_ADDITION:-}")
+AWG_REKEY_AFTER_TIME=$(safeQuoteParam "${AWG_REKEY_AFTER_TIME:-}")
+AWG_REKEY_TIMEOUT=$(safeQuoteParam "${AWG_REKEY_TIMEOUT:-}")
+AWG_REJECT_AFTER_TIME=$(safeQuoteParam "${AWG_REJECT_AFTER_TIME:-}")
+AWG_KEEPALIVE_TIMEOUT=$(safeQuoteParam "${AWG_KEEPALIVE_TIMEOUT:-}")
 EOF
 	umask "${OLD_UMASK}"
 }
@@ -3150,18 +3365,27 @@ function ensureAwgQuickRunning() {
 #   2. Runs dkms autoinstall for the current kernel
 #   3. Rebuilds the module dependency cache (depmod -a)
 #   4. Loads the module with modprobe
-#   5. Starts the awg-quick service if it was not already running
+#   5. Starts the awg-quick service if it was not already running, unless the
+#      optional first argument is 0 (module-only preparation for probes)
 #
 # If everything is already fine the function returns immediately (idempotent).
 # If repair fails, it prints diagnostic information and exits with code 1.
 function ensureAmneziawgKernelModule() {
 	local KERNEL_VER
+	local START_AWG_QUICK="${1:-1}"
+	case "${START_AWG_QUICK}" in
+		0|1) ;;
+		*)
+			echo -e "${RED}ERROR: ensureAmneziawgKernelModule expects service-start mode 0 or 1.${NC}" >&2
+			return 1
+			;;
+	esac
 	KERNEL_VER="$(uname -r)"
 
 	# Fast-path: if the module is already loaded, ensure the VPN service is also
-	# running before returning.
+	# running before returning unless this is a module-only capability probe.
 	if lsmod 2>/dev/null | grep -q '^amneziawg '; then
-		ensureAwgQuickRunning
+		[[ "${START_AWG_QUICK}" == "0" ]] || ensureAwgQuickRunning
 		return 0
 	fi
 
@@ -3169,8 +3393,9 @@ function ensureAmneziawgKernelModule() {
 	# falling back to the full repair path.
 	if [ -n "$(find "/lib/modules/${KERNEL_VER}" -name 'amneziawg.ko*' -print -quit 2>/dev/null)" ]; then
 		if modprobe amneziawg 2>/dev/null && lsmod 2>/dev/null | grep -q '^amneziawg '; then
-			# Module loaded successfully; start the VPN service if it was not running.
-			ensureAwgQuickRunning
+			# Module loaded successfully; start the VPN service unless the caller is
+			# preserving an intentionally stopped or manually managed interface.
+			[[ "${START_AWG_QUICK}" == "0" ]] || ensureAwgQuickRunning
 			return 0
 		fi
 	fi
@@ -3250,11 +3475,12 @@ function ensureAmneziawgKernelModule() {
 
 	echo -e "${GREEN}amneziawg module loaded successfully for kernel ${KERNEL_VER}.${NC}"
 
-	# The module was just loaded — start the VPN service if it was not running.
+	# The module was just loaded — start the VPN service if it was not running
+	# unless the caller requested module-only preparation.
 	# After a kernel upgrade the service fails at boot because ExecStartPre
 	# (modprobe amneziawg) returns an error; now that the module is available
 	# we restart it so the awg interface exists for subsequent awg syncconf calls.
-	ensureAwgQuickRunning
+	[[ "${START_AWG_QUICK}" == "0" ]] || ensureAwgQuickRunning
 }
 
 function readJminAndJmax() {
@@ -3699,6 +3925,11 @@ function serverConfigHasIPv6Address() {
 }
 
 function installQuestions() {
+	# Fresh installs remain on AWG 2.0 regardless of caller environment. AWG 3.0
+	# can be enabled only after installation through the explicit migration.
+	AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_2}"
+	clearAwg3Params
+
 	# Non-interactive mode: use environment variable overrides or sensible defaults
 	# Set AUTO_INSTALL=y to skip all prompts
 	if [[ "${AUTO_INSTALL,,}" == "y" ]]; then
@@ -4469,6 +4700,11 @@ function installAmneziaWG() {
 	if [[ "${ENABLE_IPV6}" == "y" ]]; then
 		SERVER_ADDRESS="${SERVER_ADDRESS},${SERVER_AWG_IPV6}/64"
 	fi
+	local AWG_PROTOCOL_FIELDS=""
+	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || {
+		echo -e "${RED}ERROR: Failed to render protocol-specific server configuration.${NC}"
+		exit 1
+	}
 	echo "[Interface]
 Address = ${SERVER_ADDRESS}
 ListenPort = ${SERVER_PORT}
@@ -4483,7 +4719,8 @@ S4 = ${SERVER_AWG_S4}
 H1 = ${SERVER_AWG_H1}
 H2 = ${SERVER_AWG_H2}
 H3 = ${SERVER_AWG_H3}
-H4 = ${SERVER_AWG_H4}" >"${SERVER_AWG_CONF}"
+H4 = ${SERVER_AWG_H4}
+${AWG_PROTOCOL_FIELDS}" >"${SERVER_AWG_CONF}"
 	chmod 600 "${SERVER_AWG_CONF}"
 
 	# Restore default umask before creating system files and running services
@@ -4800,6 +5037,11 @@ function newClient() {
 	local OLD_UMASK
 	OLD_UMASK="$(umask)"
 	umask 077
+	local AWG_PROTOCOL_FIELDS=""
+	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || {
+		umask "${OLD_UMASK}"
+		return 1
+	}
 
 	# Create client file and add the server as a peer
 	echo "[Interface]
@@ -4817,6 +5059,7 @@ H1 = ${SERVER_AWG_H1}
 H2 = ${SERVER_AWG_H2}
 H3 = ${SERVER_AWG_H3}
 H4 = ${SERVER_AWG_H4}
+${AWG_PROTOCOL_FIELDS}
 
 [Peer]
 PublicKey = ${SERVER_PUB_KEY}
@@ -5002,6 +5245,8 @@ function regenerateClients() {
 	local REGENERATED=0
 	local FAILED=0
 	local NEWKEYS=0
+	local AWG_PROTOCOL_FIELDS=""
+	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || return 1
 
 	# Iterate over each client peer block in the server config
 	while IFS= read -r CLIENT_NAME; do
@@ -5231,6 +5476,7 @@ H1 = ${SERVER_AWG_H1}
 H2 = ${SERVER_AWG_H2}
 H3 = ${SERVER_AWG_H3}
 H4 = ${SERVER_AWG_H4}
+${AWG_PROTOCOL_FIELDS}
 
 [Peer]
 PublicKey = ${SERVER_PUB_KEY}
@@ -5409,6 +5655,7 @@ function uninstallAmneziaWG() {
 }
 
 function validateParamsFile() {
+	local ALLOW_INVALID_AWG3_FOR_DOWNGRADE="${1:-0}"
 	# Security: verify params file is safe to source (owned by root, not readable/writable by others)
 	# This mitigates the risk of arbitrary code execution or private key exposure
 	# Reject symlinks explicitly so we don't accidentally source an unexpected file via a link.
@@ -5489,13 +5736,19 @@ function validateParamsFile() {
 		fi
 	fi
 
-	# Params must be authoritative; do not let an exported shell variable fill in
-	# keys that older params files legitimately lack.
-	unset ENABLE_IPV6
+	# Params must be authoritative; do not let exported shell variables fill in
+	# keys that older params files legitimately lack or enable AWG 3.0 features.
+	unset ENABLE_IPV6 AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY \
+		AWG_CONTENT_PADDING_ADDITION AWG_REKEY_AFTER_TIME AWG_REKEY_TIMEOUT \
+		AWG_REJECT_AFTER_TIME AWG_KEEPALIVE_TIMEOUT
 	# shellcheck source=/etc/amnezia/amneziawg/params
 	if ! source "${AMNEZIAWG_DIR}/params"; then
 		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}" >&2
 		echo -e "${ORANGE}The file may be corrupted or contain a syntax error. Fix or regenerate it and rerun the installer.${NC}" >&2
+		return 1
+	fi
+	if ! validatePersistedAwgProtocolState "${ALLOW_INVALID_AWG3_FOR_DOWNGRADE}"; then
+		echo -e "${RED}ERROR: Invalid AWG 3.0 protocol state in ${AMNEZIAWG_DIR}/params.${NC}" >&2
 		return 1
 	fi
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
@@ -6028,9 +6281,17 @@ function quietIPv6Rewrite() {
 }
 
 function loadParams() {
-	if ! validateParamsFile; then
+	local ALLOW_INVALID_AWG3_FOR_DOWNGRADE="${1:-0}"
+	local SKIP_LEGACY_MIGRATIONS="${2:-0}"
+	if ! validateParamsFile "${ALLOW_INVALID_AWG3_FOR_DOWNGRADE}"; then
 		echo -e "${RED}Failed to validate params file. Aborting parameter loading.${NC}" >&2
 		exit 1
+	fi
+	# The explicit AWG 2.0 recovery path must not mutate params or configs before
+	# the protocol transaction has captured its backups. Any legacy normalization
+	# can run on a later ordinary management invocation after the downgrade.
+	if [[ "${SKIP_LEGACY_MIGRATIONS}" == "1" ]]; then
+		return 0
 	fi
 
 	local NEEDS_UPDATE=0
@@ -6059,6 +6320,645 @@ function loadParams() {
 	fi
 }
 
+# Return success when an older AWG 2.0 installation still needs the ordinary
+# compatibility migration performed by loadParams. Run the migration probes in
+# a subshell so generated replacement values never escape into the protocol
+# transaction before the operator has accepted that compatibility migration.
+function awg2StateNeedsLegacyMigration() (
+	if [[ "${_MIGRATE_ORIG_IPV6}" != "${SERVER_AWG_IPV6}" ]]; then
+		return 0
+	fi
+	if migrateS3S4; then
+		return 0
+	fi
+	if migrateH1H4; then
+		return 0
+	fi
+	return 1
+)
+
+# Rewrite only AWG 3.0 interface fields, preserving all addresses, keys, peers,
+# routes, DNS settings, comments, and firewall hooks byte-for-line otherwise.
+# The field file is private because it contains HeaderProtectionKey in mode 3.
+function rewriteAwgProtocolConfig() {
+	local INPUT_FILE="$1"
+	local OUTPUT_FILE="$2"
+	local FIELD_FILE="$3"
+	local LINE INSERTED=0
+	local -a PENDING_BLANK_LINES=()
+
+	(
+		umask 077
+		while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+			if [[ "${LINE}" =~ ^[[:space:]]*(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout)[[:space:]]*= ]]; then
+				continue
+			fi
+			# Hold only the blank separator immediately before the first peer.
+			# AWG 3.0 fields belong before that existing separator; otherwise a
+			# newly inserted blank line would survive downgrade and accumulate on
+			# every protocol round trip.
+			if (( INSERTED == 0 )) && [[ "${LINE}" =~ ^[[:space:]]*$ ]]; then
+				PENDING_BLANK_LINES+=("${LINE}")
+				continue
+			fi
+			if (( INSERTED == 0 )) && { [[ "${LINE}" =~ ^[[:space:]]*\[Peer\][[:space:]]*$ ]] || [[ "${LINE}" =~ ^[[:space:]]*###[[:space:]]+Client([[:space:]]|$) ]]; }; then
+				if [[ -s "${FIELD_FILE}" ]]; then
+					cat -- "${FIELD_FILE}" || exit 1
+				fi
+				if (( ${#PENDING_BLANK_LINES[@]} > 0 )); then
+					printf '%s\n' "${PENDING_BLANK_LINES[@]}"
+					PENDING_BLANK_LINES=()
+				fi
+				INSERTED=1
+			elif (( ${#PENDING_BLANK_LINES[@]} > 0 )); then
+				printf '%s\n' "${PENDING_BLANK_LINES[@]}"
+				PENDING_BLANK_LINES=()
+			fi
+			printf '%s\n' "${LINE}"
+		done <"${INPUT_FILE}"
+		if (( INSERTED == 0 )) && [[ -s "${FIELD_FILE}" ]]; then
+			cat -- "${FIELD_FILE}" || exit 1
+		fi
+		if (( ${#PENDING_BLANK_LINES[@]} > 0 )); then
+			printf '%s\n' "${PENDING_BLANK_LINES[@]}"
+		fi
+	) >"${OUTPUT_FILE}" || return 1
+}
+
+# Return every regular, non-symlink client config in the known installer/web
+# locations. Search roots come from managed server state, the system account
+# database, and root-controlled web configuration.
+function collectAwgClientConfigCandidates() {
+	local OUTPUT_NAME="$1"
+	local -n OUTPUT_REF="${OUTPUT_NAME}"
+	local -a SEARCH_ROOTS=()
+	local ROOT CANDIDATE CANONICAL PANEL_DIR HOME_PATH CLIENT_NAME
+	local NULLGLOB_WAS_SET=0
+	local -A SEEN_PATHS=()
+
+	OUTPUT_REF=()
+	SEARCH_ROOTS+=("${AMNEZIAWG_DIR}/clients" "/root")
+	for HOME_PATH in /home/*; do
+		[[ -d "${HOME_PATH}" && ! -L "${HOME_PATH}" ]] && SEARCH_ROOTS+=("${HOME_PATH}")
+	done
+	# getHomeDirForClient supports NSS/LDAP accounts whose homes are outside
+	# /home. Resolve each root-controlled managed marker so configs originally
+	# written to paths such as /srv/alice remain part of an all-client migration.
+	while IFS= read -r CLIENT_NAME; do
+		[[ -n "${CLIENT_NAME}" ]] || continue
+		HOME_PATH="$(getHomeDirForClient "${CLIENT_NAME}")" || return 1
+		if [[ "${HOME_PATH}" == /* && -d "${HOME_PATH}" && ! -L "${HOME_PATH}" ]]; then
+			SEARCH_ROOTS+=("${HOME_PATH}")
+		fi
+	done < <(grep -E '^### Client [A-Za-z0-9_-]{1,15}$' "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
+	PANEL_DIR="$(resolveWebPanelConfigDir 2>/dev/null || true)"
+	[[ -z "${PANEL_DIR}" ]] || SEARCH_ROOTS+=("${PANEL_DIR}")
+
+	shopt -q nullglob && NULLGLOB_WAS_SET=1
+	shopt -s nullglob
+	for ROOT in "${SEARCH_ROOTS[@]}"; do
+		[[ -d "${ROOT}" && ! -L "${ROOT}" ]] || continue
+		for CANDIDATE in "${ROOT}/${SERVER_AWG_NIC}-client-"*.conf; do
+			[[ -f "${CANDIDATE}" && ! -L "${CANDIDATE}" ]] || continue
+			CANONICAL="$(readlink -f -- "${CANDIDATE}" 2>/dev/null || true)"
+			[[ -n "${CANONICAL}" && -z "${SEEN_PATHS[${CANONICAL}]+present}" ]] || continue
+			SEEN_PATHS["${CANONICAL}"]=1
+			OUTPUT_REF+=("${CANONICAL}")
+		done
+	done
+	(( NULLGLOB_WAS_SET )) || shopt -u nullglob
+}
+
+# Filter discovered files to active peers and require at least one recoverable
+# private-key-bearing config for every server peer. This avoids a migration
+# that would silently strand a client whose configuration cannot be updated.
+function collectActiveAwgClientConfigs() {
+	local OUTPUT_NAME="$1"
+	# shellcheck disable=SC2178 # OUTPUT_REF is intentionally a nameref to an array.
+	local -n OUTPUT_REF="${OUTPUT_NAME}"
+	local -a CANDIDATES=()
+	local -A ACTIVE_PATHS=()
+	local CLIENT_NAME EXPECTED_PUB CANDIDATE PRIVATE_KEY DERIVED_PUB
+	local MATCHED_COUNT PEER_COUNT MARKER_COUNT UNIQUE_MARKER_COUNT
+
+	OUTPUT_REF=()
+	collectAwgClientConfigCandidates CANDIDATES || return 1
+	PEER_COUNT="$(grep -Ec '^[[:space:]]*\[Peer\][[:space:]]*$' "${SERVER_AWG_CONF}" || true)"
+	MARKER_COUNT="$(grep -Ec '^### Client [A-Za-z0-9_-]{1,15}$' "${SERVER_AWG_CONF}" || true)"
+	UNIQUE_MARKER_COUNT="$(grep -E '^### Client [A-Za-z0-9_-]{1,15}$' "${SERVER_AWG_CONF}" | sort -u | wc -l)"
+	UNIQUE_MARKER_COUNT="${UNIQUE_MARKER_COUNT//[[:space:]]/}"
+	if (( PEER_COUNT != MARKER_COUNT || MARKER_COUNT != UNIQUE_MARKER_COUNT )); then
+		echo "ERROR: every server peer must have one unique installer-managed client marker before changing protocol mode" >&2
+		return 1
+	fi
+	while IFS= read -r CLIENT_NAME; do
+		[[ -n "${CLIENT_NAME}" ]] || continue
+		if ! [[ "${CLIENT_NAME}" =~ ^[A-Za-z0-9_-]{1,15}$ ]]; then
+			echo "ERROR: unsafe client marker in server config; refusing protocol migration" >&2
+			return 1
+		fi
+		EXPECTED_PUB="$(sed -n "/^### Client ${CLIENT_NAME}\$/,/^\$/p" "${SERVER_AWG_CONF}" | sed -n 's/^PublicKey = //p' | head -n1)"
+		if [[ -z "${EXPECTED_PUB}" ]]; then
+			echo "ERROR: client '${CLIENT_NAME}' has no public key in the server config" >&2
+			return 1
+		fi
+		MATCHED_COUNT=0
+		for CANDIDATE in "${CANDIDATES[@]}"; do
+			[[ "$(basename -- "${CANDIDATE}")" == "${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf" ]] || continue
+			PRIVATE_KEY="$(sed -n 's/^PrivateKey = //p' "${CANDIDATE}" | head -n1)"
+			[[ -n "${PRIVATE_KEY}" ]] || continue
+			DERIVED_PUB="$(printf '%s\n' "${PRIVATE_KEY}" | awg pubkey 2>/dev/null || true)"
+			[[ "${DERIVED_PUB}" == "${EXPECTED_PUB}" ]] || continue
+			MATCHED_COUNT=$((MATCHED_COUNT + 1))
+			ACTIVE_PATHS["${CANDIDATE}"]=1
+		done
+		if (( MATCHED_COUNT == 0 )); then
+			echo "ERROR: no recoverable configuration was found for client '${CLIENT_NAME}'" >&2
+			echo "       Restore or regenerate that client's config before changing protocol mode." >&2
+			return 1
+		fi
+	done < <(grep -E '^### Client ' "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
+
+	for CANDIDATE in "${CANDIDATES[@]}"; do
+		[[ -z "${ACTIVE_PATHS[${CANDIDATE}]+present}" ]] || OUTPUT_REF+=("${CANDIDATE}")
+	done
+}
+
+# Confirm that one server/client configuration contains exactly the protocol
+# fields described by the already-validated persisted params. Field order and
+# harmless surrounding whitespace are ignored, but duplicate, missing, stale,
+# or mismatched values require a repair transaction.
+function awgProtocolConfigMatchesPersistedState() {
+	local CONFIG_FILE="$1"
+	local LINE KEY VALUE EXPECTED_KEY
+	local -A EXPECTED_FIELDS=() SEEN_FIELDS=()
+
+	[[ -f "${CONFIG_FILE}" && ! -L "${CONFIG_FILE}" && -r "${CONFIG_FILE}" ]] || return 2
+
+	if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
+		EXPECTED_FIELDS[HeaderProtectionKey]="${AWG_HEADER_PROTECTION_KEY}"
+		[[ -z "${AWG_CONTENT_PADDING_ADDITION:-}" ]] || EXPECTED_FIELDS[ContentPaddingAddition]="${AWG_CONTENT_PADDING_ADDITION}"
+		[[ -z "${AWG_REKEY_AFTER_TIME:-}" ]] || EXPECTED_FIELDS[RekeyAfterTime]="${AWG_REKEY_AFTER_TIME}"
+		[[ -z "${AWG_REKEY_TIMEOUT:-}" ]] || EXPECTED_FIELDS[RekeyTimeout]="${AWG_REKEY_TIMEOUT}"
+		[[ -z "${AWG_REJECT_AFTER_TIME:-}" ]] || EXPECTED_FIELDS[RejectAfterTime]="${AWG_REJECT_AFTER_TIME}"
+		[[ -z "${AWG_KEEPALIVE_TIMEOUT:-}" ]] || EXPECTED_FIELDS[KeepaliveTimeout]="${AWG_KEEPALIVE_TIMEOUT}"
+	elif [[ "${AWG_PROTOCOL_VERSION}" != "${AWG_PROTOCOL_VERSION_2}" ]]; then
+		return 2
+	fi
+
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		if [[ "${LINE}" =~ ^[[:space:]]*(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+			KEY="${BASH_REMATCH[1]}"
+			VALUE="$(trimWhitespace "${BASH_REMATCH[2]}")"
+			[[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]] || return 1
+			[[ -n "${EXPECTED_FIELDS[${KEY}]+present}" ]] || return 1
+			[[ -z "${SEEN_FIELDS[${KEY}]+present}" ]] || return 1
+			[[ "${VALUE}" == "${EXPECTED_FIELDS[${KEY}]}" ]] || return 1
+			SEEN_FIELDS["${KEY}"]=1
+		fi
+	done <"${CONFIG_FILE}"
+
+	for EXPECTED_KEY in "${!EXPECTED_FIELDS[@]}"; do
+		[[ -n "${SEEN_FIELDS[${EXPECTED_KEY}]+present}" ]] || return 1
+	done
+	return 0
+}
+
+# Return 0 only when persisted protocol state and every recoverable active
+# config agree. Return 1 for a repairable mismatch and 2 when the complete
+# active-client set cannot be verified safely.
+function awgProtocolConfigsMatchPersistedState() {
+	local -a CLIENT_PATHS=()
+	local CLIENT_PATH CONFIG_STATE_RC
+
+	case "${AWG_PROTOCOL_VERSION}" in
+		"${AWG_PROTOCOL_VERSION_2}")
+			# Explicit AWG 2.0 state should not retain dormant secrets or settings.
+			if [[ -n "${AWG_HEADER_PROTECTION_KEY:-}${AWG_CONTENT_PADDING_ADDITION:-}${AWG_REKEY_AFTER_TIME:-}${AWG_REKEY_TIMEOUT:-}${AWG_REJECT_AFTER_TIME:-}${AWG_KEEPALIVE_TIMEOUT:-}" ]]; then
+				return 1
+			fi
+			;;
+		"${AWG_PROTOCOL_VERSION_3}") ;;
+		*) return 2 ;;
+	esac
+
+	collectActiveAwgClientConfigs CLIENT_PATHS || return 2
+	if awgProtocolConfigMatchesPersistedState "${SERVER_AWG_CONF}"; then
+		:
+	else
+		CONFIG_STATE_RC=$?
+		(( CONFIG_STATE_RC == 2 )) && return 2
+		return 1
+	fi
+	for CLIENT_PATH in "${CLIENT_PATHS[@]}"; do
+		if awgProtocolConfigMatchesPersistedState "${CLIENT_PATH}"; then
+			:
+		else
+			CONFIG_STATE_RC=$?
+			(( CONFIG_STATE_RC == 2 )) && return 2
+			return 1
+		fi
+	done
+	return 0
+}
+
+# Validate the interface section of every staged config with both awg-quick and
+# the running module. Peer/address data is unchanged by this migration; limiting
+# setconf to [Interface] also avoids DNS resolution for hostname endpoints.
+function validateStagedAwgConfigs() {
+	local WORK_DIR="$1"
+	shift
+	local -a CONFIG_FILES=("$@")
+	local VALIDATE_INTERFACE="awgv$((BASHPID % 100000000))"
+	local CONFIG_FILE STRIPPED_FILE INTERFACE_FILE LINE
+	local INDEX=0 RC=0 INTERFACE_CREATED=0
+
+	if ! ip link add dev "${VALIDATE_INTERFACE}" type amneziawg >/dev/null 2>&1; then
+		echo "ERROR: could not create the temporary AWG configuration-validation interface" >&2
+		return 1
+	fi
+	INTERFACE_CREATED=1
+
+	for CONFIG_FILE in "${CONFIG_FILES[@]}"; do
+		INDEX=$((INDEX + 1))
+		STRIPPED_FILE="${WORK_DIR}/validate-${INDEX}.stripped"
+		INTERFACE_FILE="${WORK_DIR}/validate-${INDEX}.interface"
+		if ! awg-quick strip "${CONFIG_FILE}" >"${STRIPPED_FILE}" 2>/dev/null; then
+			RC=1
+			break
+		fi
+		: >"${INTERFACE_FILE}"
+		while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+			[[ "${LINE}" =~ ^[[:space:]]*\[Peer\][[:space:]]*$ ]] && break
+			printf '%s\n' "${LINE}" >>"${INTERFACE_FILE}"
+		done <"${STRIPPED_FILE}"
+		if ! awg setconf "${VALIDATE_INTERFACE}" "${INTERFACE_FILE}" >/dev/null 2>&1; then
+			RC=1
+			break
+		fi
+	done
+
+	if (( INTERFACE_CREATED )) && ! ip link delete dev "${VALIDATE_INTERFACE}" >/dev/null 2>&1; then
+		RC=1
+	fi
+	if (( RC != 0 )); then
+		echo "ERROR: a staged protocol configuration was rejected by the installed tooling or running module" >&2
+		return 1
+	fi
+}
+
+function replaceAwgProtocolFile() {
+	local SOURCE_FILE="$1"
+	local DEST_FILE="$2"
+	local DEST_DIR TEMP_FILE DEST_MODE
+	DEST_DIR="$(dirname -- "${DEST_FILE}")"
+	DEST_MODE="$(stat -c '%a' -- "${DEST_FILE}" 2>/dev/null || true)"
+	case "${DEST_MODE}" in
+		600|640) ;;
+		*) DEST_MODE=600 ;;
+	esac
+	TEMP_FILE="$(mktemp "${DEST_DIR}/.$(basename -- "${DEST_FILE}").protocol.XXXXXX")" || return 1
+	if ! cp -p -- "${SOURCE_FILE}" "${TEMP_FILE}" || \
+		! chown --reference="${DEST_FILE}" -- "${TEMP_FILE}" || \
+		! chmod "${DEST_MODE}" "${TEMP_FILE}" || \
+		! mv -f -- "${TEMP_FILE}" "${DEST_FILE}"; then
+		rm -f -- "${TEMP_FILE}"
+		return 1
+	fi
+}
+
+function cleanupAwgProtocolTransactionDir() {
+	local TRANSACTION_DIR="$1"
+	local RESOLVED_DIR RESOLVED_ROOT
+	RESOLVED_DIR="$(readlink -f -- "${TRANSACTION_DIR}" 2>/dev/null || true)"
+	RESOLVED_ROOT="$(readlink -f -- "${AMNEZIAWG_DIR}" 2>/dev/null || true)"
+	if [[ -n "${RESOLVED_DIR}" && -n "${RESOLVED_ROOT}" && ! -L "${TRANSACTION_DIR}" && \
+		"${RESOLVED_DIR}" == "${RESOLVED_ROOT}/.awg-protocol."* ]]; then
+		rm -rf -- "${RESOLVED_DIR}"
+	fi
+}
+
+function restoreAwgProtocolTransaction() {
+	local SERVER_BACKUP="$1"
+	local PARAMS_BACKUP="$2"
+	local CLIENT_PATHS_NAME="$3"
+	local CLIENT_BACKUPS_NAME="$4"
+	local -n CLIENT_PATHS_REF="${CLIENT_PATHS_NAME}"
+	local -n CLIENT_BACKUPS_REF="${CLIENT_BACKUPS_NAME}"
+	local INDEX RESTORE_FAILED=0
+
+	replaceAwgProtocolFile "${SERVER_BACKUP}" "${SERVER_AWG_CONF}" || RESTORE_FAILED=1
+	replaceAwgProtocolFile "${PARAMS_BACKUP}" "${AMNEZIAWG_DIR}/params" || RESTORE_FAILED=1
+	for INDEX in "${!CLIENT_PATHS_REF[@]}"; do
+		replaceAwgProtocolFile "${CLIENT_BACKUPS_REF[${INDEX}]}" "${CLIENT_PATHS_REF[${INDEX}]}" || RESTORE_FAILED=1
+	done
+	return "${RESTORE_FAILED}"
+}
+
+function applyAwgProtocolTransaction() (
+	local TRANSACTION_DIR FIELDS_FILE SERVER_STAGE PARAMS_STAGE SERVER_BACKUP PARAMS_BACKUP
+	local -a CLIENT_PATHS=() CLIENT_STAGES=() CLIENT_BACKUPS=() VALIDATION_FILES=()
+	local CLIENT_PATH INDEX SERVICE_WAS_ACTIVE=0 MANUAL_INTERFACE_ACTIVE=0 APPLY_FAILED=0
+	local TRANSACTION_READY=0 TRANSACTION_APPLY_STARTED=0
+
+	# A config that omits AWG 3.0 fields cannot clear those live attributes via
+	# syncconf. Cycle a manually managed interface so the kernel receives a fresh
+	# setconf from the selected protocol configuration.
+	function restartManualAwgInterface() {
+		if ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
+			awg-quick down "${SERVER_AWG_CONF}" >/dev/null 2>&1 || true
+			if ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
+				ip link delete dev "${SERVER_AWG_NIC}" >/dev/null 2>&1 || return 1
+			fi
+		fi
+		awg-quick up "${SERVER_AWG_CONF}" || return 1
+		ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1
+	}
+
+	# A file rollback is complete only when the runtime state that existed before
+	# the transaction is restored as well. Keep command output private here and
+	# let each caller report the transaction directory retained for recovery.
+	function restorePreviousAwgRuntime() {
+		if (( SERVICE_WAS_ACTIVE )); then
+			systemctl restart "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 && \
+				systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"
+		elif (( MANUAL_INTERFACE_ACTIVE )); then
+			restartManualAwgInterface >/dev/null 2>&1
+		else
+			return 0
+		fi
+	}
+
+	function rollbackAwgProtocolOnSignal() {
+		local EXIT_CODE="$1"
+		local RESTORE_FAILED=0
+		trap '' HUP INT TERM
+		echo "ERROR: protocol migration interrupted; restoring server and client files" >&2
+		if (( TRANSACTION_READY != 0 && TRANSACTION_APPLY_STARTED != 0 )); then
+			if ! restoreAwgProtocolTransaction "${SERVER_BACKUP}" "${PARAMS_BACKUP}" \
+				CLIENT_PATHS CLIENT_BACKUPS >/dev/null 2>&1; then
+				RESTORE_FAILED=1
+				echo "ERROR: interrupted rollback was incomplete; recovery files remain in ${TRANSACTION_DIR}" >&2
+			fi
+			if ! restorePreviousAwgRuntime; then
+				RESTORE_FAILED=1
+				echo "ERROR: interrupted rollback could not reactivate the previous AWG runtime" >&2
+				echo "       Recovery files remain in ${TRANSACTION_DIR}" >&2
+			fi
+		fi
+		if (( RESTORE_FAILED == 0 )) && [[ -n "${TRANSACTION_DIR:-}" ]]; then
+			cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
+		fi
+		exit "${EXIT_CODE}"
+	}
+
+	trap 'rollbackAwgProtocolOnSignal 129' HUP
+	trap 'rollbackAwgProtocolOnSignal 130' INT
+	trap 'rollbackAwgProtocolOnSignal 143' TERM
+
+	TRANSACTION_DIR="$(mktemp -d "${AMNEZIAWG_DIR}/.awg-protocol.XXXXXX")" || {
+		echo "ERROR: could not create the AWG protocol transaction directory" >&2
+		return 1
+	}
+	chmod 700 "${TRANSACTION_DIR}"
+	FIELDS_FILE="${TRANSACTION_DIR}/protocol-fields"
+	# awg-quick requires the input basename to be a valid interface-style
+	# `<name>.conf`, even when it is used only for `strip` validation.
+	SERVER_STAGE="${TRANSACTION_DIR}/server.conf"
+	PARAMS_STAGE="${TRANSACTION_DIR}/params.new"
+	SERVER_BACKUP="${TRANSACTION_DIR}/server.backup"
+	PARAMS_BACKUP="${TRANSACTION_DIR}/params.backup"
+
+	if ! (umask 077; renderAwgProtocolFields >"${FIELDS_FILE}") || \
+		! collectActiveAwgClientConfigs CLIENT_PATHS || \
+		! cp -p -- "${SERVER_AWG_CONF}" "${SERVER_BACKUP}" || \
+		! cp -p -- "${AMNEZIAWG_DIR}/params" "${PARAMS_BACKUP}" || \
+		! rewriteAwgProtocolConfig "${SERVER_AWG_CONF}" "${SERVER_STAGE}" "${FIELDS_FILE}" || \
+		! serializeParams "${PARAMS_STAGE}"; then
+		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+	chmod 600 "${FIELDS_FILE}" "${SERVER_BACKUP}" "${PARAMS_BACKUP}" "${SERVER_STAGE}" "${PARAMS_STAGE}"
+	VALIDATION_FILES+=("${SERVER_STAGE}")
+
+	for INDEX in "${!CLIENT_PATHS[@]}"; do
+		CLIENT_PATH="${CLIENT_PATHS[${INDEX}]}"
+		CLIENT_STAGES[${INDEX}]="${TRANSACTION_DIR}/client-${INDEX}.conf"
+		CLIENT_BACKUPS[${INDEX}]="${TRANSACTION_DIR}/client-${INDEX}.backup"
+		if ! cp -p -- "${CLIENT_PATH}" "${CLIENT_BACKUPS[${INDEX}]}" || \
+			! rewriteAwgProtocolConfig "${CLIENT_PATH}" "${CLIENT_STAGES[${INDEX}]}" "${FIELDS_FILE}"; then
+			cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
+			return 1
+		fi
+		chown --reference="${CLIENT_PATH}" "${CLIENT_STAGES[${INDEX}]}" 2>/dev/null || true
+		chmod 600 "${CLIENT_STAGES[${INDEX}]}" "${CLIENT_BACKUPS[${INDEX}]}"
+		VALIDATION_FILES+=("${CLIENT_STAGES[${INDEX}]}")
+	done
+
+	if ! validateStagedAwgConfigs "${TRANSACTION_DIR}" "${VALIDATION_FILES[@]}"; then
+		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+	TRANSACTION_READY=1
+
+	if systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
+		SERVICE_WAS_ACTIVE=1
+	elif ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
+		MANUAL_INTERFACE_ACTIVE=1
+	fi
+	TRANSACTION_APPLY_STARTED=1
+	if (( SERVICE_WAS_ACTIVE )) && ! systemctl stop "awg-quick@${SERVER_AWG_NIC}"; then
+		echo "ERROR: could not stop the AWG service before protocol migration" >&2
+		if ! restorePreviousAwgRuntime; then
+			echo "ERROR: the previous AWG service could not be restored; recovery files remain in ${TRANSACTION_DIR}" >&2
+			return 1
+		fi
+		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	elif (( MANUAL_INTERFACE_ACTIVE )) && ! awg-quick down "${SERVER_AWG_CONF}"; then
+		echo "ERROR: could not stop the manually active AWG interface before protocol migration" >&2
+		if ! restorePreviousAwgRuntime; then
+			echo "ERROR: the previous manually managed AWG interface could not be restored; recovery files remain in ${TRANSACTION_DIR}" >&2
+			return 1
+		fi
+		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+
+	if ! replaceAwgProtocolFile "${SERVER_STAGE}" "${SERVER_AWG_CONF}" || \
+		! replaceAwgProtocolFile "${PARAMS_STAGE}" "${AMNEZIAWG_DIR}/params"; then
+		APPLY_FAILED=1
+	fi
+	if (( APPLY_FAILED == 0 )); then
+		for INDEX in "${!CLIENT_PATHS[@]}"; do
+			if ! replaceAwgProtocolFile "${CLIENT_STAGES[${INDEX}]}" "${CLIENT_PATHS[${INDEX}]}"; then
+				APPLY_FAILED=1
+				break
+			fi
+		done
+	fi
+
+	if (( APPLY_FAILED == 0 && SERVICE_WAS_ACTIVE )); then
+		systemctl restart "awg-quick@${SERVER_AWG_NIC}" || APPLY_FAILED=1
+	elif (( APPLY_FAILED == 0 && MANUAL_INTERFACE_ACTIVE )); then
+		awg-quick up "${SERVER_AWG_CONF}" || APPLY_FAILED=1
+	fi
+
+	if (( APPLY_FAILED != 0 )); then
+		echo "ERROR: protocol migration failed; restoring every server and client file" >&2
+		if ! restoreAwgProtocolTransaction "${SERVER_BACKUP}" "${PARAMS_BACKUP}" CLIENT_PATHS CLIENT_BACKUPS; then
+			echo "ERROR: automatic rollback was incomplete; recovery files remain in ${TRANSACTION_DIR}" >&2
+			return 1
+		fi
+		if ! restorePreviousAwgRuntime; then
+			echo "ERROR: automatic rollback restored files but could not reactivate the previous AWG runtime" >&2
+			echo "       Recovery files remain in ${TRANSACTION_DIR}" >&2
+			return 1
+		fi
+		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+
+	trap - HUP INT TERM
+	cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
+	return 0
+)
+
+function setAwgProtocolMode() (
+	local TARGET_MODE="$1"
+	local ORIGINAL_PROTOCOL ORIGINAL_KEY ORIGINAL_CONTENT ORIGINAL_REKEY_AFTER
+	local ORIGINAL_REKEY_TIMEOUT ORIGINAL_REJECT ORIGINAL_KEEPALIVE
+	local NEW_KEY CONFIG_STATE_RC=0 REPAIRING_SAME_MODE=0
+
+	case "${TARGET_MODE}" in
+		2|3) ;;
+		*)
+			echo "ERROR: protocol mode must be 2 or 3" >&2
+			return 1
+			;;
+	esac
+	# Params must be read only after this process owns the same lifecycle lock as
+	# web-native add/remove operations and other protocol changes. Otherwise a
+	# concurrent opposite toggle can make an already-active check use stale state.
+	acquireClientLifecycleLock || return 1
+	# Neither protocol direction may run the older compatibility migrations
+	# before the protocol transaction has captured its complete rollback set.
+	# Damaged AWG 3.0-only state remains recoverable only through mode 2.
+	if [[ "${TARGET_MODE}" == "2" ]]; then
+		loadParams 1 1
+	else
+		loadParams 0 1
+	fi
+	normalizeAwgProtocolVersion || return 1
+	if [[ "${AWG_PROTOCOL_VERSION}" == "${TARGET_MODE}" ]]; then
+		# A persisted AWG 3.0 mode is not enough to prove that the currently
+		# installed userspace and running kernel still support it. Kernel/package
+		# changes can invalidate a previously successful migration, so every
+		# explicit enable request must repeat the complete readback probe without
+		# rotating the shared key.
+		if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
+			# The capability probe needs only the module. Do not start an
+			# intentionally stopped service or collide with a manual interface.
+			ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
+			probeAwg3Capability "${AWG_HEADER_PROTECTION_KEY}" || return 1
+		fi
+		if awgProtocolConfigsMatchPersistedState; then
+			echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is already active and consistent."
+			return 0
+		else
+			CONFIG_STATE_RC=$?
+		fi
+		if (( CONFIG_STATE_RC == 2 )); then
+			echo "ERROR: could not verify every active client config before repairing AWG protocol mode ${TARGET_MODE}.0" >&2
+			return 1
+		fi
+		REPAIRING_SAME_MODE=1
+		echo "WARNING: persisted AWG protocol mode ${TARGET_MODE}.0 does not match every server/client config; repairing the transaction." >&2
+	fi
+	if (( REPAIRING_SAME_MODE == 0 )) && [[ "${TARGET_MODE}" == "3" ]] && awg2StateNeedsLegacyMigration; then
+		echo "ERROR: this installation needs AWG 2.0 compatibility normalization before AWG 3.0 can be enabled." >&2
+		echo "Run amneziawg-install.sh interactively, complete any prompted migration, and then retry." >&2
+		return 1
+	fi
+	ORIGINAL_PROTOCOL="${AWG_PROTOCOL_VERSION}"
+	ORIGINAL_KEY="${AWG_HEADER_PROTECTION_KEY:-}"
+	ORIGINAL_CONTENT="${AWG_CONTENT_PADDING_ADDITION:-}"
+	ORIGINAL_REKEY_AFTER="${AWG_REKEY_AFTER_TIME:-}"
+	ORIGINAL_REKEY_TIMEOUT="${AWG_REKEY_TIMEOUT:-}"
+	ORIGINAL_REJECT="${AWG_REJECT_AFTER_TIME:-}"
+	ORIGINAL_KEEPALIVE="${AWG_KEEPALIVE_TIMEOUT:-}"
+
+	if (( REPAIRING_SAME_MODE )); then
+		# AWG 3.0 repairs deliberately retain the existing shared key. AWG 2.0
+		# repairs also purge dormant 3.0-only values from persisted params.
+		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_2}" ]] && clearAwg3Params
+	elif [[ "${TARGET_MODE}" == "3" ]]; then
+		NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
+		ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
+		if ! probeAwg3Capability "${NEW_KEY}"; then
+			return 1
+		fi
+		AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_3}"
+		AWG_HEADER_PROTECTION_KEY="${NEW_KEY}"
+		AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+		AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+		AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+		AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+		AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+	else
+		AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_2}"
+		clearAwg3Params
+	fi
+
+	if ! applyAwgProtocolTransaction; then
+		AWG_PROTOCOL_VERSION="${ORIGINAL_PROTOCOL}"
+		AWG_HEADER_PROTECTION_KEY="${ORIGINAL_KEY}"
+		AWG_CONTENT_PADDING_ADDITION="${ORIGINAL_CONTENT}"
+		AWG_REKEY_AFTER_TIME="${ORIGINAL_REKEY_AFTER}"
+		AWG_REKEY_TIMEOUT="${ORIGINAL_REKEY_TIMEOUT}"
+		AWG_REJECT_AFTER_TIME="${ORIGINAL_REJECT}"
+		AWG_KEEPALIVE_TIMEOUT="${ORIGINAL_KEEPALIVE}"
+		return 1
+	fi
+
+	if (( REPAIRING_SAME_MODE )); then
+		echo "AmneziaWG protocol mode ${TARGET_MODE}.0 state was repaired successfully."
+	else
+		echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is now active."
+	fi
+	echo "All client configuration files were updated; redistribute them before reconnecting clients."
+)
+
+function changeAwgProtocolInteractively() {
+	local TARGET_MODE RESPONSE
+	normalizeAwgProtocolVersion || return 1
+	if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
+		TARGET_MODE=2
+		echo -e "${ORANGE}This will downgrade the interface and every client config to AWG 2.0.${NC}"
+	else
+		TARGET_MODE=3
+		echo -e "${RED}AWG 3.0 cannot communicate with AWG 2.0 clients on this interface.${NC}"
+		echo -e "${ORANGE}Every client must support AWG 3.0 and receive its regenerated config.${NC}"
+	fi
+	read -rp "Switch this interface to AWG ${TARGET_MODE}.0? [y/N]: " RESPONSE
+	[[ "${RESPONSE}" == [Yy] ]] || {
+		echo "Protocol change cancelled."
+		return 0
+	}
+	setAwgProtocolMode "${TARGET_MODE}"
+}
+
+# Interactive management can remain open while the web panel or another CLI
+# changes protocol state. Reload persisted params only after taking the shared
+# lifecycle lock, and keep the lock through the complete mutation so a staged
+# protocol transaction can never overwrite the result.
+function runLockedManagementOperation() (
+	local OPERATION="$1"
+	acquireClientLifecycleLock || return 1
+	loadParams
+	"${OPERATION}"
+)
+
 function manageMenu() {
 	local MENU_OPTION=""
 	echo "AmneziaWG server installer (https://github.com/wiresock/amneziawg-install)"
@@ -6070,28 +6970,36 @@ function manageMenu() {
 	echo "   2) List all users"
 	echo "   3) Revoke existing user"
 	echo "   4) Regenerate all client configs (using current server parameters)"
-	echo "   5) Uninstall AmneziaWG"
-	echo "   6) Exit"
-	until [[ ${MENU_OPTION} =~ ^[1-6]$ ]]; do
-		read -rp "Select an option [1-6]: " MENU_OPTION
+	if [[ "${AWG_PROTOCOL_VERSION:-${AWG_PROTOCOL_VERSION_2}}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
+		echo "   5) Downgrade interface and clients to AWG 2.0"
+	else
+		echo "   5) Enable AWG 3.0 for interface and clients"
+	fi
+	echo "   6) Uninstall AmneziaWG"
+	echo "   7) Exit"
+	until [[ ${MENU_OPTION} =~ ^[1-7]$ ]]; do
+		read -rp "Select an option [1-7]: " MENU_OPTION
 	done
 	case "${MENU_OPTION}" in
 	1)
-		newClient
+		runLockedManagementOperation newClient
 		;;
 	2)
 		listClients
 		;;
 	3)
-		revokeClient
+		runLockedManagementOperation revokeClient
 		;;
 	4)
-		regenerateClients
+		runLockedManagementOperation regenerateClients
 		;;
 	5)
-		uninstallAmneziaWG
+		changeAwgProtocolInteractively
 		;;
 	6)
+		runLockedManagementOperation uninstallAmneziaWG
+		;;
+	7)
 		exit 0
 		;;
 	esac
@@ -6116,8 +7024,8 @@ CLIENT_LIFECYCLE_LOCK_FD=""
 # persistent state directory is opened read-only, its descriptor identity
 # is revalidated against the path, and the descriptor is locked. The root-run
 # CLI therefore never creates, truncates, chowns, or chmods a service-writable
-# lock pathname. The caller runs in a subshell so the descriptor, and therefore
-# the lock, is released on every success, return, or exit path.
+# lock pathname. Mutating callers run in a subshell so the descriptor is closed
+# automatically; the interactive menu preloader releases it explicitly.
 function acquireClientLifecycleLock() {
 	local lock_dir env_file panel_installed=0
 	local old_umask dir_identity descriptor_identity descriptor_path
@@ -6165,9 +7073,27 @@ function acquireClientLifecycleLock() {
 	fi
 	if ! flock -xn "${CLIENT_LIFECYCLE_LOCK_FD}"; then
 		exec {CLIENT_LIFECYCLE_LOCK_FD}>&-
-		echo "ERROR: another add/remove operation is already in progress" >&2
+		echo "ERROR: another client or protocol management operation is already in progress" >&2
 		return 1
 	fi
+}
+
+function releaseClientLifecycleLock() {
+	if [[ -n "${CLIENT_LIFECYCLE_LOCK_FD:-}" ]]; then
+		exec {CLIENT_LIFECYCLE_LOCK_FD}>&- 2>/dev/null || true
+		CLIENT_LIFECYCLE_LOCK_FD=""
+	fi
+}
+
+# The initial interactive menu needs loaded values for display, but must not
+# hold the lifecycle lock while waiting for input. Mutating menu actions reload
+# again under their own lock through runLockedManagementOperation.
+function loadParamsForManagementMenu() {
+	local RC=0
+	acquireClientLifecycleLock || return 1
+	loadParams || RC=$?
+	releaseClientLifecycleLock
+	return "${RC}"
 }
 
 function nonInteractiveAddClient() (
@@ -6187,8 +7113,11 @@ function nonInteractiveAddClient() (
 		exit 1
 	fi
 	acquireClientLifecycleLock || exit 1
+	# Reload only after locking: a protocol transaction may have completed after
+	# this CLI process started but before it acquired the lifecycle lock.
+	loadParams
 
-	# Ensure params are loaded and config path is set
+	# Ensure the config path follows the freshly loaded interface name.
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
 	# Check for duplicate name
@@ -6277,6 +7206,8 @@ function nonInteractiveAddClient() (
 	local OLD_UMASK
 	OLD_UMASK="$(umask)"
 	umask 077
+	local AWG_PROTOCOL_FIELDS=""
+	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || exit 1
 
 	echo "[Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
@@ -6293,6 +7224,7 @@ H1 = ${SERVER_AWG_H1}
 H2 = ${SERVER_AWG_H2}
 H3 = ${SERVER_AWG_H3}
 H4 = ${SERVER_AWG_H4}
+${AWG_PROTOCOL_FIELDS}
 
 [Peer]
 PublicKey = ${SERVER_PUB_KEY}
@@ -6357,6 +7289,7 @@ function nonInteractiveRemoveClient() (
 		exit 1
 	fi
 	acquireClientLifecycleLock || exit 1
+	loadParams
 
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
@@ -6391,10 +7324,12 @@ function nonInteractiveRemoveClient() (
 	echo "OK"
 )
 
-function nonInteractiveListClients() {
+function nonInteractiveListClients() (
+	acquireClientLifecycleLock || exit 1
+	loadParams
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 	grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3 || true
-}
+)
 
 # Only run main logic when executed directly (not when sourced for testing)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -6407,9 +7342,34 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	#   amneziawg-install.sh --add-client <NAME>
 	#   amneziawg-install.sh --remove-client <NAME>
 	#   amneziawg-install.sh --list-clients
+	#   amneziawg-install.sh --protocol-status
+	#   amneziawg-install.sh --enable-awg3
+	#   amneziawg-install.sh --disable-awg3
 	#
 	# Requires AmneziaWG to be already installed (params file must exist).
 	case "${1:-}" in
+		--protocol-status|--enable-awg3|--disable-awg3)
+			initialCheck
+			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
+				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
+				exit 1
+			fi
+			case "$1" in
+				--protocol-status)
+					# Status is a read-only query and must never prompt for or persist
+					# an unrelated legacy compatibility migration.
+					loadParams 0 1
+					printf '%s\n' "${AWG_PROTOCOL_VERSION}"
+					;;
+				--enable-awg3)
+					setAwgProtocolMode 3
+					;;
+				--disable-awg3)
+					setAwgProtocolMode 2
+					;;
+			esac
+			exit $?
+			;;
 		--add-client)
 			if [[ -z "${2:-}" ]]; then
 				echo "ERROR: --add-client requires a client name argument" >&2
@@ -6420,7 +7380,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
 				exit 1
 			fi
-			loadParams
 			nonInteractiveAddClient "$2"
 			exit $?
 			;;
@@ -6434,7 +7393,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
 				exit 1
 			fi
-			loadParams
 			nonInteractiveRemoveClient "$2"
 			exit $?
 			;;
@@ -6444,7 +7402,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
 				exit 1
 			fi
-			loadParams
 			nonInteractiveListClients
 			exit $?
 			;;
@@ -6459,7 +7416,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 		if [[ "${OS}" == "ubuntu" ]]; then
 			refreshConfiguredUbuntuAmneziaPpa
 		fi
-		loadParams
+		loadParamsForManagementMenu || exit 1
 		manageMenu
 	else
 		installAmneziaWG

@@ -683,12 +683,14 @@ _make_mock "tail" 'exit 0'
 # Helper: run ensureAmneziawgKernelModule in a subshell with mocked commands.
 # $1 = lsmod body, $2 = modprobe body, $3 = find body (optional)
 # $4 = OS value (default: ubuntu), $5 = SERVER_AWG_NIC (default: awg0)
+# $6 = service-start mode (default: 1)
 run_ensureModule() {
 	local LSMOD_BODY="$1"
 	local MODPROBE_BODY="$2"
 	local FIND_BODY="${3:-exit 0}"
 	local TEST_OS="${4:-ubuntu}"
 	local TEST_NIC="${5:-awg0}"
+	local START_AWG_QUICK="${6:-1}"
 
 	_make_mock "lsmod" "${LSMOD_BODY}"
 	_make_mock "modprobe" "${MODPROBE_BODY}"
@@ -704,7 +706,7 @@ run_ensureModule() {
 		# Stub enable_apt_ipv4/disable_apt_ipv4 to avoid touching real system files
 		enable_apt_ipv4() { :; }
 		disable_apt_ipv4() { :; }
-		ensureAmneziawgKernelModule
+		ensureAmneziawgKernelModule "${START_AWG_QUICK}"
 	) 2>&1
 }
 
@@ -871,6 +873,35 @@ if [[ ${RC} -eq 0 ]] && echo "${OUTPUT}" | grep -q "Starting awg-quick@awg0"; th
 else
 	TESTS_FAILED=$((TESTS_FAILED + 1))
 	echo "  FAIL: ensureAmneziawgKernelModule should start awg-quick when module loaded but service inactive (rc=${RC}, output: ${OUTPUT})"
+fi
+
+# Reset systemctl mock to default
+_make_mock "systemctl" 'exit 0'
+
+# Test 9: module-only preparation preserves an inactive service
+_make_mock "systemctl" '
+case "$1" in
+	is-active) exit 1;;
+	start)     echo "unexpected service start"; exit 1;;
+	*)         exit 0;;
+esac
+'
+OUTPUT=$(run_ensureModule \
+	'echo "amneziawg 12345 0"' \
+	'exit 1' \
+	'exit 0' \
+	'ubuntu' \
+	'awg0' \
+	'0')
+RC=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ${RC} -eq 0 ]] && \
+	! echo "${OUTPUT}" | grep -q "Starting awg-quick@awg0" && \
+	! echo "${OUTPUT}" | grep -q "unexpected service start"; then
+	TESTS_PASSED=$((TESTS_PASSED + 1))
+else
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "  FAIL: module-only preparation must preserve an inactive service (rc=${RC}, output: ${OUTPUT})"
 fi
 
 # Reset systemctl mock to default
@@ -1322,6 +1353,7 @@ _run_niac() {  # $1=ENABLE_IPV6 (y/n) $2=client name
 		SERVER_AWG_H1="5-10"; SERVER_AWG_H2="11-20"; SERVER_AWG_H3="21-30"; SERVER_AWG_H4="31-40"
 		ALLOWED_IPS="0.0.0.0/0,::/0"; ENABLE_IPV6="$1"
 		# Neutralize side-effecting helpers for the unit test.
+		loadParams() { :; }
 		ensureAmneziawgKernelModule() { :; }
 		copyToWebPanelDir() { :; }
 		nonInteractiveAddClient "$2" >/dev/null 2>&1

@@ -32,9 +32,9 @@ fn map_lock_error(err: std::io::Error) -> RemoveClientError {
         Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
             RemoveClientError::LockBusy
         }
-        _ => RemoveClientError::Internal(format!(
-            "failed to acquire lock for client removal: {err}"
-        )),
+        _ => {
+            RemoveClientError::Internal(format!("failed to acquire lock for client removal: {err}"))
+        }
     }
 }
 
@@ -502,13 +502,8 @@ pub async fn execute_update_peer_expiration(
     managed_client_name: Option<&str>,
 ) -> Result<Option<PeerRow>, sqlx::Error> {
     let _guard = EXPIRATION_STATE_LOCK.lock().await;
-    crate::db::peers::update_peer_expiration(
-        &db.pool,
-        peer_id,
-        expires_at,
-        managed_client_name,
-    )
-    .await
+    crate::db::peers::update_peer_expiration(&db.pool, peer_id, expires_at, managed_client_name)
+        .await
 }
 
 /// Update metadata and an optional expiration as one guarded database change.
@@ -647,14 +642,9 @@ async fn execute_remove_user_transaction(
     // after the candidate list was read, the client is left untouched.
     if let Some(expected) = expected_expires_at.as_deref() {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let still_due = crate::db::peers::expiration_is_due(
-            &db.pool,
-            peer_id,
-            expected,
-            &now,
-        )
-        .await
-        .map_err(|e| RemoveClientError::DbRead(e.to_string()))?;
+        let still_due = crate::db::peers::expiration_is_due(&db.pool, peer_id, expected, &now)
+            .await
+            .map_err(|e| RemoveClientError::DbRead(e.to_string()))?;
         if !still_due {
             tracing::info!(
                 peer_id,
@@ -716,12 +706,7 @@ async fn execute_remove_user_transaction(
     let dir = config_dir.clone();
     let name = client_name.clone();
     let remove_result = tokio::task::spawn_blocking(move || {
-        client_manager::remove_client_resumable(
-            &dir,
-            &name,
-            &expected_public_key,
-            &disabled_keys,
-        )
+        client_manager::remove_client_resumable(&dir, &name, &expected_public_key, &disabled_keys)
     })
     .await;
 
@@ -844,10 +829,7 @@ async fn execute_remove_user_transaction(
     }
 }
 
-async fn delete_rolled_back_peer_state(
-    db: &Database,
-    public_key: &str,
-) -> Result<(), sqlx::Error> {
+async fn delete_rolled_back_peer_state(db: &Database, public_key: &str) -> Result<(), sqlx::Error> {
     let mut tx = db.pool.begin().await?;
     sqlx::query(
         "UPDATE events
@@ -1008,8 +990,8 @@ mod tests {
             Some("Main phone"),
             Some("2026-08-18T12:00:00Z"),
         )
-            .await
-            .expect("persist created peer");
+        .await
+        .expect("persist created peer");
 
         assert_eq!(row.public_key, result.public_key);
         assert_eq!(row.comment.as_deref(), Some("Main phone"));
@@ -1222,14 +1204,13 @@ mod tests {
             .await
             .expect("persistence task")
             .expect("persist after mapping");
-        let removed =
-            crate::db::peers::delete_stale_peers(
-                &db.pool,
-                &std::collections::HashSet::new(),
-                "2026-08-11T12:00:00Z",
-            )
-                .await
-                .expect("stale cleanup");
+        let removed = crate::db::peers::delete_stale_peers(
+            &db.pool,
+            &std::collections::HashSet::new(),
+            "2026-08-11T12:00:00Z",
+        )
+        .await
+        .expect("stale cleanup");
         assert!(removed.is_empty());
 
         let persisted = find_by_public_key(&db.pool, &row.public_key)

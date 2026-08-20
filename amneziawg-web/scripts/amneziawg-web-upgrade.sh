@@ -40,6 +40,7 @@ readonly DEFAULT_INSTALL_DIR="/usr/local/bin"
 readonly DEFAULT_ENV_FILE="/etc/amneziawg-web/env.conf"
 readonly DEFAULT_DATA_DIR="/var/lib/amneziawg-web"
 readonly BINARY_NAME="amneziawg-web"
+readonly DEFAULT_AWG_INSTALL_SCRIPT_DEST="/usr/local/bin/amneziawg-install.sh"
 readonly PRIVILEGED_HELPER_NAME="amneziawg-web-privileged"
 readonly PRIVILEGED_HELPER_DEST="/usr/local/libexec/${PRIVILEGED_HELPER_NAME}"
 readonly BUILD_MIN_FREE_KB="2097152"
@@ -64,21 +65,29 @@ RESTART_MODE=""          # "" = auto-detect, "yes" = always, "no" = never
 REFRESH_UNIT="false"
 
 STAGED_BINARY=""
+STAGED_AWG_INSTALL_SCRIPT=""
 STAGED_HELPER=""
 STAGED_SUDOERS=""
 ROLLBACK_BINARY=""
+ROLLBACK_AWG_INSTALL_SCRIPT=""
 ROLLBACK_HELPER=""
 ROLLBACK_SUDOERS=""
 HAD_LIVE_BINARY="false"
+HAD_LIVE_AWG_INSTALL_SCRIPT="false"
 HAD_LIVE_HELPER="false"
 HAD_LIVE_SUDOERS="false"
 SERVICE_WAS_ACTIVE="false"
 BINARY_COMMITTED="false"
+AWG_INSTALL_SCRIPT_COMMITTED="false"
 HELPER_COMMITTED="false"
 SUDOERS_COMMITTED="false"
 BINARY_RENAME_STARTED="false"
+AWG_INSTALL_SCRIPT_RENAME_STARTED="false"
 HELPER_RENAME_STARTED="false"
 SUDOERS_RENAME_STARTED="false"
+AWG_INSTALL_SCRIPT_DEST=""
+AWG_INSTALL_SCRIPT_SRC=""
+REFRESH_AWG_INSTALL_SCRIPT="false"
 TRANSACTION_ACTIVE="false"
 ACTIVATION_COMPLETE="false"
 ROLLBACK_FAILED="false"
@@ -94,6 +103,7 @@ cleanup_staged_artifacts() {
     if [[ "${TRANSACTION_ACTIVE}" == "true" && "${ACTIVATION_COMPLETE}" != "true" ]]; then
         refresh_commit_state
         if [[ "${BINARY_COMMITTED}" == "true" || \
+              "${AWG_INSTALL_SCRIPT_COMMITTED}" == "true" || \
               "${HELPER_COMMITTED}" == "true" || \
               "${SUDOERS_COMMITTED}" == "true" ]]; then
             if systemctl stop "${SERVICE_NAME}" 2>/dev/null; then
@@ -116,6 +126,9 @@ cleanup_staged_artifacts() {
     if [[ -n "${STAGED_BINARY}" ]]; then
         rm -f -- "${STAGED_BINARY}" 2>/dev/null || true
     fi
+    if [[ -n "${STAGED_AWG_INSTALL_SCRIPT}" ]]; then
+        rm -f -- "${STAGED_AWG_INSTALL_SCRIPT}" 2>/dev/null || true
+    fi
     if [[ -n "${STAGED_HELPER}" ]]; then
         rm -f -- "${STAGED_HELPER}" 2>/dev/null || true
     fi
@@ -126,6 +139,11 @@ cleanup_staged_artifacts() {
             [[ "${ROLLBACK_FAILED}" != "true" || "${BINARY_COMMITTED}" != "true" ]]; then
         rm -f -- "${ROLLBACK_BINARY}" 2>/dev/null || true
         ROLLBACK_BINARY=""
+    fi
+    if [[ -n "${ROLLBACK_AWG_INSTALL_SCRIPT}" ]] && \
+            [[ "${ROLLBACK_FAILED}" != "true" || "${AWG_INSTALL_SCRIPT_COMMITTED}" != "true" ]]; then
+        rm -f -- "${ROLLBACK_AWG_INSTALL_SCRIPT}" 2>/dev/null || true
+        ROLLBACK_AWG_INSTALL_SCRIPT=""
     fi
     if [[ -n "${ROLLBACK_HELPER}" ]] && \
             [[ "${ROLLBACK_FAILED}" != "true" || "${HELPER_COMMITTED}" != "true" ]]; then
@@ -586,6 +604,104 @@ if [[ ! -f "${DEST_BINARY}" ]]; then
 Has the web panel been installed? Run: sudo ./amneziawg-web.sh install"
 fi
 
+resolve_awg_install_script_refresh() {
+    local marker_path
+    local marker_managed="false"
+    local resolved_path="${DEFAULT_AWG_INSTALL_SCRIPT_DEST}"
+    local configured_path=""
+    local script_dir=""
+    local dir_uid="" dir_gid="" dir_mode="" dir_mode_octal=0
+
+    marker_path="$(dirname "${ENV_FILE}")/installed-awg-script.path"
+
+    # The root-owned marker is authoritative for the privileged helper. Older
+    # installations may use a non-default allowlisted destination.
+    if [[ -L "${marker_path}" ]] || \
+            { [[ -e "${marker_path}" ]] && [[ ! -f "${marker_path}" ]]; }; then
+        die "AWG lifecycle-script marker is not a safe regular file: ${marker_path}"
+    fi
+    if [[ -f "${marker_path}" && ! -L "${marker_path}" ]]; then
+        marker_managed="true"
+        resolved_path="$(head -n 1 "${marker_path}" 2>/dev/null || true)"
+        if tail -n +2 "${marker_path}" 2>/dev/null | grep -q '[^[:space:]]'; then
+            die "AWG lifecycle-script marker has unexpected trailing content: ${marker_path}"
+        fi
+    elif [[ -n "${AWG_INSTALL_SCRIPT:-}" ]]; then
+        resolved_path="${AWG_INSTALL_SCRIPT}"
+    elif [[ -f "${ENV_FILE}" ]]; then
+        configured_path="$(grep -E '^AWG_INSTALL_SCRIPT=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true)"
+        if [[ -n "${configured_path}" ]]; then
+            resolved_path="${configured_path}"
+        fi
+    fi
+
+    AWG_INSTALL_SCRIPT_DEST="${resolved_path}"
+    AWG_INSTALL_SCRIPT_SRC="${SCRIPT_DIR}/../../amneziawg-install.sh"
+
+    # The installer deliberately leaves no marker when it preserves an
+    # operator-managed script. Without that explicit ownership record, the
+    # upgrader must not take ownership or overwrite the path, even when the
+    # repository contains a newer lifecycle script.
+    if [[ "${marker_managed}" != "true" ]]; then
+        warn "No installer ownership marker found; preserving unmanaged AWG lifecycle script: ${AWG_INSTALL_SCRIPT_DEST}"
+        warn "AWG protocol controls require an installer-managed lifecycle script; re-run the web installer with --force to replace and register it."
+        REFRESH_AWG_INSTALL_SCRIPT="false"
+        return 0
+    fi
+
+    if [[ "${resolved_path}" != /* ]] || [[ "${resolved_path}" =~ [[:space:],] ]]; then
+        die "AWG lifecycle-script destination is invalid: ${resolved_path}"
+    fi
+    case "${resolved_path}" in
+        /usr/local/bin/amneziawg-install.sh|/usr/bin/amneziawg-install.sh|\
+        /opt/amneziawg-web/bin/amneziawg-install.sh)
+            ;;
+        *)
+            die "AWG lifecycle-script destination is outside trusted locations: ${resolved_path}"
+            ;;
+    esac
+
+    script_dir="$(dirname "${resolved_path}")"
+    if [[ ! -d "${script_dir}" ]] || [[ -L "${script_dir}" ]]; then
+        die "AWG lifecycle-script directory is missing or unsafe: ${script_dir}"
+    fi
+    dir_uid="$(stat -c '%u' "${script_dir}" 2>/dev/null || true)"
+    dir_gid="$(stat -c '%g' "${script_dir}" 2>/dev/null || true)"
+    dir_mode="$(stat -c '%a' "${script_dir}" 2>/dev/null || true)"
+    if [[ "${dir_uid}" != "0" || "${dir_gid}" != "0" || ! "${dir_mode}" =~ ^[0-7]{3,4}$ ]]; then
+        die "AWG lifecycle-script directory must be a root-owned trusted directory: ${script_dir}"
+    fi
+    dir_mode_octal=$((8#${dir_mode}))
+    if (( (dir_mode_octal & 8#022) != 0 )); then
+        die "AWG lifecycle-script directory must not be group or world-writable: ${script_dir}"
+    fi
+    if [[ -L "${resolved_path}" ]] || \
+            { [[ -e "${resolved_path}" ]] && [[ ! -f "${resolved_path}" ]]; }; then
+        die "AWG lifecycle-script destination is not a safe regular file: ${resolved_path}"
+    fi
+
+    if [[ -f "${AWG_INSTALL_SCRIPT_SRC}" && ! -L "${AWG_INSTALL_SCRIPT_SRC}" ]]; then
+        REFRESH_AWG_INSTALL_SCRIPT="true"
+        return 0
+    fi
+
+    # A standalone binary-only updater can still be used when the installed
+    # lifecycle script already implements the protocol contract expected by
+    # the refreshed helper. Fail before stopping the service otherwise.
+    if [[ -x "${AWG_INSTALL_SCRIPT_DEST}" ]] && \
+            grep -q -- '--protocol-status' "${AWG_INSTALL_SCRIPT_DEST}" && \
+            grep -q -- '--enable-awg3' "${AWG_INSTALL_SCRIPT_DEST}" && \
+            grep -q -- '--disable-awg3' "${AWG_INSTALL_SCRIPT_DEST}"; then
+        warn "Repository lifecycle script is unavailable; preserving compatible installed script: ${AWG_INSTALL_SCRIPT_DEST}"
+        REFRESH_AWG_INSTALL_SCRIPT="false"
+        return 0
+    fi
+
+    die "Repository lifecycle script is required to upgrade this older installation: ${AWG_INSTALL_SCRIPT_SRC}"
+}
+
+resolve_awg_install_script_refresh
+
 # Validate refresh-unit: check the repo unit file exists
 UNIT_SRC="${SCRIPT_DIR}/../packaging/amneziawg-web.service"
 if [[ "${REFRESH_UNIT}" == "true" ]] && [[ ! -f "${UNIT_SRC}" ]]; then
@@ -656,6 +772,9 @@ print_plan() {
     printf '\n'
     printf 'Will REPLACE:\n'
     printf '  Binary:       %s  ←  %s\n' "${DEST_BINARY}" "${BINARY_SRC}"
+    if [[ "${REFRESH_AWG_INSTALL_SCRIPT}" == "true" ]]; then
+        printf '  AWG script:   %s  ←  %s\n' "${AWG_INSTALL_SCRIPT_DEST}" "${AWG_INSTALL_SCRIPT_SRC}"
+    fi
     printf '  Helper:       %s\n' "${PRIVILEGED_HELPER_DEST}"
     printf '\n'
     printf 'Service:\n'
@@ -671,6 +790,27 @@ print_plan() {
     printf '  Systemd unit: %s%s\n' "${SYSTEMD_UNIT_DEST}" \
         "$(if [[ "${REFRESH_UNIT}" == "true" ]]; then echo "  [will be refreshed]"; fi)"
     printf '\n'
+}
+
+stage_awg_install_script() {
+    if [[ "${REFRESH_AWG_INSTALL_SCRIPT}" != "true" ]]; then
+        return 0
+    fi
+
+    STAGED_AWG_INSTALL_SCRIPT="$(mktemp "${AWG_INSTALL_SCRIPT_DEST}.upgrade-tmp.XXXXXX")" \
+        || die "Could not create temporary AWG lifecycle script"
+    install -m 0755 -o root -g root -- \
+        "${AWG_INSTALL_SCRIPT_SRC}" "${STAGED_AWG_INSTALL_SCRIPT}" \
+        || die "Could not stage AWG lifecycle script"
+    if ! /bin/bash -n "${STAGED_AWG_INSTALL_SCRIPT}"; then
+        die "Staged AWG lifecycle script failed its Bash syntax check"
+    fi
+    for required_flag in --protocol-status --enable-awg3 --disable-awg3; do
+        if ! grep -q -- "${required_flag}" "${STAGED_AWG_INSTALL_SCRIPT}"; then
+            die "Staged AWG lifecycle script is missing required flag: ${required_flag}"
+        fi
+    done
+    info "Staged AWG lifecycle script: ${AWG_INSTALL_SCRIPT_DEST}"
 }
 
 stage_privileged_helper() {
@@ -754,6 +894,15 @@ stage_rollback_artifacts() {
         HAD_LIVE_BINARY="true"
     fi
 
+    if [[ "${REFRESH_AWG_INSTALL_SCRIPT}" == "true" ]] && \
+            [[ -f "${AWG_INSTALL_SCRIPT_DEST}" ]]; then
+        ROLLBACK_AWG_INSTALL_SCRIPT="$(mktemp "${AWG_INSTALL_SCRIPT_DEST}.rollback.XXXXXX")" \
+            || die "Could not create AWG lifecycle-script rollback file"
+        cp -a -- "${AWG_INSTALL_SCRIPT_DEST}" "${ROLLBACK_AWG_INSTALL_SCRIPT}" \
+            || die "Could not back up the installed AWG lifecycle script"
+        HAD_LIVE_AWG_INSTALL_SCRIPT="true"
+    fi
+
     if [[ -f "${PRIVILEGED_HELPER_DEST}" ]]; then
         ROLLBACK_HELPER="$(mktemp "${PRIVILEGED_HELPER_DEST}.rollback.XXXXXX")" \
             || die "Could not create privileged-helper rollback file"
@@ -810,6 +959,21 @@ rollback_runtime_artifacts() {
         fi
     fi
 
+    if [[ "${AWG_INSTALL_SCRIPT_COMMITTED}" == "true" ]]; then
+        if [[ "${HAD_LIVE_AWG_INSTALL_SCRIPT}" == "true" ]]; then
+            if mv -fT -- "${ROLLBACK_AWG_INSTALL_SCRIPT}" "${AWG_INSTALL_SCRIPT_DEST}"; then
+                ROLLBACK_AWG_INSTALL_SCRIPT=""
+                AWG_INSTALL_SCRIPT_COMMITTED="false"
+            else
+                rollback_ok="false"
+            fi
+        elif rm -f -- "${AWG_INSTALL_SCRIPT_DEST}"; then
+            AWG_INSTALL_SCRIPT_COMMITTED="false"
+        else
+            rollback_ok="false"
+        fi
+    fi
+
     # Restore the old application last, after its matching authorization and
     # helper are back in place. Fresh-install-style destinations are removed.
     if [[ "${BINARY_COMMITTED}" == "true" ]]; then
@@ -831,6 +995,13 @@ rollback_runtime_artifacts() {
 }
 
 refresh_commit_state() {
+    if [[ "${AWG_INSTALL_SCRIPT_RENAME_STARTED}" == "true" ]] && \
+            [[ -n "${STAGED_AWG_INSTALL_SCRIPT}" ]] && \
+            [[ ! -e "${STAGED_AWG_INSTALL_SCRIPT}" ]] && \
+            [[ -e "${AWG_INSTALL_SCRIPT_DEST}" ]]; then
+        AWG_INSTALL_SCRIPT_COMMITTED="true"
+    fi
+
     if [[ "${HELPER_RENAME_STARTED}" == "true" ]] && \
             [[ -n "${STAGED_HELPER}" ]] && [[ ! -e "${STAGED_HELPER}" ]] && \
             [[ -e "${PRIVILEGED_HELPER_DEST}" ]]; then
@@ -856,6 +1027,10 @@ report_retained_rollback_artifacts() {
     fi
     if [[ -n "${ROLLBACK_HELPER}" ]] && [[ -e "${ROLLBACK_HELPER}" ]]; then
         warn "Retained helper recovery copy: ${ROLLBACK_HELPER}"
+    fi
+    if [[ -n "${ROLLBACK_AWG_INSTALL_SCRIPT}" ]] && \
+            [[ -e "${ROLLBACK_AWG_INSTALL_SCRIPT}" ]]; then
+        warn "Retained AWG lifecycle-script recovery copy: ${ROLLBACK_AWG_INSTALL_SCRIPT}"
     fi
     if [[ -n "${ROLLBACK_SUDOERS}" ]] && [[ -e "${ROLLBACK_SUDOERS}" ]]; then
         warn "Retained sudoers recovery copy: ${ROLLBACK_SUDOERS}"
@@ -883,6 +1058,13 @@ discard_rollback_artifacts() {
             warn "Could not remove helper rollback file: ${ROLLBACK_HELPER}"
         fi
     fi
+    if [[ -n "${ROLLBACK_AWG_INSTALL_SCRIPT}" ]]; then
+        if rm -f -- "${ROLLBACK_AWG_INSTALL_SCRIPT}"; then
+            ROLLBACK_AWG_INSTALL_SCRIPT=""
+        else
+            warn "Could not remove AWG lifecycle-script rollback file: ${ROLLBACK_AWG_INSTALL_SCRIPT}"
+        fi
+    fi
     if [[ -n "${ROLLBACK_SUDOERS}" ]]; then
         if rm -f -- "${ROLLBACK_SUDOERS}"; then
             ROLLBACK_SUDOERS=""
@@ -900,6 +1082,17 @@ finalize_transaction() {
 
 commit_staged_artifacts() {
     TRANSACTION_ACTIVE="true"
+    if [[ "${REFRESH_AWG_INSTALL_SCRIPT}" == "true" ]]; then
+        AWG_INSTALL_SCRIPT_RENAME_STARTED="true"
+        if ! mv -fT -- "${STAGED_AWG_INSTALL_SCRIPT}" "${AWG_INSTALL_SCRIPT_DEST}"; then
+            abort_commit_with_rollback "Could not install staged AWG lifecycle script"
+        fi
+        AWG_INSTALL_SCRIPT_COMMITTED="true"
+        AWG_INSTALL_SCRIPT_RENAME_STARTED="false"
+        STAGED_AWG_INSTALL_SCRIPT=""
+        info "Installed AWG lifecycle script: ${AWG_INSTALL_SCRIPT_DEST}"
+    fi
+
     HELPER_RENAME_STARTED="true"
     if ! mv -fT -- "${STAGED_HELPER}" "${PRIVILEGED_HELPER_DEST}"; then
         abort_commit_with_rollback "Could not install staged privileged helper"
@@ -949,6 +1142,7 @@ main() {
     stage_privileged_helper
     stage_sudoers
     stage_binary
+    stage_awg_install_script
     stage_rollback_artifacts
 
     # 2. Stop service if it was active (clean shutdown before artifact swap).
@@ -963,7 +1157,8 @@ main() {
         info "Service not active; skipping stop."
     fi
 
-    # 3. Commit helper and sudoers first, then the matching application last.
+    # 3. Commit the lifecycle script, helper, and sudoers first, then the
+    #    matching application last.
     commit_staged_artifacts
 
     # 3a. Ensure AWG_CONFIG_DIR is writable by the service user.
