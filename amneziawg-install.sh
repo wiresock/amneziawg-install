@@ -6952,18 +6952,12 @@ function changeAwgProtocolInteractively() {
 # changes protocol state. Reload persisted params only after taking the shared
 # lifecycle lock, and keep the lock through the complete mutation so a staged
 # protocol transaction can never overwrite the result.
-function runLockedManagementOperation() {
+function runLockedManagementOperation() (
 	local OPERATION="$1"
-	local RC=0
 	acquireClientLifecycleLock || return 1
-	if ! loadParams; then
-		releaseClientLifecycleLock
-		return 1
-	fi
-	"${OPERATION}" || RC=$?
-	releaseClientLifecycleLock
-	return "${RC}"
-}
+	loadParams
+	"${OPERATION}"
+)
 
 function manageMenu() {
 	local MENU_OPTION=""
@@ -7030,10 +7024,8 @@ CLIENT_LIFECYCLE_LOCK_FD=""
 # persistent state directory is opened read-only, its descriptor identity
 # is revalidated against the path, and the descriptor is locked. The root-run
 # CLI therefore never creates, truncates, chowns, or chmods a service-writable
-# lock pathname. Non-interactive mutating subshells close the descriptor
-# automatically on exit; interactive mutating callers and the menu preloader
-# release it explicitly so interactive terminal Readline input remains in the
-# foreground process group.
+# lock pathname. Mutating callers run in a subshell so the descriptor is closed
+# automatically; the interactive menu preloader releases it explicitly.
 function acquireClientLifecycleLock() {
 	local lock_dir env_file panel_installed=0
 	local old_umask dir_identity descriptor_identity descriptor_path
