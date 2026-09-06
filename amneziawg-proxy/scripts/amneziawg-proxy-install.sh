@@ -343,7 +343,11 @@ detect_awg_config() {
             info "Detected AWG listen port: ${LISTEN_PORT}"
         fi
         if [[ "${proto}" == "3" ]]; then
-            warn "WARNING: AmneziaWG 3.0 protocol detected on ${AWG_NIC}."
+            if [[ -n "${AWG_NIC}" ]]; then
+                warn "AmneziaWG 3.0 protocol detected on ${AWG_NIC}."
+            else
+                warn "AmneziaWG 3.0 protocol detected."
+            fi
             warn "amneziawg-proxy is compatible ONLY with AmneziaWG 2.0."
             warn "AWG 3.0 uses S1-S4 padding as key material for header encryption,"
             warn "so proxy obfuscation breaks packet classification and compatibility."

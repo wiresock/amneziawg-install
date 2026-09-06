@@ -33,8 +33,9 @@ impl fmt::Display for Protocol {
     }
 }
 
-/// AmneziaWG 2.0 packet type, identified by matching the first 4 bytes (plaintext header)
-/// against the H1–H4 ranges from the AWG configuration.
+/// AmneziaWG 2.0 packet type, identified by matching the 4-byte plaintext header
+/// at offset S (following the S1–S4 padding prefix) against the H1–H4 ranges
+/// from the AWG configuration.
 ///
 /// Note: This classification requires AmneziaWG 2.0. In AmneziaWG 3.0+, headers
 /// are encrypted with `HeaderProtectionKey`, preventing plaintext matching against H1–H4.
