@@ -7267,9 +7267,9 @@ function changeAwgProtocolInteractively() {
 		echo -e "${ORANGE}This will downgrade the interface and every client config to AWG 2.0.${NC}"
 	elif [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
 		echo -e "${ORANGE}RandomTrailers must match on every client. DisableCookies is not enabled automatically (it disables Cookie Reply / anti-DoS).${NC}"
-		if [[ "${SERVER_AWG_S1}" != "${SERVER_AWG_S2}" || \
-			"${SERVER_AWG_S1}" != "${SERVER_AWG_S3}" || \
-			"${SERVER_AWG_S1}" != "${SERVER_AWG_S4}" ]]; then
+		if ! [[ "${SERVER_AWG_S1}" == "${SERVER_AWG_S2}" && \
+			"${SERVER_AWG_S1}" == "${SERVER_AWG_S3}" && \
+			"${SERVER_AWG_S1}" == "${SERVER_AWG_S4}" ]]; then
 			echo -e "${ORANGE}Current S1-S4 values differ. Upstream recommends identical S1-S4 when RandomTrailers is on; existing values will be kept.${NC}"
 		fi
 	fi
