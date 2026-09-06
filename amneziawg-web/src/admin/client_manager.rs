@@ -374,6 +374,18 @@ fn validate_awg31_params(params: &ServerParams) -> Result<(String, String), Crea
     ))
 }
 
+/// AWG 3.0 params must not retain 3.1-only keys. The installer treats that as
+/// inconsistent protocol state and repairs it; generating clients from it would
+/// disagree with CLI fail-closed checks.
+fn reject_dormant_awg31_params(params: &ServerParams) -> Result<(), CreateClientError> {
+    if params.random_trailers.is_empty() && params.disable_cookies.is_empty() {
+        return Ok(());
+    }
+    Err(CreateClientError::ParamsRead(
+        "AWG 3.0 params must not contain AWG_RANDOM_TRAILERS or AWG_DISABLE_COOKIES".to_string(),
+    ))
+}
+
 /// Parse params file content (KEY='VALUE' format) into [`ServerParams`].
 ///
 /// The format is produced by `serializeParams()` in the install script,
@@ -472,7 +484,10 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
     validate_interface_name(&params.server_awg_nic)?;
     match params.protocol_version {
         AwgProtocolVersion::V2 => {}
-        AwgProtocolVersion::V3 => validate_awg3_params(&params)?,
+        AwgProtocolVersion::V3 => {
+            validate_awg3_params(&params)?;
+            reject_dormant_awg31_params(&params)?;
+        }
         AwgProtocolVersion::V31 => {
             validate_awg31_params(&params)?;
         }
@@ -1896,6 +1911,18 @@ SERVER_AWG_H4='4'
             &content.replace("AWG_PROTOCOL_VERSION='3'", "AWG_PROTOCOL_VERSION='3.1'")
         )
         .is_err());
+        assert!(
+            parse_params(&format!(
+                "{content}AWG_RANDOM_TRAILERS='on'\nAWG_DISABLE_COOKIES='off'\n"
+            ))
+            .is_err(),
+            "AWG 3.0 params must reject dormant AWG 3.1 keys"
+        );
+        assert!(
+            parse_params(&format!("{content}AWG_RANDOM_TRAILERS=''\nAWG_DISABLE_COOKIES=''\n"))
+                .is_ok(),
+            "empty serialized AWG 3.1 keys remain valid in AWG 3.0"
+        );
     }
 
     #[test]
