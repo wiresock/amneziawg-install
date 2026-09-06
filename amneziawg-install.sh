@@ -15,15 +15,26 @@ WEB_PANEL_SYSTEMD_UNIT="/etc/systemd/system/amneziawg-web.service"
 WEB_PANEL_DATA_DIR="/var/lib/amneziawg-web"
 
 # Protocol state is deliberately independent from package/tool versions. A
-# missing value in an older params file always means AWG 2.0; AWG 3.0 is only
-# entered through the explicit, capability-gated migration path.
+# missing value in an older params file always means AWG 2.0; AWG 3.0 and
+# AWG 3.1 are only entered through the explicit, capability-gated migration
+# path. Existing AWG 3.0 installations stay on 3.0 until the operator opts in
+# to 3.1; newly installed awg tools never imply a protocol upgrade.
 AWG_PROTOCOL_VERSION_2="2"
 AWG_PROTOCOL_VERSION_3="3"
+AWG_PROTOCOL_VERSION_31="3.1"
 AWG3_DEFAULT_CONTENT_PADDING_ADDITION="10-100"
 AWG3_DEFAULT_REKEY_AFTER_TIME="100-120"
 AWG3_DEFAULT_REKEY_TIMEOUT="3-7"
 AWG3_DEFAULT_REJECT_AFTER_TIME="150-180"
 AWG3_DEFAULT_KEEPALIVE_TIMEOUT="5-15"
+# AWG 3.1: RandomTrailers must match on both ends and is the reason to opt in.
+# DisableCookies is sender-only and turns off Cookie Reply (anti-DoS), so it
+# stays off unless the operator enables it explicitly.
+AWG31_DEFAULT_RANDOM_TRAILERS="on"
+AWG31_DEFAULT_DISABLE_COOKIES="off"
+# Interface keys rewritten/verified as protocol-specific fields. Keep in sync
+# with renderAwgProtocolFields and the config match helpers.
+AWG_PROTOCOL_CONFIG_KEYS="HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|RandomTrailers|DisableCookies"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
@@ -1503,7 +1514,7 @@ function safeQuoteParam() {
 	printf "'%s'\n" "${ESCAPED}"
 }
 
-# Clear every AWG 3.0-only value before loading persistent state. This is a
+# Clear every AWG 3.x-only value before loading persistent state. This is a
 # security boundary: exported environment variables must never opt an AWG 2.0
 # installation into header protection or alter its generated client configs.
 function clearAwg3Params() {
@@ -1513,10 +1524,60 @@ function clearAwg3Params() {
 	AWG_REKEY_TIMEOUT=""
 	AWG_REJECT_AFTER_TIME=""
 	AWG_KEEPALIVE_TIMEOUT=""
+	clearAwg31Params
+}
+
+# Clear AWG 3.1-only values while leaving AWG 3.0 header-protection state.
+function clearAwg31Params() {
+	AWG_RANDOM_TRAILERS=""
+	AWG_DISABLE_COOKIES=""
+}
+
+function awgProtocolDisplayName() {
+	case "${1:-}" in
+		"${AWG_PROTOCOL_VERSION_2}"|2.0) printf '2.0\n' ;;
+		"${AWG_PROTOCOL_VERSION_3}"|3.0) printf '3.0\n' ;;
+		"${AWG_PROTOCOL_VERSION_31}") printf '3.1\n' ;;
+		*) printf '%s\n' "${1:-unknown}" ;;
+	esac
+}
+
+function awgProtocolUsesHeaderProtection() {
+	case "${AWG_PROTOCOL_VERSION}" in
+		"${AWG_PROTOCOL_VERSION_3}"|"${AWG_PROTOCOL_VERSION_31}") return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+function awgProtocolUses31Fields() {
+	[[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_31}" ]]
+}
+
+# Canonicalize a protocol boolean to the upstream on|off spelling used by
+# amneziawg-tools (`parse_bool` also accepts true/false/yes/no/1/0).
+function normalizeAwgOnOff() {
+	local NAME="$1"
+	local VALUE="${2:-}"
+	# Trim only leading/trailing whitespace so " on " matches the web parser.
+	VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
+	VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
+	case "${VALUE,,}" in
+		on|true|yes|1)
+			printf 'on\n'
+			;;
+		off|false|no|0)
+			printf 'off\n'
+			;;
+		*)
+			echo "ERROR: ${NAME} must be on or off" >&2
+			return 1
+			;;
+	esac
 }
 
 # Normalize persisted aliases while preserving the compatibility rule that a
-# missing protocol version is AWG 2.0.
+# missing protocol version is AWG 2.0. "3" / "3.0" stay AWG 3.0; they are
+# never silently reinterpreted as 3.1.
 function normalizeAwgProtocolVersion() {
 	case "${AWG_PROTOCOL_VERSION:-}" in
 		""|2|2.0)
@@ -1525,8 +1586,11 @@ function normalizeAwgProtocolVersion() {
 		3|3.0)
 			AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_3}"
 			;;
+		3.1)
+			AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_31}"
+			;;
 		*)
-			echo "ERROR: unsupported AWG_PROTOCOL_VERSION in params; expected 2 or 3" >&2
+			echo "ERROR: unsupported AWG_PROTOCOL_VERSION in params; expected 2, 3, or 3.1" >&2
 			return 1
 			;;
 	esac
@@ -1585,13 +1649,47 @@ function validateAwg3Params() {
 	validateAwg3Range "KeepaliveTimeout" "${AWG_KEEPALIVE_TIMEOUT:-}" || return 1
 }
 
-# Invalid AWG 3.0-only state normally fails closed. The sole exception is the
-# explicit downgrade command, which must remain able to remove damaged 3.0
-# fields and restore an otherwise valid installation to AWG 2.0.
+# Validate and canonicalize AWG 3.1-only booleans. Empty values are invalid
+# in 3.1 mode so generated server/client configs always agree.
+function validateAwg31Params() {
+	local NORMALIZED
+
+	validateAwg3Params || return 1
+	NORMALIZED="$(normalizeAwgOnOff "RandomTrailers" "${AWG_RANDOM_TRAILERS:-}")" || return 1
+	AWG_RANDOM_TRAILERS="${NORMALIZED}"
+	NORMALIZED="$(normalizeAwgOnOff "DisableCookies" "${AWG_DISABLE_COOKIES:-}")" || return 1
+	AWG_DISABLE_COOKIES="${NORMALIZED}"
+}
+
+# Upstream recommends identical S1-S4 when RandomTrailers is on so random
+# packet sizes are less likely to be classified as the wrong handshake type.
+# Existing S-values are never rewritten; the operator is warned instead.
+function warnIfRandomTrailersSPaddingUnequal() {
+	[[ "${AWG_RANDOM_TRAILERS:-}" == "on" ]] || return 0
+	if [[ "${SERVER_AWG_S1}" == "${SERVER_AWG_S2}" && \
+		"${SERVER_AWG_S1}" == "${SERVER_AWG_S3}" && \
+		"${SERVER_AWG_S1}" == "${SERVER_AWG_S4}" ]]; then
+		return 0
+	fi
+	echo "WARNING: RandomTrailers is on, but S1-S4 are not identical (S1=${SERVER_AWG_S1} S2=${SERVER_AWG_S2} S3=${SERVER_AWG_S3} S4=${SERVER_AWG_S4})." >&2
+	echo "         Upstream recommends the same S1, S2, S3, and S4 values to reduce packet-type misdetection." >&2
+}
+
+# Invalid AWG 3.x-only state normally fails closed. The sole exception is the
+# explicit AWG 2.0 downgrade command, which must remain able to remove damaged
+# 3.0/3.1 fields and restore an otherwise valid installation to AWG 2.0.
 function validatePersistedAwgProtocolState() {
 	local ALLOW_INVALID_AWG3_FOR_DOWNGRADE="${1:-0}"
 
 	normalizeAwgProtocolVersion || return 1
+	if awgProtocolUses31Fields && ! validateAwg31Params; then
+		if [[ "${ALLOW_INVALID_AWG3_FOR_DOWNGRADE}" == "1" ]]; then
+			echo "WARNING: invalid AWG 3.1 state will be removed by the requested AWG 2.0 downgrade" >&2
+			return 0
+		fi
+		echo "ERROR: invalid AWG 3.1 protocol state in persisted params" >&2
+		return 1
+	fi
 	if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]] && ! validateAwg3Params; then
 		if [[ "${ALLOW_INVALID_AWG3_FOR_DOWNGRADE}" == "1" ]]; then
 			echo "WARNING: invalid AWG 3.0 state will be removed by the requested AWG 2.0 downgrade" >&2
@@ -1604,11 +1702,15 @@ function validatePersistedAwgProtocolState() {
 
 # Emit only the protocol-specific [Interface] lines. Callers must redirect
 # stdout into a mode-0600 configuration file because the output contains the
-# shared HeaderProtectionKey in AWG 3.0 mode.
+# shared HeaderProtectionKey in AWG 3.0/3.1 mode.
 function renderAwgProtocolFields() {
 	normalizeAwgProtocolVersion || return 1
-	[[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]] || return 0
-	validateAwg3Params || return 1
+	awgProtocolUsesHeaderProtection || return 0
+	if awgProtocolUses31Fields; then
+		validateAwg31Params || return 1
+	else
+		validateAwg3Params || return 1
+	fi
 
 	printf 'HeaderProtectionKey = %s\n' "${AWG_HEADER_PROTECTION_KEY}"
 	[[ -z "${AWG_CONTENT_PADDING_ADDITION:-}" ]] || printf 'ContentPaddingAddition = %s\n' "${AWG_CONTENT_PADDING_ADDITION}"
@@ -1616,38 +1718,52 @@ function renderAwgProtocolFields() {
 	[[ -z "${AWG_REKEY_TIMEOUT:-}" ]] || printf 'RekeyTimeout = %s\n' "${AWG_REKEY_TIMEOUT}"
 	[[ -z "${AWG_REJECT_AFTER_TIME:-}" ]] || printf 'RejectAfterTime = %s\n' "${AWG_REJECT_AFTER_TIME}"
 	[[ -z "${AWG_KEEPALIVE_TIMEOUT:-}" ]] || printf 'KeepaliveTimeout = %s\n' "${AWG_KEEPALIVE_TIMEOUT}"
+	if awgProtocolUses31Fields; then
+		printf 'RandomTrailers = %s\n' "${AWG_RANDOM_TRAILERS}"
+		printf 'DisableCookies = %s\n' "${AWG_DISABLE_COOKIES}"
+	fi
 }
 
 # Exercise the complete userspace -> generic-netlink -> running-kernel path.
 # Version strings are intentionally ignored: distributions can ship a new awg
 # binary alongside an older loaded module (or the reverse). The probe succeeds
-# only when every AWG 3.0 field can be applied and read back unchanged.
-function probeAwg3Capability() {
-	local PROBE_KEY="${1:-}"
-	local PROBE_DIR PROBE_CONF PROBE_INTERFACE
+# only when every required protocol field can be applied and read back unchanged.
+function probeAwgProtocolCapability() {
+	local REQUIRE_31="${1:-0}"
+	local PROBE_KEY="${2:-}"
+	local PROBE_DIR PROBE_CONF PROBE_INTERFACE PROBE_EXTRA=""
 	local READ_KEY READ_CONTENT READ_REKEY_AFTER READ_REKEY_TIMEOUT
-	local READ_REJECT READ_KEEPALIVE
+	local READ_REJECT READ_KEEPALIVE READ_TRAILERS READ_COOKIES
 	local RC=1 INTERFACE_CREATED=0
+	local PROBE_LABEL="AWG 3.0"
+	local FAIL_DETAIL=""
+
+	(( REQUIRE_31 )) && PROBE_LABEL="AWG 3.1"
 
 	if [[ -z "${PROBE_KEY}" ]]; then
 		PROBE_KEY="$(awg genkey 2>/dev/null)" || PROBE_KEY=""
 	fi
 	if ! [[ "${PROBE_KEY}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
-		echo "ERROR: the installed awg tool could not generate an AWG 3.0 probe key" >&2
+		echo "ERROR: the installed awg tool could not generate an ${PROBE_LABEL} probe key" >&2
 		return 1
 	fi
 	if ! command -v ip >/dev/null 2>&1 || ! command -v awg >/dev/null 2>&1; then
-		echo "ERROR: AWG 3.0 capability probing requires both ip and awg" >&2
+		echo "ERROR: ${PROBE_LABEL} capability probing requires both ip and awg" >&2
 		return 1
 	fi
 
 	PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/awg3-probe.XXXXXX")" || {
-		echo "ERROR: could not create the private AWG 3.0 probe directory" >&2
+		echo "ERROR: could not create the private ${PROBE_LABEL} probe directory" >&2
 		return 1
 	}
 	chmod 700 "${PROBE_DIR}"
 	PROBE_CONF="${PROBE_DIR}/probe.conf"
 	PROBE_INTERFACE="awgp$((BASHPID % 100000000))"
+	if (( REQUIRE_31 )); then
+		PROBE_EXTRA="RandomTrailers = on
+DisableCookies = on
+"
+	fi
 
 	(
 		umask 077
@@ -1663,6 +1779,7 @@ RekeyAfterTime = 101-103
 RekeyTimeout = 5-7
 RejectAfterTime = 181-183
 KeepaliveTimeout = 9-11
+${PROBE_EXTRA}
 EOF
 	) || RC=1
 
@@ -1682,8 +1799,26 @@ EOF
 				[[ "${READ_REJECT}" == "181-183" ]] && \
 				[[ "${READ_KEEPALIVE}" == "9-11" ]]; then
 				RC=0
+			else
+				FAIL_DETAIL="the running amneziawg kernel module did not read back AWG 3.0 fields unchanged (upgrade the loaded module to match amneziawg-tools)"
+			fi
+			if (( REQUIRE_31 )) && (( RC == 0 )); then
+				READ_TRAILERS="$(awg show "${PROBE_INTERFACE}" random-trailers 2>/dev/null || true)"
+				READ_COOKIES="$(awg show "${PROBE_INTERFACE}" disable-cookies 2>/dev/null || true)"
+				if [[ "${READ_TRAILERS}" != "on" ]] || [[ "${READ_COOKIES}" != "on" ]]; then
+					RC=1
+					FAIL_DETAIL="the running amneziawg kernel module did not read back RandomTrailers/DisableCookies (upgrade both amneziawg-tools and the loaded kernel module to AWG 3.1)"
+				fi
+			fi
+		else
+			if (( REQUIRE_31 )); then
+				FAIL_DETAIL="awg setconf rejected RandomTrailers/DisableCookies (upgrade amneziawg-tools and the running amneziawg kernel module to AWG 3.1 together)"
+			else
+				FAIL_DETAIL="awg setconf rejected AWG 3.0 fields (upgrade amneziawg-tools and the running amneziawg kernel module together)"
 			fi
 		fi
+	else
+		FAIL_DETAIL="could not create a temporary amneziawg interface (load the amneziawg kernel module for this kernel)"
 	fi
 
 	if (( INTERFACE_CREATED )); then
@@ -1693,11 +1828,24 @@ EOF
 	rmdir -- "${PROBE_DIR}" 2>/dev/null || true
 
 	if (( RC != 0 )); then
-		echo "ERROR: AWG 3.0 is not supported by both the installed awg tool and the running kernel module" >&2
-		echo "       The temporary interface could not apply and read back every AWG 3.0 field." >&2
+		echo "ERROR: ${PROBE_LABEL} is not supported by both the installed awg tool and the running kernel module" >&2
+		if [[ -n "${FAIL_DETAIL}" ]]; then
+			echo "       ${FAIL_DETAIL}" >&2
+		else
+			echo "       The temporary interface could not apply and read back every ${PROBE_LABEL} field." >&2
+		fi
+		echo "       Package version strings are ignored; only a live apply/readback probe is accepted." >&2
 		return 1
 	fi
 	return 0
+}
+
+function probeAwg3Capability() {
+	probeAwgProtocolCapability 0 "${1:-}"
+}
+
+function probeAwg31Capability() {
+	probeAwgProtocolCapability 1 "${1:-}"
 }
 
 # Optional self-test for safeQuoteParam; run by setting SAFE_QUOTE_PARAM_SELFTEST=1
@@ -2351,6 +2499,8 @@ AWG_REKEY_AFTER_TIME=$(safeQuoteParam "${AWG_REKEY_AFTER_TIME:-}")
 AWG_REKEY_TIMEOUT=$(safeQuoteParam "${AWG_REKEY_TIMEOUT:-}")
 AWG_REJECT_AFTER_TIME=$(safeQuoteParam "${AWG_REJECT_AFTER_TIME:-}")
 AWG_KEEPALIVE_TIMEOUT=$(safeQuoteParam "${AWG_KEEPALIVE_TIMEOUT:-}")
+AWG_RANDOM_TRAILERS=$(safeQuoteParam "${AWG_RANDOM_TRAILERS:-}")
+AWG_DISABLE_COOKIES=$(safeQuoteParam "${AWG_DISABLE_COOKIES:-}")
 EOF
 	umask "${OLD_UMASK}"
 }
@@ -3941,7 +4091,8 @@ function serverConfigHasIPv6Address() {
 
 function installQuestions() {
 	# Fresh installs remain on AWG 2.0 regardless of caller environment. AWG 3.0
-	# can be enabled only after installation through the explicit migration.
+	# and AWG 3.1 can be enabled only after installation through the explicit
+	# capability-gated migration.
 	AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_2}"
 	clearAwg3Params
 
@@ -5820,7 +5971,8 @@ function validateParamsFile() {
 	# keys that older params files legitimately lack or enable AWG 3.0 features.
 	unset ENABLE_IPV6 AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY \
 		AWG_CONTENT_PADDING_ADDITION AWG_REKEY_AFTER_TIME AWG_REKEY_TIMEOUT \
-		AWG_REJECT_AFTER_TIME AWG_KEEPALIVE_TIMEOUT
+		AWG_REJECT_AFTER_TIME AWG_KEEPALIVE_TIMEOUT AWG_RANDOM_TRAILERS \
+		AWG_DISABLE_COOKIES
 	# shellcheck source=/etc/amnezia/amneziawg/params
 	if ! source "${AMNEZIAWG_DIR}/params"; then
 		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}" >&2
@@ -5828,7 +5980,7 @@ function validateParamsFile() {
 		return 1
 	fi
 	if ! validatePersistedAwgProtocolState "${ALLOW_INVALID_AWG3_FOR_DOWNGRADE}"; then
-		echo -e "${RED}ERROR: Invalid AWG 3.0 protocol state in ${AMNEZIAWG_DIR}/params.${NC}" >&2
+		echo -e "${RED}ERROR: Invalid AWG protocol state in ${AMNEZIAWG_DIR}/params.${NC}" >&2
 		return 1
 	fi
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
@@ -6430,7 +6582,7 @@ function rewriteAwgProtocolConfig() {
 	(
 		umask 077
 		while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
-			if [[ "${LINE}" =~ ^[[:space:]]*(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout)[[:space:]]*= ]]; then
+			if [[ "${LINE}" =~ ^[[:space:]]*(${AWG_PROTOCOL_CONFIG_KEYS})[[:space:]]*= ]]; then
 				continue
 			fi
 			# Hold only the blank separator immediately before the first peer.
@@ -6575,22 +6727,26 @@ function awgProtocolConfigMatchesPersistedState() {
 
 	[[ -f "${CONFIG_FILE}" && ! -L "${CONFIG_FILE}" && -r "${CONFIG_FILE}" ]] || return 2
 
-	if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
+	if awgProtocolUsesHeaderProtection; then
 		EXPECTED_FIELDS[HeaderProtectionKey]="${AWG_HEADER_PROTECTION_KEY}"
 		[[ -z "${AWG_CONTENT_PADDING_ADDITION:-}" ]] || EXPECTED_FIELDS[ContentPaddingAddition]="${AWG_CONTENT_PADDING_ADDITION}"
 		[[ -z "${AWG_REKEY_AFTER_TIME:-}" ]] || EXPECTED_FIELDS[RekeyAfterTime]="${AWG_REKEY_AFTER_TIME}"
 		[[ -z "${AWG_REKEY_TIMEOUT:-}" ]] || EXPECTED_FIELDS[RekeyTimeout]="${AWG_REKEY_TIMEOUT}"
 		[[ -z "${AWG_REJECT_AFTER_TIME:-}" ]] || EXPECTED_FIELDS[RejectAfterTime]="${AWG_REJECT_AFTER_TIME}"
 		[[ -z "${AWG_KEEPALIVE_TIMEOUT:-}" ]] || EXPECTED_FIELDS[KeepaliveTimeout]="${AWG_KEEPALIVE_TIMEOUT}"
+		if awgProtocolUses31Fields; then
+			EXPECTED_FIELDS[RandomTrailers]="${AWG_RANDOM_TRAILERS}"
+			EXPECTED_FIELDS[DisableCookies]="${AWG_DISABLE_COOKIES}"
+		fi
 	elif [[ "${AWG_PROTOCOL_VERSION}" != "${AWG_PROTOCOL_VERSION_2}" ]]; then
 		return 2
 	fi
 
 	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
-		if [[ "${LINE}" =~ ^[[:space:]]*(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+		if [[ "${LINE}" =~ ^[[:space:]]*(${AWG_PROTOCOL_CONFIG_KEYS})[[:space:]]*=[[:space:]]*(.*)$ ]]; then
 			KEY="${BASH_REMATCH[1]}"
 			VALUE="$(trimWhitespace "${BASH_REMATCH[2]}")"
-			[[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]] || return 1
+			awgProtocolUsesHeaderProtection || return 1
 			[[ -n "${EXPECTED_FIELDS[${KEY}]+present}" ]] || return 1
 			[[ -z "${SEEN_FIELDS[${KEY}]+present}" ]] || return 1
 			[[ "${VALUE}" == "${EXPECTED_FIELDS[${KEY}]}" ]] || return 1
@@ -6614,11 +6770,17 @@ function awgProtocolConfigsMatchPersistedState() {
 	case "${AWG_PROTOCOL_VERSION}" in
 		"${AWG_PROTOCOL_VERSION_2}")
 			# Explicit AWG 2.0 state should not retain dormant secrets or settings.
-			if [[ -n "${AWG_HEADER_PROTECTION_KEY:-}${AWG_CONTENT_PADDING_ADDITION:-}${AWG_REKEY_AFTER_TIME:-}${AWG_REKEY_TIMEOUT:-}${AWG_REJECT_AFTER_TIME:-}${AWG_KEEPALIVE_TIMEOUT:-}" ]]; then
+			if [[ -n "${AWG_HEADER_PROTECTION_KEY:-}${AWG_CONTENT_PADDING_ADDITION:-}${AWG_REKEY_AFTER_TIME:-}${AWG_REKEY_TIMEOUT:-}${AWG_REJECT_AFTER_TIME:-}${AWG_KEEPALIVE_TIMEOUT:-}${AWG_RANDOM_TRAILERS:-}${AWG_DISABLE_COOKIES:-}" ]]; then
 				return 1
 			fi
 			;;
-		"${AWG_PROTOCOL_VERSION_3}") ;;
+		"${AWG_PROTOCOL_VERSION_3}")
+			# AWG 3.0 must not retain dormant 3.1-only settings.
+			if [[ -n "${AWG_RANDOM_TRAILERS:-}${AWG_DISABLE_COOKIES:-}" ]]; then
+				return 1
+			fi
+			;;
+		"${AWG_PROTOCOL_VERSION_31}") ;;
 		*) return 2 ;;
 	esac
 
@@ -6908,15 +7070,19 @@ function setAwgProtocolMode() (
 	local TARGET_MODE="$1"
 	local ORIGINAL_PROTOCOL ORIGINAL_KEY ORIGINAL_CONTENT ORIGINAL_REKEY_AFTER
 	local ORIGINAL_REKEY_TIMEOUT ORIGINAL_REJECT ORIGINAL_KEEPALIVE
+	local ORIGINAL_TRAILERS ORIGINAL_COOKIES TARGET_LABEL
 	local NEW_KEY CONFIG_STATE_RC=0 REPAIRING_SAME_MODE=0
 
 	case "${TARGET_MODE}" in
-		2|3) ;;
+		2|2.0) TARGET_MODE="${AWG_PROTOCOL_VERSION_2}" ;;
+		3|3.0) TARGET_MODE="${AWG_PROTOCOL_VERSION_3}" ;;
+		3.1) TARGET_MODE="${AWG_PROTOCOL_VERSION_31}" ;;
 		*)
-			echo "ERROR: protocol mode must be 2 or 3" >&2
+			echo "ERROR: protocol mode must be 2, 3, or 3.1" >&2
 			return 1
 			;;
 	esac
+	TARGET_LABEL="$(awgProtocolDisplayName "${TARGET_MODE}")"
 	# Params must be read only after this process owns the same lifecycle lock as
 	# web-native add/remove operations and other protocol changes. Otherwise a
 	# concurrent opposite toggle can make an already-active check use stale state.
@@ -6924,39 +7090,50 @@ function setAwgProtocolMode() (
 	# Neither protocol direction may run the older compatibility migrations
 	# before the protocol transaction has captured its complete rollback set.
 	# Damaged AWG 3.0-only state remains recoverable only through mode 2.
-	if [[ "${TARGET_MODE}" == "2" ]]; then
+	if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_2}" ]]; then
 		loadParams 1 1
 	else
 		loadParams 0 1
 	fi
 	normalizeAwgProtocolVersion || return 1
 	if [[ "${AWG_PROTOCOL_VERSION}" == "${TARGET_MODE}" ]]; then
-		# A persisted AWG 3.0 mode is not enough to prove that the currently
+		# A persisted AWG 3.x mode is not enough to prove that the currently
 		# installed userspace and running kernel still support it. Kernel/package
 		# changes can invalidate a previously successful migration, so every
 		# explicit enable request must repeat the complete readback probe without
 		# rotating the shared key.
-		if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
+		if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" || \
+			"${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
 			# The capability probe needs only the module. Do not start an
 			# intentionally stopped service or collide with a manual interface.
 			ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
-			probeAwg3Capability "${AWG_HEADER_PROTECTION_KEY}" || return 1
+			if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
+				probeAwg31Capability "${AWG_HEADER_PROTECTION_KEY}" || return 1
+				# Same-mode 3.1 can turn RandomTrailers on via params without
+				# taking the 2.0/3.0 enablement path that already warns.
+				warnIfRandomTrailersSPaddingUnequal
+			else
+				probeAwg3Capability "${AWG_HEADER_PROTECTION_KEY}" || return 1
+			fi
 		fi
 		if awgProtocolConfigsMatchPersistedState; then
-			echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is already active and consistent."
+			echo "AmneziaWG protocol mode ${TARGET_LABEL} is already active and consistent."
 			return 0
 		else
 			CONFIG_STATE_RC=$?
 		fi
 		if (( CONFIG_STATE_RC == 2 )); then
-			echo "ERROR: could not verify every active client config before repairing AWG protocol mode ${TARGET_MODE}.0" >&2
+			echo "ERROR: could not verify every active client config before repairing AWG protocol mode ${TARGET_LABEL}" >&2
 			return 1
 		fi
 		REPAIRING_SAME_MODE=1
-		echo "WARNING: persisted AWG protocol mode ${TARGET_MODE}.0 does not match every server/client config; repairing the transaction." >&2
+		echo "WARNING: persisted AWG protocol mode ${TARGET_LABEL} does not match every server/client config; repairing the transaction." >&2
 	fi
-	if (( REPAIRING_SAME_MODE == 0 )) && [[ "${TARGET_MODE}" == "3" ]] && awg2StateNeedsLegacyMigration; then
-		echo "ERROR: this installation needs AWG 2.0 compatibility normalization before AWG 3.0 can be enabled." >&2
+	if (( REPAIRING_SAME_MODE == 0 )) && \
+		[[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_2}" ]] && \
+		[[ "${TARGET_MODE}" != "${AWG_PROTOCOL_VERSION_2}" ]] && \
+		awg2StateNeedsLegacyMigration; then
+		echo "ERROR: this installation needs AWG 2.0 compatibility normalization before AWG 3.x can be enabled." >&2
 		echo "Run amneziawg-install.sh interactively, complete any prompted migration, and then retry." >&2
 		return 1
 	fi
@@ -6967,24 +7144,60 @@ function setAwgProtocolMode() (
 	ORIGINAL_REKEY_TIMEOUT="${AWG_REKEY_TIMEOUT:-}"
 	ORIGINAL_REJECT="${AWG_REJECT_AFTER_TIME:-}"
 	ORIGINAL_KEEPALIVE="${AWG_KEEPALIVE_TIMEOUT:-}"
+	ORIGINAL_TRAILERS="${AWG_RANDOM_TRAILERS:-}"
+	ORIGINAL_COOKIES="${AWG_DISABLE_COOKIES:-}"
 
 	if (( REPAIRING_SAME_MODE )); then
-		# AWG 3.0 repairs deliberately retain the existing shared key. AWG 2.0
-		# repairs also purge dormant 3.0-only values from persisted params.
+		# AWG 3.x repairs deliberately retain the existing shared key. AWG 2.0
+		# repairs also purge dormant 3.x-only values from persisted params.
+		# AWG 3.0 repairs must drop leftover 3.1 fields, or the consistency
+		# check keeps failing and every --enable-awg3 repeats the repair.
 		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_2}" ]] && clearAwg3Params
-	elif [[ "${TARGET_MODE}" == "3" ]]; then
-		NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
+		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]] && clearAwg31Params
+	elif [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
 		ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
-		if ! probeAwg3Capability "${NEW_KEY}"; then
-			return 1
+		if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_2}" ]]; then
+			NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
+			if ! probeAwg31Capability "${NEW_KEY}"; then
+				return 1
+			fi
+			AWG_HEADER_PROTECTION_KEY="${NEW_KEY}"
+			AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+			AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+			AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+			AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+			AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+		else
+			# 3.0 -> 3.1 keeps the shared header-protection key.
+			if ! probeAwg31Capability "${AWG_HEADER_PROTECTION_KEY}"; then
+				return 1
+			fi
+		fi
+		AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_31}"
+		AWG_RANDOM_TRAILERS="${AWG31_DEFAULT_RANDOM_TRAILERS}"
+		AWG_DISABLE_COOKIES="${AWG31_DEFAULT_DISABLE_COOKIES}"
+		warnIfRandomTrailersSPaddingUnequal
+	elif [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
+		ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
+		if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_2}" ]]; then
+			NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
+			if ! probeAwg3Capability "${NEW_KEY}"; then
+				return 1
+			fi
+			AWG_HEADER_PROTECTION_KEY="${NEW_KEY}"
+			AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+			AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+			AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+			AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+			AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+		else
+			# 3.1 -> 3.0 keeps the shared header-protection key and 3.0 timings.
+			if ! probeAwg3Capability "${AWG_HEADER_PROTECTION_KEY}"; then
+				return 1
+			fi
 		fi
 		AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_3}"
-		AWG_HEADER_PROTECTION_KEY="${NEW_KEY}"
-		AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
-		AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
-		AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
-		AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
-		AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+		clearAwg31Params
 	else
 		AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_2}"
 		clearAwg3Params
@@ -6998,29 +7211,78 @@ function setAwgProtocolMode() (
 		AWG_REKEY_TIMEOUT="${ORIGINAL_REKEY_TIMEOUT}"
 		AWG_REJECT_AFTER_TIME="${ORIGINAL_REJECT}"
 		AWG_KEEPALIVE_TIMEOUT="${ORIGINAL_KEEPALIVE}"
+		AWG_RANDOM_TRAILERS="${ORIGINAL_TRAILERS}"
+		AWG_DISABLE_COOKIES="${ORIGINAL_COOKIES}"
 		return 1
 	fi
 
 	if (( REPAIRING_SAME_MODE )); then
-		echo "AmneziaWG protocol mode ${TARGET_MODE}.0 state was repaired successfully."
+		echo "AmneziaWG protocol mode ${TARGET_LABEL} state was repaired successfully."
 	else
-		echo "AmneziaWG protocol mode ${TARGET_MODE}.0 is now active."
+		echo "AmneziaWG protocol mode ${TARGET_LABEL} is now active."
 	fi
 	echo "All client configuration files were updated; redistribute them before reconnecting clients."
 )
 
 function changeAwgProtocolInteractively() {
-	local TARGET_MODE RESPONSE
+	local TARGET_MODE RESPONSE CHOICE=""
 	normalizeAwgProtocolVersion || return 1
-	if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
-		TARGET_MODE=2
+	echo "Current AmneziaWG protocol mode: $(awgProtocolDisplayName "${AWG_PROTOCOL_VERSION}")"
+	echo ""
+	case "${AWG_PROTOCOL_VERSION}" in
+		"${AWG_PROTOCOL_VERSION_2}")
+			echo "   1) Enable AWG 3.0 (header protection)"
+			echo "   2) Enable AWG 3.1 (header protection + RandomTrailers; DisableCookies stays off)"
+			echo "   3) Cancel"
+			until [[ ${CHOICE} =~ ^[1-3]$ ]]; do
+				read -rp "Select an option [1-3]: " CHOICE
+			done
+			case "${CHOICE}" in
+				1) TARGET_MODE="${AWG_PROTOCOL_VERSION_3}" ;;
+				2) TARGET_MODE="${AWG_PROTOCOL_VERSION_31}" ;;
+				*) echo "Protocol change cancelled."; return 0 ;;
+			esac
+			echo -e "${RED}AWG ${TARGET_MODE} cannot communicate with AWG 2.0 clients on this interface.${NC}"
+			echo -e "${ORANGE}Every client must support this protocol version and receive its regenerated config.${NC}"
+			;;
+		"${AWG_PROTOCOL_VERSION_3}")
+			echo "   1) Enable AWG 3.1 (adds RandomTrailers; DisableCookies stays off)"
+			echo "   2) Return to AWG 2.0"
+			echo "   3) Cancel"
+			until [[ ${CHOICE} =~ ^[1-3]$ ]]; do
+				read -rp "Select an option [1-3]: " CHOICE
+			done
+			case "${CHOICE}" in
+				1) TARGET_MODE="${AWG_PROTOCOL_VERSION_31}" ;;
+				2) TARGET_MODE="${AWG_PROTOCOL_VERSION_2}" ;;
+				*) echo "Protocol change cancelled."; return 0 ;;
+			esac
+			;;
+		"${AWG_PROTOCOL_VERSION_31}")
+			echo "   1) Return to AWG 3.0 (removes RandomTrailers and DisableCookies)"
+			echo "   2) Return to AWG 2.0"
+			echo "   3) Cancel"
+			until [[ ${CHOICE} =~ ^[1-3]$ ]]; do
+				read -rp "Select an option [1-3]: " CHOICE
+			done
+			case "${CHOICE}" in
+				1) TARGET_MODE="${AWG_PROTOCOL_VERSION_3}" ;;
+				2) TARGET_MODE="${AWG_PROTOCOL_VERSION_2}" ;;
+				*) echo "Protocol change cancelled."; return 0 ;;
+			esac
+			;;
+	esac
+	if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_2}" ]]; then
 		echo -e "${ORANGE}This will downgrade the interface and every client config to AWG 2.0.${NC}"
-	else
-		TARGET_MODE=3
-		echo -e "${RED}AWG 3.0 cannot communicate with AWG 2.0 clients on this interface.${NC}"
-		echo -e "${ORANGE}Every client must support AWG 3.0 and receive its regenerated config.${NC}"
+	elif [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
+		echo -e "${ORANGE}RandomTrailers must match on every client. DisableCookies is not enabled automatically (it disables Cookie Reply / anti-DoS).${NC}"
+		if ! [[ "${SERVER_AWG_S1}" == "${SERVER_AWG_S2}" && \
+			"${SERVER_AWG_S1}" == "${SERVER_AWG_S3}" && \
+			"${SERVER_AWG_S1}" == "${SERVER_AWG_S4}" ]]; then
+			echo -e "${ORANGE}Current S1-S4 values differ. Upstream recommends identical S1-S4 when RandomTrailers is on; existing values will be kept.${NC}"
+		fi
 	fi
-	read -rp "Switch this interface to AWG ${TARGET_MODE}.0? [y/N]: " RESPONSE
+	read -rp "Switch this interface to AWG $(awgProtocolDisplayName "${TARGET_MODE}")? [y/N]: " RESPONSE
 	[[ "${RESPONSE}" == [Yy] ]] || {
 		echo "Protocol change cancelled."
 		return 0
@@ -7050,11 +7312,7 @@ function manageMenu() {
 	echo "   2) List all users"
 	echo "   3) Revoke existing user"
 	echo "   4) Regenerate all client configs (using current server parameters)"
-	if [[ "${AWG_PROTOCOL_VERSION:-${AWG_PROTOCOL_VERSION_2}}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
-		echo "   5) Downgrade interface and clients to AWG 2.0"
-	else
-		echo "   5) Enable AWG 3.0 for interface and clients"
-	fi
+	echo "   5) Change AWG protocol mode (current: $(awgProtocolDisplayName "${AWG_PROTOCOL_VERSION:-${AWG_PROTOCOL_VERSION_2}}"))"
 	echo "   6) Uninstall AmneziaWG"
 	echo "   7) Exit"
 	until [[ ${MENU_OPTION} =~ ^[1-7]$ ]]; do
@@ -7422,11 +7680,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	#   amneziawg-install.sh --list-clients
 	#   amneziawg-install.sh --protocol-status
 	#   amneziawg-install.sh --enable-awg3
+	#   amneziawg-install.sh --enable-awg31
 	#   amneziawg-install.sh --disable-awg3
 	#
 	# Requires AmneziaWG to be already installed (params file must exist).
 	case "${1:-}" in
-		--protocol-status|--enable-awg3|--disable-awg3)
+		--protocol-status|--enable-awg3|--enable-awg31|--disable-awg3)
 			initialCheck
 			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
 				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
@@ -7441,6 +7700,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 					;;
 				--enable-awg3)
 					setAwgProtocolMode 3
+					;;
+				--enable-awg31)
+					setAwgProtocolMode 3.1
 					;;
 				--disable-awg3)
 					setAwgProtocolMode 2

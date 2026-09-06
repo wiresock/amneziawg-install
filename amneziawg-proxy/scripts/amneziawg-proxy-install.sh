@@ -319,6 +319,19 @@ Install AmneziaWG first (https://github.com/wiresock/amneziawg-install)."
 
 # ── AWG configuration detection ───────────────────────────────────────────────
 
+# Proxy setup is allowed only for AWG 2.0. Missing/empty protocol state is the
+# same legacy default the installer uses (AWG 2.0). Any 3.x generation, later
+# major version, or malformed value must fail closed.
+awg_protocol_is_proxy_compatible() {
+    local proto="${1:-}"
+    proto="${proto#"${proto%%[![:space:]]*}"}"
+    proto="${proto%"${proto##*[![:space:]]}"}"
+    case "${proto}" in
+        ""|2|2.0) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Detect the active AmneziaWG interface and its config file.
 # Sets AWG_NIC, AWG_CONF_FILE, and LISTEN_PORT (if not already set).
 detect_awg_config() {
@@ -332,7 +345,7 @@ detect_awg_config() {
         local nic port proto
         nic="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_AWG_NIC:-}"' _ "${params_file}")"
         port="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_PORT:-}"' _ "${params_file}")"
-        proto="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${AWG_PROTOCOL_VERSION:-2}"' _ "${params_file}")"
+        proto="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${AWG_PROTOCOL_VERSION-}"' _ "${params_file}")"
 
         if [[ -n "${nic}" ]]; then
             AWG_NIC="${nic}"
@@ -342,16 +355,16 @@ detect_awg_config() {
             LISTEN_PORT="${port}"
             info "Detected AWG listen port: ${LISTEN_PORT}"
         fi
-        if [[ "${proto}" == "3" ]]; then
+        if ! awg_protocol_is_proxy_compatible "${proto}"; then
             if [[ -n "${AWG_NIC}" ]]; then
-                warn "AmneziaWG 3.0 protocol detected on ${AWG_NIC}."
+                error "AmneziaWG ${proto} protocol detected on ${AWG_NIC}."
             else
-                warn "AmneziaWG 3.0 protocol detected."
+                error "AmneziaWG ${proto} protocol detected."
             fi
-            warn "amneziawg-proxy is compatible ONLY with AmneziaWG 2.0."
-            warn "AWG 3.0 uses S1-S4 padding as key material for header encryption,"
-            warn "so proxy obfuscation breaks packet classification and compatibility."
-            warn "Please downgrade the interface to AWG 2.0 via 'amneziawg-install.sh --disable-awg3'."
+            die "amneziawg-proxy is compatible ONLY with AmneziaWG 2.0.
+AWG 3.0+ uses S1-S4 padding as key material for header encryption,
+so proxy obfuscation breaks packet classification and compatibility.
+Please downgrade the interface to AWG 2.0 via 'amneziawg-install.sh --disable-awg3'."
         fi
     fi
 

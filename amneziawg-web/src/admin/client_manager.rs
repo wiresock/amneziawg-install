@@ -230,6 +230,7 @@ impl From<script_bridge::ScriptError> for RemoveClientError {
 pub enum AwgProtocolVersion {
     V2,
     V3,
+    V31,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +262,8 @@ pub struct ServerParams {
     pub rekey_timeout: String,
     pub reject_after_time: String,
     pub keepalive_timeout: String,
+    pub random_trailers: String,
+    pub disable_cookies: String,
 }
 
 fn validate_awg3_range(name: &str, value: &str) -> Result<(), CreateClientError> {
@@ -353,6 +356,36 @@ fn validate_awg3_params(params: &ServerParams) -> Result<(), CreateClientError> 
     Ok(())
 }
 
+fn normalize_awg_on_off(name: &str, value: &str) -> Result<String, CreateClientError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok("on".to_string()),
+        "off" | "false" | "no" | "0" => Ok("off".to_string()),
+        _ => Err(CreateClientError::ParamsRead(format!(
+            "{name} must be on or off"
+        ))),
+    }
+}
+
+fn validate_awg31_params(params: &ServerParams) -> Result<(String, String), CreateClientError> {
+    validate_awg3_params(params)?;
+    Ok((
+        normalize_awg_on_off("RandomTrailers", &params.random_trailers)?,
+        normalize_awg_on_off("DisableCookies", &params.disable_cookies)?,
+    ))
+}
+
+/// AWG 3.0 params must not retain 3.1-only keys. The installer treats that as
+/// inconsistent protocol state and repairs it; generating clients from it would
+/// disagree with CLI fail-closed checks.
+fn reject_dormant_awg31_params(params: &ServerParams) -> Result<(), CreateClientError> {
+    if params.random_trailers.is_empty() && params.disable_cookies.is_empty() {
+        return Ok(());
+    }
+    Err(CreateClientError::ParamsRead(
+        "AWG 3.0 params must not contain AWG_RANDOM_TRAILERS or AWG_DISABLE_COOKIES".to_string(),
+    ))
+}
+
 /// Parse params file content (KEY='VALUE' format) into [`ServerParams`].
 ///
 /// The format is produced by `serializeParams()` in the install script,
@@ -404,6 +437,7 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
     let protocol_version = match get_opt("AWG_PROTOCOL_VERSION").as_str() {
         "" | "2" | "2.0" => AwgProtocolVersion::V2,
         "3" | "3.0" => AwgProtocolVersion::V3,
+        "3.1" => AwgProtocolVersion::V31,
         value => {
             return Err(CreateClientError::ParamsRead(format!(
                 "unsupported AWG protocol version: {value}"
@@ -411,7 +445,7 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
         }
     };
 
-    let params = ServerParams {
+    let mut params = ServerParams {
         server_pub_ip: get("SERVER_PUB_IP")?,
         server_awg_nic: get("SERVER_AWG_NIC")?,
         server_awg_ipv4: get("SERVER_AWG_IPV4")?,
@@ -439,6 +473,8 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
         rekey_timeout: get_opt("AWG_REKEY_TIMEOUT"),
         reject_after_time: get_opt("AWG_REJECT_AFTER_TIME"),
         keepalive_timeout: get_opt("AWG_KEEPALIVE_TIMEOUT"),
+        random_trailers: get_opt("AWG_RANDOM_TRAILERS"),
+        disable_cookies: get_opt("AWG_DISABLE_COOKIES"),
     };
 
     // Validate server_awg_nic: must be a safe interface name (alphanumeric,
@@ -446,8 +482,17 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
     // This prevents path-traversal when constructing filesystem paths and
     // option-injection when the name is passed as a command argument.
     validate_interface_name(&params.server_awg_nic)?;
-    if params.protocol_version == AwgProtocolVersion::V3 {
-        validate_awg3_params(&params)?;
+    match params.protocol_version {
+        AwgProtocolVersion::V2 => {}
+        AwgProtocolVersion::V3 => {
+            validate_awg3_params(&params)?;
+            reject_dormant_awg31_params(&params)?;
+        }
+        AwgProtocolVersion::V31 => {
+            let (random_trailers, disable_cookies) = validate_awg31_params(&params)?;
+            params.random_trailers = random_trailers;
+            params.disable_cookies = disable_cookies;
+        }
     }
 
     Ok(params)
@@ -997,9 +1042,18 @@ fn build_client_config(
         prepare_client_allowed_ips(&params.allowed_ips, client_ipv6_display.is_some())?;
     let protocol_fields = match params.protocol_version {
         AwgProtocolVersion::V2 => String::new(),
-        AwgProtocolVersion::V3 => {
-            validate_awg3_params(params)?;
-            [
+        AwgProtocolVersion::V3 | AwgProtocolVersion::V31 => {
+            let extra_31 = if params.protocol_version == AwgProtocolVersion::V31 {
+                let (random_trailers, disable_cookies) = validate_awg31_params(params)?;
+                vec![
+                    format!("RandomTrailers = {random_trailers}"),
+                    format!("DisableCookies = {disable_cookies}"),
+                ]
+            } else {
+                validate_awg3_params(params)?;
+                Vec::new()
+            };
+            let mut fields = [
                 Some(format!(
                     "HeaderProtectionKey = {}",
                     params.header_protection_key
@@ -1021,8 +1075,9 @@ fn build_client_config(
             ]
             .into_iter()
             .flatten()
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect::<Vec<_>>();
+            fields.extend(extra_31);
+            fields.join("\n")
         }
     };
 
@@ -1847,6 +1902,95 @@ SERVER_AWG_H4='4'
         let params = parse_params(&content).unwrap();
         assert_eq!(params.protocol_version, AwgProtocolVersion::V3);
         assert_eq!(params.rekey_timeout, "3-7");
+
+        let awg31 = format!("{content}AWG_RANDOM_TRAILERS='on'\nAWG_DISABLE_COOKIES='off'\n")
+            .replace("AWG_PROTOCOL_VERSION='3'", "AWG_PROTOCOL_VERSION='3.1'");
+        let params31 = parse_params(&awg31).unwrap();
+        assert_eq!(params31.protocol_version, AwgProtocolVersion::V31);
+        assert_eq!(params31.random_trailers, "on");
+        assert_eq!(params31.disable_cookies, "off");
+        assert!(parse_params(
+            &content.replace("AWG_PROTOCOL_VERSION='3'", "AWG_PROTOCOL_VERSION='3.1'")
+        )
+        .is_err());
+        assert!(
+            parse_params(&format!(
+                "{content}AWG_RANDOM_TRAILERS='on'\nAWG_DISABLE_COOKIES='off'\n"
+            ))
+            .is_err(),
+            "AWG 3.0 params must reject dormant AWG 3.1 keys"
+        );
+        assert!(
+            parse_params(&format!(
+                "{content}AWG_RANDOM_TRAILERS=''\nAWG_DISABLE_COOKIES=''\n"
+            ))
+            .is_ok(),
+            "empty serialized AWG 3.1 keys remain valid in AWG 3.0"
+        );
+    }
+
+    #[test]
+    fn parse_params_normalizes_awg31_boolean_aliases() {
+        let base = "\
+SERVER_PUB_IP='203.0.113.42'
+SERVER_AWG_NIC='awg0'
+SERVER_AWG_IPV4='10.66.66.1'
+SERVER_AWG_IPV6='fd42:42:42::1'
+SERVER_PORT='51820'
+SERVER_PUB_KEY='PUBLIC_KEY='
+CLIENT_DNS_1='1.1.1.1'
+ALLOWED_IPS='0.0.0.0/0'
+SERVER_AWG_JC='8'
+SERVER_AWG_JMIN='50'
+SERVER_AWG_JMAX='1000'
+SERVER_AWG_S1='107'
+SERVER_AWG_S2='105'
+SERVER_AWG_S3='62'
+SERVER_AWG_S4='95'
+SERVER_AWG_H1='1'
+SERVER_AWG_H2='2'
+SERVER_AWG_H3='3'
+SERVER_AWG_H4='4'
+AWG_PROTOCOL_VERSION='3.1'
+AWG_HEADER_PROTECTION_KEY='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+AWG_CONTENT_PADDING_ADDITION='10-100'
+AWG_REKEY_AFTER_TIME='100-120'
+AWG_REKEY_TIMEOUT='3-7'
+AWG_REJECT_AFTER_TIME='150-180'
+AWG_KEEPALIVE_TIMEOUT='5-15'
+";
+        let parse = |trailers: &str, cookies: &str| {
+            parse_params(&format!(
+                "{base}AWG_RANDOM_TRAILERS='{trailers}'\nAWG_DISABLE_COOKIES='{cookies}'\n"
+            ))
+        };
+        let params = parse("1", "true").unwrap();
+        assert_eq!(params.random_trailers, "on");
+        assert_eq!(params.disable_cookies, "on");
+        let params = parse("yes", "TRUE").unwrap();
+        assert_eq!(params.random_trailers, "on");
+        assert_eq!(params.disable_cookies, "on");
+        let params = parse(" ON ", " False ").unwrap();
+        assert_eq!(params.random_trailers, "on");
+        assert_eq!(params.disable_cookies, "off");
+        let params = parse(" 1 ", " 0 ").unwrap();
+        assert_eq!(params.random_trailers, "on");
+        assert_eq!(params.disable_cookies, "off");
+        let params = parse("YES", "no").unwrap();
+        assert_eq!(params.random_trailers, "on");
+        assert_eq!(params.disable_cookies, "off");
+        assert!(
+            parse("maybe", "off").is_err(),
+            "invalid RandomTrailers aliases remain rejected"
+        );
+        assert!(
+            parse("on", "perhaps").is_err(),
+            "invalid DisableCookies aliases remain rejected"
+        );
+        assert!(
+            parse("on extra", "off").is_err(),
+            "internal whitespace in RandomTrailers remains rejected"
+        );
     }
 
     #[test]
@@ -2292,6 +2436,8 @@ AllowedIPs = 10.66.66.2/32
             rekey_timeout: String::new(),
             reject_after_time: String::new(),
             keepalive_timeout: String::new(),
+            random_trailers: String::new(),
+            disable_cookies: String::new(),
         };
         let config = build_client_config(
             &params,
@@ -2336,6 +2482,44 @@ AllowedIPs = 10.66.66.2/32
             .contains("HeaderProtectionKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
         assert!(awg3_config.contains("ContentPaddingAddition = 10-100"));
         assert!(awg3_config.contains("KeepaliveTimeout = 5-15"));
+        assert!(!awg3_config.contains("RandomTrailers"));
+        assert!(!awg3_config.contains("DisableCookies"));
+
+        let mut awg31_params = awg3_params.clone();
+        awg31_params.protocol_version = AwgProtocolVersion::V31;
+        awg31_params.random_trailers = "ON".into();
+        awg31_params.disable_cookies = "0".into();
+        let awg31_config = build_client_config(
+            &awg31_params,
+            "PRIV_KEY=",
+            "10.66.66.2",
+            Some("fd42:42:42::2"),
+            "PSK_KEY=",
+            "1.1.1.1,1.0.0.1",
+            "1.2.3.4:51820",
+        )
+        .unwrap();
+        assert!(awg31_config.contains("RandomTrailers = on"));
+        assert!(awg31_config.contains("DisableCookies = off"));
+        assert!(awg31_config
+            .contains("HeaderProtectionKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+
+        awg31_params.random_trailers = "off".into();
+        awg31_params.disable_cookies = "on".into();
+        let mixed = build_client_config(
+            &awg31_params,
+            "PRIV_KEY=",
+            "10.66.66.2",
+            Some("fd42:42:42::2"),
+            "PSK_KEY=",
+            "1.1.1.1,1.0.0.1",
+            "1.2.3.4:51820",
+        )
+        .unwrap();
+        assert!(mixed.contains("RandomTrailers = off"));
+        assert!(mixed.contains("DisableCookies = on"));
+        assert_eq!(mixed.matches("RandomTrailers =").count(), 1);
+        assert_eq!(mixed.matches("DisableCookies =").count(), 1);
     }
 
     #[test]
@@ -2368,6 +2552,8 @@ AllowedIPs = 10.66.66.2/32
             rekey_timeout: String::new(),
             reject_after_time: String::new(),
             keepalive_timeout: String::new(),
+            random_trailers: String::new(),
+            disable_cookies: String::new(),
         };
         let config = build_client_config(
             &params,
@@ -2416,6 +2602,8 @@ AllowedIPs = 10.66.66.2/32
             rekey_timeout: String::new(),
             reject_after_time: String::new(),
             keepalive_timeout: String::new(),
+            random_trailers: String::new(),
+            disable_cookies: String::new(),
         };
 
         let err = build_client_config(

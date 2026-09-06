@@ -476,11 +476,11 @@ if [[ -f "${SERVER_CONF}" ]]; then
 			FAILED=$((FAILED + 1))
 		fi
 	done
-	if grep -Eq '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout) = ' "${SERVER_CONF}"; then
-		echo "  FAIL: Fresh AWG 2.0 server config contains AWG 3.0-only fields"
+	if grep -Eq '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|RandomTrailers|DisableCookies) = ' "${SERVER_CONF}"; then
+		echo "  FAIL: Fresh AWG 2.0 server config contains AWG 3.x-only fields"
 		FAILED=$((FAILED + 1))
 	else
-		echo "  OK: Fresh AWG 2.0 server config omits AWG 3.0-only fields"
+		echo "  OK: Fresh AWG 2.0 server config omits AWG 3.x-only fields"
 	fi
 
 	# Verify the native nftables firewall rules were generated (issue #79).
@@ -562,11 +562,11 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 			FAILED=$((FAILED + 1))
 		fi
 	done
-	if grep -Eq '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout) = ' "${CLIENT_CONF}"; then
-		echo "  FAIL: Fresh AWG 2.0 client config contains AWG 3.0-only fields"
+	if grep -Eq '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|RandomTrailers|DisableCookies) = ' "${CLIENT_CONF}"; then
+		echo "  FAIL: Fresh AWG 2.0 client config contains AWG 3.x-only fields"
 		FAILED=$((FAILED + 1))
 	else
-		echo "  OK: Fresh AWG 2.0 client config omits AWG 3.0-only fields"
+		echo "  OK: Fresh AWG 2.0 client config omits AWG 3.x-only fields"
 	fi
 
 	# Verify Address line contains both a valid IPv4/32 and IPv6/128 entry
@@ -2298,6 +2298,19 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 		echo "FAIL: Privileged helper did not expose AWG 3.0 protocol state"
 		FAILED=$((FAILED + 1))
 	fi
+	printf '%s\n' \
+		"AWG_PROTOCOL_VERSION='3.1'" \
+		"AWG_RANDOM_TRAILERS='on'" \
+		"AWG_DISABLE_COOKIES='off'" >> /etc/amnezia/amneziawg/params
+	if [[ "$("${PRIVILEGED_HELPER}" protocol-status)" == "3.1" ]] && \
+		"${PRIVILEGED_HELPER}" read-params > "${PARAMS_ACTUAL}" && \
+		grep -Fqx "AWG_RANDOM_TRAILERS='on'" "${PARAMS_ACTUAL}" && \
+		grep -Fqx "AWG_DISABLE_COOKIES='off'" "${PARAMS_ACTUAL}"; then
+		echo "OK: Privileged helper exposes validated AWG 3.1 client-generation state"
+	else
+		echo "FAIL: Privileged helper did not expose AWG 3.1 protocol state"
+		FAILED=$((FAILED + 1))
+	fi
 	cp -p "${HELPER_PARAMS_BACKUP}" /etc/amnezia/amneziawg/params
 	rm -f "${HELPER_PARAMS_BACKUP}"
 
@@ -2315,9 +2328,11 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	rm -f "${HELPER_PROTOCOL_CALLS}"
 	HELPER_PROTOCOL_DISPATCH_OK=0
 	if "${PRIVILEGED_HELPER}" enable-awg3 && \
+		"${PRIVILEGED_HELPER}" enable-awg31 && \
 		"${PRIVILEGED_HELPER}" disable-awg3 && \
 		[[ "$(sed -n '1p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg3" ]] && \
-		[[ "$(sed -n '2p' "${HELPER_PROTOCOL_CALLS}")" == "--disable-awg3" ]]; then
+		[[ "$(sed -n '2p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg31" ]] && \
+		[[ "$(sed -n '3p' "${HELPER_PROTOCOL_CALLS}")" == "--disable-awg3" ]]; then
 		HELPER_PROTOCOL_DISPATCH_OK=1
 	fi
 
@@ -2336,7 +2351,7 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	if grep -Fqx "EnvironmentFile=${HELPER_CUSTOM_ENV_ROOT}/env.conf" \
 			/etc/systemd/system/amneziawg-web.service && \
 		"${PRIVILEGED_HELPER}" enable-awg3 && \
-		[[ "$(sed -n '3p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg3" ]]; then
+		[[ "$(sed -n '4p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg3" ]]; then
 		HELPER_CUSTOM_ENV_OK=1
 	fi
 	chmod 0777 "${HELPER_CUSTOM_ENV_ROOT}"
@@ -2394,6 +2409,7 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	"${PRIVILEGED_HELPER}" read-params extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" protocol-status extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" enable-awg3 extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" enable-awg31 extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" read-server-state ../etc >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" remove-client-if-key "${HELPER_TEST_INTERFACE}" alice invalid-key \
 		>/dev/null 2>&1 && HELPER_REJECTION_FAILED=1

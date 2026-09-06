@@ -2343,7 +2343,10 @@ mod tests {
             .expect("list events before");
         assert_eq!(events_before.len(), 1);
         assert_eq!(events_before[0].peer_id, Some(id));
-        assert_eq!(events_before[0].target_key.as_deref(), Some("KEY_WITH_EVENTS="));
+        assert_eq!(
+            events_before[0].target_key.as_deref(),
+            Some("KEY_WITH_EVENTS=")
+        );
 
         // delete_stale_peers should succeed without foreign key constraint error
         let active: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2360,7 +2363,10 @@ mod tests {
             .expect("list all events after cleanup");
         assert_eq!(all_events.len(), 1);
         assert_eq!(all_events[0].peer_id, None);
-        assert_eq!(all_events[0].target_key.as_deref(), Some("KEY_WITH_EVENTS="));
+        assert_eq!(
+            all_events[0].target_key.as_deref(),
+            Some("KEY_WITH_EVENTS=")
+        );
         assert_eq!(all_events[0].action, crate::db::events::EVT_PEER_UPDATED);
         assert_eq!(all_events[0].actor, "admin");
     }

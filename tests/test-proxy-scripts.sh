@@ -546,6 +546,28 @@ assert_rc 1 run_validate_config "invalid" "false" "false"
 assert_rc 1 run_validate_config "udp"     "false" "false"
 assert_rc 1 run_validate_config ""        "false" "false"
 
+# ── awg_protocol_is_proxy_compatible ──────────────────────────────────────────
+
+echo "=== awg_protocol_is_proxy_compatible ==="
+_proxy_proto() { run_install_helper awg_protocol_is_proxy_compatible "$@"; }
+# Legacy missing/empty protocol state and AWG 2.0 aliases are allowed.
+assert_rc 0 _proxy_proto ""
+assert_rc 0 _proxy_proto "2"
+assert_rc 0 _proxy_proto "2.0"
+assert_rc 0 _proxy_proto " 2.0 "
+# AWG 3.x and later generations must fail closed.
+assert_rc 1 _proxy_proto "3"
+assert_rc 1 _proxy_proto "3.0"
+assert_rc 1 _proxy_proto "3.1"
+assert_rc 1 _proxy_proto "3.2"
+assert_rc 1 _proxy_proto "4"
+assert_rc 1 _proxy_proto "4.0"
+# Malformed or unknown protocol state must not be treated as compatible.
+assert_rc 1 _proxy_proto "foo"
+assert_rc 1 _proxy_proto "2.1"
+assert_rc 1 _proxy_proto "30"
+assert_rc 1 _proxy_proto "3.1-rc"
+
 # ── _validate_dns_upstream ────────────────────────────────────────────────────
 
 echo "=== _validate_dns_upstream ==="

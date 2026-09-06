@@ -301,7 +301,8 @@ pub fn read_params_via_sudo() -> Result<String, AwgError> {
 
 /// Read the persisted AWG protocol mode. Missing state is normalized by the
 /// privileged helper to version 2 for compatibility with existing installs.
-pub fn protocol_status_via_sudo() -> Result<u8, AwgError> {
+/// Returns a display string: `2.0`, `3.0`, or `3.1`.
+pub fn protocol_status_via_sudo() -> Result<String, AwgError> {
     let output = Command::new(SUDO_BIN)
         .args(["-n", PRIVILEGED_HELPER_BIN, "protocol-status"])
         .output()?;
@@ -314,8 +315,9 @@ pub fn protocol_status_via_sudo() -> Result<u8, AwgError> {
         });
     }
     match String::from_utf8_lossy(&output.stdout).trim() {
-        "2" => Ok(2),
-        "3" => Ok(3),
+        "2" => Ok("2.0".to_string()),
+        "3" => Ok("3.0".to_string()),
+        "3.1" => Ok("3.1".to_string()),
         value => Err(AwgError::Parse(format!(
             "privileged helper returned unsupported protocol version: {value}"
         ))),
@@ -324,12 +326,15 @@ pub fn protocol_status_via_sudo() -> Result<u8, AwgError> {
 
 /// Explicitly migrate the server and all recoverable clients to one protocol
 /// mode through the root-owned helper and install script transaction.
-pub fn set_protocol_mode_via_sudo(enable_awg3: bool) -> Result<(), AwgError> {
-    let operation = if enable_awg3 {
-        "enable-awg3"
-    } else {
-        "disable-awg3"
-    };
+pub fn set_protocol_mode_via_sudo(operation: &str) -> Result<(), AwgError> {
+    match operation {
+        "enable-awg3" | "enable-awg31" | "disable-awg3" => {}
+        _ => {
+            return Err(AwgError::Parse(format!(
+                "unsupported protocol operation: {operation}"
+            )))
+        }
+    }
     let output = Command::new(SUDO_BIN)
         .args(["-n", PRIVILEGED_HELPER_BIN, operation])
         .output()?;
@@ -932,7 +937,12 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
 
     #[test]
     fn protocol_commands_use_privileged_helper() {
-        for operation in ["protocol-status", "enable-awg3", "disable-awg3"] {
+        for operation in [
+            "protocol-status",
+            "enable-awg3",
+            "enable-awg31",
+            "disable-awg3",
+        ] {
             let mut cmd = Command::new(SUDO_BIN);
             cmd.args(["-n", PRIVILEGED_HELPER_BIN, operation]);
             let args: Vec<_> = cmd

@@ -1204,6 +1204,7 @@ pub fn router_with_lifecycle_lock_dir(
         .route("/admin/peers/:id/archive", post(post_archive_peer_form))
         .route("/admin/peers/:id/restore", post(post_restore_peer_form))
         .route("/admin/protocol/enable-awg3", post(post_enable_awg3_form))
+        .route("/admin/protocol/enable-awg31", post(post_enable_awg31_form))
         .route("/admin/protocol/disable-awg3", post(post_disable_awg3_form))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
@@ -2698,6 +2699,7 @@ const CREATE_NOTICE_METADATA_NOT_PERSISTED: &str = "metadata_not_persisted";
 const CREATE_NOTICE_SYNC_AND_METADATA: &str = "sync_and_metadata";
 const PEER_NOTICE_ARCHIVED: &str = "peer_archived";
 const PROTOCOL_NOTICE_AWG3_ENABLED: &str = "awg3_enabled";
+const PROTOCOL_NOTICE_AWG31_ENABLED: &str = "awg31_enabled";
 const PROTOCOL_NOTICE_AWG2_ENABLED: &str = "awg2_enabled";
 const PROTOCOL_NOTICE_FAILED: &str = "protocol_failed";
 
@@ -2750,6 +2752,9 @@ fn protocol_notice_message(code: &str) -> Option<&'static str> {
         PROTOCOL_NOTICE_AWG3_ENABLED => Some(
             "AWG 3.0 is active. Redistribute every regenerated client config before reconnecting clients.",
         ),
+        PROTOCOL_NOTICE_AWG31_ENABLED => Some(
+            "AWG 3.1 is active. Redistribute every regenerated client config before reconnecting clients.",
+        ),
         PROTOCOL_NOTICE_AWG2_ENABLED => Some(
             "The interface and all recoverable client configs were returned to AWG 2.0.",
         ),
@@ -2760,20 +2765,25 @@ fn protocol_notice_message(code: &str) -> Option<&'static str> {
     }
 }
 
+fn protocol_operation_notice(operation: &str) -> (&'static str, &'static str) {
+    match operation {
+        "enable-awg3" => ("3.0", PROTOCOL_NOTICE_AWG3_ENABLED),
+        "enable-awg31" => ("3.1", PROTOCOL_NOTICE_AWG31_ENABLED),
+        _ => ("2.0", PROTOCOL_NOTICE_AWG2_ENABLED),
+    }
+}
+
 /// `GET /api/admin/protocol` – report the normalized interface protocol mode.
 async fn api_protocol_status() -> Result<Response, ApiError> {
     let version = tokio::task::spawn_blocking(crate::awg::protocol_status_via_sudo).await??;
-    Ok(Json(ProtocolStatusDto {
-        version: format!("{version}.0"),
-    })
-    .into_response())
+    Ok(Json(ProtocolStatusDto { version }).into_response())
 }
 
 async fn post_protocol_change(
     state: &AppState,
     headers: &HeaderMap,
     form: ProtocolChangeForm,
-    enable_awg3: bool,
+    operation: &'static str,
 ) -> Result<Response, ApiError> {
     if state.auth.enabled {
         let cookie_header = headers
@@ -2797,11 +2807,11 @@ async fn post_protocol_change(
     }
 
     let result =
-        tokio::task::spawn_blocking(move || crate::awg::set_protocol_mode_via_sudo(enable_awg3))
+        tokio::task::spawn_blocking(move || crate::awg::set_protocol_mode_via_sudo(operation))
             .await;
     let notice = match result {
         Ok(Ok(())) => {
-            let version = if enable_awg3 { "3.0" } else { "2.0" };
+            let (version, notice) = protocol_operation_notice(operation);
             let detail = json!({ "version": version }).to_string();
             log_event(
                 &state.db.pool,
@@ -2812,11 +2822,7 @@ async fn post_protocol_change(
                 &state.auth.username,
             )
             .await;
-            if enable_awg3 {
-                PROTOCOL_NOTICE_AWG3_ENABLED
-            } else {
-                PROTOCOL_NOTICE_AWG2_ENABLED
-            }
+            notice
         }
         Ok(Err(error)) => {
             tracing::error!(error = %error, "AWG protocol migration failed");
@@ -2835,7 +2841,15 @@ async fn post_enable_awg3_form(
     headers: HeaderMap,
     Form(form): Form<ProtocolChangeForm>,
 ) -> Result<Response, ApiError> {
-    post_protocol_change(&state, &headers, form, true).await
+    post_protocol_change(&state, &headers, form, "enable-awg3").await
+}
+
+async fn post_enable_awg31_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProtocolChangeForm>,
+) -> Result<Response, ApiError> {
+    post_protocol_change(&state, &headers, form, "enable-awg31").await
 }
 
 async fn post_disable_awg3_form(
@@ -2843,7 +2857,7 @@ async fn post_disable_awg3_form(
     headers: HeaderMap,
     Form(form): Form<ProtocolChangeForm>,
 ) -> Result<Response, ApiError> {
-    post_protocol_change(&state, &headers, form, false).await
+    post_protocol_change(&state, &headers, form, "disable-awg3").await
 }
 
 #[cfg(test)]
@@ -4015,8 +4029,16 @@ fn render_protocol_controls(csrf_token: &str) -> String {
     <button type="submit">Enable AWG 3.0</button>
   </form>
 </section>
+<section id="protocol-enable-awg31">
+  <p class="creation-warning"><strong>AWG 3.1 adds RandomTrailers (must match on every client) on top of AWG 3.0.</strong> DisableCookies defaults to off (it disables Cookie Reply / anti-DoS). To change it, set <code>AWG_DISABLE_COOKIES</code> in the installer params file, then run <code>amneziawg-install.sh --enable-awg31</code> so the same-mode transaction updates the server and every client together. Regenerating clients or editing a generated file alone leaves the live server config stale. Existing AWG 3.0 installs are not upgraded automatically.</p>
+  <form method="POST" action="/admin/protocol/enable-awg31">
+    <input type="hidden" name="csrf_token" value="{csrf}">
+    <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
+    <button type="submit">Enable AWG 3.1</button>
+  </form>
+</section>
 <section id="protocol-disable-awg3">
-  <p>Downgrade the interface and all recoverable client configs to AWG 2.0. AWG 3.0-only fields and the shared header-protection key are removed.</p>
+  <p>Downgrade the interface and all recoverable client configs to AWG 2.0. AWG 3.x-only fields and the shared header-protection key are removed.</p>
   <form method="POST" action="/admin/protocol/disable-awg3">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
@@ -4027,7 +4049,8 @@ fn render_protocol_controls(csrf_token: &str) -> String {
 <script>
 (function() {{
   var current = document.getElementById('protocol-current');
-  var enable = document.getElementById('protocol-enable-awg3');
+  var enable3 = document.getElementById('protocol-enable-awg3');
+  var enable31 = document.getElementById('protocol-enable-awg31');
   var disable = document.getElementById('protocol-disable-awg3');
   fetch('/api/admin/protocol', {{ credentials: 'same-origin' }})
     .then(function(response) {{
@@ -4036,8 +4059,13 @@ fn render_protocol_controls(csrf_token: &str) -> String {
     }})
     .then(function(data) {{
       current.textContent = 'Current mode: AWG ' + data.version;
-      enable.hidden = data.version === '3.0';
-      disable.hidden = data.version !== '3.0';
+      enable3.hidden = data.version === '3.0';
+      enable31.hidden = data.version === '3.1';
+      disable.hidden = data.version === '2.0';
+      var enable3Btn = enable3.querySelector('button[type="submit"]');
+      if (enable3Btn) {{
+        enable3Btn.textContent = data.version === '3.1' ? 'Switch to AWG 3.0' : 'Enable AWG 3.0';
+      }}
     }})
     .catch(function() {{
       current.textContent = 'Current mode unavailable. No change occurs until a confirmed action succeeds.';
@@ -8167,7 +8195,10 @@ mod tests {
     fn protocol_controls_require_confirmation_and_never_render_key_state() {
         let html = render_protocol_controls("protocol-csrf");
         assert!(html.contains("/admin/protocol/enable-awg3"));
+        assert!(html.contains("/admin/protocol/enable-awg31"));
         assert!(html.contains("/admin/protocol/disable-awg3"));
+        assert!(html.contains("Enable AWG 3.0"));
+        assert!(html.contains("Switch to AWG 3.0"));
         assert!(html.contains("name=\"confirm\" value=\"yes\" required"));
         assert!(html.contains("name=\"csrf_token\" value=\"protocol-csrf\""));
         assert!(html.contains("/api/admin/protocol"));
@@ -8179,6 +8210,7 @@ mod tests {
         let app = test_router(test_db().await);
         for path in [
             "/admin/protocol/enable-awg3",
+            "/admin/protocol/enable-awg31",
             "/admin/protocol/disable-awg3",
         ] {
             let response = app
