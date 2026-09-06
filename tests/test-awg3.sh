@@ -891,8 +891,8 @@ else
 	not_ok "AWG 3.1 fields appear exactly once on server and client configs"
 fi
 
-printf '\nI1 = <b 0x00>\n' >>"${SERVER_AWG_CONF}"
-printf '\nI1 = <b 0x00>\n' >>"${CLIENT_CONF}"
+sed -i '/^\[Peer\]/i I1 = <b 0x00>' "${SERVER_AWG_CONF}"
+sed -i '/^\[Peer\]/i I1 = <b 0x00>' "${CLIENT_CONF}"
 SERVER_PRIV_BEFORE="$(sed -n 's/^PrivateKey = //p' "${CLIENT_CONF}" | head -n1)"
 HASH_BEFORE="$(sha256sum "${SERVER_AWG_CONF}" "${CLIENT_CONF}")"
 if applyAwgProtocolTransaction && \

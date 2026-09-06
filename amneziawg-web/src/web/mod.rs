@@ -2753,7 +2753,7 @@ fn protocol_notice_message(code: &str) -> Option<&'static str> {
             "AWG 3.0 is active. Redistribute every regenerated client config before reconnecting clients.",
         ),
         PROTOCOL_NOTICE_AWG31_ENABLED => Some(
-            "AWG 3.1 is active (RandomTrailers on, DisableCookies off). Redistribute every regenerated client config before reconnecting clients.",
+            "AWG 3.1 is active. Redistribute every regenerated client config before reconnecting clients.",
         ),
         PROTOCOL_NOTICE_AWG2_ENABLED => Some(
             "The interface and all recoverable client configs were returned to AWG 2.0.",
@@ -4030,7 +4030,7 @@ fn render_protocol_controls(csrf_token: &str) -> String {
   </form>
 </section>
 <section id="protocol-enable-awg31">
-  <p class="creation-warning"><strong>AWG 3.1 adds RandomTrailers (must match on every client) on top of AWG 3.0.</strong> DisableCookies stays off unless you change it in the generated configs; it disables Cookie Reply / anti-DoS. Existing AWG 3.0 installs are not upgraded automatically.</p>
+  <p class="creation-warning"><strong>AWG 3.1 adds RandomTrailers (must match on every client) on top of AWG 3.0.</strong> DisableCookies defaults to off (it disables Cookie Reply / anti-DoS). To change it, set <code>AWG_DISABLE_COOKIES</code> in the installer params file and regenerate every client config; editing a generated file alone will not persist. Existing AWG 3.0 installs are not upgraded automatically.</p>
   <form method="POST" action="/admin/protocol/enable-awg31">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
