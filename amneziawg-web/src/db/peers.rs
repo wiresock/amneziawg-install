@@ -400,7 +400,13 @@ pub async fn delete_expired_snapshots(
 
         if let Some(max) = max_batches {
             if batches_run >= max {
-                break true;
+                let has_more: i64 = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM snapshots WHERE captured_at < ?)",
+                )
+                .bind(cutoff_rfc3339)
+                .fetch_one(pool)
+                .await?;
+                break has_more != 0;
             }
         }
 
@@ -1224,6 +1230,33 @@ mod tests {
             .await
             .expect("remaining");
         assert_eq!(remaining.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_exact_batch_multiple_reports_more_remaining_false() {
+        let db = test_db().await;
+        // Insert exactly 6 expired rows (2 batches of 3) and 2 newer rows
+        for i in 1..=6 {
+            let ts = format!("2026-01-{:02}T00:00:00Z", i);
+            insert_snapshot(&db.pool, "KEY_EXACT_B=", &ts).await;
+        }
+        for i in 8..=9 {
+            let ts = format!("2026-01-{:02}T00:00:00Z", i);
+            insert_snapshot(&db.pool, "KEY_EXACT_B=", &ts).await;
+        }
+
+        // Cutoff Jan 07 has exactly 6 expired rows. With batch_size = 3 and max_batches = 2:
+        // deletes exactly 6 rows and reports more_remaining = false because no additional expired rows exist.
+        let res = delete_expired_snapshots(&db.pool, "2026-01-07T00:00:00Z", 3, Some(2))
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 6);
+        assert!(!res.more_remaining);
+
+        let remaining = find_snapshots(&db.pool, "KEY_EXACT_B=", 10)
+            .await
+            .expect("remaining");
+        assert_eq!(remaining.len(), 2);
     }
 
     // ── find_snapshots_since ─────────────────────────────────────────────────
