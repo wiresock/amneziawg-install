@@ -225,10 +225,12 @@ mod tests {
             .execute(&pool)
             .await
             .expect("0001");
-        sqlx::query(include_str!("../../migrations/0002_add_config_metadata.sql"))
-            .execute(&pool)
-            .await
-            .expect("0002");
+        sqlx::query(include_str!(
+            "../../migrations/0002_add_config_metadata.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("0002");
         sqlx::query(include_str!("../../migrations/0003_add_events_peer_id.sql"))
             .execute(&pool)
             .await
@@ -237,26 +239,34 @@ mod tests {
             .execute(&pool)
             .await
             .expect("0004");
-        sqlx::query(include_str!("../../migrations/0005_add_snapshot_composite_index.sql"))
-            .execute(&pool)
-            .await
-            .expect("0005");
-        sqlx::query(include_str!("../../migrations/0006_add_peer_sync_pending.sql"))
-            .execute(&pool)
-            .await
-            .expect("0006");
+        sqlx::query(include_str!(
+            "../../migrations/0005_add_snapshot_composite_index.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("0005");
+        sqlx::query(include_str!(
+            "../../migrations/0006_add_peer_sync_pending.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("0006");
         sqlx::query(include_str!("../../migrations/0007_add_peer_archived.sql"))
             .execute(&pool)
             .await
             .expect("0007");
-        sqlx::query(include_str!("../../migrations/0008_add_peer_expiration.sql"))
-            .execute(&pool)
-            .await
-            .expect("0008");
-        sqlx::query(include_str!("../../migrations/0009_add_peer_removal_pending.sql"))
-            .execute(&pool)
-            .await
-            .expect("0009");
+        sqlx::query(include_str!(
+            "../../migrations/0008_add_peer_expiration.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("0008");
+        sqlx::query(include_str!(
+            "../../migrations/0009_add_peer_removal_pending.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("0009");
 
         // Insert peer and event under pre-0010 schema
         sqlx::query("INSERT INTO peers (id, public_key, allowed_ips) VALUES (42, 'MIGRATE_KEY=', '10.0.0.1/32')")
@@ -269,14 +279,16 @@ mod tests {
             .expect("insert event");
 
         // Now run migration 0010
-        sqlx::query(include_str!("../../migrations/0010_events_peer_id_on_delete_set_null.sql"))
-            .execute(&pool)
-            .await
-            .expect("0010");
+        sqlx::query(include_str!(
+            "../../migrations/0010_events_peer_id_on_delete_set_null.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("0010");
 
         // Verify data was preserved after 0010
         let event_row: (i64, Option<i64>, Option<String>) = sqlx::query_as(
-            "SELECT id, peer_id, target_key FROM events WHERE target_key = 'MIGRATE_KEY='"
+            "SELECT id, peer_id, target_key FROM events WHERE target_key = 'MIGRATE_KEY='",
         )
         .fetch_one(&pool)
         .await
@@ -291,7 +303,7 @@ mod tests {
             .expect("delete peer");
 
         let event_after: (Option<i64>, Option<String>) = sqlx::query_as(
-            "SELECT peer_id, target_key FROM events WHERE target_key = 'MIGRATE_KEY='"
+            "SELECT peer_id, target_key FROM events WHERE target_key = 'MIGRATE_KEY='",
         )
         .fetch_one(&pool)
         .await

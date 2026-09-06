@@ -817,6 +817,37 @@ if validateAwg31Params >/dev/null 2>&1; then
 else
 	not_ok "canonical AWG 3.1 on/off values are accepted"
 fi
+assert_eq "on" "$(normalizeAwgOnOff RandomTrailers ' on ')" \
+	"normalizeAwgOnOff trims and accepts ' on '"
+assert_eq "off" "$(normalizeAwgOnOff RandomTrailers ' off ')" \
+	"normalizeAwgOnOff trims and accepts ' off '"
+assert_eq "on" "$(normalizeAwgOnOff DisableCookies ' true ')" \
+	"normalizeAwgOnOff trims and accepts ' true '"
+assert_eq "on" "$(normalizeAwgOnOff RandomTrailers ' 1 ')" \
+	"normalizeAwgOnOff trims and accepts ' 1 '"
+assert_eq "on" "$(normalizeAwgOnOff RandomTrailers ' YES ')" \
+	"normalizeAwgOnOff trims mixed-case aliases"
+assert_eq "off" "$(normalizeAwgOnOff DisableCookies ' FALSE ')" \
+	"normalizeAwgOnOff trims mixed-case off aliases"
+if normalizeAwgOnOff RandomTrailers ' maybe ' >/dev/null 2>&1; then
+	not_ok "normalizeAwgOnOff rejects invalid values after trimming"
+else
+	ok "normalizeAwgOnOff rejects invalid values after trimming"
+fi
+if normalizeAwgOnOff RandomTrailers 'on extra' >/dev/null 2>&1; then
+	not_ok "normalizeAwgOnOff rejects internal whitespace"
+else
+	ok "normalizeAwgOnOff rejects internal whitespace"
+fi
+AWG_RANDOM_TRAILERS=" 1 "
+AWG_DISABLE_COOKIES=" FALSE "
+if validateAwg31Params >/dev/null 2>&1 && \
+	[[ "${AWG_RANDOM_TRAILERS}" == "on" ]] && \
+	[[ "${AWG_DISABLE_COOKIES}" == "off" ]]; then
+	ok "validateAwg31Params stores canonical on/off after trimming aliases"
+else
+	not_ok "validateAwg31Params stores canonical on/off after trimming aliases"
+fi
 
 : >"${AWG3_TEST_IP_LOG}"
 if probeAwg31Capability "${MOCK_KEY}"; then

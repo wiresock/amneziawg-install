@@ -1558,6 +1558,9 @@ function awgProtocolUses31Fields() {
 function normalizeAwgOnOff() {
 	local NAME="$1"
 	local VALUE="${2:-}"
+	# Trim only leading/trailing whitespace so " on " matches the web parser.
+	VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
+	VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
 	case "${VALUE,,}" in
 		on|true|yes|1)
 			printf 'on\n'
