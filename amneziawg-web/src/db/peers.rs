@@ -348,11 +348,7 @@ pub async fn find_snapshots(
     .await
 }
 
-/// Delete snapshots captured before `cutoff_rfc3339` in bounded batches.
-///
-/// Deleting in batches (e.g. 5,000 rows at a time) prevents long-lived write locks
-/// and excessive memory usage if a large backlog of historical snapshots exists.
-/// Result of a chunked snapshot purge step.
+/// Result of a chunked snapshot purge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteSnapshotsResult {
     /// Total number of snapshot rows deleted during this invocation.
