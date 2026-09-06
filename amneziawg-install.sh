@@ -7080,7 +7080,7 @@ function acquireClientLifecycleLock() {
 
 function releaseClientLifecycleLock() {
 	if [[ -n "${CLIENT_LIFECYCLE_LOCK_FD:-}" ]]; then
-		exec {CLIENT_LIFECYCLE_LOCK_FD}>&- 2>/dev/null || true
+		exec {CLIENT_LIFECYCLE_LOCK_FD}>&- || true
 		CLIENT_LIFECYCLE_LOCK_FD=""
 	fi
 }
