@@ -211,4 +211,92 @@ mod tests {
         // Restore original directory
         std::env::set_current_dir(orig_dir).expect("restore cwd");
     }
+
+    #[tokio::test]
+    async fn migration_0010_preserves_existing_events_and_enables_set_null() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect");
+
+        // Manually execute schemas 0001 through 0009
+        sqlx::query(include_str!("../../migrations/0001_initial.sql"))
+            .execute(&pool)
+            .await
+            .expect("0001");
+        sqlx::query(include_str!("../../migrations/0002_add_config_metadata.sql"))
+            .execute(&pool)
+            .await
+            .expect("0002");
+        sqlx::query(include_str!("../../migrations/0003_add_events_peer_id.sql"))
+            .execute(&pool)
+            .await
+            .expect("0003");
+        sqlx::query(include_str!("../../migrations/0004_add_friendly_name.sql"))
+            .execute(&pool)
+            .await
+            .expect("0004");
+        sqlx::query(include_str!("../../migrations/0005_add_snapshot_composite_index.sql"))
+            .execute(&pool)
+            .await
+            .expect("0005");
+        sqlx::query(include_str!("../../migrations/0006_add_peer_sync_pending.sql"))
+            .execute(&pool)
+            .await
+            .expect("0006");
+        sqlx::query(include_str!("../../migrations/0007_add_peer_archived.sql"))
+            .execute(&pool)
+            .await
+            .expect("0007");
+        sqlx::query(include_str!("../../migrations/0008_add_peer_expiration.sql"))
+            .execute(&pool)
+            .await
+            .expect("0008");
+        sqlx::query(include_str!("../../migrations/0009_add_peer_removal_pending.sql"))
+            .execute(&pool)
+            .await
+            .expect("0009");
+
+        // Insert peer and event under pre-0010 schema
+        sqlx::query("INSERT INTO peers (id, public_key, allowed_ips) VALUES (42, 'MIGRATE_KEY=', '10.0.0.1/32')")
+            .execute(&pool)
+            .await
+            .expect("insert peer");
+        sqlx::query("INSERT INTO events (actor, action, target_key, detail, peer_id) VALUES ('admin', 'peer.created', 'MIGRATE_KEY=', '{\"test\":true}', 42)")
+            .execute(&pool)
+            .await
+            .expect("insert event");
+
+        // Now run migration 0010
+        sqlx::query(include_str!("../../migrations/0010_events_peer_id_on_delete_set_null.sql"))
+            .execute(&pool)
+            .await
+            .expect("0010");
+
+        // Verify data was preserved after 0010
+        let event_row: (i64, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT id, peer_id, target_key FROM events WHERE target_key = 'MIGRATE_KEY='"
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query event");
+        assert_eq!(event_row.1, Some(42));
+        assert_eq!(event_row.2.as_deref(), Some("MIGRATE_KEY="));
+
+        // Delete peer row directly - ON DELETE SET NULL must automatically null peer_id without error!
+        sqlx::query("DELETE FROM peers WHERE id = 42")
+            .execute(&pool)
+            .await
+            .expect("delete peer");
+
+        let event_after: (Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT peer_id, target_key FROM events WHERE target_key = 'MIGRATE_KEY='"
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query event after delete");
+        assert_eq!(event_after.0, None);
+        assert_eq!(event_after.1.as_deref(), Some("MIGRATE_KEY="));
+    }
 }

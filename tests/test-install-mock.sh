@@ -1076,13 +1076,43 @@ cp "${CLIENT1_CONF}" /root/awg0-client-client.conf
 CLIENT1_CONF="/root/awg0-client-client.conf"
 rm -rf "${STALE_HOME}" "${REAL_HOME}"
 
+# --- 2b3: Client config only in web panel directory ---
+echo ""
+echo "--- Client config preserved from web panel directory ---"
+
+# Move client2's home config away, leaving ONLY the copy in WEB_PANEL_CONFIG_DIR
+CLIENT2_HOME_DIR="$(dirname "${CLIENT2_CONF}")"
+mv "${CLIENT2_CONF}" "${CLIENT2_HOME_DIR}/awg0-client-client2.conf.bak"
+CLIENT2_ORIG_PRIV=$(grep -m1 -E "^PrivateKey = " "${WEB_PANEL_CONFIG_DIR}/awg0-client-client2.conf" | sed 's/^PrivateKey = //')
+
+REGEN_PANEL_ONLY_OUTPUT=$(regenerateClients 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+
+if echo "${REGEN_PANEL_ONLY_OUTPUT}" | grep -q "client2.*no existing private key found"; then
+	echo "FAIL: client2 regenerated key despite config existing in WEB_PANEL_CONFIG_DIR"
+	FAILED=$((FAILED + 1))
+else
+	echo "OK: client2 private key preserved from WEB_PANEL_CONFIG_DIR"
+fi
+
+CLIENT2_CURR_PRIV=$(grep -m1 -E "^PrivateKey = " "${WEB_PANEL_CONFIG_DIR}/awg0-client-client2.conf" | sed 's/^PrivateKey = //')
+if [[ "${CLIENT2_CURR_PRIV}" == "${CLIENT2_ORIG_PRIV}" ]]; then
+	echo "OK: client2 private key unchanged in web panel directory"
+else
+	echo "FAIL: client2 private key changed in web panel directory"
+	FAILED=$((FAILED + 1))
+fi
+
+rm -f "${CLIENT2_HOME_DIR}/awg0-client-client2.conf.bak"
+
 # --- 2c: Key regeneration when client config is missing ---
 echo ""
 echo "--- Key regeneration test ---"
 
-# Delete client2's config to force key regeneration on next run
+# Delete client2's config everywhere (home and web panel config dir) to force key regeneration on next run
 rm -f "${CLIENT2_CONF}"
 rm -f "${CLIENT2_CONF}.old" 2>/dev/null
+rm -f "${WEB_PANEL_CONFIG_DIR}/awg0-client-client2.conf"
+rm -f "${WEB_PANEL_CONFIG_DIR}/awg0-client-client2.conf.old" 2>/dev/null
 
 REGEN_OUTPUT2=$(regenerateClients 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
 
