@@ -44,6 +44,7 @@ readonly DEFAULT_AWG_CONFIG_DIR="/etc/amnezia/amneziawg/clients"
 readonly DEFAULT_LISTEN_HOST="127.0.0.1"
 readonly DEFAULT_LISTEN_PORT="8080"
 readonly DEFAULT_POLL_INTERVAL="30"
+readonly DEFAULT_SNAPSHOT_RETENTION_DAYS="30"
 readonly DEFAULT_SESSION_TTL="86400"
 readonly DEFAULT_USERNAME="admin"
 
@@ -86,6 +87,7 @@ AWG_DETECTED_HOME_DIR=""     # set by detect_awg_config_dir when configs are in 
 LISTEN_HOST="${DEFAULT_LISTEN_HOST}"
 LISTEN_PORT="${DEFAULT_LISTEN_PORT}"
 POLL_INTERVAL="${DEFAULT_POLL_INTERVAL}"
+SNAPSHOT_RETENTION_DAYS="${DEFAULT_SNAPSHOT_RETENTION_DAYS}"
 SESSION_TTL="${DEFAULT_SESSION_TTL}"
 USERNAME="${DEFAULT_USERNAME}"
 PASSWORD_HASH=""          # pre-hashed; takes precedence over PASSWORD
@@ -232,6 +234,9 @@ Options:
                             Generate with:
                               python3 -c "import argon2; print(argon2.PasswordHasher().hash('pw'))"
   --poll-interval SECS      Polling interval in seconds (default: ${DEFAULT_POLL_INTERVAL})
+  --snapshot-retention-days DAYS
+                            Retention window for historical traffic snapshots in days
+                            (default: ${DEFAULT_SNAPSHOT_RETENTION_DAYS}, 0 to disable)
   --session-ttl SECS        Session lifetime in seconds (default: ${DEFAULT_SESSION_TTL})
   --no-enable               Do not enable the systemd service at boot
   --no-start                Do not start the systemd service immediately
@@ -294,6 +299,8 @@ parse_args() {
                 PASSWORD_HASH="$2"; shift 2 ;;
             --poll-interval)
                 POLL_INTERVAL="$2"; shift 2 ;;
+            --snapshot-retention-days)
+                SNAPSHOT_RETENTION_DAYS="$2"; shift 2 ;;
             --session-ttl)
                 SESSION_TTL="$2"; shift 2 ;;
             --no-enable)
@@ -685,6 +692,7 @@ EOF
     prompt_default LISTEN_HOST "Bind host" "${LISTEN_HOST}"
     prompt_default LISTEN_PORT "Bind port" "${LISTEN_PORT}"
     prompt_default POLL_INTERVAL "Poll interval (seconds)" "${POLL_INTERVAL}"
+    prompt_default SNAPSHOT_RETENTION_DAYS "Snapshot retention in days (0=unlimited)" "${SNAPSHOT_RETENTION_DAYS}"
     prompt_default USERNAME "Admin username" "${USERNAME}"
 
     # Password: only prompt if no hash was supplied
@@ -1881,6 +1889,7 @@ AWG_WEB_DB=${DATA_DIR}/awg-web.db
 # ── AWG integration ───────────────────────────────────────────────────────────
 AWG_CONFIG_DIR=${AWG_CONFIG_DIR}
 AWG_POLL_INTERVAL=${POLL_INTERVAL}
+AWG_SNAPSHOT_RETENTION_DAYS=${SNAPSHOT_RETENTION_DAYS}
 AWG_PROXY_SESSIONS_FILE=/var/lib/amneziawg-proxy/sessions.json
 ENVEOF
 

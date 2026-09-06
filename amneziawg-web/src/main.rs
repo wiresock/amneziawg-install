@@ -45,6 +45,11 @@ pub struct Config {
     #[arg(long, env = "AWG_POLL_INTERVAL", default_value_t = 30)]
     pub poll_interval: u64,
 
+    /// Maximum age of traffic snapshots to retain in days. Older snapshots are
+    /// periodically purged. Set to 0 to disable retention cleanup.
+    #[arg(long, env = "AWG_SNAPSHOT_RETENTION_DAYS", default_value_t = 30)]
+    pub snapshot_retention_days: u32,
+
     /// Proxy active-session status file written by amneziawg-proxy.
     #[arg(
         long,
@@ -232,11 +237,12 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Background poller --------------------------------------------------
     let config_dir = config.config_dir.clone();
-    let poller = Poller::new_with_lifecycle_lock_dir(
+    let poller = Poller::new_full(
         db.clone(),
         config.poll_interval,
         config.config_dir,
         lifecycle_lock_dir.clone(),
+        config.snapshot_retention_days,
     );
     tokio::spawn(async move {
         poller.run().await;

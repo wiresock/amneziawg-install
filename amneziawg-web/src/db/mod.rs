@@ -6,7 +6,9 @@ pub mod peers;
 use std::str::FromStr;
 
 use anyhow::Context;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
 use sqlx::SqlitePool;
 use tracing::info;
 
@@ -75,20 +77,26 @@ impl Database {
 /// - anything else → treated as a filesystem path with `create_if_missing(true)`
 fn parse_db_options(input: &str) -> anyhow::Result<SqliteConnectOptions> {
     if input == "sqlite::memory:" || input == ":memory:" {
-        return SqliteConnectOptions::from_str("sqlite::memory:").context("parse in-memory url");
+        return SqliteConnectOptions::from_str("sqlite::memory:")
+            .map(|opts| opts.busy_timeout(std::time::Duration::from_secs(5)))
+            .context("parse in-memory url");
     }
 
-    if input.starts_with("sqlite:") {
-        return Ok(SqliteConnectOptions::from_str(input)
+    let opts = if input.starts_with("sqlite:") {
+        SqliteConnectOptions::from_str(input)
             .with_context(|| format!("parse sqlite url: {input}"))?
-            .create_if_missing(true));
-    }
+            .create_if_missing(true)
+    } else {
+        SqliteConnectOptions::new()
+            .filename(input)
+            .create_if_missing(true)
+    };
 
-    // Plain filesystem path – use SqliteConnectOptions::new().filename()
-    // which handles both absolute and relative paths correctly.
-    Ok(SqliteConnectOptions::new()
-        .filename(input)
-        .create_if_missing(true))
+    Ok(opts
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .foreign_keys(true))
 }
 
 #[cfg(test)]
@@ -298,5 +306,34 @@ mod tests {
         .expect("query event after delete");
         assert_eq!(event_after.0, None);
         assert_eq!(event_after.1.as_deref(), Some("MIGRATE_KEY="));
+    }
+
+    #[tokio::test]
+    async fn file_database_configures_wal_and_pragmas() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("wal_test.db");
+        let db = Database::connect(db_path.to_str().unwrap()).await.unwrap();
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+        assert_eq!(busy_timeout, 5000);
+        assert_eq!(synchronous, 1); // 1 = NORMAL
+        assert_eq!(foreign_keys, 1); // 1 = ON
     }
 }

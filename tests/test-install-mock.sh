@@ -1749,7 +1749,7 @@ if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
 fi
 
 # Verify key variables are present in the env file
-for VAR in AUTH_ENABLED AUTH_USERNAME AUTH_PASSWORD_HASH AWG_WEB_LISTEN AWG_WEB_DB AWG_CONFIG_DIR; do
+for VAR in AUTH_ENABLED AUTH_USERNAME AUTH_PASSWORD_HASH AWG_WEB_LISTEN AWG_WEB_DB AWG_CONFIG_DIR AWG_SNAPSHOT_RETENTION_DAYS; do
 	if grep -q "^${VAR}=" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
 		echo "OK: Env file contains ${VAR}"
 	else

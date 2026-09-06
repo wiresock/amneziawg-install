@@ -23,8 +23,11 @@
 //! poller's immediate first cycle at process startup.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicI64;
+use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use chrono::SecondsFormat;
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
@@ -49,6 +52,7 @@ pub(crate) async fn acquire_config_mapping_lock() -> MutexGuard<'static, ()> {
     CONFIG_MAPPING_LOCK.lock().await
 }
 
+#[derive(Clone)]
 pub struct Poller {
     db: Database,
     interval: Duration,
@@ -56,6 +60,10 @@ pub struct Poller {
     config_dir: PathBuf,
     /// Persistent directory whose descriptor serializes client lifecycle work.
     lifecycle_lock_dir: PathBuf,
+    /// Maximum age of snapshots in days before cleanup (0 = disabled).
+    snapshot_retention_days: u32,
+    /// Epoch timestamp of the last executed snapshot retention cleanup.
+    last_retention_cleanup: Arc<AtomicI64>,
 }
 
 impl Poller {
@@ -64,18 +72,37 @@ impl Poller {
         Self::new_with_lifecycle_lock_dir(db, interval_secs, config_dir.clone(), config_dir)
     }
 
+    #[allow(dead_code)]
     pub fn new_with_lifecycle_lock_dir(
         db: Database,
         interval_secs: u64,
         config_dir: PathBuf,
         lifecycle_lock_dir: PathBuf,
     ) -> Self {
+        Self::new_full(db, interval_secs, config_dir, lifecycle_lock_dir, 30)
+    }
+
+    pub fn new_full(
+        db: Database,
+        interval_secs: u64,
+        config_dir: PathBuf,
+        lifecycle_lock_dir: PathBuf,
+        snapshot_retention_days: u32,
+    ) -> Self {
         Self {
             db,
             interval: Duration::from_secs(interval_secs),
             config_dir,
             lifecycle_lock_dir,
+            snapshot_retention_days,
+            last_retention_cleanup: Arc::new(AtomicI64::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_retention_days(mut self, days: u32) -> Self {
+        self.snapshot_retention_days = days;
+        self
     }
 
     /// Run the polling loop forever.  Uses `tokio::time::interval` so that
@@ -121,6 +148,12 @@ impl Poller {
             }
         }
 
+        // ── Step 0b: Snapshot retention cleanup ──────────────────────────────
+        // Periodically purges historical traffic snapshots older than
+        // `snapshot_retention_days`. Runs bounded chunk deletions to prevent
+        // holding prolonged locks.
+        self.cleanup_expired_snapshots_step().await;
+
         // ── Step 1–3: AWG data ───────────────────────────────────────────────
         let interfaces = match awg::show_all_dump() {
             Ok(ifaces) => ifaces,
@@ -141,35 +174,13 @@ impl Poller {
         );
 
         let now = chrono::Utc::now();
-        let mut snapshots_written: usize = 0;
-
-        for iface in &interfaces {
-            for peer in &iface.peers {
-                match self.store_snapshot(&peer.public_key, peer, now).await {
-                    Ok(true) => snapshots_written += 1,
-                    Ok(false) => {
-                        debug!(
-                            public_key = %peer.public_key,
-                            "snapshot skipped for archived peer"
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            public_key = %peer.public_key,
-                            error = %e,
-                            "failed to write snapshot – continuing"
-                        );
-                    }
-                }
-                if let Err(e) = self.upsert_peer(&peer.public_key, peer).await {
-                    error!(
-                        public_key = %peer.public_key,
-                        error = %e,
-                        "failed to upsert peer – continuing"
-                    );
-                }
+        let snapshots_written = match self.record_poll_batch(&interfaces, now).await {
+            Ok(count) => count,
+            Err(e) => {
+                error!(error = %e, "failed to record poll batch – continuing");
+                0
             }
-        }
+        };
 
         info!(
             snapshots_written,
@@ -336,8 +347,112 @@ impl Poller {
         apply_config_mappings(&self.db, &configs).await
     }
 
-    async fn store_snapshot(
+    /// Purge snapshots older than `snapshot_retention_days` (if configured > 0).
+    ///
+    /// Returns the number of snapshots deleted.
+    pub async fn cleanup_expired_snapshots(&self) -> anyhow::Result<u64> {
+        if self.snapshot_retention_days == 0 {
+            return Ok(0);
+        }
+        let cutoff =
+            chrono::Utc::now() - chrono::Duration::days(self.snapshot_retention_days as i64);
+        let cutoff_str = cutoff.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let deleted =
+            crate::db::peers::delete_expired_snapshots(&self.db.pool, &cutoff_str, 5000).await?;
+        self.last_retention_cleanup.store(
+            chrono::Utc::now().timestamp(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(deleted)
+    }
+
+    async fn cleanup_expired_snapshots_step(&self) {
+        if self.snapshot_retention_days == 0 {
+            return;
+        }
+
+        let now_epoch = chrono::Utc::now().timestamp();
+        let last_epoch = self
+            .last_retention_cleanup
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Run at most once every hour (3600 seconds), and on the first poll cycle
+        if now_epoch - last_epoch < 3600 {
+            return;
+        }
+
+        match self.cleanup_expired_snapshots().await {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    info!(
+                        deleted,
+                        retention_days = self.snapshot_retention_days,
+                        "expired snapshot cleanup complete"
+                    );
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "expired snapshot cleanup failed – continuing");
+            }
+        }
+    }
+
+    async fn record_poll_batch(
         &self,
+        interfaces: &[awg::AwgInterface],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<usize> {
+        let mut tx = self
+            .db
+            .pool
+            .begin()
+            .await
+            .context("begin poll batch transaction")?;
+        let mut snapshots_written = 0;
+
+        for iface in interfaces {
+            for peer in &iface.peers {
+                match self
+                    .store_snapshot_tx(&mut tx, &peer.public_key, peer, now)
+                    .await
+                {
+                    Ok(true) => snapshots_written += 1,
+                    Ok(false) => {
+                        debug!(
+                            public_key = %peer.public_key,
+                            "snapshot skipped for archived peer"
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            public_key = %peer.public_key,
+                            error = %e,
+                            "failed to write snapshot in batch"
+                        );
+                        return Err(e);
+                    }
+                }
+
+                if let Err(e) = self.upsert_peer_tx(&mut tx, &peer.public_key, peer).await {
+                    error!(
+                        public_key = %peer.public_key,
+                        error = %e,
+                        "failed to upsert peer in batch"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+
+        tx.commit()
+            .await
+            .context("commit poll batch transaction")?;
+        Ok(snapshots_written)
+    }
+
+    async fn store_snapshot_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
         public_key: &PublicKey,
         peer: &awg::AwgPeer,
         captured_at: chrono::DateTime<chrono::Utc>,
@@ -345,7 +460,7 @@ impl Poller {
         let endpoint = peer.endpoint.as_deref();
         let last_handshake = peer.last_handshake.map(|ts| ts.timestamp());
         let rx = saturating_u64_to_i64(peer.rx_bytes);
-        let tx = saturating_u64_to_i64(peer.tx_bytes);
+        let tx_bytes = saturating_u64_to_i64(peer.tx_bytes);
         let captured_str = captured_at.to_rfc3339_opts(SecondsFormat::Secs, true);
 
         let result = sqlx::query(
@@ -361,20 +476,40 @@ impl Poller {
         .bind(endpoint)
         .bind(last_handshake)
         .bind(rx)
-        .bind(tx)
+        .bind(tx_bytes)
         .bind(&public_key.0)
-        .execute(&self.db.pool)
+        .execute(tx)
         .await?;
 
         Ok(result.rows_affected() == 1)
     }
 
-    async fn upsert_peer(&self, public_key: &PublicKey, peer: &awg::AwgPeer) -> anyhow::Result<()> {
+    #[cfg(test)]
+    async fn store_snapshot(
+        &self,
+        public_key: &PublicKey,
+        peer: &awg::AwgPeer,
+        captured_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.db.pool.begin().await?;
+        let res = self
+            .store_snapshot_tx(&mut tx, public_key, peer, captured_at)
+            .await?;
+        tx.commit().await?;
+        Ok(res)
+    }
+
+    async fn upsert_peer_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        public_key: &PublicKey,
+        peer: &awg::AwgPeer,
+    ) -> anyhow::Result<()> {
         let endpoint = peer.endpoint.as_deref();
         let allowed_ips = peer.allowed_ips.join(",");
         let last_handshake = peer.last_handshake.map(|ts| ts.timestamp());
         let rx = saturating_u64_to_i64(peer.rx_bytes);
-        let tx = saturating_u64_to_i64(peer.tx_bytes);
+        let tx_bytes = saturating_u64_to_i64(peer.tx_bytes);
 
         sqlx::query(
             "INSERT INTO peers (public_key, endpoint, allowed_ips, last_handshake_at, rx_bytes, tx_bytes) \
@@ -394,10 +529,18 @@ impl Poller {
         .bind(&allowed_ips)
         .bind(last_handshake)
         .bind(rx)
-        .bind(tx)
-        .execute(&self.db.pool)
+        .bind(tx_bytes)
+        .execute(tx)
         .await?;
 
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn upsert_peer(&self, public_key: &PublicKey, peer: &awg::AwgPeer) -> anyhow::Result<()> {
+        let mut tx = self.db.pool.begin().await?;
+        self.upsert_peer_tx(&mut tx, public_key, peer).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -465,13 +608,14 @@ pub async fn sync_peers_from_awg(db: &crate::db::Database) -> anyhow::Result<()>
         }
     };
 
+    let mut tx = db.pool.begin().await.context("begin sync_peers tx")?;
     for iface in &interfaces {
         for peer in &iface.peers {
             let endpoint = peer.endpoint.as_deref();
             let allowed_ips = peer.allowed_ips.join(",");
             let last_handshake = peer.last_handshake.map(|ts| ts.timestamp());
             let rx = saturating_u64_to_i64(peer.rx_bytes);
-            let tx = saturating_u64_to_i64(peer.tx_bytes);
+            let tx_bytes = saturating_u64_to_i64(peer.tx_bytes);
 
             sqlx::query(
                 "INSERT INTO peers (public_key, endpoint, allowed_ips, last_handshake_at, rx_bytes, tx_bytes) \
@@ -490,11 +634,12 @@ pub async fn sync_peers_from_awg(db: &crate::db::Database) -> anyhow::Result<()>
             .bind(&allowed_ips)
             .bind(last_handshake)
             .bind(rx)
-            .bind(tx)
-            .execute(&db.pool)
+            .bind(tx_bytes)
+            .execute(&mut *tx)
             .await?;
         }
     }
+    tx.commit().await.context("commit sync_peers tx")?;
 
     Ok(())
 }
@@ -774,5 +919,247 @@ mod tests {
                 .await
                 .expect("count snapshots");
         assert_eq!(snapshots, 0);
+    }
+
+    #[tokio::test]
+    async fn record_poll_batch_writes_snapshots_and_upserts_peers() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let pk1 = PublicKey("KEY_BATCH_1=".to_string());
+        let pk2 = PublicKey("KEY_BATCH_2=".to_string());
+
+        let peer1 = awg::AwgPeer {
+            public_key: pk1.clone(),
+            endpoint: Some("198.51.100.10:51820".to_string()),
+            allowed_ips: vec!["10.8.0.2/32".to_string()],
+            last_handshake: Some(Utc::now()),
+            rx_bytes: 1000,
+            tx_bytes: 2000,
+        };
+        let peer2 = awg::AwgPeer {
+            public_key: pk2.clone(),
+            endpoint: Some("198.51.100.11:51820".to_string()),
+            allowed_ips: vec!["10.8.0.3/32".to_string()],
+            last_handshake: Some(Utc::now()),
+            rx_bytes: 3000,
+            tx_bytes: 4000,
+        };
+
+        let iface = awg::AwgInterface {
+            name: "awg0".to_string(),
+            public_key: PublicKey("SERVER_PUBKEY=".to_string()),
+            listen_port: Some(51820),
+            peers: vec![peer1, peer2],
+        };
+
+        let poller = Poller::new(db.clone(), 30, PathBuf::from("."));
+        let written = poller
+            .record_poll_batch(&[iface], Utc::now())
+            .await
+            .expect("record batch");
+        assert_eq!(written, 2);
+
+        let row1 = crate::db::peers::find_by_public_key(&db.pool, &pk1.0)
+            .await
+            .expect("find peer1")
+            .expect("peer1 exists");
+        assert_eq!(row1.rx_bytes, 1000);
+        assert_eq!(row1.tx_bytes, 2000);
+
+        let snaps1 = crate::db::peers::find_snapshots(&db.pool, &pk1.0, 10)
+            .await
+            .expect("find snapshots");
+        assert_eq!(snaps1.len(), 1);
+        assert_eq!(snaps1[0].rx_bytes, 1000);
+        assert_eq!(snaps1[0].tx_bytes, 2000);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_snapshots_respects_retention_days() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let pk = "KEY_RETENTION=";
+
+        // Insert older snapshot (40 days ago) and newer snapshot (10 days ago)
+        let old_ts =
+            (Utc::now() - chrono::Duration::days(40)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let new_ts =
+            (Utc::now() - chrono::Duration::days(10)).to_rfc3339_opts(SecondsFormat::Secs, true);
+
+        sqlx::query(
+            "INSERT INTO snapshots (public_key, captured_at, rx_bytes, tx_bytes) VALUES (?, ?, 10, 20)",
+        )
+        .bind(pk)
+        .bind(&old_ts)
+        .execute(&db.pool)
+        .await
+        .expect("insert old snapshot");
+
+        sqlx::query(
+            "INSERT INTO snapshots (public_key, captured_at, rx_bytes, tx_bytes) VALUES (?, ?, 30, 40)",
+        )
+        .bind(pk)
+        .bind(&new_ts)
+        .execute(&db.pool)
+        .await
+        .expect("insert new snapshot");
+
+        // Poller with 30-day retention
+        let poller = Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(30);
+        let deleted = poller.cleanup_expired_snapshots().await.expect("cleanup");
+        assert_eq!(deleted, 1);
+
+        let remaining = crate::db::peers::find_snapshots(&db.pool, pk, 10)
+            .await
+            .expect("find snapshots");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].captured_at, new_ts);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_snapshots_disabled_when_zero() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let pk = "KEY_RETENTION_ZERO=";
+
+        let old_ts =
+            (Utc::now() - chrono::Duration::days(100)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        sqlx::query(
+            "INSERT INTO snapshots (public_key, captured_at, rx_bytes, tx_bytes) VALUES (?, ?, 10, 20)",
+        )
+        .bind(pk)
+        .bind(&old_ts)
+        .execute(&db.pool)
+        .await
+        .expect("insert old snapshot");
+
+        // Poller with retention_days = 0 (disabled)
+        let poller = Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(0);
+        let deleted = poller.cleanup_expired_snapshots().await.expect("cleanup");
+        assert_eq!(deleted, 0);
+
+        let remaining = crate::db::peers::find_snapshots(&db.pool, pk, 10)
+            .await
+            .expect("find snapshots");
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrency_stress_test_file_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("stress_concurrency.db");
+        let db = Database::connect(db_path.to_str().unwrap()).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let peer_count = 30;
+        let mut pks = Vec::new();
+        for i in 0..peer_count {
+            let pk = format!("CONCURRENT_PK_{:03}=", i);
+            sqlx::query("INSERT INTO peers (public_key, allowed_ips) VALUES (?, ?)")
+                .bind(&pk)
+                .bind(format!("10.8.0.{}/32", i + 2))
+                .execute(&db.pool)
+                .await
+                .expect("seed peer");
+            pks.push(pk);
+        }
+
+        let poller = Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(30);
+
+        // Writer task 1: Poller writing batches of snapshots and upserting peers
+        let poller1 = poller.clone();
+        let pks1 = pks.clone();
+        let writer_task = tokio::spawn(async move {
+            for round in 0..15 {
+                let mut peers = Vec::new();
+                for pk in &pks1 {
+                    peers.push(awg::AwgPeer {
+                        public_key: PublicKey(pk.clone()),
+                        endpoint: Some("198.51.100.1:51820".to_string()),
+                        allowed_ips: vec!["10.8.0.2/32".to_string()],
+                        last_handshake: Some(Utc::now()),
+                        rx_bytes: (round + 1) * 1000,
+                        tx_bytes: (round + 1) * 2000,
+                    });
+                }
+                let iface = awg::AwgInterface {
+                    name: "awg0".to_string(),
+                    public_key: PublicKey("SERVER_KEY=".to_string()),
+                    listen_port: Some(51820),
+                    peers,
+                };
+                poller1
+                    .record_poll_batch(&[iface], Utc::now())
+                    .await
+                    .expect("record_poll_batch in writer task");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        // Writer task 2: Snapshot retention cleaner running concurrently
+        let poller2 = poller.clone();
+        let cleaner_task = tokio::spawn(async move {
+            for _ in 0..10 {
+                poller2
+                    .cleanup_expired_snapshots()
+                    .await
+                    .expect("cleanup in cleaner task");
+                tokio::time::sleep(Duration::from_millis(8)).await;
+            }
+        });
+
+        // Reader task 1: API listing visible peers
+        let db_r1 = db.clone();
+        let reader_visible = tokio::spawn(async move {
+            for _ in 0..30 {
+                let peers = crate::db::peers::list_visible(&db_r1.pool)
+                    .await
+                    .expect("list_visible in reader");
+                assert_eq!(peers.len(), peer_count);
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+        });
+
+        // Reader task 2: Traffic history queries
+        let db_r2 = db.clone();
+        let pks2 = pks.clone();
+        let reader_history = tokio::spawn(async move {
+            for _ in 0..30 {
+                for pk in pks2.iter().take(5) {
+                    let _ = crate::db::peers::find_snapshots(&db_r2.pool, pk, 10)
+                        .await
+                        .expect("find_snapshots in reader");
+                }
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+        });
+
+        // Writer task 3: Web handler updating metadata / disabling peers
+        let db_w3 = db.clone();
+        let pks3 = pks.clone();
+        let web_updater = tokio::spawn(async move {
+            for i in 0..15 {
+                let target_pk = &pks3[i % pks3.len()];
+                let row = crate::db::peers::find_by_public_key(&db_w3.pool, target_pk)
+                    .await
+                    .expect("find peer")
+                    .expect("peer exists");
+                let updated = crate::db::peers::update_peer_disabled(&db_w3.pool, row.id, i % 2 == 1)
+                    .await
+                    .expect("update disabled");
+                assert!(updated.is_some());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let (r1, r2, r3, r4, r5) = tokio::join!(
+            writer_task,
+            cleaner_task,
+            reader_visible,
+            reader_history,
+            web_updater
+        );
+        r1.expect("writer task");
+        r2.expect("cleaner task");
+        r3.expect("reader visible task");
+        r4.expect("reader history task");
+        r5.expect("web updater task");
     }
 }
