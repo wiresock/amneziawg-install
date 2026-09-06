@@ -24,7 +24,10 @@
 ## Prerequisites
 
 - Linux host with **systemd** (Debian/Ubuntu/CentOS/Fedora/Arch)
-- **AmneziaWG** already installed and a working `awg0` interface
+- **AmneziaWG 2.0** already installed and a working `awg0` interface.
+  *(**Important:** `amneziawg-proxy` is compatible **only with AmneziaWG 2.0**;
+  it is **not compatible with AmneziaWG 3.0+** because AWG 3.0 uses S1–S4 padding
+  as key material for header encryption).*
 - **Rust toolchain ≥ 1.75** (only needed for a source build; the installer
   can install it automatically via `rustup`)
 - Approximately **1 GiB of free build space** when compiling from source
@@ -299,7 +302,16 @@ quic_certificate_domain = "localhost"
 
 ### AWG config integration
 
-The proxy reads a subset of the `[Interface]` section from the AmneziaWG
+> [!IMPORTANT]
+> **Compatibility limitation: AmneziaWG 2.0 only**
+> The proxy is compatible **only with AmneziaWG 2.0**. It expects standard AWG 2.0
+> parameters (`Jc`, `Jmin`, `Jmax`, `S1`–`S4`, and `H1`–`H4`). Starting with AmneziaWG 3.0,
+> the S1–S4 padding values are used as key material for header encryption (`HeaderProtectionKey`).
+> Modifying them breaks compatibility with AWG 3.0+, and the resulting encrypted headers
+> prevent the proxy from classifying packets. Configurations enabled for AWG 3.0
+> must not be used with `amneziawg-proxy`.
+
+The proxy reads a subset of the `[Interface]` section from the AmneziaWG 2.0
 config file. Only the `[Interface]` section is parsed; `[Peer]` sections and
 unknown keys (e.g. `Address`, `PrivateKey`, `DNS`) are silently ignored.
 
@@ -322,6 +334,9 @@ H2 = 100000005-200000004
 H3 = 200000005-300000004
 H4 = 300000005-400000004
 ```
+
+> **Note:** The above represents an AmneziaWG 2.0 configuration. AWG 3.0+ configurations
+> containing `HeaderProtectionKey` or range-based timer settings are not supported by the proxy.
 
 If `awg_config` is not set in `proxy.toml`, no padding transformation is
 applied and AWG packets are forwarded unmodified.
@@ -595,3 +610,19 @@ sudo setcap CAP_NET_BIND_SERVICE=+eip /usr/local/bin/amneziawg-proxy
 ```
 
 Then update the `User=` in the service unit to a non-root user if desired.
+
+### Incompatibility with AmneziaWG 3.0+ (packets not transformed or probe misbehavior)
+
+`amneziawg-proxy` is **compatible only with AmneziaWG 2.0**.
+
+If the backend server was migrated to AWG 3.0 (e.g. via `sudo ./amneziawg-install.sh --enable-awg3`):
+1. In AWG 3.0, the kernel module encrypts the 4-byte header with `HeaderProtectionKey`, so `classify_awg_packet()` fails to match plaintext headers against H1–H4 and every packet returns as unclassified.
+2. Because packets cannot be classified, `apply_awg_transform()` returns `false`, and outgoing server packets retain their raw S-prefix instead of receiving cover-protocol disguise (DPI sees raw AWG).
+3. Client packets may be routed through probe detection, causing spurious probe responses (such as QUIC Version Negotiation).
+4. S1–S4 padding values are used as key material for header encryption in AWG 3.0. Rewriting them in flight alters the key material and breaks header decryption.
+
+**Resolution:** Return the interface and clients to AWG 2.0:
+```bash
+sudo ./amneziawg-install.sh --disable-awg3
+```
+Redistribute regenerated client configs after the downgrade.

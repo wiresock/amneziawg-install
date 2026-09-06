@@ -6,12 +6,20 @@
 server and makes the traffic look like a legitimate application protocol
 (QUIC, DNS, STUN, or SIP) to defeat Deep Packet Inspection (DPI).
 
+> [!IMPORTANT]
+> **Compatibility: AmneziaWG 2.0 only**
+> `amneziawg-proxy` is compatible **only with AmneziaWG 2.0**. It is **incompatible with AmneziaWG 3.0+**.
+> The proxy's traffic-shaping mechanism relies on rewriting the leading S1–S4 padding prefix.
+> In AWG 3.0+, these padding values are used as key material for header encryption (`HeaderProtectionKey`),
+> so modifying them breaks header decryption. Furthermore, header encryption prevents the proxy
+> from classifying packets against H1–H4 ranges. See [Protocol Compatibility: AmneziaWG 2.0 vs 3.0+](#protocol-compatibility-amneziawg-20-vs-30) below.
+
 It performs two complementary functions:
 
 1. **Probe response** — when a DPI system sends a protocol probe (e.g. a QUIC
    Initial or a DNS query), the proxy generates a valid protocol response so
    the port appears to host the imitated service.
-2. **Padding transformation** — outgoing AmneziaWG packets have their S1–S4
+2. **Padding transformation** — outgoing AmneziaWG 2.0 packets have their S1–S4
    padding prefix (the random bytes prepended before the obfuscated header)
    overwritten with protocol-conformant filler bytes, so the statistical byte
    distribution matches the imitated protocol.
@@ -124,6 +132,12 @@ corresponding H range. This determines the AWG packet type (Handshake Init /
 Response / Cookie Reply / Transport Data). The S-value tells it how many
 leading bytes are the padding prefix. Those bytes are then overwritten with
 protocol-conformant filler (see "Padding Strategies" below).
+
+> **Note:** This mechanism requires **AmneziaWG 2.0**. In AmneziaWG 3.0+,
+> the 4-byte header is encrypted using `HeaderProtectionKey`, and the S1–S4
+> padding prefix serves as key material for that encryption. Modifying the
+> padding prefix corrupts decryption, and the encrypted header prevents
+> matching against H1–H4 ranges.
 
 ---
 
@@ -464,6 +478,35 @@ otherwise → unclassified (no transform applied)
 The S-padding precedes the H header, so the classifier tries each S offset
 to find the header. The H ranges are validated to be non-overlapping during
 config parsing so classification is unambiguous.
+
+### Protocol Compatibility: AmneziaWG 2.0 vs 3.0+
+
+`amneziawg-proxy` is designed specifically for **AmneziaWG 2.0** and is fundamentally incompatible with **AmneziaWG 3.0+**.
+
+#### AmneziaWG 2.0 packet structure
+In AWG 2.0, the wire layout of a packet is:
+```
+[ S-bytes random discard padding ] [ 4-byte header in H range ] [ WireGuard payload ... ]
+```
+- The leading `S` bytes are arbitrary random padding used only to alter packet lengths. The recipient kernel module strips the first `S` bytes and discards them.
+- The 4-byte header is in plaintext (drawn from the per-type range `H1`–`H4`).
+- This allows the proxy to:
+  1. Read the 4 bytes at offset `S` to match against `H1`–`H4` and unambiguously identify the packet type.
+  2. Overwrite the first `S` bytes with cover-protocol headers (QUIC, DNS, STUN, or SIP). When the AWG 2.0 backend or client receives the packet, it skips the first `S` bytes anyway, so replacing the random bytes with cover protocol bytes has zero impact on WireGuard decryption.
+
+#### Why AmneziaWG 3.0+ breaks compatibility
+In AmneziaWG 3.0, header protection is introduced via `HeaderProtectionKey`:
+```
+[ S-bytes padding (used as key material) ] [ 4-byte encrypted header ] [ WireGuard payload ... ]
+```
+This breaks the proxy in two fatal ways:
+1. **Header classification failure:** The 4-byte header following the S-padding is encrypted with the `HeaderProtectionKey`. The proxy's classifier reads ciphertext at offset `S`, which does not match the configured `H1`–`H4` ranges. As a result:
+   - `classify_awg_packet()` returns unclassified for every packet.
+   - `apply_awg_transform()` returns `false`, meaning server-to-client packets are never disguised (sent as raw AWG).
+   - Inbound client packets may trigger probe detection and receive spurious probe responses (e.g., QUIC Version Negotiation).
+2. **Header decryption corruption:** Starting with AWG 3.0, the `S1`–`S4` padding bytes are not mere discard bytes; they are also incorporated as key material for the header encryption cipher. Overwriting the S-padding bytes with cover-protocol data alters the key material, causing header decryption to fail on the receiving side.
+
+Therefore, `amneziawg-proxy` **must only be used with AmneziaWG 2.0**. Interfaces running AWG 3.0 cannot be proxied with `amneziawg-proxy`.
 
 ---
 

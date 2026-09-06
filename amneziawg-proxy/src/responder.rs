@@ -33,8 +33,12 @@ impl fmt::Display for Protocol {
     }
 }
 
-/// AmneziaWG packet type, identified by matching the first 4 bytes (header)
-/// against the H1–H4 ranges from the AWG configuration.
+/// AmneziaWG 2.0 packet type, identified by matching the 4-byte plaintext header
+/// at offset S (following the S1–S4 padding prefix) against the H1–H4 ranges
+/// from the AWG configuration.
+///
+/// Note: This classification requires AmneziaWG 2.0. In AmneziaWG 3.0+, headers
+/// are encrypted with `HeaderProtectionKey`, preventing plaintext matching against H1–H4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AwgPacketType {
     /// Handshake Initiation (WG type 1), padded with S1 bytes.
@@ -79,10 +83,14 @@ impl AwgPacketType {
     }
 }
 
-/// Classify an AmneziaWG packet by checking the H-range header that follows
+/// Classify an AmneziaWG 2.0 packet by checking the H-range header that follows
 /// the S-padding prefix and validating expected packet sizes.
 ///
-/// AmneziaWG prepends S1–S4 random bytes before the obfuscated header, so the
+/// Note: Compatible with AmneziaWG 2.0 only. Starting with AWG 3.0, headers are
+/// encrypted using `HeaderProtectionKey`, so matching against H1–H4 never succeeds
+/// on AWG 3.0 packets.
+///
+/// AmneziaWG 2.0 prepends S1–S4 random bytes before the obfuscated header, so the
 /// header starts at byte offset S for each packet type.  This function tries
 /// each (S-offset, H-range) pair and validates the total packet size matches
 /// expected WireGuard message sizes.

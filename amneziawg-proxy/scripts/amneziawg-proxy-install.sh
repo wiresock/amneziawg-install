@@ -21,6 +21,10 @@
 #      restricted (for example with firewall rules) to avoid unintended exposure
 #   8. Installs and optionally enables the systemd service
 #
+# Note: amneziawg-proxy is compatible ONLY with AmneziaWG 2.0. It is incompatible
+# with AmneziaWG 3.0+ because AWG 3.0 uses S1-S4 padding as key material for
+# header encryption, which is corrupted by proxy padding rewrites.
+#
 # Intended deployment topology when loopback rebinding succeeds:
 #   VPN clients → 0.0.0.0:LISTEN_PORT (proxy) → 127.0.0.1:BACKEND_PORT (AWG)
 #
@@ -120,7 +124,11 @@ AWG_NIC=""
 
 usage() {
     cat <<EOF
-amneziawg-proxy installer
+amneziawg-proxy installer (AmneziaWG 2.0 only)
+
+Note: amneziawg-proxy is compatible ONLY with AmneziaWG 2.0. It is incompatible
+with AmneziaWG 3.0+ because AWG 3.0 uses S1-S4 padding as key material for
+header encryption, which is corrupted by proxy padding rewrites.
 
 Usage:
   $0 [OPTIONS]
@@ -321,9 +329,10 @@ detect_awg_config() {
     # Try to read the params file saved by amneziawg-install.sh
     if validate_params_file "${params_file}"; then
         # Source params in a subshell to avoid polluting current environment.
-        local nic port
+        local nic port proto
         nic="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_AWG_NIC:-}"' _ "${params_file}")"
         port="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_PORT:-}"' _ "${params_file}")"
+        proto="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${AWG_PROTOCOL_VERSION:-2}"' _ "${params_file}")"
 
         if [[ -n "${nic}" ]]; then
             AWG_NIC="${nic}"
@@ -332,6 +341,17 @@ detect_awg_config() {
         if [[ -n "${port}" ]] && [[ -z "${LISTEN_PORT}" ]]; then
             LISTEN_PORT="${port}"
             info "Detected AWG listen port: ${LISTEN_PORT}"
+        fi
+        if [[ "${proto}" == "3" ]]; then
+            if [[ -n "${AWG_NIC}" ]]; then
+                warn "AmneziaWG 3.0 protocol detected on ${AWG_NIC}."
+            else
+                warn "AmneziaWG 3.0 protocol detected."
+            fi
+            warn "amneziawg-proxy is compatible ONLY with AmneziaWG 2.0."
+            warn "AWG 3.0 uses S1-S4 padding as key material for header encryption,"
+            warn "so proxy obfuscation breaks packet classification and compatibility."
+            warn "Please downgrade the interface to AWG 2.0 via 'amneziawg-install.sh --disable-awg3'."
         fi
     fi
 

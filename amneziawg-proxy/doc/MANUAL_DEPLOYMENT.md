@@ -10,9 +10,16 @@ The proxy is deliberately simple:
 - it listens on a public UDP address (`listen`);
 - it forwards valid AmneziaWG traffic to a private backend UDP address
   (`backend`);
-- it can read the AWG server config (`awg_config`) to apply the same padding
+- it can read the AWG 2.0 server config (`awg_config`) to apply the same padding
   transformation that AmneziaWG expects;
 - it can write a local session status file (`status_file`) for `amneziawg-web`.
+
+> [!IMPORTANT]
+> **Compatibility: AmneziaWG 2.0 only**
+> `amneziawg-proxy` is compatible **only with AmneziaWG 2.0**. It is **not compatible with AmneziaWG 3.0+**
+> because AWG 3.0 uses S1–S4 padding as key material for header encryption (`HeaderProtectionKey`).
+> Rewriting padding in flight breaks header decryption, and encrypted headers prevent packet classification.
+> Ensure the target AWG backend is configured for AWG 2.0.
 
 The proxy does not need to manage the AWG interface. In a manual deployment,
 you only need to make sure the proxy can reach the AWG UDP backend and that
@@ -217,7 +224,9 @@ Important notes:
   `172.30.0.10:51820`. Hostnames such as Docker service names are not accepted.
 - `awg_config` is optional, but recommended when the proxy must apply AWG
   padding transformation. The file only needs the `[Interface]` obfuscation
-  parameters; peer sections are ignored.
+  parameters (`Jc`, `Jmin`, `Jmax`, `S1`–`S4`, `H1`–`H4`); peer sections are ignored.
+  The config must be an AmneziaWG 2.0 configuration; AWG 3.0+ configurations (which
+  use `HeaderProtectionKey`) are incompatible.
 - `status_file` defaults to `/var/lib/amneziawg-proxy/sessions.json` when it is
   omitted. Set it explicitly when `amneziawg-web` should read sessions from a
   different path.
