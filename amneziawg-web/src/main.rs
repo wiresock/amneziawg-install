@@ -46,8 +46,10 @@ pub struct Config {
     pub poll_interval: u64,
 
     /// Maximum age of traffic snapshots to retain in days. Older snapshots are
-    /// periodically purged. Set to 0 to disable retention cleanup.
-    #[arg(long, env = "AWG_SNAPSHOT_RETENTION_DAYS", default_value_t = 30)]
+    /// periodically purged in the background. Defaults to 31 days (strictly
+    /// longer than the 30-day UI history window to preserve pre-window baseline
+    /// snapshots for accurate usage deltas). Set to 0 to disable retention cleanup.
+    #[arg(long, env = "AWG_SNAPSHOT_RETENTION_DAYS", default_value_t = 31)]
     pub snapshot_retention_days: u32,
 
     /// Proxy active-session status file written by amneziawg-proxy.

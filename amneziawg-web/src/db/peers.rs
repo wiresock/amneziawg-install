@@ -352,16 +352,35 @@ pub async fn find_snapshots(
 ///
 /// Deleting in batches (e.g. 5,000 rows at a time) prevents long-lived write locks
 /// and excessive memory usage if a large backlog of historical snapshots exists.
+/// Result of a chunked snapshot purge step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteSnapshotsResult {
+    /// Total number of snapshot rows deleted during this invocation.
+    pub deleted: u64,
+    /// Whether additional expired snapshot rows remain to be deleted.
+    pub more_remaining: bool,
+}
+
+/// Delete historical snapshots older than `cutoff_rfc3339` in bounded batches.
 ///
-/// Returns the total number of deleted snapshot rows.
+/// If `max_batches` is `Some(n)`, at most `n` batches of `batch_size` rows are
+/// deleted before returning, allowing callers to throttle cleanup across multiple
+/// poll cycles. If `max_batches` is `None`, purging continues until all expired
+/// rows are drained.
+///
+/// To prevent monopolizing the SQLite write lock and starving concurrent HTTP
+/// readers and writers, a brief sleep is performed between batches.
 pub async fn delete_expired_snapshots(
     pool: &SqlitePool,
     cutoff_rfc3339: &str,
     batch_size: u32,
-) -> Result<u64, sqlx::Error> {
+    max_batches: Option<u32>,
+) -> Result<DeleteSnapshotsResult, sqlx::Error> {
     let mut total_deleted: u64 = 0;
     let limit = batch_size.max(1) as i64;
-    loop {
+    let mut batches_run: u32 = 0;
+
+    let more_remaining = loop {
         let result = sqlx::query(
             "DELETE FROM snapshots
              WHERE id IN (
@@ -377,12 +396,27 @@ pub async fn delete_expired_snapshots(
 
         let affected = result.rows_affected();
         total_deleted += affected;
+        batches_run = batches_run.saturating_add(1);
+
         if affected < limit as u64 {
-            break;
+            break false;
         }
-        tokio::task::yield_now().await;
-    }
-    Ok(total_deleted)
+
+        if let Some(max) = max_batches {
+            if batches_run >= max {
+                break true;
+            }
+        }
+
+        // Throttle briefly between batches to yield the SQLite write lock to
+        // concurrent readers/writers (such as web handlers or checkpoints).
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+
+    Ok(DeleteSnapshotsResult {
+        deleted: total_deleted,
+        more_remaining,
+    })
 }
 
 /// Update the human-editable metadata fields (`display_name`, `comment`) for a
@@ -1139,10 +1173,11 @@ mod tests {
         insert_snapshot(&db.pool, "KEY_PURGE=", "2026-02-01T00:00:00Z").await;
 
         // Cutoff is Jan 15: Jan 01 and Jan 10 should be deleted (2 rows)
-        let deleted = delete_expired_snapshots(&db.pool, "2026-01-15T00:00:00Z", 1000)
+        let res = delete_expired_snapshots(&db.pool, "2026-01-15T00:00:00Z", 1000, None)
             .await
             .expect("delete expired");
-        assert_eq!(deleted, 2);
+        assert_eq!(res.deleted, 2);
+        assert!(!res.more_remaining);
 
         let remaining = find_snapshots(&db.pool, "KEY_PURGE=", 10)
             .await
@@ -1161,15 +1196,38 @@ mod tests {
         }
 
         // Delete with batch_size = 3, cutoff Jan 08 (deletes 7 rows across 3 batches)
-        let deleted = delete_expired_snapshots(&db.pool, "2026-01-08T00:00:00Z", 3)
+        let res = delete_expired_snapshots(&db.pool, "2026-01-08T00:00:00Z", 3, None)
             .await
             .expect("delete expired");
-        assert_eq!(deleted, 7);
+        assert_eq!(res.deleted, 7);
+        assert!(!res.more_remaining);
 
         let remaining = find_snapshots(&db.pool, "KEY_BATCH=", 10)
             .await
             .expect("remaining");
         assert_eq!(remaining.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_respects_max_batches() {
+        let db = test_db().await;
+        for i in 1..=10 {
+            let ts = format!("2026-01-{:02}T00:00:00Z", i);
+            insert_snapshot(&db.pool, "KEY_MAX_B=", &ts).await;
+        }
+
+        // Cutoff Jan 08 has 7 expired rows. With batch_size = 3 and max_batches = 1:
+        // deletes 3 rows and reports more_remaining = true.
+        let res = delete_expired_snapshots(&db.pool, "2026-01-08T00:00:00Z", 3, Some(1))
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 3);
+        assert!(res.more_remaining);
+
+        let remaining = find_snapshots(&db.pool, "KEY_MAX_B=", 10)
+            .await
+            .expect("remaining");
+        assert_eq!(remaining.len(), 7);
     }
 
     // ── find_snapshots_since ─────────────────────────────────────────────────

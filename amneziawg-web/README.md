@@ -213,6 +213,7 @@ All settings are read from environment variables (or a `.env`-style file via sys
 | `AWG_WEB_DB` | `awg-web.db` | Path to SQLite database file (created automatically) |
 | `AWG_CONFIG_DIR` | `/etc/amnezia/amneziawg/clients` | Directory of client `.conf` files |
 | `AWG_POLL_INTERVAL` | `30` | Polling interval in seconds |
+| `AWG_SNAPSHOT_RETENTION_DAYS` | `31` | Maximum snapshot age in days (0 to disable cleanup) |
 | `AWG_PROXY_SESSIONS_FILE` | `/var/lib/amneziawg-proxy/sessions.json` | Optional proxy active-session status file |
 | `RUST_LOG` | `amneziawg_web=info` | Log level (`error`/`warn`/`info`/`debug`) |
 | `AUTH_ENABLED` | `false` | Enable authentication (set `true` in production) |

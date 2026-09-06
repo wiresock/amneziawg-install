@@ -69,17 +69,7 @@ pub struct Poller {
 impl Poller {
     #[cfg(test)]
     pub fn new(db: Database, interval_secs: u64, config_dir: PathBuf) -> Self {
-        Self::new_with_lifecycle_lock_dir(db, interval_secs, config_dir.clone(), config_dir)
-    }
-
-    #[allow(dead_code)]
-    pub fn new_with_lifecycle_lock_dir(
-        db: Database,
-        interval_secs: u64,
-        config_dir: PathBuf,
-        lifecycle_lock_dir: PathBuf,
-    ) -> Self {
-        Self::new_full(db, interval_secs, config_dir, lifecycle_lock_dir, 30)
+        Self::new_full(db, interval_secs, config_dir.clone(), config_dir, 0)
     }
 
     pub fn new_full(
@@ -109,11 +99,20 @@ impl Poller {
     /// cycles are tick-aligned – the period between the *start* of consecutive
     /// cycles is `interval`, regardless of how long each `poll_once` takes.
     pub async fn run(&self) {
-        info!(
-            interval_secs = self.interval.as_secs(),
-            config_dir = %self.config_dir.display(),
-            "poller started"
-        );
+        if self.snapshot_retention_days > 0 {
+            info!(
+                interval_secs = self.interval.as_secs(),
+                snapshot_retention_days = self.snapshot_retention_days,
+                config_dir = %self.config_dir.display(),
+                "poller started (snapshot retention enabled)"
+            );
+        } else {
+            info!(
+                interval_secs = self.interval.as_secs(),
+                config_dir = %self.config_dir.display(),
+                "poller started (snapshot retention disabled)"
+            );
+        }
         let mut ticker = tokio::time::interval(self.interval);
         loop {
             ticker.tick().await;
@@ -349,21 +348,33 @@ impl Poller {
 
     /// Purge snapshots older than `snapshot_retention_days` (if configured > 0).
     ///
-    /// Returns the number of snapshots deleted.
+    /// Drains all expired snapshots. Returns the total number of snapshots deleted.
+    #[cfg(test)]
     pub async fn cleanup_expired_snapshots(&self) -> anyhow::Result<u64> {
         if self.snapshot_retention_days == 0 {
             return Ok(0);
         }
-        let cutoff =
-            chrono::Utc::now() - chrono::Duration::days(self.snapshot_retention_days as i64);
+
+        let retention_duration = match chrono::Duration::try_days(self.snapshot_retention_days as i64) {
+            Some(dur) if self.snapshot_retention_days <= 36_500 => dur,
+            _ => {
+                warn!(
+                    days = self.snapshot_retention_days,
+                    "snapshot retention days exceeds maximum supported range (36500); skipping cleanup"
+                );
+                return Ok(0);
+            }
+        };
+
+        let cutoff = chrono::Utc::now() - retention_duration;
         let cutoff_str = cutoff.to_rfc3339_opts(SecondsFormat::Secs, true);
-        let deleted =
-            crate::db::peers::delete_expired_snapshots(&self.db.pool, &cutoff_str, 5000).await?;
+        let res =
+            crate::db::peers::delete_expired_snapshots(&self.db.pool, &cutoff_str, 5000, None).await?;
         self.last_retention_cleanup.store(
             chrono::Utc::now().timestamp(),
             std::sync::atomic::Ordering::Relaxed,
         );
-        Ok(deleted)
+        Ok(res.deleted)
     }
 
     async fn cleanup_expired_snapshots_step(&self) {
@@ -376,19 +387,49 @@ impl Poller {
             .last_retention_cleanup
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        // Run at most once every hour (3600 seconds), and on the first poll cycle
-        if now_epoch - last_epoch < 3600 {
+        // Run if:
+        // 1. Initial startup run (last_epoch == 0)
+        // 2. Continuing to drain an existing backlog from previous tick (last_epoch < 0)
+        // 3. Hourly scheduled interval elapsed (last_epoch > 0 && now_epoch - last_epoch >= 3600)
+        if last_epoch > 0 && now_epoch - last_epoch < 3600 {
             return;
         }
 
-        match self.cleanup_expired_snapshots().await {
-            Ok(deleted) => {
-                if deleted > 0 {
+        let retention_duration = match chrono::Duration::try_days(self.snapshot_retention_days as i64) {
+            Some(dur) if self.snapshot_retention_days <= 36_500 => dur,
+            _ => {
+                warn!(
+                    days = self.snapshot_retention_days,
+                    "snapshot retention days exceeds maximum supported range (36500); skipping cleanup"
+                );
+                return;
+            }
+        };
+
+        let cutoff = chrono::Utc::now() - retention_duration;
+        let cutoff_str = cutoff.to_rfc3339_opts(SecondsFormat::Secs, true);
+
+        // Cap to 2 batches (up to 10,000 rows) per tick with 25ms pause between batches,
+        // preventing the poller from being delayed and yielding the SQLite write lock.
+        match crate::db::peers::delete_expired_snapshots(&self.db.pool, &cutoff_str, 5000, Some(2)).await {
+            Ok(result) => {
+                if result.deleted > 0 {
                     info!(
-                        deleted,
+                        deleted = result.deleted,
+                        more_remaining = result.more_remaining,
                         retention_days = self.snapshot_retention_days,
-                        "expired snapshot cleanup complete"
+                        "expired snapshot cleanup progress"
                     );
+                }
+                if result.more_remaining {
+                    // Backlog remains; mark last_retention_cleanup as -1 so the next
+                    // poller cycle immediately processes the next chunk.
+                    self.last_retention_cleanup
+                        .store(-1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    // Fully caught up; record current epoch to schedule next run in 1 hour.
+                    self.last_retention_cleanup
+                        .store(now_epoch, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             Err(e) => {
@@ -1039,6 +1080,61 @@ mod tests {
             .await
             .expect("find snapshots");
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_snapshots_handles_overflow_gracefully() {
+        let db = Database::connect_for_test().await.expect("test database");
+
+        // Poller with overflow retention_days (e.g. 200,000 days or u32::MAX)
+        let poller_huge =
+            Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(200_000);
+        let deleted = poller_huge
+            .cleanup_expired_snapshots()
+            .await
+            .expect("must not panic on huge retention days");
+        assert_eq!(deleted, 0);
+
+        let poller_max =
+            Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(u32::MAX);
+        let deleted_max = poller_max
+            .cleanup_expired_snapshots()
+            .await
+            .expect("must not panic on u32::MAX");
+        assert_eq!(deleted_max, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_snapshots_step_throttles_and_sets_backlog_flag() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let pk = "KEY_STEP_THROTTLE=";
+
+        // Insert 12 old snapshots (50 days ago)
+        for i in 1..=12 {
+            let ts = (Utc::now() - chrono::Duration::days(50 + i))
+                .to_rfc3339_opts(SecondsFormat::Secs, true);
+            sqlx::query(
+                "INSERT INTO snapshots (public_key, captured_at, rx_bytes, tx_bytes) VALUES (?, ?, 10, 20)",
+            )
+            .bind(pk)
+            .bind(&ts)
+            .execute(&db.pool)
+            .await
+            .expect("insert snapshot");
+        }
+
+        // Poller with 31 days retention
+        let poller = Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(31);
+        poller.cleanup_expired_snapshots_step().await;
+
+        // Cleanup was executed
+        let remaining = crate::db::peers::find_snapshots(&db.pool, pk, 20)
+            .await
+            .expect("find snapshots");
+        // All 12 rows were deleted (5000 batch size is well above 12)
+        assert_eq!(remaining.len(), 0);
+        // last_retention_cleanup was updated to positive epoch
+        assert!(poller.last_retention_cleanup.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
 
     #[tokio::test]
