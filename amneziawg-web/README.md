@@ -50,8 +50,9 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
   their saved metadata and traffic history deleted from the panel. The public
   key remains archived and disabled so enforcement can continue.
 - **Traffic history** – counter-reset-safe per-snapshot deltas over 24 h / 7 d / 30 d.
-- **Proxy session visibility** – when `amneziawg-proxy` is enabled, reads its
-  local status file and shows active remote client sessions on the peer list.
+- **Proxy session visibility** – when `amneziawg-proxy` is enabled (AmneziaWG 2.0
+  interfaces only), reads its local status file and shows active remote client sessions
+  on the peer list.
 - **Session cookie authentication** – Argon2id password verification,
   32-byte cryptographically random session IDs, configurable TTL.
 - **Bearer token** – optional static token for headless API access.
@@ -237,7 +238,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `POST` | `/admin/peers/:id/restore` | Yes | Return an archived key to the normal list as a blank, still-disabled peer |
 | `POST` | `/admin/users/add` | Yes | HTML form: add new user (PRG redirect) |
 | `POST` | `/admin/users/:id/remove` | Yes | HTML form: remove user (PRG redirect) |
-| `POST` | `/admin/protocol/enable-awg3` | Yes | Confirmed HTML form: probe support and atomically migrate the interface plus all clients to AWG 3.0 |
+| `POST` | `/admin/protocol/enable-awg3` | Yes | Confirmed HTML form: probe support and atomically migrate the interface plus all clients to AWG 3.0 (incompatible with `amneziawg-proxy`) |
 | `POST` | `/admin/protocol/disable-awg3` | Yes | Confirmed HTML form: atomically return the interface plus all clients to AWG 2.0 |
 | `GET` | `/login` | No | Login form |
 | `POST` | `/login` | No | Validate credentials, set cookie |
@@ -303,6 +304,12 @@ script output. The header-protection key is provided to the unprivileged
 process only through the existing safe-parameter projection needed to create
 AWG 3.0 client configs; it is never rendered in HTML, returned by the status
 API, or written to application logs.
+
+> [!WARNING]
+> **Compatibility with amneziawg-proxy:**
+> `amneziawg-proxy` is compatible **only with AmneziaWG 2.0**. Enabling AWG 3.0 via
+> `/admin/protocol/enable-awg3` will cause `amneziawg-proxy` to fail packet classification
+> and stop camouflaging traffic. If `amneziawg-proxy` is in use, keep the interface on AWG 2.0.
 
 **Troubleshooting:** If peer polling fails with "Operation not permitted",
 verify the sudoers file exists and is correct:

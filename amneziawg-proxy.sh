@@ -9,8 +9,12 @@
 #     to view status, tail logs, upgrade, reconfigure, uninstall, or exit.
 #
 # Recommended workflow:
-#   sudo ./amneziawg-install.sh      # 1. install AmneziaWG
+#   sudo ./amneziawg-install.sh      # 1. install AmneziaWG (AWG 2.0)
 #   sudo ./amneziawg-proxy.sh        # 2. install / manage the UDP proxy
+#
+# Note: amneziawg-proxy is compatible ONLY with AmneziaWG 2.0. It is incompatible
+# with AmneziaWG 3.0+ because AWG 3.0 uses S1-S4 padding as key material for
+# header encryption, which is corrupted by proxy padding rewrites.
 #
 # All installer logic lives in amneziawg-proxy/scripts/.
 # This file is a thin dispatcher that forwards to those scripts.
@@ -258,6 +262,7 @@ warn() { printf '\033[0;33m[WARN] \033[0m %s\n' "$*" >&2; }
 usage() {
     cat <<EOF
 amneziawg-proxy - unified management script for the AmneziaWG UDP proxy.
+Compatible ONLY with AmneziaWG 2.0 (incompatible with AWG 3.0+).
 
 Usage:
   sudo $0 [installer-options]              Install or manage the proxy

@@ -1,5 +1,9 @@
 # amneziawg-proxy — Documentation
 
+> [!IMPORTANT]
+> **Compatibility: AmneziaWG 2.0 only**
+> `amneziawg-proxy` is compatible **only with AmneziaWG 2.0**. It is **not compatible with AmneziaWG 3.0+** because AWG 3.0 incorporates the S1–S4 padding values into header protection key derivation (`HeaderProtectionKey`). Rewriting padding in flight breaks header decryption, and encrypted headers prevent packet classification.
+
 | Document | Description |
 |----------|-------------|
 | [USAGE.md](USAGE.md) | Installation, configuration reference, running, logging, uninstallation, and troubleshooting. |

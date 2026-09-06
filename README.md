@@ -1,6 +1,6 @@
 # AmneziaWG Installer
 
-Set up an [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscated VPN on any supported Linux server in under 2 minutes — with backward-compatible AWG 2.0 defaults, optional AWG 3.0 support, an optional web panel, and an optional traffic-obfuscation proxy.
+Set up an [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscated VPN on any supported Linux server in under 2 minutes — with backward-compatible AWG 2.0 defaults, optional AWG 3.0 support, an optional web panel, and an optional traffic-obfuscation proxy (AmneziaWG 2.0 only).
 
 ```
 VPN install → (optional) Web panel → (optional) Obfuscation proxy → Manage clients
@@ -16,10 +16,10 @@ Once the installer was solid, it was hard to stop:
 
 1. **`amneziawg-install.sh`** — the original script, extended for AmneziaWG 2.0 (S3/S4, H1–H4, migration from pre-2.0 installs) and optional AmneziaWG 3.0 header protection.
 2. **`amneziawg-web.sh`** — a web panel for managing clients and explicit AWG 2.0/AWG 3.0 migrations without touching the CLI.
-3. **`amneziawg-proxy.sh`** — a UDP obfuscation proxy that takes traffic camouflage to the next level: it wraps AmneziaWG so the datagrams on the wire look like a legitimate QUIC, DNS, STUN, or SIP service to Deep Packet Inspection (DPI).
+3. **`amneziawg-proxy.sh`** — a UDP obfuscation proxy that takes traffic camouflage to the next level: it wraps AmneziaWG (AWG 2.0 only) so the datagrams on the wire look like a legitimate QUIC, DNS, STUN, or SIP service to Deep Packet Inspection (DPI).
 
-> **⚠️ amneziawg-proxy is most powerful with WireSock Secure Connect 3.5+.**
-> The proxy's full protocol-imitation feature set — coordinated client/server cover traffic, junk-packet shaping, and per-protocol padding — is only fully unleashed when paired with [WireSock Secure Connect](https://www.wiresock.net/) **3.5 or later** on the client side. Standard AmneziaWG clients still connect through the proxy and benefit from the server-side obfuscation, but the bidirectional imitation requires the WireSock client.
+> **⚠️ amneziawg-proxy is compatible only with AmneziaWG 2.0 and is most powerful with WireSock Secure Connect 3.5+.**
+> The proxy is compatible **only with AmneziaWG 2.0** (it is **not compatible with AWG 3.0+** because AWG 3.0 uses S1–S4 padding as key material for header encryption). The proxy's full protocol-imitation feature set — coordinated client/server cover traffic, junk-packet shaping, and per-protocol padding — is only fully unleashed when paired with [WireSock Secure Connect](https://www.wiresock.net/) **3.5 or later** on the client side. Standard AmneziaWG clients still connect through the proxy and benefit from the server-side obfuscation, but the bidirectional imitation requires the WireSock client.
 
 ---
 
@@ -53,12 +53,13 @@ chmod +x amneziawg-proxy.sh
 sudo ./amneziawg-proxy.sh
 ```
 
-> Makes the VPN traffic look like QUIC/DNS/STUN/SIP to DPI. See
+> Makes the VPN traffic look like QUIC/DNS/STUN/SIP to DPI. Compatible with
+> **AmneziaWG 2.0 only** (not compatible with AWG 3.0+). See
 > **[Traffic Obfuscation Proxy](#-traffic-obfuscation-proxy-amneziawg-proxy)**.
 
 ✅ **After installation:**
 - VPN server is running
-- AWG 2.0 remains active by default; [AWG 3.0](#-optional-awg-30-mode) is enabled only by an explicit migration after userspace and kernel capability checks pass
+- AWG 2.0 remains active by default; [AWG 3.0](#-optional-awg-30-mode) is enabled only by an explicit migration after userspace and kernel capability checks pass (do not enable AWG 3.0 if using `amneziawg-proxy`)
 - A client config file is generated at `~/awg0-client-<name>.conf`
 - (If installed) Web panel listens on `127.0.0.1:8080` by default — access it on the server at `http://127.0.0.1:8080`, or change `AWG_WEB_LISTEN` / use a reverse proxy for remote access
 
@@ -72,7 +73,7 @@ sudo ./amneziawg-proxy.sh
   - `upgrade` — upgrade the binary
   - `uninstall` — remove the panel
   - `status` — show installation status
-- **`amneziawg-proxy.sh`** — **optional.** Installs and manages the UDP obfuscation proxy that fronts AmneziaWG and makes the traffic look like QUIC, DNS, STUN, or SIP. See **[Traffic Obfuscation Proxy](#-traffic-obfuscation-proxy-amneziawg-proxy)** below.
+- **`amneziawg-proxy.sh`** — **optional.** Installs and manages the UDP obfuscation proxy that fronts AmneziaWG (**AWG 2.0 only**) and makes the traffic look like QUIC, DNS, STUN, or SIP. See **[Traffic Obfuscation Proxy](#-traffic-obfuscation-proxy-amneziawg-proxy)** below.
 
 ---
 
@@ -82,8 +83,8 @@ sudo ./amneziawg-proxy.sh
 |------|-------------|
 | VPN server only | `amneziawg-install.sh` |
 | VPN + web panel | `amneziawg-install.sh` then `amneziawg-web.sh install` |
-| VPN + DPI-resistant obfuscation | `amneziawg-install.sh` then `amneziawg-proxy.sh` |
-| Everything | `amneziawg-install.sh`, then `amneziawg-web.sh install`, then `amneziawg-proxy.sh` |
+| VPN + DPI-resistant obfuscation | `amneziawg-install.sh` then `amneziawg-proxy.sh` *(AWG 2.0 only)* |
+| Everything | `amneziawg-install.sh`, then `amneziawg-web.sh install`, then `amneziawg-proxy.sh` *(AWG 2.0 only)* |
 | Advanced / development | Clone the repo, then run the scripts from the checkout |
 
 ---
@@ -122,6 +123,15 @@ See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for all insta
 ## 🎭 Traffic Obfuscation Proxy (amneziawg-proxy)
 
 > ⚠️ Requires VPN to be installed first (`amneziawg-install.sh`).
+
+> [!IMPORTANT]
+> **Compatibility: AmneziaWG 2.0 only (incompatible with AWG 3.0+)**
+>
+> `amneziawg-proxy` is compatible **only with AmneziaWG 2.0** and cannot be used when AWG 3.0 mode is enabled.
+>
+> In AmneziaWG 2.0, the S1–S4 padding prefix consists of arbitrary random bytes that the proxy safely replaces with cover-protocol filler bytes (QUIC, DNS, STUN, or SIP headers) while preserving the encrypted payload. Starting with AmneziaWG 3.0, the S1–S4 padding values are used as key material for header encryption (`HeaderProtectionKey`). Modifying or rewriting them in flight breaks header decryption on the peer, and the encrypted headers prevent the proxy from classifying packets.
+>
+> If you plan to use `amneziawg-proxy`, keep your interface in AWG 2.0 mode (the default). Do not enable AWG 3.0 on a proxied interface.
 
 `amneziawg-proxy` is an async UDP proxy (written in Rust) that sits **in front of**
 your AmneziaWG server and disguises the traffic so that, to Deep Packet
@@ -196,12 +206,14 @@ The proxy does two complementary things:
    a DNS answer, a STUN Binding Success, a SIP `100 Trying`. The port therefore
    behaves exactly like the service it is pretending to be when actively
    probed.
-2. **Padding transformation.** Every outgoing AmneziaWG packet already carries a
+2. **Padding transformation.** Every outgoing AmneziaWG 2.0 packet already carries a
    random S1–S4 padding prefix. The proxy overwrites that prefix with
    protocol-conformant bytes (a QUIC short header, a DNS/STUN header, SIP header
    text) so the *leading bytes and byte-distribution* of each datagram match the
    imitated protocol — while the encrypted WireGuard payload that follows is
-   left untouched.
+   left untouched. (Note: this relies on AmneziaWG 2.0 protocol semantics where
+   headers are plaintext and S1–S4 padding is unkeyed; in AWG 3.0+, S1–S4 padding
+   serves as key material for header encryption, so rewriting it breaks compatibility).
 
 | Mode | What DPI sees | Typical port | Good for |
 |------|---------------|--------------|----------|
@@ -361,6 +373,12 @@ sudo ./amneziawg-install.sh --list-clients
 ---
 
 ## 🔐 Optional AWG 3.0 Mode
+
+> [!WARNING]
+> **Incompatible with amneziawg-proxy:**
+> Do **not** enable AWG 3.0 if you are using `amneziawg-proxy`. Because AmneziaWG 3.0 incorporates the S1–S4 padding values as key material for header protection, the proxy's padding transformations corrupt header decryption and break packet classification.
+>
+> If you require `amneziawg-proxy`, keep your interface in AWG 2.0 mode (the default). If an interface was already migrated to AWG 3.0, revert it to AWG 2.0 using `sudo ./amneziawg-install.sh --disable-awg3` (or via the web panel under **AWG protocol**) before setting up or running the proxy.
 
 Fresh installs and parameter files created by earlier releases use AWG 2.0 by
 default. Installing or upgrading this project never changes an existing

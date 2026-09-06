@@ -21,9 +21,13 @@ impl HRange {
     }
 }
 
-/// AmneziaWG obfuscation parameters parsed from an AWG config file.
+/// AmneziaWG 2.0 obfuscation parameters parsed from an AWG config file.
 ///
-/// AmneziaWG extends WireGuard by replacing the standard 4-byte message type
+/// Note: `amneziawg-proxy` is compatible **only with AmneziaWG 2.0**. In AmneziaWG 3.0+,
+/// S1–S4 padding values are used as key material for header encryption (`HeaderProtectionKey`),
+/// which breaks when padding is rewritten, and encrypted headers prevent packet classification.
+///
+/// AmneziaWG 2.0 extends WireGuard by replacing the standard 4-byte message type
 /// header with a random value drawn from a per-type H range and prepending
 /// S bytes of random padding before the obfuscated header.
 ///
@@ -59,8 +63,11 @@ pub struct AwgParams {
     pub h4: HRange,
 }
 
-/// Parse an AWG config file (INI-style) and extract the obfuscation parameters
+/// Parse an AmneziaWG 2.0 config file (INI-style) and extract the obfuscation parameters
 /// from the `[Interface]` section.
+///
+/// Note: The proxy is compatible only with AmneziaWG 2.0 configurations. AWG 3.0+
+/// header protection configurations (`HeaderProtectionKey`) are not supported.
 ///
 /// Expected format (keys are case-insensitive):
 /// ```ini

@@ -83,7 +83,11 @@ pub fn apply_quic_padding_typed(
     }
 }
 
-/// Apply AWG-aware padding transformation to an outgoing packet.
+/// Apply AWG 2.0-aware padding transformation to an outgoing packet.
+///
+/// Note: Compatible only with AmneziaWG 2.0. In AmneziaWG 3.0+, S1–S4 padding values
+/// are used as key material for header encryption (`HeaderProtectionKey`), which breaks
+/// if padding is rewritten, and encrypted headers prevent packet classification.
 ///
 /// Classifies the packet using the S-offset / H-range pairs to determine its
 /// type, then overwrites the leading S-padding prefix with protocol-conformant
