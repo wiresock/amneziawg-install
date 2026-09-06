@@ -2432,14 +2432,29 @@ EOF
 	local cur_h1
 	cur_h1="$(grep -m1 -E '^H1 = ' "${PANEL_DIR}/awg0-client-alice.conf" | sed 's/^H1 = //')"
 
-	[[ "${cur_pub}" == "PUB_ALICE" ]] || echo "FAIL_PUB"
-	[[ "${cur_priv}" == "PRIV_ALICE" ]] || echo "FAIL_PRIV"
-	[[ "${cur_h1}" == "5-10" ]] || echo "FAIL_H1"
-	echo "${out}" | grep -q "1 succeeded, 0 failed" || echo "FAIL_SUMMARY"
-	echo "${out}" | grep -q "no existing private key found" && echo "FAIL_REGEN_TRIGGERED"
+	if [[ "${cur_pub}" != "PUB_ALICE" ]]; then
+		echo "FAIL: expected PublicKey PUB_ALICE, got ${cur_pub}" >&2
+		return 1
+	fi
+	if [[ "${cur_priv}" != "PRIV_ALICE" ]]; then
+		echo "FAIL: expected PrivateKey PRIV_ALICE, got ${cur_priv}" >&2
+		return 1
+	fi
+	if [[ "${cur_h1}" != "5-10" ]]; then
+		echo "FAIL: expected H1 5-10, got ${cur_h1}" >&2
+		return 1
+	fi
+	if ! echo "${out}" | grep -q "1 succeeded, 0 failed"; then
+		echo "FAIL: expected summary '1 succeeded, 0 failed', got: ${out}" >&2
+		return 1
+	fi
+	if echo "${out}" | grep -q "no existing private key found"; then
+		echo "FAIL: unexpected key regeneration triggered: ${out}" >&2
+		return 1
+	fi
 	echo "OK"
 }
-assert_contains "$(_run_regen_test _setup_panel_only)" "OK" "regenerateClients: preserves key when config exists only in web panel config dir"
+assert_eq "OK" "$(_run_regen_test _setup_panel_only)" "regenerateClients: preserves key when config exists only in web panel config dir"
 
 # Test 2: Web panel installed, client config MISSING, non-interactive -> refuses to rotate key
 _setup_panel_missing_noninteractive() {
@@ -2461,12 +2476,21 @@ EOF
 	out="$(regenerateClients </dev/null 2>&1)"
 	local cur_pub
 	cur_pub="$(grep -m1 -E '^PublicKey = ' "${SERVER_AWG_CONF}" | sed 's/^PublicKey = //')"
-	[[ "${cur_pub}" == "PUB_BOB" ]] || echo "FAIL_ROTATED"
-	echo "${out}" | grep -q "skipped to avoid rotating web-managed client identity" || echo "FAIL_NO_WARNING"
-	echo "${out}" | grep -q "0 succeeded, 1 failed" || echo "FAIL_SUMMARY"
+	if [[ "${cur_pub}" != "PUB_BOB" ]]; then
+		echo "FAIL: PublicKey was modified when key rotation should be refused: ${cur_pub}" >&2
+		return 1
+	fi
+	if ! echo "${out}" | grep -q "skipped to avoid rotating web-managed client identity"; then
+		echo "FAIL: missing refusal warning in output: ${out}" >&2
+		return 1
+	fi
+	if ! echo "${out}" | grep -q "0 succeeded, 1 failed"; then
+		echo "FAIL: expected summary '0 succeeded, 1 failed', got: ${out}" >&2
+		return 1
+	fi
 	echo "OK"
 }
-assert_contains "$(_run_regen_test _setup_panel_missing_noninteractive)" "OK" "regenerateClients: refuses silent key rotation when panel installed and config missing"
+assert_eq "OK" "$(_run_regen_test _setup_panel_missing_noninteractive)" "regenerateClients: refuses silent key rotation when panel installed and config missing"
 
 # Test 3: Web panel NOT installed, client config MISSING -> generates new key (standalone behavior)
 _setup_standalone_missing() {
@@ -2488,12 +2512,21 @@ EOF
 	out="$(regenerateClients </dev/null 2>&1)"
 	local cur_pub
 	cur_pub="$(grep -m1 -E '^PublicKey = ' "${SERVER_AWG_CONF}" | sed 's/^PublicKey = //')"
-	[[ "${cur_pub}" == "NEW_PUBKEY" ]] || echo "FAIL_NOT_ROTATED"
-	echo "${out}" | grep -q "1 succeeded, 0 failed" || echo "FAIL_SUMMARY"
-	echo "${out}" | grep -q "1 client(s) had new key pairs generated" || echo "FAIL_NEWKEYS_COUNT"
+	if [[ "${cur_pub}" != "NEW_PUBKEY" ]]; then
+		echo "FAIL: expected PublicKey to rotate to NEW_PUBKEY, got: ${cur_pub}" >&2
+		return 1
+	fi
+	if ! echo "${out}" | grep -q "1 succeeded, 0 failed"; then
+		echo "FAIL: expected summary '1 succeeded, 0 failed', got: ${out}" >&2
+		return 1
+	fi
+	if ! echo "${out}" | grep -q "1 client(s) had new key pairs generated"; then
+		echo "FAIL: expected '1 client(s) had new key pairs generated', got: ${out}" >&2
+		return 1
+	fi
 	echo "OK"
 }
-assert_contains "$(_run_regen_test _setup_standalone_missing)" "OK" "regenerateClients: generates new key in standalone mode when config missing"
+assert_eq "OK" "$(_run_regen_test _setup_standalone_missing)" "regenerateClients: generates new key in standalone mode when config missing"
 
 echo ""
 echo "=========================================="

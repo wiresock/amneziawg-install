@@ -736,16 +736,12 @@ pub async fn restore_archived_peer(
 /// re-enabled later. Newly-created peers are preserved only while both their
 /// config is present and they are awaiting observation on the live interface.
 ///
-/// Returns the list of `(id, public_key)` pairs that were **actually**
-/// Remove database peers that are no longer active on the interface and are
-/// not administratively disabled.
-///
 /// Deletes stale peers atomically within a transaction, ensuring any `events.peer_id`
 /// references are set to NULL prior to deletion to preserve full audit history
 /// without triggering SQLite foreign key constraint violations.
 ///
-/// Returns the list of `(id, public_key)` tuples for all peers that were
-/// actually deleted. Peers that were concurrently disabled between the initial
+/// Returns the list of `(id, public_key)` pairs that were **actually**
+/// deleted. Peers that were concurrently disabled between the initial
 /// SELECT and the DELETE are excluded from the returned list.
 pub async fn delete_stale_peers(
     pool: &SqlitePool,
