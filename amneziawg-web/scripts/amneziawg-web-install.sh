@@ -300,11 +300,13 @@ parse_args() {
             --poll-interval)
                 POLL_INTERVAL="$2"; shift 2 ;;
             --snapshot-retention-days)
-                if ! [[ "$2" =~ ^[0-9]+$ ]] || (( 10#$2 > 36500 )); then
+                if [[ "$2" =~ ^0*([1-9][0-9]*|0)$ ]] && (( ${#BASH_REMATCH[1]} <= 5 )) && (( 10#${BASH_REMATCH[1]} <= 36500 )); then
+                    SNAPSHOT_RETENTION_DAYS="${BASH_REMATCH[1]}"
+                    shift 2
+                else
                     error "--snapshot-retention-days must be an integer between 0 and 36500"
                     exit 1
-                fi
-                SNAPSHOT_RETENTION_DAYS="$((10#$2))"; shift 2 ;;
+                fi ;;
             --session-ttl)
                 SESSION_TTL="$2"; shift 2 ;;
             --no-enable)
@@ -698,8 +700,8 @@ EOF
     prompt_default POLL_INTERVAL "Poll interval (seconds)" "${POLL_INTERVAL}"
     while true; do
         prompt_default SNAPSHOT_RETENTION_DAYS "Snapshot retention in days (0=unlimited, max 36500)" "${SNAPSHOT_RETENTION_DAYS}"
-        if [[ "${SNAPSHOT_RETENTION_DAYS}" =~ ^[0-9]+$ ]] && (( 10#SNAPSHOT_RETENTION_DAYS <= 36500 )); then
-            SNAPSHOT_RETENTION_DAYS="$((10#SNAPSHOT_RETENTION_DAYS))"
+        if [[ "${SNAPSHOT_RETENTION_DAYS}" =~ ^0*([1-9][0-9]*|0)$ ]] && (( ${#BASH_REMATCH[1]} <= 5 )) && (( 10#${BASH_REMATCH[1]} <= 36500 )); then
+            SNAPSHOT_RETENTION_DAYS="${BASH_REMATCH[1]}"
             break
         fi
         warn "Snapshot retention days must be an integer between 0 and 36500."
