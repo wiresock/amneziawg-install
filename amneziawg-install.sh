@@ -7106,6 +7106,9 @@ function setAwgProtocolMode() (
 			ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
 			if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
 				probeAwg31Capability "${AWG_HEADER_PROTECTION_KEY}" || return 1
+				# Same-mode 3.1 can turn RandomTrailers on via params without
+				# taking the 2.0/3.0 enablement path that already warns.
+				warnIfRandomTrailersSPaddingUnequal
 			else
 				probeAwg3Capability "${AWG_HEADER_PROTECTION_KEY}" || return 1
 			fi
@@ -7144,7 +7147,10 @@ function setAwgProtocolMode() (
 	if (( REPAIRING_SAME_MODE )); then
 		# AWG 3.x repairs deliberately retain the existing shared key. AWG 2.0
 		# repairs also purge dormant 3.x-only values from persisted params.
+		# AWG 3.0 repairs must drop leftover 3.1 fields, or the consistency
+		# check keeps failing and every --enable-awg3 repeats the repair.
 		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_2}" ]] && clearAwg3Params
+		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]] && clearAwg31Params
 	elif [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
 		ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
 		if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_2}" ]]; then

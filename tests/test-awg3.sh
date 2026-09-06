@@ -1026,5 +1026,64 @@ else
 	not_ok "same-mode AWG 3.1 requests re-probe 3.1 support and remain no-ops when configs agree"
 fi
 
+SAME_MODE_31_WARN_LOG="${TEST_ROOT}/same-mode-31-warn.log"
+: >"${SAME_MODE_31_WARN_LOG}"
+if (
+	AWG_PROTOCOL_VERSION=3.1
+	AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
+	AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+	AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+	AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+	AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+	AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+	AWG_RANDOM_TRAILERS="on"
+	AWG_DISABLE_COOKIES="off"
+	SERVER_AWG_S1=20
+	SERVER_AWG_S2=30
+	SERVER_AWG_S3=40
+	SERVER_AWG_S4=50
+	acquireClientLifecycleLock() { :; }
+	loadParams() { :; }
+	ensureAmneziawgKernelModule() { :; }
+	probeAwg31Capability() { :; }
+	warnIfRandomTrailersSPaddingUnequal() { printf 'warn-s-padding\n' >>"${SAME_MODE_31_WARN_LOG}"; }
+	awgProtocolConfigsMatchPersistedState() { return 1; }
+	applyAwgProtocolTransaction() { printf 'apply\n' >>"${SAME_MODE_31_WARN_LOG}"; }
+	setAwgProtocolMode 3.1 >/dev/null 2>&1
+) && [[ "$(paste -sd, "${SAME_MODE_31_WARN_LOG}")" == "warn-s-padding,apply" ]]; then
+	ok "same-mode AWG 3.1 repair warns about unequal S1-S4 when RandomTrailers is on"
+else
+	not_ok "same-mode AWG 3.1 repair warns about unequal S1-S4 when RandomTrailers is on"
+fi
+
+SAME_MODE_3_CLEARS_31_LOG="${TEST_ROOT}/same-mode-3-clears-31.log"
+: >"${SAME_MODE_3_CLEARS_31_LOG}"
+if (
+	AWG_PROTOCOL_VERSION=3
+	AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
+	AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+	AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+	AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+	AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+	AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+	AWG_RANDOM_TRAILERS="on"
+	AWG_DISABLE_COOKIES="off"
+	acquireClientLifecycleLock() { :; }
+	loadParams() { :; }
+	ensureAmneziawgKernelModule() { :; }
+	probeAwg3Capability() { :; }
+	awgProtocolConfigsMatchPersistedState() { return 1; }
+	applyAwgProtocolTransaction() {
+		printf 'apply-%s-%s-%s\n' "${AWG_PROTOCOL_VERSION}" \
+			"${AWG_RANDOM_TRAILERS:-empty}" "${AWG_DISABLE_COOKIES:-empty}" \
+			>>"${SAME_MODE_3_CLEARS_31_LOG}"
+	}
+	setAwgProtocolMode 3 >/dev/null 2>&1
+) && [[ "$(cat "${SAME_MODE_3_CLEARS_31_LOG}")" == "apply-3-empty-empty" ]]; then
+	ok "same-mode AWG 3.0 repair clears dormant AWG 3.1 params"
+else
+	not_ok "same-mode AWG 3.0 repair clears dormant AWG 3.1 params"
+fi
+
 printf '\n%d tests, %d failures\n' "$((PASS + FAIL))" "${FAIL}"
 (( FAIL == 0 ))
