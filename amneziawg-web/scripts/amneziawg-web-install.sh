@@ -300,6 +300,10 @@ parse_args() {
             --poll-interval)
                 POLL_INTERVAL="$2"; shift 2 ;;
             --snapshot-retention-days)
+                if ! [[ "$2" =~ ^[0-9]+$ ]] || [[ "$2" -gt 36500 ]]; then
+                    error "--snapshot-retention-days must be an integer between 0 and 36500"
+                    exit 1
+                fi
                 SNAPSHOT_RETENTION_DAYS="$2"; shift 2 ;;
             --session-ttl)
                 SESSION_TTL="$2"; shift 2 ;;
@@ -692,7 +696,7 @@ EOF
     prompt_default LISTEN_HOST "Bind host" "${LISTEN_HOST}"
     prompt_default LISTEN_PORT "Bind port" "${LISTEN_PORT}"
     prompt_default POLL_INTERVAL "Poll interval (seconds)" "${POLL_INTERVAL}"
-    prompt_default SNAPSHOT_RETENTION_DAYS "Snapshot retention in days (0=unlimited)" "${SNAPSHOT_RETENTION_DAYS}"
+    prompt_default SNAPSHOT_RETENTION_DAYS "Snapshot retention in days (0=unlimited, max 36500)" "${SNAPSHOT_RETENTION_DAYS}"
     prompt_default USERNAME "Admin username" "${USERNAME}"
 
     # Password: only prompt if no hash was supplied

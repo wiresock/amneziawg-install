@@ -402,6 +402,8 @@ impl Poller {
                     days = self.snapshot_retention_days,
                     "snapshot retention days exceeds maximum supported range (36500); skipping cleanup"
                 );
+                self.last_retention_cleanup
+                    .store(now_epoch, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         };
@@ -1157,7 +1159,30 @@ mod tests {
             pks.push(pk);
         }
 
-        let poller = Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(30);
+        // Seed expired snapshots (40 days old) crossing the 5,000-row batch boundary (6,000 rows)
+        // to thoroughly exercise concurrent chunk deletion, inter-batch sleep, and lock yielding.
+        let expired_count = 6000;
+        let expired_ts =
+            (Utc::now() - chrono::Duration::days(40)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        {
+            let mut tx = db.pool.begin().await.expect("seed tx");
+            for i in 0..expired_count {
+                let pk = &pks[i % pks.len()];
+                sqlx::query(
+                    "INSERT INTO snapshots (public_key, captured_at, rx_bytes, tx_bytes) VALUES (?, ?, ?, ?)",
+                )
+                .bind(pk)
+                .bind(&expired_ts)
+                .bind(100)
+                .bind(200)
+                .execute(&mut *tx)
+                .await
+                .expect("seed snapshot");
+            }
+            tx.commit().await.expect("commit seed tx");
+        }
+
+        let poller = Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(31);
 
         // Writer task 1: Poller writing batches of snapshots and upserting peers
         let poller1 = poller.clone();
@@ -1192,13 +1217,16 @@ mod tests {
         // Writer task 2: Snapshot retention cleaner running concurrently
         let poller2 = poller.clone();
         let cleaner_task = tokio::spawn(async move {
+            let mut total_deleted = 0u64;
             for _ in 0..10 {
-                poller2
+                let deleted = poller2
                     .cleanup_expired_snapshots()
                     .await
                     .expect("cleanup in cleaner task");
+                total_deleted += deleted;
                 tokio::time::sleep(Duration::from_millis(8)).await;
             }
+            total_deleted
         });
 
         // Reader task 1: API listing visible peers
@@ -1253,9 +1281,28 @@ mod tests {
             web_updater
         );
         r1.expect("writer task");
-        r2.expect("cleaner task");
+        let cleaner_deleted = r2.expect("cleaner task");
         r3.expect("reader visible task");
         r4.expect("reader history task");
         r5.expect("web updater task");
+
+        // Verify the cleaner actually purged the expired batch across boundaries
+        assert_eq!(cleaner_deleted, expired_count as u64);
+
+        let expired_remaining: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM snapshots WHERE captured_at = ?")
+                .bind(&expired_ts)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count expired snapshots");
+        assert_eq!(expired_remaining.0, 0);
+
+        let fresh_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM snapshots WHERE captured_at > ?")
+                .bind(&expired_ts)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count fresh snapshots");
+        assert!(fresh_count.0 > 0);
     }
 }
