@@ -60,6 +60,9 @@ case "${1:-}" in
 		;;
 	setconf)
 		[[ "${AWG3_TEST_FAIL_SET:-0}" == "0" ]] || exit 1
+		if grep -q '^RandomTrailers = ' "$3"; then
+			[[ "${AWG31_TEST_FAIL_SET:-0}" == "0" ]] || exit 1
+		fi
 		if grep -q '^HeaderProtectionKey = ' "$3"; then
 			grep -q '^ContentPaddingAddition = ' "$3" || exit 1
 		fi
@@ -75,6 +78,8 @@ case "${1:-}" in
 			rekey-timeout) printf '%s\n' '5-7' ;;
 			reject-after-time) printf '%s\n' '181-183' ;;
 			keepalive-timeout) printf '%s\n' '9-11' ;;
+			random-trailers) printf '%s\n' "${AWG31_TEST_TRAILERS_READBACK:-on}" ;;
+			disable-cookies) printf '%s\n' "${AWG31_TEST_COOKIES_READBACK:-on}" ;;
 			*) exit 1 ;;
 		esac
 		;;
@@ -180,6 +185,14 @@ AWG_PROTOCOL_VERSION="2.0"
 normalizeAwgProtocolVersion
 assert_eq "2" "${AWG_PROTOCOL_VERSION}" "legacy 2.0 alias normalizes to AWG 2.0"
 
+AWG_PROTOCOL_VERSION="3.0"
+normalizeAwgProtocolVersion
+assert_eq "3" "${AWG_PROTOCOL_VERSION}" "legacy 3.0 alias stays AWG 3.0, not 3.1"
+
+AWG_PROTOCOL_VERSION="3.1"
+normalizeAwgProtocolVersion
+assert_eq "3.1" "${AWG_PROTOCOL_VERSION}" "AWG 3.1 is an explicit persisted protocol version"
+
 AWG_PROTOCOL_VERSION="2"
 AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
 AWG_CONTENT_PADDING_ADDITION="10-100"
@@ -199,11 +212,27 @@ AWG_KEEPALIVE_TIMEOUT="5-15"
 FIELDS="$(renderAwgProtocolFields)"
 if grep -q '^HeaderProtectionKey = ' <<<"${FIELDS}" && \
 	grep -q '^ContentPaddingAddition = 10-100$' <<<"${FIELDS}" && \
-	grep -q '^KeepaliveTimeout = 5-15$' <<<"${FIELDS}"; then
-	ok "AWG 3.0 rendering includes validated optional fields"
+	grep -q '^KeepaliveTimeout = 5-15$' <<<"${FIELDS}" && \
+	! grep -q '^RandomTrailers = ' <<<"${FIELDS}" && \
+	! grep -q '^DisableCookies = ' <<<"${FIELDS}"; then
+	ok "AWG 3.0 rendering includes validated optional fields and omits 3.1 fields"
 else
-	not_ok "AWG 3.0 rendering includes validated optional fields"
+	not_ok "AWG 3.0 rendering includes validated optional fields and omits 3.1 fields"
 fi
+
+AWG_PROTOCOL_VERSION=3.1
+AWG_RANDOM_TRAILERS="ON"
+AWG_DISABLE_COOKIES="0"
+FIELDS="$(renderAwgProtocolFields)"
+if grep -q '^HeaderProtectionKey = ' <<<"${FIELDS}" && \
+	grep -q '^RandomTrailers = on$' <<<"${FIELDS}" && \
+	grep -q '^DisableCookies = off$' <<<"${FIELDS}"; then
+	ok "AWG 3.1 rendering canonicalizes on/off and includes 3.0 fields"
+else
+	not_ok "AWG 3.1 rendering canonicalizes on/off and includes 3.0 fields"
+fi
+AWG_PROTOCOL_VERSION=3
+clearAwg31Params
 
 if validateAwg3Range "test" "20-10" >/dev/null 2>&1; then
 	not_ok "descending AWG 3.0 ranges are rejected"
@@ -551,6 +580,13 @@ else
 	ok "AWG 2.0 consistency verification rejects dormant AWG 3.0 params"
 fi
 clearAwg3Params
+AWG_RANDOM_TRAILERS="on"
+if awgProtocolConfigsMatchPersistedState >/dev/null 2>&1; then
+	not_ok "AWG 2.0 consistency verification rejects dormant AWG 3.1 params"
+else
+	ok "AWG 2.0 consistency verification rejects dormant AWG 3.1 params"
+fi
+clearAwg3Params
 
 CLIENT_CONSISTENCY_BACKUP="${TEST_ROOT}/client-consistency.backup"
 cp -p "${CLIENT_CONF}" "${CLIENT_CONSISTENCY_BACKUP}"
@@ -609,6 +645,8 @@ if applyAwgProtocolTransaction && \
 	grep -q "^AWG_PROTOCOL_VERSION='3'$" "${AMNEZIAWG_DIR}/params" && \
 	grep -q "^HeaderProtectionKey = ${MOCK_KEY}$" "${SERVER_AWG_CONF}" && \
 	grep -q "^HeaderProtectionKey = ${MOCK_KEY}$" "${CLIENT_CONF}" && \
+	! grep -q '^RandomTrailers = ' "${SERVER_AWG_CONF}" && \
+	! grep -q '^DisableCookies = ' "${CLIENT_CONF}" && \
 	[[ "$(stat -c '%a' "${CLIENT_CONF}")" == "640" ]]; then
 	ok "AWG 3.0 transaction updates params, server, and every active client"
 else
@@ -712,6 +750,281 @@ else
 	not_ok "interrupted protocol migration restores params, server, and client files"
 fi
 unset AWG3_TEST_SERVICE_ACTIVE AWG3_TEST_SIGNAL_ON_STOP
+
+
+# ── AWG 3.1 capability, persistence, and migration ──────────────────────────
+
+AWG_PROTOCOL_VERSION=3.1
+AWG_RANDOM_TRAILERS=""
+AWG_DISABLE_COOKIES="off"
+if validateAwg31Params >/dev/null 2>&1; then
+	not_ok "empty RandomTrailers is rejected in AWG 3.1 mode"
+else
+	ok "empty RandomTrailers is rejected in AWG 3.1 mode"
+fi
+AWG_RANDOM_TRAILERS="maybe"
+if validateAwg31Params >/dev/null 2>&1; then
+	not_ok "invalid RandomTrailers values are rejected"
+else
+	ok "invalid RandomTrailers values are rejected"
+fi
+AWG_RANDOM_TRAILERS="on"
+AWG_DISABLE_COOKIES="off"
+if validateAwg31Params >/dev/null 2>&1; then
+	ok "canonical AWG 3.1 on/off values are accepted"
+else
+	not_ok "canonical AWG 3.1 on/off values are accepted"
+fi
+
+: >"${AWG3_TEST_IP_LOG}"
+if probeAwg31Capability "${MOCK_KEY}"; then
+	if grep -q '^link add dev awgp' "${AWG3_TEST_IP_LOG}" && \
+		grep -q '^link delete dev awgp' "${AWG3_TEST_IP_LOG}"; then
+		ok "AWG 3.1 capability probe applies, reads back, and removes its temporary interface"
+	else
+		not_ok "AWG 3.1 capability probe applies, reads back, and removes its temporary interface"
+	fi
+else
+	not_ok "AWG 3.1 capability probe accepts matching userspace/kernel readback"
+fi
+
+: >"${AWG3_TEST_IP_LOG}"
+AWG31_TEST_TRAILERS_READBACK="off"
+export AWG31_TEST_TRAILERS_READBACK
+if probeAwg31Capability "${MOCK_KEY}" >/dev/null 2>&1; then
+	not_ok "AWG 3.1 capability probe rejects mismatched RandomTrailers readback"
+else
+	if grep -q '^link delete dev awgp' "${AWG3_TEST_IP_LOG}"; then
+		ok "AWG 3.1 capability probe rejects mismatched RandomTrailers readback and cleans up"
+	else
+		not_ok "AWG 3.1 capability probe rejects mismatched RandomTrailers readback and cleans up"
+	fi
+fi
+unset AWG31_TEST_TRAILERS_READBACK
+
+AWG_PROTOCOL_VERSION=3
+AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
+AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+clearAwg31Params
+if ! applyAwgProtocolTransaction >/dev/null 2>&1; then
+	not_ok "restore AWG 3.0 fixture before 3.1 consistency checks"
+else
+	ok "restore AWG 3.0 fixture before 3.1 consistency checks"
+fi
+AWG_RANDOM_TRAILERS="on"
+if awgProtocolConfigsMatchPersistedState >/dev/null 2>&1; then
+	not_ok "AWG 3.0 consistency verification rejects dormant AWG 3.1 params"
+else
+	ok "AWG 3.0 consistency verification rejects dormant AWG 3.1 params"
+fi
+clearAwg31Params
+
+ENABLE_AWG31_FROM_3_LOG="${TEST_ROOT}/enable-awg31-from-3.log"
+: >"${ENABLE_AWG31_FROM_3_LOG}"
+if (
+	AWG_PROTOCOL_VERSION=3
+	AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
+	AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+	AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+	AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+	AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+	AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+	clearAwg31Params
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${ENABLE_AWG31_FROM_3_LOG}"; }
+	loadParams() {
+		printf 'load\n' >>"${ENABLE_AWG31_FROM_3_LOG}"
+		AWG_PROTOCOL_VERSION=3
+	}
+	awg2StateNeedsLegacyMigration() { return 1; }
+	ensureAmneziawgKernelModule() { printf 'ensure-module-%s\n' "${1:-}" >>"${ENABLE_AWG31_FROM_3_LOG}"; }
+	probeAwg3Capability() { printf 'unexpected-probe3\n' >>"${ENABLE_AWG31_FROM_3_LOG}"; }
+	probeAwg31Capability() { printf 'probe31-%s\n' "$1" >>"${ENABLE_AWG31_FROM_3_LOG}"; }
+	applyAwgProtocolTransaction() {
+		printf 'apply-%s-%s-%s-%s\n' "${AWG_PROTOCOL_VERSION}" "${AWG_HEADER_PROTECTION_KEY}" \
+			"${AWG_RANDOM_TRAILERS}" "${AWG_DISABLE_COOKIES}" >>"${ENABLE_AWG31_FROM_3_LOG}"
+	}
+	setAwgProtocolMode 3.1 >/dev/null 2>&1
+) && [[ "$(paste -sd, "${ENABLE_AWG31_FROM_3_LOG}")" == "lock,load,ensure-module-0,probe31-${MOCK_KEY},apply-3.1-${MOCK_KEY}-on-off" ]]; then
+	ok "AWG 3.1 enablement from 3.0 keeps the header key and defaults DisableCookies to off"
+else
+	not_ok "AWG 3.1 enablement from 3.0 keeps the header key and defaults DisableCookies to off"
+fi
+
+AWG_PROTOCOL_VERSION=3.1
+AWG_RANDOM_TRAILERS="on"
+AWG_DISABLE_COOKIES="off"
+if applyAwgProtocolTransaction && \
+	grep -q "^AWG_PROTOCOL_VERSION='3.1'$" "${AMNEZIAWG_DIR}/params" && \
+	grep -q "^RandomTrailers = on$" "${SERVER_AWG_CONF}" && \
+	grep -q "^DisableCookies = off$" "${SERVER_AWG_CONF}" && \
+	grep -q "^RandomTrailers = on$" "${CLIENT_CONF}" && \
+	grep -q "^DisableCookies = off$" "${CLIENT_CONF}" && \
+	grep -q "^HeaderProtectionKey = ${MOCK_KEY}$" "${CLIENT_CONF}"; then
+	ok "AWG 3.1 transaction writes matching RandomTrailers and DisableCookies on server and clients"
+else
+	not_ok "AWG 3.1 transaction writes matching RandomTrailers and DisableCookies on server and clients"
+fi
+
+if awgProtocolConfigsMatchPersistedState; then
+	ok "AWG 3.1 consistency verification accepts matching server and client fields"
+else
+	not_ok "AWG 3.1 consistency verification accepts matching server and client fields"
+fi
+
+sed -i 's/^RandomTrailers = on$/RandomTrailers = off/' "${CLIENT_CONF}"
+if awgProtocolConfigsMatchPersistedState >/dev/null 2>&1; then
+	not_ok "AWG 3.1 consistency verification rejects a mismatched RandomTrailers client field"
+else
+	ok "AWG 3.1 consistency verification rejects a mismatched RandomTrailers client field"
+fi
+sed -i 's/^RandomTrailers = off$/RandomTrailers = on/' "${CLIENT_CONF}"
+
+if [[ "$(grep -c '^RandomTrailers = ' "${SERVER_AWG_CONF}")" == "1" ]] && \
+	[[ "$(grep -c '^DisableCookies = ' "${SERVER_AWG_CONF}")" == "1" ]] && \
+	[[ "$(grep -c '^RandomTrailers = ' "${CLIENT_CONF}")" == "1" ]]; then
+	ok "AWG 3.1 fields appear exactly once on server and client configs"
+else
+	not_ok "AWG 3.1 fields appear exactly once on server and client configs"
+fi
+
+printf '\nI1 = <b 0x00>\n' >>"${SERVER_AWG_CONF}"
+printf '\nI1 = <b 0x00>\n' >>"${CLIENT_CONF}"
+SERVER_PRIV_BEFORE="$(sed -n 's/^PrivateKey = //p' "${CLIENT_CONF}" | head -n1)"
+HASH_BEFORE="$(sha256sum "${SERVER_AWG_CONF}" "${CLIENT_CONF}")"
+if applyAwgProtocolTransaction && \
+	[[ "$(grep -c '^RandomTrailers = ' "${SERVER_AWG_CONF}")" == "1" ]] && \
+	[[ "$(grep -c '^DisableCookies = ' "${CLIENT_CONF}")" == "1" ]] && \
+	grep -q '^I1 = <b 0x00>$' "${SERVER_AWG_CONF}" && \
+	grep -q '^I1 = <b 0x00>$' "${CLIENT_CONF}" && \
+	[[ "$(sed -n 's/^PrivateKey = //p' "${CLIENT_CONF}" | head -n1)" == "${SERVER_PRIV_BEFORE}" ]]; then
+	ok "AWG 3.1 rewrite is idempotent, preserves private keys, and does not strip I1"
+else
+	not_ok "AWG 3.1 rewrite is idempotent, preserves private keys, and does not strip I1"
+fi
+HASH_AFTER="$(sha256sum "${SERVER_AWG_CONF}" "${CLIENT_CONF}")"
+if applyAwgProtocolTransaction && [[ "${HASH_AFTER}" == "$(sha256sum "${SERVER_AWG_CONF}" "${CLIENT_CONF}")" ]]; then
+	ok "repeated AWG 3.1 rewrite leaves configs byte-identical"
+else
+	not_ok "repeated AWG 3.1 rewrite leaves configs byte-identical"
+fi
+sed -i '/^I1 = /d' "${SERVER_AWG_CONF}" "${CLIENT_CONF}"
+
+AWG_RANDOM_TRAILERS="off"
+AWG_DISABLE_COOKIES="off"
+if applyAwgProtocolTransaction && \
+	grep -q "^RandomTrailers = off$" "${SERVER_AWG_CONF}" && \
+	grep -q "^DisableCookies = off$" "${CLIENT_CONF}" && \
+	awgProtocolConfigsMatchPersistedState; then
+	ok "AWG 3.1 persists RandomTrailers=off and DisableCookies=off on server and clients"
+else
+	not_ok "AWG 3.1 persists RandomTrailers=off and DisableCookies=off on server and clients"
+fi
+
+AWG_RANDOM_TRAILERS="on"
+AWG_DISABLE_COOKIES="on"
+if applyAwgProtocolTransaction && \
+	grep -q "^RandomTrailers = on$" "${SERVER_AWG_CONF}" && \
+	grep -q "^DisableCookies = on$" "${SERVER_AWG_CONF}" && \
+	grep -q "^RandomTrailers = on$" "${CLIENT_CONF}" && \
+	grep -q "^DisableCookies = on$" "${CLIENT_CONF}"; then
+	ok "AWG 3.1 persists RandomTrailers=on and DisableCookies=on together"
+else
+	not_ok "AWG 3.1 persists RandomTrailers=on and DisableCookies=on together"
+fi
+
+AWG_RANDOM_TRAILERS="off"
+AWG_DISABLE_COOKIES="on"
+if applyAwgProtocolTransaction && \
+	grep -q "^RandomTrailers = off$" "${CLIENT_CONF}" && \
+	grep -q "^DisableCookies = on$" "${CLIENT_CONF}"; then
+	ok "AWG 3.1 persists mixed RandomTrailers=off and DisableCookies=on"
+else
+	not_ok "AWG 3.1 persists mixed RandomTrailers=off and DisableCookies=on"
+fi
+
+AWG_RANDOM_TRAILERS="on"
+AWG_DISABLE_COOKIES="off"
+applyAwgProtocolTransaction >/dev/null 2>&1
+
+AWG_PROTOCOL_VERSION=3
+clearAwg31Params
+if applyAwgProtocolTransaction && \
+	grep -q "^AWG_PROTOCOL_VERSION='3'$" "${AMNEZIAWG_DIR}/params" && \
+	! grep -q '^RandomTrailers = ' "${SERVER_AWG_CONF}" && \
+	! grep -q '^DisableCookies = ' "${CLIENT_CONF}" && \
+	grep -q "^HeaderProtectionKey = ${MOCK_KEY}$" "${SERVER_AWG_CONF}"; then
+	ok "AWG 3.1 to 3.0 downgrade removes 3.1 fields and keeps header protection"
+else
+	not_ok "AWG 3.1 to 3.0 downgrade removes 3.1 fields and keeps header protection"
+fi
+
+ENABLE_AWG31_FROM_2_LOG="${TEST_ROOT}/enable-awg31-from-2.log"
+: >"${ENABLE_AWG31_FROM_2_LOG}"
+if (
+	AWG_PROTOCOL_VERSION=2
+	clearAwg3Params
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${ENABLE_AWG31_FROM_2_LOG}"; }
+	loadParams() {
+		printf 'load\n' >>"${ENABLE_AWG31_FROM_2_LOG}"
+		AWG_PROTOCOL_VERSION=2
+	}
+	awg2StateNeedsLegacyMigration() { return 1; }
+	ensureAmneziawgKernelModule() { printf 'ensure-module-%s\n' "${1:-}" >>"${ENABLE_AWG31_FROM_2_LOG}"; }
+	probeAwg3Capability() { printf 'unexpected-probe3\n' >>"${ENABLE_AWG31_FROM_2_LOG}"; }
+	probeAwg31Capability() { printf 'probe31\n' >>"${ENABLE_AWG31_FROM_2_LOG}"; }
+	applyAwgProtocolTransaction() { printf 'apply-%s\n' "${AWG_PROTOCOL_VERSION}" >>"${ENABLE_AWG31_FROM_2_LOG}"; }
+	setAwgProtocolMode 3.1 >/dev/null 2>&1
+) && [[ "$(paste -sd, "${ENABLE_AWG31_FROM_2_LOG}")" == "lock,load,ensure-module-0,probe31,apply-3.1" ]]; then
+	ok "AWG 3.1 enablement from 2.0 probes 3.1 support rather than 3.0-only support"
+else
+	not_ok "AWG 3.1 enablement from 2.0 probes 3.1 support rather than 3.0-only support"
+fi
+
+: >"${AWG3_TEST_IP_LOG}"
+AWG31_TEST_FAIL_SET=1
+export AWG31_TEST_FAIL_SET
+if probeAwg3Capability "${MOCK_KEY}" >/dev/null 2>&1 && \
+	! probeAwg31Capability "${MOCK_KEY}" >/dev/null 2>&1; then
+	PROBE31_ERR="$(probeAwg31Capability "${MOCK_KEY}" 2>&1 || true)"
+	if [[ "${PROBE31_ERR}" == *"RandomTrailers/DisableCookies"* ]]; then
+		ok "AWG 3.1 probe fails closed when tools reject 3.1 fields while AWG 3.0 still works"
+	else
+		not_ok "AWG 3.1 probe fails closed when tools reject 3.1 fields while AWG 3.0 still works"
+	fi
+else
+	not_ok "AWG 3.1 probe fails closed when tools reject 3.1 fields while AWG 3.0 still works"
+fi
+unset AWG31_TEST_FAIL_SET
+
+SAME_MODE_31_LOG="${TEST_ROOT}/same-mode-31.log"
+: >"${SAME_MODE_31_LOG}"
+if (
+	AWG_PROTOCOL_VERSION=3.1
+	AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
+	AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+	AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+	AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+	AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+	AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+	AWG_RANDOM_TRAILERS="off"
+	AWG_DISABLE_COOKIES="on"
+	acquireClientLifecycleLock() { printf 'lock\n' >>"${SAME_MODE_31_LOG}"; }
+	loadParams() { printf 'load\n' >>"${SAME_MODE_31_LOG}"; }
+	ensureAmneziawgKernelModule() { printf 'ensure-module-%s\n' "${1:-}" >>"${SAME_MODE_31_LOG}"; }
+	probeAwg3Capability() { printf 'unexpected-probe3\n' >>"${SAME_MODE_31_LOG}"; }
+	probeAwg31Capability() { printf 'probe31-%s\n' "$1" >>"${SAME_MODE_31_LOG}"; }
+	awgProtocolConfigsMatchPersistedState() { return 0; }
+	applyAwgProtocolTransaction() { printf 'unexpected-apply\n' >>"${SAME_MODE_31_LOG}"; return 1; }
+	setAwgProtocolMode 3.1 >/dev/null 2>&1
+) && [[ "$(paste -sd, "${SAME_MODE_31_LOG}")" == "lock,load,ensure-module-0,probe31-${MOCK_KEY}" ]]; then
+	ok "same-mode AWG 3.1 requests re-probe 3.1 support and remain no-ops when configs agree"
+else
+	not_ok "same-mode AWG 3.1 requests re-probe 3.1 support and remain no-ops when configs agree"
+fi
 
 printf '\n%d tests, %d failures\n' "$((PASS + FAIL))" "${FAIL}"
 (( FAIL == 0 ))

@@ -691,6 +691,7 @@ resolve_awg_install_script_refresh() {
     if [[ -x "${AWG_INSTALL_SCRIPT_DEST}" ]] && \
             grep -q -- '--protocol-status' "${AWG_INSTALL_SCRIPT_DEST}" && \
             grep -q -- '--enable-awg3' "${AWG_INSTALL_SCRIPT_DEST}" && \
+            grep -q -- '--enable-awg31' "${AWG_INSTALL_SCRIPT_DEST}" && \
             grep -q -- '--disable-awg3' "${AWG_INSTALL_SCRIPT_DEST}"; then
         warn "Repository lifecycle script is unavailable; preserving compatible installed script: ${AWG_INSTALL_SCRIPT_DEST}"
         REFRESH_AWG_INSTALL_SCRIPT="false"
@@ -805,7 +806,7 @@ stage_awg_install_script() {
     if ! /bin/bash -n "${STAGED_AWG_INSTALL_SCRIPT}"; then
         die "Staged AWG lifecycle script failed its Bash syntax check"
     fi
-    for required_flag in --protocol-status --enable-awg3 --disable-awg3; do
+    for required_flag in --protocol-status --enable-awg3 --enable-awg31 --disable-awg3; do
         if ! grep -q -- "${required_flag}" "${STAGED_AWG_INSTALL_SCRIPT}"; then
             die "Staged AWG lifecycle script is missing required flag: ${required_flag}"
         fi

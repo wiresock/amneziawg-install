@@ -239,6 +239,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `POST` | `/admin/users/add` | Yes | HTML form: add new user (PRG redirect) |
 | `POST` | `/admin/users/:id/remove` | Yes | HTML form: remove user (PRG redirect) |
 | `POST` | `/admin/protocol/enable-awg3` | Yes | Confirmed HTML form: probe support and atomically migrate the interface plus all clients to AWG 3.0 (incompatible with `amneziawg-proxy`) |
+| `POST` | `/admin/protocol/enable-awg31` | Yes | Confirmed HTML form: migrate to AWG 3.1 (`RandomTrailers` on, `DisableCookies` off; incompatible with `amneziawg-proxy`) |
 | `POST` | `/admin/protocol/disable-awg3` | Yes | Confirmed HTML form: atomically return the interface plus all clients to AWG 2.0 |
 | `GET` | `/login` | No | Login form |
 | `POST` | `/login` | No | Validate credentials, set cookie |
@@ -253,7 +254,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `GET` | `/api/events` | Yes | Audit log (`?peer_id=`, `?event_type=`, `?limit=`) |
 | `POST` | `/api/admin/users` | Yes | JSON API: create user `{"name":"...","comment":"optional note"}` (`comment` optional, max 512 characters) |
 | `POST` | `/api/admin/users/:id/remove` | Yes | JSON API: remove user |
-| `GET` | `/api/admin/protocol` | Yes | Normalized protocol status (`2.0` for legacy/missing state, otherwise `3.0`) |
+| `GET` | `/api/admin/protocol` | Yes | Normalized protocol status (`2.0` for legacy/missing state, `3.0`, or `3.1`) |
 
 ---
 
@@ -307,8 +308,8 @@ API, or written to application logs.
 
 > [!WARNING]
 > **Compatibility with amneziawg-proxy:**
-> `amneziawg-proxy` is compatible **only with AmneziaWG 2.0**. Enabling AWG 3.0 via
-> `/admin/protocol/enable-awg3` will cause `amneziawg-proxy` to fail packet classification
+> `amneziawg-proxy` is compatible **only with AmneziaWG 2.0**. Enabling AWG 3.0 or 3.1 via
+> `/admin/protocol/enable-awg3` or `/admin/protocol/enable-awg31` will cause `amneziawg-proxy` to fail packet classification
 > and stop camouflaging traffic. If `amneziawg-proxy` is in use, keep the interface on AWG 2.0.
 
 **Troubleshooting:** If peer polling fails with "Operation not permitted",

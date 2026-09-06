@@ -342,14 +342,14 @@ detect_awg_config() {
             LISTEN_PORT="${port}"
             info "Detected AWG listen port: ${LISTEN_PORT}"
         fi
-        if [[ "${proto}" == "3" ]]; then
+        if [[ "${proto}" == "3" || "${proto}" == "3.0" || "${proto}" == "3.1" ]]; then
             if [[ -n "${AWG_NIC}" ]]; then
-                warn "AmneziaWG 3.0 protocol detected on ${AWG_NIC}."
+                warn "AmneziaWG ${proto} protocol detected on ${AWG_NIC}."
             else
-                warn "AmneziaWG 3.0 protocol detected."
+                warn "AmneziaWG ${proto} protocol detected."
             fi
             warn "amneziawg-proxy is compatible ONLY with AmneziaWG 2.0."
-            warn "AWG 3.0 uses S1-S4 padding as key material for header encryption,"
+            warn "AWG 3.0+ uses S1-S4 padding as key material for header encryption,"
             warn "so proxy obfuscation breaks packet classification and compatibility."
             warn "Please downgrade the interface to AWG 2.0 via 'amneziawg-install.sh --disable-awg3'."
         fi

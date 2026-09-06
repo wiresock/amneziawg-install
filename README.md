@@ -14,8 +14,8 @@ This project started as a fork of [RomikB/amneziawg-install](https://github.com/
 
 Once the installer was solid, it was hard to stop:
 
-1. **`amneziawg-install.sh`** — the original script, extended for AmneziaWG 2.0 (S3/S4, H1–H4, migration from pre-2.0 installs) and optional AmneziaWG 3.0 header protection.
-2. **`amneziawg-web.sh`** — a web panel for managing clients and explicit AWG 2.0/AWG 3.0 migrations without touching the CLI.
+1. **`amneziawg-install.sh`** — the original script, extended for AmneziaWG 2.0 (S3/S4, H1–H4, migration from pre-2.0 installs), optional AmneziaWG 3.0 header protection, and optional AmneziaWG 3.1 (`RandomTrailers` / `DisableCookies`).
+2. **`amneziawg-web.sh`** — a web panel for managing clients and explicit AWG 2.0 / 3.0 / 3.1 migrations without touching the CLI.
 3. **`amneziawg-proxy.sh`** — a UDP obfuscation proxy that takes traffic camouflage to the next level: it wraps AmneziaWG (AWG 2.0 only) so the datagrams on the wire look like a legitimate QUIC, DNS, STUN, or SIP service to Deep Packet Inspection (DPI).
 
 > **⚠️ amneziawg-proxy is compatible only with AmneziaWG 2.0 and is most powerful with WireSock Secure Connect 3.5+.**
@@ -372,36 +372,63 @@ sudo ./amneziawg-install.sh --list-clients
 
 ---
 
-## 🔐 Optional AWG 3.0 Mode
+## 🔐 Optional AWG 3.0 / 3.1 Mode
 
 > [!WARNING]
 > **Incompatible with amneziawg-proxy:**
-> Do **not** enable AWG 3.0 if you are using `amneziawg-proxy`. Because AmneziaWG 3.0 incorporates the S1–S4 padding values as key material for header protection, the proxy's padding transformations corrupt header decryption and break packet classification.
+> Do **not** enable AWG 3.0 or AWG 3.1 if you are using `amneziawg-proxy`. Because AmneziaWG 3.0+ incorporates the S1–S4 padding values as key material for header protection, the proxy's padding transformations corrupt header decryption and break packet classification.
 >
-> If you require `amneziawg-proxy`, keep your interface in AWG 2.0 mode (the default). If an interface was already migrated to AWG 3.0, revert it to AWG 2.0 using `sudo ./amneziawg-install.sh --disable-awg3` (or via the web panel under **AWG protocol**) before setting up or running the proxy.
+> If you require `amneziawg-proxy`, keep your interface in AWG 2.0 mode (the default). If an interface was already migrated to AWG 3.0 or 3.1, revert it to AWG 2.0 using `sudo ./amneziawg-install.sh --disable-awg3` (or via the web panel under **AWG protocol**) before setting up or running the proxy.
 
 Fresh installs and parameter files created by earlier releases use AWG 2.0 by
 default. Installing or upgrading this project never changes an existing
-interface's protocol mode.
+interface's protocol mode. Existing AWG 3.0 installations stay on 3.0 until
+you explicitly enable AWG 3.1.
 
 ```bash
-# Missing protocol state is reported as 2.0
+# Missing protocol state is reported as 2
 sudo ./amneziawg-install.sh --protocol-status
 
 # Probe userspace + running kernel support, then migrate the server and clients
 sudo ./amneziawg-install.sh --enable-awg3
 
-# Atomically remove AWG 3.0-only fields and return every config to AWG 2.0
+# Enable AWG 3.1 (AWG 3.0 plus RandomTrailers; DisableCookies stays off)
+sudo ./amneziawg-install.sh --enable-awg31
+
+# Atomically remove AWG 3.x-only fields and return every config to AWG 2.0
 sudo ./amneziawg-install.sh --disable-awg3
 ```
 
 AWG 3.0 header protection is interface-wide and cannot communicate with AWG
-2.0 clients on the same interface. Enabling it creates one shared header key,
-validates all generated configs, and updates the server plus every recoverable
-client config as one transaction. If capability validation, file replacement,
-service restart, or the process itself fails, the previous state is restored.
-Redistribute every client config after either migration. The web panel exposes
-the same confirmed operations under **AWG protocol**.
+2.0 clients on the same interface. AWG 3.1 is AWG 3.0 plus `RandomTrailers`
+(must match on every peer) and optional `DisableCookies` (server-sent Cookie
+Reply / anti-DoS; default `off`). Enabling a mode creates or keeps one shared
+header key, validates all generated configs, and updates the server plus every
+recoverable client config as one transaction. If capability validation, file
+replacement, service restart, or the process itself fails, the previous state
+is restored. Redistribute every client config after a migration. The web panel
+exposes the same confirmed operations under **AWG protocol**.
+
+When `RandomTrailers` is on, upstream recommends identical `S1`–`S4` values to
+reduce packet-type misdetection. The installer warns if they differ and does
+not rewrite existing S-values.
+
+**What this installer implements**
+
+| Mode | Fields |
+| --- | --- |
+| AWG 2.0 | `Jc`, `Jmin`, `Jmax`, `S1`–`S4`, `H1`–`H4` |
+| AWG 3.0 | AWG 2.0 plus `HeaderProtectionKey`, optional `ContentPaddingAddition`, `RekeyAfterTime`, `RekeyTimeout`, `RejectAfterTime`, `KeepaliveTimeout` |
+| AWG 3.1 | AWG 3.0 plus `RandomTrailers` and `DisableCookies` |
+
+Clients and the server must run AWG 3.1-capable implementations (`amneziawg-tools`
+plus the running kernel module, or an equivalent 3.1 userspace stack). The
+installer does not trust package version strings; it probes by applying the
+fields to a temporary interface and reading them back. `I1`–`I5` (CPS) are
+intentionally not generated, persisted, or migrated. Upstream also defines
+optional `MaxHandshakeAttempts`; this installer does not manage that field
+(same as the existing AWG 3.0 mode). Externally added `I1`–`I5` or
+`MaxHandshakeAttempts` lines are left in place during protocol rewrites.
 
 ---
 

@@ -389,7 +389,7 @@ emit_safe_params() {
             SERVER_AWG_H2|SERVER_AWG_H3|SERVER_AWG_H4|AWG_PROTOCOL_VERSION|\
             AWG_HEADER_PROTECTION_KEY|AWG_CONTENT_PADDING_ADDITION|\
             AWG_REKEY_AFTER_TIME|AWG_REKEY_TIMEOUT|AWG_REJECT_AFTER_TIME|\
-            AWG_KEEPALIVE_TIMEOUT)
+            AWG_KEEPALIVE_TIMEOUT|AWG_RANDOM_TRAILERS|AWG_DISABLE_COOKIES)
                 printf '%s\n' "${line}"
                 ;;
         esac
@@ -416,6 +416,9 @@ emit_protocol_status() {
             ;;
         3|3.0)
             printf '3\n'
+            ;;
+        3.1)
+            printf '3.1\n'
             ;;
         *)
             fail "params contain an unsupported AWG protocol version"
@@ -817,6 +820,11 @@ main() {
         enable-awg3)
             require_arg_count "${subcommand}" 0 "$#"
             run_protocol_migration --enable-awg3
+            return 0
+            ;;
+        enable-awg31)
+            require_arg_count "${subcommand}" 0 "$#"
+            run_protocol_migration --enable-awg31
             return 0
             ;;
         disable-awg3)
