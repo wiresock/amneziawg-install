@@ -95,9 +95,7 @@ impl Poller {
         self
     }
 
-    /// Run the polling loop forever.  Uses `tokio::time::interval` so that
-    /// cycles are tick-aligned – the period between the *start* of consecutive
-    /// cycles is `interval`, regardless of how long each `poll_once` takes.
+    /// Run the polling loop and independent retention task forever.
     pub async fn run(&self) {
         if self.snapshot_retention_days > 0 {
             info!(
@@ -113,12 +111,52 @@ impl Poller {
                 "poller started (snapshot retention disabled)"
             );
         }
+
+        tokio::join!(self.run_poll_loop(), self.run_retention_loop());
+    }
+
+    async fn run_poll_loop(&self) {
         let mut ticker = tokio::time::interval(self.interval);
         loop {
             ticker.tick().await;
             if let Err(e) = self.poll_once().await {
                 error!(error = %e, "poll cycle failed");
             }
+        }
+    }
+
+    /// Independent retention loop that runs snapshot cleanup on startup and
+    /// subsequently every hour. If an expired snapshot backlog remains,
+    /// continues draining in bounded chunks with a 1-second pause between steps
+    /// until fully cleared, without delaying or being delayed by the AWG poller.
+    pub async fn run_retention_loop(&self) {
+        self.run_retention_loop_with_intervals(
+            Duration::from_secs(3600),
+            Duration::from_secs(1),
+        )
+        .await;
+    }
+
+    pub async fn run_retention_loop_with_intervals(
+        &self,
+        interval: Duration,
+        backlog_delay: Duration,
+    ) {
+        if self.snapshot_retention_days == 0 {
+            return;
+        }
+
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+
+            let mut more_remaining = self.cleanup_expired_snapshots_step().await;
+            while more_remaining {
+                tokio::time::sleep(backlog_delay).await;
+                more_remaining = self.cleanup_expired_snapshots_step().await;
+            }
+
+            ticker.reset();
         }
     }
 
@@ -146,12 +184,6 @@ impl Poller {
                 error!(error = %e, "expired-user cleanup query failed – continuing");
             }
         }
-
-        // ── Step 0b: Snapshot retention cleanup ──────────────────────────────
-        // Periodically purges historical traffic snapshots older than
-        // `snapshot_retention_days`. Runs bounded chunk deletions to prevent
-        // holding prolonged locks.
-        self.cleanup_expired_snapshots_step().await;
 
         // ── Step 1–3: AWG data ───────────────────────────────────────────────
         let interfaces = match awg::show_all_dump() {
@@ -377,24 +409,12 @@ impl Poller {
         Ok(res.deleted)
     }
 
-    async fn cleanup_expired_snapshots_step(&self) {
+    pub async fn cleanup_expired_snapshots_step(&self) -> bool {
         if self.snapshot_retention_days == 0 {
-            return;
+            return false;
         }
 
         let now_epoch = chrono::Utc::now().timestamp();
-        let last_epoch = self
-            .last_retention_cleanup
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        // Run if:
-        // 1. Initial startup run (last_epoch == 0)
-        // 2. Continuing to drain an existing backlog from previous tick (last_epoch < 0)
-        // 3. Hourly scheduled interval elapsed (last_epoch > 0 && now_epoch - last_epoch >= 3600)
-        if last_epoch > 0 && now_epoch - last_epoch < 3600 {
-            return;
-        }
-
         let retention_duration = match chrono::Duration::try_days(self.snapshot_retention_days as i64) {
             Some(dur) if self.snapshot_retention_days <= 36_500 => dur,
             _ => {
@@ -404,15 +424,15 @@ impl Poller {
                 );
                 self.last_retention_cleanup
                     .store(now_epoch, std::sync::atomic::Ordering::Relaxed);
-                return;
+                return false;
             }
         };
 
         let cutoff = chrono::Utc::now() - retention_duration;
         let cutoff_str = cutoff.to_rfc3339_opts(SecondsFormat::Secs, true);
 
-        // Cap to 2 batches (up to 10,000 rows) per tick with 25ms pause between batches,
-        // preventing the poller from being delayed and yielding the SQLite write lock.
+        // Cap to 2 batches (up to 10,000 rows) per step with 25ms pause between batches,
+        // preventing prolonged lock contention and yielding the SQLite write lock.
         match crate::db::peers::delete_expired_snapshots(&self.db.pool, &cutoff_str, 5000, Some(2)).await {
             Ok(result) => {
                 if result.deleted > 0 {
@@ -424,18 +444,17 @@ impl Poller {
                     );
                 }
                 if result.more_remaining {
-                    // Backlog remains; mark last_retention_cleanup as -1 so the next
-                    // poller cycle immediately processes the next chunk.
                     self.last_retention_cleanup
                         .store(-1, std::sync::atomic::Ordering::Relaxed);
                 } else {
-                    // Fully caught up; record current epoch to schedule next run in 1 hour.
                     self.last_retention_cleanup
                         .store(now_epoch, std::sync::atomic::Ordering::Relaxed);
                 }
+                result.more_remaining
             }
             Err(e) => {
                 error!(error = %e, "expired snapshot cleanup failed – continuing");
+                false
             }
         }
     }
@@ -1137,6 +1156,70 @@ mod tests {
         assert_eq!(remaining.len(), 0);
         // last_retention_cleanup was updated to positive epoch
         assert!(poller.last_retention_cleanup.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn run_retention_loop_runs_on_startup_and_interval() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let pk = "KEY_RETENTION_LOOP=";
+
+        // Insert 10 old snapshots (50 days ago)
+        for i in 1..=10 {
+            let ts = (Utc::now() - chrono::Duration::days(50 + i))
+                .to_rfc3339_opts(SecondsFormat::Secs, true);
+            sqlx::query(
+                "INSERT INTO snapshots (public_key, captured_at, rx_bytes, tx_bytes) VALUES (?, ?, 10, 20)",
+            )
+            .bind(pk)
+            .bind(&ts)
+            .execute(&db.pool)
+            .await
+            .expect("insert snapshot");
+        }
+
+        // Create poller with 31 days retention and a 7200s poller interval (to verify it doesn't wait on poller)
+        let poller = Poller::new(db.clone(), 7200, PathBuf::from(".")).with_retention_days(31);
+
+        // Spawn retention loop with 50ms interval and 10ms backlog delay
+        let poller_clone = poller.clone();
+        let handle = tokio::spawn(async move {
+            poller_clone
+                .run_retention_loop_with_intervals(Duration::from_millis(50), Duration::from_millis(10))
+                .await;
+        });
+
+        // Give it a moment to run the startup cleanup
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let remaining = crate::db::peers::find_snapshots(&db.pool, pk, 20)
+            .await
+            .expect("find snapshots");
+        assert_eq!(remaining.len(), 0);
+        assert!(poller.last_retention_cleanup.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+        // Insert more expired snapshots and verify the loop picks them up on the next tick
+        for i in 1..=5 {
+            let ts = (Utc::now() - chrono::Duration::days(50 + i))
+                .to_rfc3339_opts(SecondsFormat::Secs, true);
+            sqlx::query(
+                "INSERT INTO snapshots (public_key, captured_at, rx_bytes, tx_bytes) VALUES (?, ?, 10, 20)",
+            )
+            .bind(pk)
+            .bind(&ts)
+            .execute(&db.pool)
+            .await
+            .expect("insert snapshot");
+        }
+
+        // Wait for the next 50ms tick
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let remaining_after = crate::db::peers::find_snapshots(&db.pool, pk, 20)
+            .await
+            .expect("find snapshots");
+        assert_eq!(remaining_after.len(), 0);
+
+        handle.abort();
     }
 
     #[tokio::test]
