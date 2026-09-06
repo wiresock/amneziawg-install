@@ -4030,7 +4030,7 @@ fn render_protocol_controls(csrf_token: &str) -> String {
   </form>
 </section>
 <section id="protocol-enable-awg31">
-  <p class="creation-warning"><strong>AWG 3.1 adds RandomTrailers (must match on every client) on top of AWG 3.0.</strong> DisableCookies defaults to off (it disables Cookie Reply / anti-DoS). To change it, set <code>AWG_DISABLE_COOKIES</code> in the installer params file and regenerate every client config; editing a generated file alone will not persist. Existing AWG 3.0 installs are not upgraded automatically.</p>
+  <p class="creation-warning"><strong>AWG 3.1 adds RandomTrailers (must match on every client) on top of AWG 3.0.</strong> DisableCookies defaults to off (it disables Cookie Reply / anti-DoS). To change it, set <code>AWG_DISABLE_COOKIES</code> in the installer params file, then run <code>amneziawg-install.sh --enable-awg31</code> so the same-mode transaction updates the server and every client together. Regenerating clients or editing a generated file alone leaves the live server config stale. Existing AWG 3.0 installs are not upgraded automatically.</p>
   <form method="POST" action="/admin/protocol/enable-awg31">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
