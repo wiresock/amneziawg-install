@@ -401,7 +401,7 @@ docker run -d \
 | `AWG_WEB_DB` | `awg-web.db` | SQLite database path |
 | `AWG_CONFIG_DIR` | `/etc/amnezia/amneziawg/clients` | Client `.conf` directory |
 | `AWG_POLL_INTERVAL` | `30` | Poll interval in seconds |
-| `AWG_SNAPSHOT_RETENTION_DAYS` | `31` | Snapshot retention in days (0 to disable) |
+| `AWG_SNAPSHOT_RETENTION_DAYS` | `31` | Snapshot retention window in days (0 to disable). Each peer may keep one older baseline snapshot for usage deltas. |
 | `RUST_LOG` | `amneziawg_web=info` | Log verbosity |
 | `AUTH_ENABLED` | `false` | Enable auth; set `true` in production |
 | `AUTH_USERNAME` | `admin` | Admin username |

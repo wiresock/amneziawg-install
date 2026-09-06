@@ -4,7 +4,7 @@
 //! between the *start* of consecutive cycles is `interval` seconds, regardless
 //! of how long each cycle takes.
 //!
-//! 1. Calls `awg::show_all_dump()` – reads current AWG state.
+//! 1. Calls `awg::show_all_dump()` on a blocking thread – reads current AWG state.
 //! 2. Writes a snapshot row per peer into `snapshots`.
 //! 3. Upserts each peer into the `peers` table.
 //!    3b. Removes disabled peers from the running AWG interface
@@ -126,15 +126,13 @@ impl Poller {
     }
 
     /// Independent retention loop that runs snapshot cleanup on startup and
-    /// subsequently every hour. If an expired snapshot backlog remains,
-    /// continues draining in bounded chunks with a 1-second pause between steps
-    /// until fully cleared, without delaying or being delayed by the AWG poller.
+    /// subsequently every hour. If a deletable (non-baseline) snapshot backlog
+    /// remains, continues draining in bounded chunks with a 1-second pause
+    /// between steps until fully cleared. AWG dump collection runs on the
+    /// blocking pool, so a slow `awg` command does not stall this timer.
     pub async fn run_retention_loop(&self) {
-        self.run_retention_loop_with_intervals(
-            Duration::from_secs(3600),
-            Duration::from_secs(1),
-        )
-        .await;
+        self.run_retention_loop_with_intervals(Duration::from_secs(3600), Duration::from_secs(1))
+            .await;
     }
 
     pub async fn run_retention_loop_with_intervals(
@@ -186,7 +184,10 @@ impl Poller {
         }
 
         // ── Step 1–3: AWG data ───────────────────────────────────────────────
-        let interfaces = match awg::show_all_dump() {
+        // `awg show all dump` is a blocking process; run it off the async
+        // executor so the independent retention timer (and HTTP tasks) can
+        // still be polled while the command is in flight.
+        let interfaces = match collect_awg_dump().await {
             Ok(ifaces) => ifaces,
             Err(awg::AwgError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 warn!("awg binary not found at /usr/bin/awg – skipping poll cycle");
@@ -380,14 +381,17 @@ impl Poller {
 
     /// Purge snapshots older than `snapshot_retention_days` (if configured > 0).
     ///
-    /// Drains all expired snapshots. Returns the total number of snapshots deleted.
+    /// Each peer keeps its newest pre-cutoff snapshot as a usage baseline.
+    /// Returns the number of snapshots deleted.
     #[cfg(test)]
     pub async fn cleanup_expired_snapshots(&self) -> anyhow::Result<u64> {
         if self.snapshot_retention_days == 0 {
             return Ok(0);
         }
 
-        let retention_duration = match chrono::Duration::try_days(self.snapshot_retention_days as i64) {
+        let retention_duration = match chrono::Duration::try_days(
+            self.snapshot_retention_days as i64,
+        ) {
             Some(dur) if self.snapshot_retention_days <= 36_500 => dur,
             _ => {
                 warn!(
@@ -401,7 +405,8 @@ impl Poller {
         let cutoff = chrono::Utc::now() - retention_duration;
         let cutoff_str = cutoff.to_rfc3339_opts(SecondsFormat::Secs, true);
         let res =
-            crate::db::peers::delete_expired_snapshots(&self.db.pool, &cutoff_str, 5000, None).await?;
+            crate::db::peers::delete_expired_snapshots(&self.db.pool, &cutoff_str, 5000, None)
+                .await?;
         self.last_retention_cleanup.store(
             chrono::Utc::now().timestamp(),
             std::sync::atomic::Ordering::Relaxed,
@@ -415,7 +420,9 @@ impl Poller {
         }
 
         let now_epoch = chrono::Utc::now().timestamp();
-        let retention_duration = match chrono::Duration::try_days(self.snapshot_retention_days as i64) {
+        let retention_duration = match chrono::Duration::try_days(
+            self.snapshot_retention_days as i64,
+        ) {
             Some(dur) if self.snapshot_retention_days <= 36_500 => dur,
             _ => {
                 warn!(
@@ -433,7 +440,9 @@ impl Poller {
 
         // Cap to 2 batches (up to 10,000 rows) per step with 25ms pause between batches,
         // preventing prolonged lock contention and yielding the SQLite write lock.
-        match crate::db::peers::delete_expired_snapshots(&self.db.pool, &cutoff_str, 5000, Some(2)).await {
+        match crate::db::peers::delete_expired_snapshots(&self.db.pool, &cutoff_str, 5000, Some(2))
+            .await
+        {
             Ok(result) => {
                 if result.deleted > 0 {
                     info!(
@@ -506,9 +515,7 @@ impl Poller {
             }
         }
 
-        tx.commit()
-            .await
-            .context("commit poll batch transaction")?;
+        tx.commit().await.context("commit poll batch transaction")?;
         Ok(snapshots_written)
     }
 
@@ -637,37 +644,59 @@ impl Poller {
     }
 }
 
+/// Run blocking `awg show all dump` off the async executor.
+///
+/// A hung or slow AWG command still occupies a blocking-pool thread until it
+/// returns, but it must not stall the Tokio worker that drives the retention
+/// timer and HTTP tasks.
+async fn collect_awg_dump() -> Result<Vec<awg::AwgInterface>, awg::AwgError> {
+    collect_awg_dump_with(awg::show_all_dump).await
+}
+
+#[allow(clippy::io_other_error)] // Error::other requires Rust 1.83; crate MSRV is 1.75
+async fn collect_awg_dump_with<F>(dump: F) -> Result<Vec<awg::AwgInterface>, awg::AwgError>
+where
+    F: FnOnce() -> Result<Vec<awg::AwgInterface>, awg::AwgError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(dump).await {
+        Ok(result) => result,
+        Err(e) if e.is_panic() => {
+            error!(error = %e, "spawn_blocking for awg dump panicked");
+            Err(awg::AwgError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "awg dump task panicked",
+            )))
+        }
+        Err(e) if e.is_cancelled() => {
+            error!(error = %e, "spawn_blocking for awg dump was cancelled");
+            Err(awg::AwgError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "awg dump task was cancelled",
+            )))
+        }
+        Err(e) => {
+            error!(error = %e, "spawn_blocking for awg dump failed");
+            Err(awg::AwgError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "awg dump task failed",
+            )))
+        }
+    }
+}
+
 /// Perform a one-shot AWG peer snapshot into the `peers` table.
 ///
 /// Unlike the full poller cycle, this helper does not write traffic snapshots
 /// and does not touch config mapping; it only upserts the latest peer rows so
 /// UI pages can reflect lifecycle changes immediately.
 pub async fn sync_peers_from_awg(db: &crate::db::Database) -> anyhow::Result<()> {
-    let interfaces = match tokio::task::spawn_blocking(awg::show_all_dump).await {
-        Ok(Ok(ifaces)) => ifaces,
-        Ok(Err(awg::AwgError::Io(e))) if e.kind() == std::io::ErrorKind::NotFound => {
+    let interfaces = match collect_awg_dump().await {
+        Ok(ifaces) => ifaces,
+        Err(awg::AwgError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             warn!("awg binary not found at /usr/bin/awg – skipping one-shot peer sync");
             return Ok(());
         }
-        Ok(Err(e)) => return Err(e.into()),
-        Err(e) if e.is_panic() => {
-            error!(error = %e, "spawn_blocking for one-shot peer sync panicked");
-            return Err(anyhow::anyhow!(
-                "one-shot peer sync task panicked while reading AWG state"
-            ));
-        }
-        Err(e) if e.is_cancelled() => {
-            error!(error = %e, "spawn_blocking for one-shot peer sync was cancelled");
-            return Err(anyhow::anyhow!(
-                "one-shot peer sync task was cancelled while reading AWG state"
-            ));
-        }
-        Err(e) => {
-            error!(error = %e, "spawn_blocking for one-shot peer sync failed");
-            return Err(anyhow::anyhow!(
-                "one-shot peer sync task failed while reading AWG state"
-            ));
-        }
+        Err(e) => return Err(e.into()),
     };
 
     let mut tx = db.pool.begin().await.context("begin sync_peers tx")?;
@@ -921,6 +950,59 @@ mod tests {
     use chrono::Utc;
 
     #[tokio::test]
+    async fn collect_awg_dump_propagates_success() {
+        let result = collect_awg_dump_with(|| Ok(Vec::new())).await;
+        assert!(result.expect("success").is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_awg_dump_propagates_awg_error() {
+        let result = collect_awg_dump_with(|| Err(awg::AwgError::Parse("bad dump".into()))).await;
+        assert!(matches!(result, Err(awg::AwgError::Parse(_))));
+    }
+
+    #[tokio::test]
+    async fn collect_awg_dump_propagates_blocking_panic() {
+        let result = collect_awg_dump_with(|| panic!("awg dump panicked")).await;
+        match result {
+            Err(awg::AwgError::Io(err)) => {
+                assert!(err.to_string().contains("panicked"));
+            }
+            other => panic!("expected Io panic error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_awg_dump_does_not_starve_async_work() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let dump = tokio::spawn(async move {
+            collect_awg_dump_with(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+                Ok(Vec::new())
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .expect("blocking dump should start without occupying the async worker")
+            .expect("oneshot");
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::time::sleep(Duration::from_millis(30)),
+        )
+        .await
+        .expect("retention/HTTP timers must fire while AWG collection is blocked");
+
+        release_tx.send(()).expect("release blocking dump");
+        dump.await.expect("join dump task").expect("dump result");
+    }
+
+    #[tokio::test]
     async fn poller_writes_cannot_repopulate_an_archived_peer() {
         let db = Database::connect_for_test().await.expect("test database");
         let public_key = PublicKey("KEY_ARCHIVED_POLLER=".to_string());
@@ -1064,16 +1146,76 @@ mod tests {
         .await
         .expect("insert new snapshot");
 
-        // Poller with 30-day retention
+        // Poller with 30-day retention: the 40-day row is the sparse baseline
+        // and must be kept so 30-day usage can still compute a delta.
         let poller = Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(30);
         let deleted = poller.cleanup_expired_snapshots().await.expect("cleanup");
-        assert_eq!(deleted, 1);
+        assert_eq!(deleted, 0);
 
         let remaining = crate::db::peers::find_snapshots(&db.pool, pk, 10)
             .await
             .expect("find snapshots");
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].captured_at, new_ts);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|row| row.captured_at == old_ts));
+        assert!(remaining.iter().any(|row| row.captured_at == new_ts));
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_sparse_baseline_for_thirty_day_usage() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let pk = "KEY_SPARSE_USAGE=";
+        let old_ts =
+            (Utc::now() - chrono::Duration::days(40)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let new_ts =
+            (Utc::now() - chrono::Duration::days(5)).to_rfc3339_opts(SecondsFormat::Secs, true);
+
+        sqlx::query(
+            "INSERT INTO snapshots (public_key, captured_at, rx_bytes, tx_bytes) VALUES (?, ?, 1000, 2000)",
+        )
+        .bind(pk)
+        .bind(&old_ts)
+        .execute(&db.pool)
+        .await
+        .expect("insert old snapshot");
+        sqlx::query(
+            "INSERT INTO snapshots (public_key, captured_at, rx_bytes, tx_bytes) VALUES (?, ?, 5000, 8000)",
+        )
+        .bind(pk)
+        .bind(&new_ts)
+        .execute(&db.pool)
+        .await
+        .expect("insert new snapshot");
+
+        let poller = Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(31);
+        let deleted = poller.cleanup_expired_snapshots().await.expect("cleanup");
+        assert_eq!(deleted, 0);
+
+        let window_start =
+            (Utc::now() - chrono::Duration::days(30)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let baseline = crate::db::peers::find_baseline_snapshot(&db.pool, pk, &window_start)
+            .await
+            .expect("baseline")
+            .expect("40-day snapshot must remain as the 30-day baseline");
+        let in_window = crate::db::peers::find_snapshots_since(&db.pool, pk, &window_start)
+            .await
+            .expect("in-window");
+        let mut inputs = vec![crate::domain::history::SnapshotInput {
+            captured_at: baseline.captured_at,
+            rx_bytes: baseline.rx_bytes as u64,
+            tx_bytes: baseline.tx_bytes as u64,
+        }];
+        inputs.extend(
+            in_window
+                .into_iter()
+                .map(|row| crate::domain::history::SnapshotInput {
+                    captured_at: row.captured_at,
+                    rx_bytes: row.rx_bytes as u64,
+                    tx_bytes: row.tx_bytes as u64,
+                }),
+        );
+        let summary = crate::domain::history::compute_usage_summary(&inputs);
+        assert_eq!(summary.rx_total_delta, 4_000);
+        assert_eq!(summary.tx_total_delta, 6_000);
     }
 
     #[tokio::test]
@@ -1148,14 +1290,19 @@ mod tests {
         let poller = Poller::new(db.clone(), 30, PathBuf::from(".")).with_retention_days(31);
         poller.cleanup_expired_snapshots_step().await;
 
-        // Cleanup was executed
+        // Cleanup was executed: 11 older rows go away, the newest pre-cutoff
+        // snapshot is retained as the usage baseline.
         let remaining = crate::db::peers::find_snapshots(&db.pool, pk, 20)
             .await
             .expect("find snapshots");
-        // All 12 rows were deleted (5000 batch size is well above 12)
-        assert_eq!(remaining.len(), 0);
-        // last_retention_cleanup was updated to positive epoch
-        assert!(poller.last_retention_cleanup.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(remaining.len(), 1);
+        // last_retention_cleanup was updated to positive epoch (no backlog)
+        assert!(
+            poller
+                .last_retention_cleanup
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
     }
 
     #[tokio::test]
@@ -1184,7 +1331,10 @@ mod tests {
         let poller_clone = poller.clone();
         let handle = tokio::spawn(async move {
             poller_clone
-                .run_retention_loop_with_intervals(Duration::from_millis(50), Duration::from_millis(10))
+                .run_retention_loop_with_intervals(
+                    Duration::from_millis(50),
+                    Duration::from_millis(10),
+                )
                 .await;
         });
 
@@ -1194,8 +1344,13 @@ mod tests {
         let remaining = crate::db::peers::find_snapshots(&db.pool, pk, 20)
             .await
             .expect("find snapshots");
-        assert_eq!(remaining.len(), 0);
-        assert!(poller.last_retention_cleanup.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(remaining.len(), 1);
+        assert!(
+            poller
+                .last_retention_cleanup
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
 
         // Insert more expired snapshots and verify the loop picks them up on the next tick
         for i in 1..=5 {
@@ -1217,7 +1372,7 @@ mod tests {
         let remaining_after = crate::db::peers::find_snapshots(&db.pool, pk, 20)
             .await
             .expect("find snapshots");
-        assert_eq!(remaining_after.len(), 0);
+        assert_eq!(remaining_after.len(), 1);
 
         handle.abort();
     }
@@ -1348,9 +1503,10 @@ mod tests {
                     .await
                     .expect("find peer")
                     .expect("peer exists");
-                let updated = crate::db::peers::update_peer_disabled(&db_w3.pool, row.id, i % 2 == 1)
-                    .await
-                    .expect("update disabled");
+                let updated =
+                    crate::db::peers::update_peer_disabled(&db_w3.pool, row.id, i % 2 == 1)
+                        .await
+                        .expect("update disabled");
                 assert!(updated.is_some());
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1369,8 +1525,9 @@ mod tests {
         r4.expect("reader history task");
         r5.expect("web updater task");
 
-        // Verify the cleaner actually purged the expired batch across boundaries
-        assert_eq!(cleaner_deleted, expired_count as u64);
+        // Each of the 30 peers keeps one pre-cutoff baseline; the rest of the
+        // 6,000 expired rows are deleted across batch boundaries.
+        assert_eq!(cleaner_deleted, (expired_count - peer_count) as u64);
 
         let expired_remaining: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM snapshots WHERE captured_at = ?")
@@ -1378,7 +1535,7 @@ mod tests {
                 .fetch_one(&db.pool)
                 .await
                 .expect("count expired snapshots");
-        assert_eq!(expired_remaining.0, 0);
+        assert_eq!(expired_remaining.0, peer_count as i64);
 
         let fresh_count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM snapshots WHERE captured_at > ?")
