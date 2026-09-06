@@ -5977,7 +5977,7 @@ function validateParamsFile() {
 		return 1
 	fi
 	if ! validatePersistedAwgProtocolState "${ALLOW_INVALID_AWG3_FOR_DOWNGRADE}"; then
-		echo -e "${RED}ERROR: Invalid AWG 3.0 protocol state in ${AMNEZIAWG_DIR}/params.${NC}" >&2
+		echo -e "${RED}ERROR: Invalid AWG protocol state in ${AMNEZIAWG_DIR}/params.${NC}" >&2
 		return 1
 	fi
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"

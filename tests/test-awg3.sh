@@ -768,6 +768,48 @@ if validateAwg31Params >/dev/null 2>&1; then
 else
 	ok "invalid RandomTrailers values are rejected"
 fi
+WRAPPER_31_DIR="${TEST_ROOT}/wrapper-31-params"
+mkdir -p "${WRAPPER_31_DIR}/bin" "${WRAPPER_31_DIR}/state"
+cat >"${WRAPPER_31_DIR}/bin/stat" <<'EOF'
+#!/usr/bin/env bash
+fmt=""
+while [[ "${1:-}" == -* ]]; do
+	case "$1" in
+		-c) fmt="${2:-}"; shift 2 ;;
+		*) shift ;;
+	esac
+done
+case "${fmt}" in
+	%u) printf '0\n' ;;
+	%a) printf '600\n' ;;
+	*) exit 1 ;;
+esac
+EOF
+chmod +x "${WRAPPER_31_DIR}/bin/stat"
+cat >"${WRAPPER_31_DIR}/state/params" <<EOF
+SERVER_AWG_NIC='awg0'
+AWG_PROTOCOL_VERSION='3.1'
+AWG_HEADER_PROTECTION_KEY='${MOCK_KEY}'
+AWG_CONTENT_PADDING_ADDITION='${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}'
+AWG_REKEY_AFTER_TIME='${AWG3_DEFAULT_REKEY_AFTER_TIME}'
+AWG_REKEY_TIMEOUT='${AWG3_DEFAULT_REKEY_TIMEOUT}'
+AWG_REJECT_AFTER_TIME='${AWG3_DEFAULT_REJECT_AFTER_TIME}'
+AWG_KEEPALIVE_TIMEOUT='${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}'
+AWG_RANDOM_TRAILERS='maybe'
+AWG_DISABLE_COOKIES='off'
+EOF
+chmod 600 "${WRAPPER_31_DIR}/state/params"
+WRAPPER_31_ERR="$(
+	PATH="${WRAPPER_31_DIR}/bin:${PATH}"
+	AMNEZIAWG_DIR="${WRAPPER_31_DIR}/state"
+	validateParamsFile 2>&1 || true
+)"
+if [[ "${WRAPPER_31_ERR}" == *"Invalid AWG protocol state"* ]] && \
+	[[ "${WRAPPER_31_ERR}" != *"Invalid AWG 3.0 protocol state"* ]]; then
+	ok "params wrapper reports version-neutral protocol errors for invalid AWG 3.1 booleans"
+else
+	not_ok "params wrapper reports version-neutral protocol errors for invalid AWG 3.1 booleans"
+fi
 AWG_RANDOM_TRAILERS="on"
 AWG_DISABLE_COOKIES="off"
 if validateAwg31Params >/dev/null 2>&1; then

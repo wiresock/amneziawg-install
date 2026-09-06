@@ -4062,6 +4062,10 @@ fn render_protocol_controls(csrf_token: &str) -> String {
       enable3.hidden = data.version === '3.0';
       enable31.hidden = data.version === '3.1';
       disable.hidden = data.version === '2.0';
+      var enable3Btn = enable3.querySelector('button[type="submit"]');
+      if (enable3Btn) {{
+        enable3Btn.textContent = data.version === '3.1' ? 'Switch to AWG 3.0' : 'Enable AWG 3.0';
+      }}
     }})
     .catch(function() {{
       current.textContent = 'Current mode unavailable. No change occurs until a confirmed action succeeds.';
@@ -8193,6 +8197,8 @@ mod tests {
         assert!(html.contains("/admin/protocol/enable-awg3"));
         assert!(html.contains("/admin/protocol/enable-awg31"));
         assert!(html.contains("/admin/protocol/disable-awg3"));
+        assert!(html.contains("Enable AWG 3.0"));
+        assert!(html.contains("Switch to AWG 3.0"));
         assert!(html.contains("name=\"confirm\" value=\"yes\" required"));
         assert!(html.contains("name=\"csrf_token\" value=\"protocol-csrf\""));
         assert!(html.contains("/api/admin/protocol"));
