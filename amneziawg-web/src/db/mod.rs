@@ -26,6 +26,10 @@ impl Database {
     /// - an in-memory URL: `sqlite::memory:`
     ///
     /// For file-based databases, the file is created if it does not exist.
+    ///
+    /// sqlx parses `sqlite::memory:` as a named shared-cache in-memory database,
+    /// so a pool of several connections still sees one schema. File-backed
+    /// databases use WAL; in-memory databases do not.
     pub async fn connect(path_or_url: &str) -> anyhow::Result<Self> {
         let options = parse_db_options(path_or_url)
             .with_context(|| format!("invalid database path: {path_or_url}"))?;
@@ -50,15 +54,15 @@ impl Database {
 
     /// Create an in-memory database suitable for unit tests.
     ///
-    /// Uses `max_connections(1)` so that all operations on the pool share the
-    /// same SQLite in-memory database.
+    /// Uses `parse_db_options` so busy timeout and foreign keys match production
+    /// in-memory connections, and `max_connections(1)` so tests do not depend
+    /// on sqlx shared-cache naming.
     #[cfg(test)]
     pub(crate) async fn connect_for_test() -> anyhow::Result<Self> {
+        let options = parse_db_options("sqlite::memory:").context("parse test memory url")?;
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::from_str("sqlite::memory:").context("parse memory url")?,
-            )
+            .connect_with(options)
             .await
             .context("connect test db")?;
         let db = Self { pool };
@@ -75,8 +79,13 @@ impl Database {
 /// - anything else → treated as a filesystem path with `create_if_missing(true)`
 fn parse_db_options(input: &str) -> anyhow::Result<SqliteConnectOptions> {
     if input == "sqlite::memory:" || input == ":memory:" {
+        // sqlx already defaults foreign_keys=ON, but set it explicitly so
+        // in-memory connections share the same invariant as file-backed ones.
         return SqliteConnectOptions::from_str("sqlite::memory:")
-            .map(|opts| opts.busy_timeout(std::time::Duration::from_secs(5)))
+            .map(|opts| {
+                opts.busy_timeout(std::time::Duration::from_secs(5))
+                    .foreign_keys(true)
+            })
             .context("parse in-memory url");
     }
 
@@ -218,11 +227,117 @@ mod tests {
         std::env::set_current_dir(orig_dir).expect("restore cwd");
     }
 
+    async fn pragma_i64(pool: &SqlitePool, pragma: &str) -> i64 {
+        sqlx::query_scalar(&format!("PRAGMA {pragma}"))
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|_| panic!("PRAGMA {pragma}"))
+    }
+
+    async fn assert_foreign_keys_enforced(pool: &SqlitePool) {
+        assert_eq!(pragma_i64(pool, "foreign_keys").await, 1);
+        sqlx::query(
+            "INSERT INTO events (actor, action, target_key, peer_id) VALUES ('admin', 'peer.created', 'FK_MISSING=', 99999)",
+        )
+        .execute(pool)
+        .await
+        .expect_err("invalid events.peer_id must be rejected when foreign keys are on");
+    }
+
+    #[tokio::test]
+    async fn connect_memory_enables_foreign_keys() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite::memory:");
+        db.migrate().await.expect("migrate");
+        assert_eq!(pragma_i64(&db.pool, "busy_timeout").await, 5000);
+        assert_foreign_keys_enforced(&db.pool).await;
+    }
+
+    #[tokio::test]
+    async fn connect_bare_memory_enables_foreign_keys() {
+        let db = Database::connect(":memory:")
+            .await
+            .expect("connect :memory:");
+        db.migrate().await.expect("migrate");
+        assert_foreign_keys_enforced(&db.pool).await;
+    }
+
+    #[tokio::test]
+    async fn connect_for_test_enables_foreign_keys() {
+        let db = Database::connect_for_test()
+            .await
+            .expect("connect_for_test");
+        assert_eq!(pragma_i64(&db.pool, "busy_timeout").await, 5000);
+        assert_foreign_keys_enforced(&db.pool).await;
+    }
+
+    #[tokio::test]
+    async fn connect_memory_on_delete_set_null() {
+        let db = Database::connect_for_test()
+            .await
+            .expect("connect_for_test");
+        sqlx::query("INSERT INTO peers (id, public_key, allowed_ips) VALUES (7, 'FK_PARENT=', '10.0.0.1/32')")
+            .execute(&db.pool)
+            .await
+            .expect("insert peer");
+        sqlx::query(
+            "INSERT INTO events (actor, action, target_key, peer_id) VALUES ('admin', 'peer.created', 'FK_PARENT=', 7)",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("insert event");
+
+        sqlx::query("DELETE FROM peers WHERE id = 7")
+            .execute(&db.pool)
+            .await
+            .expect("delete peer");
+
+        let peer_id: Option<i64> =
+            sqlx::query_scalar("SELECT peer_id FROM events WHERE target_key = 'FK_PARENT='")
+                .fetch_one(&db.pool)
+                .await
+                .expect("query event");
+        assert_eq!(peer_id, None);
+    }
+
+    #[tokio::test]
+    async fn connect_memory_pool_connections_share_schema() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite::memory:");
+        db.migrate().await.expect("migrate");
+
+        sqlx::query(
+            "INSERT INTO peers (public_key, allowed_ips) VALUES ('SHARED_MEM=', '10.0.0.1/32')",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("insert on pool");
+
+        let mut conn_a = db.pool.acquire().await.expect("acquire a");
+        let mut conn_b = db.pool.acquire().await.expect("acquire b");
+        let count_a: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM peers WHERE public_key = 'SHARED_MEM='")
+                .fetch_one(&mut *conn_a)
+                .await
+                .expect("count a");
+        let count_b: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM peers WHERE public_key = 'SHARED_MEM='")
+                .fetch_one(&mut *conn_b)
+                .await
+                .expect("count b");
+        assert_eq!(count_a, 1);
+        assert_eq!(count_b, 1);
+        assert_eq!(pragma_i64(&db.pool, "foreign_keys").await, 1);
+    }
+
     #[tokio::test]
     async fn migration_0010_preserves_existing_events_and_enables_set_null() {
+        let options = parse_db_options("sqlite::memory:").expect("parse memory url");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect_with(options)
             .await
             .expect("connect");
 
