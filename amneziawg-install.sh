@@ -5263,8 +5263,17 @@ function regenerateClients() {
 	local AWG_PROTOCOL_FIELDS=""
 	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || return 1
 
+	# Preload client names from the server config so the loop does not redirect
+	# stdin. This preserves stdin on fd 0 for interactive confirmation prompts
+	# (e.g. read -rp ... / [[ -t 0 ]]).
+	local -a CLIENT_NAMES=()
+	local _CLIENT_ENTRY
+	while IFS= read -r _CLIENT_ENTRY; do
+		[[ -n "${_CLIENT_ENTRY}" ]] && CLIENT_NAMES+=("${_CLIENT_ENTRY}")
+	done < <(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
+
 	# Iterate over each client peer block in the server config
-	while IFS= read -r CLIENT_NAME; do
+	for CLIENT_NAME in "${CLIENT_NAMES[@]}"; do
 		# Validate client name contains only characters safe for sed regex patterns.
 		# Names created by this script are always [a-zA-Z0-9_-], but a manually
 		# edited config could introduce regex metacharacters (e.g., '.', '*').
@@ -5590,7 +5599,7 @@ EOF
 		echo -e "${RED}  ${CLIENT_NAME}: failed to regenerate client config, existing config left unchanged.${NC}"
 		FAILED=$((FAILED + 1))
 	fi
-	done < <(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
+	done
 
 	# If any server-side peer keys were updated, sync the running config
 	if (( NEWKEYS > 0 )); then

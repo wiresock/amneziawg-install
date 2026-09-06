@@ -2296,48 +2296,81 @@ rm -rf "${KERNEL_HEADER_TMP}"
 unset KERNEL_HEADER_TMP KERNEL_HEADER_LOG KERNEL_HEADER_ERR
 
 echo "=== isWebPanelInstalled ==="
-(
-	TMP="$(mktemp -d)"
-	trap 'rm -rf "${TMP}"' EXIT
+TMP_IWPI="$(mktemp -d)"
 
-	# Case 1: No env file, no systemd unit, LoadState not available -> false
-	WEB_PANEL_ENV_FILE="${TMP}/missing.env"
-	WEB_PANEL_SYSTEMD_UNIT="${TMP}/missing.service"
-	resolveWebPanelEnvFiles() { printf '0\t%s\n' "${WEB_PANEL_ENV_FILE}"; }
-	readWebPanelEffectiveProperty() { return 1; }
-	assert_rc 1 isWebPanelInstalled
+_case1_isWebPanelInstalled() {
+	(
+		WEB_PANEL_ENV_FILE="${TMP_IWPI}/missing.env"
+		WEB_PANEL_SYSTEMD_UNIT="${TMP_IWPI}/missing.service"
+		resolveWebPanelEnvFiles() { printf '0\t%s\n' "${WEB_PANEL_ENV_FILE}"; }
+		readWebPanelEffectiveProperty() { return 1; }
+		isWebPanelInstalled
+	)
+}
+assert_rc 1 _case1_isWebPanelInstalled "isWebPanelInstalled: false when missing env, unit, and service"
 
-	# Case 2: Env file exists -> true
-	touch "${WEB_PANEL_ENV_FILE}"
-	assert_rc 0 isWebPanelInstalled
-	rm -f "${WEB_PANEL_ENV_FILE}"
+_case2_isWebPanelInstalled() {
+	(
+		local env_file="${TMP_IWPI}/exists.env"
+		touch "${env_file}"
+		WEB_PANEL_ENV_FILE="${env_file}"
+		WEB_PANEL_SYSTEMD_UNIT="${TMP_IWPI}/missing.service"
+		resolveWebPanelEnvFiles() { printf '0\t%s\n' "${env_file}"; }
+		readWebPanelEffectiveProperty() { return 1; }
+		isWebPanelInstalled
+	)
+}
+assert_rc 0 _case2_isWebPanelInstalled "isWebPanelInstalled: true when env file exists"
 
-	# Case 3: Systemd unit exists -> true
-	touch "${WEB_PANEL_SYSTEMD_UNIT}"
-	assert_rc 0 isWebPanelInstalled
-	rm -f "${WEB_PANEL_SYSTEMD_UNIT}"
+_case3_isWebPanelInstalled() {
+	(
+		local unit_file="${TMP_IWPI}/exists.service"
+		touch "${unit_file}"
+		WEB_PANEL_ENV_FILE="${TMP_IWPI}/missing.env"
+		WEB_PANEL_SYSTEMD_UNIT="${unit_file}"
+		resolveWebPanelEnvFiles() { printf '0\t%s\n' "${WEB_PANEL_ENV_FILE}"; }
+		readWebPanelEffectiveProperty() { return 1; }
+		isWebPanelInstalled
+	)
+}
+assert_rc 0 _case3_isWebPanelInstalled "isWebPanelInstalled: true when systemd unit exists"
 
-	# Case 4: systemctl LoadState succeeds -> true
-	readWebPanelEffectiveProperty() {
-		[[ "$1" == "LoadState" ]] && return 0
-		return 1
-	}
-	assert_rc 0 isWebPanelInstalled
-)
+_case4_isWebPanelInstalled() {
+	(
+		WEB_PANEL_ENV_FILE="${TMP_IWPI}/missing.env"
+		WEB_PANEL_SYSTEMD_UNIT="${TMP_IWPI}/missing.service"
+		resolveWebPanelEnvFiles() { printf '0\t%s\n' "${WEB_PANEL_ENV_FILE}"; }
+		readWebPanelEffectiveProperty() {
+			[[ "$1" == "LoadState" ]] && return 0
+			return 1
+		}
+		isWebPanelInstalled
+	)
+}
+assert_rc 0 _case4_isWebPanelInstalled "isWebPanelInstalled: true when LoadState succeeds"
+
+rm -rf "${TMP_IWPI}"
+unset TMP_IWPI
 
 echo "=== copyToWebPanelDir self-copy ==="
-(
-	TMP="$(mktemp -d)"
-	trap 'rm -rf "${TMP}"' EXIT
-	PANEL_DIR="${TMP}/clients"
-	mkdir -p "${PANEL_DIR}"
-	resolveWebPanelConfigDir() { printf '%s\n' "${PANEL_DIR}"; }
+_run_copy_self_test() {
+	(
+		local TMP; TMP="$(mktemp -d)"
+		local PANEL_DIR="${TMP}/clients"
+		mkdir -p "${PANEL_DIR}"
+		resolveWebPanelConfigDir() { printf '%s\n' "${PANEL_DIR}"; }
 
-	TEST_FILE="${PANEL_DIR}/test.conf"
-	printf '%s\n' "[Interface]" > "${TEST_FILE}"
-	assert_rc 0 copyToWebPanelDir "${TEST_FILE}"
-	assert_eq "[Interface]" "$(cat "${TEST_FILE}")" "copyToWebPanelDir self-copy preserves content"
-)
+		local TEST_FILE="${PANEL_DIR}/test.conf"
+		printf '%s\n' "[Interface]" > "${TEST_FILE}"
+		copyToWebPanelDir "${TEST_FILE}" || { rm -rf "${TMP}"; return 1; }
+		local content
+		content="$(cat "${TEST_FILE}")"
+		rm -rf "${TMP}"
+		[[ "${content}" == "[Interface]" ]] || return 1
+		return 0
+	)
+}
+assert_rc 0 _run_copy_self_test "copyToWebPanelDir self-copy preserves content without error"
 
 echo "=== regenerateClients candidate discovery and web-panel protection ==="
 REGEN_TEST_TMP="$(mktemp -d)"
