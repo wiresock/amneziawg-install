@@ -2295,6 +2295,272 @@ assert_eq "linux-headers-arm64-16k" "$(_debian_arm64_16k_header_meta)" "kernel h
 rm -rf "${KERNEL_HEADER_TMP}"
 unset KERNEL_HEADER_TMP KERNEL_HEADER_LOG KERNEL_HEADER_ERR
 
+echo "=== isWebPanelInstalled ==="
+TMP_IWPI="$(mktemp -d)"
+
+_case1_isWebPanelInstalled() {
+	(
+		WEB_PANEL_ENV_FILE="${TMP_IWPI}/missing.env"
+		WEB_PANEL_SYSTEMD_UNIT="${TMP_IWPI}/missing.service"
+		resolveWebPanelEnvFiles() { printf '0\t%s\n' "${WEB_PANEL_ENV_FILE}"; }
+		readWebPanelEffectiveProperty() { return 1; }
+		isWebPanelInstalled
+	)
+}
+assert_rc 1 _case1_isWebPanelInstalled "isWebPanelInstalled: false when missing env, unit, and service"
+
+_case2_isWebPanelInstalled() {
+	(
+		local env_file="${TMP_IWPI}/exists.env"
+		touch "${env_file}"
+		WEB_PANEL_ENV_FILE="${env_file}"
+		WEB_PANEL_SYSTEMD_UNIT="${TMP_IWPI}/missing.service"
+		resolveWebPanelEnvFiles() { printf '0\t%s\n' "${env_file}"; }
+		readWebPanelEffectiveProperty() { return 1; }
+		isWebPanelInstalled
+	)
+}
+assert_rc 0 _case2_isWebPanelInstalled "isWebPanelInstalled: true when env file exists"
+
+_case3_isWebPanelInstalled() {
+	(
+		local unit_file="${TMP_IWPI}/exists.service"
+		touch "${unit_file}"
+		WEB_PANEL_ENV_FILE="${TMP_IWPI}/missing.env"
+		WEB_PANEL_SYSTEMD_UNIT="${unit_file}"
+		resolveWebPanelEnvFiles() { printf '0\t%s\n' "${WEB_PANEL_ENV_FILE}"; }
+		readWebPanelEffectiveProperty() { return 1; }
+		isWebPanelInstalled
+	)
+}
+assert_rc 0 _case3_isWebPanelInstalled "isWebPanelInstalled: true when systemd unit exists"
+
+_case4_isWebPanelInstalled() {
+	(
+		WEB_PANEL_ENV_FILE="${TMP_IWPI}/missing.env"
+		WEB_PANEL_SYSTEMD_UNIT="${TMP_IWPI}/missing.service"
+		resolveWebPanelEnvFiles() { printf '0\t%s\n' "${WEB_PANEL_ENV_FILE}"; }
+		readWebPanelEffectiveProperty() {
+			[[ "$1" == "LoadState" ]] && return 0
+			return 1
+		}
+		isWebPanelInstalled
+	)
+}
+assert_rc 0 _case4_isWebPanelInstalled "isWebPanelInstalled: true when LoadState succeeds"
+
+rm -rf "${TMP_IWPI}"
+unset TMP_IWPI
+
+echo "=== copyToWebPanelDir self-copy ==="
+_run_copy_self_test() {
+	(
+		local TMP; TMP="$(mktemp -d)"
+		local PANEL_DIR="${TMP}/clients"
+		mkdir -p "${PANEL_DIR}"
+		resolveWebPanelConfigDir() { printf '%s\n' "${PANEL_DIR}"; }
+
+		local TEST_FILE="${PANEL_DIR}/test.conf"
+		printf '%s\n' "[Interface]" > "${TEST_FILE}"
+		copyToWebPanelDir "${TEST_FILE}" || { rm -rf "${TMP}"; return 1; }
+		local content
+		content="$(cat "${TEST_FILE}")"
+		rm -rf "${TMP}"
+		[[ "${content}" == "[Interface]" ]] || return 1
+		return 0
+	)
+}
+assert_rc 0 _run_copy_self_test "copyToWebPanelDir self-copy preserves content without error"
+
+echo "=== regenerateClients candidate discovery and web-panel protection ==="
+REGEN_TEST_TMP="$(mktemp -d)"
+trap 'rm -rf "${REGEN_TEST_TMP}"' EXIT
+
+mkdir -p "${REGEN_TEST_TMP}/bin"
+cat > "${REGEN_TEST_TMP}/bin/awg" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+	genkey) echo "NEW_PRIVKEY";;
+	pubkey)
+		key="$(cat -)"
+		case "${key}" in
+			*PRIV_ALICE*) echo "PUB_ALICE";;
+			*PRIV_BOB*) echo "PUB_BOB";;
+			*NEW_PRIVKEY*) echo "NEW_PUBKEY";;
+			*) echo "PUB_${key}";;
+		esac
+		;;
+	syncconf) exit 0;;
+	*) exit 0;;
+esac
+EOF
+cat > "${REGEN_TEST_TMP}/bin/awg-quick" <<'EOF'
+#!/usr/bin/env bash
+echo "[Interface]"
+EOF
+chmod +x "${REGEN_TEST_TMP}/bin/awg" "${REGEN_TEST_TMP}/bin/awg-quick"
+
+_run_regen_test() {
+	(
+		PATH="${REGEN_TEST_TMP}/bin:${PATH}"; export PATH
+		local dir; dir="$(mktemp -d)"
+		local PANEL_DIR="${dir}/web-clients"
+		mkdir -p "${dir}/amneziawg" "${PANEL_DIR}"
+		SERVER_AWG_NIC="awg0"
+		SERVER_AWG_CONF="${dir}/amneziawg/awg0.conf"
+		SERVER_AWG_IPV4="10.66.66.1"
+		SERVER_AWG_IPV6="fd42:42:42:0:0:0:0:1"
+		SERVER_PORT="51820"
+		SERVER_PUB_IP="198.51.100.1"
+		SERVER_PUB_KEY="SRVPUB"
+		CLIENT_DNS_1="1.1.1.1"
+		CLIENT_DNS_2=""
+		SERVER_AWG_JC=4; SERVER_AWG_JMIN=50; SERVER_AWG_JMAX=1000
+		SERVER_AWG_S1=30; SERVER_AWG_S2=100; SERVER_AWG_S3=45; SERVER_AWG_S4=120
+		SERVER_AWG_H1="5-10"; SERVER_AWG_H2="11-20"; SERVER_AWG_H3="21-30"; SERVER_AWG_H4="31-40"
+		ALLOWED_IPS="0.0.0.0/0,::/0"; ENABLE_IPV6="y"
+		loadParams() { :; }
+		ensureAmneziawgKernelModule() { :; }
+		getHomeDirForClient() { echo "${dir}/nonexistent-home/$1"; }
+		resolveWebPanelConfigDir() { echo "${PANEL_DIR}"; }
+
+		"$1" "${dir}" "${PANEL_DIR}"
+	)
+}
+
+# Test 1: Client config exists ONLY in web panel config directory -> key is preserved
+_setup_panel_only() {
+	local dir="$1" PANEL_DIR="$2"
+	cat > "${SERVER_AWG_CONF}" <<EOF
+[Interface]
+Address = 10.66.66.1/24
+ListenPort = 51820
+PrivateKey = SRVPRIV
+
+### Client alice
+[Peer]
+PublicKey = PUB_ALICE
+PresharedKey = PSK_ALICE
+AllowedIPs = 10.66.66.2/32,fd42:42:42::2/128
+EOF
+	cat > "${PANEL_DIR}/awg0-client-alice.conf" <<EOF
+[Interface]
+PrivateKey = PRIV_ALICE
+Address = 10.66.66.2/32,fd42:42:42::2/128
+DNS = 1.1.1.1
+H1 = 1-2
+
+[Peer]
+PublicKey = SRVPUB
+PresharedKey = PSK_ALICE
+Endpoint = 198.51.100.1:51820
+AllowedIPs = 0.0.0.0/0,::/0
+EOF
+	local out
+	out="$(regenerateClients 2>&1)"
+	local cur_pub
+	cur_pub="$(grep -m1 -E '^PublicKey = ' "${SERVER_AWG_CONF}" | sed 's/^PublicKey = //')"
+	local cur_priv
+	cur_priv="$(grep -m1 -E '^PrivateKey = ' "${PANEL_DIR}/awg0-client-alice.conf" | sed 's/^PrivateKey = //')"
+	local cur_h1
+	cur_h1="$(grep -m1 -E '^H1 = ' "${PANEL_DIR}/awg0-client-alice.conf" | sed 's/^H1 = //')"
+
+	if [[ "${cur_pub}" != "PUB_ALICE" ]]; then
+		echo "FAIL: expected PublicKey PUB_ALICE, got ${cur_pub}" >&2
+		return 1
+	fi
+	if [[ "${cur_priv}" != "PRIV_ALICE" ]]; then
+		echo "FAIL: expected PrivateKey PRIV_ALICE, got ${cur_priv}" >&2
+		return 1
+	fi
+	if [[ "${cur_h1}" != "5-10" ]]; then
+		echo "FAIL: expected H1 5-10, got ${cur_h1}" >&2
+		return 1
+	fi
+	if ! echo "${out}" | grep -q "1 succeeded, 0 failed"; then
+		echo "FAIL: expected summary '1 succeeded, 0 failed', got: ${out}" >&2
+		return 1
+	fi
+	if echo "${out}" | grep -q "no existing private key found"; then
+		echo "FAIL: unexpected key regeneration triggered: ${out}" >&2
+		return 1
+	fi
+	echo "OK"
+}
+assert_eq "OK" "$(_run_regen_test _setup_panel_only)" "regenerateClients: preserves key when config exists only in web panel config dir"
+
+# Test 2: Web panel installed, client config MISSING, non-interactive -> refuses to rotate key
+_setup_panel_missing_noninteractive() {
+	local dir="$1" PANEL_DIR="$2"
+	cat > "${SERVER_AWG_CONF}" <<EOF
+[Interface]
+Address = 10.66.66.1/24
+ListenPort = 51820
+PrivateKey = SRVPRIV
+
+### Client bob
+[Peer]
+PublicKey = PUB_BOB
+PresharedKey = PSK_BOB
+AllowedIPs = 10.66.66.3/32,fd42:42:42::3/128
+EOF
+	isWebPanelInstalled() { return 0; }
+	local out
+	out="$(regenerateClients </dev/null 2>&1)"
+	local cur_pub
+	cur_pub="$(grep -m1 -E '^PublicKey = ' "${SERVER_AWG_CONF}" | sed 's/^PublicKey = //')"
+	if [[ "${cur_pub}" != "PUB_BOB" ]]; then
+		echo "FAIL: PublicKey was modified when key rotation should be refused: ${cur_pub}" >&2
+		return 1
+	fi
+	if ! echo "${out}" | grep -q "skipped to avoid rotating web-managed client identity"; then
+		echo "FAIL: missing refusal warning in output: ${out}" >&2
+		return 1
+	fi
+	if ! echo "${out}" | grep -q "0 succeeded, 1 failed"; then
+		echo "FAIL: expected summary '0 succeeded, 1 failed', got: ${out}" >&2
+		return 1
+	fi
+	echo "OK"
+}
+assert_eq "OK" "$(_run_regen_test _setup_panel_missing_noninteractive)" "regenerateClients: refuses silent key rotation when panel installed and config missing"
+
+# Test 3: Web panel NOT installed, client config MISSING -> generates new key (standalone behavior)
+_setup_standalone_missing() {
+	local dir="$1" PANEL_DIR="$2"
+	cat > "${SERVER_AWG_CONF}" <<EOF
+[Interface]
+Address = 10.66.66.1/24
+ListenPort = 51820
+PrivateKey = SRVPRIV
+
+### Client charlie
+[Peer]
+PublicKey = PUB_OLD_CHARLIE
+PresharedKey = PSK_CHARLIE
+AllowedIPs = 10.66.66.4/32,fd42:42:42::4/128
+EOF
+	isWebPanelInstalled() { return 1; }
+	local out
+	out="$(regenerateClients </dev/null 2>&1)"
+	local cur_pub
+	cur_pub="$(grep -m1 -E '^PublicKey = ' "${SERVER_AWG_CONF}" | sed 's/^PublicKey = //')"
+	if [[ "${cur_pub}" != "NEW_PUBKEY" ]]; then
+		echo "FAIL: expected PublicKey to rotate to NEW_PUBKEY, got: ${cur_pub}" >&2
+		return 1
+	fi
+	if ! echo "${out}" | grep -q "1 succeeded, 0 failed"; then
+		echo "FAIL: expected summary '1 succeeded, 0 failed', got: ${out}" >&2
+		return 1
+	fi
+	if ! echo "${out}" | grep -q "1 client(s) had new key pairs generated"; then
+		echo "FAIL: expected '1 client(s) had new key pairs generated', got: ${out}" >&2
+		return 1
+	fi
+	echo "OK"
+}
+assert_eq "OK" "$(_run_regen_test _setup_standalone_missing)" "regenerateClients: generates new key in standalone mode when config missing"
+
 echo ""
 echo "=========================================="
 echo "Results: ${TESTS_PASSED}/${TESTS_RUN} passed, ${TESTS_FAILED} failed"

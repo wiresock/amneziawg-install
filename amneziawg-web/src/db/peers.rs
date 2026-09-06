@@ -736,9 +736,12 @@ pub async fn restore_archived_peer(
 /// re-enabled later. Newly-created peers are preserved only while both their
 /// config is present and they are awaiting observation on the live interface.
 ///
+/// Deletes stale peers atomically within a transaction, ensuring any `events.peer_id`
+/// references are set to NULL prior to deletion to preserve full audit history
+/// without triggering SQLite foreign key constraint violations.
+///
 /// Returns the list of `(id, public_key)` pairs that were **actually**
-/// deleted so the caller can perform follow-up cleanup (e.g. clearing event
-/// references).  Peers that were concurrently disabled between the initial
+/// deleted. Peers that were concurrently disabled between the initial
 /// SELECT and the DELETE are excluded from the returned list.
 pub async fn delete_stale_peers(
     pool: &SqlitePool,
@@ -779,11 +782,40 @@ pub async fn delete_stale_peers(
     // Delete in batches to avoid exceeding this limit.
     const MAX_SQLITE_PARAMS: usize = 900;
 
+    let mut tx = pool.begin().await?;
+
     for chunk in stale.chunks(MAX_SQLITE_PARAMS) {
         let placeholders: String = std::iter::repeat("?")
             .take(chunk.len())
             .collect::<Vec<_>>()
             .join(",");
+
+        // Explicitly clear events.peer_id references in the same transaction prior
+        // to deletion. This prevents foreign key constraint violations and works
+        // seamlessly alongside migration 0010 (ON DELETE SET NULL) while preserving
+        // full audit history (target_key, action, detail, timestamps).
+        let events_sql = format!(
+            "UPDATE events
+             SET peer_id = NULL
+             WHERE peer_id IN (
+                 SELECT id FROM peers
+                 WHERE id IN ({placeholders})
+                   AND disabled = 0
+                   AND archived = 0
+                   AND removal_pending = 0
+                   AND (expires_at IS NULL
+                        OR julianday(expires_at) IS NULL
+                        OR julianday(expires_at) > julianday(?))
+                   AND NOT (sync_pending = 1 AND has_config = 1)
+             )"
+        );
+        let mut events_query = sqlx::query(&events_sql);
+        for (id, _) in chunk {
+            events_query = events_query.bind(id);
+        }
+        events_query = events_query.bind(now_rfc3339);
+        events_query.execute(&mut *tx).await?;
+
         let sql = format!(
             "DELETE FROM peers
              WHERE id IN ({placeholders})
@@ -800,8 +832,10 @@ pub async fn delete_stale_peers(
             query = query.bind(id);
         }
         query = query.bind(now_rfc3339);
-        query.execute(pool).await?;
+        query.execute(&mut *tx).await?;
     }
+
+    tx.commit().await?;
 
     // Some stale peers may have been concurrently disabled between the
     // SELECT and DELETE above. The DELETE guards prevent their removal, but
@@ -2285,5 +2319,139 @@ mod tests {
 
         // Both peers should still exist
         assert_eq!(list_all(&db.pool).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_stale_peers_succeeds_when_peer_has_associated_events() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_WITH_EVENTS=", None).await;
+
+        // Log an audit event referencing this peer ID and public key
+        crate::db::events::log_event(
+            &db.pool,
+            crate::db::events::EVT_PEER_UPDATED,
+            Some(id),
+            Some("KEY_WITH_EVENTS="),
+            Some(r#"{"name":"test-client"}"#),
+            "admin",
+        )
+        .await;
+
+        // Verify event was inserted and references peer_id
+        let events_before = crate::db::events::list_events(&db.pool, Some(id), None, 10)
+            .await
+            .expect("list events before");
+        assert_eq!(events_before.len(), 1);
+        assert_eq!(events_before[0].peer_id, Some(id));
+        assert_eq!(events_before[0].target_key.as_deref(), Some("KEY_WITH_EVENTS="));
+
+        // delete_stale_peers should succeed without foreign key constraint error
+        let active: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let stale = delete_stale_peers(&db.pool, &active, STALE_CLEANUP_NOW)
+            .await
+            .expect("delete stale peers with events must succeed");
+
+        assert_eq!(stale, vec![(id, "KEY_WITH_EVENTS=".to_string())]);
+        assert!(find_by_id(&db.pool, id).await.unwrap().is_none());
+
+        // Verify audit event is preserved with peer_id nulled and target_key intact
+        let all_events = crate::db::events::list_events(&db.pool, None, None, 10)
+            .await
+            .expect("list all events after cleanup");
+        assert_eq!(all_events.len(), 1);
+        assert_eq!(all_events[0].peer_id, None);
+        assert_eq!(all_events[0].target_key.as_deref(), Some("KEY_WITH_EVENTS="));
+        assert_eq!(all_events[0].action, crate::db::events::EVT_PEER_UPDATED);
+        assert_eq!(all_events[0].actor, "admin");
+    }
+
+    #[tokio::test]
+    async fn delete_stale_peers_preserves_unrelated_peer_events() {
+        let db = test_db().await;
+        let id_stale = insert_peer(&db.pool, "KEY_STALE_EVT=", None).await;
+        let id_active = insert_peer(&db.pool, "KEY_ACTIVE_EVT=", None).await;
+
+        crate::db::events::log_event(
+            &db.pool,
+            crate::db::events::EVT_PEER_UPDATED,
+            Some(id_stale),
+            Some("KEY_STALE_EVT="),
+            None,
+            "admin",
+        )
+        .await;
+        crate::db::events::log_event(
+            &db.pool,
+            crate::db::events::EVT_PEER_UPDATED,
+            Some(id_active),
+            Some("KEY_ACTIVE_EVT="),
+            None,
+            "admin",
+        )
+        .await;
+
+        let active: std::collections::HashSet<String> =
+            ["KEY_ACTIVE_EVT=".to_string()].into_iter().collect();
+
+        let stale = delete_stale_peers(&db.pool, &active, STALE_CLEANUP_NOW)
+            .await
+            .expect("delete stale peers");
+
+        assert_eq!(stale, vec![(id_stale, "KEY_STALE_EVT=".to_string())]);
+        assert!(find_by_id(&db.pool, id_stale).await.unwrap().is_none());
+        assert!(find_by_id(&db.pool, id_active).await.unwrap().is_some());
+
+        // Active peer's event still has its peer_id
+        let active_events = crate::db::events::list_events(&db.pool, Some(id_active), None, 10)
+            .await
+            .expect("active peer events");
+        assert_eq!(active_events.len(), 1);
+        assert_eq!(active_events[0].peer_id, Some(id_active));
+
+        // Stale peer's event has peer_id nulled
+        let all_events = crate::db::events::list_events(&db.pool, None, None, 10)
+            .await
+            .expect("all events");
+        assert_eq!(all_events.len(), 2);
+        let stale_event = all_events
+            .iter()
+            .find(|e| e.target_key.as_deref() == Some("KEY_STALE_EVT="))
+            .expect("stale event found");
+        assert_eq!(stale_event.peer_id, None);
+    }
+
+    #[tokio::test]
+    async fn delete_by_id_succeeds_and_nulls_events_when_peer_has_events() {
+        let db = test_db().await;
+        let id = insert_peer(&db.pool, "KEY_DELETE_BY_ID=", None).await;
+
+        crate::db::events::log_event(
+            &db.pool,
+            crate::db::events::EVT_PEER_UPDATED,
+            Some(id),
+            Some("KEY_DELETE_BY_ID="),
+            None,
+            "admin",
+        )
+        .await;
+
+        // Direct delete_by_id without prior manual clear_peer_id_references call
+        let deleted = delete_by_id(&db.pool, id)
+            .await
+            .expect("delete_by_id with ON DELETE SET NULL must succeed");
+        assert!(deleted);
+
+        // Verify peer was deleted
+        assert!(find_by_id(&db.pool, id).await.unwrap().is_none());
+
+        // Verify event was preserved with peer_id set to NULL
+        let all_events = crate::db::events::list_events(&db.pool, None, None, 10)
+            .await
+            .expect("all events");
+        let event = all_events
+            .iter()
+            .find(|e| e.target_key.as_deref() == Some("KEY_DELETE_BY_ID="))
+            .expect("event found");
+        assert_eq!(event.peer_id, None);
     }
 }

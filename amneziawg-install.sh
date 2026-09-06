@@ -2196,6 +2196,17 @@ function resolveWebPanelConfigDir() {
 	printf '%s\n' "${WEB_PANEL_CONFIG_DIR%/}"
 }
 
+# Check if the web panel is installed (via environment file, systemd unit, or active service state).
+function isWebPanelInstalled() {
+	local env_file
+	env_file="$(resolveWebPanelEnvFile 2>/dev/null || true)"
+	if [[ (-n "${env_file}" && -f "${env_file}") || -e "${WEB_PANEL_SYSTEMD_UNIT}" ]] || \
+		readWebPanelEffectiveProperty LoadState >/dev/null 2>&1; then
+		return 0
+	fi
+	return 1
+}
+
 # Use the web database directory as the stable cross-process lifecycle lock.
 # Unlike AWG_CONFIG_DIR it exists for the panel's lifetime, including when no
 # client has been created yet. Standalone installer use (no panel env file)
@@ -2204,8 +2215,7 @@ function resolveClientLifecycleLockDir() {
 	local env_file database_path exec_database_path exec_setting_rc working_dir database_parent
 	env_file="$(resolveWebPanelEnvFile)" || return 1
 
-	if [[ ! -f "${env_file}" && ! -e "${WEB_PANEL_SYSTEMD_UNIT}" ]] && \
-		! readWebPanelEffectiveProperty LoadState >/dev/null; then
+	if ! isWebPanelInstalled; then
 		resolveWebPanelConfigDir
 		return
 	fi
@@ -2262,7 +2272,12 @@ function copyToWebPanelDir() {
 			echo "Warning: refusing to copy '${src_file}' to '${dest}' because destination is a symlink" >&2
 			return 0
 		fi
-		cp -f "${src_file}" "${dest}" 2>/dev/null || true
+		local src_real dest_real
+		src_real="$(readlink -f -- "${src_file}" 2>/dev/null || true)"
+		dest_real="$(readlink -f -- "${dest}" 2>/dev/null || true)"
+		if [[ -z "${dest_real}" || "${src_real}" != "${dest_real}" ]]; then
+			cp -f "${src_file}" "${dest}" 2>/dev/null || true
+		fi
 		# Only adjust ownership and permissions on a regular non-symlink file we just copied.
 		if [[ -f "${dest}" && ! -L "${dest}" ]]; then
 			# Determine the directory's group; use it if available, otherwise fall back to root.
@@ -5248,8 +5263,17 @@ function regenerateClients() {
 	local AWG_PROTOCOL_FIELDS=""
 	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || return 1
 
+	# Preload client names from the server config so the loop does not redirect
+	# stdin. This preserves stdin on fd 0 for interactive confirmation prompts
+	# (e.g. read -rp ... / [[ -t 0 ]]).
+	local -a CLIENT_NAMES=()
+	local _CLIENT_ENTRY
+	while IFS= read -r _CLIENT_ENTRY; do
+		[[ -n "${_CLIENT_ENTRY}" ]] && CLIENT_NAMES+=("${_CLIENT_ENTRY}")
+	done < <(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
+
 	# Iterate over each client peer block in the server config
-	while IFS= read -r CLIENT_NAME; do
+	for CLIENT_NAME in "${CLIENT_NAMES[@]}"; do
 		# Validate client name contains only characters safe for sed regex patterns.
 		# Names created by this script are always [a-zA-Z0-9_-], but a manually
 		# edited config could introduce regex metacharacters (e.g., '.', '*').
@@ -5369,24 +5393,56 @@ function regenerateClients() {
 		# Search multiple common locations to avoid regenerating keys just because
 		# getHomeDirForClient guessed a different home than where the config was created.
 		local -a CLIENT_CONF_CANDIDATES=()
+		local -a SEARCH_DIRS=()
 
-		# 1) Config under the resolved HOME_DIR (if any)
-		if [[ -n "${CLIENT_CONF}" ]]; then
-			CLIENT_CONF_CANDIDATES+=("${CLIENT_CONF}" "${CLIENT_CONF}.old")
+		# 1) Resolved HOME_DIR (if any)
+		if [[ -n "${HOME_DIR}" ]]; then
+			SEARCH_DIRS+=("${HOME_DIR}")
 		fi
 
-		# 2) Root's home (common when run as root or via sudo)
-		if [[ -d "/root" ]]; then
-			CLIENT_CONF_CANDIDATES+=("/root/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf" \
-									 "/root/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf.old")
+		# 2) Web panel config directories (if configured/available)
+		local PANEL_CONFIG_DIR
+		PANEL_CONFIG_DIR="$(resolveWebPanelConfigDir 2>/dev/null || true)"
+		if [[ -n "${PANEL_CONFIG_DIR}" ]]; then
+			SEARCH_DIRS+=("${PANEL_CONFIG_DIR}")
+		fi
+		if [[ -n "${WEB_PANEL_CONFIG_DIR}" ]]; then
+			SEARCH_DIRS+=("${WEB_PANEL_CONFIG_DIR}")
 		fi
 
-		# 3) All user homes under /home
+		# 3) Root's home (common when run as root or via sudo)
+		SEARCH_DIRS+=("/root")
+
+		# 4) All user homes under /home
 		for SEARCH_DIR in /home/*; do
 			if [[ -d "${SEARCH_DIR}" ]]; then
-				CLIENT_CONF_CANDIDATES+=("${SEARCH_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf" \
-										 "${SEARCH_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf.old")
+				SEARCH_DIRS+=("${SEARCH_DIR}")
 			fi
+		done
+
+		# De-duplicate search directories while preserving search precedence
+		local -a UNIQUE_SEARCH_DIRS=()
+		for DIR in "${SEARCH_DIRS[@]}"; do
+			[[ -z "${DIR}" ]] && continue
+			local SEEN=0
+			for UDIR in "${UNIQUE_SEARCH_DIRS[@]}"; do
+				if [[ "${UDIR}" == "${DIR}" ]]; then
+					SEEN=1
+					break
+				fi
+			done
+			if [[ ${SEEN} -eq 0 ]]; then
+				UNIQUE_SEARCH_DIRS+=("${DIR}")
+			fi
+		done
+
+		# Scan candidate config files.
+		# Check active .conf files first across all directories, then archived .conf.old files.
+		for CANDIDATE_DIR in "${UNIQUE_SEARCH_DIRS[@]}"; do
+			CLIENT_CONF_CANDIDATES+=("${CANDIDATE_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf")
+		done
+		for CANDIDATE_DIR in "${UNIQUE_SEARCH_DIRS[@]}"; do
+			CLIENT_CONF_CANDIDATES+=("${CANDIDATE_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf.old")
 		done
 
 		# Scan candidate config files (including .conf.old, renamed during migration).
@@ -5424,8 +5480,25 @@ function regenerateClients() {
 		fi
 
 		if [[ -z "${CLIENT_PRIV_KEY}" ]]; then
-			# No existing private key found - generate a new key pair
-			# This means the client will need the new config to reconnect
+			# No existing private key found.
+			# If the web panel is installed, rotating keys silently would desynchronize
+			# the web panel database and break client connectivity/identity.
+			if isWebPanelInstalled; then
+				echo -e "${RED}  WARNING: ${CLIENT_NAME}: no existing private key found and amneziawg-web is installed.${NC}" >&2
+				echo -e "${RED}  Generating a new key pair will desynchronize the web panel database and break client connectivity.${NC}" >&2
+				local CONFIRM_NEW_KEY="n"
+				if [[ -t 0 ]]; then
+					read -rp "Generate new key pair for ${CLIENT_NAME} anyway? [y/N]: " CONFIRM_NEW_KEY
+				fi
+				if [[ ! "${CONFIRM_NEW_KEY}" =~ ^[Yy]$ ]]; then
+					echo -e "${RED}  FAIL: ${CLIENT_NAME}: skipped to avoid rotating web-managed client identity without existing private key.${NC}" >&2
+					FAILED=$((FAILED + 1))
+					continue
+				fi
+			fi
+
+			# Standalone mode, or explicitly confirmed by user in interactive mode:
+			# generate a new key pair. Client will need the new config to reconnect.
 			echo -e "${ORANGE}  ${CLIENT_NAME}: no existing private key found, generating new key pair${NC}"
 			CLIENT_PRIV_KEY=$(awg genkey)
 			local NEW_CLIENT_PUB_KEY
@@ -5445,6 +5518,13 @@ function regenerateClients() {
 
 		# Write the new client config file with current server parameters
 		local OUTPUT_CONF="${CLIENT_CONF_OUTPUT:-$CLIENT_CONF}"
+		if [[ -z "${OUTPUT_CONF}" ]]; then
+			if [[ -n "${PANEL_CONFIG_DIR}" ]]; then
+				OUTPUT_CONF="${PANEL_CONFIG_DIR}/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+			else
+				OUTPUT_CONF="/root/${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
+			fi
+		fi
 		local TMP_CONF
 
 		# Ensure parent directory for the output config exists
@@ -5519,7 +5599,7 @@ EOF
 		echo -e "${RED}  ${CLIENT_NAME}: failed to regenerate client config, existing config left unchanged.${NC}"
 		FAILED=$((FAILED + 1))
 	fi
-	done < <(grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3)
+	done
 
 	# If any server-side peer keys were updated, sync the running config
 	if (( NEWKEYS > 0 )); then
@@ -7027,12 +7107,10 @@ CLIENT_LIFECYCLE_LOCK_FD=""
 # lock pathname. Mutating callers run in a subshell so the descriptor is closed
 # automatically; the interactive menu preloader releases it explicitly.
 function acquireClientLifecycleLock() {
-	local lock_dir env_file panel_installed=0
+	local lock_dir panel_installed=0
 	local old_umask dir_identity descriptor_identity descriptor_path
 	lock_dir="$(resolveClientLifecycleLockDir)" || return 1
-	env_file="$(resolveWebPanelEnvFile)" || return 1
-	if [[ -f "${env_file}" || -e "${WEB_PANEL_SYSTEMD_UNIT}" ]] || \
-		readWebPanelEffectiveProperty LoadState >/dev/null; then
+	if isWebPanelInstalled; then
 		panel_installed=1
 	fi
 
