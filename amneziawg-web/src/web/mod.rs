@@ -3821,6 +3821,7 @@ fn html_head(title: &str) -> String {
   .add-user-panel {{ max-width: 440px; padding: .75rem 1rem; }}
   .add-user-panel summary {{ cursor: pointer; font-weight: 700; font-size: 1.05rem; }}
   .add-user-panel[open] summary {{ margin-bottom: .75rem; }}
+  .protocol-panel section:not([hidden]) ~ section:not([hidden]) {{ margin-top: 1.5rem; }}
   .edit-form label {{ display: block; font-weight: bold; margin-bottom: .25rem; margin-top: .75rem; }}
   .edit-form input[type=text], .edit-form input[type=password], .edit-form input[type=number], .edit-form textarea {{ width: 100%; padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 3px; font-family: inherit; font-size: .95rem; box-sizing: border-box; }}
   .edit-form textarea {{ resize: vertical; min-height: 4rem; }}
@@ -8203,6 +8204,14 @@ mod tests {
         assert!(html.contains("name=\"csrf_token\" value=\"protocol-csrf\""));
         assert!(html.contains("/api/admin/protocol"));
         assert!(!html.contains("AWG_HEADER_PROTECTION_KEY"));
+    }
+
+    #[test]
+    fn protocol_panel_styling_separates_adjacent_visible_sections() {
+        let head = html_head("AmneziaWG – Peers");
+        assert!(head.contains(
+            ".protocol-panel section:not([hidden]) ~ section:not([hidden]) { margin-top: 1.5rem; }"
+        ));
     }
 
     #[tokio::test]
