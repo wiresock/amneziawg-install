@@ -348,6 +348,108 @@ pub async fn find_snapshots(
     .await
 }
 
+/// Result of a chunked snapshot purge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteSnapshotsResult {
+    /// Total number of snapshot rows deleted during this invocation.
+    pub deleted: u64,
+    /// Whether additional *deletable* expired snapshot rows remain.
+    ///
+    /// Intentionally retained pre-cutoff baseline rows (one newest snapshot
+    /// per `public_key` before the cutoff) are not a deletion backlog.
+    pub more_remaining: bool,
+}
+
+/// Pre-cutoff rows that still have a newer pre-cutoff sibling for the same
+/// `public_key`. The newest pre-cutoff row per peer (highest `captured_at`,
+/// then highest `id`) is the usage baseline and must not be deleted.
+///
+/// Uses the existing `(public_key, captured_at, id)` composite index.
+const DELETABLE_EXPIRED_SNAPSHOT_PREDICATE: &str = "captured_at < ?
+      AND EXISTS (
+          SELECT 1
+          FROM snapshots AS newer
+          WHERE newer.public_key = snapshots.public_key
+            AND newer.captured_at < ?
+            AND (
+                newer.captured_at > snapshots.captured_at
+                OR (newer.captured_at = snapshots.captured_at AND newer.id > snapshots.id)
+            )
+      )";
+
+/// Delete historical snapshots older than `cutoff_rfc3339` in bounded batches.
+///
+/// Each `public_key` keeps its newest pre-cutoff snapshot as a usage baseline
+/// so sparse 30-day history can still compute a delta from traffic that
+/// accumulated before the window. Older pre-cutoff rows for that peer are
+/// deleted. In-window snapshots are never deleted by this function.
+///
+/// If `max_batches` is `Some(n)`, at most `n` batches of `batch_size` rows are
+/// deleted before returning, allowing callers to throttle cleanup across multiple
+/// poll cycles. If `max_batches` is `None`, purging continues until all expired
+/// *non-baseline* rows are drained.
+///
+/// To prevent monopolizing the SQLite write lock and starving concurrent HTTP
+/// readers and writers, a brief sleep is performed between batches.
+pub async fn delete_expired_snapshots(
+    pool: &SqlitePool,
+    cutoff_rfc3339: &str,
+    batch_size: u32,
+    max_batches: Option<u32>,
+) -> Result<DeleteSnapshotsResult, sqlx::Error> {
+    let mut total_deleted: u64 = 0;
+    let limit = batch_size.max(1) as i64;
+    let mut batches_run: u32 = 0;
+    let delete_sql = format!(
+        "DELETE FROM snapshots
+         WHERE id IN (
+             SELECT id FROM snapshots
+             WHERE {DELETABLE_EXPIRED_SNAPSHOT_PREDICATE}
+             LIMIT ?
+         )"
+    );
+    let remaining_sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM snapshots WHERE {DELETABLE_EXPIRED_SNAPSHOT_PREDICATE})"
+    );
+
+    let more_remaining = loop {
+        let result = sqlx::query(&delete_sql)
+            .bind(cutoff_rfc3339)
+            .bind(cutoff_rfc3339)
+            .bind(limit)
+            .execute(pool)
+            .await?;
+
+        let affected = result.rows_affected();
+        total_deleted += affected;
+        batches_run = batches_run.saturating_add(1);
+
+        if affected < limit as u64 {
+            break false;
+        }
+
+        if let Some(max) = max_batches {
+            if batches_run >= max {
+                let has_more: i64 = sqlx::query_scalar(&remaining_sql)
+                    .bind(cutoff_rfc3339)
+                    .bind(cutoff_rfc3339)
+                    .fetch_one(pool)
+                    .await?;
+                break has_more != 0;
+            }
+        }
+
+        // Throttle briefly between batches to yield the SQLite write lock to
+        // concurrent readers/writers (such as web handlers or checkpoints).
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+
+    Ok(DeleteSnapshotsResult {
+        deleted: total_deleted,
+        more_remaining,
+    })
+}
+
 /// Update the human-editable metadata fields (`display_name`, `comment`) for a
 /// single peer.
 ///
@@ -1091,6 +1193,284 @@ mod tests {
             .await
             .expect("snapshots");
         assert_eq!(rows.len(), 3);
+    }
+
+    async fn remaining_captured_at(pool: &SqlitePool, public_key: &str) -> Vec<String> {
+        find_snapshots(pool, public_key, 50)
+            .await
+            .expect("remaining snapshots")
+            .into_iter()
+            .map(|row| row.captured_at)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_purges_only_older_rows() {
+        let db = test_db().await;
+        insert_snapshot(&db.pool, "KEY_PURGE=", "2026-01-01T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_PURGE=", "2026-01-10T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_PURGE=", "2026-01-20T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_PURGE=", "2026-02-01T00:00:00Z").await;
+
+        // Cutoff Jan 15: keep Jan 10 as the pre-cutoff baseline; delete Jan 01.
+        let res = delete_expired_snapshots(&db.pool, "2026-01-15T00:00:00Z", 1000, None)
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 1);
+        assert!(!res.more_remaining);
+
+        let remaining = remaining_captured_at(&db.pool, "KEY_PURGE=").await;
+        assert_eq!(
+            remaining,
+            vec![
+                "2026-02-01T00:00:00Z".to_string(),
+                "2026-01-20T00:00:00Z".to_string(),
+                "2026-01-10T00:00:00Z".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_preserves_sparse_baseline() {
+        let db = test_db().await;
+        insert_snapshot(&db.pool, "KEY_SPARSE=", "2025-12-01T00:00:00Z").await; // ~40d before cutoff
+        insert_snapshot(&db.pool, "KEY_SPARSE=", "2026-01-10T00:00:00Z").await; // in window
+
+        let res = delete_expired_snapshots(&db.pool, "2026-01-05T00:00:00Z", 1000, None)
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 0);
+        assert!(!res.more_remaining);
+        assert_eq!(
+            remaining_captured_at(&db.pool, "KEY_SPARSE=").await,
+            vec![
+                "2026-01-10T00:00:00Z".to_string(),
+                "2025-12-01T00:00:00Z".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_keeps_newest_of_multiple_expired_rows() {
+        let db = test_db().await;
+        insert_snapshot(&db.pool, "KEY_MULTI=", "2025-11-01T00:00:00Z").await; // 60d
+        insert_snapshot(&db.pool, "KEY_MULTI=", "2025-11-11T00:00:00Z").await; // 50d
+        insert_snapshot(&db.pool, "KEY_MULTI=", "2025-11-21T00:00:00Z").await; // 40d
+        insert_snapshot(&db.pool, "KEY_MULTI=", "2026-01-10T00:00:00Z").await; // 5d
+
+        let res = delete_expired_snapshots(&db.pool, "2026-01-01T00:00:00Z", 1000, None)
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 2);
+        assert!(!res.more_remaining);
+        assert_eq!(
+            remaining_captured_at(&db.pool, "KEY_MULTI=").await,
+            vec![
+                "2026-01-10T00:00:00Z".to_string(),
+                "2025-11-21T00:00:00Z".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_preserves_one_baseline_per_peer() {
+        let db = test_db().await;
+        insert_snapshot(&db.pool, "KEY_PEER_A=", "2025-11-01T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_PEER_A=", "2025-11-21T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_PEER_A=", "2026-01-10T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_PEER_B=", "2025-10-01T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_PEER_B=", "2025-12-01T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_PEER_B=", "2026-01-08T00:00:00Z").await;
+
+        let res = delete_expired_snapshots(&db.pool, "2026-01-01T00:00:00Z", 1000, None)
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 2);
+        assert!(!res.more_remaining);
+        assert_eq!(
+            remaining_captured_at(&db.pool, "KEY_PEER_A=").await,
+            vec![
+                "2026-01-10T00:00:00Z".to_string(),
+                "2025-11-21T00:00:00Z".to_string(),
+            ]
+        );
+        assert_eq!(
+            remaining_captured_at(&db.pool, "KEY_PEER_B=").await,
+            vec![
+                "2026-01-08T00:00:00Z".to_string(),
+                "2025-12-01T00:00:00Z".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_keeps_newest_when_all_history_is_old() {
+        let db = test_db().await;
+        insert_snapshot(&db.pool, "KEY_OLD_ONLY=", "2025-10-01T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_OLD_ONLY=", "2025-11-01T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_OLD_ONLY=", "2025-12-01T00:00:00Z").await;
+
+        let res = delete_expired_snapshots(&db.pool, "2026-01-01T00:00:00Z", 1000, None)
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 2);
+        assert!(!res.more_remaining);
+        assert_eq!(
+            remaining_captured_at(&db.pool, "KEY_OLD_ONLY=").await,
+            vec!["2025-12-01T00:00:00Z".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_tie_breaks_same_timestamp_by_id() {
+        let db = test_db().await;
+        insert_snapshot_with_rx(&db.pool, "KEY_TIE=", "2025-12-01T00:00:00Z", 10).await;
+        insert_snapshot_with_rx(&db.pool, "KEY_TIE=", "2025-12-01T00:00:00Z", 20).await;
+        insert_snapshot_with_rx(&db.pool, "KEY_TIE=", "2026-01-10T00:00:00Z", 30).await;
+
+        let res = delete_expired_snapshots(&db.pool, "2026-01-01T00:00:00Z", 1000, None)
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 1);
+        assert!(!res.more_remaining);
+
+        let remaining = find_snapshots(&db.pool, "KEY_TIE=", 10)
+            .await
+            .expect("remaining");
+        assert_eq!(remaining.len(), 2);
+        let baseline = remaining
+            .iter()
+            .find(|row| row.captured_at == "2025-12-01T00:00:00Z")
+            .expect("baseline");
+        assert_eq!(baseline.rx_bytes, 20);
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_preserved_baseline_is_not_a_backlog() {
+        let db = test_db().await;
+        insert_snapshot(&db.pool, "KEY_ANCHOR=", "2025-12-01T00:00:00Z").await;
+        insert_snapshot(&db.pool, "KEY_ANCHOR=", "2026-01-10T00:00:00Z").await;
+
+        let first = delete_expired_snapshots(&db.pool, "2026-01-01T00:00:00Z", 1000, Some(1))
+            .await
+            .expect("first cleanup");
+        assert_eq!(first.deleted, 0);
+        assert!(!first.more_remaining);
+
+        let second = delete_expired_snapshots(&db.pool, "2026-01-01T00:00:00Z", 1, Some(1))
+            .await
+            .expect("second cleanup");
+        assert_eq!(second.deleted, 0);
+        assert!(!second.more_remaining);
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_handles_multiple_batches() {
+        let db = test_db().await;
+        for i in 1..=10 {
+            let ts = format!("2026-01-{:02}T00:00:00Z", i);
+            insert_snapshot(&db.pool, "KEY_BATCH=", &ts).await;
+        }
+
+        // Cutoff Jan 08: Jan 1-7 are pre-cutoff; keep Jan 07, delete Jan 1-6.
+        let res = delete_expired_snapshots(&db.pool, "2026-01-08T00:00:00Z", 3, None)
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 6);
+        assert!(!res.more_remaining);
+
+        let remaining = remaining_captured_at(&db.pool, "KEY_BATCH=").await;
+        assert_eq!(remaining.len(), 4);
+        assert_eq!(remaining[3], "2026-01-07T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_respects_max_batches() {
+        let db = test_db().await;
+        for i in 1..=10 {
+            let ts = format!("2026-01-{:02}T00:00:00Z", i);
+            insert_snapshot(&db.pool, "KEY_MAX_B=", &ts).await;
+        }
+
+        // 6 deletable rows (Jan 1-6). batch_size = 3, max_batches = 1 deletes 3
+        // and reports more_remaining because Jan 4-6 are still deletable.
+        let res = delete_expired_snapshots(&db.pool, "2026-01-08T00:00:00Z", 3, Some(1))
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 3);
+        assert!(res.more_remaining);
+
+        let remaining = find_snapshots(&db.pool, "KEY_MAX_B=", 10)
+            .await
+            .expect("remaining");
+        assert_eq!(remaining.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_exact_batch_multiple_reports_more_remaining_false() {
+        let db = test_db().await;
+        // Jan 1-7 pre-cutoff (keep Jan 7) => 6 deletable rows, plus 2 in-window.
+        for i in 1..=7 {
+            let ts = format!("2026-01-{:02}T00:00:00Z", i);
+            insert_snapshot(&db.pool, "KEY_EXACT_B=", &ts).await;
+        }
+        for i in 8..=9 {
+            let ts = format!("2026-01-{:02}T00:00:00Z", i);
+            insert_snapshot(&db.pool, "KEY_EXACT_B=", &ts).await;
+        }
+
+        let res = delete_expired_snapshots(&db.pool, "2026-01-08T00:00:00Z", 3, Some(2))
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 6);
+        assert!(!res.more_remaining);
+
+        let remaining = remaining_captured_at(&db.pool, "KEY_EXACT_B=").await;
+        assert_eq!(
+            remaining,
+            vec![
+                "2026-01-09T00:00:00Z".to_string(),
+                "2026-01-08T00:00:00Z".to_string(),
+                "2026-01-07T00:00:00Z".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_expired_snapshots_preserves_sparse_usage_delta() {
+        let db = test_db().await;
+        insert_snapshot_with_rx(&db.pool, "KEY_USAGE=", "2025-12-01T00:00:00Z", 1_000).await;
+        insert_snapshot_with_rx(&db.pool, "KEY_USAGE=", "2026-01-10T00:00:00Z", 5_000).await;
+
+        let res = delete_expired_snapshots(&db.pool, "2026-01-01T00:00:00Z", 1000, None)
+            .await
+            .expect("delete expired");
+        assert_eq!(res.deleted, 0);
+
+        let window_start = "2026-01-01T00:00:00Z";
+        let baseline = find_baseline_snapshot(&db.pool, "KEY_USAGE=", window_start)
+            .await
+            .expect("baseline")
+            .expect("sparse baseline must survive");
+        let in_window = find_snapshots_since(&db.pool, "KEY_USAGE=", window_start)
+            .await
+            .expect("in-window");
+        let mut inputs = vec![crate::domain::history::SnapshotInput {
+            captured_at: baseline.captured_at,
+            rx_bytes: baseline.rx_bytes as u64,
+            tx_bytes: baseline.tx_bytes as u64,
+        }];
+        inputs.extend(
+            in_window
+                .into_iter()
+                .map(|row| crate::domain::history::SnapshotInput {
+                    captured_at: row.captured_at,
+                    rx_bytes: row.rx_bytes as u64,
+                    tx_bytes: row.tx_bytes as u64,
+                }),
+        );
+        let summary = crate::domain::history::compute_usage_summary(&inputs);
+        assert_eq!(summary.rx_total_delta, 4_000);
     }
 
     // ── find_snapshots_since ─────────────────────────────────────────────────

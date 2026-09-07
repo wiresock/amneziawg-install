@@ -45,6 +45,18 @@ pub struct Config {
     #[arg(long, env = "AWG_POLL_INTERVAL", default_value_t = 30)]
     pub poll_interval: u64,
 
+    /// Snapshot retention window in days (up to 36500 days / ~100 years).
+    /// In-window snapshots are kept, and each peer also keeps its newest older
+    /// snapshot as a usage-delta baseline. History before that baseline is
+    /// purged in the background. Defaults to 31 days. Set to 0 to disable cleanup.
+    #[arg(
+        long,
+        env = "AWG_SNAPSHOT_RETENTION_DAYS",
+        default_value_t = 31,
+        value_parser = clap::value_parser!(u32).range(0..=36500)
+    )]
+    pub snapshot_retention_days: u32,
+
     /// Proxy active-session status file written by amneziawg-proxy.
     #[arg(
         long,
@@ -232,11 +244,12 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Background poller --------------------------------------------------
     let config_dir = config.config_dir.clone();
-    let poller = Poller::new_with_lifecycle_lock_dir(
+    let poller = Poller::new_full(
         db.clone(),
         config.poll_interval,
         config.config_dir,
         lifecycle_lock_dir.clone(),
+        config.snapshot_retention_days,
     );
     tokio::spawn(async move {
         poller.run().await;
@@ -259,4 +272,39 @@ async fn main() -> anyhow::Result<()> {
         .context("HTTP server error")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn config_accepts_valid_snapshot_retention_days() {
+        let cfg = Config::try_parse_from(["amneziawg-web", "--snapshot-retention-days", "31"])
+            .expect("parse valid days");
+        assert_eq!(cfg.snapshot_retention_days, 31);
+
+        let cfg_zero = Config::try_parse_from(["amneziawg-web", "--snapshot-retention-days", "0"])
+            .expect("parse zero days");
+        assert_eq!(cfg_zero.snapshot_retention_days, 0);
+
+        let cfg_max =
+            Config::try_parse_from(["amneziawg-web", "--snapshot-retention-days", "36500"])
+                .expect("parse max days");
+        assert_eq!(cfg_max.snapshot_retention_days, 36500);
+    }
+
+    #[test]
+    fn config_rejects_out_of_range_snapshot_retention_days() {
+        assert!(
+            Config::try_parse_from(["amneziawg-web", "--snapshot-retention-days", "36501",])
+                .is_err()
+        );
+
+        assert!(
+            Config::try_parse_from(["amneziawg-web", "--snapshot-retention-days", "200000",])
+                .is_err()
+        );
+    }
 }
