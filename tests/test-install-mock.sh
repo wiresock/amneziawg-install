@@ -1749,7 +1749,7 @@ if [[ -f "${WEB_TEST_ENV_FILE}" ]]; then
 fi
 
 # Verify key variables are present in the env file
-for VAR in AUTH_ENABLED AUTH_USERNAME AUTH_PASSWORD_HASH AWG_WEB_LISTEN AWG_WEB_DB AWG_CONFIG_DIR; do
+for VAR in AUTH_ENABLED AUTH_USERNAME AUTH_PASSWORD_HASH AWG_WEB_LISTEN AWG_WEB_DB AWG_CONFIG_DIR AWG_SNAPSHOT_RETENTION_DAYS; do
 	if grep -q "^${VAR}=" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
 		echo "OK: Env file contains ${VAR}"
 	else
@@ -1757,6 +1757,114 @@ for VAR in AUTH_ENABLED AUTH_USERNAME AUTH_PASSWORD_HASH AWG_WEB_LISTEN AWG_WEB_
 		FAILED=$((FAILED + 1))
 	fi
 done
+
+if grep -q "^AWG_SNAPSHOT_RETENTION_DAYS=31$" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
+	echo "OK: Default AWG_SNAPSHOT_RETENTION_DAYS is 31"
+else
+	echo "FAIL: Default AWG_SNAPSHOT_RETENTION_DAYS is not 31"
+	echo "  Value: $(grep '^AWG_SNAPSHOT_RETENTION_DAYS' "${WEB_TEST_ENV_FILE}" 2>/dev/null || echo '(not found)')"
+	FAILED=$((FAILED + 1))
+fi
+
+echo ""
+echo "--- Web installer: snapshot-retention-days validation ---"
+
+run_retention_install() {
+	local days="$1"
+	local env_file="$2"
+	shift 2
+	local stamp root install_dir data_dir
+	stamp="$(basename "${env_file}" .conf)"
+	root="/tmp/awg-web-ret-${stamp}"
+	install_dir="${root}/bin"
+	data_dir="/var/lib/awg-web-ret-${stamp}"
+	mkdir -p "${install_dir}" "${data_dir}" "$(dirname "${env_file}")"
+	bash "${WEB_INSTALLER_IMPL}" \
+		--non-interactive \
+		--binary-src "${STUB_BINARY}" \
+		--install-dir "${install_dir}" \
+		--data-dir "${data_dir}" \
+		--env-file "${env_file}" \
+		--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+		--username testadmin \
+		--password-hash "${TEST_PASSWORD_HASH}" \
+		--snapshot-retention-days "${days}" \
+		--no-start --no-enable \
+		"$@" 2>&1
+}
+
+assert_retention_rejected() {
+	local days="$1"
+	local label="$2"
+	local env_file="/etc/awg-web-ret-reject/env-${label}.conf"
+	local rc=0
+	local output
+	output="$(run_retention_install "${days}" "${env_file}")" || rc=$?
+	if [[ ${rc} -ne 0 ]]; then
+		echo "OK: --snapshot-retention-days ${days} is rejected (rc=${rc})"
+	else
+		echo "FAIL: --snapshot-retention-days ${days} should be rejected"
+		echo "  Output: ${output}"
+		FAILED=$((FAILED + 1))
+	fi
+	if [[ -f "${env_file}" ]] && grep -q "^AWG_SNAPSHOT_RETENTION_DAYS=" "${env_file}"; then
+		echo "FAIL: rejected --snapshot-retention-days ${days} persisted an env value"
+		FAILED=$((FAILED + 1))
+	fi
+}
+
+assert_retention_accepted() {
+	local days="$1"
+	local expected="$2"
+	local env_file="/etc/awg-web-ret-ok/${expected}.conf"
+	local rc=0
+	local output
+	output="$(run_retention_install "${days}" "${env_file}" --force)" || rc=$?
+	if [[ ${rc} -eq 0 ]]; then
+		echo "OK: --snapshot-retention-days ${days} is accepted"
+	else
+		echo "FAIL: --snapshot-retention-days ${days} should succeed (rc=${rc})"
+		echo "  Output tail: $(echo "${output}" | tail -10)"
+		FAILED=$((FAILED + 1))
+	fi
+	if grep -q "^AWG_SNAPSHOT_RETENTION_DAYS=${expected}$" "${env_file}" 2>/dev/null; then
+		echo "OK: AWG_SNAPSHOT_RETENTION_DAYS=${expected} persisted for input ${days}"
+	else
+		echo "FAIL: expected AWG_SNAPSHOT_RETENTION_DAYS=${expected} for input ${days}"
+		echo "  Value: $(grep '^AWG_SNAPSHOT_RETENTION_DAYS' "${env_file}" 2>/dev/null || echo '(not found)')"
+		FAILED=$((FAILED + 1))
+	fi
+}
+
+assert_retention_accepted "45" "45"
+assert_retention_accepted "08" "8"
+assert_retention_accepted "00031" "31"
+assert_retention_accepted "0" "0"
+assert_retention_accepted "36500" "36500"
+assert_retention_rejected "36501" "over-max"
+assert_retention_rejected "abc" "non-numeric"
+assert_retention_rejected "18446744073709551616" "overflow"
+
+# Restore the default install artifacts so later systemd/env checks stay valid.
+WEB_RESTORE_RC=0
+WEB_RESTORE_OUTPUT=$(bash "${WEB_INSTALLER_IMPL}" \
+	--non-interactive \
+	--force \
+	--binary-src "${STUB_BINARY}" \
+	--install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--data-dir "${WEB_TEST_DATA_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" \
+	--config-dir "${WEB_TEST_AWG_CONFIG_DIR}" \
+	--username testadmin \
+	--password-hash "${TEST_PASSWORD_HASH}" \
+	--no-start --no-enable 2>&1) || WEB_RESTORE_RC=$?
+if [[ ${WEB_RESTORE_RC} -eq 0 ]]; then
+	echo "OK: Restored default web installer artifacts after retention tests"
+else
+	echo "FAIL: Failed to restore default web installer artifacts (rc=${WEB_RESTORE_RC})"
+	echo "  Output tail: $(echo "${WEB_RESTORE_OUTPUT}" | tail -10)"
+	FAILED=$((FAILED + 1))
+fi
 
 # Verify username was written correctly
 if grep -q "^AUTH_USERNAME=testadmin$" "${WEB_TEST_ENV_FILE}" 2>/dev/null; then
