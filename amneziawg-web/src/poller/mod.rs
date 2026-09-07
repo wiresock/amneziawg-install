@@ -23,8 +23,6 @@
 //! poller's immediate first cycle at process startup.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicI64;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -62,8 +60,6 @@ pub struct Poller {
     lifecycle_lock_dir: PathBuf,
     /// Maximum age of snapshots in days before cleanup (0 = disabled).
     snapshot_retention_days: u32,
-    /// Epoch timestamp of the last executed snapshot retention cleanup.
-    last_retention_cleanup: Arc<AtomicI64>,
 }
 
 impl Poller {
@@ -85,7 +81,6 @@ impl Poller {
             config_dir,
             lifecycle_lock_dir,
             snapshot_retention_days,
-            last_retention_cleanup: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -407,10 +402,6 @@ impl Poller {
         let res =
             crate::db::peers::delete_expired_snapshots(&self.db.pool, &cutoff_str, 5000, None)
                 .await?;
-        self.last_retention_cleanup.store(
-            chrono::Utc::now().timestamp(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
         Ok(res.deleted)
     }
 
@@ -419,7 +410,6 @@ impl Poller {
             return false;
         }
 
-        let now_epoch = chrono::Utc::now().timestamp();
         let retention_duration = match chrono::Duration::try_days(
             self.snapshot_retention_days as i64,
         ) {
@@ -429,8 +419,6 @@ impl Poller {
                     days = self.snapshot_retention_days,
                     "snapshot retention days exceeds maximum supported range (36500); skipping cleanup"
                 );
-                self.last_retention_cleanup
-                    .store(now_epoch, std::sync::atomic::Ordering::Relaxed);
                 return false;
             }
         };
@@ -451,13 +439,6 @@ impl Poller {
                         retention_days = self.snapshot_retention_days,
                         "expired snapshot cleanup progress"
                     );
-                }
-                if result.more_remaining {
-                    self.last_retention_cleanup
-                        .store(-1, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    self.last_retention_cleanup
-                        .store(now_epoch, std::sync::atomic::Ordering::Relaxed);
                 }
                 result.more_remaining
             }
@@ -1268,7 +1249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_expired_snapshots_step_throttles_and_sets_backlog_flag() {
+    async fn cleanup_expired_snapshots_step_retains_newest_pre_cutoff_snapshot() {
         let db = Database::connect_for_test().await.expect("test database");
         let pk = "KEY_STEP_THROTTLE=";
 
@@ -1296,13 +1277,6 @@ mod tests {
             .await
             .expect("find snapshots");
         assert_eq!(remaining.len(), 1);
-        // last_retention_cleanup was updated to positive epoch (no backlog)
-        assert!(
-            poller
-                .last_retention_cleanup
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0
-        );
     }
 
     #[tokio::test]
@@ -1345,12 +1319,6 @@ mod tests {
             .await
             .expect("find snapshots");
         assert_eq!(remaining.len(), 1);
-        assert!(
-            poller
-                .last_retention_cleanup
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0
-        );
 
         // Insert more expired snapshots and verify the loop picks them up on the next tick
         for i in 1..=5 {

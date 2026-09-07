@@ -699,7 +699,7 @@ EOF
     prompt_default LISTEN_PORT "Bind port" "${LISTEN_PORT}"
     prompt_default POLL_INTERVAL "Poll interval (seconds)" "${POLL_INTERVAL}"
     while true; do
-        prompt_default SNAPSHOT_RETENTION_DAYS "Snapshot retention in days (0=unlimited, max 36500)" "${SNAPSHOT_RETENTION_DAYS}"
+        prompt_default SNAPSHOT_RETENTION_DAYS "Snapshot retention in days (0 to disable cleanup, max 36500)" "${SNAPSHOT_RETENTION_DAYS}"
         if [[ "${SNAPSHOT_RETENTION_DAYS}" =~ ^0*([1-9][0-9]*|0)$ ]] && (( ${#BASH_REMATCH[1]} <= 5 )) && (( 10#${BASH_REMATCH[1]} <= 36500 )); then
             SNAPSHOT_RETENTION_DAYS="${BASH_REMATCH[1]}"
             break
