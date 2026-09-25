@@ -310,6 +310,7 @@ Types: deb deb-src
 URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu/
 Suites: noble
 Components: main
+Architectures: amd64
 Signed-By:
  -----BEGIN PGP PUBLIC KEY BLOCK-----
  keep-this-inline-key-material
@@ -334,7 +335,7 @@ MODE_BEFORE=$(stat -c '%a' "${DEB822_DIR}/combined.sources")
 setAmneziaPpaSuite noble "${DEB822_DIR}" amd64
 RC=$?
 assert_rc 0 "${RC}" "DEB822 target stanza is rewritten"
-assert_file_eq "${TEST_ROOT}/combined.expected" "${DEB822_DIR}/combined.sources" "only the matching DEB822 Suites value changes"
+assert_file_eq "${TEST_ROOT}/combined.expected" "${DEB822_DIR}/combined.sources" "only the matching DEB822 stanza changes: selected suite and native architecture"
 assert_file_eq "${TEST_ROOT}/amneziawg.expected" "${DEB822_DIR}/amneziawg.sources" "filename containing amnezia does not cause unrelated rewrite"
 assert_eq "${MODE_BEFORE}" "$(stat -c '%a' "${DEB822_DIR}/combined.sources")" "DEB822 file mode is preserved"
 
@@ -403,14 +404,14 @@ EOF
 cat > "${TEST_ROOT}/mixed.expected" <<'EOF'
 # resolute in this comment must stay unchanged
 deb [arch=amd64 signed-by=/key.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu noble main
-deb-src https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu/ noble main # keep trailing comment
+deb-src [arch=amd64] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu/ noble main # keep trailing comment
 deb https://archive.ubuntu.com/ubuntu resolute main
 deb https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu.evil resolute main
 # deb https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu resolute main
 EOF
 setAmneziaPpaSuite noble "${LEGACY_DIR}" amd64
 assert_rc 0 "$?" "legacy deb and deb-src entries are rewritten"
-assert_file_eq "${TEST_ROOT}/mixed.expected" "${LEGACY_DIR}/mixed.list" "legacy rewrite changes only the exact suite field"
+assert_file_eq "${TEST_ROOT}/mixed.expected" "${LEGACY_DIR}/mixed.list" "legacy rewrite changes only the exact suite field and native arch option"
 CHECKSUM_BEFORE=$(cksum "${LEGACY_DIR}/mixed.list")
 setAmneziaPpaSuite noble "${LEGACY_DIR}" amd64
 assert_rc 0 "$?" "already-correct legacy entries succeed"
@@ -432,7 +433,7 @@ deb "https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu" resolute main
 EOF
 setAmneziaPpaSuite noble "${QUOTED_URI_DIR}" amd64
 assert_rc 0 "$?" "APT-valid quoted legacy PPA URI is recognized"
-assert_contains '^deb "https://ppa\.launchpadcontent\.net/amnezia/ppa/ubuntu" noble main$' "${QUOTED_URI_DIR}/quoted.list" "quoted URI is preserved while its suite changes"
+assert_contains '^deb \[arch=amd64\] "https://ppa\.launchpadcontent\.net/amnezia/ppa/ubuntu" noble main$' "${QUOTED_URI_DIR}/quoted.list" "quoted URI is preserved while its suite changes"
 
 ENCODED_URI_DIR="${TEST_ROOT}/encoded-legacy-uri"
 mkdir -p "${ENCODED_URI_DIR}"
@@ -441,7 +442,7 @@ deb https%3a%2f%2fppa.launchpadcontent.net%2famnezia%2fppa%2fubuntu resolute mai
 EOF
 setAmneziaPpaSuite noble "${ENCODED_URI_DIR}" amd64
 assert_rc 0 "$?" "APT percent-encoded exact legacy PPA URI is recognized"
-assert_contains '^deb https%3a%2f%2fppa\.launchpadcontent\.net%2famnezia%2fppa%2fubuntu noble main$' "${ENCODED_URI_DIR}/encoded.list" "encoded URI spelling is preserved while its suite changes"
+assert_contains '^deb \[arch=amd64\] https%3a%2f%2fppa\.launchpadcontent\.net%2famnezia%2fppa%2fubuntu noble main$' "${ENCODED_URI_DIR}/encoded.list" "encoded URI spelling is preserved while its suite changes"
 
 SINGLE_QUOTED_URI_DIR="${TEST_ROOT}/single-quoted-legacy-uri"
 mkdir -p "${SINGLE_QUOTED_URI_DIR}"
@@ -470,6 +471,191 @@ setAmneziaPpaSuite noble "${NO_NEWLINE_DIR}" amd64
 assert_rc 0 "$?" "source without a final newline is rewritten"
 assert_contains ' noble main$' "${NO_NEWLINE_DIR}/no-newline.list" "source without final newline receives the selected suite"
 assert_eq "0" "$(tail -c 1 "${NO_NEWLINE_DIR}/no-newline.list" | wc -l | tr -d ' ')" "rewrite preserves absence of a final newline"
+
+echo "=== Native architecture pinning (DEB822) ==="
+# With APT architecture variants enabled, an unpinned PPA source whose Release
+# file lists amd64v3 is read only through that index, which Launchpad publishes
+# without amneziawg-tools. The managed entry is pinned to the dpkg architecture.
+ARCH_DIR="${TEST_ROOT}/native-arch"
+
+# write_ppa_deb822 <file> [lines after Components...]
+function write_ppa_deb822() {
+	local FILE="$1"
+	shift
+	{
+		printf '%s\n' '# Managed Amnezia PPA entry; this comment stays.' 'Types: deb' \
+			'URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu/' \
+			'Suites: resolute' 'Components: main'
+		if [[ $# -gt 0 ]]; then
+			printf '%s\n' "$@"
+		fi
+		printf '%s\n' 'Signed-By:' ' -----BEGIN PGP PUBLIC KEY BLOCK-----' \
+			' fixture-key-material' ' -----END PGP PUBLIC KEY BLOCK-----'
+	} > "${FILE}"
+}
+
+for ARCH in amd64 arm64 armhf; do
+	rm -rf "${ARCH_DIR}"
+	mkdir -p "${ARCH_DIR}"
+	write_ppa_deb822 "${ARCH_DIR}/amnezia-ubuntu-ppa-resolute.sources"
+	write_ppa_deb822 "${TEST_ROOT}/native-arch.expected" "Architectures: ${ARCH}"
+	setAmneziaPpaSuite resolute "${ARCH_DIR}" "${ARCH}"
+	assert_rc 0 "$?" "unpinned DEB822 source is reconciled on ${ARCH}"
+	assert_file_eq "${TEST_ROOT}/native-arch.expected" "${ARCH_DIR}/amnezia-ubuntu-ppa-resolute.sources" \
+		"DEB822 source gains exactly 'Architectures: ${ARCH}' and keeps every other field and comment"
+	cp "${ARCH_DIR}/amnezia-ubuntu-ppa-resolute.sources" "${TEST_ROOT}/native-arch.first"
+	setAmneziaPpaSuite resolute "${ARCH_DIR}" "${ARCH}"
+	assert_rc 0 "$?" "second DEB822 reconciliation succeeds on ${ARCH}"
+	assert_file_eq "${TEST_ROOT}/native-arch.first" "${ARCH_DIR}/amnezia-ubuntu-ppa-resolute.sources" \
+		"second DEB822 reconciliation on ${ARCH} is byte-identical"
+	amneziaPpaSourceEntriesExist "${ARCH_DIR}" "${ARCH}"
+	assert_rc 0 "$?" "the matcher accepts the entry its writer pinned to ${ARCH}"
+done
+
+rm -rf "${ARCH_DIR}"
+mkdir -p "${ARCH_DIR}"
+write_ppa_deb822 "${ARCH_DIR}/suite-change.sources"
+sed -i 's/^Suites: resolute$/Suites: noble/' "${ARCH_DIR}/suite-change.sources"
+write_ppa_deb822 "${TEST_ROOT}/suite-change.expected" "Architectures: amd64"
+setAmneziaPpaSuite resolute "${ARCH_DIR}" amd64
+assert_rc 0 "$?" "noble entry moved to resolute is reconciled"
+assert_file_eq "${TEST_ROOT}/suite-change.expected" "${ARCH_DIR}/suite-change.sources" \
+	"a noble to resolute suite change pins the native architecture in the same pass"
+
+EXISTING_NAMES=("amd64 amd64v3" "amd64 i386" "amd64" "amd64v3 amd64")
+for EXISTING in "${EXISTING_NAMES[@]}"; do
+	rm -rf "${ARCH_DIR}"
+	mkdir -p "${ARCH_DIR}"
+	write_ppa_deb822 "${ARCH_DIR}/existing.sources" "Architectures: ${EXISTING}"
+	setAmneziaPpaSuite resolute "${ARCH_DIR}" amd64
+	assert_rc 0 "$?" "existing 'Architectures: ${EXISTING}' is reconciled"
+	assert_file_eq "${TEST_ROOT}/suite-change.expected" "${ARCH_DIR}/existing.sources" \
+		"'Architectures: ${EXISTING}' converges to exactly 'Architectures: amd64'"
+done
+
+rm -rf "${ARCH_DIR}"
+mkdir -p "${ARCH_DIR}"
+write_ppa_deb822 "${ARCH_DIR}/multiline.sources" "Architectures:" " amd64" " amd64v3"
+setAmneziaPpaSuite resolute "${ARCH_DIR}" amd64
+assert_rc 0 "$?" "multiline Architectures field is reconciled"
+assert_file_eq "${TEST_ROOT}/suite-change.expected" "${ARCH_DIR}/multiline.sources" \
+	"multiline Architectures converges to one line and drops stale continuations"
+
+rm -rf "${ARCH_DIR}"
+mkdir -p "${ARCH_DIR}"
+write_ppa_deb822 "${ARCH_DIR}/lowercase.sources" "architectures: amd64v3 amd64"
+write_ppa_deb822 "${TEST_ROOT}/lowercase.expected" "architectures: amd64"
+setAmneziaPpaSuite resolute "${ARCH_DIR}" amd64
+assert_rc 0 "$?" "lowercase Architectures field name is reconciled"
+assert_file_eq "${TEST_ROOT}/lowercase.expected" "${ARCH_DIR}/lowercase.sources" \
+	"field name spelling is kept and no second Architectures field is added"
+
+for DIRECTIVE in "Architectures-Add: amd64v3" "Architectures-Remove: i386"; do
+	rm -rf "${ARCH_DIR}"
+	mkdir -p "${ARCH_DIR}"
+	write_ppa_deb822 "${ARCH_DIR}/directive.sources" "Architectures: amd64" "${DIRECTIVE}"
+	cp "${ARCH_DIR}/directive.sources" "${TEST_ROOT}/directive.original"
+	setAmneziaPpaSuite resolute "${ARCH_DIR}" amd64 > /dev/null 2>"${ERROR_LOG}"
+	assert_rc 1 "$?" "'${DIRECTIVE%%:*}' cannot be normalized safely and is rejected"
+	assert_file_eq "${TEST_ROOT}/directive.original" "${ARCH_DIR}/directive.sources" \
+		"source with '${DIRECTIVE%%:*}' is left untouched"
+	amneziaPpaSourceEntriesExist "${ARCH_DIR}" amd64 > /dev/null 2>"${ERROR_LOG}"
+	assert_rc 2 "$?" "matcher reports the '${DIRECTIVE%%:*}' entry as unusable"
+done
+
+rm -rf "${ARCH_DIR}"
+mkdir -p "${ARCH_DIR}"
+write_ppa_deb822 "${ARCH_DIR}/two-fields.sources" "Architectures: amd64" "Architectures: amd64v3"
+setAmneziaPpaSuite resolute "${ARCH_DIR}" amd64 > /dev/null 2>"${ERROR_LOG}"
+assert_rc 1 "$?" "two Architectures fields are rejected rather than merged"
+
+for BAD_ARCH in "AMD64" "amd64 amd64v3" "amd64;x" "-amd64"; do
+	rm -rf "${ARCH_DIR}"
+	mkdir -p "${ARCH_DIR}"
+	write_ppa_deb822 "${ARCH_DIR}/bad-arch.sources"
+	cp "${ARCH_DIR}/bad-arch.sources" "${TEST_ROOT}/bad-arch.original"
+	setAmneziaPpaSuite resolute "${ARCH_DIR}" "${BAD_ARCH}" > /dev/null 2>"${ERROR_LOG}"
+	assert_rc 1 "$?" "invalid architecture '${BAD_ARCH}' is refused"
+	assert_file_eq "${TEST_ROOT}/bad-arch.original" "${ARCH_DIR}/bad-arch.sources" \
+		"invalid architecture '${BAD_ARCH}' is never written to a source"
+done
+
+rm -rf "${ARCH_DIR}"
+mkdir -p "${ARCH_DIR}"
+write_ppa_deb822 "${ARCH_DIR}/pinned.sources" "Architectures: amd64"
+cat >> "${ARCH_DIR}/pinned.sources" <<'EOF'
+
+Types: deb
+URIs: https://archive.ubuntu.com/ubuntu
+Suites: resolute
+Components: main
+Architectures: amd64 i386
+EOF
+removeAmneziaPpaSourceEntries "${ARCH_DIR}"
+assert_rc 0 "$?" "a pinned DEB822 PPA stanza is removed"
+assert_not_contains 'ppa\.launchpadcontent\.net/amnezia' "${ARCH_DIR}/pinned.sources" "pinned PPA stanza is gone after removal"
+assert_contains '^Architectures: amd64 i386$' "${ARCH_DIR}/pinned.sources" "an unrelated stanza keeps its architecture list"
+
+echo "=== Native architecture pinning (legacy .list) ==="
+PPA_URI_TEXT="https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu"
+# legacy_case <arch> <input line> <expected line>
+function legacy_case() {
+	local ARCH="$1"
+	local INPUT="$2"
+	local EXPECTED="$3"
+	rm -rf "${ARCH_DIR}"
+	mkdir -p "${ARCH_DIR}"
+	printf '%s\n' '# keep this comment' "${INPUT}" \
+		'deb [arch=amd64,i386] https://archive.ubuntu.com/ubuntu resolute main' > "${ARCH_DIR}/amnezia.list"
+	printf '%s\n' '# keep this comment' "${EXPECTED}" \
+		'deb [arch=amd64,i386] https://archive.ubuntu.com/ubuntu resolute main' > "${TEST_ROOT}/legacy-arch.expected"
+	setAmneziaPpaSuite resolute "${ARCH_DIR}" "${ARCH}"
+	assert_rc 0 "$?" "legacy entry is reconciled: ${INPUT}"
+	assert_file_eq "${TEST_ROOT}/legacy-arch.expected" "${ARCH_DIR}/amnezia.list" \
+		"legacy entry becomes '${EXPECTED}' and other lines stay byte-identical"
+	setAmneziaPpaSuite resolute "${ARCH_DIR}" "${ARCH}"
+	assert_file_eq "${TEST_ROOT}/legacy-arch.expected" "${ARCH_DIR}/amnezia.list" \
+		"second legacy reconciliation is byte-identical: ${EXPECTED}"
+	amneziaPpaSourceEntriesExist "${ARCH_DIR}" "${ARCH}"
+	assert_rc 0 "$?" "the matcher accepts the legacy entry pinned to ${ARCH}"
+}
+legacy_case amd64 "deb [signed-by=/usr/share/keyrings/amnezia.gpg] ${PPA_URI_TEXT} resolute main" \
+	"deb [signed-by=/usr/share/keyrings/amnezia.gpg arch=amd64] ${PPA_URI_TEXT} resolute main"
+legacy_case amd64 "deb [arch=amd64,amd64v3 signed-by=/k.gpg] ${PPA_URI_TEXT} resolute main" \
+	"deb [arch=amd64 signed-by=/k.gpg] ${PPA_URI_TEXT} resolute main"
+legacy_case amd64 "deb [signed-by=/k.gpg arch=i386,amd64] ${PPA_URI_TEXT} noble main" \
+	"deb [signed-by=/k.gpg arch=amd64] ${PPA_URI_TEXT} resolute main"
+legacy_case amd64 "deb [ signed-by=/k.gpg ] ${PPA_URI_TEXT} resolute main" \
+	"deb [ signed-by=/k.gpg arch=amd64 ] ${PPA_URI_TEXT} resolute main"
+legacy_case amd64 "deb [] ${PPA_URI_TEXT} resolute main" \
+	"deb [arch=amd64] ${PPA_URI_TEXT} resolute main"
+legacy_case amd64 "deb [Arch=amd64] ${PPA_URI_TEXT} resolute main # trailing comment" \
+	"deb [arch=amd64] ${PPA_URI_TEXT} resolute main # trailing comment"
+legacy_case arm64 "deb ${PPA_URI_TEXT} resolute main" \
+	"deb [arch=arm64] ${PPA_URI_TEXT} resolute main"
+legacy_case armhf "deb [signed-by=/k.gpg] ${PPA_URI_TEXT}/ resolute main" \
+	"deb [signed-by=/k.gpg arch=armhf] ${PPA_URI_TEXT}/ resolute main"
+
+for OPTIONS in "arch=amd64 arch=amd64v3" "arch=amd64 arch=amd64,amd64v3" "arch+=amd64v3" "arch-=i386"; do
+	rm -rf "${ARCH_DIR}"
+	mkdir -p "${ARCH_DIR}"
+	printf '%s\n' "deb [${OPTIONS}] ${PPA_URI_TEXT} resolute main" > "${ARCH_DIR}/amnezia.list"
+	cp "${ARCH_DIR}/amnezia.list" "${TEST_ROOT}/legacy-options.original"
+	setAmneziaPpaSuite resolute "${ARCH_DIR}" amd64 > /dev/null 2>"${ERROR_LOG}"
+	assert_rc 1 "$?" "legacy options '${OPTIONS}' cannot be normalized safely and are rejected"
+	assert_file_eq "${TEST_ROOT}/legacy-options.original" "${ARCH_DIR}/amnezia.list" \
+		"legacy entry with '${OPTIONS}' is left untouched"
+done
+
+rm -rf "${ARCH_DIR}"
+mkdir -p "${ARCH_DIR}"
+printf '%s\n' "deb [arch=amd64 signed-by=/k.gpg] ${PPA_URI_TEXT} resolute main" \
+	'deb [arch=amd64,i386] https://archive.ubuntu.com/ubuntu resolute main' > "${ARCH_DIR}/amnezia.list"
+removeAmneziaPpaSourceEntries "${ARCH_DIR}"
+assert_rc 0 "$?" "a pinned legacy PPA entry is removed"
+assert_not_contains 'ppa\.launchpadcontent\.net/amnezia' "${ARCH_DIR}/amnezia.list" "pinned legacy PPA entry is gone after removal"
+assert_contains '^deb \[arch=amd64,i386\] https://archive\.ubuntu\.com/ubuntu resolute main$' "${ARCH_DIR}/amnezia.list" \
+	"an unrelated legacy line keeps its architecture option"
 
 echo "=== Malformed and ambiguous source handling ==="
 MALFORMED_DIR="${TEST_ROOT}/malformed"
@@ -892,6 +1078,169 @@ export PPA_STUB_MODE="fail-after-create"
 ) > /dev/null 2>"${ERROR_LOG}"
 assert_rc 1 "$?" "add-apt-repository failure is fatal"
 assert_eq "0" "$(find "${FAILED_ADD_DIR}" -maxdepth 1 -type f | wc -l | tr -d ' ')" "failed add cleans the partially created source"
+
+echo "=== Native architecture in configure and refresh ==="
+DPKG_STUB_BIN="${TEST_ROOT}/dpkg-bin"
+mkdir -p "${DPKG_STUB_BIN}"
+cat > "${DPKG_STUB_BIN}/dpkg" <<'EOF'
+#!/bin/bash
+[[ "$1" == "--print-architecture" ]] || exit 2
+[[ "${DPKG_STUB_ARCH}" == "fail" ]] && exit 1
+printf '%s\n' "${DPKG_STUB_ARCH}"
+EOF
+chmod +x "${DPKG_STUB_BIN}/dpkg"
+
+for STUB_ARCH in amd64 arm64 armhf; do
+	assert_eq "${STUB_ARCH}" "$(DPKG_STUB_ARCH="${STUB_ARCH}" PATH="${DPKG_STUB_BIN}:${PATH}" getNativeDpkgArchitecture)" \
+		"native architecture is what dpkg reports (${STUB_ARCH})"
+done
+for STUB_ARCH in fail "" "AMD64" "amd64 i386"; do
+	DPKG_STUB_ARCH="${STUB_ARCH}" PATH="${DPKG_STUB_BIN}:${PATH}" getNativeDpkgArchitecture > /dev/null
+	assert_rc 1 "$?" "an unusable dpkg architecture ('${STUB_ARCH}') is refused"
+done
+
+FRESH_DIR="${TEST_ROOT}/fresh-native"
+mkdir -p "${FRESH_DIR}"
+export PPA_STUB_SOURCES="${FRESH_DIR}"
+export PPA_STUB_MODE="create"
+: > "${PPA_STUB_LOG}"
+(
+	set -euo pipefail
+	function probeAmneziaPpaSuite() { [[ "$1" == "resolute" ]]; }
+	DPKG_STUB_ARCH=arm64 PATH="${STUB_BIN}:${DPKG_STUB_BIN}:${PATH}" \
+		configureUbuntuAmneziaPpa resolute "${FRESH_DIR}"
+	printf '%s %s\n' "${AMNEZIA_PPA_SELECTED_SUITE}" "${AMNEZIA_PPA_ARCHITECTURE}" > "${TEST_ROOT}/fresh.selected"
+)
+assert_rc 0 "$?" "fresh configure with the dpkg architecture succeeds"
+assert_contains '^Suites: resolute$' "${FRESH_DIR}/amnezia-ubuntu-ppa-resolute.sources" "fresh install keeps the native resolute suite"
+assert_eq "1" "$(grep -c '^Architectures:' "${FRESH_DIR}/amnezia-ubuntu-ppa-resolute.sources")" "fresh source has exactly one Architectures field"
+assert_contains '^Architectures: arm64$' "${FRESH_DIR}/amnezia-ubuntu-ppa-resolute.sources" "fresh source is pinned to the architecture dpkg reports"
+assert_eq "resolute arm64" "$(cat "${TEST_ROOT}/fresh.selected")" "configure records the selected suite and architecture"
+
+BADARCH_DIR="${TEST_ROOT}/bad-dpkg-arch"
+mkdir -p "${BADARCH_DIR}"
+export PPA_STUB_SOURCES="${BADARCH_DIR}"
+: > "${PPA_STUB_LOG}"
+(
+	function probeAmneziaPpaSuite() { return 0; }
+	DPKG_STUB_ARCH="AMD64" PATH="${STUB_BIN}:${DPKG_STUB_BIN}:${PATH}" \
+		configureUbuntuAmneziaPpa resolute "${BADARCH_DIR}"
+) > /dev/null 2>"${ERROR_LOG}"
+assert_rc 1 "$?" "configure refuses an invalid dpkg architecture"
+assert_eq "0" "$(wc -l < "${PPA_STUB_LOG}" | tr -d ' ')" "an invalid architecture never reaches add-apt-repository"
+assert_eq "0" "$(find "${BADARCH_DIR}" -maxdepth 1 -type f | wc -l | tr -d ' ')" "an invalid architecture leaves no source file"
+
+# An Ubuntu 26.04 host installed while the PPA had no resolute suite carries a
+# noble entry without an architecture pin. The refresh on the next installer
+# run must move it to resolute and pin it in the same reconciliation.
+MIGRATE_DIR="${TEST_ROOT}/noble-migration"
+mkdir -p "${MIGRATE_DIR}"
+cat > "${MIGRATE_DIR}/amnezia-ubuntu-ppa-resolute.sources" <<'EOF'
+Types: deb
+URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu/
+Suites: noble
+Components: main
+Signed-By:
+ -----BEGIN PGP PUBLIC KEY BLOCK-----
+ fixture-key-material
+ -----END PGP PUBLIC KEY BLOCK-----
+EOF
+cat > "${TEST_ROOT}/noble-migration.expected" <<'EOF'
+Types: deb
+URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu/
+Suites: resolute
+Components: main
+Architectures: amd64
+Signed-By:
+ -----BEGIN PGP PUBLIC KEY BLOCK-----
+ fixture-key-material
+ -----END PGP PUBLIC KEY BLOCK-----
+EOF
+function run_refresh() {
+	(
+		function probeAmneziaPpaSuite() { [[ "$1" == "resolute" ]]; }
+		function enable_apt_ipv4() { :; }
+		function disable_apt_ipv4() { :; }
+		ID=ubuntu VERSION_CODENAME=resolute AMNEZIA_PPA_SOURCES_DIR="${MIGRATE_DIR}" \
+			DPKG_STUB_ARCH=amd64 PATH="${STUB_BIN}:${DPKG_STUB_BIN}:${PATH}" refreshConfiguredUbuntuAmneziaPpa
+	)
+}
+run_refresh > /dev/null 2>"${ERROR_LOG}"
+assert_rc 0 "$?" "refresh of an existing noble entry succeeds"
+assert_file_eq "${TEST_ROOT}/noble-migration.expected" "${MIGRATE_DIR}/amnezia-ubuntu-ppa-resolute.sources" \
+	"refresh moves noble to resolute and pins the native architecture in the same source"
+run_refresh > /dev/null 2>"${ERROR_LOG}"
+assert_file_eq "${TEST_ROOT}/noble-migration.expected" "${MIGRATE_DIR}/amnezia-ubuntu-ppa-resolute.sources" \
+	"a second refresh leaves the migrated source byte-identical"
+
+echo "=== amneziawg-tools candidate preflight ==="
+CANDIDATE_BIN="${TEST_ROOT}/candidate-bin"
+mkdir -p "${CANDIDATE_BIN}"
+cat > "${CANDIDATE_BIN}/apt-cache" <<'EOF'
+#!/bin/bash
+printf '%s|%s\n' "${LC_ALL:-}" "$*" >> "${CANDIDATE_LOG}"
+case "${CANDIDATE_MODE}" in
+	present)
+		printf 'Package: amneziawg-tools\nArchitecture: amd64\nVersion: 1.0\nFilename: pool/main/a/amneziawg/amneziawg-tools_1.0_amd64.deb\n\n'
+		;;
+	status-only)
+		printf 'Package: amneziawg-tools\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1.0\n\n'
+		;;
+	absent) ;;
+	error) exit 100 ;;
+esac
+EOF
+chmod +x "${CANDIDATE_BIN}/apt-cache"
+export CANDIDATE_LOG="${TEST_ROOT}/candidate.log"
+CANDIDATE_ERR="${TEST_ROOT}/candidate.err"
+
+: > "${CANDIDATE_LOG}"
+CANDIDATE_MODE=present PATH="${CANDIDATE_BIN}:${PATH}" checkAmneziaPpaToolsCandidate resolute amd64 2>"${CANDIDATE_ERR}"
+assert_rc 0 "$?" "a downloadable amneziawg-tools candidate passes the preflight"
+assert_eq "C|show --no-all-versions amneziawg-tools" "$(cat "${CANDIDATE_LOG}")" "preflight reads the candidate record with a C locale"
+assert_eq "0" "$(wc -c < "${CANDIDATE_ERR}" | tr -d ' ')" "a passing preflight prints nothing"
+
+for MODE in absent status-only error; do
+	CANDIDATE_MODE="${MODE}" PATH="${CANDIDATE_BIN}:${PATH}" checkAmneziaPpaToolsCandidate resolute amd64 2>"${CANDIDATE_ERR}"
+	assert_rc 1 "$?" "no downloadable candidate (${MODE}) fails the preflight"
+	assert_contains "suite 'resolute'" "${CANDIDATE_ERR}" "preflight error (${MODE}) names the Ubuntu suite"
+	assert_contains "architecture 'amd64'" "${CANDIDATE_ERR}" "preflight error (${MODE}) names the native architecture"
+	assert_contains 'amneziawg-tools' "${CANDIDATE_ERR}" "preflight error (${MODE}) names the package"
+	assert_contains 'ppa:amnezia/ppa' "${CANDIDATE_ERR}" "preflight error (${MODE}) names the PPA"
+	assert_contains 'not a network failure' "${CANDIDATE_ERR}" "preflight error (${MODE}) rules out a network failure"
+	assert_not_contains 'internet connection' "${CANDIDATE_ERR}" "preflight error (${MODE}) does not blame the connection"
+done
+
+CANDIDATE_MODE=absent PATH="${CANDIDATE_BIN}:${PATH}" checkAmneziaPpaToolsCandidate noble arm64 2>"${CANDIDATE_ERR}"
+assert_rc 1 "$?" "preflight fails on a missing arm64 candidate"
+assert_contains "suite 'noble' and architecture 'arm64'" "${CANDIDATE_ERR}" "preflight error reports the suite and architecture it was given"
+
+# The Ubuntu install flow refreshes the lists, then checks the candidate, then
+# installs; the Debian and Raspberry Pi branch is untouched by the pinning.
+INSTALL_BODY="$(declare -f installAmneziaWG)"
+UBUNTU_BRANCH="$(awk '/OS.* == .debian. /{exit} /OS.* == .ubuntu. /{p=1} p' <<< "${INSTALL_BODY}")"
+DEBIAN_BRANCH="$(awk '/OS.* == .fedora. /{exit} /OS.* == .debian. /{p=1} p' <<< "${INSTALL_BODY}")"
+UPDATE_LINE=$(grep -n 'APT::Update::Error-Mode=any update' <<< "${UBUNTU_BRANCH}" | head -1 | cut -d: -f1)
+PREFLIGHT_LINE=$(grep -n 'checkAmneziaPpaToolsCandidate' <<< "${UBUNTU_BRANCH}" | head -1 | cut -d: -f1)
+INSTALL_LINE=$(grep -n 'install -y dkms iptables nftables amneziawg amneziawg-tools' <<< "${UBUNTU_BRANCH}" | head -1 | cut -d: -f1)
+if [[ -n "${UPDATE_LINE}" && -n "${PREFLIGHT_LINE}" && -n "${INSTALL_LINE}" ]] &&
+	((UPDATE_LINE < PREFLIGHT_LINE && PREFLIGHT_LINE < INSTALL_LINE)); then
+	pass
+else
+	fail "Ubuntu install flow runs the candidate preflight after the PPA update and before the install"
+fi
+if grep -qF 'checkAmneziaPpaToolsCandidate "${AMNEZIA_PPA_SELECTED_SUITE}" "${AMNEZIA_PPA_ARCHITECTURE}"' <<< "${UBUNTU_BRANCH}"; then
+	pass
+else
+	fail "Ubuntu install flow passes the suite and architecture configure selected to the preflight"
+fi
+if [[ -n "${DEBIAN_BRANCH}" ]] &&
+	grep -qF 'ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main' <<< "${DEBIAN_BRANCH}" &&
+	! grep -qE 'configureUbuntuAmneziaPpa|setAmneziaPpaSuite|checkAmneziaPpaToolsCandidate|[[[:space:]]arch=' <<< "${DEBIAN_BRANCH}"; then
+	pass
+else
+	fail "Debian branch keeps its focal entries and gains no Ubuntu PPA reconciliation or architecture pin"
+fi
 
 echo "=== Installed package removal selection ==="
 PACKAGE_STUB_BIN="${TEST_ROOT}/package-bin"
