@@ -50,6 +50,14 @@ uname -a
 if command -v mokutil &>/dev/null; then
 	mokutil --sb-state || true
 fi
+# The runner's own APT configuration is deliberately left as it is: GitHub's
+# Ubuntu 26.04 image, like Canonical's cloud images, enables the amd64v3
+# architecture variant, which is the configuration the PPA pin must survive.
+echo "=== APT architecture configuration ==="
+echo "dpkg --print-architecture: $(dpkg --print-architecture)"
+echo "dpkg --print-foreign-architectures: $(dpkg --print-foreign-architectures | tr '\n' ' ')"
+apt-get --version | head -n 1
+apt-config dump | grep -i variant || echo "(no APT architecture variant configured)"
 
 enable_apt_ipv4
 apt-get -o APT::Update::Error-Mode=any update
@@ -223,9 +231,25 @@ printf 'Path: %s\nTypes: %s\nURIs: %s\nSuites: %s\nComponents: %s\nFingerprint: 
 	"${PPA_SOURCE_FILE}" "${PPA_FIELDS[1]}" "${PPA_FIELDS[2]}" \
 	"${SELECTED_SUITE}" "${PPA_FIELDS[4]}" "${PPA_FINGERPRINT}"
 
+echo "=== Managed Amnezia PPA source (inline key omitted) ==="
+grep -v '^[[:space:]]' "${PPA_SOURCE_FILE}"
+NATIVE_ARCHITECTURE_LINES="$(grep -c "^Architectures: ${ARCHITECTURE}\$" "${PPA_SOURCE_FILE}" || true)"
+ARCHITECTURE_DIRECTIVES="$(grep -ciE '^Architectures(-Add|-Remove)?:' "${PPA_SOURCE_FILE}" || true)"
+if [[ "${NATIVE_ARCHITECTURE_LINES}" != "1" || "${ARCHITECTURE_DIRECTIVES}" != "1" ]]; then
+	echo "ERROR: the managed PPA source must be pinned to exactly 'Architectures: ${ARCHITECTURE}'" >&2
+	exit 1
+fi
+
 # APT performs normal InRelease signature verification here.
 apt-get -o APT::Update::Error-Mode=any update
 apt-cache policy amneziawg amneziawg-tools amneziawg-dkms
+# The installer's own preflight: a downloadable amneziawg-tools candidate.
+checkAmneziaPpaToolsCandidate "${SELECTED_SUITE}" "${ARCHITECTURE}"
+TOOLS_POLICY="$(LC_ALL=C apt-cache policy amneziawg-tools)"
+if ! grep -qF "ppa.launchpadcontent.net/amnezia/ppa/ubuntu ${SELECTED_SUITE}/main ${ARCHITECTURE} Packages" <<< "${TOOLS_POLICY}"; then
+	echo "ERROR: amneziawg-tools is not offered from the PPA's plain ${ARCHITECTURE} index" >&2
+	exit 1
+fi
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
 	amneziawg \
 	amneziawg-dkms \
