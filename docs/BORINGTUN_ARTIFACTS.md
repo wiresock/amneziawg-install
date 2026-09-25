@@ -147,9 +147,12 @@ checks that the device disappears when the daemon stops.
 ## What CI checks
 
 [`.github/workflows/boringtun-artifacts.yml`](../.github/workflows/boringtun-artifacts.yml)
-runs when `packaging/boringtun/`, the script or the workflow change, and on
-manual dispatch. It has read-only repository permissions and uses only
-GitHub-owned actions.
+runs on pushes to any branch that change `packaging/boringtun/`, the script,
+the interop launcher or the workflow, and on manual dispatch. Pull requests from
+branches of this repository are built by those pushes, so the `pull_request`
+event builds only pull requests from forks, and a change is not built twice. The
+workflow has read-only repository permissions and uses only GitHub-owned
+actions.
 
 1. **License and dependency gate**: `cargo-deny` checks advisories, bans,
    licenses and sources (crates.io only) for the binary's dependency graph, and

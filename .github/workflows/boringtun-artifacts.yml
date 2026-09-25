@@ -8,8 +8,11 @@ name: BoringTun Artifacts
 # released, tagged or pushed. See docs/BORINGTUN_ARTIFACTS.md.
 
 on:
-  # Any branch: workflow_dispatch works only once this file is on the default
-  # branch, so a pipeline change must be able to build before it is merged.
+  # Pushes to any branch, so that a pipeline change builds before it is merged;
+  # workflow_dispatch works only once this file is on the default branch. A pull
+  # request from a branch of this repository is then already built by its
+  # pushes, so the pull_request event builds only pull requests from forks (see
+  # the licenses job, which every other job needs).
   push:
     paths:
       - packaging/boringtun/**
@@ -47,6 +50,7 @@ env:
 jobs:
   licenses:
     name: License and dependency gate
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
