@@ -47,6 +47,36 @@ AWG_PROTOCOL_CONFIG_KEYS="HeaderProtectionKey|ContentPaddingAddition|RekeyAfterT
 AWG_BACKEND_KERNEL="kernel"
 AWG_BACKEND="${AWG_BACKEND_KERNEL}"
 
+# BoringTun runtime layer. This installer version does not support BoringTun as
+# a backend: params validation still rejects it, and nothing in an ordinary run
+# selects it. Its runtime branches exist for internal testing only and are
+# reachable solely through _awgInternalSelectBoringtunRuntimeForTesting, called
+# by test code that sources this file. The flag below is assigned, never read
+# from the environment, each time the installer is loaded.
+AWG_BACKEND_BORINGTUN="boringtun"
+_AWG_BORINGTUN_RUNTIME_INTERNAL=0
+
+# Where the BoringTun runtime lives. The generated helpers embed these values
+# when they are written, so a helper never reads a path from its environment.
+# Tests may reassign them after sourcing, before generating helpers.
+AWG_BT_STORE_DIR="/usr/local/lib/amneziawg-install/boringtun"
+AWG_BT_LIBEXEC_DIR="/usr/local/libexec/amneziawg-install"
+AWG_BT_RUN_DIR="/run/amneziawg-install"
+AWG_BT_CONFIG_DIR="/etc/amnezia/amneziawg"
+AWG_BT_SYSTEMD_DIR="/etc/systemd/system"
+AWG_BT_UNIT_DIRS="/usr/lib/systemd/system /lib/systemd/system"
+AWG_BT_SYSTEMD_RUNTIME_DIR="/run/systemd/system"
+AWG_BT_WG_SOCKET_DIR="/var/run/wireguard"
+AWG_BT_AWG_SOCKET_DIR="/var/run/amneziawg"
+AWG_BT_SYS_DIR="/sys"
+AWG_BT_PROC_DIR="/proc"
+AWG_BT_TUN_DEVICE="/dev/net/tun"
+AWG_BT_TRUST_ANCHOR="/"
+AWG_BT_TRUSTED_UID=0
+AWG_BT_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+AWG_BT_READY_TIMEOUT=10
+AWG_BT_HOST_ARCH=""
+
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
 # Only adjust PATH when the script is executed directly, not when sourced.
@@ -1916,6 +1946,33 @@ function renderAwgProtocolFields() {
 	fi
 }
 
+# Failure text for capability probes and staged validation. Only the wording
+# names the datapath; the probe configuration and readback comparisons are
+# shared by every backend. The kernel strings are the historical ones verbatim.
+function awgBackendValidationText() {
+	if [[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+		case "$1" in
+			create) echo "could not start a temporary BoringTun interface (check the verified BoringTun store and /dev/net/tun)" ;;
+			readback30) echo "the pinned BoringTun build did not read back AWG 3.0 fields unchanged" ;;
+			readback31) echo "the pinned BoringTun build did not read back RandomTrailers/DisableCookies" ;;
+			setconf30) echo "awg setconf rejected AWG 3.0 fields on the pinned BoringTun build (upgrade amneziawg-tools)" ;;
+			setconf31) echo "awg setconf rejected RandomTrailers/DisableCookies on the pinned BoringTun build (upgrade amneziawg-tools)" ;;
+			summary) echo "is not supported by both the installed awg tool and the pinned BoringTun build" ;;
+			staged) echo "a staged protocol configuration was rejected by the installed tooling or the pinned BoringTun build" ;;
+		esac
+		return 0
+	fi
+	case "$1" in
+		create) echo "could not create a temporary amneziawg interface (load the amneziawg kernel module for this kernel)" ;;
+		readback30) echo "the running amneziawg kernel module did not read back AWG 3.0 fields unchanged (upgrade the loaded module to match amneziawg-tools)" ;;
+		readback31) echo "the running amneziawg kernel module did not read back RandomTrailers/DisableCookies (upgrade both amneziawg-tools and the loaded kernel module to AWG 3.1)" ;;
+		setconf30) echo "awg setconf rejected AWG 3.0 fields (upgrade amneziawg-tools and the running amneziawg kernel module together)" ;;
+		setconf31) echo "awg setconf rejected RandomTrailers/DisableCookies (upgrade amneziawg-tools and the running amneziawg kernel module to AWG 3.1 together)" ;;
+		summary) echo "is not supported by both the installed awg tool and the running kernel module" ;;
+		staged) echo "a staged protocol configuration was rejected by the installed tooling or running module" ;;
+	esac
+}
+
 # Exercise the complete userspace -> generic-netlink -> running-kernel path.
 # Version strings are intentionally ignored: distributions can ship a new awg
 # binary alongside an older loaded module (or the reverse). The probe succeeds
@@ -1992,25 +2049,25 @@ EOF
 				[[ "${READ_KEEPALIVE}" == "9-11" ]]; then
 				RC=0
 			else
-				FAIL_DETAIL="the running amneziawg kernel module did not read back AWG 3.0 fields unchanged (upgrade the loaded module to match amneziawg-tools)"
+				FAIL_DETAIL="$(awgBackendValidationText readback30)"
 			fi
 			if (( REQUIRE_31 )) && (( RC == 0 )); then
 				READ_TRAILERS="$(awg show "${PROBE_INTERFACE}" random-trailers 2>/dev/null || true)"
 				READ_COOKIES="$(awg show "${PROBE_INTERFACE}" disable-cookies 2>/dev/null || true)"
 				if [[ "${READ_TRAILERS}" != "on" ]] || [[ "${READ_COOKIES}" != "on" ]]; then
 					RC=1
-					FAIL_DETAIL="the running amneziawg kernel module did not read back RandomTrailers/DisableCookies (upgrade both amneziawg-tools and the loaded kernel module to AWG 3.1)"
+					FAIL_DETAIL="$(awgBackendValidationText readback31)"
 				fi
 			fi
 		else
 			if (( REQUIRE_31 )); then
-				FAIL_DETAIL="awg setconf rejected RandomTrailers/DisableCookies (upgrade amneziawg-tools and the running amneziawg kernel module to AWG 3.1 together)"
+				FAIL_DETAIL="$(awgBackendValidationText setconf31)"
 			else
-				FAIL_DETAIL="awg setconf rejected AWG 3.0 fields (upgrade amneziawg-tools and the running amneziawg kernel module together)"
+				FAIL_DETAIL="$(awgBackendValidationText setconf30)"
 			fi
 		fi
 	else
-		FAIL_DETAIL="could not create a temporary amneziawg interface (load the amneziawg kernel module for this kernel)"
+		FAIL_DETAIL="$(awgBackendValidationText create)"
 	fi
 
 	if (( INTERFACE_CREATED )); then
@@ -2020,7 +2077,7 @@ EOF
 	rmdir -- "${PROBE_DIR}" 2>/dev/null || true
 
 	if (( RC != 0 )); then
-		echo "ERROR: ${PROBE_LABEL} is not supported by both the installed awg tool and the running kernel module" >&2
+		echo "ERROR: ${PROBE_LABEL} $(awgBackendValidationText summary)" >&2
 		if [[ -n "${FAIL_DETAIL}" ]]; then
 			echo "       ${FAIL_DETAIL}" >&2
 		else
@@ -2653,6 +2710,12 @@ function serializeParams() {
 	local OUTPUT_FILE="$1"
 	if [[ -z "${OUTPUT_FILE}" ]]; then
 		echo "ERROR: serializeParams() requires an output file path" >&2
+		return 1
+	fi
+	# Only the kernel backend is a supported persisted value. The internal
+	# BoringTun runtime selection must never reach params.
+	if [[ -n "${AWG_BACKEND:-}" && "${AWG_BACKEND}" != "${AWG_BACKEND_KERNEL}" ]]; then
+		reportUnsupportedAwgBackend "${AWG_BACKEND}"
 		return 1
 	fi
 	# Apply a restrictive umask only while writing the params file to disk,
@@ -3860,6 +3923,13 @@ function ensureAwgBackendReady() {
 		"${AWG_BACKEND_KERNEL}")
 			ensureAmneziawgKernelModule "$@"
 			;;
+		"${AWG_BACKEND_BORINGTUN}")
+			if ! _awgBtRuntimeSelected; then
+				reportUnsupportedAwgBackend "${AWG_BACKEND}"
+				exit 1
+			fi
+			_awgBtEnsureReady "$@"
+			;;
 		*)
 			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
 			exit 1
@@ -3877,6 +3947,13 @@ function awgBackendCreateScratchInterface() {
 		"${AWG_BACKEND_KERNEL}")
 			ip link add dev "${INTERFACE_NAME}" type amneziawg
 			;;
+		"${AWG_BACKEND_BORINGTUN}")
+			if ! _awgBtRuntimeSelected; then
+				reportUnsupportedAwgBackend "${AWG_BACKEND}"
+				return 1
+			fi
+			_awgBtScratchCreate "${INTERFACE_NAME}"
+			;;
 		*)
 			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
 			return 1
@@ -3890,6 +3967,13 @@ function awgBackendDestroyScratchInterface() {
 	case "${AWG_BACKEND:-}" in
 		"${AWG_BACKEND_KERNEL}")
 			ip link delete dev "${INTERFACE_NAME}"
+			;;
+		"${AWG_BACKEND_BORINGTUN}")
+			if ! _awgBtRuntimeSelected; then
+				reportUnsupportedAwgBackend "${AWG_BACKEND}"
+				return 1
+			fi
+			_awgBtScratchDestroy "${INTERFACE_NAME}"
 			;;
 		*)
 			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
@@ -3907,6 +3991,13 @@ function awgBackendQuickUp() {
 	case "${AWG_BACKEND:-}" in
 		"${AWG_BACKEND_KERNEL}")
 			awg-quick up "${CONFIG_FILE}"
+			;;
+		"${AWG_BACKEND_BORINGTUN}")
+			if ! _awgBtRuntimeSelected; then
+				reportUnsupportedAwgBackend "${AWG_BACKEND}"
+				return 1
+			fi
+			_awgBtQuickUp "${CONFIG_FILE}"
 			;;
 		*)
 			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
@@ -3942,11 +4033,1173 @@ function awgSyncInterfaceConfig() {
 					;;
 			esac
 			;;
+		"${AWG_BACKEND_BORINGTUN}")
+			if ! _awgBtRuntimeSelected; then
+				reportUnsupportedAwgBackend "${AWG_BACKEND}"
+				return 1
+			fi
+			_awgBtSync "${INTERFACE_NAME}" "${SYNCCONF_STDERR}"
+			;;
 		*)
 			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
 			return 1
 			;;
 	esac
+}
+
+# ── BoringTun runtime layer (internal) ───────────────────────────────────────
+#
+# The supervised BoringTun datapath: store verification, the launcher that
+# awg-quick runs as its userspace implementation, the awg-backend-ctl hooks of
+# the awg-quick@<if> drop-in, the filtered live sync and scratch interfaces.
+# See docs/BORINGTUN_BACKEND_DESIGN.md sections 6 to 8.
+#
+# awg-boringtun-launch and awg-backend-ctl are generated from the functions
+# below with declare -f (_awgBtRenderHelper), so the installer and the helpers
+# share one implementation. Functions listed in _AWG_BT_HELPER_FUNCTIONS may use
+# only the AWG_BT_* settings that the helpers embed, never other installer
+# state, and must work under `set -u`.
+#
+# Nothing here is reachable in an ordinary run. The seam dispatches to it only
+# after _awgInternalSelectBoringtunRuntimeForTesting, and params validation
+# still rejects a persisted AWG_BACKEND=boringtun.
+
+# MANIFEST keys of artifact format 1, in the order scripts/boringtun-artifact.sh
+# writes them (BTA_MANIFEST_KEYS). A unit test keeps the two lists equal.
+AWG_BT_MANIFEST_KEYS="artifact_format name version source_repository source_commit source_date_epoch target os arch libc linkage rust_toolchain rustc cargo build_command build_profile rustflags binary binary_sha256 license third_party_licenses"
+
+# Settings embedded in both helpers, in this order.
+_AWG_BT_HELPER_VARIABLES="AWG_BT_STORE_DIR AWG_BT_LIBEXEC_DIR AWG_BT_RUN_DIR AWG_BT_CONFIG_DIR AWG_BT_SYSTEMD_DIR AWG_BT_UNIT_DIRS AWG_BT_WG_SOCKET_DIR AWG_BT_AWG_SOCKET_DIR AWG_BT_SYS_DIR AWG_BT_PROC_DIR AWG_BT_TUN_DEVICE AWG_BT_TRUST_ANCHOR AWG_BT_TRUSTED_UID AWG_BT_PATH AWG_BT_READY_TIMEOUT AWG_BT_HOST_ARCH AWG_BT_MANIFEST_KEYS"
+
+_AWG_BT_VERIFIED_BIN=""
+_AWG_BT_FILE_CHANGED=0
+_AWG_BT_ARGV=()
+declare -gA _AWG_BT_SCRATCH_UNITS=()
+declare -gA _AWG_BT_SCRATCH_PIDS=()
+declare -gA _AWG_BT_SCRATCH_PID_STARTS=()
+declare -gA _AWG_BT_SCRATCH_GUARDS=()
+
+# Internal, undocumented: select the BoringTun runtime for this shell only, so
+# tests that source the installer can exercise its branches. It is not reachable
+# from the command line, the menu, params or the environment, and
+# serializeParams refuses to persist it. Normal backend selection replaces it.
+function _awgInternalSelectBoringtunRuntimeForTesting() {
+	_AWG_BORINGTUN_RUNTIME_INTERNAL=1
+	AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
+}
+
+# The BoringTun branches refuse to run unless that internal selection happened
+# in this shell, whatever AWG_BACKEND says.
+function _awgBtRuntimeSelected() {
+	[[ "${_AWG_BORINGTUN_RUNTIME_INTERNAL}" == 1 && "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]
+}
+
+function _awgBtErr() {
+	printf '%s: %s\n' "${_AWG_BT_PROG:-amneziawg-install}" "$*" >&2
+}
+
+# awg-quick's own interface-name pattern.
+function _awgBtValidInterfaceName() {
+	[[ "${1:-}" =~ ^[a-zA-Z0-9_=+.-]{1,15}$ ]]
+}
+
+# "<uid> <octal mode>" of a path, without following a final symlink.
+function _awgBtStatOwnerMode() {
+	stat -c '%u %a' -- "$1" 2>/dev/null
+}
+
+# A trusted node is not a symlink, is owned by AWG_BT_TRUSTED_UID and is not
+# writable by group or other. KIND is dir, file or exec (a file its owner can
+# execute). Files may not carry setuid, setgid or sticky bits.
+function _awgBtTrustedNode() {
+	local NODE="$1" KIND="$2" OWNER="" MODE=""
+	[[ ! -L "${NODE}" ]] || return 1
+	case "${KIND}" in
+		dir) [[ -d "${NODE}" ]] || return 1 ;;
+		file | exec) [[ -f "${NODE}" ]] || return 1 ;;
+		*) return 1 ;;
+	esac
+	read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${NODE}")"
+	[[ "${OWNER}" == "${AWG_BT_TRUSTED_UID}" ]] || return 1
+	if [[ "${KIND}" == dir ]]; then
+		[[ "${MODE}" =~ ^[0-7]{3,4}$ ]] || return 1
+	else
+		[[ "${MODE}" =~ ^[0-7]{3}$ ]] || return 1
+	fi
+	(((8#${MODE} & 8#022) == 0)) || return 1
+	if [[ "${KIND}" == exec ]]; then
+		(((8#${MODE} & 8#100) != 0)) || return 1
+	fi
+	return 0
+}
+
+# Every directory from AWG_BT_TRUST_ANCHOR down to the parent of TARGET must be
+# a trusted directory. TARGET must be an absolute, normalized path below the
+# anchor. The anchor is / in production; tests anchor at their own root.
+function _awgBtTrustedAncestors() {
+	local TARGET="$1" ANCHOR="${AWG_BT_TRUST_ANCHOR%/}" REST CURRENT COMPONENT
+	[[ "${TARGET}" == /* && "${TARGET}" != *//* && "${TARGET}" != */ ]] || return 1
+	[[ "${TARGET}/" != */../* && "${TARGET}/" != */./* ]] || return 1
+	if [[ -z "${ANCHOR}" ]]; then
+		CURRENT="/"
+		REST="${TARGET#/}"
+	else
+		[[ "${TARGET}" == "${ANCHOR}/"* ]] || return 1
+		CURRENT="${ANCHOR}"
+		REST="${TARGET#"${ANCHOR}/"}"
+	fi
+	_awgBtTrustedNode "${CURRENT}" dir || return 1
+	while [[ "${REST}" == */* ]]; do
+		COMPONENT="${REST%%/*}"
+		REST="${REST#*/}"
+		CURRENT="${CURRENT%/}/${COMPONENT}"
+		_awgBtTrustedNode "${CURRENT}" dir || return 1
+	done
+	return 0
+}
+
+function _awgBtHostArch() {
+	local MACHINE="${AWG_BT_HOST_ARCH}"
+	if [[ -z "${MACHINE}" ]]; then
+		MACHINE="$(uname -m 2>/dev/null)" || return 1
+	fi
+	case "${MACHINE}" in
+		x86_64 | amd64) echo x86_64 ;;
+		aarch64 | arm64) echo aarch64 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Verify the BoringTun store and set _AWG_BT_VERIFIED_BIN to the canonical path
+# of the binary that may run. The store is AWG_BT_STORE_DIR/<release>/ as
+# unpacked from a pinned artifact archive, and AWG_BT_STORE_DIR/current is a
+# link to one release. Every directory on the path, the release, its MANIFEST
+# and the binary must be trusted; the MANIFEST must describe this release and
+# host; and the binary must match its binary_sha256. The check runs at every
+# start. Between it and the exec only root can change these files, because no
+# path component is writable by anyone else.
+function _awgBtVerifyStore() {
+	local STORE="${AWG_BT_STORE_DIR}" RELEASE_ID="" RELEASE BINARY MANIFEST LINE KEY VALUE
+	local ARCH OWNER="" MODE="" ACTUAL_SHA="" CANONICAL_STORE CANONICAL_BINARY
+	local -A FIELDS=()
+	_AWG_BT_VERIFIED_BIN=""
+	if ! ARCH="$(_awgBtHostArch)"; then
+		_awgBtErr "BoringTun artifacts exist only for x86_64 and aarch64 hosts"
+		return 1
+	fi
+	if ! _awgBtTrustedAncestors "${STORE}" || ! _awgBtTrustedNode "${STORE}" dir; then
+		_awgBtErr "the BoringTun store ${STORE} is missing, or it or a parent directory is writable by someone other than root"
+		return 1
+	fi
+	if [[ ! -L "${STORE}/current" ]]; then
+		_awgBtErr "the BoringTun store has no current release link: ${STORE}/current"
+		return 1
+	fi
+	read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${STORE}/current")"
+	RELEASE_ID="$(readlink -- "${STORE}/current" 2>/dev/null)" || RELEASE_ID=""
+	if [[ "${OWNER}" != "${AWG_BT_TRUSTED_UID}" ]] || \
+		! [[ "${RELEASE_ID}" =~ ^boringtun-cli-[0-9]+\.[0-9]+\.[0-9]+-g[0-9a-f]{12}-linux-(x86_64|aarch64)-musl$ ]]; then
+		_awgBtErr "${STORE}/current must be a root-owned link to a release directory in the store"
+		return 1
+	fi
+	RELEASE="${STORE}/${RELEASE_ID}"
+	BINARY="${RELEASE}/boringtun-cli"
+	MANIFEST="${RELEASE}/MANIFEST"
+	if ! _awgBtTrustedNode "${RELEASE}" dir || ! _awgBtTrustedNode "${MANIFEST}" file || \
+		! _awgBtTrustedNode "${BINARY}" exec; then
+		_awgBtErr "the BoringTun release ${RELEASE_ID} is incomplete or writable by someone other than root"
+		return 1
+	fi
+	# MANIFEST is data, never sourced: exactly the format-1 keys, once each.
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		if [[ ! "${LINE}" =~ ^([a-z0-9_]+)=([^[:cntrl:]]*)$ ]]; then
+			_awgBtErr "malformed line in ${MANIFEST}"
+			return 1
+		fi
+		KEY="${BASH_REMATCH[1]}"
+		VALUE="${BASH_REMATCH[2]}"
+		if [[ " ${AWG_BT_MANIFEST_KEYS} " != *" ${KEY} "* || -n "${FIELDS[${KEY}]+set}" ]]; then
+			_awgBtErr "unexpected or repeated key ${KEY} in ${MANIFEST}"
+			return 1
+		fi
+		FIELDS["${KEY}"]="${VALUE}"
+	done <"${MANIFEST}"
+	for KEY in ${AWG_BT_MANIFEST_KEYS}; do
+		if [[ -z "${FIELDS[${KEY}]+set}" ]]; then
+			_awgBtErr "${MANIFEST} has no ${KEY}"
+			return 1
+		fi
+	done
+	if [[ "${FIELDS[artifact_format]}" != 1 || "${FIELDS[name]}" != boringtun-cli || \
+		"${FIELDS[binary]}" != boringtun-cli || "${FIELDS[os]}" != linux || \
+		"${FIELDS[libc]}" != musl || "${FIELDS[linkage]}" != static || \
+		"${FIELDS[arch]}" != "${ARCH}" || "${FIELDS[target]}" != "${ARCH}-unknown-linux-musl" ]] || \
+		! [[ "${FIELDS[version]}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && \
+			"${FIELDS[source_commit]}" =~ ^[0-9a-f]{40}$ && \
+			"${FIELDS[binary_sha256]}" =~ ^[0-9a-f]{64}$ ]] || \
+		[[ "${RELEASE_ID}" != "boringtun-cli-${FIELDS[version]}-g${FIELDS[source_commit]:0:12}-linux-${ARCH}-musl" ]]; then
+		_awgBtErr "${MANIFEST} does not describe release ${RELEASE_ID} for this ${ARCH} host"
+		return 1
+	fi
+	ACTUAL_SHA="$(sha256sum -- "${BINARY}" 2>/dev/null)" || ACTUAL_SHA=""
+	ACTUAL_SHA="${ACTUAL_SHA%% *}"
+	if [[ "${ACTUAL_SHA}" != "${FIELDS[binary_sha256]}" ]]; then
+		_awgBtErr "boringtun-cli in ${RELEASE_ID} does not match the binary_sha256 of its MANIFEST"
+		return 1
+	fi
+	CANONICAL_STORE="$(readlink -f -- "${STORE}")" || CANONICAL_STORE=""
+	CANONICAL_BINARY="$(readlink -f -- "${BINARY}")" || CANONICAL_BINARY=""
+	if [[ -z "${CANONICAL_STORE}" || "${CANONICAL_BINARY}" != "${CANONICAL_STORE}/${RELEASE_ID}/boringtun-cli" ]]; then
+		_awgBtErr "boringtun-cli resolves outside the BoringTun store"
+		return 1
+	fi
+	_AWG_BT_VERIFIED_BIN="${CANONICAL_BINARY}"
+}
+
+# The runtime file carries launcher settings rendered from params. Format 1 has
+# none yet: later settings are added to its allowlist, never read from the
+# environment.
+function _awgBtRuntimeFilePath() {
+	printf '%s/%s.boringtun\n' "${AWG_BT_CONFIG_DIR}" "$1"
+}
+
+function _awgBtRenderRuntimeFile() {
+	printf '# Managed by amneziawg-install (backend: boringtun). Regenerated from params.\n'
+	printf 'FORMAT=1\n'
+}
+
+function _awgBtReadRuntimeFile() {
+	local FILE LINE KEY VALUE OWNER="" MODE=""
+	local -A SEEN=()
+	FILE="$(_awgBtRuntimeFilePath "$1")"
+	if [[ -L "${FILE}" || ! -f "${FILE}" ]]; then
+		_awgBtErr "the BoringTun runtime file ${FILE} is missing or not a regular file"
+		return 1
+	fi
+	read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${FILE}")"
+	if [[ "${OWNER}" != "${AWG_BT_TRUSTED_UID}" || "${MODE}" != 600 ]] || ! _awgBtTrustedAncestors "${FILE}"; then
+		_awgBtErr "the BoringTun runtime file ${FILE} must be owned by root with mode 0600 in a root-owned directory"
+		return 1
+	fi
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		[[ -z "${LINE}" || "${LINE}" == "#"* ]] && continue
+		if [[ ! "${LINE}" =~ ^([A-Z][A-Z0-9_]*)=([^[:cntrl:]]*)$ ]]; then
+			_awgBtErr "malformed line in ${FILE}"
+			return 1
+		fi
+		KEY="${BASH_REMATCH[1]}"
+		VALUE="${BASH_REMATCH[2]}"
+		if [[ -n "${SEEN[${KEY}]+set}" ]]; then
+			_awgBtErr "repeated key ${KEY} in ${FILE}"
+			return 1
+		fi
+		SEEN["${KEY}"]=1
+		case "${KEY}" in
+			FORMAT)
+				if [[ "${VALUE}" != 1 ]]; then
+					_awgBtErr "unsupported FORMAT ${VALUE} in ${FILE}"
+					return 1
+				fi
+				;;
+			*)
+				_awgBtErr "unknown key ${KEY} in ${FILE}"
+				return 1
+				;;
+		esac
+	done <"${FILE}"
+	if [[ -z "${SEEN[FORMAT]+set}" ]]; then
+		_awgBtErr "${FILE} has no FORMAT"
+		return 1
+	fi
+}
+
+function _awgBtPidFile() {
+	printf '%s/boringtun-%s.pid\n' "${AWG_BT_RUN_DIR}" "$1"
+}
+
+function _awgBtMarkerFile() {
+	printf '%s/%s.up\n' "${AWG_BT_RUN_DIR}" "$1"
+}
+
+# The private runtime directory: a root-owned 0700 directory, never a symlink.
+function _awgBtPrepareRunDir() {
+	local OWNER="" MODE=""
+	[[ ! -L "${AWG_BT_RUN_DIR}" ]] || return 1
+	if [[ ! -d "${AWG_BT_RUN_DIR}" ]]; then
+		mkdir -m 0700 -- "${AWG_BT_RUN_DIR}" 2>/dev/null || [[ -d "${AWG_BT_RUN_DIR}" ]] || return 1
+	fi
+	chmod 0700 -- "${AWG_BT_RUN_DIR}" 2>/dev/null || return 1
+	read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${AWG_BT_RUN_DIR}")"
+	[[ ! -L "${AWG_BT_RUN_DIR}" && -d "${AWG_BT_RUN_DIR}" && "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${MODE}" == 700 ]]
+}
+
+# Replace one state file in the runtime directory atomically.
+function _awgBtWriteState() {
+	local FILE="$1" CONTENT="$2" TMP
+	TMP="$(mktemp "${FILE}.XXXXXX")" || return 1
+	if printf '%s' "${CONTENT}" >"${TMP}" && mv -f -- "${TMP}" "${FILE}"; then
+		return 0
+	fi
+	rm -f -- "${TMP}"
+	return 1
+}
+
+# The live UDP port of the interface, from its UAPI, as a plain number.
+function _awgBtListenPort() {
+	local PORT
+	PORT="$(awg show "$1" listen-port 2>/dev/null)" || return 1
+	[[ "${PORT}" =~ ^[0-9]{1,5}$ ]] && ((10#${PORT} <= 65535)) || return 1
+	printf '%s\n' "$((10#${PORT}))"
+}
+
+# Ready means both UAPI socket paths exist and the daemon answers.
+function _awgBtUapiReady() {
+	[[ -S "${AWG_BT_WG_SOCKET_DIR}/$1.sock" && -e "${AWG_BT_AWG_SOCKET_DIR}/$1.sock" ]] &&
+		_awgBtListenPort "$1" >/dev/null
+}
+
+function _awgBtUapiLive() {
+	awg show "$1" >/dev/null 2>&1
+}
+
+# Remove this interface's UAPI socket paths, but only when no daemon answers on
+# them: deleting a live daemon's socket makes that daemon exit.
+function _awgBtRemoveStaleSockets() {
+	_awgBtUapiLive "$1" && return 0
+	rm -f -- "${AWG_BT_WG_SOCKET_DIR}/$1.sock" "${AWG_BT_AWG_SOCKET_DIR}/$1.sock"
+}
+
+function _awgBtLinkExists() {
+	[[ -e "${AWG_BT_SYS_DIR}/class/net/$1" ]]
+}
+
+# BoringTun's link is a TUN device, which the kernel's AmneziaWG link is not.
+function _awgBtLinkIsTun() {
+	[[ -e "${AWG_BT_SYS_DIR}/class/net/$1/tun_flags" ]]
+}
+
+# The same membership test awg-quick down uses.
+function _awgBtListedByAwg() {
+	[[ " $(awg show interfaces 2>/dev/null) " == *" $1 "* ]]
+}
+
+# A PID is alive while /proc lists it and it is not a zombie.
+function _awgBtProcessAlive() {
+	local STAT
+	[[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+	STAT="$(cat -- "${AWG_BT_PROC_DIR}/$1/stat" 2>/dev/null)" || return 1
+	STAT="${STAT##*) }"
+	[[ -n "${STAT}" && "${STAT:0:1}" != Z ]]
+}
+
+# Stop one tracked process: SIGTERM, a bounded wait, then SIGKILL. Only this PID
+# is signalled; nothing is ever matched by name. A caller that is not the
+# process's parent passes its start time (field 22 of /proc/<pid>/stat): the
+# PID is then released as soon as the process is reaped and may be reused, so
+# the start time is checked again before each signal.
+function _awgBtStopProcess() {
+	local PID="$1" START="${2:-}" I
+	_awgBtStopTarget "${PID}" "${START}" || return 0
+	kill -TERM "${PID}" 2>/dev/null || return 0
+	for ((I = 0; I < 50; I++)); do
+		_awgBtStopTarget "${PID}" "${START}" || return 0
+		sleep 0.1
+	done
+	_awgBtStopTarget "${PID}" "${START}" || return 0
+	kill -KILL "${PID}" 2>/dev/null
+	return 0
+}
+
+function _awgBtStopTarget() {
+	local STAT FIELDS=()
+	_awgBtProcessAlive "$1" || return 1
+	[[ -z "$2" ]] && return 0
+	STAT="$(cat -- "${AWG_BT_PROC_DIR}/$1/stat" 2>/dev/null)" || return 1
+	read -r -a FIELDS <<<"${STAT##*) }"
+	[[ "${FIELDS[19]:-}" == "$2" ]]
+}
+
+# The one BoringTun command line, shared by the launcher and scratch
+# interfaces: an empty environment apart from PATH and NO_COLOR, so no WG_*
+# variable reaches the daemon, the foreground daemon, root privileges kept
+# (its getlogin() based drop fails under systemd) and the quietest log level.
+function _awgBtDaemonArgv() {
+	local ENV_BIN
+	ENV_BIN="$(command -v env)" || return 1
+	_AWG_BT_ARGV=("${ENV_BIN}" -i "PATH=${AWG_BT_PATH}" NO_COLOR=1 "$1" --foreground --disable-drop-privileges --verbosity error "$2")
+}
+
+# Close every descriptor above stderr. The daemon and the scratch guardian
+# outlive their caller, and an inherited descriptor would keep, for example,
+# the installer's lifecycle lock held for as long as they run.
+function _awgBtCloseInheritedFds() {
+	local FD
+	for FD in /proc/self/fd/*; do
+		FD="${FD##*/}"
+		if [[ "${FD}" =~ ^[0-9]+$ ]] && ((FD > 2)); then
+			eval "exec ${FD}>&-" 2>/dev/null
+		fi
+	done
+	return 0
+}
+
+# ── awg-boringtun-launch ─────────────────────────────────────────────────────
+# awg-quick runs this, as WG_QUICK_USERSPACE_IMPLEMENTATION, with the interface
+# name as its only argument, and continues with `awg setconf` as soon as it
+# returns. It starts the verified BoringTun binary as a background child, waits
+# until the UAPI answers and only then writes the PID file that systemd's
+# Type=forking unit tracks. On any failure it stops the child and cleans up.
+function awgBoringtunLaunchMain() {
+	local INTERFACE_NAME="${1:-}" PID_FILE CHILD I LIMIT
+	if [[ $# -ne 1 ]] || ! _awgBtValidInterfaceName "${INTERFACE_NAME}"; then
+		_awgBtErr "usage: awg-boringtun-launch <interface>"
+		return 2
+	fi
+	_awgBtVerifyStore || return 1
+	_awgBtReadRuntimeFile "${INTERFACE_NAME}" || return 1
+	if ! _awgBtPrepareRunDir; then
+		_awgBtErr "cannot prepare the private runtime directory ${AWG_BT_RUN_DIR}"
+		return 1
+	fi
+	PID_FILE="$(_awgBtPidFile "${INTERFACE_NAME}")"
+	rm -f -- "${PID_FILE}"
+	if _awgBtUapiLive "${INTERFACE_NAME}"; then
+		_awgBtErr "a live daemon already answers on the UAPI socket of ${INTERFACE_NAME}"
+		return 1
+	fi
+	_awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${INTERFACE_NAME}" || return 1
+	(
+		_awgBtCloseInheritedFds
+		exec "${_AWG_BT_ARGV[@]}" </dev/null
+	) &
+	CHILD=$!
+	LIMIT=$((AWG_BT_READY_TIMEOUT * 10))
+	for ((I = 0; I < LIMIT; I++)); do
+		if ! _awgBtProcessAlive "${CHILD}"; then
+			_awgBtErr "boringtun-cli exited before ${INTERFACE_NAME} became ready"
+			_awgBtLaunchFailed "${INTERFACE_NAME}" "${CHILD}"
+			return 1
+		fi
+		if _awgBtUapiReady "${INTERFACE_NAME}"; then
+			if _awgBtWriteState "${PID_FILE}" "${CHILD}"$'\n'; then
+				return 0
+			fi
+			_awgBtErr "cannot write ${PID_FILE}"
+			_awgBtLaunchFailed "${INTERFACE_NAME}" "${CHILD}"
+			return 1
+		fi
+		sleep 0.1
+	done
+	_awgBtErr "${INTERFACE_NAME} did not become ready within ${AWG_BT_READY_TIMEOUT} seconds"
+	_awgBtLaunchFailed "${INTERFACE_NAME}" "${CHILD}"
+	return 1
+}
+
+function _awgBtLaunchFailed() {
+	_awgBtStopProcess "$2"
+	wait "$2" 2>/dev/null
+	_awgBtRemoveStaleSockets "$1"
+	rm -f -- "$(_awgBtPidFile "$1")"
+}
+
+# Print each value of KEY in the [Interface] section of an awg-quick config,
+# NUL-terminated and in file order, parsed the way awg-quick's parse_options
+# parses it: `read -r` with the default IFS, text from the first # dropped, the
+# key and value split at the first = and trimmed, and keys and section names
+# compared case-insensitively. Only [Interface] counts; any other [...] line
+# ends it.
+function _awgBtInterfaceValues() {
+	local CONFIG_FILE="$1" WANTED="$2" LINE STRIPPED KEY VALUE IN_INTERFACE=0 RC=0 RESTORE_NOCASE=0
+	local IFS=$' \t\n'
+	shopt -q nocasematch || RESTORE_NOCASE=1
+	shopt -s nocasematch
+	while read -r LINE || [[ -n "${LINE}" ]]; do
+		STRIPPED="${LINE%%\#*}"
+		KEY="${STRIPPED%%=*}"
+		KEY="${KEY#"${KEY%%[![:space:]]*}"}"
+		KEY="${KEY%"${KEY##*[![:space:]]}"}"
+		VALUE="${STRIPPED#*=}"
+		VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
+		VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
+		[[ "${KEY}" == "["* ]] && IN_INTERFACE=0
+		[[ "${KEY}" == "[Interface]" ]] && IN_INTERFACE=1
+		if ((IN_INTERFACE)) && [[ "${KEY}" == "${WANTED}" ]]; then
+			printf '%s\0' "${VALUE}"
+		fi
+	done <"${CONFIG_FILE}" || RC=1
+	((RESTORE_NOCASE)) && shopt -u nocasematch
+	return "${RC}"
+}
+
+# Whether a config sets SaveConfig = true, read like awg-quick's read_bool:
+# true or false in any case, the last one wins, anything else is invalid.
+# Returns 0 for true, 1 for false or absent, 2 for invalid or unreadable.
+function _awgBtSaveConfigEnabled() {
+	local VALUE ENABLED=0
+	local -a VALUES=()
+	[[ -f "$1" && -r "$1" ]] || return 2
+	mapfile -d '' -t VALUES < <(_awgBtInterfaceValues "$1" SaveConfig)
+	for VALUE in ${VALUES[@]+"${VALUES[@]}"}; do
+		case "${VALUE,,}" in
+			true) ENABLED=1 ;;
+			false) ENABLED=0 ;;
+			*) return 2 ;;
+		esac
+	done
+	((ENABLED)) && return 0
+	return 1
+}
+
+# Replay the [Interface] PostDown hooks of the server config after the interface
+# went away without `awg-quick down`. Like awg-quick's execute_hooks, each hook
+# gets %i replaced and runs in its own shell with `set -e -o pipefail` and
+# LC_ALL=C; unlike awg-quick, a failing hook is logged and the rest still run.
+# PreDown and SaveConfig are never replayed.
+function _awgBtReplayPostDown() {
+	local INTERFACE_NAME="$1" CONFIG_FILE HOOK
+	local -a HOOKS=()
+	CONFIG_FILE="${AWG_BT_CONFIG_DIR}/${INTERFACE_NAME}.conf"
+	if [[ ! -f "${CONFIG_FILE}" || ! -r "${CONFIG_FILE}" ]]; then
+		_awgBtErr "cannot replay PostDown hooks: ${CONFIG_FILE} is not readable"
+		return 1
+	fi
+	mapfile -d '' -t HOOKS < <(_awgBtInterfaceValues "${CONFIG_FILE}" PostDown)
+	for HOOK in ${HOOKS[@]+"${HOOKS[@]}"}; do
+		HOOK="${HOOK//%i/${INTERFACE_NAME}}"
+		printf '[#] %s\n' "${HOOK}" >&2
+		if ! INTERFACE="${INTERFACE_NAME}" LC_ALL=C bash -e -o pipefail -c "${HOOK}"; then
+			_awgBtErr "PostDown hook failed, continuing: ${HOOK}"
+		fi
+	done
+	return 0
+}
+
+# `awg-quick strip <if>` without its ListenPort line when that port is already
+# the live one. Every UAPI set carrying listen_port makes BoringTun bind a new
+# socket pair without closing the old one, so an unchanged port is left out; a
+# changed port is kept. Lines are matched the way awg's own config parser reads
+# them: comments dropped, whitespace ignored, names case-insensitive. Anything
+# ambiguous fails instead of guessing. Diagnostics go to file descriptor $2.
+function _awgBtFilteredStrip() {
+	local INTERFACE_NAME="$1" DIAG_FD="$2" STRIPPED LINE CLEAN INDEX=0 PORT_INDEX=-1 COUNT=0
+	local CONFIGURED="" LIVE="" IN_INTERFACE=0
+	local -a LINES=()
+	if ! STRIPPED="$(awg-quick strip "${INTERFACE_NAME}")"; then
+		printf 'awg-quick strip failed for %s\n' "${INTERFACE_NAME}" >&"${DIAG_FD}"
+		return 1
+	fi
+	mapfile -t LINES <<<"${STRIPPED}"
+	for LINE in ${LINES[@]+"${LINES[@]}"}; do
+		CLEAN="${LINE%%#*}"
+		CLEAN="${CLEAN//[[:space:]]/}"
+		if [[ "${CLEAN}" == "["* ]]; then
+			IN_INTERFACE=0
+			[[ "${CLEAN,,}" == "[interface]" ]] && IN_INTERFACE=1
+		elif ((IN_INTERFACE)) && [[ "${CLEAN,,}" == listenport=* ]]; then
+			COUNT=$((COUNT + 1))
+			PORT_INDEX="${INDEX}"
+			CONFIGURED="${CLEAN#*=}"
+		fi
+		INDEX=$((INDEX + 1))
+	done
+	if ((COUNT == 0)); then
+		printf '%s\n' ${LINES[@]+"${LINES[@]}"}
+		return 0
+	fi
+	if ((COUNT > 1)); then
+		printf 'the [Interface] section of %s sets ListenPort more than once\n' "${INTERFACE_NAME}" >&"${DIAG_FD}"
+		return 1
+	fi
+	if ! [[ "${CONFIGURED}" =~ ^[0-9]{1,5}$ ]] || ((10#${CONFIGURED} > 65535)); then
+		printf 'the configured ListenPort of %s is not a valid port\n' "${INTERFACE_NAME}" >&"${DIAG_FD}"
+		return 1
+	fi
+	if ! LIVE="$(_awgBtListenPort "${INTERFACE_NAME}")"; then
+		printf 'cannot read the live listen port of %s\n' "${INTERFACE_NAME}" >&"${DIAG_FD}"
+		return 1
+	fi
+	for INDEX in "${!LINES[@]}"; do
+		if ((INDEX == PORT_INDEX)) && ((10#${CONFIGURED} == LIVE)); then
+			continue
+		fi
+		printf '%s\n' "${LINES[INDEX]}"
+	done
+}
+
+# The BoringTun form of `awg syncconf <if> <(awg-quick strip <if>)`, with the
+# same destinations for awg syncconf's stderr as awgSyncInterfaceConfig: the
+# caller's stderr, --stderr-to-stdout, or a file. The filter's own diagnostics
+# go to the same place, and awg-quick strip's stderr to the caller's.
+function _awgBtSync() {
+	local INTERFACE_NAME="$1" DESTINATION="${2:-}" DIAG_FD FILTERED RC=1
+	case "${DESTINATION}" in
+		"") exec {DIAG_FD}>&2 ;;
+		--stderr-to-stdout) exec {DIAG_FD}>&1 ;;
+		*) exec {DIAG_FD}>"${DESTINATION}" || return 1 ;;
+	esac
+	if FILTERED="$(_awgBtFilteredStrip "${INTERFACE_NAME}" "${DIAG_FD}")"; then
+		awg syncconf "${INTERFACE_NAME}" <(printf '%s\n' "${FILTERED}") 2>&"${DIAG_FD}"
+		RC=$?
+	fi
+	exec {DIAG_FD}>&-
+	return "${RC}"
+}
+
+# awg-quick tries `ip link add <if> type amneziawg` first and uses the
+# userspace implementation only when that fails and the module is not loaded.
+# A loaded module, or one it can autoload, would therefore win silently.
+function _awgBtCheckKernelModule() {
+	if [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then
+		_awgBtErr "the amneziawg kernel module is loaded, so awg-quick would create a kernel interface instead of starting BoringTun; unload it with: modprobe -r amneziawg"
+		return 1
+	fi
+	if ! command -v modinfo >/dev/null 2>&1; then
+		_awgBtErr "modinfo is unavailable, so an autoloadable amneziawg kernel module cannot be ruled out"
+		return 1
+	fi
+	if modinfo -n amneziawg >/dev/null 2>&1; then
+		_awgBtErr "the amneziawg kernel module is installed and awg-quick would autoload it instead of starting BoringTun; remove amneziawg-dkms or the module first"
+		return 1
+	fi
+	return 0
+}
+
+function _awgBtCheckPlatform() {
+	if [[ ! -c "${AWG_BT_TUN_DEVICE}" || ! -r "${AWG_BT_TUN_DEVICE}" || ! -w "${AWG_BT_TUN_DEVICE}" ]]; then
+		_awgBtErr "${AWG_BT_TUN_DEVICE} is not a usable character device; BoringTun needs TUN support"
+		return 1
+	fi
+	if [[ ! -d "${AWG_BT_PROC_DIR}/sys/net/ipv6" ]]; then
+		_awgBtErr "the IPv6 socket family is unavailable (ipv6.disable=1); this BoringTun build always binds an IPv6 socket"
+		return 1
+	fi
+	return 0
+}
+
+function _awgBtCheckHelpers() {
+	local HELPER
+	for HELPER in "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl"; do
+		if ! _awgBtTrustedAncestors "${HELPER}" || ! _awgBtTrustedNode "${HELPER}" exec; then
+			_awgBtErr "${HELPER} is missing or writable by someone other than root"
+			return 1
+		fi
+	done
+	return 0
+}
+
+# The drop-in changes Type= and replaces ExecStop= and ExecReload=, but keeps
+# the packaged `ExecStart=/usr/bin/awg-quick up %i` as the bring-up. Refuse to
+# start if that is no longer what the packaged unit runs, or if a local unit
+# file replaces the packaged one.
+function _awgBtCheckBaseUnit() {
+	local DIRECTORY UNIT=""
+	for DIRECTORY in ${AWG_BT_UNIT_DIRS}; do
+		if [[ -f "${DIRECTORY}/awg-quick@.service" ]]; then
+			UNIT="${DIRECTORY}/awg-quick@.service"
+			break
+		fi
+	done
+	if [[ -z "${UNIT}" ]]; then
+		_awgBtErr "the packaged awg-quick@.service is not installed"
+		return 1
+	fi
+	if ! grep -qxF 'ExecStart=/usr/bin/awg-quick up %i' "${UNIT}" || [[ "$(grep -c '^ExecStart=' "${UNIT}")" != 1 ]]; then
+		_awgBtErr "${UNIT} no longer brings the interface up with 'ExecStart=/usr/bin/awg-quick up %i', which the BoringTun drop-in relies on"
+		return 1
+	fi
+	if [[ -e "${AWG_BT_SYSTEMD_DIR}/awg-quick@.service" || -e "${AWG_BT_SYSTEMD_DIR}/awg-quick@$1.service" ]]; then
+		_awgBtErr "a unit file in ${AWG_BT_SYSTEMD_DIR} replaces the packaged awg-quick@.service, which the BoringTun drop-in relies on"
+		return 1
+	fi
+	return 0
+}
+
+# ExecStartPre: refuse to start unless BoringTun will really serve the
+# interface, from verified files, with a safe config.
+function _awgBtCtlPrecheck() {
+	local INTERFACE_NAME="$1" CONFIG_FILE RC=0
+	_awgBtCheckKernelModule || return 1
+	_awgBtCheckPlatform || return 1
+	_awgBtVerifyStore || return 1
+	_awgBtCheckHelpers || return 1
+	_awgBtReadRuntimeFile "${INTERFACE_NAME}" || return 1
+	CONFIG_FILE="${AWG_BT_CONFIG_DIR}/${INTERFACE_NAME}.conf"
+	_awgBtSaveConfigEnabled "${CONFIG_FILE}" || RC=$?
+	case "${RC}" in
+		0)
+			_awgBtErr "${CONFIG_FILE} sets SaveConfig = true, which BoringTun cannot honour: its UAPI never returns the private key, so saving would erase it"
+			return 1
+			;;
+		1) ;;
+		*)
+			_awgBtErr "${CONFIG_FILE} is unreadable or has an invalid SaveConfig value"
+			return 1
+			;;
+	esac
+	_awgBtCheckBaseUnit "${INTERFACE_NAME}" || return 1
+	return 0
+}
+
+# ExecStartPost: awg-quick up has completed, so its PostUp hooks ran. The .up
+# marker is written first, so that poststop replays PostDown even when a check
+# below fails. Then verify that what runs is the verified BoringTun binary
+# serving a TUN interface.
+function _awgBtCtlPoststart() {
+	local INTERFACE_NAME="$1" PID_FILE PID="" EXE=""
+	if ! _awgBtPrepareRunDir || ! _awgBtWriteState "$(_awgBtMarkerFile "${INTERFACE_NAME}")" ""; then
+		_awgBtErr "cannot record that ${INTERFACE_NAME} is up in ${AWG_BT_RUN_DIR}"
+		return 1
+	fi
+	_awgBtVerifyStore || return 1
+	if ! _awgBtLinkExists "${INTERFACE_NAME}"; then
+		_awgBtErr "${INTERFACE_NAME} does not exist after awg-quick up"
+		return 1
+	fi
+	if ! _awgBtLinkIsTun "${INTERFACE_NAME}"; then
+		_awgBtErr "${INTERFACE_NAME} is not a TUN device, so awg-quick did not start BoringTun"
+		return 1
+	fi
+	PID_FILE="$(_awgBtPidFile "${INTERFACE_NAME}")"
+	read -r PID <"${PID_FILE}" 2>/dev/null || PID=""
+	if ! [[ "${PID}" =~ ^[1-9][0-9]*$ ]] || ! _awgBtProcessAlive "${PID}"; then
+		_awgBtErr "${PID_FILE} does not name a running process"
+		return 1
+	fi
+	EXE="$(readlink -- "${AWG_BT_PROC_DIR}/${PID}/exe" 2>/dev/null)" || EXE=""
+	if [[ "${EXE}" != "${_AWG_BT_VERIFIED_BIN}" ]]; then
+		_awgBtErr "process ${PID} is not the verified BoringTun binary ${_AWG_BT_VERIFIED_BIN}"
+		return 1
+	fi
+	if ! _awgBtUapiReady "${INTERFACE_NAME}" || ! _awgBtListedByAwg "${INTERFACE_NAME}"; then
+		_awgBtErr "the UAPI of ${INTERFACE_NAME} does not answer"
+		return 1
+	fi
+	return 0
+}
+
+# ExecStop: a clean awg-quick down, which runs PreDown and PostDown. When the
+# interface is already gone (a crash or `ip link del`), succeed and keep the
+# marker so that poststop replays PostDown.
+function _awgBtCtlStop() {
+	local INTERFACE_NAME="$1"
+	_awgBtListedByAwg "${INTERFACE_NAME}" || return 0
+	if awg-quick down "${INTERFACE_NAME}"; then
+		rm -f -- "$(_awgBtMarkerFile "${INTERFACE_NAME}")"
+		return 0
+	fi
+	return 1
+}
+
+# ExecStopPost, after every stop, crash and failed start:
+#  1. A surviving non-TUN AmneziaWG link means awg-quick took the kernel path;
+#     awg-quick down removes it and runs its PostDown.
+#  2. A remaining .up marker means the interface went away without a clean
+#     down, so PostDown is replayed from the server config.
+#  3. UAPI sockets are removed only if no daemon answers on them.
+#  4. This interface's PID file and marker are removed. Nothing else is touched.
+function _awgBtCtlPoststop() {
+	local INTERFACE_NAME="$1" MARKER
+	MARKER="$(_awgBtMarkerFile "${INTERFACE_NAME}")"
+	if _awgBtLinkExists "${INTERFACE_NAME}" && ! _awgBtLinkIsTun "${INTERFACE_NAME}" && \
+		_awgBtListedByAwg "${INTERFACE_NAME}"; then
+		if awg-quick down "${INTERFACE_NAME}"; then
+			rm -f -- "${MARKER}"
+		else
+			_awgBtErr "awg-quick down failed for the non-BoringTun interface ${INTERFACE_NAME}"
+		fi
+	fi
+	if [[ -e "${MARKER}" ]]; then
+		_awgBtReplayPostDown "${INTERFACE_NAME}"
+	fi
+	_awgBtRemoveStaleSockets "${INTERFACE_NAME}"
+	rm -f -- "$(_awgBtPidFile "${INTERFACE_NAME}")" "${MARKER}"
+	return 0
+}
+
+# ── awg-backend-ctl ──────────────────────────────────────────────────────────
+# The hooks of the BoringTun drop-in for awg-quick@<if>.service.
+function awgBackendCtlMain() {
+	local COMMAND="${1:-}" INTERFACE_NAME="${2:-}"
+	if [[ $# -ne 2 ]] || ! _awgBtValidInterfaceName "${INTERFACE_NAME}"; then
+		_awgBtErr "usage: awg-backend-ctl precheck|poststart|sync|stop|poststop <interface>"
+		return 2
+	fi
+	case "${COMMAND}" in
+		precheck) _awgBtCtlPrecheck "${INTERFACE_NAME}" ;;
+		poststart) _awgBtCtlPoststart "${INTERFACE_NAME}" ;;
+		sync) _awgBtSync "${INTERFACE_NAME}" ;;
+		stop) _awgBtCtlStop "${INTERFACE_NAME}" ;;
+		poststop) _awgBtCtlPoststop "${INTERFACE_NAME}" ;;
+		*)
+			_awgBtErr "usage: awg-backend-ctl precheck|poststart|sync|stop|poststop <interface>"
+			return 2
+			;;
+	esac
+}
+
+# Functions the generated helpers carry. Keep in step with their callers.
+_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtMarkerFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtUapiLive _awgBtRemoveStaleSockets _awgBtLinkExists _awgBtLinkIsTun _awgBtListedByAwg _awgBtProcessAlive _awgBtStopProcess _awgBtStopTarget _awgBtDaemonArgv _awgBtCloseInheritedFds"
+_AWG_BT_LAUNCH_FUNCTIONS="awgBoringtunLaunchMain _awgBtLaunchFailed"
+_AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtReplayPostDown _awgBtFilteredStrip _awgBtSync _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
+
+# Emit a generated helper: a fixed header, the embedded AWG_BT_* settings, the
+# installer's own functions and a call to the entry point. The output depends
+# only on this installer's code and settings, never on the environment.
+function _awgBtRenderHelper() {
+	local KIND="$1" NAME FUNCTIONS MAIN VARIABLE
+	case "${KIND}" in
+		launch)
+			NAME="awg-boringtun-launch"
+			FUNCTIONS="${_AWG_BT_HELPER_FUNCTIONS} ${_AWG_BT_LAUNCH_FUNCTIONS}"
+			MAIN="awgBoringtunLaunchMain"
+			;;
+		ctl)
+			NAME="awg-backend-ctl"
+			FUNCTIONS="${_AWG_BT_HELPER_FUNCTIONS} ${_AWG_BT_CTL_FUNCTIONS}"
+			MAIN="awgBackendCtlMain"
+			;;
+		*) return 1 ;;
+	esac
+	printf '#!/bin/bash\n'
+	printf '# %s: generated by amneziawg-install from its own functions.\n' "${NAME}"
+	printf '# Do not edit: the installer rewrites this file.\n'
+	printf 'set -uo pipefail\n'
+	printf 'umask 077\n'
+	printf 'export LC_ALL=C\n'
+	printf 'export PATH=%q\n' "${AWG_BT_PATH}"
+	printf '_AWG_BT_PROG=%q\n' "${NAME}"
+	printf '_AWG_BT_VERIFIED_BIN=""\n'
+	printf '_AWG_BT_ARGV=()\n'
+	for VARIABLE in ${_AWG_BT_HELPER_VARIABLES}; do
+		printf 'readonly %s=%q\n' "${VARIABLE}" "${!VARIABLE}"
+	done
+	# shellcheck disable=SC2086 # the function lists are fixed words
+	declare -f ${FUNCTIONS} || return 1
+	printf '%s "$@"\n' "${MAIN}"
+	printf 'exit $?\n'
+}
+
+# The BoringTun drop-in for awg-quick@<if>.service. The packaged
+# `ExecStart=/usr/bin/awg-quick up %i` stays the bring-up.
+function _awgBtRenderServiceDropIn() {
+	cat <<EOF
+# Managed by amneziawg-install (backend: boringtun). Regenerated from params.
+[Unit]
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=forking
+RemainAfterExit=no
+PIDFile=${AWG_BT_RUN_DIR}/boringtun-%i.pid
+TimeoutStartSec=30
+Restart=on-failure
+RestartSec=3
+Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch
+ExecStartPre=${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl precheck %i
+ExecStartPost=${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl poststart %i
+ExecReload=
+ExecReload=${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl sync %i
+ExecStop=
+ExecStop=${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl stop %i
+ExecStopPost=${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl poststop %i
+EOF
+}
+
+# Create DIRECTORY with MODE if needed and require it to be trusted.
+function _awgBtEnsureDirectory() {
+	local DIRECTORY="$1" MODE="$2"
+	if [[ -L "${DIRECTORY}" ]]; then
+		_awgBtErr "refusing to use ${DIRECTORY}: it is a symlink"
+		return 1
+	fi
+	if [[ ! -d "${DIRECTORY}" ]]; then
+		mkdir -p -- "${DIRECTORY}" && chmod "${MODE}" -- "${DIRECTORY}" || return 1
+	fi
+	if ! _awgBtTrustedAncestors "${DIRECTORY}" || ! _awgBtTrustedNode "${DIRECTORY}" dir; then
+		_awgBtErr "${DIRECTORY} or a parent directory is writable by someone other than root"
+		return 1
+	fi
+}
+
+# Replace DEST with stdin atomically, as a root-owned file with MODE. An
+# identical file is left alone. _AWG_BT_FILE_CHANGED says whether DEST changed.
+function _awgBtWriteManagedFile() {
+	local DEST="$1" MODE="$2" TMP OWNER="" CURRENT_MODE=""
+	_AWG_BT_FILE_CHANGED=0
+	if [[ -L "${DEST}" ]] || { [[ -e "${DEST}" ]] && [[ ! -f "${DEST}" ]]; }; then
+		_awgBtErr "refusing to replace ${DEST}: it is not a regular file"
+		cat >/dev/null
+		return 1
+	fi
+	if ! TMP="$(mktemp "${DEST%/*}/.${DEST##*/}.XXXXXX")"; then
+		cat >/dev/null
+		return 1
+	fi
+	if ! cat >"${TMP}" || ! chmod "${MODE}" -- "${TMP}" ||
+		{ [[ "${EUID}" -eq 0 ]] && ! chown 0:0 -- "${TMP}"; }; then
+		rm -f -- "${TMP}"
+		return 1
+	fi
+	if [[ -f "${DEST}" ]] && cmp -s -- "${TMP}" "${DEST}"; then
+		read -r OWNER CURRENT_MODE <<<"$(_awgBtStatOwnerMode "${DEST}")"
+		if [[ "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${CURRENT_MODE}" == "${MODE#0}" ]]; then
+			rm -f -- "${TMP}"
+			return 0
+		fi
+	fi
+	if ! mv -f -- "${TMP}" "${DEST}"; then
+		rm -f -- "${TMP}"
+		return 1
+	fi
+	_AWG_BT_FILE_CHANGED=1
+}
+
+function _awgBtInstallHelpers() {
+	local CONTENT
+	_awgBtEnsureDirectory "${AWG_BT_LIBEXEC_DIR}" 0755 || return 1
+	CONTENT="$(_awgBtRenderHelper launch)" || return 1
+	_awgBtWriteManagedFile "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" 0755 <<<"${CONTENT}" || return 1
+	CONTENT="$(_awgBtRenderHelper ctl)" || return 1
+	_awgBtWriteManagedFile "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" 0755 <<<"${CONTENT}" || return 1
+}
+
+# Write the runtime file and the drop-in for INTERFACE and reload systemd when
+# the drop-in changed.
+function _awgBtInstallServiceFiles() {
+	local INTERFACE_NAME="$1" DROPIN_DIR CONTENT
+	_awgBtValidInterfaceName "${INTERFACE_NAME}" || return 1
+	CONTENT="$(_awgBtRenderRuntimeFile)" || return 1
+	_awgBtWriteManagedFile "$(_awgBtRuntimeFilePath "${INTERFACE_NAME}")" 0600 <<<"${CONTENT}" || return 1
+	DROPIN_DIR="${AWG_BT_SYSTEMD_DIR}/awg-quick@${INTERFACE_NAME}.service.d"
+	_awgBtEnsureDirectory "${DROPIN_DIR}" 0755 || return 1
+	CONTENT="$(_awgBtRenderServiceDropIn)" || return 1
+	_awgBtWriteManagedFile "${DROPIN_DIR}/override.conf" 0644 <<<"${CONTENT}" || return 1
+	if ((_AWG_BT_FILE_CHANGED)); then
+		systemctl daemon-reload || return 1
+	fi
+	return 0
+}
+
+# ensureAwgBackendReady for BoringTun, with the kernel implementation's calling
+# convention and exit semantics. It verifies an already provisioned store and
+# regenerates the helpers; mode 1 also writes the runtime file and drop-in,
+# starts awg-quick@<if> when it is inactive and requires a live UAPI. It never
+# installs or downloads BoringTun and never touches kernel packages.
+function _awgBtEnsureReady() {
+	local START_AWG_QUICK="${1:-1}"
+	case "${START_AWG_QUICK}" in
+		0 | 1) ;;
+		*)
+			echo -e "${RED}ERROR: ensureAwgBackendReady expects service-start mode 0 or 1.${NC}" >&2
+			return 1
+			;;
+	esac
+	if ! _awgBtVerifyStore || ! _awgBtCheckPlatform || ! _awgBtInstallHelpers; then
+		echo -e "${RED}ERROR: the BoringTun runtime is not ready.${NC}" >&2
+		exit 1
+	fi
+	[[ "${START_AWG_QUICK}" == 0 ]] && return 0
+	if ! _awgBtValidInterfaceName "${SERVER_AWG_NIC:-}" || ! _awgBtInstallServiceFiles "${SERVER_AWG_NIC}"; then
+		echo -e "${RED}ERROR: could not write the BoringTun service files for awg-quick@${SERVER_AWG_NIC:-}.${NC}" >&2
+		exit 1
+	fi
+	ensureAwgQuickRunning
+	if ! _awgBtListenPort "${SERVER_AWG_NIC}" >/dev/null; then
+		echo -e "${RED}ERROR: ${SERVER_AWG_NIC} does not answer on its BoringTun UAPI socket.${NC}" >&2
+		echo -e "${ORANGE}Check: journalctl -u awg-quick@${SERVER_AWG_NIC}${NC}" >&2
+		exit 1
+	fi
+}
+
+# awgBackendQuickUp for BoringTun: the service's precheck, awg-quick up with the
+# launcher, then poststart, through the same generated helpers systemd uses.
+function _awgBtQuickUp() {
+	local CONFIG_FILE="$1" INTERFACE_NAME CTL="${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl"
+	if ! [[ "${CONFIG_FILE}" =~ (^|/)([a-zA-Z0-9_=+.-]{1,15})\.conf$ ]]; then
+		_awgBtErr "${CONFIG_FILE} is not named <interface>.conf"
+		return 1
+	fi
+	INTERFACE_NAME="${BASH_REMATCH[2]}"
+	"${CTL}" precheck "${INTERFACE_NAME}" || return 1
+	if ! WG_QUICK_USERSPACE_IMPLEMENTATION="${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" awg-quick up "${CONFIG_FILE}"; then
+		"${CTL}" poststop "${INTERFACE_NAME}"
+		return 1
+	fi
+	if ! "${CTL}" poststart "${INTERFACE_NAME}"; then
+		"${CTL}" stop "${INTERFACE_NAME}"
+		"${CTL}" poststop "${INTERFACE_NAME}"
+		return 1
+	fi
+	return 0
+}
+
+# ── BoringTun scratch interfaces ─────────────────────────────────────────────
+# Throwaway instances for capability probes and staged validation, started from
+# the verified binary with the production command line. BoringTun replaces an
+# existing UAPI socket path when it binds, which would hijack a live instance of
+# the same name, so any sign of the name in use is refused. Under systemd each
+# instance is a transient unit with its own cgroup; otherwise it is a tracked
+# child.
+#
+# Cleanup is guaranteed by a guardian: a tracked background process that
+# ignores HUP, INT and TERM, watches the shell that created the instance and
+# tears the instance down as soon as that shell is gone, whether it exited,
+# was signalled or was killed. The caller's traps are never touched: in a bash
+# subshell, trap -p reports the parent's handlers although they are not
+# active, so chaining traps safely is not possible there. Everything targets
+# tracked names, units and PIDs only.
+
+function _awgBtScratchUnitName() {
+	printf 'amneziawg-scratch-%s\n' "$1"
+}
+
+# Field 22 of /proc/<pid>/stat, the start time, which tells a live process from
+# a later one that reused its PID.
+function _awgBtProcessStartTime() {
+	local STAT
+	local -a FIELDS=()
+	[[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+	STAT="$(cat -- "${AWG_BT_PROC_DIR}/$1/stat" 2>/dev/null)" || return 1
+	read -r -a FIELDS <<<"${STAT##*) }"
+	[[ "${FIELDS[19]:-}" =~ ^[0-9]+$ ]] || return 1
+	printf '%s\n' "${FIELDS[19]}"
+}
+
+function _awgBtScratchAlive() {
+	if [[ -n "${_AWG_BT_SCRATCH_UNITS[$1]:-}" ]]; then
+		systemctl is-active --quiet "${_AWG_BT_SCRATCH_UNITS[$1]}"
+	else
+		_awgBtProcessAlive "${_AWG_BT_SCRATCH_PIDS[$1]:-}"
+	fi
+}
+
+# Remove whatever of a scratch instance remains: the link, the transient unit or
+# the tracked process (only while it is still the same process), and the
+# name's sockets if no daemon answers on them.
+function _awgBtScratchTeardown() {
+	local NAME="$1" UNIT="$2" PID="$3" PID_START="$4"
+	if ip link show dev "${NAME}" >/dev/null 2>&1; then
+		ip link delete dev "${NAME}" >/dev/null 2>&1
+	fi
+	if [[ -n "${UNIT}" ]]; then
+		systemctl stop "${UNIT}" >/dev/null 2>&1
+		systemctl reset-failed "${UNIT}" >/dev/null 2>&1
+	fi
+	if [[ -n "${PID}" && -n "${PID_START}" ]]; then
+		_awgBtStopProcess "${PID}" "${PID_START}"
+	fi
+	_awgBtRemoveStaleSockets "${NAME}"
+}
+
+function _awgBtScratchGuardian() {
+	local NAME="$1" UNIT="$2" PID="$3" PID_START="$4" OWNER="$5" OWNER_START="$6"
+	trap '' HUP INT TERM
+	_awgBtCloseInheritedFds
+	while [[ "$(_awgBtProcessStartTime "${OWNER}")" == "${OWNER_START}" ]]; do
+		sleep 0.2
+	done
+	_awgBtScratchTeardown "${NAME}" "${UNIT}" "${PID}" "${PID_START}"
+}
+
+function _awgBtScratchCreate() {
+	local NAME="$1" UNIT="" PID="" PID_START="" OWNER OWNER_START I LIMIT
+	if ! [[ "${NAME}" =~ ^[a-zA-Z0-9_-]{1,15}$ ]]; then
+		_awgBtErr "invalid scratch interface name ${NAME}"
+		return 1
+	fi
+	if ip link show dev "${NAME}" >/dev/null 2>&1 ||
+		[[ -e "${AWG_BT_WG_SOCKET_DIR}/${NAME}.sock" || -L "${AWG_BT_WG_SOCKET_DIR}/${NAME}.sock" ||
+			-e "${AWG_BT_AWG_SOCKET_DIR}/${NAME}.sock" || -L "${AWG_BT_AWG_SOCKET_DIR}/${NAME}.sock" ]] ||
+		_awgBtListedByAwg "${NAME}"; then
+		_awgBtErr "refusing to start scratch interface ${NAME}: the name is already in use"
+		return 1
+	fi
+	OWNER="${BASHPID}"
+	if ! OWNER_START="$(_awgBtProcessStartTime "${OWNER}")"; then
+		_awgBtErr "cannot identify the shell that owns scratch interface ${NAME}"
+		return 1
+	fi
+	_awgBtVerifyStore || return 1
+	_awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${NAME}" || return 1
+	if [[ -d "${AWG_BT_SYSTEMD_RUNTIME_DIR}" ]] && command -v systemd-run >/dev/null 2>&1; then
+		UNIT="$(_awgBtScratchUnitName "${NAME}")"
+		# A unit systemd already knows, loaded, failed or left over from an
+		# interrupted run, belongs to someone else: never start over it.
+		if [[ "$(systemctl show -p LoadState --value "${UNIT}.service" 2>/dev/null)" != "not-found" ]]; then
+			_awgBtErr "refusing to start scratch interface ${NAME}: the unit ${UNIT} already exists"
+			return 1
+		fi
+		_AWG_BT_SCRATCH_UNITS["${NAME}"]="${UNIT}"
+	fi
+	# The guardian is started before the daemon, so no instance ever runs
+	# unwatched.
+	if [[ -n "${UNIT}" ]]; then
+		_awgBtScratchGuardian "${NAME}" "${UNIT}" "" "" "${OWNER}" "${OWNER_START}" </dev/null >/dev/null 2>&1 &
+		_AWG_BT_SCRATCH_GUARDS["${NAME}"]=$!
+		if ! systemd-run --quiet --collect --unit="${UNIT}" -p Type=exec -- "${_AWG_BT_ARGV[@]}" >/dev/null; then
+			# The unit may have appeared since the check above and then is not
+			# ours, so only the guardian is stopped: no unit, link or socket is
+			# touched.
+			_awgBtErr "could not start the transient unit ${UNIT}"
+			kill -KILL "${_AWG_BT_SCRATCH_GUARDS[${NAME}]}" 2>/dev/null
+			wait "${_AWG_BT_SCRATCH_GUARDS[${NAME}]}" 2>/dev/null
+			unset "_AWG_BT_SCRATCH_UNITS[${NAME}]" "_AWG_BT_SCRATCH_GUARDS[${NAME}]"
+			return 1
+		fi
+	else
+		(
+			_awgBtCloseInheritedFds
+			exec "${_AWG_BT_ARGV[@]}" </dev/null >/dev/null 2>&1
+		) &
+		PID=$!
+		PID_START="$(_awgBtProcessStartTime "${PID}")" || PID_START=""
+		_AWG_BT_SCRATCH_PIDS["${NAME}"]="${PID}"
+		_AWG_BT_SCRATCH_PID_STARTS["${NAME}"]="${PID_START}"
+		_awgBtScratchGuardian "${NAME}" "" "${PID}" "${PID_START}" "${OWNER}" "${OWNER_START}" </dev/null >/dev/null 2>&1 &
+		_AWG_BT_SCRATCH_GUARDS["${NAME}"]=$!
+	fi
+	LIMIT=$((AWG_BT_READY_TIMEOUT * 10))
+	for ((I = 0; I < LIMIT; I++)); do
+		_awgBtScratchAlive "${NAME}" || break
+		_awgBtUapiReady "${NAME}" && return 0
+		sleep 0.1
+	done
+	_awgBtErr "scratch interface ${NAME} did not become ready"
+	_awgBtScratchDestroy "${NAME}"
+	return 1
+}
+
+# Stop the guardian, then delete the link (the daemon exits), stop the
+# transient unit or tracked process and remove the name's stale sockets.
+function _awgBtScratchDestroy() {
+	local NAME="$1" UNIT PID PID_START GUARD RC=0
+	UNIT="${_AWG_BT_SCRATCH_UNITS[${NAME}]:-}"
+	PID="${_AWG_BT_SCRATCH_PIDS[${NAME}]:-}"
+	PID_START="${_AWG_BT_SCRATCH_PID_STARTS[${NAME}]:-}"
+	GUARD="${_AWG_BT_SCRATCH_GUARDS[${NAME}]:-}"
+	if [[ -z "${UNIT}" && -z "${PID}" ]]; then
+		_awgBtErr "scratch interface ${NAME} was not started here"
+		return 1
+	fi
+	if [[ -n "${GUARD}" ]]; then
+		kill -KILL "${GUARD}" 2>/dev/null
+		wait "${GUARD}" 2>/dev/null
+	fi
+	_awgBtScratchTeardown "${NAME}" "${UNIT}" "${PID}" "${PID_START}"
+	if [[ -n "${PID}" ]]; then
+		wait "${PID}" 2>/dev/null
+	fi
+	unset "_AWG_BT_SCRATCH_UNITS[${NAME}]" "_AWG_BT_SCRATCH_PIDS[${NAME}]" \
+		"_AWG_BT_SCRATCH_PID_STARTS[${NAME}]" "_AWG_BT_SCRATCH_GUARDS[${NAME}]"
+	if ip link show dev "${NAME}" >/dev/null 2>&1 ||
+		{ [[ -n "${UNIT}" ]] && systemctl is-active --quiet "${UNIT}"; } ||
+		_awgBtUapiLive "${NAME}"; then
+		RC=1
+	fi
+	return "${RC}"
 }
 
 function readJminAndJmax() {
@@ -7122,7 +8375,7 @@ function validateStagedAwgConfigs() {
 	shift
 	local -a CONFIG_FILES=("$@")
 	local VALIDATE_INTERFACE="awgv$((BASHPID % 100000000))"
-	local CONFIG_FILE STRIPPED_FILE INTERFACE_FILE LINE
+	local CONFIG_FILE STRIPPED_FILE INTERFACE_FILE LINE CLEAN
 	local INDEX=0 RC=0 INTERFACE_CREATED=0
 
 	if ! awgBackendCreateScratchInterface "${VALIDATE_INTERFACE}" >/dev/null 2>&1; then
@@ -7142,6 +8395,15 @@ function validateStagedAwgConfigs() {
 		: >"${INTERFACE_FILE}"
 		while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
 			[[ "${LINE}" =~ ^[[:space:]]*\[Peer\][[:space:]]*$ ]] && break
+			# BoringTun binds ListenPort as soon as it is set, even on a link
+			# that is down, so a scratch instance given the running server's
+			# staged config would collide with the server's own socket. The
+			# port is not a protocol field, so BoringTun validation omits it.
+			if [[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+				CLEAN="${LINE%%#*}"
+				CLEAN="${CLEAN//[[:space:]]/}"
+				[[ "${CLEAN,,}" == listenport=* ]] && continue
+			fi
 			printf '%s\n' "${LINE}" >>"${INTERFACE_FILE}"
 		done <"${STRIPPED_FILE}"
 		if ! awg setconf "${VALIDATE_INTERFACE}" "${INTERFACE_FILE}" >/dev/null 2>&1; then
@@ -7154,7 +8416,7 @@ function validateStagedAwgConfigs() {
 		RC=1
 	fi
 	if (( RC != 0 )); then
-		echo "ERROR: a staged protocol configuration was rejected by the installed tooling or running module" >&2
+		echo "ERROR: $(awgBackendValidationText staged)" >&2
 		return 1
 	fi
 }

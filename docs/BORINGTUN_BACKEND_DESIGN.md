@@ -1540,6 +1540,145 @@ artefacts can be staged, validated and swapped.
 | **9. Container deliverable** | Dockerfile and entrypoint, `awgService*` abstraction, container mode, Docker integration test. | Yes | 4, 5 |
 | **10. Explicit backend migration** | `--migrate-backend kernel\|boringtun` transaction (§20). | Yes | 4, 6 |
 
+### 21.1 Runtime layer as implemented (PR 3)
+
+PR 3 implements §6 to §8 for BoringTun without making it a backend a user can
+select. This section records the implemented contract and every place where it
+differs from the proposals above.
+
+**Reachability.** Params validation still accepts only `kernel`, and
+`serializeParams` refuses any other value. The BoringTun branches of the seam
+run only after `_awgInternalSelectBoringtunRuntimeForTesting`, an undocumented
+function that test code calls after sourcing the installer. The flag it sets is
+assigned, never read from the environment, each time the installer loads. No
+command-line option, menu entry or params value reaches it, and PR 4 replaces it
+with normal backend selection.
+
+**Store.** The runtime consumes the PR 2 archive layout as is:
+`/usr/local/lib/amneziawg-install/boringtun/<release>/` holds the unpacked
+archive directory `boringtun-cli-<version>-g<commit12>-linux-<arch>-musl`, and
+`current` is a relative link to it. Every start verifies:
+
+- every directory from `/` down to the release is root-owned, not a symlink and
+  not group- or other-writable, and `current` is a root-owned link to a
+  well-formed release name;
+- the binary is a root-owned regular file, executable by its owner and not
+  writable by anyone else, and its real path stays inside the store;
+- `MANIFEST` has exactly the format-1 keys that `scripts/boringtun-artifact.sh`
+  writes, once each, for this host's architecture, and its version, commit and
+  architecture name the release directory;
+- the binary's SHA-256 equals `binary_sha256`.
+
+PR 3 does not compare the release with the pin. The commit may appear only in
+`packaging/boringtun/pin.env`, and the store is populated by hand in PR 3's live
+test. PR 4, which downloads and installs the artifact, embeds the expected
+hashes.
+
+**Helpers.** `awg-boringtun-launch` and `awg-backend-ctl` are generated with
+`declare -f` from the installer's own functions. Each carries its paths as
+read-only settings, sets `PATH` and `LC_ALL=C` itself and reads nothing from its
+environment. Regenerating identical content leaves the files alone. All
+installer-written files (helpers, drop-in, runtime file) are replaced atomically
+and never through a symlink.
+
+**Runtime file.** Format 1 has a single key, `FORMAT=1`. The imitation keys of
+§4.3 arrive with PR 5 through the same allowlist.
+
+**Drop-in.** Exactly §7.4, written to `awg-quick@<if>.service.d/override.conf`,
+the file the kernel drop-in uses. The packaged `awg-quick@.service` in the
+Amnezia PPA (`resolute` and `noble`) still has `Type=oneshot`,
+`RemainAfterExit=yes` and `ExecStart=/usr/bin/awg-quick up %i`, so the drop-in
+contract holds. `precheck` refuses to start if that `ExecStart=` changes or a
+local unit file replaces the packaged one.
+
+**precheck.** It refuses when:
+
+- `/sys/module/amneziawg` exists, or `modinfo -n amneziawg` finds the module
+  (PR 3 has no load override, §7.11, so any installed module blocks BoringTun);
+- `modinfo` is missing, so autoloading cannot be ruled out;
+- `/dev/net/tun` is not a usable character device, or `/proc/sys/net/ipv6` is
+  absent;
+- store, helper or runtime-file verification fails;
+- the server config sets `SaveConfig = true` or an invalid value, read the way
+  `awg-quick`'s `read_bool` reads it.
+
+**poststart.** Deviation: the `.up` marker is written *before* the checks. When
+`ExecStartPost` runs, `awg-quick up` has completed and its PostUp hooks have
+run, so a failing check must still leave the marker for `poststop` to replay
+PostDown. The checks are then those of §7.4: a TUN link, a live PID from the
+launcher's PID file whose `/proc/<pid>/exe` is the verified binary, and a UAPI
+that answers and is listed by `awg show interfaces`.
+
+**stop and poststop.** As §7.9. `poststop` runs `awg-quick down` only for a
+surviving link that is not a TUN device and that `awg show interfaces` lists, so
+an unrelated link of the same name is left alone. PostDown hooks are parsed like
+`awg-quick`'s `parse_options`, and each runs as `bash -e -o pipefail -c` with
+`LC_ALL=C`, `%i` substituted and `INTERFACE` exported. Deviation: a failing hook
+is logged and the remaining hooks still run, whereas `awg-quick down` stops at
+the first failure. `awg-quick`'s own shell variables other than `INTERFACE` are
+not available to replayed hooks; the installer's generated hooks use none.
+
+**Sync filter.** As §6.4. It fails without calling `awg syncconf` when
+`awg-quick strip` fails, when `[Interface]` has more than one `ListenPort` or an
+invalid one, or when the live port cannot be read.
+
+**Scratch interfaces.** Deviation from §8.4: cleanup is guaranteed by a guardian
+process, not by traps. In a bash subshell, `trap -p` reports the parent's
+handlers although they are not active there, so a scratch primitive called from
+the protocol code, which runs in subshells, cannot chain traps safely. The
+guardian is a tracked background process that ignores HUP, INT and TERM,
+watches the owning shell's PID and start time, and tears the instance down when
+that shell is gone. This covers EXIT, HUP, INT and TERM, and also SIGKILL of
+the owner. Scratch names are limited to `[a-zA-Z0-9_-]`, because they become
+unit names. A name is refused when its link, either UAPI socket, an
+`awg show interfaces` entry or a unit that systemd already knows exists. If
+`systemd-run` still fails, only the guardian is stopped: the unit and link may
+belong to whoever took the name in between. Without systemd, a process is
+signalled only while its start time still matches the one recorded when it was
+started. The sweep of leftovers from interrupted runs (§8.4) is not
+implemented yet.
+
+**Staged validation.** Correction to §20 and §8.4, found by the live test: the
+kernel module binds `ListenPort` only when a link is brought up, so a kernel
+scratch link can take the running server's staged config. BoringTun binds the
+port as soon as it is set, even on a link that is down, so the same config
+collides with the running server. For BoringTun only, `validateStagedAwgConfigs`
+therefore leaves `ListenPort` out of what it applies; the port is not a protocol
+field. The live test also confirmed §8.6: BoringTun rejects configurations the
+kernel accepts, for example header protection with `S3` below 12 bytes, or a
+`RejectAfterTime` shorter than `RekeyAfterTime` plus `RekeyTimeout`.
+
+**awgBackendQuickUp.** It runs the generated `precheck`, then `awg-quick up`
+with the launcher, then `poststart`. On a failed `poststart` it runs `stop` and
+`poststop`.
+
+**Live test.** `.github/workflows/boringtun-runtime.yml` builds and packages the
+pinned binary with `scripts/boringtun-artifact.sh`, installs `amneziawg-tools`
+without recommends, so no kernel module is present, and runs
+`tests/test-boringtun-runtime-live.sh`. That test covers start, reload, restart,
+stop, SIGKILL with restart and PostDown replay, `ip link del`, descriptor
+stability over repeated syncs, and AWG 2.0/3.0/3.1 validation on scratch
+instances.
+
+**Residual assumptions.**
+
+- Between verification and `exec` only root can change the binary, because
+  every path component is root-owned and not writable by anyone else. Bash
+  cannot open and execute the verified file descriptor itself.
+- PID reuse between the launcher writing the PID file and `poststart` reading it
+  is caught only by the `/proc/<pid>/exe` comparison.
+- A module that appears after `precheck` (for example, installed in between) is
+  caught by `poststart`'s TUN check and the PID-file contract, not prevented.
+- Without systemd, a guardian stops a daemon that is no longer the child of a
+  live shell, so its PID is freed as soon as it exits. The start time is
+  checked before every signal, but a PID reused between that check and `kill`
+  would still be signalled; bash cannot signal through a pidfd. Under systemd
+  the transient unit is stopped instead.
+- If the owning shell dies after its guardian starts but before a failing
+  `systemd-run` returns, and another process created the same unit in between,
+  the guardian stops that unit. Scratch names embed the owner's PID, and only
+  root can create units.
+
 ---
 
 ## 22. Current functions and files that will need modification
