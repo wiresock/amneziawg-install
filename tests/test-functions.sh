@@ -1380,6 +1380,182 @@ assert_not_contains "${NIAC_SC_PEER}" "::" "niac v4-only: server peer has no IPv
 rm -rf "${NIAC_BIN}"
 unset NIAC_BIN NIAC_PATHS NIAC_CC NIAC_SC_PEER
 
+echo "=== nonInteractiveAddClient syncconf error file ==="
+# The add path captures `awg syncconf` stderr in a private temporary file. The
+# awg mock records which file its stderr went to and that file's mode, and can
+# wait at a barrier so two concurrent adds provably hold their files at once.
+SYNCERR_ROOT="$(readlink -f "$(mktemp -d)")"
+SYNCERR_BIN="${SYNCERR_ROOT}/bin"
+mkdir -p "${SYNCERR_BIN}"
+cat > "${SYNCERR_BIN}/awg" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+	genkey) echo "PRIVKEY";;
+	pubkey) read -r _ 2>/dev/null; echo "PUBKEY";;
+	genpsk) echo "PSK";;
+	syncconf)
+		cat -- "$3" >/dev/null
+		err_path="$(readlink -f "/proc/$$/fd/2")"
+		met=no
+		if [[ -n "${SYNCERR_BARRIER:-}" ]]; then
+			: >"${SYNCERR_BARRIER}/${SYNCERR_MARKER}"
+			for _ in $(seq 1 200); do
+				arrived=("${SYNCERR_BARRIER}"/*)
+				if (( ${#arrived[@]} >= 2 )); then met=yes; break; fi
+				sleep 0.05
+			done
+		fi
+		printf '%s %s %s\n' "${err_path}" "$(stat -c '%a' -- "${err_path}")" "${met}" \
+			>"${SYNCERR_RECORD}"
+		echo "syncconf stdout ${SYNCERR_MARKER}"
+		echo "syncconf failed: ${SYNCERR_MARKER}" >&2
+		if [[ "${SYNCERR_KILL_CALLER:-0}" == "1" ]]; then
+			kill -TERM "${PPID}"
+		fi
+		exit "${SYNCERR_RC:-0}"
+		;;
+	*) exit 0;;
+esac
+EOF
+cat > "${SYNCERR_BIN}/awg-quick" <<'EOF'
+#!/usr/bin/env bash
+echo "strip warning ${SYNCERR_MARKER}" >&2
+printf '[Interface]\nListenPort = 51820\n'
+EOF
+chmod +x "${SYNCERR_BIN}/awg" "${SYNCERR_BIN}/awg-quick"
+
+# Add client $2 to a fresh server state in directory $1, with TMPDIR set to $3.
+# Stdout, stderr, the exit status and the awg mock's record land in $1. The
+# lifecycle lock is disabled so concurrent runs overlap, as they did in the
+# parallel test runs that exposed the former fixed error-file path.
+_run_syncerr_add() {
+	local dir="$1" client="$2" tmp_dir="$3"
+	mkdir -p "${dir}/amneziawg"
+	printf '%s\n' "[Interface]" "Address = 10.66.66.1/24" "ListenPort = 51820" \
+		> "${dir}/amneziawg/awg0.conf"
+	(
+		PATH="${SYNCERR_BIN}:${PATH}"; export PATH
+		export TMPDIR="${tmp_dir}" SYNCERR_MARKER="${client}" SYNCERR_RECORD="${dir}/record"
+		AMNEZIAWG_DIR="${dir}/amneziawg"
+		WEB_PANEL_CONFIG_DIR="${dir}/amneziawg/clients"
+		WEB_PANEL_ENV_FILE="${dir}/missing-env.conf"
+		WEB_PANEL_SYSTEMD_UNIT="${dir}/missing.service"
+		SERVER_AWG_NIC="awg0"; SERVER_AWG_IPV4="10.66.66.1"
+		SERVER_AWG_IPV6="fd42:42:42:0:0:0:0:1"; SERVER_PORT="51820"
+		SERVER_PUB_IP="198.51.100.1"; SERVER_PUB_KEY="SRVPUB"
+		CLIENT_DNS_1="1.1.1.1"; CLIENT_DNS_2=""
+		SERVER_AWG_JC=4; SERVER_AWG_JMIN=50; SERVER_AWG_JMAX=1000
+		SERVER_AWG_S1=30; SERVER_AWG_S2=100; SERVER_AWG_S3=45; SERVER_AWG_S4=120
+		SERVER_AWG_H1="5-10"; SERVER_AWG_H2="11-20"; SERVER_AWG_H3="21-30"; SERVER_AWG_H4="31-40"
+		ALLOWED_IPS="0.0.0.0/0"; ENABLE_IPV6="n"
+		acquireClientLifecycleLock() { :; }
+		loadParams() { :; }
+		ensureAmneziawgKernelModule() { :; }
+		copyToWebPanelDir() { :; }
+		nonInteractiveAddClient "${client}" >"${dir}/stdout" 2>"${dir}/stderr"
+		echo "$?" >"${dir}/rc"
+	)
+}
+
+# Print "<error file> <mode> <barrier met>" as recorded by the awg mock.
+_syncerr_record() {
+	cat "$1/record" 2>/dev/null || echo "missing missing missing"
+}
+
+# Print every file left in a temporary directory.
+_syncerr_leftovers() {
+	find "$1" -mindepth 1 -print 2>/dev/null
+}
+
+# Print "unique" when a recorded error file is a mktemp name inside $2.
+_syncerr_is_private_name() {
+	if [[ "$1" == "$2"/amneziawg-syncconf.?????? ]]; then echo "unique"; else echo "$1"; fi
+}
+
+# Success: a unique mode-0600 file under TMPDIR receives syncconf stderr and is
+# removed. syncconf stderr stays off stderr; awg-quick strip diagnostics stay on it.
+SYNCERR_TMP="${SYNCERR_ROOT}/tmp-success"
+mkdir -p "${SYNCERR_TMP}"
+_run_syncerr_add "${SYNCERR_ROOT}/success" okclient "${SYNCERR_TMP}"
+read -r SYNCERR_FILE SYNCERR_MODE _ <<<"$(_syncerr_record "${SYNCERR_ROOT}/success")"
+assert_eq "0" "$(cat "${SYNCERR_ROOT}/success/rc")" "syncconf error file: successful add exits 0"
+assert_eq "${SYNCERR_ROOT}/success/amneziawg/clients/awg0-client-okclient.conf" \
+	"$(tail -n 1 "${SYNCERR_ROOT}/success/stdout")" \
+	"syncconf error file: successful add still prints the client config path last"
+assert_eq "strip warning okclient" "$(cat "${SYNCERR_ROOT}/success/stderr")" \
+	"syncconf error file: success keeps strip diagnostics on stderr and syncconf stderr off it"
+assert_eq "unique" "$(_syncerr_is_private_name "${SYNCERR_FILE}" "${SYNCERR_TMP}")" \
+	"syncconf error file: stderr goes to a unique mktemp file under TMPDIR, not a fixed path"
+assert_eq "600" "${SYNCERR_MODE}" "syncconf error file: the file is private (mode 600)"
+assert_eq "" "$(_syncerr_leftovers "${SYNCERR_TMP}")" "syncconf error file: removed after success"
+
+# Failure: the same diagnostics as before, the captured detail holds only
+# syncconf stderr (strip diagnostics come first, uncaptured), and the file is removed.
+SYNCERR_TMP="${SYNCERR_ROOT}/tmp-failure"
+mkdir -p "${SYNCERR_TMP}"
+SYNCERR_RC=1 _run_syncerr_add "${SYNCERR_ROOT}/failure" failclient "${SYNCERR_TMP}"
+assert_eq "1" "$(cat "${SYNCERR_ROOT}/failure/rc")" "syncconf error file: failed sync exits 1"
+assert_eq "strip warning failclient
+ERROR: failed to sync AmneziaWG interface 'awg0' after adding client 'failclient'
+syncconf failed: failclient" "$(cat "${SYNCERR_ROOT}/failure/stderr")" \
+	"syncconf error file: failed sync prints the same error and only the syncconf stderr as detail"
+assert_eq "syncconf stdout failclient" "$(cat "${SYNCERR_ROOT}/failure/stdout")" \
+	"syncconf error file: failed sync passes syncconf stdout through and prints no config path"
+assert_eq "" "$(_syncerr_leftovers "${SYNCERR_TMP}")" "syncconf error file: removed after a failed sync"
+
+# Concurrency: two failing adds share one TMPDIR and wait for each other inside
+# syncconf, so both error files exist at once. Each must report only its own
+# stderr, and neither may remove the other's file.
+SYNCERR_TMP="${SYNCERR_ROOT}/tmp-parallel"
+mkdir -p "${SYNCERR_TMP}" "${SYNCERR_ROOT}/barrier"
+(
+	export SYNCERR_RC=1 SYNCERR_BARRIER="${SYNCERR_ROOT}/barrier"
+	_run_syncerr_add "${SYNCERR_ROOT}/alpha" alpha "${SYNCERR_TMP}" &
+	_run_syncerr_add "${SYNCERR_ROOT}/beta" beta "${SYNCERR_TMP}" &
+	wait
+)
+read -r SYNCERR_ALPHA_FILE _ SYNCERR_ALPHA_MET <<<"$(_syncerr_record "${SYNCERR_ROOT}/alpha")"
+read -r SYNCERR_BETA_FILE _ SYNCERR_BETA_MET <<<"$(_syncerr_record "${SYNCERR_ROOT}/beta")"
+assert_eq "yes yes" "${SYNCERR_ALPHA_MET} ${SYNCERR_BETA_MET}" \
+	"syncconf error file: concurrent adds held their error files at the same time"
+assert_eq "unique unique" \
+	"$(_syncerr_is_private_name "${SYNCERR_ALPHA_FILE}" "${SYNCERR_TMP}") $(_syncerr_is_private_name "${SYNCERR_BETA_FILE}" "${SYNCERR_TMP}")" \
+	"syncconf error file: concurrent adds use mktemp files under TMPDIR"
+if [[ "${SYNCERR_ALPHA_FILE}" != "${SYNCERR_BETA_FILE}" ]]; then SYNCERR_DISTINCT="distinct"; else SYNCERR_DISTINCT="shared"; fi
+assert_eq "distinct" "${SYNCERR_DISTINCT}" "syncconf error file: concurrent adds use distinct files"
+for SYNCERR_CLIENT in alpha beta; do
+	assert_eq "1" "$(cat "${SYNCERR_ROOT}/${SYNCERR_CLIENT}/rc")" \
+		"syncconf error file: concurrent failed sync for ${SYNCERR_CLIENT} exits 1"
+	assert_eq "strip warning ${SYNCERR_CLIENT}
+ERROR: failed to sync AmneziaWG interface 'awg0' after adding client '${SYNCERR_CLIENT}'
+syncconf failed: ${SYNCERR_CLIENT}" "$(cat "${SYNCERR_ROOT}/${SYNCERR_CLIENT}/stderr")" \
+		"syncconf error file: concurrent add ${SYNCERR_CLIENT} reports only its own syncconf stderr"
+done
+assert_eq "" "$(_syncerr_leftovers "${SYNCERR_TMP}")" "syncconf error file: concurrent adds leave no files behind"
+
+# No fallback: when no private file can be created, the add fails before syncing.
+_run_syncerr_add "${SYNCERR_ROOT}/no-tmp" notmp "${SYNCERR_ROOT}/missing-tmp-dir"
+assert_eq "1" "$(cat "${SYNCERR_ROOT}/no-tmp/rc")" "syncconf error file: add fails when the file cannot be created"
+assert_contains "$(cat "${SYNCERR_ROOT}/no-tmp/stderr")" \
+	"ERROR: could not create a temporary file for AmneziaWG sync errors" \
+	"syncconf error file: the creation failure is reported"
+assert_eq "missing missing missing" "$(_syncerr_record "${SYNCERR_ROOT}/no-tmp")" \
+	"syncconf error file: no sync runs without a private error file"
+
+# A terminating signal during the sync still removes the file.
+SYNCERR_TMP="${SYNCERR_ROOT}/tmp-signal"
+mkdir -p "${SYNCERR_TMP}"
+SYNCERR_KILL_CALLER=1 _run_syncerr_add "${SYNCERR_ROOT}/signal" sigclient "${SYNCERR_TMP}"
+assert_eq "unique" "$(_syncerr_is_private_name "$(_syncerr_record "${SYNCERR_ROOT}/signal" | cut -d' ' -f1)" "${SYNCERR_TMP}")" \
+	"syncconf error file: the interrupted sync had its private file"
+assert_eq "143" "$(cat "${SYNCERR_ROOT}/signal/rc")" "syncconf error file: an interrupted sync exits 143, as before"
+assert_eq "" "$(_syncerr_leftovers "${SYNCERR_TMP}")" "syncconf error file: removed after a terminating signal"
+
+rm -rf "${SYNCERR_ROOT}"
+unset SYNCERR_ROOT SYNCERR_BIN SYNCERR_TMP SYNCERR_FILE SYNCERR_MODE SYNCERR_DISTINCT SYNCERR_CLIENT
+unset SYNCERR_ALPHA_FILE SYNCERR_ALPHA_MET SYNCERR_BETA_FILE SYNCERR_BETA_MET
+unset -f _run_syncerr_add _syncerr_record _syncerr_leftovers _syncerr_is_private_name
+
 echo "=== installKernelHeaders future-upgrade coverage ==="
 KERNEL_HEADER_TMP="$(mktemp -d)"
 KERNEL_HEADER_LOG="${KERNEL_HEADER_TMP}/apt-get.log"
