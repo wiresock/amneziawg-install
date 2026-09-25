@@ -277,13 +277,66 @@ jobs:
           binary="$(bash scripts/boringtun-artifact.sh verify-archive dist/*.tar.gz "$RUNNER_TEMP/extract")"
           echo "binary=$binary" >>"$GITHUB_OUTPUT"
 
+      # The harnesses talk to the daemons over UAPI sockets without timeouts, so
+      # a daemon that never answers would hold the job until its timeout with
+      # no diagnostics. Bound each harness; on expiry, record the state of every
+      # daemon and helper it started before stopping it.
+      - name: Prepare the harness watchdog
+        run: |
+          cat >"$RUNNER_TEMP/watchdog.sh" <<'EOF'
+          #!/usr/bin/env bash
+          # Usage: watchdog.sh <seconds> <command...>
+          set -u
+          limit="$1"; shift
+          "$@" &
+          pid=$!
+          for ((i = 0; i < limit; i++)); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              wait "$pid"
+              exit $?
+            fi
+            sleep 1
+          done
+          echo "::error::harness still running after ${limit}s; recording daemon state before stopping it"
+          echo "=== processes"
+          ps -eo pid,ppid,stat,wchan:32,etime,args | grep -E 'boringtun-cli|amneziawg-go|python3|interop' | grep -v -e grep -e watchdog
+          for p in $(pgrep -f 'boringtun-cli|amneziawg-go|python3 -c'); do
+            echo "=== pid $p: $(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | cut -c1-160)"
+            for t in /proc/"$p"/task/*; do
+              echo "  tid ${t##*/} state=$(awk '{ print $3 }' "$t/stat" 2>/dev/null) wchan=$(cat "$t/wchan" 2>/dev/null)"
+              sed 's/^/      /' "$t/stack" 2>/dev/null | head -n 12
+            done
+            ls -l "/proc/$p/fd" 2>/dev/null | sed 's/^/    fd /' | head -n 40
+          done
+          echo "=== unix sockets"
+          ss -xp 2>/dev/null | grep -E 'wireguard|amneziawg|boringtun|python3' | head -n 40
+          # amneziawg-go writes every goroutine's stack to its log on SIGQUIT.
+          pkill -QUIT -x amneziawg-go 2>/dev/null
+          sleep 3
+          for f in $(find /tmp -newer "$0" -type f -name '*.log' 2>/dev/null); do
+            echo "=== $f"
+            tail -n 80 "$f"
+          done
+          kill -TERM "$pid" 2>/dev/null
+          sleep 10
+          kill -KILL "$pid" 2>/dev/null
+          exit 124
+          EOF
+          chmod +x "$RUNNER_TEMP/watchdog.sh"
+
       - name: awg-go-interop.sh (AWG 2.0/3.0 wire against amneziawg-go)
         working-directory: boringtun-src
-        run: sudo bash scripts/awg-go-interop.sh "${{ steps.verify.outputs.binary }}" "$RUNNER_TEMP/amneziawg-go"
+        run: |
+          sudo "$RUNNER_TEMP/watchdog.sh" 300 \
+            bash scripts/awg-go-interop.sh "${{ steps.verify.outputs.binary }}" "$RUNNER_TEMP/amneziawg-go"
 
       - name: awg31-interop.sh (AWG 3.1 wire against the pinned amneziawg-go)
+        # Also after an awg-go-interop.sh failure, so that one run shows both.
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
         working-directory: boringtun-src
-        run: sudo bash scripts/awg31-interop.sh "${{ steps.verify.outputs.binary }}" "$RUNNER_TEMP/amneziawg-go"
+        run: |
+          sudo "$RUNNER_TEMP/watchdog.sh" 1200 \
+            bash scripts/awg31-interop.sh "${{ steps.verify.outputs.binary }}" "$RUNNER_TEMP/amneziawg-go"
 
   checksums:
     name: SHA256SUMS
