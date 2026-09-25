@@ -7758,17 +7758,26 @@ AllowedIPs = ${PEER_ALLOWED_IPS}" >>"${SERVER_AWG_CONF}"
 	# Preserve stdout for the generated client config path expected by callers.
 	# Route any informational/repair output from helper setup to stderr.
 	ensureAwgBackendReady 1>&2
-	if ! awgSyncInterfaceConfig "${SERVER_AWG_NIC}" /tmp/amneziawg-syncconf.err; then
-		local sync_err
-		sync_err="$(cat /tmp/amneziawg-syncconf.err 2>/dev/null || true)"
-		rm -f /tmp/amneziawg-syncconf.err
-		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after adding client '${CLIENT_NAME}'" >&2
-		if [[ -n "${sync_err}" ]]; then
-			echo "${sync_err}" >&2
+	# Capture `awg syncconf` stderr in a file that mktemp creates with a unique
+	# name and mode 0600, so concurrent invocations never share it. The nested
+	# subshell gives the EXIT trap its own scope: the trap removes exactly this
+	# file after success, failure or a terminating signal, and cannot replace or
+	# outlive any trap of the caller.
+	(
+		sync_err_file="$(mktemp "${TMPDIR:-/tmp}/amneziawg-syncconf.XXXXXX")" || {
+			echo "ERROR: could not create a temporary file for AmneziaWG sync errors" >&2
+			exit 1
+		}
+		trap 'rm -f -- "${sync_err_file}"' EXIT
+		if ! awgSyncInterfaceConfig "${SERVER_AWG_NIC}" "${sync_err_file}"; then
+			sync_err="$(cat -- "${sync_err_file}" 2>/dev/null || true)"
+			echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after adding client '${CLIENT_NAME}'" >&2
+			if [[ -n "${sync_err}" ]]; then
+				echo "${sync_err}" >&2
+			fi
+			exit 1
 		fi
-		exit 1
-	fi
-	rm -f /tmp/amneziawg-syncconf.err
+	) || exit "$?"
 
 	# Print the config path to stdout for the caller
 	echo "${client_conf}"
