@@ -23,6 +23,7 @@ jobs:
         run: |
           bash tests/test-functions.sh
           bash tests/test-awg3.sh
+          bash tests/test-backend.sh
           bash tests/test-cargo-build-common.sh
           bash tests/test-ubuntu-ppa.sh
           bash tests/test-proxy-scripts.sh
