@@ -104,3 +104,22 @@ jobs:
 
       - name: Validate signed PPA selection, DKMS, module, and tools
         run: sudo bash tests/test-ubuntu-resolute-live.sh
+
+  ppa-architecture-variants:
+    name: Ubuntu 26.04 PPA Architecture Variants
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      # A disposable container that enables APT::Architecture-Variants
+      # (amd64v3, then auto) and drives the installer's PPA configuration and
+      # noble-to-resolute refresh against the live PPA.
+      - name: Reproduce APT architecture-variant selection in Docker
+        run: |
+          docker run --rm \
+            -e AWG_DISPOSABLE_APT_TEST=1 \
+            -v "$PWD:/workspace:ro" \
+            -w /workspace \
+            ubuntu:26.04 \
+            bash tests/test-ubuntu-ppa-variants.sh
