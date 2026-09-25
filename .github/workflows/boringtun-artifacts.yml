@@ -14,12 +14,14 @@ on:
     paths:
       - packaging/boringtun/**
       - scripts/boringtun-artifact.sh
+      - tests/helpers/boringtun-foreground-launcher.sh
       - .github/workflows/boringtun-artifacts.yml
   pull_request:
     branches: [main]
     paths:
       - packaging/boringtun/**
       - scripts/boringtun-artifact.sh
+      - tests/helpers/boringtun-foreground-launcher.sh
       - .github/workflows/boringtun-artifacts.yml
   workflow_dispatch:
 
@@ -200,6 +202,13 @@ jobs:
   # the packaged binary and amneziawg-go. The kernel-module harness
   # (scripts/awg-interop-poc.sh) is not run: it needs an AmneziaWG kernel module
   # for the runner kernel. See docs/BORINGTUN_ARTIFACTS.md.
+  #
+  # The harnesses start boringtun-cli without -f, so it daemonizes itself, and
+  # that path has hung on native aarch64. The planned runtime runs it with
+  # --foreground under a service manager, so the harnesses are given
+  # tests/helpers/boringtun-foreground-launcher.sh as their boringtun-cli: it
+  # starts the packaged binary, named by BORINGTUN_REAL_CLI, with --foreground
+  # and the harness's arguments, and returns. The harnesses are not changed.
   interop:
     name: Interop with amneziawg-go (${{ matrix.arch }})
     needs: build
@@ -324,19 +333,68 @@ jobs:
           EOF
           chmod +x "$RUNNER_TEMP/watchdog.sh"
 
+      # Evidence from the running process, not the launcher's source: started
+      # the way the harnesses start it, the daemon is the packaged binary, runs
+      # with --foreground, is the only process in its namespace and has not
+      # left the caller's session, which daemonizing (setsid) would do.
+      - name: Check the foreground launcher (as root)
+        env:
+          BORINGTUN_REAL_CLI: ${{ steps.verify.outputs.binary }}
+          LAUNCHER: ${{ github.workspace }}/tests/helpers/boringtun-foreground-launcher.sh
+        run: |
+          sudo env BORINGTUN_REAL_CLI="$BORINGTUN_REAL_CLI" LAUNCHER="$LAUNCHER" bash -euo pipefail <<'EOF'
+          ns=bt-fg-check iface=btfg0
+          sock=/var/run/wireguard/$iface.sock log=$(mktemp)
+          cleanup() {
+            for p in $(ip netns pids "$ns" 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+            sleep 0.4
+            ip netns del "$ns" 2>/dev/null || true
+            rm -f "$sock" "$log"
+          }
+          trap cleanup EXIT
+          ip netns add "$ns"
+          ip netns exec "$ns" env WG_LOG_FILE="$log" WG_LOG_LEVEL=debug \
+            "$LAUNCHER" --disable-drop-privileges "$iface"
+          for _ in $(seq 60); do [ -S "$sock" ] && break; sleep 0.2; done
+          [ -S "$sock" ] || { echo "::error::no UAPI socket"; cat "$log"; exit 1; }
+          pids=$(ip netns pids "$ns")
+          ps -o pid,ppid,pgid,sid,stat,args -p "$(echo $pids | tr ' ' ,)"
+          [ "$(wc -w <<<"$pids")" -eq 1 ] || { echo "::error::expected one process in $ns"; exit 1; }
+          pid=$pids
+          cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+          echo "cmdline: $cmdline"
+          [ "$cmdline" = "$BORINGTUN_REAL_CLI --foreground --disable-drop-privileges $iface " ] ||
+            { echo "::error::unexpected command line"; exit 1; }
+          [ "/proc/$pid/exe" -ef "$BORINGTUN_REAL_CLI" ] || { echo "::error::not the packaged binary"; exit 1; }
+          sid=$(awk '{ print $6 }' "/proc/$pid/stat") mysid=$(awk '{ print $6 }' /proc/$$/stat)
+          [ "$sid" = "$mysid" ] || { echo "::error::daemon left the caller's session"; exit 1; }
+          grep -q 'started successfully' "$log" || { echo "::error::no daemon output in WG_LOG_FILE"; cat "$log"; exit 1; }
+          echo "boringtun-cli pid $pid: packaged binary, --foreground, session $sid (the caller's), output in WG_LOG_FILE"
+          kill "$pid"
+          for _ in $(seq 25); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+          ! kill -0 "$pid" 2>/dev/null || { echo "::error::daemon did not stop on SIGTERM"; exit 1; }
+          echo "stopped by SIGTERM, as the harness teardown stops it"
+          EOF
+
       - name: awg-go-interop.sh (AWG 2.0/3.0 wire against amneziawg-go)
         working-directory: boringtun-src
+        env:
+          BORINGTUN_REAL_CLI: ${{ steps.verify.outputs.binary }}
+          LAUNCHER: ${{ github.workspace }}/tests/helpers/boringtun-foreground-launcher.sh
         run: |
-          sudo "$RUNNER_TEMP/watchdog.sh" 300 \
-            bash scripts/awg-go-interop.sh "${{ steps.verify.outputs.binary }}" "$RUNNER_TEMP/amneziawg-go"
+          sudo env BORINGTUN_REAL_CLI="$BORINGTUN_REAL_CLI" "$RUNNER_TEMP/watchdog.sh" 300 \
+            bash scripts/awg-go-interop.sh "$LAUNCHER" "$RUNNER_TEMP/amneziawg-go"
 
       - name: awg31-interop.sh (AWG 3.1 wire against the pinned amneziawg-go)
         # Also after an awg-go-interop.sh failure, so that one run shows both.
         if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
         working-directory: boringtun-src
+        env:
+          BORINGTUN_REAL_CLI: ${{ steps.verify.outputs.binary }}
+          LAUNCHER: ${{ github.workspace }}/tests/helpers/boringtun-foreground-launcher.sh
         run: |
-          sudo "$RUNNER_TEMP/watchdog.sh" 1200 \
-            bash scripts/awg31-interop.sh "${{ steps.verify.outputs.binary }}" "$RUNNER_TEMP/amneziawg-go"
+          sudo env BORINGTUN_REAL_CLI="$BORINGTUN_REAL_CLI" "$RUNNER_TEMP/watchdog.sh" 1200 \
+            bash scripts/awg31-interop.sh "$LAUNCHER" "$RUNNER_TEMP/amneziawg-go"
 
   checksums:
     name: SHA256SUMS

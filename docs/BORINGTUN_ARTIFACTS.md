@@ -159,11 +159,15 @@ GitHub-owned actions.
    the archive must pass `verify-archive`, and `device-smoke` runs as root.
 3. **Interop**, per architecture: BoringTun's `scripts/awg-go-interop.sh` and
    `scripts/awg31-interop.sh`, at the pinned commit, against the packaged binary
-   and `amneziawg-go` built from the commit that `awg31-interop.sh` pins.
+   and `amneziawg-go` built from the commit that `awg31-interop.sh` pins. The
+   binary runs in the foreground, as the planned runtime runs it; see
+   [Interop coverage](#interop-coverage). A watchdog stops a harness that runs
+   too long and records the state of every daemon it started.
 4. **SHA256SUMS** over both archives, uploaded with them as
    `boringtun-cli-artifacts`.
 
-The unit tests for the script (`tests/test-boringtun-artifact.sh`) run in the
+The unit tests for the script (`tests/test-boringtun-artifact.sh`) and for the
+foreground launcher (`tests/test-boringtun-foreground-launcher.sh`) run in the
 regular test workflow without compiling Rust.
 
 ## Licensing
@@ -191,6 +195,31 @@ still need to review the generated notices and decide on the release channel
 and on build provenance attestation.
 
 ## Interop coverage
+
+At the pinned commit, both userspace harnesses start
+`boringtun-cli --disable-drop-privileges [flags] <interface>` without `-f`, so
+the daemon forks itself into the background, and then wait for its UAPI socket.
+On native aarch64 runners that self-daemonizing path hung intermittently, in 3
+of 4 interop jobs, before the socket appeared. The watchdog found the launching
+process waiting for its forked child, and every forked process blocked in a
+futex wait.
+The x86_64 runs did not hang. The observed hang is a deadlock in BoringTun's
+daemonization and fork path. Its exact cause was not established, and it is
+not fixed here.
+
+The planned runtime does not use self-daemonization: it runs
+`boringtun-cli --foreground` under a service manager. CI therefore tests that
+mode. The harnesses get
+[`tests/helpers/boringtun-foreground-launcher.sh`](../tests/helpers/boringtun-foreground-launcher.sh)
+as their `boringtun-cli`. It starts the packaged binary, whose absolute path is
+in `BORINGTUN_REAL_CLI`, with `--foreground` and the harness's own arguments as a
+background child in the harness's namespace, and returns. The harnesses, their
+assertions and their teardown are unchanged. Because the foreground daemon logs
+to stdout instead of `WG_LOG_FILE`, the launcher sends its output to that file,
+where the harnesses look for it on failure. Before the harnesses run, a CI step
+checks the running daemon that the launcher started: the packaged binary, with
+`--foreground`, the only process in its namespace, still in the caller's session,
+and stopped by `SIGTERM`. The launcher is for CI only and is never installed.
 
 The userspace harnesses run in CI. The kernel-module harness,
 `scripts/awg-interop-poc.sh`, does not: it needs an AmneziaWG kernel module
