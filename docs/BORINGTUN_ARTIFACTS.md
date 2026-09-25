@@ -42,8 +42,11 @@ A pin bump is a reviewed change to `pin.env`, together with any policy change in
 | aarch64 | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` |
 
 Both are built natively, without cross toolchains. The binaries are static
-executables (static PIE) with no program interpreter and no shared library
-dependencies, so they need no Rust, Cargo, kernel headers or DKMS on the target.
+executables with no program interpreter and no shared library dependencies, so
+they need no Rust, Cargo, kernel headers or DKMS on the target. With the Rust
+defaults for each target, the x86_64 binary is a static PIE, while the aarch64
+binary is a static non-PIE executable, so its own code is not
+address-randomized.
 
 Archives are named
 `boringtun-cli-<version>-g<commit12>-linux-<arch>-musl.tar.gz`, for example
