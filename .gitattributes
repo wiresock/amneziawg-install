@@ -4,3 +4,4 @@ amneziawg-web/scripts/amneziawg-web-privileged text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.md text eol=auto
+packaging/boringtun/** text eol=lf

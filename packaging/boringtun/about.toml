@@ -1,0 +1,20 @@
+# cargo-about configuration for THIRD-PARTY-LICENSES in the boringtun-cli
+# artifacts: the crates linked into the binary for the two shipped targets.
+# deny.toml gates the same graph plus build dependencies; both must accept the
+# same licenses. Run by `scripts/boringtun-artifact.sh licenses`.
+accepted = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+ignore-dev-dependencies = true
+# Build scripts and their dependencies (cc, cfg_aliases, ...) run on the build
+# host and are not part of the binary, so they are not redistributed.
+ignore-build-dependencies = true
+# The script runs cargo-about with --frozen, so license texts come only from the
+# crate sources in the lockfile and from its bundled SPDX texts, never from the
+# network, and the output is deterministic for a given pin.

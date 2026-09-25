@@ -1,0 +1,430 @@
+name: BoringTun Artifacts
+
+# Builds static boringtun-cli artifacts from the WireSock BoringTun commit pinned
+# in packaging/boringtun/pin.env, natively on x86_64 and aarch64. Every job reads
+# the pin through scripts/boringtun-artifact.sh, which also does the building,
+# packaging and checking; this file only acquires sources and tools and
+# orchestrates. The archives are uploaded as workflow artifacts only: nothing is
+# released, tagged or pushed. See docs/BORINGTUN_ARTIFACTS.md.
+
+on:
+  # Pushes to any branch, so that a pipeline change builds before it is merged;
+  # workflow_dispatch works only once this file is on the default branch. A pull
+  # request from a branch of this repository is then already built by its
+  # pushes, so the pull_request event builds only pull requests from forks (see
+  # the licenses job, which every other job needs).
+  push:
+    paths:
+      - packaging/boringtun/**
+      - scripts/boringtun-artifact.sh
+      - tests/helpers/boringtun-foreground-launcher.sh
+      - .github/workflows/boringtun-artifacts.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - packaging/boringtun/**
+      - scripts/boringtun-artifact.sh
+      - tests/helpers/boringtun-foreground-launcher.sh
+      - .github/workflows/boringtun-artifacts.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# `bash -eo pipefail`, so that a failing command in a pipeline such as
+# `pin | tee` fails its step.
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: boringtun-artifacts-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Build and test tools; the Rust toolchain itself is pinned in pin.env.
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_ABOUT_VERSION: 0.9.2
+  GO_VERSION: 1.27.1
+
+jobs:
+  licenses:
+    name: License and dependency gate
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read the pin
+        id: pin
+        run: bash scripts/boringtun-artifact.sh pin | tee -a "$GITHUB_OUTPUT"
+
+      - name: Check out the pinned BoringTun source
+        uses: actions/checkout@v6
+        with:
+          repository: Wiresock-Foundation/wiresock-boringtun
+          ref: ${{ steps.pin.outputs.BORINGTUN_COMMIT }}
+          path: boringtun-src
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        env:
+          TOOLCHAIN: ${{ steps.pin.outputs.BORINGTUN_RUST_TOOLCHAIN }}
+          TARGET: x86_64-unknown-linux-musl
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/rustup-init" \
+              "https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init"
+            chmod +x "$RUNNER_TEMP/rustup-init"
+            "$RUNNER_TEMP/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none
+            echo "${CARGO_HOME:-$HOME/.cargo}/bin" >>"$GITHUB_PATH"
+            export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+          fi
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustc "+$TOOLCHAIN" --version --verbose
+
+      - name: Install cargo-deny and cargo-about
+        env:
+          TOOLCHAIN: ${{ steps.pin.outputs.BORINGTUN_RUST_TOOLCHAIN }}
+        run: |
+          cargo "+$TOOLCHAIN" install --locked "cargo-deny@${CARGO_DENY_VERSION}"
+          cargo "+$TOOLCHAIN" install --locked --features cli "cargo-about@${CARGO_ABOUT_VERSION}"
+
+      - name: Gate the dependency graph and generate THIRD-PARTY-LICENSES
+        run: |
+          mkdir -p licenses
+          bash scripts/boringtun-artifact.sh licenses boringtun-src licenses/THIRD-PARTY-LICENSES
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: third-party-licenses
+          path: licenses/THIRD-PARTY-LICENSES
+          if-no-files-found: error
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: licenses
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read the pin
+        id: pin
+        run: bash scripts/boringtun-artifact.sh pin | tee -a "$GITHUB_OUTPUT"
+
+      - name: Check out the pinned BoringTun source
+        uses: actions/checkout@v6
+        with:
+          repository: Wiresock-Foundation/wiresock-boringtun
+          ref: ${{ steps.pin.outputs.BORINGTUN_COMMIT }}
+          path: boringtun-src
+          persist-credentials: false
+
+      - name: Install the musl C toolchain for ring
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          musl-gcc --version | sed -n 1p
+
+      - name: Install the pinned Rust toolchain
+        env:
+          TOOLCHAIN: ${{ steps.pin.outputs.BORINGTUN_RUST_TOOLCHAIN }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/rustup-init" \
+              "https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init"
+            chmod +x "$RUNNER_TEMP/rustup-init"
+            "$RUNNER_TEMP/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none
+            echo "${CARGO_HOME:-$HOME/.cargo}/bin" >>"$GITHUB_PATH"
+            export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+          fi
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustc "+$TOOLCHAIN" --version --verbose
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: third-party-licenses
+          path: licenses
+
+      # Two builds of the same pinned source in independent directories must be
+      # byte-identical, and so must two packagings of the result.
+      - name: Build twice
+        run: |
+          bash scripts/boringtun-artifact.sh build boringtun-src "${{ matrix.target }}" "$RUNNER_TEMP/build-1"
+          bash scripts/boringtun-artifact.sh build boringtun-src "${{ matrix.target }}" "$RUNNER_TEMP/build-2"
+
+      - name: Require byte-identical binaries
+        run: |
+          sha256sum "$RUNNER_TEMP"/build-{1,2}/boringtun-cli
+          cmp "$RUNNER_TEMP/build-1/boringtun-cli" "$RUNNER_TEMP/build-2/boringtun-cli"
+
+      - name: Package twice and require byte-identical archives
+        run: |
+          mkdir -p dist "$RUNNER_TEMP/package-2"
+          bash scripts/boringtun-artifact.sh package "$RUNNER_TEMP/build-1" boringtun-src licenses/THIRD-PARTY-LICENSES dist
+          bash scripts/boringtun-artifact.sh package "$RUNNER_TEMP/build-2" boringtun-src licenses/THIRD-PARTY-LICENSES "$RUNNER_TEMP/package-2"
+          sha256sum dist/*.tar.gz "$RUNNER_TEMP"/package-2/*.tar.gz
+          cmp dist/*.tar.gz "$RUNNER_TEMP"/package-2/*.tar.gz
+
+      - name: Verify the packaged artifact
+        id: verify
+        run: |
+          binary="$(bash scripts/boringtun-artifact.sh verify-archive dist/*.tar.gz "$RUNNER_TEMP/extract")"
+          echo "binary=$binary" >>"$GITHUB_OUTPUT"
+          file "$binary"
+          ldd "$binary" || true
+          "$binary" --version
+          cat "$RUNNER_TEMP"/extract/*/MANIFEST
+
+      - name: Device smoke test (TUN device and UAPI, as root)
+        run: sudo bash scripts/boringtun-artifact.sh device-smoke "${{ steps.verify.outputs.binary }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: boringtun-cli-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # BoringTun's own userspace interop harnesses, at the pinned commit, against
+  # the packaged binary and amneziawg-go. The kernel-module harness
+  # (scripts/awg-interop-poc.sh) is not run: it needs an AmneziaWG kernel module
+  # for the runner kernel. See docs/BORINGTUN_ARTIFACTS.md.
+  #
+  # The harnesses start boringtun-cli without -f, so it daemonizes itself, and
+  # that path has hung on native aarch64. The planned runtime runs it with
+  # --foreground under a service manager, so the harnesses are given
+  # tests/helpers/boringtun-foreground-launcher.sh as their boringtun-cli: it
+  # starts the packaged binary, named by BORINGTUN_REAL_CLI, with --foreground
+  # and the harness's arguments, and returns. The harnesses are not changed.
+  interop:
+    name: Interop with amneziawg-go (${{ matrix.arch }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read the pin
+        id: pin
+        run: bash scripts/boringtun-artifact.sh pin | tee -a "$GITHUB_OUTPUT"
+
+      - name: Check out the pinned BoringTun source (harness scripts)
+        uses: actions/checkout@v6
+        with:
+          repository: Wiresock-Foundation/wiresock-boringtun
+          ref: ${{ steps.pin.outputs.BORINGTUN_COMMIT }}
+          path: boringtun-src
+          persist-credentials: false
+
+      # awg31-interop.sh accepts only the amneziawg-go release it pins; read that
+      # commit from the harness at the BoringTun pin instead of copying it here.
+      - name: Read the amneziawg-go commit pinned by the harness
+        id: awggo
+        run: |
+          commit="$(sed -n 's/^readonly PINNED_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' boringtun-src/scripts/awg31-interop.sh)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "no pinned amneziawg-go commit in awg31-interop.sh" >&2; exit 1; }
+          echo "commit=$commit" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Check out amneziawg-go
+        uses: actions/checkout@v6
+        with:
+          repository: amnezia-vpn/amneziawg-go
+          ref: ${{ steps.awggo.outputs.commit }}
+          path: amneziawg-go
+          # The harness checks the release tag that `go build` stamps from VCS.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Build amneziawg-go
+        run: |
+          cd amneziawg-go
+          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/amneziawg-go" .
+          go version -m "$RUNNER_TEMP/amneziawg-go" | grep -E '^\s+(mod|build\s+vcs\.)'
+          bash ../boringtun-src/scripts/awg31-interop.sh --check-go "$RUNNER_TEMP/amneziawg-go"
+
+      - name: Install harness dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-cryptography iproute2 iputils-ping
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: boringtun-cli-${{ matrix.arch }}
+          path: dist
+
+      - name: Verify and extract the artifact
+        id: verify
+        run: |
+          binary="$(bash scripts/boringtun-artifact.sh verify-archive dist/*.tar.gz "$RUNNER_TEMP/extract")"
+          echo "binary=$binary" >>"$GITHUB_OUTPUT"
+
+      # The harnesses talk to the daemons over UAPI sockets without timeouts, so
+      # a daemon that never answers would hold the job until its timeout with
+      # no diagnostics. Bound each harness; on expiry, record the state of every
+      # daemon and helper it started before stopping it.
+      - name: Prepare the harness watchdog
+        run: |
+          cat >"$RUNNER_TEMP/watchdog.sh" <<'EOF'
+          #!/usr/bin/env bash
+          # Usage: watchdog.sh <seconds> <command...>
+          set -u
+          limit="$1"; shift
+          "$@" &
+          pid=$!
+          for ((i = 0; i < limit; i++)); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              wait "$pid"
+              exit $?
+            fi
+            sleep 1
+          done
+          echo "::error::harness still running after ${limit}s; recording daemon state before stopping it"
+          echo "=== processes"
+          ps -eo pid,ppid,stat,wchan:32,etime,args | grep -E 'boringtun-cli|amneziawg-go|python3|interop' | grep -v -e grep -e watchdog
+          for p in $(pgrep -f 'boringtun-cli|amneziawg-go|python3 -c'); do
+            echo "=== pid $p: $(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | cut -c1-160)"
+            for t in /proc/"$p"/task/*; do
+              echo "  tid ${t##*/} state=$(awk '{ print $3 }' "$t/stat" 2>/dev/null) wchan=$(cat "$t/wchan" 2>/dev/null)"
+              sed 's/^/      /' "$t/stack" 2>/dev/null | head -n 12
+            done
+            ls -l "/proc/$p/fd" 2>/dev/null | sed 's/^/    fd /' | head -n 40
+          done
+          echo "=== unix sockets"
+          ss -xp 2>/dev/null | grep -E 'wireguard|amneziawg|boringtun|python3' | head -n 40
+          # amneziawg-go writes every goroutine's stack to its log on SIGQUIT.
+          pkill -QUIT -x amneziawg-go 2>/dev/null
+          sleep 3
+          for f in $(find /tmp -newer "$0" -type f -name '*.log' 2>/dev/null); do
+            echo "=== $f"
+            tail -n 80 "$f"
+          done
+          kill -TERM "$pid" 2>/dev/null
+          sleep 10
+          kill -KILL "$pid" 2>/dev/null
+          exit 124
+          EOF
+          chmod +x "$RUNNER_TEMP/watchdog.sh"
+
+      # Evidence from the running process, not the launcher's source: started
+      # the way the harnesses start it, the daemon is the packaged binary, runs
+      # with --foreground, is the only process in its namespace and has not
+      # left the caller's session, which daemonizing (setsid) would do.
+      - name: Check the foreground launcher (as root)
+        env:
+          BORINGTUN_REAL_CLI: ${{ steps.verify.outputs.binary }}
+          LAUNCHER: ${{ github.workspace }}/tests/helpers/boringtun-foreground-launcher.sh
+        run: |
+          sudo env BORINGTUN_REAL_CLI="$BORINGTUN_REAL_CLI" LAUNCHER="$LAUNCHER" bash -euo pipefail <<'EOF'
+          ns=bt-fg-check iface=btfg0
+          sock=/var/run/wireguard/$iface.sock log=$(mktemp)
+          cleanup() {
+            for p in $(ip netns pids "$ns" 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+            sleep 0.4
+            ip netns del "$ns" 2>/dev/null || true
+            rm -f "$sock" "$log"
+          }
+          trap cleanup EXIT
+          ip netns add "$ns"
+          ip netns exec "$ns" env WG_LOG_FILE="$log" WG_LOG_LEVEL=debug \
+            "$LAUNCHER" --disable-drop-privileges "$iface"
+          for _ in $(seq 60); do [ -S "$sock" ] && break; sleep 0.2; done
+          [ -S "$sock" ] || { echo "::error::no UAPI socket"; cat "$log"; exit 1; }
+          pids=$(ip netns pids "$ns")
+          ps -o pid,ppid,pgid,sid,stat,args -p "$(echo $pids | tr ' ' ,)"
+          [ "$(wc -w <<<"$pids")" -eq 1 ] || { echo "::error::expected one process in $ns"; exit 1; }
+          pid=$pids
+          cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+          echo "cmdline: $cmdline"
+          [ "$cmdline" = "$BORINGTUN_REAL_CLI --foreground --disable-drop-privileges $iface " ] ||
+            { echo "::error::unexpected command line"; exit 1; }
+          [ "/proc/$pid/exe" -ef "$BORINGTUN_REAL_CLI" ] || { echo "::error::not the packaged binary"; exit 1; }
+          sid=$(awk '{ print $6 }' "/proc/$pid/stat") mysid=$(awk '{ print $6 }' /proc/$$/stat)
+          [ "$sid" = "$mysid" ] || { echo "::error::daemon left the caller's session"; exit 1; }
+          grep -q 'started successfully' "$log" || { echo "::error::no daemon output in WG_LOG_FILE"; cat "$log"; exit 1; }
+          echo "boringtun-cli pid $pid: packaged binary, --foreground, session $sid (the caller's), output in WG_LOG_FILE"
+          kill "$pid"
+          for _ in $(seq 25); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+          ! kill -0 "$pid" 2>/dev/null || { echo "::error::daemon did not stop on SIGTERM"; exit 1; }
+          echo "stopped by SIGTERM, as the harness teardown stops it"
+          EOF
+
+      - name: awg-go-interop.sh (AWG 2.0/3.0 wire against amneziawg-go)
+        working-directory: boringtun-src
+        env:
+          BORINGTUN_REAL_CLI: ${{ steps.verify.outputs.binary }}
+          LAUNCHER: ${{ github.workspace }}/tests/helpers/boringtun-foreground-launcher.sh
+        run: |
+          sudo env BORINGTUN_REAL_CLI="$BORINGTUN_REAL_CLI" "$RUNNER_TEMP/watchdog.sh" 300 \
+            bash scripts/awg-go-interop.sh "$LAUNCHER" "$RUNNER_TEMP/amneziawg-go"
+
+      - name: awg31-interop.sh (AWG 3.1 wire against the pinned amneziawg-go)
+        # Also after an awg-go-interop.sh failure, so that one run shows both.
+        if: ${{ !cancelled() && steps.verify.outcome == 'success' }}
+        working-directory: boringtun-src
+        env:
+          BORINGTUN_REAL_CLI: ${{ steps.verify.outputs.binary }}
+          LAUNCHER: ${{ github.workspace }}/tests/helpers/boringtun-foreground-launcher.sh
+        run: |
+          sudo env BORINGTUN_REAL_CLI="$BORINGTUN_REAL_CLI" "$RUNNER_TEMP/watchdog.sh" 1200 \
+            bash scripts/awg31-interop.sh "$LAUNCHER" "$RUNNER_TEMP/amneziawg-go"
+
+  checksums:
+    name: SHA256SUMS
+    needs: [build, interop]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: boringtun-cli-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        run: |
+          bash scripts/boringtun-artifact.sh checksums dist
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: boringtun-cli-artifacts
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
