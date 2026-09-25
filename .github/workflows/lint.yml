@@ -32,6 +32,8 @@ jobs:
           bash -n tests/test-backend.sh
           bash -n tests/test-boringtun-artifact.sh
           bash -n tests/test-boringtun-foreground-launcher.sh
+          bash -n tests/test-boringtun-runtime.sh
+          bash -n tests/test-boringtun-runtime-live.sh
           bash -n tests/helpers/boringtun-foreground-launcher.sh
           bash -n tests/test-proxy-bootstrap.sh
           bash -n tests/test-ubuntu-ppa.sh
@@ -67,6 +69,8 @@ jobs:
           shellcheck --severity=warning tests/test-backend.sh
           shellcheck --severity=warning tests/test-boringtun-artifact.sh
           shellcheck --severity=warning tests/test-boringtun-foreground-launcher.sh
+          shellcheck --severity=warning tests/test-boringtun-runtime.sh
+          shellcheck --severity=warning tests/test-boringtun-runtime-live.sh
           shellcheck --severity=warning tests/helpers/boringtun-foreground-launcher.sh
           shellcheck --severity=warning tests/test-proxy-bootstrap.sh
           shellcheck --severity=warning tests/test-ubuntu-ppa.sh
