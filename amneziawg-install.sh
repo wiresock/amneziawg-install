@@ -36,6 +36,17 @@ AWG31_DEFAULT_DISABLE_COOKIES="off"
 # with renderAwgProtocolFields and the config match helpers.
 AWG_PROTOCOL_CONFIG_KEYS="HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|RandomTrailers|DisableCookies"
 
+# AWG backend (datapath) state. Params written before backends existed have no
+# AWG_BACKEND, and that always means the kernel module. This installer version
+# supports only the kernel backend: validatePersistedAwgBackendState rejects
+# every other persisted value, and the runtime dispatchers refuse to operate on
+# an unset or unknown backend. The assignment below is the default until params
+# are loaded; validateParamsFile then re-derives the backend from params alone.
+# It also discards an AWG_BACKEND inherited from the caller's environment, so
+# the environment can never select a backend.
+AWG_BACKEND_KERNEL="kernel"
+AWG_BACKEND="${AWG_BACKEND_KERNEL}"
+
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
 # Only adjust PATH when the script is executed directly, not when sourced.
@@ -1844,6 +1855,43 @@ function validatePersistedAwgProtocolState() {
 	fi
 }
 
+# Explain why an AWG backend value cannot be used by this installer version.
+# The value is echoed only when it is a plain token, so a damaged params file
+# cannot put control characters into the diagnostics.
+function reportUnsupportedAwgBackend() {
+	local BACKEND_VALUE="${1:-}"
+
+	if [[ -z "${BACKEND_VALUE}" ]]; then
+		echo "ERROR: the AWG backend is not set; refusing to operate on an unknown backend" >&2
+	elif [[ "${BACKEND_VALUE}" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
+		echo "ERROR: AWG backend '${BACKEND_VALUE}' is not supported by this installer version (supported: ${AWG_BACKEND_KERNEL})" >&2
+	else
+		echo "ERROR: the configured AWG backend is not supported by this installer version (supported: ${AWG_BACKEND_KERNEL})" >&2
+	fi
+}
+
+# Normalize the persisted backend. A missing or empty value is the kernel
+# backend, which is what every params file written before backends existed
+# means. Every other value, including backends that later installer versions
+# may add, fails closed instead of being reinterpreted as the kernel backend.
+function normalizeAwgBackend() {
+	case "${AWG_BACKEND:-}" in
+		""|"${AWG_BACKEND_KERNEL}")
+			AWG_BACKEND="${AWG_BACKEND_KERNEL}"
+			;;
+		*)
+			reportUnsupportedAwgBackend "${AWG_BACKEND}"
+			return 1
+			;;
+	esac
+}
+
+# Validate the persisted backend after params are sourced. Backends with their
+# own persisted settings will validate them here too.
+function validatePersistedAwgBackendState() {
+	normalizeAwgBackend
+}
+
 # Emit only the protocol-specific [Interface] lines. Callers must redirect
 # stdout into a mode-0600 configuration file because the output contains the
 # shared HeaderProtectionKey in AWG 3.0/3.1 mode.
@@ -1927,7 +1975,7 @@ ${PROBE_EXTRA}
 EOF
 	) || RC=1
 
-	if [[ -s "${PROBE_CONF}" ]] && ip link add dev "${PROBE_INTERFACE}" type amneziawg >/dev/null 2>&1; then
+	if [[ -s "${PROBE_CONF}" ]] && awgBackendCreateScratchInterface "${PROBE_INTERFACE}" >/dev/null 2>&1; then
 		INTERFACE_CREATED=1
 		if awg setconf "${PROBE_INTERFACE}" "${PROBE_CONF}" >/dev/null 2>&1; then
 			READ_KEY="$(WG_HIDE_KEYS=never awg show "${PROBE_INTERFACE}" header-protection-key 2>/dev/null || true)"
@@ -1966,7 +2014,7 @@ EOF
 	fi
 
 	if (( INTERFACE_CREATED )); then
-		ip link delete dev "${PROBE_INTERFACE}" >/dev/null 2>&1 || RC=1
+		awgBackendDestroyScratchInterface "${PROBE_INTERFACE}" >/dev/null 2>&1 || RC=1
 	fi
 	rm -f -- "${PROBE_CONF}"
 	rmdir -- "${PROBE_DIR}" 2>/dev/null || true
@@ -2636,6 +2684,7 @@ SERVER_AWG_H1=$(safeQuoteParam "${SERVER_AWG_H1}")
 SERVER_AWG_H2=$(safeQuoteParam "${SERVER_AWG_H2}")
 SERVER_AWG_H3=$(safeQuoteParam "${SERVER_AWG_H3}")
 SERVER_AWG_H4=$(safeQuoteParam "${SERVER_AWG_H4}")
+AWG_BACKEND=$(safeQuoteParam "${AWG_BACKEND:-${AWG_BACKEND_KERNEL}}")
 AWG_PROTOCOL_VERSION=$(safeQuoteParam "${AWG_PROTOCOL_VERSION:-${AWG_PROTOCOL_VERSION_2}}")
 AWG_HEADER_PROTECTION_KEY=$(safeQuoteParam "${AWG_HEADER_PROTECTION_KEY:-}")
 AWG_CONTENT_PADDING_ADDITION=$(safeQuoteParam "${AWG_CONTENT_PADDING_ADDITION:-}")
@@ -3792,6 +3841,114 @@ function ensureAmneziawgKernelModule() {
 	[[ "${START_AWG_QUICK}" == "0" ]] || ensureAwgQuickRunning
 }
 
+# ── AWG backend runtime seam ─────────────────────────────────────────────────
+#
+# Backend-neutral management code reaches the datapath only through the small
+# set of operations below. Each one dispatches on AWG_BACKEND, which
+# validateParamsFile (managed installations) or installQuestions (fresh
+# installations) has already set. The kernel branches run exactly the commands
+# their callers used to run inline. An unset or unknown backend fails closed
+# instead of falling back to the kernel module.
+
+# Make sure the selected backend can serve the interface. The calling
+# convention is that of the kernel implementation, ensureAmneziawgKernelModule
+# [0|1]: mode 1 (the default) also starts awg-quick@<if> when it is inactive,
+# and mode 0 only prepares the datapath for capability probes. Failures are
+# fatal, as they are in the kernel implementation.
+function ensureAwgBackendReady() {
+	case "${AWG_BACKEND:-}" in
+		"${AWG_BACKEND_KERNEL}")
+			ensureAmneziawgKernelModule "$@"
+			;;
+		*)
+			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
+			exit 1
+			;;
+	esac
+}
+
+# Create and destroy the throwaway interface that capability probes and staged
+# configuration validation apply configurations to. Callers own the interface
+# name, output redirection and cleanup.
+function awgBackendCreateScratchInterface() {
+	local INTERFACE_NAME="$1"
+
+	case "${AWG_BACKEND:-}" in
+		"${AWG_BACKEND_KERNEL}")
+			ip link add dev "${INTERFACE_NAME}" type amneziawg
+			;;
+		*)
+			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
+			return 1
+			;;
+	esac
+}
+
+function awgBackendDestroyScratchInterface() {
+	local INTERFACE_NAME="$1"
+
+	case "${AWG_BACKEND:-}" in
+		"${AWG_BACKEND_KERNEL}")
+			ip link delete dev "${INTERFACE_NAME}"
+			;;
+		*)
+			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
+			return 1
+			;;
+	esac
+}
+
+# Bring up an interface that is managed manually rather than by
+# awg-quick@<if>.service. Bringing it down stays a plain `awg-quick down`,
+# which does not depend on the datapath.
+function awgBackendQuickUp() {
+	local CONFIG_FILE="$1"
+
+	case "${AWG_BACKEND:-}" in
+		"${AWG_BACKEND_KERNEL}")
+			awg-quick up "${CONFIG_FILE}"
+			;;
+		*)
+			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
+			return 1
+			;;
+	esac
+}
+
+# Apply the interface's configuration file to the running interface without
+# restarting it, as `awg syncconf <if> <(awg-quick strip <if>)`.
+#
+# The optional second argument says where `awg syncconf` output goes:
+# `--stderr-to-stdout` merges its stderr into stdout for command substitution,
+# and a file path receives its stderr. The redirection applies to `awg syncconf`
+# alone, exactly as in the former inline call sites, so `awg-quick strip`
+# diagnostics still reach the caller's stderr. Callers pass the destination
+# here instead of redirecting stderr on the call itself.
+function awgSyncInterfaceConfig() {
+	local INTERFACE_NAME="$1"
+	local SYNCCONF_STDERR="${2:-}"
+
+	case "${AWG_BACKEND:-}" in
+		"${AWG_BACKEND_KERNEL}")
+			case "${SYNCCONF_STDERR}" in
+				"")
+					awg syncconf "${INTERFACE_NAME}" <(awg-quick strip "${INTERFACE_NAME}")
+					;;
+				--stderr-to-stdout)
+					awg syncconf "${INTERFACE_NAME}" <(awg-quick strip "${INTERFACE_NAME}") 2>&1
+					;;
+				*)
+					awg syncconf "${INTERFACE_NAME}" <(awg-quick strip "${INTERFACE_NAME}") 2>"${SYNCCONF_STDERR}"
+					;;
+			esac
+			;;
+		*)
+			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
+			return 1
+			;;
+	esac
+}
+
 function readJminAndJmax() {
 	SERVER_AWG_JMIN=0
 	SERVER_AWG_JMAX=0
@@ -4239,6 +4396,9 @@ function installQuestions() {
 	# capability-gated migration.
 	AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_2}"
 	clearAwg3Params
+	# Fresh installs always use the kernel backend. This installer version has no
+	# other backend and never takes one from the caller's environment.
+	AWG_BACKEND="${AWG_BACKEND_KERNEL}"
 
 	# Non-interactive mode: use environment variable overrides or sensible defaults
 	# Set AUTO_INSTALL=y to skip all prompts
@@ -5145,7 +5305,7 @@ EOF
 }
 
 function newClient() {
-	ensureAmneziawgKernelModule
+	ensureAwgBackendReady
 	# Reset variables to ensure clean state for each new client
 	local CLIENT_NAME=""
 	local CLIENT_EXISTS=""
@@ -5457,7 +5617,7 @@ AllowedIPs = ${PEER_ALLOWED_IPS}" >>"${SERVER_AWG_CONF}"
 
 	local sync_err
 	sync_err=""
-	if ! sync_err="$(awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>&1)"; then
+	if ! sync_err="$(awgSyncInterfaceConfig "${SERVER_AWG_NIC}" --stderr-to-stdout)"; then
 		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after adding client '${CLIENT_NAME}'" >&2
 		if [[ -n "${sync_err}" ]]; then
 			echo "${sync_err}" >&2
@@ -5529,8 +5689,8 @@ function revokeClient() {
 	removeFromWebPanelDir "${SERVER_AWG_NIC}-client-${CLIENT_NAME}.conf"
 
 	# restart AmneziaWG to apply changes
-	ensureAmneziawgKernelModule
-	awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+	ensureAwgBackendReady
+	awgSyncInterfaceConfig "${SERVER_AWG_NIC}"
 }
 
 function regenerateClients() {
@@ -5899,8 +6059,8 @@ EOF
 
 	# If any server-side peer keys were updated, sync the running config
 	if (( NEWKEYS > 0 )); then
-		ensureAmneziawgKernelModule
-		awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+		ensureAwgBackendReady
+		awgSyncInterfaceConfig "${SERVER_AWG_NIC}"
 	fi
 
 	echo ""
@@ -6113,15 +6273,20 @@ function validateParamsFile() {
 	fi
 
 	# Params must be authoritative; do not let exported shell variables fill in
-	# keys that older params files legitimately lack or enable AWG 3.0 features.
+	# keys that older params files legitimately lack, select an AWG backend, or
+	# enable AWG 3.0 features.
 	unset ENABLE_IPV6 AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY \
 		AWG_CONTENT_PADDING_ADDITION AWG_REKEY_AFTER_TIME AWG_REKEY_TIMEOUT \
 		AWG_REJECT_AFTER_TIME AWG_KEEPALIVE_TIMEOUT AWG_RANDOM_TRAILERS \
-		AWG_DISABLE_COOKIES
+		AWG_DISABLE_COOKIES AWG_BACKEND
 	# shellcheck source=/etc/amnezia/amneziawg/params
 	if ! source "${AMNEZIAWG_DIR}/params"; then
 		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}" >&2
 		echo -e "${ORANGE}The file may be corrupted or contain a syntax error. Fix or regenerate it and rerun the installer.${NC}" >&2
+		return 1
+	fi
+	if ! validatePersistedAwgBackendState; then
+		echo -e "${RED}ERROR: Invalid AWG backend state in ${AMNEZIAWG_DIR}/params.${NC}" >&2
 		return 1
 	fi
 	if ! validatePersistedAwgProtocolState "${ALLOW_INVALID_AWG3_FOR_DOWNGRADE}"; then
@@ -6601,7 +6766,7 @@ function persistMigration() {
 
 		# Validate configuration before reloading to prevent VPN disconnection
 		if awg-quick strip "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
-			awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+			awgSyncInterfaceConfig "${SERVER_AWG_NIC}"
 		else
 			echo -e "${ORANGE}WARNING: Configuration validation failed. Skipping live reload.${NC}"
 			echo -e "${ORANGE}The configuration file has been updated successfully, but the running${NC}"
@@ -6960,7 +7125,7 @@ function validateStagedAwgConfigs() {
 	local CONFIG_FILE STRIPPED_FILE INTERFACE_FILE LINE
 	local INDEX=0 RC=0 INTERFACE_CREATED=0
 
-	if ! ip link add dev "${VALIDATE_INTERFACE}" type amneziawg >/dev/null 2>&1; then
+	if ! awgBackendCreateScratchInterface "${VALIDATE_INTERFACE}" >/dev/null 2>&1; then
 		echo "ERROR: could not create the temporary AWG configuration-validation interface" >&2
 		return 1
 	fi
@@ -6985,7 +7150,7 @@ function validateStagedAwgConfigs() {
 		fi
 	done
 
-	if (( INTERFACE_CREATED )) && ! ip link delete dev "${VALIDATE_INTERFACE}" >/dev/null 2>&1; then
+	if (( INTERFACE_CREATED )) && ! awgBackendDestroyScratchInterface "${VALIDATE_INTERFACE}" >/dev/null 2>&1; then
 		RC=1
 	fi
 	if (( RC != 0 )); then
@@ -7058,7 +7223,7 @@ function applyAwgProtocolTransaction() (
 				ip link delete dev "${SERVER_AWG_NIC}" >/dev/null 2>&1 || return 1
 			fi
 		fi
-		awg-quick up "${SERVER_AWG_CONF}" || return 1
+		awgBackendQuickUp "${SERVER_AWG_CONF}" || return 1
 		ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1
 	}
 
@@ -7188,7 +7353,7 @@ function applyAwgProtocolTransaction() (
 	if (( APPLY_FAILED == 0 && SERVICE_WAS_ACTIVE )); then
 		systemctl restart "awg-quick@${SERVER_AWG_NIC}" || APPLY_FAILED=1
 	elif (( APPLY_FAILED == 0 && MANUAL_INTERFACE_ACTIVE )); then
-		awg-quick up "${SERVER_AWG_CONF}" || APPLY_FAILED=1
+		awgBackendQuickUp "${SERVER_AWG_CONF}" || APPLY_FAILED=1
 	fi
 
 	if (( APPLY_FAILED != 0 )); then
@@ -7251,7 +7416,7 @@ function setAwgProtocolMode() (
 			"${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
 			# The capability probe needs only the module. Do not start an
 			# intentionally stopped service or collide with a manual interface.
-			ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
+			ensureAwgBackendReady 0 >/dev/null 2>&1 || true
 			if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
 				probeAwg31Capability "${AWG_HEADER_PROTECTION_KEY}" || return 1
 				# Same-mode 3.1 can turn RandomTrailers on via params without
@@ -7300,7 +7465,7 @@ function setAwgProtocolMode() (
 		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_2}" ]] && clearAwg3Params
 		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]] && clearAwg31Params
 	elif [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
-		ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
+		ensureAwgBackendReady 0 >/dev/null 2>&1 || true
 		if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_2}" ]]; then
 			NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
 			if ! probeAwg31Capability "${NEW_KEY}"; then
@@ -7323,7 +7488,7 @@ function setAwgProtocolMode() (
 		AWG_DISABLE_COOKIES="${AWG31_DEFAULT_DISABLE_COOKIES}"
 		warnIfRandomTrailersSPaddingUnequal
 	elif [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
-		ensureAmneziawgKernelModule 0 >/dev/null 2>&1 || true
+		ensureAwgBackendReady 0 >/dev/null 2>&1 || true
 		if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_2}" ]]; then
 			NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
 			if ! probeAwg3Capability "${NEW_KEY}"; then
@@ -7737,8 +7902,8 @@ AllowedIPs = ${PEER_ALLOWED_IPS}" >>"${SERVER_AWG_CONF}"
 
 	# Preserve stdout for the generated client config path expected by callers.
 	# Route any informational/repair output from helper setup to stderr.
-	ensureAmneziawgKernelModule 1>&2
-	if ! awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>/tmp/amneziawg-syncconf.err; then
+	ensureAwgBackendReady 1>&2
+	if ! awgSyncInterfaceConfig "${SERVER_AWG_NIC}" /tmp/amneziawg-syncconf.err; then
 		local sync_err
 		sync_err="$(cat /tmp/amneziawg-syncconf.err 2>/dev/null || true)"
 		rm -f /tmp/amneziawg-syncconf.err
@@ -7793,8 +7958,8 @@ function nonInteractiveRemoveClient() (
 
 	local sync_err
 	sync_err=""
-	ensureAmneziawgKernelModule >&2
-	if ! sync_err="$(awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}") 2>&1)"; then
+	ensureAwgBackendReady >&2
+	if ! sync_err="$(awgSyncInterfaceConfig "${SERVER_AWG_NIC}" --stderr-to-stdout)"; then
 		echo "ERROR: failed to sync AmneziaWG interface '${SERVER_AWG_NIC}' after removing client '${CLIENT_NAME}'" >&2
 		if [[ -n "${sync_err}" ]]; then
 			echo "${sync_err}" >&2
