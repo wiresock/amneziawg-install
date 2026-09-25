@@ -73,6 +73,9 @@ GAI_CONF_IPV4_RULE_REGEX='^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:spa
 AMNEZIA_PPA_URI="https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu"
 AMNEZIA_PPA_SOURCES_DIR="/etc/apt/sources.list.d"
 AMNEZIA_PPA_SOURCE_CREATED=0
+# Suite and architecture chosen by the last successful configureUbuntuAmneziaPpa.
+AMNEZIA_PPA_SELECTED_SUITE=""
+AMNEZIA_PPA_ARCHITECTURE=""
 _APT_IPV4_PREV_TRAP_EXIT=""
 _APT_IPV4_PREV_TRAP_INT=""
 _APT_IPV4_PREV_TRAP_TERM=""
@@ -241,6 +244,21 @@ function isAmneziaPpaFallbackArchitectureSupported() {
 		amd64 | arm64 | armhf | ppc64el | riscv64 | s390x) return 0 ;;
 		*) return 1 ;;
 	esac
+}
+
+function isValidDpkgArchitecture() {
+	[[ "${1:-}" =~ ^[a-z0-9][a-z0-9-]*$ ]]
+}
+
+# The native package architecture, as dpkg reports it, is the only value the
+# Amnezia PPA source is pinned to. CPU variants such as amd64v3 are an APT
+# index choice rather than an architecture, and uname -m names the kernel's
+# machine type rather than a Debian architecture.
+function getNativeDpkgArchitecture() {
+	local ARCHITECTURE
+	ARCHITECTURE=$(dpkg --print-architecture 2>/dev/null) || return 1
+	isValidDpkgArchitecture "${ARCHITECTURE}" || return 1
+	printf '%s\n' "${ARCHITECTURE}"
 }
 
 # Print the direct HTTP status for a PPA metadata URL without following
@@ -461,7 +479,7 @@ function _transformAmneziaPpaLegacyFile() {
 		for (i=1; i<=count; i++) delete values[i]
 		return 0
 	}
-	function options_are_safe(value, count, options, i, option, option_value, arch_value) {
+	function options_are_safe(value, count, options, i, option, option_value, arch_value, arch_options) {
 		# APT applies a quote-word lexer to option tokens. Reject quoted option
 		# text instead of attempting a partial reimplementation that could miss
 		# a quoted signature-bypass key.
@@ -469,6 +487,7 @@ function _transformAmneziaPpaLegacyFile() {
 			index(value, "\\") > 0 || index(value, "%") > 0) {
 			return 0
 		}
+		arch_options=0
 		count=split(value, options, /[[:space:]]+/)
 		for (i=1; i<=count; i++) {
 			option=tolower(options[i])
@@ -485,7 +504,10 @@ function _transformAmneziaPpaLegacyFile() {
 			}
 			if (option ~ /^arch=/) {
 				arch_value=substr(option, 6)
-				if (host_arch == "" || !csv_contains(arch_value, host_arch)) {
+				# A second arch= option leaves which list APT applies unclear,
+				# so it cannot be normalized to the native architecture safely.
+				if (++arch_options > 1 || host_arch == "" ||
+					!csv_contains(arch_value, host_arch)) {
 					for (i=1; i<=count; i++) delete options[i]
 					return 0
 				}
@@ -500,11 +522,34 @@ function _transformAmneziaPpaLegacyFile() {
 		for (i=1; i<=count; i++) delete options[i]
 		return 1
 	}
+	# Return the option text with its single arch= option set to exactly the
+	# native architecture, appending one when absent. options_are_safe has
+	# already rejected arch+=, arch-= and repeated arch= options.
+	function native_arch_options(value, lowered, start, trailing) {
+		lowered=tolower(value)
+		if (match(lowered, /(^|[[:space:]])arch=[^[:space:]]*/)) {
+			start=RSTART
+			if (substr(lowered, start, 1) ~ /[[:space:]]/) {
+				start++
+			}
+			return substr(value, 1, start - 1) "arch=" host_arch substr(value, RSTART + RLENGTH)
+		}
+		if (value !~ /[^[:space:]]/) {
+			return "arch=" host_arch
+		}
+		trailing=value
+		sub(/^.*[^[:space:]]/, "", trailing)
+		sub(/[[:space:]]+$/, "", value)
+		return value " arch=" host_arch trailing
+	}
 	BEGIN {
 		found=0
 		binary_found=0
 		source_found=0
 		malformed=0
+		if (mode == "set" && host_arch !~ /^[a-z0-9][a-z0-9-]*$/) {
+			invalid_host_arch=1
+		}
 	}
 	{
 		line=$0
@@ -533,7 +578,9 @@ function _transformAmneziaPpaLegacyFile() {
 			position++
 		}
 		options=""
+		options_start=0
 		if (substr(line, position, 1) == "[") {
+			options_start=position + 1
 			close_offset=index(substr(line, position), "]")
 			if (close_offset == 0) {
 				if (contains_target_literal(substr(line, 1, length_line))) {
@@ -568,7 +615,7 @@ function _transformAmneziaPpaLegacyFile() {
 		if (mode == "remove") {
 			next
 		}
-		if (!options_are_safe(options)) {
+		if (!options_are_safe(options) || invalid_host_arch) {
 			malformed=1
 			emit_line(line)
 			next
@@ -622,8 +669,18 @@ function _transformAmneziaPpaLegacyFile() {
 			source_found++
 		}
 
-		if (mode == "set" && suite_value != replacement) {
-			line=substr(line, 1, suite_start - 1) replacement substr(line, suite_end + 1)
+		if (mode == "set") {
+			# Rewrite the suite first: the options precede it, so their
+			# positions are still valid afterwards.
+			if (suite_value != replacement) {
+				line=substr(line, 1, suite_start - 1) replacement substr(line, suite_end + 1)
+			}
+			if (options_start > 0) {
+				line=substr(line, 1, options_start - 1) native_arch_options(options) \
+					substr(line, options_start + length(options))
+			} else {
+				line=substr(line, 1, uri_start - 1) "[arch=" host_arch "] " substr(line, uri_start)
+			}
 		}
 		emit_line(line)
 	}
@@ -690,7 +747,9 @@ function _transformAmneziaPpaDeb822File() {
 		for (i=1; i<=line_count; i++) {
 			delete lines[i]
 			delete suite_continuation_lines[i]
+			delete architecture_continuation_lines[i]
 			delete skip_lines[i]
+			delete insert_after[i]
 		}
 		line_count=0
 	}
@@ -700,8 +759,28 @@ function _transformAmneziaPpaDeb822File() {
 				if (!skip_lines[i]) {
 					print lines[i]
 				}
+				if (i in insert_after) {
+					print insert_after[i]
+				}
 			}
 		}
+	}
+	# Replace the value on a field line, keeping the field name and spacing.
+	# A field whose old value was only on continuation lines gains one space.
+	function replace_field_value(line, value, start, finish, prefix) {
+		start=index(line, ":") + 1
+		while (start <= length(line) && substr(line, start, 1) ~ /[[:space:]]/) {
+			start++
+		}
+		finish=length(line) + 1
+		while (finish > start && substr(line, finish - 1, 1) ~ /[[:space:]]/) {
+			finish--
+		}
+		prefix=substr(line, 1, start - 1)
+		if (prefix ~ /:$/) {
+			prefix=prefix " "
+		}
+		return prefix value substr(line, finish)
 	}
 	function process_stanza( i, line, colon, field, value, current_field,
 			uri_value, type_value, suite_value, component_value, enabled_value,
@@ -710,11 +789,11 @@ function _transformAmneziaPpaDeb822File() {
 			uri_fields, type_fields, suite_fields, component_fields,
 			enabled_fields, trusted_fields, allow_insecure_fields,
 			allow_weak_fields, allow_downgrade_fields, architecture_fields,
-			architecture_remove_fields, suite_line, syntax_error,
+			architecture_remove_fields, architecture_add_fields, suite_line,
+			architecture_line, component_end, syntax_error,
 			uri_count, target_count, type_count, type_has_deb,
 			type_has_deb_src, type_valid,
-			suite_count, suite_valid, component_count, component_valid,
-			start, finish) {
+			suite_count, suite_valid, component_count, component_valid) {
 		if (line_count == 0) {
 			return
 		}
@@ -741,7 +820,10 @@ function _transformAmneziaPpaDeb822File() {
 		allow_downgrade_fields=0
 		architecture_fields=0
 		architecture_remove_fields=0
+		architecture_add_fields=0
 		suite_line=0
+		architecture_line=0
+		component_end=0
 		syntax_error=0
 
 		for (i=1; i<=line_count; i++) {
@@ -766,6 +848,7 @@ function _transformAmneziaPpaDeb822File() {
 					suite_value=(suite_value == "" ? value : suite_value " " value)
 				} else if (field == "components") {
 					component_fields++
+					component_end=i
 					component_value=(component_value == "" ? value : component_value " " value)
 				} else if (field == "enabled") {
 					enabled_fields++
@@ -784,9 +867,12 @@ function _transformAmneziaPpaDeb822File() {
 					allow_downgrade_value=(allow_downgrade_value == "" ? value : allow_downgrade_value " " value)
 				} else if (field == "architectures") {
 					architecture_fields++
+					architecture_line=i
 					architecture_value=(architecture_value == "" ? value : architecture_value " " value)
 				} else if (field == "architectures-remove") {
 					architecture_remove_fields++
+				} else if (field == "architectures-add") {
+					architecture_add_fields++
 				}
 				continue
 			}
@@ -803,6 +889,7 @@ function _transformAmneziaPpaDeb822File() {
 					suite_continuation_lines[i]=1
 				} else if (current_field == "components") {
 					component_value=component_value " " value
+					component_end=i
 				} else if (current_field == "enabled") {
 					enabled_value=enabled_value " " value
 				} else if (current_field == "trusted") {
@@ -815,6 +902,7 @@ function _transformAmneziaPpaDeb822File() {
 					allow_downgrade_value=allow_downgrade_value " " value
 				} else if (current_field == "architectures") {
 					architecture_value=architecture_value " " value
+					architecture_continuation_lines[i]=1
 				}
 			} else {
 				syntax_error=1
@@ -902,7 +990,10 @@ function _transformAmneziaPpaDeb822File() {
 				architecture_fields > 1 ||
 				(architecture_fields == 1 &&
 					(host_arch == "" || !token_list_contains(architecture_value, host_arch))) ||
-				architecture_remove_fields > 0) {
+				architecture_remove_fields > 0 || architecture_add_fields > 0 ||
+				invalid_host_arch) {
+			# Architectures-Add could re-add a variant such as amd64v3 after
+			# the list is normalized, so it is rejected like Architectures-Remove.
 			malformed=1
 			emit_stanza()
 			clear_stanza()
@@ -917,21 +1008,27 @@ function _transformAmneziaPpaDeb822File() {
 		}
 
 		if (mode == "set" && trim(suite_value) != replacement) {
-			line=lines[suite_line]
-			start=index(line, ":") + 1
-			while (start <= length(line) && substr(line, start, 1) ~ /[[:space:]]/) {
-				start++
-			}
-			finish=length(line) + 1
-			while (finish > start && substr(line, finish - 1, 1) ~ /[[:space:]]/) {
-				finish--
-			}
-			lines[suite_line]=substr(line, 1, start - 1) replacement substr(line, finish)
+			lines[suite_line]=replace_field_value(lines[suite_line], replacement)
 			for (i=1; i<=line_count; i++) {
 				if (suite_continuation_lines[i]) {
 					skip_lines[i]=1
 				}
 			}
+		}
+		# Pin the source to exactly the native architecture. With APT
+		# architecture variants enabled, an unpinned source whose Release file
+		# lists amd64v3 is read only through that index, which Launchpad
+		# publishes for PPAs without the architecture-specific packages.
+		if (mode == "set" && architecture_fields == 1 &&
+				trim(architecture_value) != host_arch) {
+			lines[architecture_line]=replace_field_value(lines[architecture_line], host_arch)
+			for (i=1; i<=line_count; i++) {
+				if (architecture_continuation_lines[i]) {
+					skip_lines[i]=1
+				}
+			}
+		} else if (mode == "set" && architecture_fields == 0) {
+			insert_after[component_end]="Architectures: " host_arch
 		}
 		emit_stanza()
 		clear_stanza()
@@ -942,6 +1039,9 @@ function _transformAmneziaPpaDeb822File() {
 		binary_found=0
 		source_found=0
 		malformed=0
+		if (mode == "set" && host_arch !~ /^[a-z0-9][a-z0-9-]*$/) {
+			invalid_host_arch=1
+		}
 	}
 	{
 		if ($0 ~ /^[[:space:]]*$/) {
@@ -1017,7 +1117,14 @@ function amneziaPpaSourceEntriesExist() {
 
 	[[ -d "${SOURCES_DIR}" ]] || return 1
 	if [[ -z "${ARCHITECTURE}" ]]; then
-		ARCHITECTURE=$(dpkg --print-architecture 2>/dev/null) || return 2
+		ARCHITECTURE=$(getNativeDpkgArchitecture) || {
+			echo -e "${RED}ERROR: Unable to determine a valid native package architecture with dpkg.${NC}" >&2
+			return 2
+		}
+	fi
+	if ! isValidDpkgArchitecture "${ARCHITECTURE}"; then
+		echo -e "${RED}ERROR: Invalid package architecture '${ARCHITECTURE}' for the Amnezia PPA source.${NC}" >&2
+		return 2
 	fi
 
 	for FILE in "${SOURCES_DIR}"/*.sources "${SOURCES_DIR}"/*.list; do
@@ -1071,9 +1178,10 @@ function amneziaPpaSourceEntriesExist() {
 	return 0
 }
 
-# Set the suite of each exact Amnezia PPA entry, replacing each affected file
-# atomically. Unrelated files, stanzas, fields, comments, options, and inline
-# signing keys are preserved. Return 2 when no target entry exists.
+# Set the suite of each exact Amnezia PPA entry and pin it to exactly the
+# native dpkg architecture (DEB822 Architectures, legacy arch=), replacing each
+# affected file atomically. Unrelated files, stanzas, fields, comments, options,
+# and inline signing keys are preserved. Return 2 when no target entry exists.
 function setAmneziaPpaSuite() {
 	local SUITE="$1"
 	local SOURCES_DIR="${2:-${AMNEZIA_PPA_SOURCES_DIR}}"
@@ -1106,7 +1214,14 @@ function setAmneziaPpaSuite() {
 	fi
 	[[ -d "${SOURCES_DIR}" ]] || return 2
 	if [[ -z "${ARCHITECTURE}" ]]; then
-		ARCHITECTURE=$(dpkg --print-architecture 2>/dev/null) || return 1
+		ARCHITECTURE=$(getNativeDpkgArchitecture) || {
+			echo -e "${RED}ERROR: Unable to determine a valid native package architecture with dpkg.${NC}" >&2
+			return 1
+		}
+	fi
+	if ! isValidDpkgArchitecture "${ARCHITECTURE}"; then
+		echo -e "${RED}ERROR: Invalid package architecture '${ARCHITECTURE}' for the Amnezia PPA source.${NC}" >&2
+		return 1
 	fi
 
 	# Validate all matching content before creating any staged replacements.
@@ -1410,14 +1525,20 @@ function configureUbuntuAmneziaPpa() {
 	local SELECTED_SUITE
 
 	AMNEZIA_PPA_SOURCE_CREATED=0
+	AMNEZIA_PPA_SELECTED_SUITE=""
+	AMNEZIA_PPA_ARCHITECTURE=""
 	if [[ -z "${NATIVE_SUITE}" ]]; then
 		NATIVE_SUITE=$(getUbuntuPpaCodename) || return 1
 	fi
 	if [[ -z "${ARCHITECTURE}" ]]; then
-		ARCHITECTURE=$(dpkg --print-architecture 2>/dev/null) || {
+		ARCHITECTURE=$(getNativeDpkgArchitecture) || {
 			echo -e "${RED}ERROR: Unable to determine the system package architecture.${NC}" >&2
 			return 1
 		}
+	fi
+	if ! isValidDpkgArchitecture "${ARCHITECTURE}"; then
+		echo -e "${RED}ERROR: Invalid package architecture '${ARCHITECTURE}' for the Amnezia PPA source.${NC}" >&2
+		return 1
 	fi
 	SELECTED_SUITE=$(selectAmneziaPpaSuite "${NATIVE_SUITE}" "${ARCHITECTURE}") || return 1
 
@@ -1455,7 +1576,30 @@ function configureUbuntuAmneziaPpa() {
 			;;
 	esac
 
+	AMNEZIA_PPA_SELECTED_SUITE="${SELECTED_SUITE}"
+	AMNEZIA_PPA_ARCHITECTURE="${ARCHITECTURE}"
 	return 0
+}
+
+# After the PPA is configured and the package lists refreshed, require an
+# installable amneziawg-tools candidate. The candidate record must come from a
+# package index (only index records carry Filename): a version known only from
+# the dpkg status file cannot be installed or repaired from the PPA. Field names
+# in apt-cache show output are not translated, unlike apt-cache policy text.
+function checkAmneziaPpaToolsCandidate() {
+	local SUITE="$1"
+	local ARCHITECTURE="$2"
+	local RECORD
+
+	RECORD=$(LC_ALL=C apt-cache show --no-all-versions amneziawg-tools 2>/dev/null) || RECORD=""
+	if grep -q '^Filename: ' <<< "${RECORD}"; then
+		return 0
+	fi
+
+	echo -e "${RED}ERROR: The Amnezia PPA (ppa:amnezia/ppa, ${AMNEZIA_PPA_URI}) has no installable amneziawg-tools package for Ubuntu suite '${SUITE:-unknown}' and architecture '${ARCHITECTURE:-unknown}'.${NC}" >&2
+	echo -e "${ORANGE}The package lists were refreshed successfully, so this is not a network failure: the PPA currently publishes no usable amneziawg-tools candidate for this suite and architecture.${NC}" >&2
+	echo -e "${ORANGE}Check https://launchpad.net/~amnezia/+archive/ubuntu/ppa/+packages and retry once the package is published.${NC}" >&2
+	return 1
 }
 
 # Roll back only a source entry created by the current configure call. A
@@ -4672,6 +4816,7 @@ function installAmneziaWG() {
 			esac
 			exit 1
 		fi
+		checkAmneziaPpaToolsCandidate "${AMNEZIA_PPA_SELECTED_SUITE}" "${AMNEZIA_PPA_ARCHITECTURE}" || exit 1
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
 		apt install -y dkms iptables nftables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }

@@ -339,7 +339,13 @@ exit 0
 if [[ "${OS_FAMILY}" == "debian" ]]; then
 	create_mock "apt" 'exit 0'
 	create_mock "apt-get" 'exit 0'
+	# The installer requires a downloadable amneziawg-tools candidate (a record
+	# with Filename) after configuring the PPA; other lookups stay unknown.
 	create_mock "apt-cache" '
+if [[ "$*" == "show --no-all-versions amneziawg-tools" ]]; then
+	printf "Package: amneziawg-tools\nArchitecture: %s\nVersion: 1.0-mock\nFilename: pool/main/a/amneziawg/amneziawg-tools_1.0-mock.deb\n\n" "$(dpkg --print-architecture)"
+	exit 0
+fi
 case "$1" in
 	show) exit 1;;
 	*) exit 0;;
@@ -381,6 +387,33 @@ FAILED=0
 if [[ ${INSTALL_RC} -ne 0 ]]; then
 	echo "FAIL: Installer exited with non-zero code ${INSTALL_RC}"
 	FAILED=$((FAILED + 1))
+fi
+
+# The Ubuntu PPA source is pinned to the native dpkg architecture, so an APT
+# architecture variant such as amd64v3 cannot select an incomplete PPA index.
+# The Debian and Raspberry Pi path keeps its own unpinned focal entries.
+if [[ "${ID}" == "ubuntu" ]]; then
+	mapfile -t PPA_SOURCE_FILES < <(grep -l 'ppa.launchpadcontent.net/amnezia/ppa/ubuntu' /etc/apt/sources.list.d/*.sources 2>/dev/null)
+	if [[ "${#PPA_SOURCE_FILES[@]}" -eq 1 ]] &&
+		[[ "$(grep -c "^Architectures: $(dpkg --print-architecture)\$" "${PPA_SOURCE_FILES[0]}")" == "1" ]] &&
+		[[ "$(grep -c '^Architectures:' "${PPA_SOURCE_FILES[0]}")" == "1" ]]; then
+		echo "OK: Ubuntu PPA source is pinned to the native architecture $(dpkg --print-architecture)"
+	else
+		echo "FAIL: Ubuntu PPA source must contain exactly one 'Architectures: $(dpkg --print-architecture)'"
+		cat "${PPA_SOURCE_FILES[@]}" 2>/dev/null
+		FAILED=$((FAILED + 1))
+	fi
+elif [[ "${ID}" == "debian" ]]; then
+	DEBIAN_PPA_LIST=/etc/apt/sources.list.d/amneziawg.sources.list
+	if grep -qxF 'deb [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main' "${DEBIAN_PPA_LIST}" &&
+		grep -qxF 'deb-src [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main' "${DEBIAN_PPA_LIST}" &&
+		! grep -q 'arch=' "${DEBIAN_PPA_LIST}"; then
+		echo "OK: Debian PPA entries are the unchanged focal lines without an architecture pin"
+	else
+		echo "FAIL: Debian PPA entries changed"
+		cat "${DEBIAN_PPA_LIST}" 2>/dev/null
+		FAILED=$((FAILED + 1))
+	fi
 fi
 
 # Check config directory exists
