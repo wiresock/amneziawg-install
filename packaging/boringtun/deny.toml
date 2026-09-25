@@ -1,0 +1,41 @@
+# cargo-deny policy for the dependency graph of the redistributed boringtun-cli
+# binary at the pinned commit (packaging/boringtun/pin.env). Run by
+# `scripts/boringtun-artifact.sh licenses`; see docs/BORINGTUN_ARTIFACTS.md.
+
+[graph]
+# Only what is linked into the Linux artifacts: no dev-dependencies, and only
+# the dependencies of the two shipped targets.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+exclude-dev = true
+
+[advisories]
+# The RustSec database is fetched live, so a new advisory can fail a rebuild of
+# an unchanged pin. That is intended: review it before shipping. Exceptions
+# must name one advisory and say why the artifact is still acceptable.
+ignore = [
+    { id = "RUSTSEC-2025-0069", reason = "daemonize 0.5.0 is unmaintained (no fix available). It is a direct dependency of boringtun-cli, used only when the daemon is not run with --foreground; this project does not modify BoringTun. Tracked in docs/BORINGTUN_ARTIFACTS.md." },
+]
+
+[licenses]
+# Permissive licenses whose notices THIRD-PARTY-LICENSES reproduces. Any other
+# license, or a crate whose license cannot be determined, fails the check.
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# crates.io only: no git or other registry dependencies can enter the binary.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

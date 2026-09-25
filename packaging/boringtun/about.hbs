@@ -1,0 +1,22 @@
+THIRD-PARTY LICENSES FOR boringtun-cli
+
+boringtun-cli is built from WireSock BoringTun (BSD-3-Clause, see LICENSE) and
+statically links the Rust crates listed below. Each license text is followed by
+the crates distributed under it.
+
+{{#each overview}}
+{{{name}}} ({{count}})
+{{/each}}
+
+{{#each licenses}}
+================================================================================
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}
+  {{crate.name}} {{crate.version}}{{#if crate.repository}} <{{crate.repository}}>{{/if}}
+{{/each}}
+--------------------------------------------------------------------------------
+{{{text}}}
+
+{{/each}}

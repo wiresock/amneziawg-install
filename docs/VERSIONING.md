@@ -81,3 +81,10 @@ git checkout proxy-v0.1.3
 cd amneziawg-proxy
 cargo build --release --locked
 ```
+
+## BoringTun Artifacts
+
+The static `boringtun-cli` binaries built by the `BoringTun Artifacts` workflow
+are not a versioned component: they follow the WireSock BoringTun commit pinned
+in `packaging/boringtun/pin.env`, get no component tag and are not released.
+See [BORINGTUN_ARTIFACTS.md](BORINGTUN_ARTIFACTS.md).
