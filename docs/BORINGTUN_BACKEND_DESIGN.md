@@ -564,7 +564,7 @@ ExecStopPost=/usr/local/libexec/amneziawg-install/awg-backend-ctl poststop %i
 | `ExecStartPre=… precheck` | Refuses to start when the kernel module is loaded or autoloadable, the binary fails verification, the runtime file is invalid, `/dev/net/tun` is missing or the IPv6 socket family is absent (§7.11). |
 | `ExecStartPost=… poststart` | Verifies that the link is a TUN device, that the PID file points at a live process whose `/proc/<pid>/exe` is the store binary, and that the UAPI responds. Then writes `/run/amneziawg-install/<if>.up`. |
 | `ExecReload=… sync` | Filtered sync (§6.4) instead of the packaged unfiltered one. |
-| `ExecStop=… stop` | Runs `awg-quick down %i` and removes the `.up` marker on success. If the interface is already gone it exits 0 and leaves the marker. |
+| `ExecStop=… stop` | Runs `awg-quick down %i` for the interface its start recorded, after recording the attempt (as implemented, §21.1). If the interface is already gone it exits 0 without `awg-quick down`, and `poststop` replays PostDown. |
 | `ExecStopPost=… poststop` | Crash-safe teardown (§7.9). Runs after every stop, including crashes and failed starts (VERIFIED). |
 
 ### 7.5 Launcher contract (PROPOSAL)
@@ -622,9 +622,9 @@ single downloaded file, and this keeps the logic single-sourced and unit-testabl
 
 | Event | Observed systemd behaviour | Design response |
 |---|---|---|
-| `systemctl stop` | `ExecStop` runs: `awg-quick down` succeeds and PostDown runs. Then `ExecStopPost` runs with `SERVICE_RESULT=success`. | `stop` clears the `.up` marker; `poststop` has nothing to do. |
-| Daemon crash (SIGKILL) | `ExecStop` does **not** run. `ExecStopPost` runs with `SERVICE_RESULT=signal`. The unit restarts after `RestartSec`, and PostUp runs again without a PostDown in between. | `poststop` sees the marker and replays PostDown (§7.9). |
-| Operator runs `ip link del <if>` | The daemon exits 0. `ExecStop` runs, but `awg-quick down` fails because the interface is gone. `ExecStopPost` runs. The unit becomes inactive and is not restarted. | `stop` leaves the marker, and `poststop` replays PostDown. |
+| `systemctl stop` | `ExecStop` runs: `awg-quick down` succeeds and PostDown runs. Then `ExecStopPost` runs with `SERVICE_RESULT=success`. | `stop` records the completed down; `poststop` has nothing to do. |
+| Daemon crash (SIGKILL) | `ExecStop` does **not** run. `ExecStopPost` runs with `SERVICE_RESULT=signal`. The unit restarts after `RestartSec`, and PostUp runs again without a PostDown in between. | `poststop` sees an attempt that is up and was never brought down, and replays PostDown once (§7.9, §21.1). |
+| Operator runs `ip link del <if>` | The daemon exits 0. `ExecStop` runs; as implemented, `stop` finds the interface gone and does not run `awg-quick down` (§21.1). `ExecStopPost` runs. The unit becomes inactive and is not restarted. | `poststop` replays PostDown once. |
 | `awg-quick` used another datapath, so no PID file was written (simulated with an implementation that does not write it) | The unit stays "activating" until `TimeoutStartSec`, then fails with `timeout`, kills its cgroup and runs `ExecStopPost`. `Restart=` retries. | `poststop` removes a surviving non-TUN link with `awg-quick down`, which runs PostDown. Start limits stop the loop. |
 | `ExecStartPost` fails | `ExecStop` is skipped and `ExecStopPost` runs. | Same cleanup. |
 | Reload | `ExecReload` works with `Type=forking`. | Filtered sync. |
@@ -634,6 +634,10 @@ while the interface was gone and `awg syncconf` failed (VERIFIED). That is why s
 proposed.
 
 ### 7.9 Crash-safe teardown (PROPOSAL)
+
+> As implemented in PR 3, the `.up` marker below is replaced by the per-attempt
+> ownership state of §21.1, which also records whether `awg-quick down` was
+> started, so PostDown is never replayed after a partial down.
 
 `poststop <if>`:
 
@@ -1579,7 +1583,9 @@ hashes.
 read-only settings, sets `PATH` and `LC_ALL=C` itself and reads nothing from its
 environment. Regenerating identical content leaves the files alone. All
 installer-written files (helpers, drop-in, runtime file) are replaced atomically
-and never through a symlink.
+and never through a symlink. Writing the service files always ends with
+`systemctl daemon-reload`, also when nothing changed, so a reload that failed
+once is retried by the next reconciliation instead of being forgotten.
 
 **Runtime file.** Format 1 has a single key, `FORMAT=1`. The imitation keys of
 §4.3 arrive with PR 5 through the same allowlist.
@@ -1591,7 +1597,33 @@ Amnezia PPA (`resolute` and `noble`) still has `Type=oneshot`,
 contract holds. `precheck` refuses to start if that `ExecStart=` changes or a
 local unit file replaces the packaged one.
 
-**precheck.** It refuses when:
+**Ownership.** Every destructive step acts only on what the runtime can show it
+owns. Processes are identified by PID and start time (field 22 of
+`/proc/<pid>/stat`), socket nodes by device, inode, mode and change time in
+nanoseconds (the kernel reuses a freed inode number at once), and links by
+ifindex. Without that evidence a resource is left alone, and a failed `awg`
+query is never evidence of anything. Two kinds of record hold the evidence;
+both are data in root-owned 0600 files in the root-owned 0700 directory
+`/run/amneziawg-install`, replaced atomically, parsed against a strict allowlist
+and never sourced:
+
+- `<if>.state`, one per start attempt of `awg-quick@<if>` (or of
+  `awgBackendQuickUp`). systemd runs the hooks one at a time, so each is its
+  only writer while it runs: `precheck` opens the attempt (`ATTEMPT`, `CONFIG`,
+  `PRE_EXISTING`, `PHASE=started`, then `prechecked`), the launcher records the
+  daemon (`PHASE=launching` with `PID`, `PID_START`, then each socket node, then
+  `PHASE=launched` with `IFINDEX`), `poststart` records `PHASE=up`, `stop`
+  records `DOWN` (`none`, `attempted`, `done`, `failed-intact`, `failed`) and
+  `poststop` records `REPLAY` (`none`, `started`, `done`) and removes the file.
+- `scratch/<token>.owner` and `scratch/<token>.guard` for scratch instances,
+  below.
+
+**precheck.** It opens a new attempt before any check can fail, so `poststop`
+acts on this attempt's facts and never on an earlier attempt's; if the attempt
+cannot be recorded, nothing starts. A link, UAPI socket or `awg` interface of
+the name that already exists belongs to someone else: `precheck` records
+`PRE_EXISTING=1`, refuses, and the following `poststop` touches none of it. It
+also refuses when:
 
 - `/sys/module/amneziawg` exists, or `modinfo -n amneziawg` finds the module
   (PR 3 has no load override, §7.11, so any installed module blocks BoringTun);
@@ -1599,85 +1631,249 @@ local unit file replaces the packaged one.
 - `/dev/net/tun` is not a usable character device, or `/proc/sys/net/ipv6` is
   absent;
 - store, helper or runtime-file verification fails;
-- the server config sets `SaveConfig = true` or an invalid value, read the way
-  `awg-quick`'s `read_bool` reads it.
+- the config sets `SaveConfig = true` or an invalid value, read the way
+  `awg-quick`'s `read_bool` reads it. The config is the exact file of the
+  attempt: `<config dir>/<if>.conf` for the service, the canonical path given to
+  `awgBackendQuickUp` otherwise, which `precheck` and `poststart` take as a
+  third argument and every later step reads from the state.
 
-**poststart.** Deviation: the `.up` marker is written *before* the checks. When
-`ExecStartPost` runs, `awg-quick up` has completed and its PostUp hooks have
-run, so a failing check must still leave the marker for `poststop` to replay
-PostDown. The checks are then those of §7.4: a TUN link, a live PID from the
-launcher's PID file whose `/proc/<pid>/exe` is the verified binary, and a UAPI
-that answers and is listed by `awg show interfaces`.
+**Launcher.** It serves only an attempt in `PHASE=prechecked`, and only while
+no link or socket of the name exists. It records its child's PID and start time
+before waiting, each socket node as it first appears while the child is alive,
+and the nodes and the TUN link's ifindex again once the UAPI answers; only then
+does it write the PID file. On failure it stops the child through its identity
+and removes only the nodes it saw that child create; a node that appeared and
+lost its daemon between two looks is left in place and makes the next
+`precheck` refuse the name.
 
-**stop and poststop.** As §7.9. `poststop` runs `awg-quick down` only for a
-surviving link that is not a TUN device and that `awg show interfaces` lists, so
-an unrelated link of the same name is left alone. PostDown hooks are parsed like
-`awg-quick`'s `parse_options`, and each runs as `bash -e -o pipefail -c` with
-`LC_ALL=C`, `%i` substituted and `INTERFACE` exported. Deviation: a failing hook
-is logged and the remaining hooks still run, whereas `awg-quick down` stops at
-the first failure. `awg-quick`'s own shell variables other than `INTERFACE` are
-not available to replayed hooks; the installer's generated hooks use none.
+**poststart.** `awg-quick up` returned successfully, so this attempt created the
+link (`awg-quick` refuses an existing one) and its PostUp hooks ran. `PHASE=up`
+is recorded first. If the state cannot be written (the directory or the file
+is unusable, or the write fails), `poststop` could not know that PostDown is
+owed, so `poststart` brings the interface down at once with `awg-quick down`,
+which runs PreDown and PostDown, and fails. A missing state in a usable
+directory means no attempt is in progress: nothing is brought down. Then the
+check shared with `ensureAwgBackendReady` runs: the recorded TUN link, a live
+daemon with the recorded PID and start time that the PID file names and whose
+`/proc/<pid>/exe` is the verified binary, and a UAPI that answers on the
+recorded socket nodes. When a PostUp hook fails inside `awg-quick up`, the
+earlier PostUp hooks stay done and no PostDown runs, exactly as with
+`awg-quick` on the kernel module: `awg-quick`'s own trap deletes the link and
+`poststop` replays nothing for an attempt that never reached `PHASE=up`.
+
+**stop.** For an attempt recorded as up whose link (by ifindex) is still listed,
+it records `DOWN=attempted` and only then runs `awg-quick down`, through a
+private copy of the config without SaveConfig (below). The outcome is recorded
+as `done`, `failed-intact` when the link survived (awg-quick deletes the link
+before the first PostDown hook, so none started) or `failed` (the hooks may
+have run in part). If the attempt cannot be recorded, `awg-quick down` is not
+run. When the interface is already gone, after a crash or an operator's
+`ip link del`, `stop` logs that and succeeds without `awg-quick down`. As
+§7.8 and E4 found, systemd runs `ExecStop` only when the main process exited
+successfully: after a SIGKILL, or an exit with a failure status, only
+`ExecStopPost` runs. The live test checks both cases in the journal, and
+`poststop` alone suffices for them.
+
+**poststop.** It runs after every stop, crash and failed start, and:
+
+- without a readable state removes only the PID file;
+- after a refused or failed `precheck` (`PHASE=started`) touches nothing;
+- stops the recorded daemon if it still runs (`awgBackendQuickUp` has no cgroup
+  for systemd to end);
+- brings down, with `awg-quick down`, a kernel link that `awg-quick up`
+  created for this attempt after a successful precheck (the recorded ifindex,
+  not a TUN device, `PHASE=up`, `DOWN=none`);
+- replays PostDown once when the interface is gone and `DOWN` is `none` or
+  `failed-intact`, recording `REPLAY=started` first;
+- after `DOWN=attempted` or `failed` names the PostDown hooks it will not run
+  again, instead of replaying them;
+- removes the recorded socket nodes only if they are unchanged and their daemon
+  is gone, then the PID file and the state (the state is kept while the
+  recorded daemon still runs).
+
+Replayed hooks are parsed like `awg-quick`'s `parse_options` and each runs as
+`bash -e -o pipefail -c` with `LC_ALL=C`, `%i` substituted and `INTERFACE`
+exported; a failing hook is logged and the rest still run. `awg-quick`'s own
+shell variables other than `INTERFACE` are not available to them.
+
+**PostDown semantics.** The runtime runs each PostDown hook at most once per
+attempt: once by `awg-quick down`, or once by the replay when `awg-quick down`
+provably never reached PostDown. It cannot guarantee exactly once for arbitrary
+shell commands across every crash boundary: after a partial `awg-quick down`,
+after `stop` or `poststop` is killed mid-run, or when the state cannot be
+written, the remaining hooks are reported and left to the operator rather than
+risked twice.
+
+**SaveConfig.** Every `awg-quick down` the runtime runs (in `stop`, in
+`poststop`, and in `poststart`'s fallback) goes through a private copy,
+`/run/amneziawg-install/down.XXXXXX/<if>.conf` (or a private `mktemp`
+directory in `/tmp` when the runtime directory is unusable), made from the
+current config without its `[Interface]` SaveConfig lines, found the way
+`parse_options` finds them. The copy has the interface's file name, so
+`awg-quick` derives the same interface and runs the same hooks. BoringTun's
+UAPI never returns the private key, so a save would otherwise write a keyless
+configuration over the real one; a test runs `awg-quick`'s real `cmd_down` and
+`save_config` against a keyless `showconf` to show both outcomes. An operator
+who runs `awg-quick down` or `awg-quick save` by hand on a BoringTun interface
+with `SaveConfig = true` still loses the key; the runtime cannot prevent that.
 
 **Sync filter.** As §6.4. It fails without calling `awg syncconf` when
 `awg-quick strip` fails, when `[Interface]` has more than one `ListenPort` or an
 invalid one, or when the live port cannot be read.
-
-**Scratch interfaces.** Deviation from §8.4: cleanup is guaranteed by a guardian
-process, not by traps. In a bash subshell, `trap -p` reports the parent's
-handlers although they are not active there, so a scratch primitive called from
-the protocol code, which runs in subshells, cannot chain traps safely. The
-guardian is a tracked background process that ignores HUP, INT and TERM,
-watches the owning shell's PID and start time, and tears the instance down when
-that shell is gone. This covers EXIT, HUP, INT and TERM, and also SIGKILL of
-the owner. Scratch names are limited to `[a-zA-Z0-9_-]`, because they become
-unit names. A name is refused when its link, either UAPI socket, an
-`awg show interfaces` entry or a unit that systemd already knows exists. If
-`systemd-run` still fails, only the guardian is stopped: the unit and link may
-belong to whoever took the name in between. Without systemd, a process is
-signalled only while its start time still matches the one recorded when it was
-started. The sweep of leftovers from interrupted runs (§8.4) is not
-implemented yet.
 
 **Staged validation.** Correction to §20 and §8.4, found by the live test: the
 kernel module binds `ListenPort` only when a link is brought up, so a kernel
 scratch link can take the running server's staged config. BoringTun binds the
 port as soon as it is set, even on a link that is down, so the same config
 collides with the running server. For BoringTun only, `validateStagedAwgConfigs`
-therefore leaves `ListenPort` out of what it applies; the port is not a protocol
-field. The live test also confirmed §8.6: BoringTun rejects configurations the
-kernel accepts, for example header protection with `S3` below 12 bytes, or a
-`RejectAfterTime` shorter than `RekeyAfterTime` plus `RekeyTimeout`.
+checks `ListenPort` itself and leaves it out of what it applies: at most one
+`ListenPort` line, read the way `awg` reads it (comments dropped, whitespace
+ignored, any case), with a decimal value from 1 to 65535 and no leading zero.
+That is stricter than `awg`, which also takes 0 and service names, and matches
+the ports the installer writes. It checks the syntax only, not whether the port
+is free. The kernel path is unchanged. The live test also confirmed §8.6:
+BoringTun rejects configurations the kernel accepts, for example header
+protection with `S3` below 12 bytes, or a `RejectAfterTime` shorter than
+`RekeyAfterTime` plus `RekeyTimeout`.
 
-**awgBackendQuickUp.** It runs the generated `precheck`, then `awg-quick up`
-with the launcher, then `poststart`. On a failed `poststart` it runs `stop` and
-`poststop`.
+**Scratch interfaces.** Deviation from §8.4: cleanup is done by a guardian
+process, not by traps. In a bash subshell, `trap -p` reports the parent's
+handlers although they are not active there, so a scratch primitive called from
+the protocol code, which runs in subshells, cannot chain traps safely. Each
+creation is one attempt with a random 128-bit token and two records:
+`<token>.owner`, written once by the creating shell (the owner) before anything
+starts, and `<token>.guard`, written only by the guardian. The guardian ignores
+HUP, INT and TERM, holds no inherited descriptor and is the only process that
+starts or tears down the instance:
 
-**Live test.** `.github/workflows/boringtun-runtime.yml` builds and packages the
-pinned binary with `scripts/boringtun-artifact.sh`, installs `amneziawg-tools`
-without recommends, so no kernel module is present, and runs
-`tests/test-boringtun-runtime-live.sh`. That test covers start, reload, restart,
-stop, SIGKILL with restart and PostDown replay, `ip link del`, descriptor
-stability over repeated syncs, and AWG 2.0/3.0/3.1 validation on scratch
-instances.
+1. It records its own PID and start time (`PHASE=starting`) before it starts
+   anything, so no instance exists without a recorded guardian.
+2. It starts the daemon only while the owner lives, has not asked it to stop
+   and has not reclaimed the attempt. Under systemd that is a transient unit
+   named `amneziawg-scratch-<name>-<token>` with `RuntimeMaxSec=900`, and the
+   guardian waits for `systemd-run` to return even if the owner dies meanwhile,
+   so a unit created late is still torn down; a unit whose `systemd-run` answer
+   was lost is recognised by its token. Without systemd the daemon is the
+   guardian's child under `setpriv --pdeathsig KILL`, with the guardian's
+   ignored signals reset, so it cannot outlive the guardian.
+3. It records the daemon's PID and start time, the socket nodes and the TUN
+   link's ifindex, then `PHASE=created`.
+4. When the owner is gone (exit, signal, SIGKILL or a zombie) or has written a
+   stop request, it tears the instance down through the records and removes the
+   records last.
+
+The owner's destroy writes the stop request and waits for the guardian to
+finish before it reaps it. A guardian that is gone, or hangs for 30 seconds, is
+replaced by a reclaim from the records in the owner. A reclaim waits for a
+`systemd-run` client that may still create the unit, records socket nodes of a
+daemon that still provably runs, deletes the link only if it has the recorded
+ifindex and is a TUN device, stops the unit by its token name and the daemon by
+its identity, removes only recorded, unchanged nodes of a dead daemon, and
+keeps the records while anything of the attempt is left. Scratch names are
+limited to `[a-zA-Z0-9_-]`, because they become unit names, and a name is
+refused when its link, either UAPI socket or an `awg show interfaces` entry
+exists.
+
+**Stale sweep (§8.4).** Every scratch creation and every
+`ensureAwgBackendReady` sweeps `/run/amneziawg-install/scratch`. It reclaims an
+attempt only when its owner and its guardian are both proven gone by PID and
+start time, which covers an owner killed together with its guardian, a guardian
+killed before its owner exited, and a teardown interrupted part way. It never
+matches resources by name, leaves attempts with unreadable records alone, and
+does not rely on the lifecycle lock: callers that hold the lock sweep under it,
+and two concurrent sweeps only repeat idempotent steps.
+
+**Signals.** The runtime signals a process only through a check that it is
+still the process that started at the recorded time, never PID 1 or itself,
+and treats a zombie as gone. Bash reaps an exited background child at once, so
+even a child's PID stops naming it when it exits; a child whose start time
+cannot be read is not signalled at all. Bash cannot signal through a pidfd, so
+a PID reused in the instant between a check and the `kill` after it remains
+possible.
+
+**ensureAwgBackendReady.** Mode 1 writes the service files, starts
+`awg-quick@<if>` when it is inactive, and then requires the active unit to run
+the instance its recorded start launched (the check shared with `poststart`),
+with systemd's `MainPID` equal to the recorded daemon. A unit that is already
+active on the kernel module, or on anything else, fails closed with an error;
+PR 3 neither restarts nor migrates it.
+
+**awgBackendQuickUp.** It resolves the given config to its canonical path and
+runs the generated `precheck` for that file, `awg-quick up` with the launcher,
+then `poststart`. On a failed `precheck` or `awg-quick up` it runs `poststop`;
+on a failed `poststart`, `stop` and `poststop`.
+
+**Tests.** `tests/test-boringtun-runtime.sh` covers the runtime with mocks and
+a compiled stand-in daemon whose `/proc/<pid>/exe` really is the verified store
+binary; with `AWG_QUICK_REFERENCE` it also compares the parsers with
+`awg-quick`'s and runs `awg-quick`'s real SaveConfig path.
+`tests/mutate-boringtun-runtime.sh` breaks one rule at a time and requires that
+suite to fail; it is run by hand, not in CI. The live test
+(`.github/workflows/boringtun-runtime.yml`) builds and packages the pinned
+binary with `scripts/boringtun-artifact.sh`, installs `amneziawg-tools` without
+recommends, so no kernel module is present, and runs
+`tests/test-boringtun-runtime-live.sh`: start, reload, restart, stop, SIGKILL
+with restart and one PostDown replay, `ip link del`, descriptor stability over
+repeated syncs, AWG 2.0/3.0/3.1 validation on scratch instances, SaveConfig set
+while running, a failed start next to a pre-existing link, a partial
+`awg-quick down`, and a SIGKILL of the shell that owns a scratch instance.
+
+**Service lifecycle.**
+
+| Event | Owned resources | ExecStop | `awg-quick down` | PostDown | Can PostDown run twice | Sockets | PID file and state | Result |
+|---|---|---|---|---|---|---|---|---|
+| Clean stop | TUN link, daemon, nodes | runs | yes, via the SaveConfig-free copy | by `awg-quick down` | no (`DOWN=done`) | the daemon removes them; recorded leftovers of a dead daemon removed | removed | inactive |
+| SIGTERM of the daemon | as above | runs and finds the link gone if the daemon exits 0; not run otherwise | no | replayed once | no (`REPLAY`) | recorded, daemon dead: removed | removed | restarted (`on-failure`) or inactive on exit 0 |
+| SIGKILL of the daemon | as above | not run (the main process failed) | no | replayed once | no | recorded, daemon dead: removed | removed | restarted |
+| Daemon exits 0 | as above | runs and finds the link gone | no | replayed once | no | as above | removed | inactive |
+| Daemon exits non-zero | as above | not run | no | replayed once | no | as above | removed | restarted |
+| `ip link del` by an operator | as above | runs (the daemon exits 0) and finds the link gone | no | replayed once | no | as above | removed | inactive |
+| Socket node lost or replaced | as above | runs | only if `awg` still lists the name; otherwise as after a crash | by `awg-quick down`, or replayed once | no | a replacement node is kept | removed | inactive |
+| Transient `awg` failure at stop | as above | runs; `awg` does not list the link | no | replayed once, the link being gone after the cgroup kill | no | only recorded nodes of a dead daemon | removed | inactive |
+| Launcher fails | the child and the nodes it was seen to create | not run | no (awg-quick's trap deletes the link) | none; PostUp never ran | no | recorded nodes of the reaped child removed | removed | failed, retried |
+| `precheck` refuses a pre-existing kernel link | none (`PRE_EXISTING=1`) | not run | no | none | no | none touched | state removed | failed |
+| Kernel path wins after a successful `precheck` | the kernel link, by ifindex | not run | yes, in `poststop` | by `awg-quick down` | no | none | removed | failed, retried |
+| Partial `awg-quick down` (a PostDown hook fails) | as for a clean stop | runs, fails | yes, once | partly, by `awg-quick down`; rest reported | no | as above | removed | failed |
+| `awg-quick down` fails before deleting the link | as for a clean stop | runs, fails (`failed-intact`) | yes, once | replayed once after the cgroup kill | no | as above | removed | failed |
+| State cannot be written in `poststart` | as for a clean start | not run | yes, in `poststart` | by that `awg-quick down` | no | as above | whatever `poststop` can still read | failed, retried |
+| State cannot be written in `precheck` | none | not run | no | none | no | none | none | failed |
+
+No row removes a link, socket or unit that existed before the attempt.
+
+**Scratch failures.**
+
+| Event | Outcome |
+|---|---|
+| Guardian cannot start or record itself | Nothing was started; the owner reclaims the records and fails. |
+| Guardian killed before the daemon starts | Direct: nothing started. Unit: the owner (or a sweep) waits for the recorded `systemd-run` client and stops the token unit. |
+| Owner killed while `systemd-run` is pending | The guardian waits for `systemd-run`, sees the owner gone and stops the late unit. |
+| `systemd-run` answer lost | The unit is found by its token; the attempt proceeds and is torn down normally. |
+| `systemd-run` fails after a concurrent creator took the name | No unit or link but the attempt's own is touched. |
+| Owner exits, is signalled, is SIGKILLed or becomes a zombie | The guardian tears the instance down. |
+| Guardian killed while the instance runs | Direct: the daemon dies with it (parent-death signal). Unit: it runs until the owner's destroy, the next sweep or `RuntimeMaxSec` ends it. |
+| Guardian killed, then the owner | The records remain; the next sweep reclaims the instance. |
+| Destroy interrupted after its stop request | The guardian completes the teardown. |
+| Teardown interrupted (guardian killed inside it) | The records remain with `PHASE=teardown`; the next sweep finishes. |
+| Foreign link, socket or unit of a scratch-like name | Never touched: nothing refers to it by token. |
 
 **Residual assumptions.**
 
 - Between verification and `exec` only root can change the binary, because
   every path component is root-owned and not writable by anyone else. Bash
   cannot open and execute the verified file descriptor itself.
-- PID reuse between the launcher writing the PID file and `poststart` reading it
-  is caught only by the `/proc/<pid>/exe` comparison.
 - A module that appears after `precheck` (for example, installed in between) is
-  caught by `poststart`'s TUN check and the PID-file contract, not prevented.
-- Without systemd, a guardian stops a daemon that is no longer the child of a
-  live shell, so its PID is freed as soon as it exits. The start time is
-  checked before every signal, but a PID reused between that check and `kill`
-  would still be signalled; bash cannot signal through a pidfd. Under systemd
-  the transient unit is stopped instead.
-- If the owning shell dies after its guardian starts but before a failing
-  `systemd-run` returns, and another process created the same unit in between,
-  the guardian stops that unit. Scratch names embed the owner's PID, and only
-  root can create units.
+  caught by `poststart`'s TUN check and cleaned up as an owned kernel link, not
+  prevented.
+- A PID reused between an identity check and the `kill` after it would be
+  signalled (no pidfd in bash).
+- A node removed and recreated by root within the same nanosecond of change
+  time would pass for the recorded one.
+- A socket node whose daemon died between two launcher polls is never recorded
+  and stays until an operator removes it; `precheck` refuses the name meanwhile.
+- A transient scratch unit whose guardian was killed can run until
+  `RuntimeMaxSec` if its owner never destroys it and no later sweep runs.
+- Root can race any of these checks deliberately; the runtime defends against
+  accidents and ordinary failures, not against root.
 
 ---
 
@@ -1831,7 +2027,7 @@ All experiments ran on the environment in §0. Test artefacts were removed after
 | E3 | Probe responder | Non-loopback DNS probe answered with SERVFAIL; loopback probe (E2) not answered. |
 | E3 | `ExecStartPost` failure | `ExecStopPost` ran; `ExecStop` did not. |
 | E3 | `Type=forking`, `PIDFile`, `Restart=on-failure` | Reload OK; kill -9 restarted the unit (`NRestarts=1`); PostUp ran twice with no PostDown in between. |
-| E4 | Stop hooks per event | Clean stop runs `ExecStop` and `ExecStopPost`; crash runs only `ExecStopPost` (`SERVICE_RESULT=signal`); operator link delete runs `ExecStop` (awg-quick down fails) and `ExecStopPost`, unit inactive and not restarted. |
+| E4 | Stop hooks per event | Clean stop runs `ExecStop` and `ExecStopPost`; crash runs only `ExecStopPost` (`SERVICE_RESULT=signal`); operator link delete runs `ExecStop` (the prototype's awg-quick down failed; the implementation skips it, §21.1) and `ExecStopPost`, unit inactive and not restarted. |
 | E5 | 20 × syncconf during 50 pings per second | 3 of 200 pings lost; listen sockets multiplied; handshake unchanged. |
 | E6 | Descriptor count over 50 + 50 syncconfs | +100 fds with `ListenPort`; 0 without; port and peers unchanged. |
 | E7 | Launcher never writes the PID file | Unit stays activating until `TimeoutStartSec`, then fails (`timeout`), kills its cgroup, runs `ExecStopPost`, then restarts. |
