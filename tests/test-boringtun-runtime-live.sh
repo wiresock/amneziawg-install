@@ -6,7 +6,11 @@
 # installer's internal test hook, and drives awg-quick@<if>.service through
 # start, reload, restart, stop, a SIGKILL crash, an operator's `ip link del`,
 # repeated unchanged-port syncs and AWG 2.0/3.0/3.1 validation on scratch
-# instances. It cleans up after itself, also on failure.
+# instances, and the ownership rules of the runtime: a failed start never
+# touches an interface that existed before it, a partial awg-quick down never
+# runs a PostDown hook twice, SaveConfig set after the start never erases the
+# private key, and a scratch instance whose owner is SIGKILLed is removed. It
+# cleans up after itself, also on failure.
 #
 # Requirements: root, systemd as PID 1, amneziawg-tools (awg, awg-quick and
 # awg-quick@.service) installed without the AmneziaWG kernel module, iptables,
@@ -22,6 +26,11 @@ ARCHIVE="${1:-}"
 IF="awgbt0"
 PORT=51899
 UNIT="awg-quick@${IF}.service"
+# A second interface for the partial-down case, and a name that a foreign TUN
+# link holds for the pre-existing-interface case.
+IF2="awgbt2"
+PORT2=51898
+FOREIGN="awgbt9"
 HOOK_LOG="/run/awgbt-live-hooks.log"
 RULE_COMMENT="awgbt-live-test"
 WORK_DIR=""
@@ -86,14 +95,17 @@ function dump_diagnostics() {
 function cleanup() {
 	local RC=$?
 	trap - EXIT
-	systemctl stop "${UNIT}" >/dev/null 2>&1
-	systemctl reset-failed "${UNIT}" >/dev/null 2>&1
-	ip link delete "${IF}" >/dev/null 2>&1
+	local NAME
+	for NAME in "${IF}" "${IF2}" "${FOREIGN}"; do
+		systemctl stop "awg-quick@${NAME}.service" >/dev/null 2>&1
+		systemctl reset-failed "awg-quick@${NAME}.service" >/dev/null 2>&1
+		ip link delete "${NAME}" >/dev/null 2>&1
+		rm -rf -- "/etc/systemd/system/awg-quick@${NAME}.service.d" "${AWG_BT_CONFIG_DIR}/${NAME}.conf" \
+			"${AWG_BT_CONFIG_DIR}/${NAME}.boringtun"
+		rm -f -- "/var/run/wireguard/${NAME}.sock" "/var/run/amneziawg/${NAME}.sock"
+	done
 	while iptables -D INPUT -p udp --dport "${PORT}" -m comment --comment "${RULE_COMMENT}" -j ACCEPT 2>/dev/null; do :; done
-	rm -rf -- "/etc/systemd/system/awg-quick@${IF}.service.d" "${AWG_BT_LIBEXEC_DIR}" "${AWG_BT_STORE_DIR%/boringtun}" \
-		"${AWG_BT_RUN_DIR}" "${AWG_BT_CONFIG_DIR}/${IF}.conf" "${AWG_BT_CONFIG_DIR}/${IF}.boringtun" "${HOOK_LOG}" \
-		"${WORK_DIR}"
-	rm -f -- "/var/run/wireguard/${IF}.sock" "/var/run/amneziawg/${IF}.sock"
+	rm -rf -- "${AWG_BT_LIBEXEC_DIR}" "${AWG_BT_STORE_DIR%/boringtun}" "${AWG_BT_RUN_DIR}" "${HOOK_LOG}" "${WORK_DIR}"
 	systemctl daemon-reload
 	exit "${RC}"
 }
@@ -120,6 +132,8 @@ check "and resolves to the unpacked binary" test "${_AWG_BT_VERIFIED_BIN}" = "$(
 
 echo "=== Server config and the internal BoringTun runtime"
 install -d -m 0700 "${AWG_BT_CONFIG_DIR}"
+WORK_DIR="$(mktemp -d)"
+chmod 0700 "${WORK_DIR}"
 SERVER_KEY="$(awg genkey)"
 PEER_PUB="$(awg genkey | awg pubkey)"
 cat >"${AWG_BT_CONFIG_DIR}/${IF}.conf" <<EOF
@@ -171,8 +185,13 @@ function check_running() {
 	check "${LABEL}: ${IF} is a TUN device" test -e "/sys/class/net/${IF}/tun_flags"
 	check "${LABEL}: the UAPI answers with the configured port" test "$(awg show "${IF}" listen-port 2>/dev/null)" = "${PORT}"
 	check "${LABEL}: awg show lists the server config's peer" grep -q "${PEER_PUB}" <<<"$(awg show "${IF}" peers 2>/dev/null)"
-	check "${LABEL}: the .up marker exists" test -e "${AWG_BT_RUN_DIR}/${IF}.up"
+	check "${LABEL}: the start attempt is recorded as up, with the MainPID and its start time" \
+		test "$(state_get PHASE) $(state_get PID) $(state_get PID_START)" = "up ${PID} $(_awgBtProcessStartTime "${PID}")"
 	check "${LABEL}: exactly one firewall rule from PostUp is present" test "$(rule_count)" -eq 1
+}
+
+function state_get() { # <key>
+	sed -n "s/^$1=//p" "${AWG_BT_RUN_DIR}/${IF}.state" 2>/dev/null
 }
 
 function wait_for() { # <seconds> <command...>
@@ -195,11 +214,15 @@ function unit_inactive() {
 
 function nothing_left() {
 	[[ ! -e "/sys/class/net/${IF}" && ! -e "/var/run/wireguard/${IF}.sock" && ! -e "/var/run/amneziawg/${IF}.sock" &&
-		! -e "${AWG_BT_RUN_DIR}/boringtun-${IF}.pid" && ! -e "${AWG_BT_RUN_DIR}/${IF}.up" && "$(rule_count)" -eq 0 ]]
+		! -e "${AWG_BT_RUN_DIR}/boringtun-${IF}.pid" && ! -e "${AWG_BT_RUN_DIR}/${IF}.state" && "$(rule_count)" -eq 0 ]]
 }
 
 echo "=== Start"
 check_running "start"
+
+echo "=== ensureAwgBackendReady on the active unit"
+(ensureAwgBackendReady 1)
+check "an active unit served by its recorded BoringTun daemon is accepted" test "$?" -eq 0
 
 echo "=== Reload"
 PID="$(main_pid)"
@@ -214,13 +237,25 @@ check "restart succeeds" test "$?" -eq 0
 check "restart starts a new daemon" test "$(main_pid)" != "${PID}"
 check_running "restart"
 
+echo "=== SaveConfig set after the start"
+cp "${AWG_BT_CONFIG_DIR}/${IF}.conf" "${WORK_DIR}/config-before"
+sed -i '/^\[Interface\]$/a SaveConfig = true' "${AWG_BT_CONFIG_DIR}/${IF}.conf"
+systemctl stop "${UNIT}"
+check "stop succeeds with SaveConfig added while running" test "$?" -eq 0
+check "the private key survives: the config is unchanged apart from the added line" \
+	test "$(grep -v '^SaveConfig = true$' "${AWG_BT_CONFIG_DIR}/${IF}.conf")" = "$(cat "${WORK_DIR}/config-before")"
+cp "${WORK_DIR}/config-before" "${AWG_BT_CONFIG_DIR}/${IF}.conf"
+systemctl start "${UNIT}"
+check "start again succeeds" test "$?" -eq 0
+check_running "after the SaveConfig stop"
+
 echo "=== Stop"
 DOWNS_BEFORE="$(grep -c "^down-${IF}$" "${HOOK_LOG}")"
 systemctl stop "${UNIT}"
 check "stop succeeds" test "$?" -eq 0
 check "the unit is inactive" unit_inactive
 check "stop ran PostDown once" test "$(grep -c "^down-${IF}$" "${HOOK_LOG}")" -eq $((DOWNS_BEFORE + 1))
-check "no link, socket, PID file, marker or firewall rule remains" nothing_left
+check "no link, socket, PID file, state or firewall rule remains" nothing_left
 
 echo "=== Start again"
 systemctl start "${UNIT}"
@@ -228,6 +263,7 @@ check "start succeeds" test "$?" -eq 0
 check_running "start again"
 
 echo "=== SIGKILL of the BoringTun daemon"
+CURSOR="$(journalctl -u "${UNIT}" -n 0 --show-cursor --no-pager | sed -n 's/^-- cursor: //p')"
 PID="$(main_pid)"
 RESTARTS_BEFORE="$(systemctl show -p NRestarts --value "${UNIT}")"
 DOWNS_BEFORE="$(grep -c "^down-${IF}$" "${HOOK_LOG}")"
@@ -235,6 +271,8 @@ kill -KILL "${PID}"
 check "systemd restarts the unit after the crash (Restart=on-failure)" wait_for 30 unit_restarted "${PID}"
 check "systemd counted the restart" test "$(systemctl show -p NRestarts --value "${UNIT}")" -gt "${RESTARTS_BEFORE}"
 check "ExecStopPost replayed PostDown after the crash" test "$(grep -c "^down-${IF}$" "${HOOK_LOG}")" -eq $((DOWNS_BEFORE + 1))
+check "systemd skipped ExecStop for the killed main process; only ExecStopPost ran" \
+	test "$(journalctl -u "${UNIT}" --after-cursor "${CURSOR}" --no-pager | grep -c 'is already gone, so awg-quick down is not run')" -eq 0
 check_running "after crash and restart"
 journalctl -u "${UNIT}" --no-pager -n 40 | grep -E 'signal|Main process exited|Scheduled restart|down-|PostDown|\[#\]' | tail -n 12
 
@@ -247,8 +285,10 @@ sleep 5
 check "and is not restarted after a clean exit" unit_inactive
 check "systemd scheduled no restart" \
 	test "$(journalctl -u "${UNIT}" --after-cursor "${CURSOR}" --no-pager | grep -c 'Scheduled restart job')" -eq 0
+check "ExecStop ran for the cleanly exited daemon and found the interface gone" \
+	grep -q "is already gone, so awg-quick down is not run" <<<"$(journalctl -u "${UNIT}" --after-cursor "${CURSOR}" --no-pager)"
 check "PostDown ran once for the vanished interface" test "$(grep -c "^down-${IF}$" "${HOOK_LOG}")" -eq $((DOWNS_BEFORE + 1))
-check "no link, socket, PID file, marker or firewall rule remains" nothing_left
+check "no link, socket, PID file, state or firewall rule remains" nothing_left
 
 echo "=== Repeated unchanged-port syncs"
 systemctl start "${UNIT}"
@@ -270,8 +310,6 @@ systemctl restart "${UNIT}"
 check_running "after the sync checks"
 
 echo "=== AWG 2.0, 3.0 and 3.1 validation on BoringTun scratch instances"
-WORK_DIR="$(mktemp -d)"
-chmod 0700 "${WORK_DIR}"
 cp "${AWG_BT_CONFIG_DIR}/${IF}.conf" "${WORK_DIR}/awgs1.conf"
 AWG3_KEY="$(awg genkey)"
 {
@@ -293,17 +331,80 @@ check "a config BoringTun rejects fails staged validation" test "$?" -ne 0
 check "with the BoringTun wording" grep -q "pinned BoringTun build" "${WORK_DIR}/reject.err"
 check "the served interface was untouched by the scratch instances" test "$(awg show "${IF}" listen-port)" = "${PORT}"
 
-echo "=== Scratch cleanup, including on signals"
+echo "=== SIGKILL of the shell that owns a scratch instance"
+SCRATCH_NAME="awgp9001"
+rm -f "${WORK_DIR}/token"
 (
-	awgBackendCreateScratchInterface awgp9001 >/dev/null 2>&1
-	kill -KILL "${BASHPID}"
-)
-sleep 2
-check "SIGKILL of the owning shell still removes its scratch instance" \
-	test -z "$(systemctl list-units --all --plain --no-legend 'amneziawg-scratch-*' 2>/dev/null)"
+	awgBackendCreateScratchInterface "${SCRATCH_NAME}" >/dev/null 2>&1 || exit 1
+	echo "${_AWG_BT_SCRATCH_TOKENS[${SCRATCH_NAME}]}" >"${WORK_DIR}/token.tmp"
+	mv "${WORK_DIR}/token.tmp" "${WORK_DIR}/token"
+	exec sleep 120
+) &
+OWNER_PID=$!
+wait_for 40 test -s "${WORK_DIR}/token"
+TOKEN="$(cat "${WORK_DIR}/token" 2>/dev/null)"
+check "the scratch instance was created before its owner is killed" test -n "${TOKEN}"
+SCRATCH_UNIT="amneziawg-scratch-${SCRATCH_NAME}-${TOKEN}.service"
+GUARD_RECORD="${AWG_BT_RUN_DIR}/scratch/${TOKEN}.guard"
+SCRATCH_PID="$(sed -n 's/^DAEMON_PID=//p' "${GUARD_RECORD}" 2>/dev/null)"
+SCRATCH_START="$(sed -n 's/^DAEMON_START=//p' "${GUARD_RECORD}" 2>/dev/null)"
+check "its transient unit ${SCRATCH_UNIT} is active" systemctl is-active --quiet "${SCRATCH_UNIT}"
+check "its recorded daemon is the unit's main process" \
+	test -n "${SCRATCH_PID}" -a "$(systemctl show -p MainPID --value "${SCRATCH_UNIT}")" = "${SCRATCH_PID}"
+check "and runs the verified binary" test "$(readlink "/proc/${SCRATCH_PID}/exe")" = "${_AWG_BT_VERIFIED_BIN}"
+check "its TUN link exists" test -e "/sys/class/net/${SCRATCH_NAME}/tun_flags"
+check "its UAPI answers" awg show "${SCRATCH_NAME}" listen-port
+kill -KILL "${OWNER_PID}"
+wait "${OWNER_PID}" 2>/dev/null
+function scratch_unit_gone() {
+	[[ "$(systemctl show -p ActiveState --value "${SCRATCH_UNIT}")" != active ]]
+}
+function scratch_daemon_gone() {
+	! _awgBtProcessIs "${SCRATCH_PID}" "${SCRATCH_START}"
+}
+check "that transient unit stops" wait_for 20 scratch_unit_gone
+check "that daemon is gone" wait_for 10 scratch_daemon_gone
+check "that link is gone" wait_for 10 test ! -e "/sys/class/net/${SCRATCH_NAME}"
+check "its sockets are gone" test ! -e "/var/run/wireguard/${SCRATCH_NAME}.sock" -a ! -e "/var/run/amneziawg/${SCRATCH_NAME}.sock"
+check "its records are gone" wait_for 10 test ! -e "${GUARD_RECORD}" -a ! -e "${AWG_BT_RUN_DIR}/scratch/${TOKEN}.owner"
 check "no scratch unit remains" test -z "$(systemctl list-units --all --plain --no-legend 'amneziawg-scratch-*' 2>/dev/null)"
 check "no scratch link remains" test -z "$(ip -o link show 2>/dev/null | grep -oE ' awg[pv][0-9]+' || true)"
 check "no scratch socket remains" test -z "$(find /var/run/wireguard /var/run/amneziawg -name 'awg[pv]*' 2>/dev/null)"
+
+echo "=== A failed start leaves an interface that existed before it alone"
+ip tuntap add dev "${FOREIGN}" mode tun
+FOREIGN_INDEX="$(cat "/sys/class/net/${FOREIGN}/ifindex")"
+sed -e "s/^ListenPort = .*/ListenPort = 51897/" -e '/^PostUp\|^PostDown/d' "${AWG_BT_CONFIG_DIR}/${IF}.conf" >"${AWG_BT_CONFIG_DIR}/${FOREIGN}.conf"
+sed -i "/^\[Interface\]$/a PostDown = echo down-%i >>${HOOK_LOG}" "${AWG_BT_CONFIG_DIR}/${FOREIGN}.conf"
+chmod 0600 "${AWG_BT_CONFIG_DIR}/${FOREIGN}.conf"
+check "service files for ${FOREIGN} are written" _awgBtInstallServiceFiles "${FOREIGN}"
+systemctl start "awg-quick@${FOREIGN}.service" 2>/dev/null
+check "the start is refused" test "$?" -ne 0
+sleep 4
+check "the pre-existing link survives, as the same link" test "$(cat "/sys/class/net/${FOREIGN}/ifindex" 2>/dev/null)" = "${FOREIGN_INDEX}"
+check "and none of its PostDown hooks ran" test "$(grep -c "^down-${FOREIGN}$" "${HOOK_LOG}")" -eq 0
+check "precheck said why" grep -q "already exists" <<<"$(journalctl -u "awg-quick@${FOREIGN}.service" --no-pager -n 50)"
+systemctl stop "awg-quick@${FOREIGN}.service" >/dev/null 2>&1
+systemctl reset-failed "awg-quick@${FOREIGN}.service" >/dev/null 2>&1
+ip link delete "${FOREIGN}"
+
+echo "=== A partial awg-quick down never runs a PostDown hook twice"
+{
+	sed -n '/^\[Interface\]/,/^\[Peer\]/{/^\[Peer\]/!p}' "${AWG_BT_CONFIG_DIR}/${IF}.conf" |
+		sed -e "s/^ListenPort = .*/ListenPort = ${PORT2}/" -e 's/^Address = .*/Address = 10.98.0.1\/24/' -e '/^PostUp\|^PostDown/d'
+	printf 'PostDown = echo hook1-%%i >>%s\nPostDown = false\nPostDown = echo hook3-%%i >>%s\n' "${HOOK_LOG}" "${HOOK_LOG}"
+} >"${AWG_BT_CONFIG_DIR}/${IF2}.conf"
+chmod 0600 "${AWG_BT_CONFIG_DIR}/${IF2}.conf"
+check "service files for ${IF2} are written" _awgBtInstallServiceFiles "${IF2}"
+systemctl start "awg-quick@${IF2}.service"
+check "${IF2} starts" test "$?" -eq 0
+systemctl stop "awg-quick@${IF2}.service"
+check "PostDown hook 1 ran exactly once" test "$(grep -c "^hook1-${IF2}$" "${HOOK_LOG}")" -eq 1
+check "hook 3, after the failing hook 2, was never run by the runtime" test "$(grep -c "^hook3-${IF2}$" "${HOOK_LOG}")" -eq 0
+check "poststop reported the unfinished down" \
+	grep -q "not replayed, because no hook may run twice" <<<"$(journalctl -u "awg-quick@${IF2}.service" --no-pager -n 80)"
+check "and ${IF2} is gone" test ! -e "/sys/class/net/${IF2}" -a ! -e "${AWG_BT_RUN_DIR}/${IF2}.state"
+systemctl reset-failed "awg-quick@${IF2}.service" >/dev/null 2>&1
 
 echo "=== Final stop"
 systemctl stop "${UNIT}"
