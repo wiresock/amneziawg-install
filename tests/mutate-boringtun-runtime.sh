@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+
+# Mutation check for the internal BoringTun runtime layer. Each mutant breaks
+# one rule of the runtime in a private copy of amneziawg-install.sh, and
+# tests/test-boringtun-runtime.sh must then fail. A mutant that no longer
+# applies (its code changed) or that survives fails this script.
+#
+# It runs the unit suite once per mutant, so it is not part of CI. Run it after
+# changing the runtime, with the unit suite's own requirements (cc, python3,
+# setpriv):
+#
+#   bash tests/mutate-boringtun-runtime.sh [-j JOBS] [NAME...]
+
+set -uo pipefail
+
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+JOBS=4
+if [[ "${1:-}" == -j ]]; then
+	JOBS="${2:?}"
+	shift 2
+fi
+
+declare -a NAMES=() OLDS=() NEWS=()
+# mutant <name> <exact text, present exactly once> <replacement>
+mutant() {
+	NAMES+=("$1")
+	OLDS+=("$2")
+	NEWS+=("$3")
+}
+
+T=$'\t'
+
+# Activation boundary and store verification.
+mutant dispatch_without_internal_flag '[[ "${_AWG_BORINGTUN_RUNTIME_INTERNAL}" == 1 && "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]' 	'[[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]'
+mutant no_sha_check 'if [[ "${ACTUAL_SHA}" != "${FIELDS[binary_sha256]}" ]]; then' 'if false; then'
+mutant no_mode_check '(((8#${MODE} & 8#022) == 0)) || return 1' ':'
+mutant no_ancestor_check $'function _awgBtTrustedAncestors() {\n' $'function _awgBtTrustedAncestors() {\n\treturn 0\n'
+mutant runtime_unknown_key_ok '_awgBtErr "unknown key ${KEY} in ${FILE}"'$'\n'"${T}${T}${T}${T}return 1" ':'
+# The daemon's command line and descriptors.
+mutant env_not_scrubbed '_AWG_BT_ARGV=("${ENV_BIN}" -i ' '_AWG_BT_ARGV=("${ENV_BIN}" '
+mutant no_foreground '"$1" --foreground --disable-drop-privileges' '"$1" --disable-drop-privileges'
+mutant descriptors_not_closed $'function _awgBtCloseInheritedFds() {\n' $'function _awgBtCloseInheritedFds() {\n\treturn 0\n'
+mutant launch_without_precheck '[[ "${_AWG_BT_STATE[PHASE]}" != prechecked ]]' 'false'
+# precheck.
+mutant no_module_loaded_check 'if [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then' 'if false; then'
+mutant no_autoload_check 'if modinfo -n amneziawg >/dev/null 2>&1; then' 'if false; then'
+mutant no_saveconfig_check '_awgBtSaveConfigEnabled "${CONFIG_FILE}" || RC=$?' 'RC=1'
+mutant b1_no_preexisting_refusal 'if [[ -n "${PRESENT}" ]]; then' 'if false; then'
+# poststart and the shared active-instance check.
+mutant no_tun_check $'if ! _awgBtLinkIsTun "${INTERFACE_NAME}"; then\n\t\t_awgBtErr "${INTERFACE_NAME} is not a TUN device' \
+	$'if false; then\n\t\t_awgBtErr "${INTERFACE_NAME} is not a TUN device'
+mutant no_exe_check 'if [[ "${EXE}" != "${_AWG_BT_VERIFIED_BIN}" ]]; then' 'if false; then'
+mutant s9_no_sync_down 'if WORK="$(_awgBtDownCopy "${INTERFACE_NAME}" "${CONFIG_FILE}")" && _awgBtQuickDownCopy "${INTERFACE_NAME}" "${WORK}"; then' 'if false; then'
+# stop and poststop (B1, S1).
+mutant b1_poststop_ignores_attempt \
+	$'if [[ "${_AWG_BT_STATE[PHASE]}" == up && "${_AWG_BT_STATE[DOWN]}" == none && -n "${INDEX}" &&\n\t\t\t"${INDEX}" == "${_AWG_BT_STATE[IFINDEX]}" ]]' \
+	'if [[ -n "${INDEX}" ]]'
+# Not a mutant: poststop's outer PHASE=started guard is redundant with the
+# PHASE=up checks inside it, so removing it alone changes nothing.
+mutant s1_no_down_attempt_record \
+	$'_AWG_BT_STATE[DOWN]=attempted\n\tif ! _awgBtStateSave "${INTERFACE_NAME}"; then' \
+	'if false; then'
+mutant s1_failed_down_counts_as_intact \
+	$'elif [[ "$(_awgBtLinkIndex "${INTERFACE_NAME}")" == "${_AWG_BT_STATE[IFINDEX]}" ]]; then\n\t\t_AWG_BT_STATE[DOWN]=failed-intact' \
+	$'elif true; then\n\t\t_AWG_BT_STATE[DOWN]=failed-intact'
+mutant s1_replay_after_partial_down 'none | failed-intact)' 'none | failed-intact | attempted | failed)'
+# Socket ownership (S2).
+mutant s2_remove_replaced_node '[[ "${CURRENT}" == "$2" ]] || return 0' ':'
+mutant s2_remove_while_owner_lives '_awgBtProcessIs "$3" "$4" && return 0' ':'
+mutant s2_inode_only_identity "stat -c '%d:%i:%f:%.9Z'" "stat -c '%d:%i:%f:0.000000000'"
+# SaveConfig (S5).
+mutant s5_down_keeps_saveconfig '_awgBtWithoutSaveConfig "$2" >"${WORK}/$1.conf"' 'cat -- "$2" >"${WORK}/$1.conf"'
+mutant s5_quickup_default_config 'if ! "${CTL}" precheck "${INTERFACE_NAME}" "${CONFIG_FILE}"; then' 'if ! "${CTL}" precheck "${INTERFACE_NAME}"; then'
+# ensureAwgBackendReady (S6).
+mutant s6_no_active_check 'if ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}"; then' 'if false; then'
+mutant s6_no_mainpid_check 'if [[ "${MAIN_PID}" != "${_AWG_BT_STATE[PID]}" ]]; then' 'if false; then'
+# ListenPort in staged validation (S7).
+mutant s7_no_port_validation 'if ((PORTS > 1)) || ! [[ "${PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || ((10#${PORT} > 65535)); then' 'if false; then'
+# daemon-reload (S8).
+mutant s8_reload_only_on_change $'\tsystemctl daemon-reload || return 1\n\treturn 0' $'\t((_AWG_BT_FILE_CHANGED == 0)) || systemctl daemon-reload || return 1\n\treturn 0'
+# Process identity (S4).
+mutant s4_signal_without_identity $'\t_awgBtProcessIs "$1" "$2" || return 1\n\tkill "-$3" "$1"' $'\tkill "-$3" "$1"'
+mutant s4_zombie_counts_as_alive '[[ -n "${FIELDS[0]:-}" && "${FIELDS[0]}" != [ZXx] && "${FIELDS[19]:-}" == "${START}" ]]' '[[ -n "${FIELDS[0]:-}" && "${FIELDS[19]:-}" == "${START}" ]]'
+# Scratch lifecycle (S3) and the sweep.
+mutant s3_no_scratch_collision_check '_awgBtErr "refusing to start scratch interface ${NAME}: the name is already in use"'$'\n'"${T}${T}return 1" ':'
+mutant s3_no_pdeathsig 'exec setpriv --pdeathsig KILL -- "${_AWG_BT_ARGV[@]}"' 'exec "${_AWG_BT_ARGV[@]}"'
+mutant s3_daemon_keeps_ignored_signals $'\t\ttrap - HUP INT TERM\n\t\t_awgBtCloseInheritedFds\n\t\texec setpriv' $'\t\t_awgBtCloseInheritedFds\n\t\texec setpriv'
+mutant s3_reclaim_leaves_unit $'\t\tsystemctl stop "${UNIT}.service" >/dev/null 2>&1\n' ''
+mutant s3_sweep_ignores_liveness '((ALIVE)) && continue' ':'
+mutant s3_no_sweep $'\t_awgBtScratchSweep\n\t_awgBtVerifyStore || return 1' $'\t_awgBtVerifyStore || return 1'
+# The ListenPort filter and the awg-quick parser.
+mutant filter_always_strips '((INDEX == PORT_INDEX)) && ((10#${CONFIGURED} == LIVE))' '((INDEX == PORT_INDEX))'
+mutant filter_never_strips '((INDEX == PORT_INDEX)) && ((10#${CONFIGURED} == LIVE))' 'false'
+mutant parser_case_sensitive $'\tshopt -s nocasematch\n\twhile read -r LINE' $'\twhile read -r LINE'
+
+if [[ $# -gt 0 ]]; then
+	declare -a SELECTED=()
+	for NAME in "$@"; do
+		FOUND=0
+		for I in "${!NAMES[@]}"; do
+			[[ "${NAMES[I]}" == "${NAME}" ]] && SELECTED+=("${I}") && FOUND=1
+		done
+		((FOUND)) || { echo "unknown mutant ${NAME}" >&2; exit 2; }
+	done
+else
+	SELECTED=("${!NAMES[@]}")
+fi
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/boringtun-mutants.XXXXXX")"
+trap 'rm -rf -- "${WORK}"' EXIT
+
+run_one() { # <index>
+	local I="$1" DIR="${WORK}/m$1" OUT RC SUMMARY
+	mkdir -p "${DIR}/tests" "${DIR}/scripts"
+	cp "${PROJECT_ROOT}/tests/test-boringtun-runtime.sh" "${DIR}/tests/"
+	cp "${PROJECT_ROOT}/scripts/boringtun-artifact.sh" "${DIR}/scripts/"
+	if ! OLD="${OLDS[I]}" NEW="${NEWS[I]}" perl -0777 -ne '
+		my $o = $ENV{OLD}; my $n = $ENV{NEW};
+		my $c = () = /\Q$o\E/g;
+		die "matches $c times\n" unless $c == 1;
+		s/\Q$o\E/$n/; print;' "${PROJECT_ROOT}/amneziawg-install.sh" >"${DIR}/amneziawg-install.sh" 2>"${DIR}/apply.err"; then
+		printf '%-38s DID NOT APPLY (%s)\n' "${NAMES[I]}" "$(cat "${DIR}/apply.err")"
+		return
+	fi
+	OUT="$(cd "${DIR}" && timeout 900 bash tests/test-boringtun-runtime.sh 2>&1)"
+	RC=$?
+	SUMMARY="$(grep 'runtime tests:' <<<"${OUT}" | tail -n 1)"
+	if ((RC == 0)); then
+		printf '%-38s SURVIVED (%s)\n' "${NAMES[I]}" "${SUMMARY}"
+	else
+		printf '%-38s caught: %s | %s\n' "${NAMES[I]}" "${SUMMARY:-no summary, rc=${RC}}" \
+			"$(grep -m1 'FAIL:' <<<"${OUT}" | sed 's/^ *//' | cut -c1-100)"
+	fi
+}
+
+for I in "${SELECTED[@]}"; do
+	while (($(jobs -rp | wc -l) >= JOBS)); do
+		wait -n
+	done
+	run_one "${I}" >"${WORK}/result.${I}" &
+done
+wait
+
+BAD=0
+for I in "${SELECTED[@]}"; do
+	cat "${WORK}/result.${I}"
+	grep -qE 'SURVIVED|DID NOT APPLY' "${WORK}/result.${I}" && BAD=$((BAD + 1))
+done
+echo
+echo "BoringTun runtime mutants: $((${#SELECTED[@]} - BAD)) of ${#SELECTED[@]} caught"
+((BAD == 0))

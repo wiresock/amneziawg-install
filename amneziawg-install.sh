@@ -4060,6 +4060,12 @@ function awgSyncInterfaceConfig() {
 # only the AWG_BT_* settings that the helpers embed, never other installer
 # state, and must work under `set -u`.
 #
+# Every destructive step acts only on what the runtime can show it owns: the
+# state of the current start attempt (<run dir>/<if>.state) for the service,
+# and per-attempt records for scratch instances. Processes are identified by
+# PID and start time, socket nodes by device and inode, links by ifindex.
+# Without that evidence a resource is left alone.
+#
 # Nothing here is reachable in an ordinary run. The seam dispatches to it only
 # after _awgInternalSelectBoringtunRuntimeForTesting, and params validation
 # still rejects a persisted AWG_BACKEND=boringtun.
@@ -4074,10 +4080,13 @@ _AWG_BT_HELPER_VARIABLES="AWG_BT_STORE_DIR AWG_BT_LIBEXEC_DIR AWG_BT_RUN_DIR AWG
 _AWG_BT_VERIFIED_BIN=""
 _AWG_BT_FILE_CHANGED=0
 _AWG_BT_ARGV=()
-declare -gA _AWG_BT_SCRATCH_UNITS=()
-declare -gA _AWG_BT_SCRATCH_PIDS=()
-declare -gA _AWG_BT_SCRATCH_PID_STARTS=()
+# The ownership state of the interface a helper works on (_awgBtStateLoad).
+declare -gA _AWG_BT_STATE=()
+# Scratch instances created by this shell, by interface name: the attempt's
+# token, its guardian's PID and the guardian's start time.
+declare -gA _AWG_BT_SCRATCH_TOKENS=()
 declare -gA _AWG_BT_SCRATCH_GUARDS=()
+declare -gA _AWG_BT_SCRATCH_GUARD_STARTS=()
 
 # Internal, undocumented: select the BoringTun runtime for this shell only, so
 # tests that source the installer can exercise its branches. It is not reachable
@@ -4317,10 +4326,6 @@ function _awgBtPidFile() {
 	printf '%s/boringtun-%s.pid\n' "${AWG_BT_RUN_DIR}" "$1"
 }
 
-function _awgBtMarkerFile() {
-	printf '%s/%s.up\n' "${AWG_BT_RUN_DIR}" "$1"
-}
-
 # The private runtime directory: a root-owned 0700 directory, never a symlink.
 function _awgBtPrepareRunDir() {
 	local OWNER="" MODE=""
@@ -4333,11 +4338,12 @@ function _awgBtPrepareRunDir() {
 	[[ ! -L "${AWG_BT_RUN_DIR}" && -d "${AWG_BT_RUN_DIR}" && "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${MODE}" == 700 ]]
 }
 
-# Replace one state file in the runtime directory atomically.
+# Replace one state file in the runtime directory atomically. mv -T refuses to
+# move the new file into a directory that took the state file's name.
 function _awgBtWriteState() {
 	local FILE="$1" CONTENT="$2" TMP
 	TMP="$(mktemp "${FILE}.XXXXXX")" || return 1
-	if printf '%s' "${CONTENT}" >"${TMP}" && mv -f -- "${TMP}" "${FILE}"; then
+	if printf '%s' "${CONTENT}" >"${TMP}" && mv -fT -- "${TMP}" "${FILE}"; then
 		return 0
 	fi
 	rm -f -- "${TMP}"
@@ -4358,17 +4364,6 @@ function _awgBtUapiReady() {
 		_awgBtListenPort "$1" >/dev/null
 }
 
-function _awgBtUapiLive() {
-	awg show "$1" >/dev/null 2>&1
-}
-
-# Remove this interface's UAPI socket paths, but only when no daemon answers on
-# them: deleting a live daemon's socket makes that daemon exit.
-function _awgBtRemoveStaleSockets() {
-	_awgBtUapiLive "$1" && return 0
-	rm -f -- "${AWG_BT_WG_SOCKET_DIR}/$1.sock" "${AWG_BT_AWG_SOCKET_DIR}/$1.sock"
-}
-
 function _awgBtLinkExists() {
 	[[ -e "${AWG_BT_SYS_DIR}/class/net/$1" ]]
 }
@@ -4378,45 +4373,206 @@ function _awgBtLinkIsTun() {
 	[[ -e "${AWG_BT_SYS_DIR}/class/net/$1/tun_flags" ]]
 }
 
+function _awgBtLinkIndex() {
+	local INDEX
+	INDEX="$(cat -- "${AWG_BT_SYS_DIR}/class/net/$1/ifindex" 2>/dev/null)" || return 1
+	[[ "${INDEX}" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+	printf '%s\n' "${INDEX}"
+}
+
 # The same membership test awg-quick down uses.
 function _awgBtListedByAwg() {
 	[[ " $(awg show interfaces 2>/dev/null) " == *" $1 "* ]]
 }
 
-# A PID is alive while /proc lists it and it is not a zombie.
-function _awgBtProcessAlive() {
+# The fields of /proc/<pid>/stat that follow the command name: the state
+# (field 3) is the first and the start time (field 22) the twentieth.
+function _awgBtProcStat() {
 	local STAT
-	[[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+	[[ "${1:-}" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
 	STAT="$(cat -- "${AWG_BT_PROC_DIR}/$1/stat" 2>/dev/null)" || return 1
-	STAT="${STAT##*) }"
-	[[ -n "${STAT}" && "${STAT:0:1}" != Z ]]
+	[[ "${STAT}" == *") "* ]] || return 1
+	printf '%s\n' "${STAT##*) }"
 }
 
-# Stop one tracked process: SIGTERM, a bounded wait, then SIGKILL. Only this PID
-# is signalled; nothing is ever matched by name. A caller that is not the
-# process's parent passes its start time (field 22 of /proc/<pid>/stat): the
-# PID is then released as soon as the process is reaped and may be reused, so
-# the start time is checked again before each signal.
-function _awgBtStopProcess() {
-	local PID="$1" START="${2:-}" I
-	_awgBtStopTarget "${PID}" "${START}" || return 0
-	kill -TERM "${PID}" 2>/dev/null || return 0
+# The start time of a process, which tells it from a later process that reuses
+# its PID. A zombie still has one.
+function _awgBtProcessStartTime() {
+	local -a FIELDS=()
+	read -r -a FIELDS <<<"$(_awgBtProcStat "${1:-}")"
+	[[ "${FIELDS[19]:-}" =~ ^[0-9]{1,20}$ ]] || return 1
+	printf '%s\n' "${FIELDS[19]}"
+}
+
+# A PID is alive while /proc lists it and it is neither a zombie nor dead.
+function _awgBtProcessAlive() {
+	local -a FIELDS=()
+	read -r -a FIELDS <<<"$(_awgBtProcStat "${1:-}")"
+	[[ -n "${FIELDS[0]:-}" && "${FIELDS[0]}" != [ZXx] ]]
+}
+
+# PID is still the live process that started at START. A zombie, a process
+# with another start time and a PID that /proc does not list all fail: the
+# runtime treats them as gone and never signals them.
+function _awgBtProcessIs() {
+	local PID="${1:-}" START="${2:-}"
+	local -a FIELDS=()
+	[[ "${PID}" =~ ^[1-9][0-9]{0,9}$ && "${START}" =~ ^[0-9]{1,20}$ ]] || return 1
+	read -r -a FIELDS <<<"$(_awgBtProcStat "${PID}")"
+	[[ -n "${FIELDS[0]:-}" && "${FIELDS[0]}" != [ZXx] && "${FIELDS[19]:-}" == "${START}" ]]
+}
+
+# Send SIGNAL to PID only while it is the process that started at START. PID 1
+# and the calling process are never signalled.
+function _awgBtSignalProcess() { # <pid> <start time> <signal>
+	[[ "${1:-}" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+	(($1 > 1 && $1 != $$ && $1 != BASHPID)) || return 1
+	_awgBtProcessIs "$1" "$2" || return 1
+	kill "-$3" "$1" 2>/dev/null
+}
+
+# Stop an identified process: SIGTERM, up to five seconds, then SIGKILL, with
+# its identity checked again before each signal. It returns 1 only if the
+# process still runs. Bash cannot signal through a pidfd, so a PID reused in
+# the instant between a check and the kill that follows it remains possible.
+function _awgBtStopProcess() { # <pid> <start time>
+	local PID="$1" START="$2" I
+	_awgBtSignalProcess "${PID}" "${START}" TERM || return 0
 	for ((I = 0; I < 50; I++)); do
-		_awgBtStopTarget "${PID}" "${START}" || return 0
+		_awgBtProcessIs "${PID}" "${START}" || return 0
 		sleep 0.1
 	done
-	_awgBtStopTarget "${PID}" "${START}" || return 0
-	kill -KILL "${PID}" 2>/dev/null
-	return 0
+	_awgBtSignalProcess "${PID}" "${START}" KILL || return 0
+	for ((I = 0; I < 30; I++)); do
+		_awgBtProcessIs "${PID}" "${START}" || return 0
+		sleep 0.1
+	done
+	return 1
 }
 
-function _awgBtStopTarget() {
-	local STAT FIELDS=()
-	_awgBtProcessAlive "$1" || return 1
-	[[ -z "$2" ]] && return 0
-	STAT="$(cat -- "${AWG_BT_PROC_DIR}/$1/stat" 2>/dev/null)" || return 1
-	read -r -a FIELDS <<<"${STAT##*) }"
-	[[ "${FIELDS[19]:-}" == "$2" ]]
+# "<device>:<inode>:<raw mode>:<ctime in ns>" of the node at a path, never
+# following a final symlink. A UAPI socket node is recorded this way while its
+# daemon runs. The kernel reuses a freed inode number at once, so the change
+# time is what tells a node from its replacement.
+function _awgBtPathId() {
+	[[ -e "$1" || -L "$1" ]] || return 1
+	stat -c '%d:%i:%f:%.9Z' -- "$1" 2>/dev/null
+}
+
+# Remove the node at PATH only if it is still the node recorded as ID and the
+# process PID/START that created it is gone. A replaced node, an unrecorded one
+# and one whose daemon may still serve it are left alone. A failed awg query is
+# never evidence that a socket is stale.
+function _awgBtRemoveOwnedPath() { # <path> <id> <pid> <start time>
+	local CURRENT
+	[[ -n "$2" && -n "$3" && -n "$4" ]] || return 0
+	_awgBtProcessIs "$3" "$4" && return 0
+	CURRENT="$(_awgBtPathId "$1")" || return 0
+	[[ "${CURRENT}" == "$2" ]] || return 0
+	rm -f -- "$1"
+}
+
+function _awgBtNewToken() {
+	local TOKEN
+	TOKEN="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null)" || return 1
+	TOKEN="${TOKEN//[[:space:]]/}"
+	[[ "${TOKEN}" =~ ^[0-9a-f]{32}$ ]] || return 1
+	printf '%s\n' "${TOKEN}"
+}
+
+# ── Service ownership state ─────────────────────────────────────────────────
+# Each start attempt of awg-quick@<if>, or of awgBackendQuickUp, is recorded in
+# <run dir>/<if>.state: a root-owned 0600 file that is replaced atomically,
+# parsed against a strict allowlist and never sourced. systemd runs the hooks
+# one at a time, so each one is the only writer while it runs:
+#   precheck   a new ATTEMPT, its CONFIG and PRE_EXISTING (a link, socket or
+#              awg interface of the name already existed), PHASE=started, and
+#              PHASE=prechecked once every check passed
+#   launcher   PHASE=launching with the daemon's PID and PID_START, the socket
+#              nodes (WG_SOCK, AWG_SOCK) as they appear, then PHASE=launched
+#              with the TUN link's IFINDEX
+#   poststart  PHASE=up (and IFINDEX if awg-quick made a kernel link instead)
+#   stop       DOWN=attempted before awg-quick down, then DOWN=done,
+#              failed-intact (the link survived, so no PostDown hook started)
+#              or failed (the hooks may have run in part)
+#   poststop   REPLAY=started and done around a PostDown replay, then removes
+#              the file
+# Without a readable state for the interface nothing is owned and nothing but
+# its PID file is removed.
+function _awgBtStateFile() {
+	printf '%s/%s.state\n' "${AWG_BT_RUN_DIR}" "$1"
+}
+
+function _awgBtStateValueValid() { # <key> <value>
+	case "$1" in
+		FORMAT) [[ "$2" == 1 ]] ;;
+		ATTEMPT) [[ "$2" =~ ^[0-9a-f]{32}$ ]] ;;
+		CONFIG) [[ "$2" =~ ^/[^[:cntrl:]]*\.conf$ ]] ;;
+		PRE_EXISTING) [[ "$2" == 0 || "$2" == 1 ]] ;;
+		PHASE) [[ "$2" =~ ^(started|prechecked|launching|launched|up)$ ]] ;;
+		PID | IFINDEX) [[ "$2" =~ ^([1-9][0-9]{0,9})?$ ]] ;;
+		PID_START) [[ "$2" =~ ^([0-9]{1,20})?$ ]] ;;
+		WG_SOCK | AWG_SOCK) [[ "$2" =~ ^([0-9]+:[0-9]+:[0-9a-f]+:[0-9]+\.[0-9]{9})?$ ]] ;;
+		DOWN) [[ "$2" =~ ^(none|attempted|done|failed-intact|failed)$ ]] ;;
+		REPLAY) [[ "$2" =~ ^(none|started|done)$ ]] ;;
+		*) return 1 ;;
+	esac
+}
+
+# A fresh attempt in _AWG_BT_STATE, not yet saved.
+function _awgBtStateNew() { # <config>
+	local ATTEMPT
+	ATTEMPT="$(_awgBtNewToken)" || return 1
+	_AWG_BT_STATE=([FORMAT]=1 [ATTEMPT]="${ATTEMPT}" [CONFIG]="$1" [PRE_EXISTING]=0 [PHASE]=started
+		[PID]="" [PID_START]="" [IFINDEX]="" [WG_SOCK]="" [AWG_SOCK]="" [DOWN]=none [REPLAY]=none)
+}
+
+function _awgBtStateSave() { # <interface>
+	local KEY CONTENT=""
+	for KEY in FORMAT ATTEMPT CONFIG PRE_EXISTING PHASE PID PID_START IFINDEX WG_SOCK AWG_SOCK DOWN REPLAY; do
+		_awgBtStateValueValid "${KEY}" "${_AWG_BT_STATE[${KEY}]-}" || return 1
+		CONTENT+="${KEY}=${_AWG_BT_STATE[${KEY}]-}"$'\n'
+	done
+	_awgBtWriteState "$(_awgBtStateFile "$1")" "${CONTENT}"
+}
+
+function _awgBtStateLoad() { # <interface>
+	local FILE LINE KEY VALUE OWNER="" MODE=""
+	_AWG_BT_STATE=()
+	FILE="$(_awgBtStateFile "$1")"
+	[[ ! -L "${FILE}" && -f "${FILE}" ]] || return 1
+	read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${FILE}")"
+	if [[ "${OWNER}" != "${AWG_BT_TRUSTED_UID}" || "${MODE}" != 600 ]]; then
+		_awgBtErr "ignoring ${FILE}: it is not a root-owned 0600 file"
+		return 1
+	fi
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		if [[ ! "${LINE}" =~ ^([A-Z_]+)=(.*)$ ]]; then
+			_AWG_BT_STATE=()
+			_awgBtErr "ignoring ${FILE}: malformed line"
+			return 1
+		fi
+		KEY="${BASH_REMATCH[1]}"
+		VALUE="${BASH_REMATCH[2]}"
+		if [[ -n "${_AWG_BT_STATE[${KEY}]+set}" ]] || ! _awgBtStateValueValid "${KEY}" "${VALUE}"; then
+			_AWG_BT_STATE=()
+			_awgBtErr "ignoring ${FILE}: unexpected, repeated or invalid ${KEY}"
+			return 1
+		fi
+		_AWG_BT_STATE["${KEY}"]="${VALUE}"
+	done <"${FILE}"
+	for KEY in FORMAT ATTEMPT CONFIG PRE_EXISTING PHASE PID PID_START IFINDEX WG_SOCK AWG_SOCK DOWN REPLAY; do
+		if [[ -z "${_AWG_BT_STATE[${KEY}]+set}" ]]; then
+			_AWG_BT_STATE=()
+			_awgBtErr "ignoring ${FILE}: it has no ${KEY}"
+			return 1
+		fi
+	done
+	if [[ "${_AWG_BT_STATE[CONFIG]}" != */"$1".conf ]]; then
+		_AWG_BT_STATE=()
+		_awgBtErr "ignoring ${FILE}: its CONFIG is not a $1.conf"
+		return 1
+	fi
 }
 
 # The one BoringTun command line, shared by the launcher and scratch
@@ -4446,11 +4602,15 @@ function _awgBtCloseInheritedFds() {
 # ── awg-boringtun-launch ─────────────────────────────────────────────────────
 # awg-quick runs this, as WG_QUICK_USERSPACE_IMPLEMENTATION, with the interface
 # name as its only argument, and continues with `awg setconf` as soon as it
-# returns. It starts the verified BoringTun binary as a background child, waits
-# until the UAPI answers and only then writes the PID file that systemd's
-# Type=forking unit tracks. On any failure it stops the child and cleans up.
+# returns. It serves only an attempt that passed precheck, and only while no
+# link or UAPI socket of the name exists. It starts the verified BoringTun
+# binary as its child and records the child's PID and start time, then each
+# socket node as the child creates it, in the attempt's state. Only once the
+# UAPI answers does it write the PID file that systemd's Type=forking unit
+# tracks. On any failure it stops the child and removes only the socket nodes
+# that child was seen to create.
 function awgBoringtunLaunchMain() {
-	local INTERFACE_NAME="${1:-}" PID_FILE CHILD I LIMIT
+	local INTERFACE_NAME="${1:-}" PID_FILE WG_PATH AWG_PATH CHILD CHILD_START="" INDEX="" I LIMIT
 	if [[ $# -ne 1 ]] || ! _awgBtValidInterfaceName "${INTERFACE_NAME}"; then
 		_awgBtErr "usage: awg-boringtun-launch <interface>"
 		return 2
@@ -4461,30 +4621,60 @@ function awgBoringtunLaunchMain() {
 		_awgBtErr "cannot prepare the private runtime directory ${AWG_BT_RUN_DIR}"
 		return 1
 	fi
-	PID_FILE="$(_awgBtPidFile "${INTERFACE_NAME}")"
-	rm -f -- "${PID_FILE}"
-	if _awgBtUapiLive "${INTERFACE_NAME}"; then
-		_awgBtErr "a live daemon already answers on the UAPI socket of ${INTERFACE_NAME}"
+	if ! _awgBtStateLoad "${INTERFACE_NAME}" || [[ "${_AWG_BT_STATE[PHASE]}" != prechecked ]]; then
+		_awgBtErr "${INTERFACE_NAME} has not passed awg-backend-ctl precheck for this start"
 		return 1
 	fi
+	WG_PATH="${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock"
+	AWG_PATH="${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock"
+	if _awgBtLinkExists "${INTERFACE_NAME}" || [[ -e "${WG_PATH}" || -L "${WG_PATH}" || -e "${AWG_PATH}" || -L "${AWG_PATH}" ]]; then
+		_awgBtErr "refusing to start BoringTun: a link or UAPI socket named ${INTERFACE_NAME} appeared after precheck; it is left untouched"
+		return 1
+	fi
+	PID_FILE="$(_awgBtPidFile "${INTERFACE_NAME}")"
+	rm -f -- "${PID_FILE}"
 	_awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${INTERFACE_NAME}" || return 1
 	(
 		_awgBtCloseInheritedFds
 		exec "${_AWG_BT_ARGV[@]}" </dev/null
 	) &
 	CHILD=$!
+	# Bash reaps a background child as soon as it exits, so its PID alone does
+	# not identify it for long; its start time does.
+	CHILD_START="$(_awgBtProcessStartTime "${CHILD}")" || CHILD_START=""
+	_AWG_BT_STATE[PHASE]=launching
+	_AWG_BT_STATE[PID]="${CHILD}"
+	_AWG_BT_STATE[PID_START]="${CHILD_START}"
+	if [[ -z "${CHILD_START}" ]] || ! _awgBtStateSave "${INTERFACE_NAME}"; then
+		_awgBtErr "cannot record the BoringTun daemon of ${INTERFACE_NAME}"
+		_awgBtLaunchFailed "${INTERFACE_NAME}" "${CHILD}"
+		return 1
+	fi
 	LIMIT=$((AWG_BT_READY_TIMEOUT * 10))
 	for ((I = 0; I < LIMIT; I++)); do
-		if ! _awgBtProcessAlive "${CHILD}"; then
+		if ! _awgBtProcessIs "${CHILD}" "${CHILD_START}"; then
 			_awgBtErr "boringtun-cli exited before ${INTERFACE_NAME} became ready"
 			_awgBtLaunchFailed "${INTERFACE_NAME}" "${CHILD}"
 			return 1
 		fi
-		if _awgBtUapiReady "${INTERFACE_NAME}"; then
-			if _awgBtWriteState "${PID_FILE}" "${CHILD}"$'\n'; then
+		if ! _awgBtRecordSocketNodes "${INTERFACE_NAME}"; then
+			_awgBtErr "cannot record the UAPI sockets of ${INTERFACE_NAME}"
+			_awgBtLaunchFailed "${INTERFACE_NAME}" "${CHILD}"
+			return 1
+		fi
+		if [[ -n "${_AWG_BT_STATE[WG_SOCK]}" && -n "${_AWG_BT_STATE[AWG_SOCK]}" ]] &&
+			_awgBtLinkIsTun "${INTERFACE_NAME}" && INDEX="$(_awgBtLinkIndex "${INTERFACE_NAME}")" &&
+			_awgBtUapiReady "${INTERFACE_NAME}"; then
+			# The nodes as the ready daemon serves them, in case they changed
+			# since they were first seen.
+			_AWG_BT_STATE[WG_SOCK]="$(_awgBtPathId "${WG_PATH}")"
+			_AWG_BT_STATE[AWG_SOCK]="$(_awgBtPathId "${AWG_PATH}")"
+			_AWG_BT_STATE[PHASE]=launched
+			_AWG_BT_STATE[IFINDEX]="${INDEX}"
+			if _awgBtStateSave "${INTERFACE_NAME}" && _awgBtWriteState "${PID_FILE}" "${CHILD}"$'\n'; then
 				return 0
 			fi
-			_awgBtErr "cannot write ${PID_FILE}"
+			_awgBtErr "cannot record that ${INTERFACE_NAME} is ready"
 			_awgBtLaunchFailed "${INTERFACE_NAME}" "${CHILD}"
 			return 1
 		fi
@@ -4495,10 +4685,35 @@ function awgBoringtunLaunchMain() {
 	return 1
 }
 
-function _awgBtLaunchFailed() {
-	_awgBtStopProcess "$2"
+# Record each UAPI socket node the daemon has created since the last look. The
+# caller has just seen the daemon alive.
+function _awgBtRecordSocketNodes() { # <interface>
+	local KEY NODE ID CHANGED=0
+	for KEY in WG_SOCK AWG_SOCK; do
+		[[ -z "${_AWG_BT_STATE[${KEY}]}" ]] || continue
+		if [[ "${KEY}" == WG_SOCK ]]; then
+			NODE="${AWG_BT_WG_SOCKET_DIR}/$1.sock"
+		else
+			NODE="${AWG_BT_AWG_SOCKET_DIR}/$1.sock"
+		fi
+		ID="$(_awgBtPathId "${NODE}")" || continue
+		_AWG_BT_STATE["${KEY}"]="${ID}"
+		CHANGED=1
+	done
+	((CHANGED == 0)) || _awgBtStateSave "$1"
+}
+
+# Stop and reap the launcher's child, then remove the socket nodes it was seen
+# to create and the PID file. The state keeps the record for poststop.
+function _awgBtLaunchFailed() { # <interface> <child pid>
+	# A child whose start time could not be read had already exited and been
+	# reaped, so its PID may name another process by now: it is not signalled.
+	if [[ -n "${_AWG_BT_STATE[PID_START]-}" ]]; then
+		_awgBtStopProcess "$2" "${_AWG_BT_STATE[PID_START]}"
+	fi
 	wait "$2" 2>/dev/null
-	_awgBtRemoveStaleSockets "$1"
+	_awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/$1.sock" "${_AWG_BT_STATE[WG_SOCK]-}" "$2" "${_AWG_BT_STATE[PID_START]-}"
+	_awgBtRemoveOwnedPath "${AWG_BT_AWG_SOCKET_DIR}/$1.sock" "${_AWG_BT_STATE[AWG_SOCK]-}" "$2" "${_AWG_BT_STATE[PID_START]-}"
 	rm -f -- "$(_awgBtPidFile "$1")"
 }
 
@@ -4550,15 +4765,14 @@ function _awgBtSaveConfigEnabled() {
 	return 1
 }
 
-# Replay the [Interface] PostDown hooks of the server config after the interface
-# went away without `awg-quick down`. Like awg-quick's execute_hooks, each hook
+# Replay the [Interface] PostDown hooks of CONFIG after the interface went away
+# without awg-quick down running them. Like awg-quick's execute_hooks, each hook
 # gets %i replaced and runs in its own shell with `set -e -o pipefail` and
 # LC_ALL=C; unlike awg-quick, a failing hook is logged and the rest still run.
 # PreDown and SaveConfig are never replayed.
-function _awgBtReplayPostDown() {
-	local INTERFACE_NAME="$1" CONFIG_FILE HOOK
+function _awgBtReplayPostDown() { # <interface> <config>
+	local INTERFACE_NAME="$1" CONFIG_FILE="$2" HOOK
 	local -a HOOKS=()
-	CONFIG_FILE="${AWG_BT_CONFIG_DIR}/${INTERFACE_NAME}.conf"
 	if [[ ! -f "${CONFIG_FILE}" || ! -r "${CONFIG_FILE}" ]]; then
 		_awgBtErr "cannot replay PostDown hooks: ${CONFIG_FILE} is not readable"
 		return 1
@@ -4572,6 +4786,76 @@ function _awgBtReplayPostDown() {
 		fi
 	done
 	return 0
+}
+
+# awg-quick down was started but did not finish: its PostDown hooks may have
+# run in part. They are never run a second time; name them instead.
+function _awgBtReportUnfinishedDown() { # <interface> <config>
+	local HOOK
+	local -a HOOKS=()
+	_awgBtErr "awg-quick down of $1 was started but did not finish, so its PostDown hooks may have run in part; they are not replayed, because no hook may run twice. Check by hand what these undo:"
+	if [[ -f "$2" && -r "$2" ]]; then
+		mapfile -d '' -t HOOKS < <(_awgBtInterfaceValues "$2" PostDown)
+	fi
+	for HOOK in ${HOOKS[@]+"${HOOKS[@]}"}; do
+		_awgBtErr "  PostDown = ${HOOK//%i/$1}"
+	done
+}
+
+# CONFIG without its [Interface] SaveConfig lines, which are found the way
+# awg-quick's parse_options finds them; every other line is copied unchanged.
+function _awgBtWithoutSaveConfig() { # <config>
+	local LINE STRIPPED KEY IN_INTERFACE=0 RC=0 RESTORE_NOCASE=0
+	shopt -q nocasematch || RESTORE_NOCASE=1
+	shopt -s nocasematch
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		STRIPPED="${LINE%%\#*}"
+		KEY="${STRIPPED%%=*}"
+		KEY="${KEY#"${KEY%%[![:space:]]*}"}"
+		KEY="${KEY%"${KEY##*[![:space:]]}"}"
+		[[ "${KEY}" == "["* ]] && IN_INTERFACE=0
+		[[ "${KEY}" == "[Interface]" ]] && IN_INTERFACE=1
+		if ((IN_INTERFACE)) && [[ "${KEY}" == SaveConfig ]]; then
+			continue
+		fi
+		printf '%s\n' "${LINE}"
+	done <"$1" || RC=1
+	((RESTORE_NOCASE)) && shopt -u nocasematch
+	return "${RC}"
+}
+
+# A private copy of CONFIG for awg-quick down, <run dir>/down.XXXXXX/<if>.conf,
+# without SaveConfig. BoringTun's UAPI never returns the private key, so a save
+# during down would write a keyless configuration over the real one, whatever
+# the file said when the interface started. The copy has the interface's file
+# name, so awg-quick derives the same interface and runs the same hooks. When
+# the runtime directory is unusable, the private 0700 directory comes from
+# mktemp in /tmp instead, so a down never depends on it. Prints the directory.
+function _awgBtDownCopy() { # <interface> <config>
+	local WORK
+	if [[ ! -f "$2" || ! -r "$2" ]]; then
+		_awgBtErr "cannot bring $1 down: $2 is not readable"
+		return 1
+	fi
+	if _awgBtPrepareRunDir; then
+		WORK="$(mktemp -d "${AWG_BT_RUN_DIR}/down.XXXXXX")" || return 1
+	else
+		WORK="$(mktemp -d /tmp/awg-boringtun-down.XXXXXX)" || return 1
+	fi
+	if ! _awgBtWithoutSaveConfig "$2" >"${WORK}/$1.conf" || ! chmod 0600 -- "${WORK}/$1.conf"; then
+		rm -rf -- "${WORK}"
+		return 1
+	fi
+	printf '%s\n' "${WORK}"
+}
+
+# awg-quick down through a copy from _awgBtDownCopy, which is removed after.
+function _awgBtQuickDownCopy() { # <interface> <copy directory>
+	local RC
+	awg-quick down "$2/$1.conf"
+	RC=$?
+	rm -rf -- "$2"
+	return "${RC}"
 }
 
 # `awg-quick strip <if>` without its ListenPort line when that port is already
@@ -4714,16 +4998,44 @@ function _awgBtCheckBaseUnit() {
 	return 0
 }
 
-# ExecStartPre: refuse to start unless BoringTun will really serve the
-# interface, from verified files, with a safe config.
-function _awgBtCtlPrecheck() {
-	local INTERFACE_NAME="$1" CONFIG_FILE RC=0
+# ExecStartPre: open a new start attempt, then refuse to start unless BoringTun
+# will really serve the interface, from verified files, with a safe config.
+# The attempt is recorded before any check can fail, so poststop acts on this
+# attempt's facts and never on an earlier attempt's. A link, UAPI socket or
+# awg interface of the name that already exists belongs to someone else:
+# precheck refuses, and poststop leaves it untouched.
+function _awgBtCtlPrecheck() { # <interface> <config>
+	local INTERFACE_NAME="$1" CONFIG_FILE="$2" STATE_FILE WG_PATH AWG_PATH PRESENT="" RC=0
+	if ! _awgBtPrepareRunDir; then
+		_awgBtErr "cannot prepare the private runtime directory ${AWG_BT_RUN_DIR}"
+		return 1
+	fi
+	STATE_FILE="$(_awgBtStateFile "${INTERFACE_NAME}")"
+	rm -f -- "${STATE_FILE}"
+	if [[ -e "${STATE_FILE}" || -L "${STATE_FILE}" ]] || ! _awgBtStateNew "${CONFIG_FILE}"; then
+		_awgBtErr "cannot begin a new start attempt of ${INTERFACE_NAME} in ${AWG_BT_RUN_DIR}"
+		return 1
+	fi
+	WG_PATH="${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock"
+	AWG_PATH="${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock"
+	_awgBtLinkExists "${INTERFACE_NAME}" && PRESENT+=", the link ${INTERFACE_NAME}"
+	[[ -e "${WG_PATH}" || -L "${WG_PATH}" ]] && PRESENT+=", ${WG_PATH}"
+	[[ -e "${AWG_PATH}" || -L "${AWG_PATH}" ]] && PRESENT+=", ${AWG_PATH}"
+	_awgBtListedByAwg "${INTERFACE_NAME}" && PRESENT+=", an awg interface ${INTERFACE_NAME}"
+	[[ -z "${PRESENT}" ]] || _AWG_BT_STATE[PRE_EXISTING]=1
+	if ! _awgBtStateSave "${INTERFACE_NAME}"; then
+		_awgBtErr "cannot record the start attempt of ${INTERFACE_NAME} in ${AWG_BT_RUN_DIR}"
+		return 1
+	fi
+	if [[ -n "${PRESENT}" ]]; then
+		_awgBtErr "refusing to start BoringTun for ${INTERFACE_NAME}, which already exists (${PRESENT#, }); this start leaves it untouched"
+		return 1
+	fi
 	_awgBtCheckKernelModule || return 1
 	_awgBtCheckPlatform || return 1
 	_awgBtVerifyStore || return 1
 	_awgBtCheckHelpers || return 1
 	_awgBtReadRuntimeFile "${INTERFACE_NAME}" || return 1
-	CONFIG_FILE="${AWG_BT_CONFIG_DIR}/${INTERFACE_NAME}.conf"
 	_awgBtSaveConfigEnabled "${CONFIG_FILE}" || RC=$?
 	case "${RC}" in
 		0)
@@ -4737,32 +5049,46 @@ function _awgBtCtlPrecheck() {
 			;;
 	esac
 	_awgBtCheckBaseUnit "${INTERFACE_NAME}" || return 1
+	_AWG_BT_STATE[PHASE]=prechecked
+	if ! _awgBtStateSave "${INTERFACE_NAME}"; then
+		_awgBtErr "cannot record the start attempt of ${INTERFACE_NAME} in ${AWG_BT_RUN_DIR}"
+		return 1
+	fi
 	return 0
 }
 
-# ExecStartPost: awg-quick up has completed, so its PostUp hooks ran. The .up
-# marker is written first, so that poststop replays PostDown even when a check
-# below fails. Then verify that what runs is the verified BoringTun binary
-# serving a TUN interface.
-function _awgBtCtlPoststart() {
-	local INTERFACE_NAME="$1" PID_FILE PID="" EXE=""
-	if ! _awgBtPrepareRunDir || ! _awgBtWriteState "$(_awgBtMarkerFile "${INTERFACE_NAME}")" ""; then
-		_awgBtErr "cannot record that ${INTERFACE_NAME} is up in ${AWG_BT_RUN_DIR}"
+# The running instance of the interface is the one this attempt launched: the
+# recorded TUN link, a live daemon with the recorded PID and start time that
+# runs the verified binary and that the PID file names, and a UAPI that answers
+# on the recorded socket nodes. poststart and ensureAwgBackendReady share it.
+function _awgBtVerifyActiveInstance() { # <interface>
+	local INTERFACE_NAME="$1" PID="" PID_FILE_PID="" EXE="" INDEX=""
+	_awgBtVerifyStore || return 1
+	if [[ "${_AWG_BT_STATE[PHASE]-}" != up ]]; then
+		_awgBtErr "no start of ${INTERFACE_NAME} is recorded as up"
 		return 1
 	fi
-	_awgBtVerifyStore || return 1
 	if ! _awgBtLinkExists "${INTERFACE_NAME}"; then
-		_awgBtErr "${INTERFACE_NAME} does not exist after awg-quick up"
+		_awgBtErr "${INTERFACE_NAME} does not exist"
 		return 1
 	fi
 	if ! _awgBtLinkIsTun "${INTERFACE_NAME}"; then
 		_awgBtErr "${INTERFACE_NAME} is not a TUN device, so awg-quick did not start BoringTun"
 		return 1
 	fi
-	PID_FILE="$(_awgBtPidFile "${INTERFACE_NAME}")"
-	read -r PID <"${PID_FILE}" 2>/dev/null || PID=""
-	if ! [[ "${PID}" =~ ^[1-9][0-9]*$ ]] || ! _awgBtProcessAlive "${PID}"; then
-		_awgBtErr "${PID_FILE} does not name a running process"
+	if [[ -z "${_AWG_BT_STATE[PID]-}" ]]; then
+		_awgBtErr "${INTERFACE_NAME} was not started by the BoringTun launcher"
+		return 1
+	fi
+	INDEX="$(_awgBtLinkIndex "${INTERFACE_NAME}")" || INDEX=""
+	if [[ -z "${INDEX}" || "${INDEX}" != "${_AWG_BT_STATE[IFINDEX]}" ]]; then
+		_awgBtErr "${INTERFACE_NAME} is not the link that this start created"
+		return 1
+	fi
+	PID="${_AWG_BT_STATE[PID]}"
+	read -r PID_FILE_PID <"$(_awgBtPidFile "${INTERFACE_NAME}")" 2>/dev/null || PID_FILE_PID=""
+	if [[ "${PID_FILE_PID}" != "${PID}" ]] || ! _awgBtProcessIs "${PID}" "${_AWG_BT_STATE[PID_START]}"; then
+		_awgBtErr "$(_awgBtPidFile "${INTERFACE_NAME}") does not name the running BoringTun daemon of ${INTERFACE_NAME}"
 		return 1
 	fi
 	EXE="$(readlink -- "${AWG_BT_PROC_DIR}/${PID}/exe" 2>/dev/null)" || EXE=""
@@ -4774,73 +5100,222 @@ function _awgBtCtlPoststart() {
 		_awgBtErr "the UAPI of ${INTERFACE_NAME} does not answer"
 		return 1
 	fi
+	if [[ "$(_awgBtPathId "${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock")" != "${_AWG_BT_STATE[WG_SOCK]}" ||
+		"$(_awgBtPathId "${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock")" != "${_AWG_BT_STATE[AWG_SOCK]}" ]]; then
+		_awgBtErr "the UAPI sockets of ${INTERFACE_NAME} are not the ones its BoringTun daemon created"
+		return 1
+	fi
 	return 0
 }
 
-# ExecStop: a clean awg-quick down, which runs PreDown and PostDown. When the
-# interface is already gone (a crash or `ip link del`), succeed and keep the
-# marker so that poststop replays PostDown.
-function _awgBtCtlStop() {
-	local INTERFACE_NAME="$1"
-	_awgBtListedByAwg "${INTERFACE_NAME}" || return 0
-	if awg-quick down "${INTERFACE_NAME}"; then
-		rm -f -- "$(_awgBtMarkerFile "${INTERFACE_NAME}")"
-		return 0
+# ExecStartPost: awg-quick up returned successfully, so this attempt created
+# the link (awg-quick refuses an existing one) and the PostUp hooks ran. That
+# is recorded first. If it cannot be recorded because the state is unusable,
+# poststop could not know that PostDown is owed, so the interface is brought
+# down here and now, which runs PreDown and PostDown, and poststart fails. Then
+# what runs must be the instance this attempt launched.
+function _awgBtCtlPoststart() { # <interface> <config>
+	local INTERFACE_NAME="$1" CONFIG_FILE="$2" STATE_FILE INDEX="" WORK
+	STATE_FILE="$(_awgBtStateFile "${INTERFACE_NAME}")"
+	INDEX="$(_awgBtLinkIndex "${INTERFACE_NAME}")" || INDEX=""
+	if _awgBtPrepareRunDir && _awgBtStateLoad "${INTERFACE_NAME}"; then
+		if [[ ! "${_AWG_BT_STATE[PHASE]}" =~ ^(prechecked|launching|launched)$ || "${_AWG_BT_STATE[CONFIG]}" != "${CONFIG_FILE}" ]]; then
+			_awgBtErr "no start attempt of ${INTERFACE_NAME} with ${CONFIG_FILE} is in progress; nothing is changed"
+			return 1
+		fi
+		[[ -n "${_AWG_BT_STATE[IFINDEX]}" ]] || _AWG_BT_STATE[IFINDEX]="${INDEX}"
+		_AWG_BT_STATE[PHASE]=up
+		if _awgBtStateSave "${INTERFACE_NAME}"; then
+			_awgBtVerifyActiveInstance "${INTERFACE_NAME}"
+			return
+		fi
+	elif [[ -d "${AWG_BT_RUN_DIR}" && ! -L "${AWG_BT_RUN_DIR}" && ! -e "${STATE_FILE}" && ! -L "${STATE_FILE}" ]]; then
+		_awgBtErr "no start attempt of ${INTERFACE_NAME} is recorded; nothing is changed"
+		return 1
+	fi
+	_awgBtErr "cannot record that ${INTERFACE_NAME} is up; bringing it down now so that its PostDown hooks still run"
+	if WORK="$(_awgBtDownCopy "${INTERFACE_NAME}" "${CONFIG_FILE}")" && _awgBtQuickDownCopy "${INTERFACE_NAME}" "${WORK}"; then
+		_awgBtErr "${INTERFACE_NAME} was brought down"
+	else
+		_awgBtErr "awg-quick down of ${INTERFACE_NAME} failed as well; check its PostDown hooks by hand"
 	fi
 	return 1
 }
 
-# ExecStopPost, after every stop, crash and failed start:
-#  1. A surviving non-TUN AmneziaWG link means awg-quick took the kernel path;
-#     awg-quick down removes it and runs its PostDown.
-#  2. A remaining .up marker means the interface went away without a clean
-#     down, so PostDown is replayed from the server config.
-#  3. UAPI sockets are removed only if no daemon answers on them.
-#  4. This interface's PID file and marker are removed. Nothing else is touched.
-function _awgBtCtlPoststop() {
-	local INTERFACE_NAME="$1" MARKER
-	MARKER="$(_awgBtMarkerFile "${INTERFACE_NAME}")"
-	if _awgBtLinkExists "${INTERFACE_NAME}" && ! _awgBtLinkIsTun "${INTERFACE_NAME}" && \
-		_awgBtListedByAwg "${INTERFACE_NAME}"; then
-		if awg-quick down "${INTERFACE_NAME}"; then
-			rm -f -- "${MARKER}"
-		else
-			_awgBtErr "awg-quick down failed for the non-BoringTun interface ${INTERFACE_NAME}"
+# ExecStop: a clean awg-quick down of the instance this attempt started, which
+# runs PreDown and PostDown. When that instance is already gone (a crash or
+# `ip link del`), stop succeeds without it and leaves DOWN=none, so poststop
+# replays PostDown. DOWN=attempted is recorded before awg-quick down starts:
+# from then on its PostDown hooks may run in part, and poststop must not run
+# them again. If the down fails while the link survives, awg-quick stopped
+# before deleting the link, which precedes every PostDown hook.
+function _awgBtCtlStop() { # <interface>
+	local INTERFACE_NAME="$1" INDEX="" WORK RC
+	if ! _awgBtStateLoad "${INTERFACE_NAME}" || [[ "${_AWG_BT_STATE[PHASE]}" != up ]]; then
+		_awgBtErr "no start of ${INTERFACE_NAME} is recorded as up; nothing is brought down"
+		return 0
+	fi
+	INDEX="$(_awgBtLinkIndex "${INTERFACE_NAME}")" || INDEX=""
+	if [[ -z "${INDEX}" || "${INDEX}" != "${_AWG_BT_STATE[IFINDEX]}" ]] || ! _awgBtListedByAwg "${INTERFACE_NAME}"; then
+		_awgBtErr "${INTERFACE_NAME} is already gone, so awg-quick down is not run; poststop replays its PostDown"
+		return 0
+	fi
+	WORK="$(_awgBtDownCopy "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}")" || return 1
+	_AWG_BT_STATE[DOWN]=attempted
+	if ! _awgBtStateSave "${INTERFACE_NAME}"; then
+		rm -rf -- "${WORK}"
+		_awgBtErr "cannot record the down attempt of ${INTERFACE_NAME}; awg-quick down is not run, so that poststop can replay PostDown exactly once"
+		return 1
+	fi
+	_awgBtQuickDownCopy "${INTERFACE_NAME}" "${WORK}"
+	RC=$?
+	if ((RC == 0)); then
+		_AWG_BT_STATE[DOWN]="done"
+	elif [[ "$(_awgBtLinkIndex "${INTERFACE_NAME}")" == "${_AWG_BT_STATE[IFINDEX]}" ]]; then
+		_AWG_BT_STATE[DOWN]=failed-intact
+	else
+		_AWG_BT_STATE[DOWN]=failed
+	fi
+	_awgBtStateSave "${INTERFACE_NAME}" || _awgBtErr "cannot record how awg-quick down of ${INTERFACE_NAME} ended"
+	return "${RC}"
+}
+
+# awg-quick up took the kernel path after a successful precheck (the module
+# appeared in between) and succeeded, so this attempt created that link: bring
+# it down with awg-quick down, which runs its PostDown.
+function _awgBtPoststopKernelDown() { # <interface>
+	local WORK RC
+	_awgBtErr "$1 is a kernel AmneziaWG link that this start created; bringing it down"
+	WORK="$(_awgBtDownCopy "$1" "${_AWG_BT_STATE[CONFIG]}")" || return 1
+	_AWG_BT_STATE[DOWN]=attempted
+	if ! _awgBtStateSave "$1"; then
+		_AWG_BT_STATE[DOWN]=none
+		rm -rf -- "${WORK}"
+		_awgBtErr "cannot record the down attempt of $1; it is left in place"
+		return 1
+	fi
+	_awgBtQuickDownCopy "$1" "${WORK}"
+	RC=$?
+	if ((RC == 0)); then
+		_AWG_BT_STATE[DOWN]="done"
+	elif [[ "$(_awgBtLinkIndex "$1")" == "${_AWG_BT_STATE[IFINDEX]}" ]]; then
+		_AWG_BT_STATE[DOWN]=failed-intact
+	else
+		_AWG_BT_STATE[DOWN]=failed
+	fi
+	_awgBtStateSave "$1" || _awgBtErr "cannot record how awg-quick down of $1 ended"
+	return "${RC}"
+}
+
+# ExecStopPost, after every stop, crash and failed start. It acts on the
+# recorded attempt only, and only on what that attempt owns:
+#  - without a readable state only the PID file is removed;
+#  - after a refused or failed precheck (PHASE=started) nothing was started;
+#  - the recorded daemon is stopped if it still runs (awgBackendQuickUp has no
+#    cgroup that systemd ends);
+#  - a kernel link that awg-quick up created for this attempt (the recorded
+#    ifindex, not a TUN device) is brought down with awg-quick down;
+#  - PostDown is replayed once when the interface is gone and awg-quick down
+#    either never started or failed before deleting the link; after a down
+#    that failed later its hooks are named, never run a second time;
+#  - socket nodes are removed only if they are the ones the recorded daemon
+#    created and that daemon is gone.
+# The state is removed last, unless the recorded daemon still runs.
+function _awgBtCtlPoststop() { # <interface>
+	local INTERFACE_NAME="$1" INDEX="" PID START KEEP=0
+	if ! _awgBtPrepareRunDir || ! _awgBtStateLoad "${INTERFACE_NAME}"; then
+		_awgBtErr "no start attempt of ${INTERFACE_NAME} is recorded; nothing but its PID file is touched"
+		rm -f -- "$(_awgBtPidFile "${INTERFACE_NAME}")" 2>/dev/null
+		return 0
+	fi
+	PID="${_AWG_BT_STATE[PID]}"
+	START="${_AWG_BT_STATE[PID_START]}"
+	if [[ "${_AWG_BT_STATE[PHASE]}" != started ]]; then
+		if [[ -n "${PID}" && -n "${START}" ]] && ! _awgBtStopProcess "${PID}" "${START}"; then
+			_awgBtErr "the BoringTun daemon ${PID} of ${INTERFACE_NAME} does not stop"
+			KEEP=1
+		fi
+		INDEX="$(_awgBtLinkIndex "${INTERFACE_NAME}")" || INDEX=""
+		if [[ "${_AWG_BT_STATE[PHASE]}" == up && "${_AWG_BT_STATE[DOWN]}" == none && -n "${INDEX}" &&
+			"${INDEX}" == "${_AWG_BT_STATE[IFINDEX]}" ]] && ! _awgBtLinkIsTun "${INTERFACE_NAME}" &&
+			_awgBtListedByAwg "${INTERFACE_NAME}"; then
+			_awgBtPoststopKernelDown "${INTERFACE_NAME}"
+			INDEX="$(_awgBtLinkIndex "${INTERFACE_NAME}")" || INDEX=""
+		fi
+		if [[ "${_AWG_BT_STATE[PHASE]}" == up ]]; then
+			if [[ -n "${INDEX}" && "${INDEX}" == "${_AWG_BT_STATE[IFINDEX]}" ]]; then
+				if [[ "${_AWG_BT_STATE[DOWN]}" != "done" ]]; then
+					_awgBtErr "${INTERFACE_NAME} is still up after its stop failed; it is left in place and its PostDown hooks are not replayed"
+				fi
+			else
+				case "${_AWG_BT_STATE[DOWN]}" in
+					none | failed-intact)
+						if [[ "${_AWG_BT_STATE[REPLAY]}" == none ]]; then
+							_AWG_BT_STATE[REPLAY]=started
+							_awgBtStateSave "${INTERFACE_NAME}" ||
+								_awgBtErr "cannot record the PostDown replay of ${INTERFACE_NAME}; replaying once anyway"
+							_awgBtReplayPostDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}"
+							_AWG_BT_STATE[REPLAY]="done"
+							_awgBtStateSave "${INTERFACE_NAME}"
+						fi
+						;;
+					attempted | failed)
+						_awgBtReportUnfinishedDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}"
+						;;
+				esac
+			fi
 		fi
 	fi
-	if [[ -e "${MARKER}" ]]; then
-		_awgBtReplayPostDown "${INTERFACE_NAME}"
+	_awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[WG_SOCK]}" "${PID}" "${START}"
+	_awgBtRemoveOwnedPath "${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[AWG_SOCK]}" "${PID}" "${START}"
+	rm -f -- "$(_awgBtPidFile "${INTERFACE_NAME}")"
+	if ((KEEP == 0)); then
+		rm -f -- "$(_awgBtStateFile "${INTERFACE_NAME}")"
 	fi
-	_awgBtRemoveStaleSockets "${INTERFACE_NAME}"
-	rm -f -- "$(_awgBtPidFile "${INTERFACE_NAME}")" "${MARKER}"
 	return 0
 }
 
 # ── awg-backend-ctl ──────────────────────────────────────────────────────────
-# The hooks of the BoringTun drop-in for awg-quick@<if>.service.
+# The hooks of the BoringTun drop-in for awg-quick@<if>.service. precheck and
+# poststart take the config's canonical path as an optional third argument,
+# for awgBackendQuickUp; the service uses <config dir>/<if>.conf.
 function awgBackendCtlMain() {
-	local COMMAND="${1:-}" INTERFACE_NAME="${2:-}"
-	if [[ $# -ne 2 ]] || ! _awgBtValidInterfaceName "${INTERFACE_NAME}"; then
-		_awgBtErr "usage: awg-backend-ctl precheck|poststart|sync|stop|poststop <interface>"
+	local COMMAND="${1:-}" INTERFACE_NAME="${2:-}" CONFIG_FILE="${3:-}"
+	local USAGE="usage: awg-backend-ctl precheck|poststart <interface> [<config>] | sync|stop|poststop <interface>"
+	if [[ $# -lt 2 || $# -gt 3 ]] || ! _awgBtValidInterfaceName "${INTERFACE_NAME}"; then
+		_awgBtErr "${USAGE}"
 		return 2
 	fi
+	if [[ $# -eq 3 ]]; then
+		if [[ "${COMMAND}" != precheck && "${COMMAND}" != poststart ]]; then
+			_awgBtErr "${USAGE}"
+			return 2
+		fi
+		if [[ ! "${CONFIG_FILE}" =~ ^/[^[:cntrl:]]*$ || "${CONFIG_FILE}" != */"${INTERFACE_NAME}.conf" ||
+			"$(readlink -f -- "${CONFIG_FILE}" 2>/dev/null)" != "${CONFIG_FILE}" ]]; then
+			_awgBtErr "the config of ${INTERFACE_NAME} must be given as the canonical absolute path of a ${INTERFACE_NAME}.conf"
+			return 2
+		fi
+	else
+		CONFIG_FILE="${AWG_BT_CONFIG_DIR}/${INTERFACE_NAME}.conf"
+	fi
 	case "${COMMAND}" in
-		precheck) _awgBtCtlPrecheck "${INTERFACE_NAME}" ;;
-		poststart) _awgBtCtlPoststart "${INTERFACE_NAME}" ;;
+		precheck) _awgBtCtlPrecheck "${INTERFACE_NAME}" "${CONFIG_FILE}" ;;
+		poststart) _awgBtCtlPoststart "${INTERFACE_NAME}" "${CONFIG_FILE}" ;;
 		sync) _awgBtSync "${INTERFACE_NAME}" ;;
 		stop) _awgBtCtlStop "${INTERFACE_NAME}" ;;
 		poststop) _awgBtCtlPoststop "${INTERFACE_NAME}" ;;
 		*)
-			_awgBtErr "usage: awg-backend-ctl precheck|poststart|sync|stop|poststop <interface>"
+			_awgBtErr "${USAGE}"
 			return 2
 			;;
 	esac
 }
 
 # Functions the generated helpers carry. Keep in step with their callers.
-_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtMarkerFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtUapiLive _awgBtRemoveStaleSockets _awgBtLinkExists _awgBtLinkIsTun _awgBtListedByAwg _awgBtProcessAlive _awgBtStopProcess _awgBtStopTarget _awgBtDaemonArgv _awgBtCloseInheritedFds"
-_AWG_BT_LAUNCH_FUNCTIONS="awgBoringtunLaunchMain _awgBtLaunchFailed"
-_AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtReplayPostDown _awgBtFilteredStrip _awgBtSync _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
+_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtRemoveOwnedPath _awgBtNewToken _awgBtStateFile _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
+_AWG_BT_LAUNCH_FUNCTIONS="awgBoringtunLaunchMain _awgBtRecordSocketNodes _awgBtLaunchFailed"
+_AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtWithoutSaveConfig _awgBtDownCopy _awgBtQuickDownCopy _awgBtReplayPostDown _awgBtReportUnfinishedDown _awgBtFilteredStrip _awgBtSync _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtVerifyActiveInstance _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtPoststopKernelDown _awgBtCtlPoststop"
 
 # Emit a generated helper: a fixed header, the embedded AWG_BT_* settings, the
 # installer's own functions and a call to the entry point. The output depends
@@ -4870,6 +5345,7 @@ function _awgBtRenderHelper() {
 	printf '_AWG_BT_PROG=%q\n' "${NAME}"
 	printf '_AWG_BT_VERIFIED_BIN=""\n'
 	printf '_AWG_BT_ARGV=()\n'
+	printf 'declare -A _AWG_BT_STATE=()\n'
 	for VARIABLE in ${_AWG_BT_HELPER_VARIABLES}; do
 		printf 'readonly %s=%q\n' "${VARIABLE}" "${!VARIABLE}"
 	done
@@ -4966,8 +5442,10 @@ function _awgBtInstallHelpers() {
 	_awgBtWriteManagedFile "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" 0755 <<<"${CONTENT}" || return 1
 }
 
-# Write the runtime file and the drop-in for INTERFACE and reload systemd when
-# the drop-in changed.
+# Write the runtime file and the drop-in for INTERFACE, then reload systemd.
+# The reload runs every time, not only when the drop-in changed: after a reload
+# that failed, an unchanged drop-in would otherwise never be reloaded, and
+# systemd would go on running the old unit definition.
 function _awgBtInstallServiceFiles() {
 	local INTERFACE_NAME="$1" DROPIN_DIR CONTENT
 	_awgBtValidInterfaceName "${INTERFACE_NAME}" || return 1
@@ -4977,16 +5455,17 @@ function _awgBtInstallServiceFiles() {
 	_awgBtEnsureDirectory "${DROPIN_DIR}" 0755 || return 1
 	CONTENT="$(_awgBtRenderServiceDropIn)" || return 1
 	_awgBtWriteManagedFile "${DROPIN_DIR}/override.conf" 0644 <<<"${CONTENT}" || return 1
-	if ((_AWG_BT_FILE_CHANGED)); then
-		systemctl daemon-reload || return 1
-	fi
+	systemctl daemon-reload || return 1
 	return 0
 }
 
 # ensureAwgBackendReady for BoringTun, with the kernel implementation's calling
-# convention and exit semantics. It verifies an already provisioned store and
-# regenerates the helpers; mode 1 also writes the runtime file and drop-in,
-# starts awg-quick@<if> when it is inactive and requires a live UAPI. It never
+# convention and exit semantics. It verifies an already provisioned store,
+# regenerates the helpers and reclaims interrupted scratch instances; mode 1
+# also writes the runtime file and drop-in, starts awg-quick@<if> when it is
+# inactive, and then requires the active unit to be served by the verified
+# BoringTun instance that its start recorded. A unit that is already active on
+# another datapath fails closed: nothing is restarted or migrated. It never
 # installs or downloads BoringTun and never touches kernel packages.
 function _awgBtEnsureReady() {
 	local START_AWG_QUICK="${1:-1}"
@@ -5001,34 +5480,57 @@ function _awgBtEnsureReady() {
 		echo -e "${RED}ERROR: the BoringTun runtime is not ready.${NC}" >&2
 		exit 1
 	fi
+	_awgBtScratchSweep
 	[[ "${START_AWG_QUICK}" == 0 ]] && return 0
 	if ! _awgBtValidInterfaceName "${SERVER_AWG_NIC:-}" || ! _awgBtInstallServiceFiles "${SERVER_AWG_NIC}"; then
 		echo -e "${RED}ERROR: could not write the BoringTun service files for awg-quick@${SERVER_AWG_NIC:-}.${NC}" >&2
 		exit 1
 	fi
 	ensureAwgQuickRunning
-	if ! _awgBtListenPort "${SERVER_AWG_NIC}" >/dev/null; then
-		echo -e "${RED}ERROR: ${SERVER_AWG_NIC} does not answer on its BoringTun UAPI socket.${NC}" >&2
-		echo -e "${ORANGE}Check: journalctl -u awg-quick@${SERVER_AWG_NIC}${NC}" >&2
+	if ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}"; then
+		echo -e "${RED}ERROR: awg-quick@${SERVER_AWG_NIC} is active but not served by the verified BoringTun instance recorded for it.${NC}" >&2
+		echo -e "${ORANGE}This installer version does not move a running interface to another datapath. Stop awg-quick@${SERVER_AWG_NIC} first, and check: journalctl -u awg-quick@${SERVER_AWG_NIC}${NC}" >&2
 		exit 1
 	fi
 }
 
-# awgBackendQuickUp for BoringTun: the service's precheck, awg-quick up with the
-# launcher, then poststart, through the same generated helpers systemd uses.
-function _awgBtQuickUp() {
-	local CONFIG_FILE="$1" INTERFACE_NAME CTL="${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl"
-	if ! [[ "${CONFIG_FILE}" =~ (^|/)([a-zA-Z0-9_=+.-]{1,15})\.conf$ ]]; then
-		_awgBtErr "${CONFIG_FILE} is not named <interface>.conf"
+# The active awg-quick@<if> runs the instance its recorded start launched, and
+# systemd tracks that daemon as the unit's main process.
+function _awgBtCheckServedByBoringtun() { # <interface>
+	local MAIN_PID
+	if ! _awgBtStateLoad "$1"; then
+		_awgBtErr "no BoringTun start of $1 is recorded"
 		return 1
 	fi
-	INTERFACE_NAME="${BASH_REMATCH[2]}"
-	"${CTL}" precheck "${INTERFACE_NAME}" || return 1
+	_awgBtVerifyActiveInstance "$1" || return 1
+	MAIN_PID="$(systemctl show -p MainPID --value "awg-quick@$1.service" 2>/dev/null)" || MAIN_PID=""
+	if [[ "${MAIN_PID}" != "${_AWG_BT_STATE[PID]}" ]]; then
+		_awgBtErr "systemd does not track the BoringTun daemon of $1 as the main process of awg-quick@$1"
+		return 1
+	fi
+	return 0
+}
+
+# awgBackendQuickUp for BoringTun: the service's precheck, awg-quick up with the
+# launcher, then poststart, through the same generated helpers systemd uses and
+# for the canonical path of the given config, which every step checks and uses.
+function _awgBtQuickUp() {
+	local CONFIG_FILE INTERFACE_NAME CTL="${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl"
+	CONFIG_FILE="$(readlink -f -- "$1" 2>/dev/null)" || CONFIG_FILE=""
+	if ! [[ "${CONFIG_FILE}" =~ ^/[^[:cntrl:]]*/([a-zA-Z0-9_=+.-]{1,15})\.conf$ ]]; then
+		_awgBtErr "$1 is not named <interface>.conf"
+		return 1
+	fi
+	INTERFACE_NAME="${BASH_REMATCH[1]}"
+	if ! "${CTL}" precheck "${INTERFACE_NAME}" "${CONFIG_FILE}"; then
+		"${CTL}" poststop "${INTERFACE_NAME}"
+		return 1
+	fi
 	if ! WG_QUICK_USERSPACE_IMPLEMENTATION="${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" awg-quick up "${CONFIG_FILE}"; then
 		"${CTL}" poststop "${INTERFACE_NAME}"
 		return 1
 	fi
-	if ! "${CTL}" poststart "${INTERFACE_NAME}"; then
+	if ! "${CTL}" poststart "${INTERFACE_NAME}" "${CONFIG_FILE}"; then
 		"${CTL}" stop "${INTERFACE_NAME}"
 		"${CTL}" poststop "${INTERFACE_NAME}"
 		return 1
@@ -5040,74 +5542,372 @@ function _awgBtQuickUp() {
 # Throwaway instances for capability probes and staged validation, started from
 # the verified binary with the production command line. BoringTun replaces an
 # existing UAPI socket path when it binds, which would hijack a live instance of
-# the same name, so any sign of the name in use is refused. Under systemd each
-# instance is a transient unit with its own cgroup; otherwise it is a tracked
-# child.
+# the same name, so any sign of the name in use is refused.
 #
-# Cleanup is guaranteed by a guardian: a tracked background process that
-# ignores HUP, INT and TERM, watches the shell that created the instance and
-# tears the instance down as soon as that shell is gone, whether it exited,
-# was signalled or was killed. The caller's traps are never touched: in a bash
-# subshell, trap -p reports the parent's handlers although they are not
-# active, so chaining traps safely is not possible there. Everything targets
-# tracked names, units and PIDs only.
+# Every creation is one attempt with a random token and two records in
+# <run dir>/scratch: <token>.owner, written once by the creating shell (the
+# owner) before anything starts, and <token>.guard, written only by the
+# attempt's guardian. Both are data, parsed like the service state. The
+# guardian is a background process that ignores HUP, INT and TERM, holds no
+# inherited descriptor, and is the only process that starts the instance:
+#  1. It records its own PID and start time (PHASE=starting) before it starts
+#     anything, so no instance exists without a recorded guardian.
+#  2. It starts the daemon only while the owner lives and has not asked it to
+#     stop. Under systemd that is a transient unit named after the token, with
+#     a hard RuntimeMaxSec, and the guardian waits for systemd-run to return
+#     even if the owner dies meanwhile, so a late unit is still torn down.
+#     Without systemd the daemon is the guardian's child with a parent-death
+#     signal, so it cannot outlive the guardian.
+#  3. It records the daemon's PID and start time, its socket nodes and the TUN
+#     link's ifindex, then PHASE=created.
+#  4. When the owner is gone (exit, signal, SIGKILL or zombie) or asks it to
+#     stop, it tears the instance down through its records and removes them
+#     last.
+# The owner's destroy waits for that teardown to finish before it reaps the
+# guardian. If the guardian is gone or hangs, the owner reclaims the attempt
+# from the records. An attempt whose owner and guardian are both gone is
+# reclaimed by the sweep that the next creation, or ensureAwgBackendReady,
+# runs. Nothing is ever matched by interface name alone.
 
-function _awgBtScratchUnitName() {
-	printf 'amneziawg-scratch-%s\n' "$1"
+_AWG_BT_SCRATCH_OWNER_KEYS="FORMAT TOKEN NAME MODE UNIT OWNER_PID OWNER_START"
+_AWG_BT_SCRATCH_GUARD_KEYS="FORMAT TOKEN NAME MODE UNIT GUARD_PID GUARD_START PHASE CLIENT_PID CLIENT_START DAEMON_PID DAEMON_START IFINDEX WG_SOCK AWG_SOCK"
+# The hard lifetime of a transient scratch unit in seconds, which bounds what an
+# instance can cost when every other cleanup fails.
+_AWG_BT_SCRATCH_MAX_SECONDS=900
+
+function _awgBtScratchDir() {
+	printf '%s/scratch\n' "${AWG_BT_RUN_DIR}"
 }
 
-# Field 22 of /proc/<pid>/stat, the start time, which tells a live process from
-# a later one that reused its PID.
-function _awgBtProcessStartTime() {
-	local STAT
-	local -a FIELDS=()
-	[[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || return 1
-	STAT="$(cat -- "${AWG_BT_PROC_DIR}/$1/stat" 2>/dev/null)" || return 1
-	read -r -a FIELDS <<<"${STAT##*) }"
-	[[ "${FIELDS[19]:-}" =~ ^[0-9]+$ ]] || return 1
-	printf '%s\n' "${FIELDS[19]}"
+function _awgBtPrepareScratchDir() {
+	local DIR OWNER="" MODE=""
+	_awgBtPrepareRunDir || return 1
+	DIR="$(_awgBtScratchDir)"
+	[[ ! -L "${DIR}" ]] || return 1
+	if [[ ! -d "${DIR}" ]]; then
+		mkdir -m 0700 -- "${DIR}" 2>/dev/null || [[ -d "${DIR}" ]] || return 1
+	fi
+	read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${DIR}")"
+	[[ ! -L "${DIR}" && -d "${DIR}" && "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${MODE}" == 700 ]]
 }
 
-function _awgBtScratchAlive() {
-	if [[ -n "${_AWG_BT_SCRATCH_UNITS[$1]:-}" ]]; then
-		systemctl is-active --quiet "${_AWG_BT_SCRATCH_UNITS[$1]}"
-	else
-		_awgBtProcessAlive "${_AWG_BT_SCRATCH_PIDS[$1]:-}"
+function _awgBtScratchValueValid() { # <key> <value>
+	case "$1" in
+		FORMAT) [[ "$2" == 1 ]] ;;
+		TOKEN) [[ "$2" =~ ^[0-9a-f]{32}$ ]] ;;
+		NAME) [[ "$2" =~ ^[a-zA-Z0-9_-]{1,15}$ ]] ;;
+		MODE) [[ "$2" == unit || "$2" == direct ]] ;;
+		UNIT) [[ "$2" =~ ^(amneziawg-scratch-[a-zA-Z0-9_-]{1,15}-[0-9a-f]{32})?$ ]] ;;
+		OWNER_PID | GUARD_PID) [[ "$2" =~ ^[1-9][0-9]{0,9}$ ]] ;;
+		OWNER_START | GUARD_START) [[ "$2" =~ ^[0-9]{1,20}$ ]] ;;
+		PHASE) [[ "$2" =~ ^(starting|created|teardown)$ ]] ;;
+		CLIENT_PID | DAEMON_PID | IFINDEX) [[ "$2" =~ ^([1-9][0-9]{0,9})?$ ]] ;;
+		CLIENT_START | DAEMON_START) [[ "$2" =~ ^([0-9]{1,20})?$ ]] ;;
+		WG_SOCK | AWG_SOCK) [[ "$2" =~ ^([0-9]+:[0-9]+:[0-9a-f]+:[0-9]+\.[0-9]{9})?$ ]] ;;
+		*) return 1 ;;
+	esac
+}
+
+# Load a scratch record into the associative array that the third argument
+# names. Exactly the given keys, once each, with valid values.
+function _awgBtScratchLoad() { # <file> <keys> <array name>
+	local FILE="$1" KEYS="$2" LINE KEY VALUE OWNER="" MODE=""
+	# shellcheck disable=SC2178 # a nameref to the caller's associative array
+	local -n SCRATCH_RECORD="$3"
+	SCRATCH_RECORD=()
+	[[ ! -L "${FILE}" && -f "${FILE}" ]] || return 1
+	read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${FILE}")"
+	[[ "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${MODE}" == 600 ]] || return 1
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		if [[ ! "${LINE}" =~ ^([A-Z_]+)=(.*)$ ]]; then
+			SCRATCH_RECORD=()
+			return 1
+		fi
+		KEY="${BASH_REMATCH[1]}"
+		VALUE="${BASH_REMATCH[2]}"
+		if [[ " ${KEYS} " != *" ${KEY} "* || -n "${SCRATCH_RECORD[${KEY}]+set}" ]] || ! _awgBtScratchValueValid "${KEY}" "${VALUE}"; then
+			SCRATCH_RECORD=()
+			return 1
+		fi
+		SCRATCH_RECORD["${KEY}"]="${VALUE}"
+	done <"${FILE}"
+	for KEY in ${KEYS}; do
+		if [[ -z "${SCRATCH_RECORD[${KEY}]+set}" ]]; then
+			SCRATCH_RECORD=()
+			return 1
+		fi
+	done
+	if [[ "${FILE##*/}" != "${SCRATCH_RECORD[TOKEN]}".* ]]; then
+		SCRATCH_RECORD=()
+		return 1
 	fi
 }
 
-# Remove whatever of a scratch instance remains: the link, the transient unit or
-# the tracked process (only while it is still the same process), and the
-# name's sockets if no daemon answers on them.
-function _awgBtScratchTeardown() {
-	local NAME="$1" UNIT="$2" PID="$3" PID_START="$4"
-	if ip link show dev "${NAME}" >/dev/null 2>&1; then
-		ip link delete dev "${NAME}" >/dev/null 2>&1
-	fi
-	if [[ -n "${UNIT}" ]]; then
-		systemctl stop "${UNIT}" >/dev/null 2>&1
-		systemctl reset-failed "${UNIT}" >/dev/null 2>&1
-	fi
-	if [[ -n "${PID}" && -n "${PID_START}" ]]; then
-		_awgBtStopProcess "${PID}" "${PID_START}"
-	fi
-	_awgBtRemoveStaleSockets "${NAME}"
+function _awgBtScratchSave() { # <file> <keys> <array name>
+	local KEY CONTENT=""
+	# shellcheck disable=SC2178 # a nameref to the caller's associative array
+	local -n SCRATCH_RECORD="$3"
+	for KEY in $2; do
+		_awgBtScratchValueValid "${KEY}" "${SCRATCH_RECORD[${KEY}]-}" || return 1
+		CONTENT+="${KEY}=${SCRATCH_RECORD[${KEY}]-}"$'\n'
+	done
+	_awgBtWriteState "$1" "${CONTENT}"
 }
 
-function _awgBtScratchGuardian() {
-	local NAME="$1" UNIT="$2" PID="$3" PID_START="$4" OWNER="$5" OWNER_START="$6"
+# The guardian of one attempt; see the section comment. It works on the arrays
+# and paths of this function, which the helpers below see through bash's
+# dynamic scoping.
+function _awgBtScratchGuardian() { # <token>
+	local TOKEN="$1" DIR OWNER_FILE GUARD_FILE STOP_FILE GUARD_START RC
+	local -A OWNER_RECORD=() GUARD_RECORD=()
 	trap '' HUP INT TERM
 	_awgBtCloseInheritedFds
-	while [[ "$(_awgBtProcessStartTime "${OWNER}")" == "${OWNER_START}" ]]; do
-		sleep 0.2
+	DIR="$(_awgBtScratchDir)"
+	OWNER_FILE="${DIR}/${TOKEN}.owner"
+	GUARD_FILE="${DIR}/${TOKEN}.guard"
+	STOP_FILE="${DIR}/${TOKEN}.stop"
+	_awgBtScratchLoad "${OWNER_FILE}" "${_AWG_BT_SCRATCH_OWNER_KEYS}" OWNER_RECORD || exit 1
+	GUARD_START="$(_awgBtProcessStartTime "${BASHPID}")" || exit 1
+	GUARD_RECORD=([FORMAT]=1 [TOKEN]="${TOKEN}" [NAME]="${OWNER_RECORD[NAME]}" [MODE]="${OWNER_RECORD[MODE]}"
+		[UNIT]="${OWNER_RECORD[UNIT]}" [GUARD_PID]="${BASHPID}" [GUARD_START]="${GUARD_START}" [PHASE]=starting
+		[CLIENT_PID]="" [CLIENT_START]="" [DAEMON_PID]="" [DAEMON_START]="" [IFINDEX]="" [WG_SOCK]="" [AWG_SOCK]="")
+	_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD || exit 1
+	if _awgBtScratchOwnerWants && _awgBtScratchStart && _awgBtScratchAwaitReady; then
+		while _awgBtScratchOwnerWants; do
+			sleep 0.2
+		done
+	fi
+	GUARD_RECORD[PHASE]=teardown
+	_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
+	_awgBtScratchReclaim "${TOKEN}"
+	RC=$?
+	# Reap the direct daemon and any systemd-run client.
+	wait
+	exit "${RC}"
+}
+
+# The owner still lives, has not asked for a teardown and has not reclaimed
+# the attempt itself. A zombie owner is gone.
+function _awgBtScratchOwnerWants() {
+	[[ ! -e "${STOP_FILE}" && -e "${OWNER_FILE}" ]] &&
+		_awgBtProcessIs "${OWNER_RECORD[OWNER_PID]}" "${OWNER_RECORD[OWNER_START]}"
+}
+
+function _awgBtScratchStart() {
+	local CLIENT DAEMON START=""
+	if [[ "${GUARD_RECORD[MODE]}" == unit ]]; then
+		systemd-run --quiet --collect --unit="${GUARD_RECORD[UNIT]}" -p Type=exec \
+			-p RuntimeMaxSec="${_AWG_BT_SCRATCH_MAX_SECONDS}" -- "${_AWG_BT_ARGV[@]}" </dev/null >/dev/null 2>&1 &
+		CLIENT=$!
+		START="$(_awgBtProcessStartTime "${CLIENT}")" || START=""
+		GUARD_RECORD[CLIENT_PID]="${CLIENT}"
+		GUARD_RECORD[CLIENT_START]="${START}"
+		_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
+		# Wait for systemd-run whatever the owner does meanwhile: a unit it
+		# still creates must be torn down, not left behind. Whether it
+		# reported success does not matter; readiness decides.
+		wait "${CLIENT}"
+		GUARD_RECORD[CLIENT_PID]=""
+		GUARD_RECORD[CLIENT_START]=""
+		_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
+		return 0
+	fi
+	(
+		trap - HUP INT TERM
+		_awgBtCloseInheritedFds
+		exec setpriv --pdeathsig KILL -- "${_AWG_BT_ARGV[@]}" </dev/null >/dev/null 2>&1
+	) &
+	DAEMON=$!
+	START="$(_awgBtProcessStartTime "${DAEMON}")" || START=""
+	GUARD_RECORD[DAEMON_PID]="${DAEMON}"
+	GUARD_RECORD[DAEMON_START]="${START}"
+	if [[ -z "${START}" ]]; then
+		# It exited at once and was reaped, so its PID is not signalled.
+		return 1
+	fi
+	if ! _awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD; then
+		_awgBtStopProcess "${DAEMON}" "${START}"
+		return 1
+	fi
+}
+
+# Wait until the daemon serves the name, recording what it creates, while the
+# owner still wants it.
+function _awgBtScratchAwaitReady() {
+	local NAME="${GUARD_RECORD[NAME]}" I LIMIT MAIN="" START="" INDEX=""
+	LIMIT=$((AWG_BT_READY_TIMEOUT * 10))
+	for ((I = 0; I < LIMIT; I++)); do
+		_awgBtScratchOwnerWants || return 1
+		if [[ -z "${GUARD_RECORD[DAEMON_PID]}" ]]; then
+			MAIN="$(systemctl show -p MainPID --value "${GUARD_RECORD[UNIT]}.service" 2>/dev/null)" || MAIN=""
+			if [[ "${MAIN}" =~ ^[1-9][0-9]{0,9}$ ]] && START="$(_awgBtProcessStartTime "${MAIN}")"; then
+				GUARD_RECORD[DAEMON_PID]="${MAIN}"
+				GUARD_RECORD[DAEMON_START]="${START}"
+				_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD || return 1
+			fi
+		fi
+		if [[ -n "${GUARD_RECORD[DAEMON_PID]}" ]]; then
+			_awgBtProcessIs "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}" || return 1
+			_awgBtScratchRecordSockets || return 1
+			if [[ -n "${GUARD_RECORD[WG_SOCK]}" && -n "${GUARD_RECORD[AWG_SOCK]}" ]] && _awgBtLinkIsTun "${NAME}" &&
+				INDEX="$(_awgBtLinkIndex "${NAME}")" && _awgBtUapiReady "${NAME}"; then
+				GUARD_RECORD[WG_SOCK]="$(_awgBtPathId "${AWG_BT_WG_SOCKET_DIR}/${NAME}.sock")"
+				GUARD_RECORD[AWG_SOCK]="$(_awgBtPathId "${AWG_BT_AWG_SOCKET_DIR}/${NAME}.sock")"
+				GUARD_RECORD[IFINDEX]="${INDEX}"
+				GUARD_RECORD[PHASE]=created
+				_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD && return 0
+				GUARD_RECORD[PHASE]=starting
+				return 1
+			fi
+		fi
+		sleep 0.1
 	done
-	_awgBtScratchTeardown "${NAME}" "${UNIT}" "${PID}" "${PID_START}"
+	return 1
+}
+
+function _awgBtScratchRecordSockets() {
+	local KEY NODE ID CHANGED=0
+	for KEY in WG_SOCK AWG_SOCK; do
+		[[ -z "${GUARD_RECORD[${KEY}]}" ]] || continue
+		if [[ "${KEY}" == WG_SOCK ]]; then
+			NODE="${AWG_BT_WG_SOCKET_DIR}/${GUARD_RECORD[NAME]}.sock"
+		else
+			NODE="${AWG_BT_AWG_SOCKET_DIR}/${GUARD_RECORD[NAME]}.sock"
+		fi
+		ID="$(_awgBtPathId "${NODE}")" || continue
+		GUARD_RECORD["${KEY}"]="${ID}"
+		CHANGED=1
+	done
+	((CHANGED == 0)) || _awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
+}
+
+# Remove what remains of one attempt, as its records say: the TUN link only
+# while it has the recorded ifindex, the transient unit by its attempt-unique
+# name, the daemon only while it is the recorded process, and socket nodes only
+# while they are the recorded nodes and their daemon is gone. A systemd-run
+# client that still runs may yet create the unit, so it is waited for first.
+# The records are removed only when nothing of the attempt is left, so an
+# interrupted or incomplete reclaim is retried later.
+function _awgBtScratchReclaim() { # <token>
+	local TOKEN="$1" DIR NAME MODE UNIT WG_NODE AWG_NODE STATE="" MAIN="" START="" I LEFT=0 HAVE_OWNER=0 HAVE_GUARD=0
+	local -A OWNER_RECORD=() GUARD_RECORD=()
+	DIR="$(_awgBtScratchDir)"
+	_awgBtScratchLoad "${DIR}/${TOKEN}.owner" "${_AWG_BT_SCRATCH_OWNER_KEYS}" OWNER_RECORD && HAVE_OWNER=1
+	_awgBtScratchLoad "${DIR}/${TOKEN}.guard" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD && HAVE_GUARD=1
+	if { ((HAVE_OWNER == 0)) && [[ -e "${DIR}/${TOKEN}.owner" || -L "${DIR}/${TOKEN}.owner" ]]; } ||
+		{ ((HAVE_GUARD == 0)) && [[ -e "${DIR}/${TOKEN}.guard" || -L "${DIR}/${TOKEN}.guard" ]]; } ||
+		{ ((HAVE_OWNER && HAVE_GUARD)) && [[ "${OWNER_RECORD[NAME]} ${OWNER_RECORD[UNIT]}" != "${GUARD_RECORD[NAME]} ${GUARD_RECORD[UNIT]}" ]]; }; then
+		_awgBtErr "the records of scratch attempt ${TOKEN} are unreadable or inconsistent; they and anything they describe are left alone"
+		return 1
+	fi
+	if ((HAVE_OWNER == 0 && HAVE_GUARD == 0)); then
+		rm -f -- "${DIR}/${TOKEN}.stop"
+		return 0
+	fi
+	if ((HAVE_GUARD)); then
+		NAME="${GUARD_RECORD[NAME]}"
+		MODE="${GUARD_RECORD[MODE]}"
+		UNIT="${GUARD_RECORD[UNIT]}"
+	else
+		NAME="${OWNER_RECORD[NAME]}"
+		MODE="${OWNER_RECORD[MODE]}"
+		UNIT="${OWNER_RECORD[UNIT]}"
+		GUARD_RECORD=([CLIENT_PID]="" [CLIENT_START]="" [DAEMON_PID]="" [DAEMON_START]="" [IFINDEX]="" [WG_SOCK]="" [AWG_SOCK]="")
+	fi
+	WG_NODE="${AWG_BT_WG_SOCKET_DIR}/${NAME}.sock"
+	AWG_NODE="${AWG_BT_AWG_SOCKET_DIR}/${NAME}.sock"
+	if [[ -n "${GUARD_RECORD[CLIENT_PID]}" ]]; then
+		for ((I = 0; I < 300; I++)); do
+			_awgBtProcessIs "${GUARD_RECORD[CLIENT_PID]}" "${GUARD_RECORD[CLIENT_START]}" || break
+			sleep 0.1
+		done
+		_awgBtProcessIs "${GUARD_RECORD[CLIENT_PID]}" "${GUARD_RECORD[CLIENT_START]}" && LEFT=1
+	fi
+	# A daemon that was never recorded is the main process of the attempt's
+	# own unit. Socket nodes it made before they could be recorded are
+	# recorded now, while it provably still runs: the name was free when the
+	# attempt began.
+	if [[ "${MODE}" == unit && -z "${GUARD_RECORD[DAEMON_PID]}" ]]; then
+		MAIN="$(systemctl show -p MainPID --value "${UNIT}.service" 2>/dev/null)" || MAIN=""
+		if [[ "${MAIN}" =~ ^[1-9][0-9]{0,9}$ ]] && START="$(_awgBtProcessStartTime "${MAIN}")"; then
+			GUARD_RECORD[DAEMON_PID]="${MAIN}"
+			GUARD_RECORD[DAEMON_START]="${START}"
+		fi
+	fi
+	if [[ -n "${GUARD_RECORD[DAEMON_PID]}" ]] && _awgBtProcessIs "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}"; then
+		[[ -n "${GUARD_RECORD[WG_SOCK]}" ]] || GUARD_RECORD[WG_SOCK]="$(_awgBtPathId "${WG_NODE}")"
+		[[ -n "${GUARD_RECORD[AWG_SOCK]}" ]] || GUARD_RECORD[AWG_SOCK]="$(_awgBtPathId "${AWG_NODE}")"
+		((HAVE_GUARD == 0)) || _awgBtScratchSave "${DIR}/${TOKEN}.guard" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
+	fi
+	if [[ -n "${GUARD_RECORD[IFINDEX]}" && "$(_awgBtLinkIndex "${NAME}")" == "${GUARD_RECORD[IFINDEX]}" ]] &&
+		_awgBtLinkIsTun "${NAME}"; then
+		ip link delete dev "${NAME}" >/dev/null 2>&1
+	fi
+	if [[ "${MODE}" == unit ]]; then
+		systemctl stop "${UNIT}.service" >/dev/null 2>&1
+		systemctl reset-failed "${UNIT}.service" >/dev/null 2>&1
+		STATE="$(systemctl show -p ActiveState --value "${UNIT}.service" 2>/dev/null)" || STATE=""
+		[[ "${STATE}" == inactive || "${STATE}" == failed ]] || LEFT=1
+	fi
+	if [[ -n "${GUARD_RECORD[DAEMON_PID]}" ]] && ! _awgBtStopProcess "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}"; then
+		LEFT=1
+	fi
+	_awgBtRemoveOwnedPath "${WG_NODE}" "${GUARD_RECORD[WG_SOCK]}" "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}"
+	_awgBtRemoveOwnedPath "${AWG_NODE}" "${GUARD_RECORD[AWG_SOCK]}" "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}"
+	if [[ -n "${GUARD_RECORD[IFINDEX]}" && "$(_awgBtLinkIndex "${NAME}")" == "${GUARD_RECORD[IFINDEX]}" ]]; then
+		LEFT=1
+	fi
+	if [[ -n "${GUARD_RECORD[WG_SOCK]}" && "$(_awgBtPathId "${WG_NODE}")" == "${GUARD_RECORD[WG_SOCK]}" ]] ||
+		[[ -n "${GUARD_RECORD[AWG_SOCK]}" && "$(_awgBtPathId "${AWG_NODE}")" == "${GUARD_RECORD[AWG_SOCK]}" ]]; then
+		LEFT=1
+	fi
+	if ((LEFT)); then
+		_awgBtErr "scratch interface ${NAME} is not completely removed yet; its records are kept for a later sweep"
+		return 1
+	fi
+	rm -f -- "${DIR}/${TOKEN}.owner" "${DIR}/${TOKEN}.guard" "${DIR}/${TOKEN}.stop"
+}
+
+# Reclaim every attempt whose owner and guardian are both gone: the owner was
+# killed together with its guardian, or the guardian was killed and the owner
+# exited later. Liveness is proven by PID and start time, never by name, and
+# an attempt with an unreadable record is left alone.
+function _awgBtScratchSweep() {
+	local DIR FILE TOKEN ALIVE
+	local -A OWNER_RECORD=() GUARD_RECORD=() SWEPT=()
+	DIR="$(_awgBtScratchDir)"
+	[[ -d "${DIR}" && ! -L "${DIR}" ]] || return 0
+	for FILE in "${DIR}"/*; do
+		[[ "${FILE##*/}" =~ ^([0-9a-f]{32})\.(owner|guard|stop)$ ]] || continue
+		TOKEN="${BASH_REMATCH[1]}"
+		[[ -z "${SWEPT[${TOKEN}]+set}" ]] || continue
+		SWEPT["${TOKEN}"]=1
+		ALIVE=0
+		if _awgBtScratchLoad "${DIR}/${TOKEN}.owner" "${_AWG_BT_SCRATCH_OWNER_KEYS}" OWNER_RECORD; then
+			_awgBtProcessIs "${OWNER_RECORD[OWNER_PID]}" "${OWNER_RECORD[OWNER_START]}" && ALIVE=1
+		elif [[ -e "${DIR}/${TOKEN}.owner" || -L "${DIR}/${TOKEN}.owner" ]]; then
+			continue
+		fi
+		if _awgBtScratchLoad "${DIR}/${TOKEN}.guard" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD; then
+			_awgBtProcessIs "${GUARD_RECORD[GUARD_PID]}" "${GUARD_RECORD[GUARD_START]}" && ALIVE=1
+		elif [[ -e "${DIR}/${TOKEN}.guard" || -L "${DIR}/${TOKEN}.guard" ]]; then
+			continue
+		fi
+		((ALIVE)) && continue
+		_awgBtScratchReclaim "${TOKEN}"
+	done
+	return 0
 }
 
 function _awgBtScratchCreate() {
-	local NAME="$1" UNIT="" PID="" PID_START="" OWNER OWNER_START I LIMIT
+	local NAME="$1" TOKEN MODE UNIT="" OWNER OWNER_START GUARD GUARD_START DIR I LIMIT
+	local -A OWNER_RECORD=() GUARD_RECORD=()
 	if ! [[ "${NAME}" =~ ^[a-zA-Z0-9_-]{1,15}$ ]]; then
 		_awgBtErr "invalid scratch interface name ${NAME}"
+		return 1
+	fi
+	if [[ -n "${_AWG_BT_SCRATCH_TOKENS[${NAME}]+set}" ]]; then
+		_awgBtErr "scratch interface ${NAME} already exists in this shell"
 		return 1
 	fi
 	if ip link show dev "${NAME}" >/dev/null 2>&1 ||
@@ -5122,49 +5922,59 @@ function _awgBtScratchCreate() {
 		_awgBtErr "cannot identify the shell that owns scratch interface ${NAME}"
 		return 1
 	fi
+	if ! _awgBtPrepareScratchDir; then
+		_awgBtErr "cannot prepare the private scratch directory $(_awgBtScratchDir)"
+		return 1
+	fi
+	_awgBtScratchSweep
 	_awgBtVerifyStore || return 1
 	_awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${NAME}" || return 1
+	if ! TOKEN="$(_awgBtNewToken)"; then
+		_awgBtErr "cannot draw a token for scratch interface ${NAME}"
+		return 1
+	fi
 	if [[ -d "${AWG_BT_SYSTEMD_RUNTIME_DIR}" ]] && command -v systemd-run >/dev/null 2>&1; then
-		UNIT="$(_awgBtScratchUnitName "${NAME}")"
-		# A unit systemd already knows, loaded, failed or left over from an
-		# interrupted run, belongs to someone else: never start over it.
-		if [[ "$(systemctl show -p LoadState --value "${UNIT}.service" 2>/dev/null)" != "not-found" ]]; then
+		MODE=unit
+		UNIT="amneziawg-scratch-${NAME}-${TOKEN}"
+		if [[ "$(systemctl show -p LoadState --value "${UNIT}.service" 2>/dev/null)" != not-found ]]; then
 			_awgBtErr "refusing to start scratch interface ${NAME}: the unit ${UNIT} already exists"
 			return 1
 		fi
-		_AWG_BT_SCRATCH_UNITS["${NAME}"]="${UNIT}"
-	fi
-	# The guardian is started before the daemon, so no instance ever runs
-	# unwatched.
-	if [[ -n "${UNIT}" ]]; then
-		_awgBtScratchGuardian "${NAME}" "${UNIT}" "" "" "${OWNER}" "${OWNER_START}" </dev/null >/dev/null 2>&1 &
-		_AWG_BT_SCRATCH_GUARDS["${NAME}"]=$!
-		if ! systemd-run --quiet --collect --unit="${UNIT}" -p Type=exec -- "${_AWG_BT_ARGV[@]}" >/dev/null; then
-			# The unit may have appeared since the check above and then is not
-			# ours, so only the guardian is stopped: no unit, link or socket is
-			# touched.
-			_awgBtErr "could not start the transient unit ${UNIT}"
-			kill -KILL "${_AWG_BT_SCRATCH_GUARDS[${NAME}]}" 2>/dev/null
-			wait "${_AWG_BT_SCRATCH_GUARDS[${NAME}]}" 2>/dev/null
-			unset "_AWG_BT_SCRATCH_UNITS[${NAME}]" "_AWG_BT_SCRATCH_GUARDS[${NAME}]"
+	else
+		MODE=direct
+		if ! command -v setpriv >/dev/null 2>&1; then
+			_awgBtErr "setpriv is required to tie a scratch daemon to its guardian"
 			return 1
 		fi
-	else
-		(
-			_awgBtCloseInheritedFds
-			exec "${_AWG_BT_ARGV[@]}" </dev/null >/dev/null 2>&1
-		) &
-		PID=$!
-		PID_START="$(_awgBtProcessStartTime "${PID}")" || PID_START=""
-		_AWG_BT_SCRATCH_PIDS["${NAME}"]="${PID}"
-		_AWG_BT_SCRATCH_PID_STARTS["${NAME}"]="${PID_START}"
-		_awgBtScratchGuardian "${NAME}" "" "${PID}" "${PID_START}" "${OWNER}" "${OWNER_START}" </dev/null >/dev/null 2>&1 &
-		_AWG_BT_SCRATCH_GUARDS["${NAME}"]=$!
 	fi
-	LIMIT=$((AWG_BT_READY_TIMEOUT * 10))
+	DIR="$(_awgBtScratchDir)"
+	OWNER_RECORD=([FORMAT]=1 [TOKEN]="${TOKEN}" [NAME]="${NAME}" [MODE]="${MODE}" [UNIT]="${UNIT}"
+		[OWNER_PID]="${OWNER}" [OWNER_START]="${OWNER_START}")
+	if ! _awgBtScratchSave "${DIR}/${TOKEN}.owner" "${_AWG_BT_SCRATCH_OWNER_KEYS}" OWNER_RECORD; then
+		_awgBtErr "cannot record scratch interface ${NAME}"
+		return 1
+	fi
+	_awgBtScratchGuardian "${TOKEN}" </dev/null >/dev/null 2>&1 &
+	GUARD=$!
+	if ! GUARD_START="$(_awgBtProcessStartTime "${GUARD}")"; then
+		# The guardian exited at once and was reaped, so its PID is not
+		# signalled.
+		wait "${GUARD}" 2>/dev/null
+		_awgBtScratchReclaim "${TOKEN}"
+		_awgBtErr "cannot identify the guardian of scratch interface ${NAME}"
+		return 1
+	fi
+	_AWG_BT_SCRATCH_TOKENS["${NAME}"]="${TOKEN}"
+	_AWG_BT_SCRATCH_GUARDS["${NAME}"]="${GUARD}"
+	_AWG_BT_SCRATCH_GUARD_STARTS["${NAME}"]="${GUARD_START}"
+	# systemd-run may take a while; the guardian waits for it in any case.
+	LIMIT=$(((AWG_BT_READY_TIMEOUT + 30) * 10))
 	for ((I = 0; I < LIMIT; I++)); do
-		_awgBtScratchAlive "${NAME}" || break
-		_awgBtUapiReady "${NAME}" && return 0
+		if _awgBtScratchLoad "${DIR}/${TOKEN}.guard" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD; then
+			[[ "${GUARD_RECORD[PHASE]}" == created ]] && return 0
+			[[ "${GUARD_RECORD[PHASE]}" == teardown ]] && break
+		fi
+		_awgBtProcessIs "${GUARD}" "${GUARD_START}" || break
 		sleep 0.1
 	done
 	_awgBtErr "scratch interface ${NAME} did not become ready"
@@ -5172,33 +5982,39 @@ function _awgBtScratchCreate() {
 	return 1
 }
 
-# Stop the guardian, then delete the link (the daemon exits), stop the
-# transient unit or tracked process and remove the name's stale sockets.
+# Ask the guardian to tear the instance down and wait until it has finished,
+# then reap it. A guardian that is gone or hangs is replaced by a reclaim from
+# the records here.
 function _awgBtScratchDestroy() {
-	local NAME="$1" UNIT PID PID_START GUARD RC=0
-	UNIT="${_AWG_BT_SCRATCH_UNITS[${NAME}]:-}"
-	PID="${_AWG_BT_SCRATCH_PIDS[${NAME}]:-}"
-	PID_START="${_AWG_BT_SCRATCH_PID_STARTS[${NAME}]:-}"
-	GUARD="${_AWG_BT_SCRATCH_GUARDS[${NAME}]:-}"
-	if [[ -z "${UNIT}" && -z "${PID}" ]]; then
+	local NAME="$1" TOKEN GUARD GUARD_START DIR I RC=0
+	TOKEN="${_AWG_BT_SCRATCH_TOKENS[${NAME}]:-}"
+	if [[ -z "${TOKEN}" ]]; then
 		_awgBtErr "scratch interface ${NAME} was not started here"
 		return 1
 	fi
-	if [[ -n "${GUARD}" ]]; then
-		kill -KILL "${GUARD}" 2>/dev/null
-		wait "${GUARD}" 2>/dev/null
+	GUARD="${_AWG_BT_SCRATCH_GUARDS[${NAME}]}"
+	GUARD_START="${_AWG_BT_SCRATCH_GUARD_STARTS[${NAME}]}"
+	DIR="$(_awgBtScratchDir)"
+	if ! { : >"${DIR}/${TOKEN}.stop"; } 2>/dev/null; then
+		_awgBtErr "cannot ask the guardian of scratch interface ${NAME} to stop; stopping it"
+		_awgBtSignalProcess "${GUARD}" "${GUARD_START}" KILL
 	fi
-	_awgBtScratchTeardown "${NAME}" "${UNIT}" "${PID}" "${PID_START}"
-	if [[ -n "${PID}" ]]; then
-		wait "${PID}" 2>/dev/null
+	for ((I = 0; I < 300; I++)); do
+		_awgBtProcessIs "${GUARD}" "${GUARD_START}" || break
+		sleep 0.1
+	done
+	if _awgBtProcessIs "${GUARD}" "${GUARD_START}"; then
+		_awgBtErr "the guardian of scratch interface ${NAME} did not finish its teardown; stopping it"
+		_awgBtSignalProcess "${GUARD}" "${GUARD_START}" KILL
+		for ((I = 0; I < 30; I++)); do
+			_awgBtProcessIs "${GUARD}" "${GUARD_START}" || break
+			sleep 0.1
+		done
 	fi
-	unset "_AWG_BT_SCRATCH_UNITS[${NAME}]" "_AWG_BT_SCRATCH_PIDS[${NAME}]" \
-		"_AWG_BT_SCRATCH_PID_STARTS[${NAME}]" "_AWG_BT_SCRATCH_GUARDS[${NAME}]"
-	if ip link show dev "${NAME}" >/dev/null 2>&1 ||
-		{ [[ -n "${UNIT}" ]] && systemctl is-active --quiet "${UNIT}"; } ||
-		_awgBtUapiLive "${NAME}"; then
-		RC=1
-	fi
+	# Reap the guardian. In a shell that is not its parent this fails at once.
+	_awgBtProcessIs "${GUARD}" "${GUARD_START}" || wait "${GUARD}" 2>/dev/null
+	_awgBtScratchReclaim "${TOKEN}" || RC=1
+	unset "_AWG_BT_SCRATCH_TOKENS[${NAME}]" "_AWG_BT_SCRATCH_GUARDS[${NAME}]" "_AWG_BT_SCRATCH_GUARD_STARTS[${NAME}]"
 	return "${RC}"
 }
 
@@ -8375,8 +9191,8 @@ function validateStagedAwgConfigs() {
 	shift
 	local -a CONFIG_FILES=("$@")
 	local VALIDATE_INTERFACE="awgv$((BASHPID % 100000000))"
-	local CONFIG_FILE STRIPPED_FILE INTERFACE_FILE LINE CLEAN
-	local INDEX=0 RC=0 INTERFACE_CREATED=0
+	local CONFIG_FILE STRIPPED_FILE INTERFACE_FILE LINE CLEAN PORT
+	local INDEX=0 RC=0 INTERFACE_CREATED=0 PORTS
 
 	if ! awgBackendCreateScratchInterface "${VALIDATE_INTERFACE}" >/dev/null 2>&1; then
 		echo "ERROR: could not create the temporary AWG configuration-validation interface" >&2
@@ -8393,19 +9209,35 @@ function validateStagedAwgConfigs() {
 			break
 		fi
 		: >"${INTERFACE_FILE}"
+		PORTS=0
 		while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
 			[[ "${LINE}" =~ ^[[:space:]]*\[Peer\][[:space:]]*$ ]] && break
 			# BoringTun binds ListenPort as soon as it is set, even on a link
 			# that is down, so a scratch instance given the running server's
 			# staged config would collide with the server's own socket. The
-			# port is not a protocol field, so BoringTun validation omits it.
+			# port is not a protocol field, so BoringTun validation checks it
+			# here instead and omits it: one ListenPort at most, read the way
+			# awg reads it (comments dropped, whitespace ignored, any case), a
+			# decimal number from 1 to 65535 without leading zeros. This is
+			# stricter than awg, which also takes 0 and service names, and it
+			# checks the syntax only, not whether the port is free.
 			if [[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
 				CLEAN="${LINE%%#*}"
 				CLEAN="${CLEAN//[[:space:]]/}"
-				[[ "${CLEAN,,}" == listenport=* ]] && continue
+				if [[ "${CLEAN,,}" == listenport=* ]]; then
+					PORTS=$((PORTS + 1))
+					PORT="${CLEAN#*=}"
+					if ((PORTS > 1)) || ! [[ "${PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || ((10#${PORT} > 65535)); then
+						echo "ERROR: ${CONFIG_FILE} must set ListenPort at most once, to a port number from 1 to 65535" >&2
+						RC=1
+						break
+					fi
+					continue
+				fi
 			fi
 			printf '%s\n' "${LINE}" >>"${INTERFACE_FILE}"
 		done <"${STRIPPED_FILE}"
+		((RC == 0)) || break
 		if ! awg setconf "${VALIDATE_INTERFACE}" "${INTERFACE_FILE}" >/dev/null 2>&1; then
 			RC=1
 			break
