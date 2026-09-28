@@ -18,6 +18,10 @@
 #   verify-archive-static <archive> <extract-dir>
 #                                               the same checks without running the binary,
 #                                               for an archive of another architecture
+#   verify-test-archive <archive> <extract-dir>
+#                                               the verify-archive checks except the required
+#                                               notices, for a test-only archive packaged with
+#                                               placeholder notices; never for a published one
 #   check-notices <third-party-licenses>        check the required copyright notices
 #   device-smoke <boringtun-cli>                as root: create a TUN device and query its UAPI
 #   checksums <dir>                             write <dir>/SHA256SUMS for the archives in <dir>
@@ -710,10 +714,11 @@ bta_package() {
 # Check an archive against the pin without trusting its contents: the name,
 # the exact member list, member types, modes and owners, then extract into a
 # new directory and check the manifest, the license files and their required
-# notices, and the binary, which is also run unless $3 is 0. Prints the path of
-# the extracted binary.
+# notices, and the binary, which is also run unless $3 is 0. The notices are
+# checked unless $4 is 0, which only the test-only command does. Prints the
+# path of the extracted binary.
 bta_verify_archive() {
-    local archive="$1" extract_dir="$2" execute="${3:-1}"
+    local archive="$1" extract_dir="$2" execute="${3:-1}" notices="${4:-1}"
     local name stem arch expected listing line mode path binary
     local -A manifest=()
 
@@ -788,10 +793,10 @@ bta_verify_archive() {
         bta_err "${name}: LICENSE or THIRD-PARTY-LICENSES is not the expected notice"
         return 1
     fi
-    bta_check_notices "${extract_dir}/${stem}/THIRD-PARTY-LICENSES" || {
+    if [[ "${notices}" != 0 ]] && ! bta_check_notices "${extract_dir}/${stem}/THIRD-PARTY-LICENSES"; then
         bta_err "${name}: THIRD-PARTY-LICENSES lacks required copyright notices"
         return 1
-    }
+    fi
     bta_verify_binary "${binary}" "${manifest[target]}" "${execute}" || return 1
     printf '%s\n' "${binary}"
 }
@@ -921,6 +926,7 @@ bta_main() {
         package:4) bta_package "$@" ;;
         verify-archive:2) bta_verify_archive "$@" ;;
         verify-archive-static:2) bta_verify_archive "$1" "$2" 0 ;;
+        verify-test-archive:2) bta_verify_archive "$1" "$2" 1 0 ;;
         check-notices:1) bta_check_notices "$@" ;;
         device-smoke:1) bta_device_smoke "$@" ;;
         checksums:1) bta_checksums "$@" ;;

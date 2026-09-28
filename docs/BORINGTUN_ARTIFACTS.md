@@ -161,7 +161,10 @@ member types, modes and owners before extracting. It then checks `MANIFEST`
 against the pin and the binary's hash, the license files and their required
 notices, and the binary itself: architecture, static linkage, `--version` and
 `--help`. `verify-archive-static` does the same without running the binary, for
-an archive of another architecture. `gh attestation verify` checks the archive's
+an archive of another architecture. `verify-test-archive` skips only the
+required-notices check, for the BoringTun Runtime workflow's never-uploaded
+test archive with placeholder notices; nothing that is published uses it.
+`gh attestation verify` checks the archive's
 build provenance: that this repository's artifacts workflow built exactly these
 bytes, and from which commit and run. As root,
 `device-smoke <binary>` also creates a TUN device, queries its UAPI socket and

@@ -713,6 +713,12 @@ if ! grep -nE -- '--clobber|release (upload|delete|edit)|method DELETE|-X DELETE
 else
 	not_ok "no --clobber, no release upload/delete/edit, no DELETE and no force anywhere in the release path"
 fi
+if ! grep -n 'verify-test-archive' "${RELEASE_SCRIPT}" "${RELEASE_WORKFLOW}" "${ARTIFACTS_WORKFLOW}" && \
+	[[ "$(grep -o 'bta_verify_archive .*' "${RELEASE_SCRIPT}")" == 'bta_verify_archive "${archive}" "${work}/${arch}" 0)" || {' ]]; then
+	ok "the release path and the artifacts workflow never skip the notices check"
+else
+	not_ok "the release path and the artifacts workflow never skip the notices check"
+fi
 assert_eq "permissions:
   contents: read" "$(grep -A1 -E '^permissions:' "${ARTIFACTS_WORKFLOW}")" "the artifacts workflow is read-only by default"
 assert_eq "2" "$(grep -cE 'id-token: write|attestations: write' "${ARTIFACTS_WORKFLOW}")" \
