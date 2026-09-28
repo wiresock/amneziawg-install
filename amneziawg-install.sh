@@ -6047,8 +6047,21 @@ function _awgBtScratchRegisterSelf() { # <CHILD|CLIENT>
 	# A reclaim marks the attempt before it reads the records, and this
 	# process records itself before it reads the mark: either the reclaim
 	# sees this record, or this process sees the mark and starts nothing.
+	# The reclaim removes the owner record before the mark, and a token's
+	# owner record is written once and never again, so the mark is read
+	# first and the owner record after it: a mark that is already gone
+	# means the owner record is gone too. Either one stops this process,
+	# whether or not the guardian still lives.
 	[[ ! -e "${DIR}/${TOKEN}.reclaim" ]] || return 1
+	_awgBtScratchOwnerRecordValid || return 1
 	_awgBtProcessIs "${GUARD_RECORD[GUARD_PID]}" "${GUARD_RECORD[GUARD_START]}"
+}
+
+# The attempt's owner record still exists and is the one the guardian read.
+function _awgBtScratchOwnerRecordValid() {
+	local -A CURRENT_OWNER=()
+	_awgBtScratchLoad "${DIR}/${TOKEN}.owner" "${_AWG_BT_SCRATCH_OWNER_KEYS}" CURRENT_OWNER &&
+		[[ "${CURRENT_OWNER[OWNER_PID]} ${CURRENT_OWNER[OWNER_START]}" == "${OWNER_RECORD[OWNER_PID]} ${OWNER_RECORD[OWNER_START]}" ]]
 }
 
 # The command line of a transient scratch unit: the production command line,
@@ -6169,7 +6182,8 @@ function _awgBtScratchReclaim() { # <token>
 			_awgBtStopProcess "${CHILD_RECORD[CHILD_PID]}" "${CHILD_RECORD[CHILD_START]}" || return 1
 		fi
 		((LEFT == 0)) || return 1
-		rm -f -- "${DIR}/${TOKEN}.child" "${DIR}/${TOKEN}.client" "${DIR}/${TOKEN}.stop" "${DIR}/${TOKEN}.reclaim"
+		rm -f -- "${DIR}/${TOKEN}.child" "${DIR}/${TOKEN}.client" "${DIR}/${TOKEN}.stop"
+		rm -f -- "${DIR}/${TOKEN}.reclaim"
 		return 0
 	fi
 	if ((HAVE_GUARD)); then
@@ -6230,8 +6244,11 @@ function _awgBtScratchReclaim() { # <token>
 		_awgBtErr "scratch interface ${NAME} is not completely removed yet; its records are kept for a later sweep"
 		return 1
 	fi
-	rm -f -- "${DIR}/${TOKEN}.owner" "${DIR}/${TOKEN}.guard" "${DIR}/${TOKEN}.child" "${DIR}/${TOKEN}.client" \
-		"${DIR}/${TOKEN}.stop" "${DIR}/${TOKEN}.reclaim"
+	# The owner record goes first and the mark last, so at every moment one of
+	# them tells a late registrant to start nothing (_awgBtScratchRegisterSelf).
+	rm -f -- "${DIR}/${TOKEN}.owner" || return 1
+	rm -f -- "${DIR}/${TOKEN}.guard" "${DIR}/${TOKEN}.child" "${DIR}/${TOKEN}.client" "${DIR}/${TOKEN}.stop"
+	rm -f -- "${DIR}/${TOKEN}.reclaim"
 }
 
 # Reclaim every attempt whose owner and guardian are both gone: the owner was
