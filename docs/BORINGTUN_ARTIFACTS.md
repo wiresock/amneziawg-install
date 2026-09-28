@@ -232,6 +232,12 @@ such as the kernel coexistence tests planned for the host install work.
 
 ## Not yet done
 
+The installer's internal BoringTun runtime layer can already run an unpacked
+archive: the archive's top-level directory becomes a release in
+`/usr/local/lib/amneziawg-install/boringtun/`, and every start checks it against
+its `MANIFEST` (see §21.1 of [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
+Only CI populates that store today.
+
 The installer does not use these artifacts. Before it can, the project needs a
 published, immutable release channel, the artifact SHA-256 values embedded in
 `amneziawg-install.sh`, download and verification on the target, and the

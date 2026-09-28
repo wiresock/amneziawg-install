@@ -1,0 +1,107 @@
+name: BoringTun Runtime
+
+# Live test of the internal, supervised BoringTun runtime layer of
+# amneziawg-install.sh on a systemd host. BoringTun is not an installer
+# backend yet: the host is provisioned by hand, and the runtime is selected
+# through the installer's internal test hook. The binary is built and packaged
+# by scripts/boringtun-artifact.sh at the commit pinned in
+# packaging/boringtun/pin.env; nothing is uploaded or released. See
+# docs/BORINGTUN_BACKEND_DESIGN.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - amneziawg-install.sh
+      - packaging/boringtun/**
+      - scripts/boringtun-artifact.sh
+      - tests/test-boringtun-runtime.sh
+      - tests/test-boringtun-runtime-live.sh
+      - .github/workflows/boringtun-runtime.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - amneziawg-install.sh
+      - packaging/boringtun/**
+      - scripts/boringtun-artifact.sh
+      - tests/test-boringtun-runtime.sh
+      - tests/test-boringtun-runtime-live.sh
+      - .github/workflows/boringtun-runtime.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  runtime:
+    name: Supervised BoringTun runtime (systemd)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read the pin
+        id: pin
+        run: bash scripts/boringtun-artifact.sh pin | tee -a "$GITHUB_OUTPUT"
+
+      - name: Check out the pinned BoringTun source
+        uses: actions/checkout@v6
+        with:
+          repository: Wiresock-Foundation/wiresock-boringtun
+          ref: ${{ steps.pin.outputs.BORINGTUN_COMMIT }}
+          path: boringtun-src
+          persist-credentials: false
+
+      - name: Install the musl C toolchain for ring
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install the pinned Rust toolchain
+        env:
+          TOOLCHAIN: ${{ steps.pin.outputs.BORINGTUN_RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
+          rustc "+$TOOLCHAIN" --version
+
+      # The same build and packaging as the BoringTun Artifacts workflow. The
+      # runtime reads only the binary and MANIFEST, so the licence notices are
+      # a labelled placeholder here instead of a cargo-about run; this archive
+      # is never uploaded.
+      - name: Build and package boringtun-cli with the repository script
+        run: |
+          bash scripts/boringtun-artifact.sh build boringtun-src x86_64-unknown-linux-musl "$RUNNER_TEMP/build"
+          {
+            echo "THIRD-PARTY LICENSES FOR boringtun-cli"
+            echo "Placeholder written by the BoringTun Runtime test job; published artifacts carry the generated notices."
+          } >"$RUNNER_TEMP/THIRD-PARTY-LICENSES"
+          mkdir -p "$RUNNER_TEMP/dist"
+          bash scripts/boringtun-artifact.sh package "$RUNNER_TEMP/build" boringtun-src "$RUNNER_TEMP/THIRD-PARTY-LICENSES" "$RUNNER_TEMP/dist"
+          bash scripts/boringtun-artifact.sh verify-archive "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP/extract"
+          sha256sum "$RUNNER_TEMP/build/boringtun-cli" "$RUNNER_TEMP"/dist/*.tar.gz
+
+      # awg, awg-quick and awg-quick@.service only. --no-install-recommends
+      # keeps amneziawg-dkms, and with it the kernel module, off the host.
+      - name: Install amneziawg-tools without the kernel module
+        run: |
+          sudo add-apt-repository -y ppa:amnezia/ppa
+          sudo apt-get install -y --no-install-recommends amneziawg-tools iptables python3
+          dpkg-query -W amneziawg-tools
+          if dpkg-query -W -f='${Status}' amneziawg-dkms 2>/dev/null | grep -q 'install ok installed' || [[ -e /sys/module/amneziawg ]]; then
+            echo "::error::the AmneziaWG kernel module must not be present"
+            exit 1
+          fi
+
+      - name: Compare the PostDown parser with the installed awg-quick
+        run: |
+          AWG_QUICK_REFERENCE=/usr/bin/awg-quick bash tests/test-boringtun-runtime.sh
+
+      - name: Live supervised runtime test (as root)
+        run: |
+          sudo env AWG_DISPOSABLE_RUNTIME_TEST=1 bash tests/test-boringtun-runtime-live.sh "$RUNNER_TEMP"/dist/*.tar.gz
