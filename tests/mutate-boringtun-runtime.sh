@@ -51,27 +51,37 @@ mutant b1_no_preexisting_refusal 'if [[ -n "${PRESENT}" ]]; then' 'if false; the
 mutant no_tun_check $'if ! _awgBtLinkIsTun "${INTERFACE_NAME}"; then\n\t\t_awgBtErr "${INTERFACE_NAME} is not a TUN device' \
 	$'if false; then\n\t\t_awgBtErr "${INTERFACE_NAME} is not a TUN device'
 mutant no_exe_check 'if [[ "${EXE}" != "${_AWG_BT_VERIFIED_BIN}" ]]; then' 'if false; then'
-mutant s9_no_sync_down 'if WORK="$(_awgBtDownCopy "${INTERFACE_NAME}" "${CONFIG_FILE}")" && _awgBtQuickDownCopy "${INTERFACE_NAME}" "${WORK}"; then' 'if false; then'
-# stop and poststop (B1, S1).
-mutant b1_poststop_ignores_attempt \
-	$'if [[ "${_AWG_BT_STATE[PHASE]}" == up && "${_AWG_BT_STATE[DOWN]}" == none && -n "${INDEX}" &&\n\t\t\t"${INDEX}" == "${_AWG_BT_STATE[IFINDEX]}" ]]' \
-	'if [[ -n "${INDEX}" ]]'
-# Not a mutant: poststop's outer PHASE=started guard is redundant with the
-# PHASE=up checks inside it, so removing it alone changes nothing.
-mutant s1_no_down_attempt_record \
-	$'_AWG_BT_STATE[DOWN]=attempted\n\tif ! _awgBtStateSave "${INTERFACE_NAME}"; then' \
-	'if false; then'
+# Attempt identity and the guarded down (B1).
+mutant b1_ignore_attempt_identity '_AWG_BT_ATTEMPT="${INVOCATION_ID}"' '_AWG_BT_ATTEMPT=00000000000000000000000000000000'
+mutant b1_skip_final_ifindex_recheck $'\tif ! _awgBtLinkIsOwned "${INTERFACE_NAME}" "$3" "$4"; then' $'\tif false; then'
+# Not a mutant: poststop's own ifindex test before a kernel down is repeated,
+# after the blocking preparation, inside _awgBtGuardedDown, so removing only
+# the first changes nothing observable.
+# Replay durability and the down record (S1).
+mutant s1_replay_without_durable_intent 'if _awgBtFlagRaise "${INTERFACE_NAME}" replay; then' \
+	'if _awgBtFlagRaise "${INTERFACE_NAME}" replay || true; then'
+# Not a mutant: skipping poststop's "replay already started" branch cannot run
+# a hook twice, because the replay flag can be raised only once.
+mutant s1_down_not_recorded_before_down $'\tif [[ -z "${5:-}" ]] && ! _awgBtFlagRaise "${INTERFACE_NAME}" down; then' $'\tif false; then'
 mutant s1_failed_down_counts_as_intact \
-	$'elif [[ "$(_awgBtLinkIndex "${INTERFACE_NAME}")" == "${_AWG_BT_STATE[IFINDEX]}" ]]; then\n\t\t_AWG_BT_STATE[DOWN]=failed-intact' \
-	$'elif true; then\n\t\t_AWG_BT_STATE[DOWN]=failed-intact'
-mutant s1_replay_after_partial_down 'none | failed-intact)' 'none | failed-intact | attempted | failed)'
+	$'\tif [[ -n "$2" && "$(_awgBtLinkIndex "$1")" == "$2" ]]; then\n\t\t_AWG_BT_STATE[DOWN]=failed-intact' \
+	$'\tif true; then\n\t\t_AWG_BT_STATE[DOWN]=failed-intact'
+mutant s1_replay_after_partial_down \
+	'if [[ "${_AWG_BT_STATE[DOWN]}" == failed-intact ]] && ! _awgBtLinkExists "${INTERFACE_NAME}"; then' \
+	'if ! _awgBtLinkExists "${INTERFACE_NAME}"; then'
+# Emergency cleanup and nonterminal state (S9).
+mutant s9_no_emergency_down '"${INTERFACE_NAME}" "${CONFIG_FILE}" any "${_AWG_BT_STATE[IFINDEX]:-${INDEX}}" noflag' \
+	'"${INTERFACE_NAME}" /nonexistent any "${_AWG_BT_STATE[IFINDEX]:-${INDEX}}" noflag'
+mutant s9_emergency_needs_run_dir 'WORK="$(mktemp -d "${AWG_BT_TMP_DIR}/awg-boringtun-down.XXXXXX" 2>/dev/null)" || WORK=""' 'WORK=""'
+mutant s9_remove_incomplete_state 'if ((TERMINAL && ! KEEP)); then' 'if ((! KEEP)); then'
 # Socket ownership (S2).
 mutant s2_remove_replaced_node '[[ "${CURRENT}" == "$2" ]] || return 0' ':'
 mutant s2_remove_while_owner_lives '_awgBtProcessIs "$3" "$4" && return 0' ':'
+mutant s2_record_without_fd_proof 'ss -xlHe 2>/dev/null | awk' 'true || ss -xlHe 2>/dev/null | awk'
 mutant s2_inode_only_identity "stat -c '%d:%i:%f:%.9Z'" "stat -c '%d:%i:%f:0.000000000'"
 # SaveConfig (S5).
 mutant s5_down_keeps_saveconfig '_awgBtWithoutSaveConfig "$2" >"${WORK}/$1.conf"' 'cat -- "$2" >"${WORK}/$1.conf"'
-mutant s5_quickup_default_config 'if ! "${CTL}" precheck "${INTERFACE_NAME}" "${CONFIG_FILE}"; then' 'if ! "${CTL}" precheck "${INTERFACE_NAME}"; then'
+mutant s5_quickup_default_config 'if ! INVOCATION_ID="${ATTEMPT}" "${CTL}" precheck "${INTERFACE_NAME}" "${CONFIG_FILE}"; then' 'if ! INVOCATION_ID="${ATTEMPT}" "${CTL}" precheck "${INTERFACE_NAME}"; then'
 # ensureAwgBackendReady (S6).
 mutant s6_no_active_check 'if ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}"; then' 'if false; then'
 mutant s6_no_mainpid_check 'if [[ "${MAIN_PID}" != "${_AWG_BT_STATE[PID]}" ]]; then' 'if false; then'
@@ -85,7 +95,9 @@ mutant s4_zombie_counts_as_alive '[[ -n "${FIELDS[0]:-}" && "${FIELDS[0]}" != [Z
 # Scratch lifecycle (S3) and the sweep.
 mutant s3_no_scratch_collision_check '_awgBtErr "refusing to start scratch interface ${NAME}: the name is already in use"'$'\n'"${T}${T}return 1" ':'
 mutant s3_no_pdeathsig 'exec setpriv --pdeathsig KILL -- "${_AWG_BT_ARGV[@]}"' 'exec "${_AWG_BT_ARGV[@]}"'
-mutant s3_daemon_keeps_ignored_signals $'\t\ttrap - HUP INT TERM\n\t\t_awgBtCloseInheritedFds\n\t\texec setpriv' $'\t\t_awgBtCloseInheritedFds\n\t\texec setpriv'
+mutant s3_daemon_keeps_ignored_signals $'\t\ttrap - HUP INT TERM\n\t\t_awgBtCloseInheritedFds\n\t\t_awgBtScratchRegisterChild' $'\t\t_awgBtCloseInheritedFds\n\t\t_awgBtScratchRegisterChild'
+mutant s3_child_execs_without_guardian $'\t_awgBtProcessIs "${GUARD_RECORD[GUARD_PID]}" "${GUARD_RECORD[GUARD_START]}"\n}' $'\ttrue\n}'
+mutant s3_child_not_registered $'\t\t_awgBtScratchRegisterChild || exit 1\n' ''
 mutant s3_reclaim_leaves_unit $'\t\tsystemctl stop "${UNIT}.service" >/dev/null 2>&1\n' ''
 mutant s3_sweep_ignores_liveness '((ALIVE)) && continue' ':'
 mutant s3_no_sweep $'\t_awgBtScratchSweep\n\t_awgBtVerifyStore || return 1' $'\t_awgBtVerifyStore || return 1'

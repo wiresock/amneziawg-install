@@ -139,10 +139,11 @@ AWG_BT_TUN_DEVICE="/dev/null"
 AWG_BT_PATH="${MOCKBIN}:/usr/local/bin:/usr/bin:/bin"
 AWG_BT_READY_TIMEOUT=5
 AWG_BT_HOST_ARCH="x86_64"
+AWG_BT_TMP_DIR="${T}/tmp"
 NET="${AWG_BT_SYS_DIR}/class/net"
 mkdir -p "${T}/lib" "${T}/run" "${AWG_BT_CONFIG_DIR}" "${AWG_BT_SYSTEMD_DIR}" \
 	"${T}/usr/lib/systemd" "${AWG_BT_WG_SOCKET_DIR}" "${AWG_BT_AWG_SOCKET_DIR}" "${NET}" \
-	"${AWG_BT_SYS_DIR}/module" "${T}/run/systemd-present"
+	"${AWG_BT_SYS_DIR}/module" "${T}/run/systemd-present" "${AWG_BT_TMP_DIR}"
 chmod 0700 "${AWG_BT_CONFIG_DIR}"
 PATH="${MOCKBIN}:${PATH}"
 SCRATCH_DIR="${AWG_BT_RUN_DIR}/scratch"
@@ -442,6 +443,9 @@ case "$1" in
 			ActiveState)
 				if running || [[ -f "${S}/active-${UNIT}" ]]; then echo active; else echo inactive; fi
 				;;
+			InvocationID)
+				cat "${S}/invocation-${UNIT}" 2>/dev/null
+				;;
 			MainPID)
 				if running; then
 					cat "${S}/units/${UNIT}"
@@ -465,16 +469,42 @@ S='${S}'
 REAL='$(command -v mktemp)'
 EOF
 cat >>"${MOCKBIN}/mktemp" <<'EOF'
-if [[ -f "${S}/mktemp-fail" && "$*" == *"$(cat "${S}/mktemp-fail")"* ]]; then
-	echo "mktemp: injected failure" >&2
-	exit 1
+# $S/mktemp-fail: fail when the arguments contain any of its lines.
+if [[ -f "${S}/mktemp-fail" ]]; then
+	while IFS= read -r PATTERN; do
+		[[ -n "${PATTERN}" && "$*" == *"${PATTERN}"* ]] && { echo "mktemp: injected failure" >&2; exit 1; }
+	done <"${S}/mktemp-fail"
+fi
+# $S/mktemp-hold: once, block a matching call until $S/mktemp-release exists.
+if [[ -f "${S}/mktemp-hold" && "$*" == *"$(cat "${S}/mktemp-hold")"* ]]; then
+	rm -f "${S}/mktemp-hold"
+	echo "$$" >"${S}/mktemp-waiting"
+	while [[ ! -f "${S}/mktemp-release" ]]; do sleep 0.02; done
 fi
 exec "${REAL}" "$@"
 EOF
+# mv, rm and chmod fail when their arguments contain the text in
+# $S/<tool>-fail.
+for TOOL in mv rm chmod; do
+	cat >"${MOCKBIN}/${TOOL}" <<EOF
+#!/bin/bash
+if [[ -f '${S}/${TOOL}-fail' && "\$*" == *"\$(cat '${S}/${TOOL}-fail')"* ]]; then
+	echo "${TOOL}: injected failure" >&2
+	exit 1
+fi
+exec '$(command -v "${TOOL}")' "\$@"
+EOF
+done
 for TOOL in nft iptables ip6tables iptables-save ip6tables-save iptables-restore ip6tables-restore; do
 	printf '#!/bin/bash\nexit 0\n' >"${MOCKBIN}/${TOOL}"
 done
 chmod 0755 "${MOCKBIN}"/*
+# A setpriv that sets no parent-death signal, installed by tests that need a
+# direct scratch daemon to outlive its guardian.
+NO_PDEATHSIG_SETPRIV='#!/bin/bash
+while [[ "$1" != -- ]]; do shift; done
+shift
+exec "$@"'
 REAL_MKTEMP="$(sed -n "s/^REAL='\(.*\)'$/\1/p" "${MOCKBIN}/mktemp")"
 [[ "${REAL_MKTEMP}" != "${MOCKBIN}/mktemp" ]] || { echo "ERROR: no real mktemp" >&2; exit 1; }
 
@@ -482,13 +512,17 @@ REAL_MKTEMP="$(sed -n "s/^REAL='\(.*\)'$/\1/p" "${MOCKBIN}/mktemp")"
 # A C program that stays the daemon process (so /proc/<pid>/exe is the store
 # binary), makes $TUNROOT/<pid> its working directory, forwards TERM, INT and
 # HUP to a worker script and dies with it; the worker dies with the daemon.
+# Like BoringTun, the daemon process itself binds and holds the listening UAPI
+# socket: the worker asks for it by writing the path to $TUNROOT/<pid>/bind.
 # The worker's behaviour comes from $S/fake-mode:
-#   ready (default)   sockets, then the TUN link, then live
+#   ready (default)   socket, symlink, then the TUN link, then live
 #   exit              exits 3 at once
 #   hang              never creates anything
 #   slow              waits 1.5 s first
-#   socket-exit       creates its sockets, waits 0.5 s and exits 4
-#   socket-exit-fast  creates its sockets and exits 4 at once
+#   hold              waits for $S/fake-release before anything else
+#   socket-exit       creates its socket, waits 0.5 s and exits 4
+#   foreign           binds its own socket elsewhere, while a separate process
+#                     (the competitor) holds a listening socket at the UAPI path
 # A TERM removes what it created; a SIGKILL leaves the sockets behind.
 FAKE_WORKER="${T}/fake-worker"
 cat >"${FAKE_WORKER}" <<EOF
@@ -510,14 +544,29 @@ case "${MODE}" in
 	exit) exit 3 ;;
 	hang) echo "${DAEMON}" >"${S}/hang-pid"; exec sleep 60 ;;
 	slow) sleep 1.5 ;;
+	hold) while [[ ! -f "${S}/fake-release" ]]; do sleep 0.02; done ;;
 esac
-python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "${WGDIR}/${IF}.sock"
+daemon_binds() { # <path>: the daemon process binds and holds the socket
+	echo "$1" >"${TUNROOT}/${DAEMON}/bind.tmp"
+	mv "${TUNROOT}/${DAEMON}/bind.tmp" "${TUNROOT}/${DAEMON}/bind"
+	while [[ ! -e "${TUNROOT}/${DAEMON}/bound" ]]; do sleep 0.01; done
+}
+OWN_SOCK="${WGDIR}/${IF}.sock"
+if [[ "${MODE}" == foreign ]]; then
+	OWN_SOCK="${WGDIR}/.shadow-${IF}.sock"
+	daemon_binds "${OWN_SOCK}"
+	python3 -c 'import socket, sys, time; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(); open(sys.argv[2], "w").write("ok"); time.sleep(120)' \
+		"${WGDIR}/${IF}.sock" "${S}/foreign-ready" </dev/null >/dev/null 2>&1 &
+	echo "$!" >"${S}/foreign-pid"
+	while [[ ! -e "${S}/foreign-ready" ]]; do sleep 0.01; done
+else
+	daemon_binds "${WGDIR}/${IF}.sock"
+fi
 ln -sf "${WGDIR}/${IF}.sock" "${AWGDIR}/${IF}.sock"
 case "${MODE}" in
 	socket-exit) sleep 0.5; exit 4 ;;
-	socket-exit-fast) exit 4 ;;
 esac
-trap 'rm -f "${S}/live/${IF}" "${WGDIR}/${IF}.sock" "${AWGDIR}/${IF}.sock"; [[ "$(readlink "${NET}/${IF}" 2>/dev/null)" == "/proc/${DAEMON}/cwd" ]] && rm -f "${NET}/${IF}"; exit 0' TERM
+trap 'rm -f "${S}/live/${IF}" "${OWN_SOCK}" "${AWGDIR}/${IF}.sock"; [[ "$(readlink "${NET}/${IF}" 2>/dev/null)" == "/proc/${DAEMON}/cwd" ]] && rm -f "${NET}/${IF}"; exit 0' TERM
 N="$(cat "${S}/ifindex" 2>/dev/null || echo 100)"
 N=$((N + 1))
 echo "${N}" >"${S}/ifindex"
@@ -538,7 +587,9 @@ cat >"${T}/fake-daemon.c" <<'EOF'
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -574,6 +625,7 @@ int main(int argc, char **argv) {
 	}
 	memset(&sa, 0, sizeof sa);
 	sa.sa_handler = forward;
+	sa.sa_flags = SA_RESTART;
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGHUP, &sa, NULL);
@@ -592,7 +644,27 @@ int main(int argc, char **argv) {
 	}
 	if (child < 0)
 		return 113;
-	while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+	for (;;) {
+		pid_t done = waitpid(child, &status, WNOHANG);
+		FILE *req;
+		if (done == child || (done < 0 && errno != EINTR))
+			break;
+		req = fopen("bind", "r");
+		if (req != NULL) {
+			char path[108];
+			struct sockaddr_un addr;
+			int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+			if (fgets(path, sizeof path, req) != NULL)
+				path[strcspn(path, "\n")] = 0;
+			fclose(req);
+			memset(&addr, 0, sizeof addr);
+			addr.sun_family = AF_UNIX;
+			strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
+			if (fd >= 0 && bind(fd, (struct sockaddr *)&addr, sizeof addr) == 0)
+				listen(fd, 16);
+			rename("bind", "bound");
+		}
+		usleep(10000);
 	}
 	if (WIFEXITED(status))
 		return WEXITSTATUS(status);
@@ -671,6 +743,29 @@ EOF
 	chmod 0600 "${DIR}/$1.conf"
 }
 
+# A new activation of awg-quick@<if>: systemd gives every one its own
+# INVOCATION_ID, which the helpers take as the start attempt's identity.
+new_activation() {
+	INVOCATION_ID="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+	export INVOCATION_ID
+}
+new_activation
+
+# Take over the attempt that awgBackendQuickUp drew for <if>.
+adopt_attempt() { # <if>
+	local FILE
+	FILE="$(ls "${AWG_BT_RUN_DIR}/$1@"*.state 2>/dev/null | head -n 1)"
+	FILE="${FILE##*@}"
+	INVOCATION_ID="${FILE%.state}"
+	export INVOCATION_ID
+}
+
+# precheck always opens a new attempt, as each start of the unit does.
+ctl_precheck() {
+	new_activation
+	"${CTL}" precheck "$@"
+}
+
 # Stop every daemon a test started and forget all state.
 reset_state() {
 	local F
@@ -682,8 +777,10 @@ reset_state() {
 	rm -rf -- "${S}" "${AWG_BT_RUN_DIR}"
 	mkdir -p "${S}/live" "${S}/units" "${S}/strip" "${S}/port"
 	: >"${S}/log"
-	rm -f -- "${AWG_BT_WG_SOCKET_DIR}"/* "${AWG_BT_AWG_SOCKET_DIR}"/*
-	rm -rf -- "${NET:?}"/* "${AWG_BT_SYS_DIR}/module"/*
+	rm -f -- "${AWG_BT_WG_SOCKET_DIR}"/* "${AWG_BT_WG_SOCKET_DIR}"/.shadow-* "${AWG_BT_AWG_SOCKET_DIR}"/*
+	rm -rf -- "${NET:?}"/* "${AWG_BT_SYS_DIR}/module"/* "${AWG_BT_TMP_DIR:?}"/*
+	[[ -f "${T}/decoys" ]] || : >"${T}/decoys"
+	new_activation
 }
 
 install_helpers() {
@@ -715,8 +812,17 @@ pid_gone() {
 	[[ ! -d "/proc/${1:-0}" ]] || [[ "$(awk '{print $3}' "/proc/$1/stat" 2>/dev/null)" == Z ]]
 }
 
+# The state and flags of the current attempt.
+state_file() { # <if>
+	printf '%s/%s@%s.state\n' "${AWG_BT_RUN_DIR}" "$1" "${INVOCATION_ID}"
+}
+
 state_get() { # <if> <key>
-	sed -n "s/^$2=//p" "${AWG_BT_RUN_DIR}/$1.state" 2>/dev/null
+	sed -n "s/^$2=//p" "$(state_file "$1")" 2>/dev/null
+}
+
+flag_is() { # <if> <flag>
+	[[ -f "${AWG_BT_RUN_DIR}/$1@${INVOCATION_ID}.$2" ]]
 }
 
 hook_count() { # <line>
@@ -725,7 +831,7 @@ hook_count() { # <line>
 
 # What systemd does for awg-quick@<if> with the BoringTun drop-in.
 service_start() { # <if>
-	"${CTL}" precheck "$1" || { "${CTL}" poststop "$1"; return 1; }
+	ctl_precheck "$1" || { "${CTL}" poststop "$1"; return 1; }
 	WG_QUICK_USERSPACE_IMPLEMENTATION="${LAUNCH}" awg-quick up "$1" || { "${CTL}" poststop "$1"; return 1; }
 	"${CTL}" poststart "$1" || { "${CTL}" poststop "$1"; return 1; }
 }
@@ -756,7 +862,7 @@ service_crash() { # <if>
 
 nothing_left() { # <if>
 	[[ ! -e "${NET}/$1" && ! -e "${AWG_BT_WG_SOCKET_DIR}/$1.sock" && ! -L "${AWG_BT_AWG_SOCKET_DIR}/$1.sock" &&
-		! -e "${AWG_BT_RUN_DIR}/boringtun-$1.pid" && ! -e "${AWG_BT_RUN_DIR}/$1.state" ]]
+		! -e "${AWG_BT_RUN_DIR}/boringtun-$1.pid" ]] && ! compgen -G "${AWG_BT_RUN_DIR}/$1@*" >/dev/null
 }
 
 bind_socket() { # <path>
@@ -819,12 +925,12 @@ FIRST_LAUNCH="$(cat "${LAUNCH}")"
 _awgBtInstallHelpers
 assert_eq "0" "${_AWG_BT_FILE_CHANGED}" "regenerating unchanged helpers leaves them alone"
 assert_eq "${FIRST_LAUNCH}" "$(_awgBtRenderHelper launch)" "helper output is deterministic"
-assert_eq "${FIRST_LAUNCH}" "$(env SERVER_PRIV_KEY=secret WG_LOG_FILE=/x AWG_BT_STORE_DIR=/evil bash -c 'source "$1"; AWG_BT_TRUST_ANCHOR="$2"; AWG_BT_TRUSTED_UID="$3"; AWG_BT_STORE_DIR="$4"; AWG_BT_LIBEXEC_DIR="$5"; AWG_BT_RUN_DIR="$6"; AWG_BT_CONFIG_DIR="$7"; AWG_BT_SYSTEMD_DIR="$8"; AWG_BT_UNIT_DIRS="$9"; shift 9; AWG_BT_SYSTEMD_RUNTIME_DIR="$1"; AWG_BT_WG_SOCKET_DIR="$2"; AWG_BT_AWG_SOCKET_DIR="$3"; AWG_BT_SYS_DIR="$4"; AWG_BT_PROC_DIR="$5"; AWG_BT_TUN_DEVICE="$6"; AWG_BT_PATH="$7"; AWG_BT_READY_TIMEOUT="$8"; AWG_BT_HOST_ARCH="$9"; _awgBtRenderHelper launch' _ \
+assert_eq "${FIRST_LAUNCH}" "$(env SERVER_PRIV_KEY=secret WG_LOG_FILE=/x AWG_BT_STORE_DIR=/evil TMPD="${AWG_BT_TMP_DIR}" bash -c 'source "$1"; AWG_BT_TRUST_ANCHOR="$2"; AWG_BT_TRUSTED_UID="$3"; AWG_BT_STORE_DIR="$4"; AWG_BT_LIBEXEC_DIR="$5"; AWG_BT_RUN_DIR="$6"; AWG_BT_CONFIG_DIR="$7"; AWG_BT_SYSTEMD_DIR="$8"; AWG_BT_UNIT_DIRS="$9"; shift 9; AWG_BT_SYSTEMD_RUNTIME_DIR="$1"; AWG_BT_WG_SOCKET_DIR="$2"; AWG_BT_AWG_SOCKET_DIR="$3"; AWG_BT_SYS_DIR="$4"; AWG_BT_PROC_DIR="$5"; AWG_BT_TUN_DEVICE="$6"; AWG_BT_PATH="$7"; AWG_BT_READY_TIMEOUT="$8"; AWG_BT_HOST_ARCH="$9"; AWG_BT_TMP_DIR="${TMPD}"; _awgBtRenderHelper launch' _ \
 	"${INSTALLER}" "${AWG_BT_TRUST_ANCHOR}" "${AWG_BT_TRUSTED_UID}" "${AWG_BT_STORE_DIR}" "${AWG_BT_LIBEXEC_DIR}" \
 	"${AWG_BT_RUN_DIR}" "${AWG_BT_CONFIG_DIR}" "${AWG_BT_SYSTEMD_DIR}" "${AWG_BT_UNIT_DIRS}" "${AWG_BT_SYSTEMD_RUNTIME_DIR}" \
 	"${AWG_BT_WG_SOCKET_DIR}" "${AWG_BT_AWG_SOCKET_DIR}" "${AWG_BT_SYS_DIR}" "${AWG_BT_PROC_DIR}" "${AWG_BT_TUN_DEVICE}" \
 	"${AWG_BT_PATH}" "${AWG_BT_READY_TIMEOUT}" "${AWG_BT_HOST_ARCH}")" \
-	"the environment of the generating shell never reaches a helper"
+	"the environment of the generating shell never reaches a generated helper"
 SERVER_PRIV_KEY="c2VjcmV0LWtleS1uZXZlci1pbi1oZWxwZXJzLTAwMDA9"
 assert_not_contains "${SERVER_PRIV_KEY}" "$(_awgBtRenderHelper launch)$(_awgBtRenderHelper ctl)" "no params value is embedded in a helper"
 unset SERVER_PRIV_KEY
@@ -1018,18 +1124,18 @@ write_runtime_file "${IF}"
 write_server_config "${IF}"
 launch_expect_refused "the launcher refuses an interface that has not passed precheck" "has not passed awg-backend-ctl precheck"
 mkdir -p "${AWG_BT_SYS_DIR}/module/amneziawg"
-"${CTL}" precheck "${IF}" 2>/dev/null
+ctl_precheck "${IF}" 2>/dev/null
 rmdir "${AWG_BT_SYS_DIR}/module/amneziawg"
 assert_eq "started" "$(state_get "${IF}" PHASE)" "(a refused precheck leaves PHASE=started)"
 launch_expect_refused "the launcher refuses an attempt whose precheck failed" "has not passed awg-backend-ctl precheck"
 
 # launch_ready: a precheck followed by the launcher, as awg-quick@<if> runs them.
 launch_ready() {
-	"${CTL}" precheck "${IF}" && "${LAUNCH}" "${IF}"
+	ctl_precheck "${IF}" && "${LAUNCH}" "${IF}"
 }
 reset_state
 write_runtime_file "${IF}"
-"${CTL}" precheck "${IF}"
+ctl_precheck "${IF}"
 assert_rc 0 "$?" "precheck opens a start attempt"
 assert_eq "0 prechecked" "$(state_get "${IF}" PRE_EXISTING) $(state_get "${IF}" PHASE)" \
 	"which records that nothing of the name existed and that every check passed"
@@ -1055,19 +1161,24 @@ ENV_NAMES="$(cut -d= -f1 "${S}/env-${IF}" | grep -vxE 'PWD|SHLVL|_' | tr '\n' ' 
 assert_eq "NO_COLOR PATH " "${ENV_NAMES}" "the daemon's environment holds only PATH and NO_COLOR"
 assert_eq "PATH=${AWG_BT_PATH}" "$(grep '^PATH=' "${S}/env-${IF}")" "with the helper's fixed PATH"
 assert_eq "700" "$(stat -c '%a' "${AWG_BT_RUN_DIR}")" "the runtime directory is private (0700)"
-assert_eq "600" "$(stat -c '%a' "${AWG_BT_RUN_DIR}/${IF}.state")" "the state file is private (0600)"
+assert_eq "600" "$(stat -c '%a' "$(state_file "${IF}")")" "the state file is private (0600)"
 assert_eq "launched ${PID} $(_awgBtProcessStartTime "${PID}")" \
 	"$(state_get "${IF}" PHASE) $(state_get "${IF}" PID) $(state_get "${IF}" PID_START)" \
 	"the state records the daemon by PID and start time"
 assert_eq "$(_awgBtPathId "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock") $(_awgBtPathId "${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock") $(cat "${NET}/${IF}/ifindex")" \
 	"$(state_get "${IF}" WG_SOCK) $(state_get "${IF}" AWG_SOCK) $(state_get "${IF}" IFINDEX)" \
 	"and its socket nodes and TUN link"
+assert_eq "$(state_get "${IF}" WG_SOCK)" "$(_awgBtSocketHeldBy "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "${PID}" "$(_awgBtProcessStartTime "${PID}")")" \
+	"S2b: the recorded socket is one the daemon itself holds, by its descriptors and the socket diagnostics"
+bash -c 'sleep 60 </dev/null >/dev/null 2>&1 & echo $!' | tee -a "${T}/decoys" >"${T}/other-pid"
+assert_eq "" "$(_awgBtSocketHeldBy "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "$(cat "${T}/other-pid")" "$(_awgBtProcessStartTime "$(cat "${T}/other-pid")")")" \
+	"S2b: no other process is taken for its holder"
 kill -TERM "${PID}"
 wait_until 3 pid_gone "${PID}"
 
 reset_state
 write_runtime_file "${IF}"
-"${CTL}" precheck "${IF}"
+ctl_precheck "${IF}"
 echo slow >"${S}/fake-mode"
 "${LAUNCH}" "${IF}" >/dev/null 2>&1 &
 LAUNCHER_PID=$!
@@ -1096,15 +1207,26 @@ run launch_ready
 assert_rc 1 "${RC}" "a daemon that dies after binding its socket fails the launch"
 assert_true "and the socket nodes it was seen to create are removed" test ! -e "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" -a ! -L "${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock"
 
+# S2a: another process holds a live socket at the UAPI path; the daemon holds
+# its own socket elsewhere, so the path is never the daemon's.
+AWG_BT_READY_TIMEOUT=2
+install_helpers
+AWG_BT_READY_TIMEOUT=5
 reset_state
 write_runtime_file "${IF}"
-echo socket-exit-fast >"${S}/fake-mode"
+echo foreign >"${S}/fake-mode"
 run launch_ready
-assert_rc 1 "${RC}" "a daemon that dies before its sockets could be recorded fails the launch"
-assert_true "and socket nodes that were never seen with a live owner are kept (S2)" test -S "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
-run "${CTL}" precheck "${IF}"
-assert_rc 1 "${RC}" "and the next precheck refuses the name instead of guessing"
-assert_contains "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "${ERR}" "and names the socket it will not remove"
+FOREIGN_PID="$(cat "${S}/foreign-pid" 2>/dev/null)"
+assert_rc 1 "${RC}" "S2a: a daemon whose UAPI path another process holds never becomes ready"
+assert_eq "" "$(state_get "${IF}" WG_SOCK)$(state_get "${IF}" AWG_SOCK)" "S2a: the foreign socket is never recorded as the daemon's"
+assert_true "S2a: and the competitor's live socket is left in place" test -S "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+assert_true "S2a: (still held by the competitor)" pid_alive "${FOREIGN_PID}"
+run ctl_precheck "${IF}"
+assert_rc 1 "${RC}" "S2a: the next precheck refuses the name instead of guessing"
+assert_contains "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "${ERR}" "S2a: and names the socket it will not remove"
+kill -KILL "${FOREIGN_PID}" 2>/dev/null
+rm -f "${S}/fake-mode"
+install_helpers
 
 # A helper set with a one-second readiness timeout.
 AWG_BT_READY_TIMEOUT=1
@@ -1125,7 +1247,7 @@ install_helpers
 
 reset_state
 write_runtime_file "${IF}"
-"${CTL}" precheck "${IF}"
+ctl_precheck "${IF}"
 bind_socket "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
 launch_expect_refused "the launcher refuses a socket that appeared after precheck" "appeared after precheck"
 assert_true "and leaves that socket alone" test -S "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
@@ -1139,27 +1261,27 @@ reset_state
 install_helpers
 write_runtime_file "${IF}"
 write_server_config "${IF}"
-run "${CTL}" precheck "${IF}"
+run ctl_precheck "${IF}"
 assert_rc 0 "${RC}" "precheck passes on a verified host"
-run "${CTL}" precheck
+run ctl_precheck
 assert_rc 2 "${RC}" "awg-backend-ctl requires a command and an interface"
-run "${CTL}" precheck 'bad name'
+run ctl_precheck 'bad name'
 assert_rc 2 "${RC}" "awg-backend-ctl refuses an invalid interface name"
 run "${CTL}" frobnicate "${IF}"
 assert_rc 2 "${RC}" "awg-backend-ctl refuses an unknown command"
 run "${CTL}" stop "${IF}" "${AWG_BT_CONFIG_DIR}/${IF}.conf"
 assert_rc 2 "${RC}" "only precheck and poststart take a config"
-run "${CTL}" precheck "${IF}" "relative/${IF}.conf"
+run ctl_precheck "${IF}" "relative/${IF}.conf"
 assert_rc 2 "${RC}" "a relative config path is refused"
-run "${CTL}" precheck "${IF}" "${AWG_BT_CONFIG_DIR}/other.conf"
+run ctl_precheck "${IF}" "${AWG_BT_CONFIG_DIR}/other.conf"
 assert_rc 2 "${RC}" "a config not named after the interface is refused"
 ln -sf "${AWG_BT_CONFIG_DIR}/${IF}.conf" "${T}/${IF}.conf"
-run "${CTL}" precheck "${IF}" "${T}/${IF}.conf"
+run ctl_precheck "${IF}" "${T}/${IF}.conf"
 assert_rc 2 "${RC}" "a config path that is not canonical is refused"
 rm -f "${T}/${IF}.conf"
 
 precheck_refused() { # <label> <fragment>
-	run "${CTL}" precheck "${IF}"
+	run ctl_precheck "${IF}"
 	if [[ "${RC}" != 0 && "${ERR}" == *"$2"* ]]; then ok "$1"; else not_ok "$1 (rc=${RC}: ${ERR})"; fi
 }
 mkdir -p "${AWG_BT_SYS_DIR}/module/amneziawg"
@@ -1211,10 +1333,10 @@ write_server_config "${IF}" "SaveConfig = maybe"
 precheck_refused "precheck refuses an invalid SaveConfig value, as awg-quick would" "invalid SaveConfig"
 write_server_config "${IF}" "SaveConfig = true
 SaveConfig = false"
-run "${CTL}" precheck "${IF}"
+run ctl_precheck "${IF}"
 assert_rc 0 "${RC}" "the last SaveConfig wins, as in awg-quick"
 printf '[Interface]\nPrivateKey = k\n[Peer]\nSaveConfig = true\n' >"${AWG_BT_CONFIG_DIR}/${IF}.conf"
-run "${CTL}" precheck "${IF}"
+run ctl_precheck "${IF}"
 assert_rc 0 "${RC}" "SaveConfig outside [Interface] is ignored, as in awg-quick"
 rm -f "${AWG_BT_CONFIG_DIR}/${IF}.conf"
 precheck_refused "precheck refuses when the server config is missing" "unreadable or has an invalid SaveConfig"
@@ -1286,11 +1408,72 @@ rm -f "${NET}/${IF}"
 ip link add dev "${IF}" type amneziawg
 echo yes >"${S}/live/${IF}"
 "${CTL}" stop "${IF}" 2>/dev/null
-"${CTL}" poststop "${IF}" 2>/dev/null
-assert_true "B1: a link of the name that replaced the crashed one after the start survives" test -d "${NET}/${IF}"
+run "${CTL}" poststop "${IF}"
+assert_true "B1: a link of the name that replaced the crashed one survives" test -d "${NET}/${IF}"
 assert_not_contains "awg-quick down" "$(cat "${S}/log")" "B1: and is never brought down"
-assert_eq "up
-down" "$(cat "${HOOK_LOG}")" "B1: while the crashed instance's PostDown is replayed once"
+assert_eq "up" "$(cat "${HOOK_LOG}")" "B1: PostDown, which may address the name, is not replayed while another link has it"
+assert_contains "cleanup is ambiguous" "${ERR}" "B1: the ambiguity is reported"
+assert_true "B1: and the attempt's state is kept for diagnosis" test -f "$(state_file "${IF}")"
+ip link delete dev "${IF}"
+
+# B1a: an earlier attempt's state never authorises the current attempt's
+# cleanup. Attempt A takes the kernel path and its poststop never runs, so its
+# state (up, with the kernel link's ifindex) stays behind with the link.
+reset_state
+: >"${HOOK_LOG}"
+touch "${S}/kernel-wins"
+ctl_precheck "${IF}" && WG_QUICK_USERSPACE_IMPLEMENTATION="${LAUNCH}" awg-quick up "${IF}" && "${CTL}" poststart "${IF}" 2>/dev/null
+rm -f "${S}/kernel-wins"
+ATTEMPT_A="${INVOCATION_ID}"
+STALE_FILES="$(ls "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT_A}".* | sort)"
+assert_true "B1a: (attempt A left an up state for the kernel link behind)" flag_is "${IF}" up
+: >"${S}/log"
+# Attempt B: its precheck fails before it can record anything.
+new_activation
+echo "${AWG_BT_RUN_DIR}" >"${S}/chmod-fail"
+"${CTL}" precheck "${IF}" 2>/dev/null
+assert_rc 1 "$?" "B1a: attempt B's precheck fails before recording anything"
+rm -f "${S}/chmod-fail"
+run "${CTL}" poststop "${IF}"
+assert_true "B1a: B's poststop leaves the pre-existing link alone" test -d "${NET}/${IF}"
+assert_not_contains "awg-quick down" "$(cat "${S}/log")" "B1a: and never runs awg-quick down"
+assert_eq "up" "$(cat "${HOOK_LOG}")" "B1a: and runs none of its hooks"
+assert_eq "${STALE_FILES}" "$(ls "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT_A}".* | sort)" "B1a: and neither reads nor removes A's state"
+# Attempt C: its precheck refuses the existing link; its poststop is as harmless.
+run service_start "${IF}"
+assert_rc 1 "${RC}" "B1a: attempt C refuses the existing link"
+assert_true "B1a: C's poststop leaves it alone too" test -d "${NET}/${IF}"
+assert_not_contains "awg-quick down" "$(cat "${S}/log")" "B1a: still without awg-quick down"
+assert_eq "${STALE_FILES}" "$(ls "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT_A}".* | sort)" "B1a: and A's state is still untouched"
+ip link delete dev "${IF}"
+
+# B1b: the owned link is replaced while the down copy is being prepared.
+reset_state
+: >"${HOOK_LOG}"
+service_start "${IF}"
+PID="$(state_get "${IF}" PID)"
+echo "/down." >"${S}/mktemp-hold"
+"${CTL}" stop "${IF}" 2>"${T}/stop.err" &
+STOPPER=$!
+wait_until 5 test -s "${S}/mktemp-waiting"
+kill -KILL "${PID}"
+wait_until 3 pid_gone "${PID}"
+rm -f "${NET}/${IF}"
+ip link add dev "${IF}" type amneziawg
+echo yes >"${S}/live/${IF}"
+REPLACEMENT_INDEX="$(cat "${NET}/${IF}/ifindex")"
+: >"${S}/log"
+touch "${S}/mktemp-release"
+wait "${STOPPER}"
+assert_rc 1 "$?" "B1b: stop fails when the link changed while its down was prepared"
+rm -f "${S}"/mktemp-*
+assert_eq "${REPLACEMENT_INDEX}" "$(cat "${NET}/${IF}/ifindex" 2>/dev/null)" "B1b: the replacement link survives"
+assert_not_contains "awg-quick down" "$(cat "${S}/log")" "B1b: awg-quick down is never run against it"
+assert_contains "replaced while its down was prepared" "$(cat "${T}/stop.err")" "B1b: and the ambiguity is reported"
+assert_true "B1b: no down was recorded as started" test ! -e "${AWG_BT_RUN_DIR}/${IF}@${INVOCATION_ID}.down"
+run "${CTL}" poststop "${IF}"
+assert_eq "up" "$(cat "${HOOK_LOG}")" "B1b: poststop does not replay PostDown while the replacement holds the name"
+assert_true "B1b: the replacement still survives" test -d "${NET}/${IF}"
 ip link delete dev "${IF}"
 
 echo "=== awg-backend-ctl poststart ==="
@@ -1299,12 +1482,12 @@ PreDown = echo predown >>${HOOK_LOG}
 PostDown = echo down >>${HOOK_LOG}"
 # launch_up: precheck and awg-quick up with the launcher, without poststart.
 launch_up() {
-	"${CTL}" precheck "${IF}" && WG_QUICK_USERSPACE_IMPLEMENTATION="${LAUNCH}" awg-quick up "${IF}"
+	ctl_precheck "${IF}" && WG_QUICK_USERSPACE_IMPLEMENTATION="${LAUNCH}" awg-quick up "${IF}"
 }
 poststart_refused() { # <label> <fragment>
 	run "${CTL}" poststart "${IF}"
 	if [[ "${RC}" != 0 && "${ERR}" == *"$2"* ]]; then ok "$1"; else not_ok "$1 (rc=${RC}: ${ERR})"; fi
-	assert_eq "up" "$(state_get "${IF}" PHASE)" "  and the attempt is recorded as up for poststop"
+	assert_true "  and the attempt is recorded as up for poststop" flag_is "${IF}" up
 	service_stop "${IF}"
 }
 reset_state
@@ -1312,7 +1495,7 @@ reset_state
 launch_up
 run "${CTL}" poststart "${IF}"
 assert_rc 0 "${RC}" "poststart accepts the verified BoringTun serving a TUN interface"
-assert_eq "up" "$(state_get "${IF}" PHASE)" "and records the attempt as up"
+assert_true "and records the attempt as up" flag_is "${IF}" up
 service_stop "${IF}"
 reset_state
 launch_up
@@ -1320,7 +1503,7 @@ echo 999999 >"${AWG_BT_RUN_DIR}/boringtun-${IF}.pid"
 poststart_refused "poststart refuses a PID file that does not name the launched daemon" "does not name the running BoringTun daemon"
 reset_state
 launch_up
-sed -i 's/^PID_START=.*/PID_START=1/' "${AWG_BT_RUN_DIR}/${IF}.state"
+sed -i 's/^PID_START=.*/PID_START=1/' "$(state_file "${IF}")"
 poststart_refused "poststart refuses a daemon whose start time is not the recorded one" "does not name the running BoringTun daemon"
 reset_state
 launch_up
@@ -1331,10 +1514,10 @@ reset_state
 launch_up
 rm -f "${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock"
 ln -s "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock"
-poststart_refused "poststart refuses a socket node that is not the one the daemon created" "are not the ones its BoringTun daemon created"
+poststart_refused "poststart refuses a socket node that is not the one the daemon created" "are not the ones its BoringTun daemon holds"
 reset_state
 launch_up
-sed -i 's/^IFINDEX=.*/IFINDEX=1/' "${AWG_BT_RUN_DIR}/${IF}.state"
+sed -i 's/^IFINDEX=.*/IFINDEX=1/' "$(state_file "${IF}")"
 poststart_refused "poststart refuses a link that is not the one this start created" "is not the link that this start created"
 
 reset_state
@@ -1349,13 +1532,13 @@ assert_rc 1 "${RC}" "poststart without a recorded attempt fails"
 assert_not_contains "awg-quick down" "$(cat "${S}/log")" "and brings nothing down"
 
 echo "=== S9: poststart when the attempt cannot be recorded ==="
-# State file write failure after a successful awg-quick up.
+# The up flag cannot be raised: poststart brings the interface down itself.
 reset_state
 : >"${HOOK_LOG}"
 launch_up
-echo ".state." >"${S}/mktemp-fail"
+echo ".up-pending" >"${S}/mv-fail"
 run "${CTL}" poststart "${IF}"
-rm -f "${S}/mktemp-fail"
+rm -f "${S}/mv-fail"
 assert_rc 1 "${RC}" "S9: poststart fails when it cannot record that the interface is up"
 assert_contains "bringing it down now" "${ERR}" "S9: and brings the interface down itself"
 assert_eq "up
@@ -1363,10 +1546,51 @@ predown
 down" "$(cat "${HOOK_LOG}")" "S9: PostUp's work is undone at once: PreDown and PostDown ran once"
 assert_true "S9: the link is gone" test ! -e "${NET}/${IF}"
 run "${CTL}" poststop "${IF}"
+assert_eq "3" "$(wc -l <"${HOOK_LOG}")" "S9: the following poststop does not run PostDown again"
+assert_true "S9: and, the cleanup being complete, leaves nothing" nothing_left "${IF}"
+# S9a: the kernel path; the runtime directory cannot allocate, so the link
+# cannot be recorded; /tmp can: emergency cleanup succeeds from there.
+reset_state
+: >"${HOOK_LOG}"
+touch "${S}/kernel-wins"
+launch_up
+rm -f "${S}/kernel-wins"
+echo "${AWG_BT_RUN_DIR}/" >"${S}/mktemp-fail"
+run "${CTL}" poststart "${IF}"
+rm -f "${S}/mktemp-fail"
+assert_rc 1 "${RC}" "S9a: poststart fails when the runtime directory cannot record the link"
+assert_contains "awg-quick down ${AWG_BT_TMP_DIR}/awg-boringtun-down." "$(cat "${S}/log")" "S9a: the down copy comes from the temporary directory"
 assert_eq "up
 predown
-down" "$(cat "${HOOK_LOG}")" "S9: the following poststop does not run PostDown again"
-assert_true "S9: and leaves nothing" nothing_left "${IF}"
+down" "$(cat "${HOOK_LOG}")" "S9a: and the emergency down runs PreDown and PostDown once"
+assert_true "S9a: the link is gone" test ! -e "${NET}/${IF}"
+assert_eq "" "$(find "${AWG_BT_TMP_DIR}" -mindepth 1)" "S9a: the private copy is removed"
+run "${CTL}" poststop "${IF}"
+assert_eq "3" "$(wc -l <"${HOOK_LOG}")" "S9a: poststop runs no hook again"
+assert_true "S9a: and the completed cleanup leaves nothing" nothing_left "${IF}"
+# S9b/S9c: neither directory can allocate the copy: the state stays, marked
+# up, and nothing claims the owed PostDown ran.
+reset_state
+: >"${HOOK_LOG}"
+touch "${S}/kernel-wins"
+launch_up
+rm -f "${S}/kernel-wins"
+printf '%s\n' "${AWG_BT_RUN_DIR}/" "${AWG_BT_TMP_DIR}/" >"${S}/mktemp-fail"
+run "${CTL}" poststart "${IF}"
+rm -f "${S}/mktemp-fail"
+assert_rc 1 "${RC}" "S9b: poststart fails when no down copy can be made"
+assert_contains "could not be started" "${ERR}" "S9b: and says the cleanup did not run"
+assert_eq "up" "$(cat "${HOOK_LOG}")" "S9b: no PreDown or PostDown is claimed"
+assert_true "S9b: the attempt stays recorded as up with no down" \
+	test -f "$(state_file "${IF}")" -a -e "${AWG_BT_RUN_DIR}/${IF}@${INVOCATION_ID}.up" -a ! -e "${AWG_BT_RUN_DIR}/${IF}@${INVOCATION_ID}.down"
+for ROUND in 1 2; do
+	run "${CTL}" poststop "${IF}"
+	assert_true "S9c: poststop (${ROUND}) keeps the state of the unfinished cleanup" test -f "$(state_file "${IF}")"
+	assert_eq "up" "$(cat "${HOOK_LOG}")" "S9c: and runs no hook blindly (${ROUND})"
+	assert_true "S9c: and leaves the link alone (${ROUND})" test -d "${NET}/${IF}"
+done
+assert_contains "its PostDown hooks are owed" "${ERR}" "S9c: the owed cleanup is reported"
+ip link delete dev "${IF}"
 # The state directory replaced by a file.
 reset_state
 : >"${HOOK_LOG}"
@@ -1378,24 +1602,23 @@ run "${CTL}" poststart "${IF}"
 assert_rc 1 "${RC}" "S9: poststart fails when the state directory is unusable"
 assert_eq "up
 predown
-down" "$(cat "${HOOK_LOG}")" "S9: and still runs PreDown and PostDown once"
+down" "$(cat "${HOOK_LOG}")" "S9: and still runs PreDown and PostDown once, from a temporary copy"
 assert_true "S9: the daemon is gone with its link" wait_until 3 pid_gone "${PID}"
 run "${CTL}" poststop "${IF}"
-assert_eq "down" "$(tail -n 1 "${HOOK_LOG}")" "S9: poststop without a state replays nothing"
-assert_eq "3" "$(wc -l <"${HOOK_LOG}")" "S9: no hook ran twice"
+assert_eq "3" "$(wc -l <"${HOOK_LOG}")" "S9: poststop without a state replays nothing"
 rm -f "${AWG_BT_RUN_DIR}"
 # The state file replaced by a directory.
 reset_state
 : >"${HOOK_LOG}"
 launch_up
-rm -f "${AWG_BT_RUN_DIR}/${IF}.state"
-mkdir "${AWG_BT_RUN_DIR}/${IF}.state"
+rm -f "$(state_file "${IF}")"
+mkdir "$(state_file "${IF}")"
 run "${CTL}" poststart "${IF}"
 assert_rc 1 "${RC}" "S9: poststart fails when the state file is unusable"
 assert_eq "up
 predown
 down" "$(cat "${HOOK_LOG}")" "S9: and still undoes PostUp once"
-rmdir "${AWG_BT_RUN_DIR}/${IF}.state"
+rmdir "$(state_file "${IF}")"
 # precheck without a usable state directory records nothing and starts nothing.
 reset_state
 : >"${HOOK_LOG}"
@@ -1494,11 +1717,75 @@ wait_until 5 test -s "${S}/down-waiting"
 kill -KILL "${STOPPER}" "$(cat "${S}/down-waiting")"
 wait "${STOPPER}" 2>/dev/null
 rm -f "${S}/down-hold" "${S}/down-waiting"
-assert_eq "attempted" "$(state_get "${IF}" DOWN)" "S1: a stop killed inside awg-quick down leaves DOWN=attempted"
+assert_true "S1: a stop killed inside awg-quick down leaves the down recorded as started, not done" \
+	test -e "${AWG_BT_RUN_DIR}/${IF}@${INVOCATION_ID}.down" -a ! -e "${AWG_BT_RUN_DIR}/${IF}@${INVOCATION_ID}.done"
 wait_until 3 pid_gone "${PID}"
 run "${CTL}" poststop "${IF}"
 assert_eq "hook1" "$(cat "${HOOK_LOG}")" "S1: and poststop runs no hook of the interrupted down again"
 assert_contains "PostDown = echo hook2" "${ERR}" "S1: but names the hooks that may not have run"
+write_server_config "${IF}" "PostDown = echo hook1 >>${HOOK_LOG}
+PostDown = false
+PostDown = echo hook3 >>${HOOK_LOG}"
+# S1a: the replay cannot be recorded as started: no hook runs.
+write_server_config "${IF}" "PostDown = echo hook1 >>${HOOK_LOG}
+PostDown = echo hook2 >>${HOOK_LOG}"
+reset_state
+: >"${HOOK_LOG}"
+service_start "${IF}"
+PID="$(state_get "${IF}" PID)"
+kill -KILL "${PID}"
+wait_until 3 pid_gone "${PID}"
+"${CTL}" stop "${IF}" 2>/dev/null
+echo ".replay-pending" >"${S}/mv-fail"
+run "${CTL}" poststop "${IF}"
+rm -f "${S}/mv-fail"
+assert_eq "" "$(cat "${HOOK_LOG}")" "S1a: when the replay cannot be recorded as started, no replay hook runs"
+assert_contains "none of its hooks is run" "${ERR}" "S1a: and that is reported"
+assert_true "S1a: and the state is kept" test -f "$(state_file "${IF}")"
+run "${CTL}" poststop "${IF}"
+assert_eq "hook1
+hook2" "$(cat "${HOOK_LOG}")" "S1a: a later poststop that can record it replays once, as no hook ran before"
+assert_true "S1a: and then leaves nothing" nothing_left "${IF}"
+# S1b: the replay is interrupted after its first hook.
+write_server_config "${IF}" "PostDown = echo hook1 >>${HOOK_LOG}; echo \$\$ >${S}/hook-pid; exec sleep 30
+PostDown = echo hook2 >>${HOOK_LOG}"
+reset_state
+: >"${HOOK_LOG}"
+service_start "${IF}"
+PID="$(state_get "${IF}" PID)"
+kill -KILL "${PID}"
+wait_until 3 pid_gone "${PID}"
+"${CTL}" stop "${IF}" 2>/dev/null
+rm -f "${S}/hook-pid"
+"${CTL}" poststop "${IF}" 2>/dev/null &
+REPLAYER=$!
+wait_until 5 test -s "${S}/hook-pid"
+kill -KILL "${REPLAYER}" "$(cat "${S}/hook-pid")"
+wait "${REPLAYER}" 2>/dev/null
+assert_eq "hook1" "$(cat "${HOOK_LOG}")" "S1b: (the replay died after its first hook)"
+run "${CTL}" poststop "${IF}"
+assert_eq "hook1" "$(cat "${HOOK_LOG}")" "S1b: a later poststop never runs hook 1, or any hook, again"
+assert_contains "may not have finished; it is never run again" "${ERR}" "S1b: and reports the replay as incomplete"
+assert_true "S1b: the state is kept for diagnosis" test -f "$(state_file "${IF}")"
+# S1c: all hooks ran, but the finished state cannot be removed.
+write_server_config "${IF}" "PostDown = echo hook1 >>${HOOK_LOG}
+PostDown = echo hook2 >>${HOOK_LOG}"
+reset_state
+: >"${HOOK_LOG}"
+service_start "${IF}"
+PID="$(state_get "${IF}" PID)"
+kill -KILL "${PID}"
+wait_until 3 pid_gone "${PID}"
+"${CTL}" stop "${IF}" 2>/dev/null
+echo "@${INVOCATION_ID}.state" >"${S}/rm-fail"
+"${CTL}" poststop "${IF}" 2>/dev/null
+rm -f "${S}/rm-fail"
+assert_eq "hook1
+hook2" "$(cat "${HOOK_LOG}")" "S1c: (the replay ran both hooks)"
+assert_true "S1c: (its state could not be removed)" test -f "$(state_file "${IF}")"
+run "${CTL}" poststop "${IF}"
+assert_eq "hook1
+hook2" "$(cat "${HOOK_LOG}")" "S1c: a later poststop never replays them a second time"
 write_server_config "${IF}" "PostDown = echo hook1 >>${HOOK_LOG}
 PostDown = false
 PostDown = echo hook3 >>${HOOK_LOG}"
@@ -1543,6 +1830,11 @@ bind_socket "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
 _awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "${LISTENER_ID}" "${LISTENER}" "${LISTENER_START}"
 assert_true "S2: a replacement node at the path is never removed, although its recorded owner is dead" \
 	test -S "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+NODE_ID="$(_awgBtPathId "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock")"
+sleep 0.01
+touch -c "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+_awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "${NODE_ID}" "${LISTENER}" "${LISTENER_START}"
+assert_true "S2: a node changed since it was recorded (same inode and mode, new change time) is never removed" 	test -S "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
 _awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "$(_awgBtPathId "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock")" "${LISTENER}" "${LISTENER_START}"
 assert_true "S2: the recorded node of a dead owner is removed" test ! -e "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
 # Through poststop: a crash, then a foreign replacement of the socket.
@@ -1592,6 +1884,7 @@ write_server_config "${IF}" "SaveConfig = true"
 reset_state
 run awgBackendQuickUp "${T}/alt/${IF}.conf"
 assert_rc 0 "${RC}" "S5: quick-up of a clean alternative config is not blocked by the default config"
+adopt_attempt "${IF}"
 assert_eq "${T}/alt/${IF}.conf" "$(state_get "${IF}" CONFIG)" "S5: and the attempt records that exact config"
 sed -i '/^\[Interface\]$/r '"${T}/save-line" "${T}/alt/${IF}.conf"
 "${CTL}" stop "${IF}"
@@ -1782,7 +2075,8 @@ assert_rc 1 "${RC}" "a scratch name outside [a-zA-Z0-9_-] is refused"
 
 # records_gone <token>: neither record of the attempt remains.
 records_gone() {
-	[[ ! -e "${SCRATCH_DIR}/$1.owner" && ! -e "${SCRATCH_DIR}/$1.guard" && ! -e "${SCRATCH_DIR}/$1.stop" ]]
+	[[ ! -e "${SCRATCH_DIR}/$1.owner" && ! -e "${SCRATCH_DIR}/$1.guard" && ! -e "${SCRATCH_DIR}/$1.child" &&
+		! -e "${SCRATCH_DIR}/$1.stop" ]]
 }
 record_get() { # <token> <owner|guard> <key>
 	sed -n "s/^$3=//p" "${SCRATCH_DIR}/$1.$2" 2>/dev/null
@@ -1826,6 +2120,9 @@ assert_rc 0 "$?" "without systemd a scratch interface is a tracked process"
 TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgv2]}"
 CHILD_PID="$(record_get "${TOKEN}" guard DAEMON_PID)"
 assert_true "and it is running" pid_alive "${CHILD_PID}"
+assert_eq "${CHILD_PID} $(_awgBtProcessStartTime "${CHILD_PID}")" \
+	"$(record_get "${TOKEN}" child CHILD_PID) $(record_get "${TOKEN}" child CHILD_START)" \
+	"S3: the daemon recorded its own identity before readiness was declared"
 assert_eq "${_AWG_BT_SCRATCH_GUARDS[awgv2]}" "$(awk '{print $4}' "/proc/${CHILD_PID}/stat")" "whose parent is its guardian"
 SIGIGN="$(tr -d '[:space:]' <"${TUNROOT}/${CHILD_PID}/sigign")"
 assert_true "and which does not inherit the guardian's ignored HUP, INT and TERM" test "$((16#${SIGIGN} & 16#4003))" -eq 0
@@ -2026,6 +2323,89 @@ rm -f "${S}"/stop-*
 owner unit sweep
 assert_true "S3: and the next sweep finishes the teardown" scratch_gone awgv8 "${TOKEN}"
 
+# S3a: the guardian dies before the direct child has registered: the child
+# then never becomes BoringTun.
+reset_state
+rm -f "${T}/token" "${S}"/argv-awgv5
+echo ".child." >"${S}/mktemp-hold"
+"${OWNER_CMD[@]}" direct create awgv5 "${T}/token" &
+OWNER_PID=$!
+wait_until 10 test -s "${S}/mktemp-waiting"
+TOKEN="$(basename "$(ls "${SCRATCH_DIR}"/*.owner)" .owner)"
+kill -KILL "$(record_get "${TOKEN}" guard GUARD_PID)"
+touch "${S}/mktemp-release"
+wait "${OWNER_PID}"
+assert_rc 1 "$?" "S3a: creation fails when the guardian dies before its child registered"
+rm -f "${S}"/mktemp-*
+assert_true "S3a: the child, registered after its guardian died, never started BoringTun" test ! -e "${S}/argv-awgv5"
+assert_true "S3a: and nothing of the attempt is left" wait_until 5 scratch_gone awgv5 "${TOKEN}"
+# S3b: the guardian dies after the child registered, before readiness, and no
+# parent-death signal ends the daemon: the owner reclaims it from the record.
+reset_state
+rm -f "${T}/token"
+printf '%s\n' "${NO_PDEATHSIG_SETPRIV}" >"${MOCKBIN}/setpriv"
+chmod 0755 "${MOCKBIN}/setpriv"
+echo hold >"${S}/fake-mode"
+"${OWNER_CMD[@]}" direct create awgv5 "${T}/token" &
+OWNER_PID=$!
+wait_until 10 test -e "${S}/argv-awgv5"
+TOKEN="$(basename "$(ls "${SCRATCH_DIR}"/*.owner)" .owner)"
+DAEMON="$(record_get "${TOKEN}" child CHILD_PID)"
+assert_true "S3b: (the daemon runs and has registered itself)" pid_alive "${DAEMON}"
+kill -KILL "$(record_get "${TOKEN}" guard GUARD_PID)"
+wait "${OWNER_PID}"
+assert_rc 1 "$?" "S3b: creation fails when the guardian dies before readiness"
+assert_true "S3b: and the owner stops the registered daemon from its record" wait_until 5 pid_gone "${DAEMON}"
+assert_true "S3b: and nothing of the attempt is left" wait_until 5 scratch_gone awgv5 "${TOKEN}"
+rm -f "${S}/fake-mode"
+# S3c: guardian and owner both die after readiness; the daemon survives them
+# (no parent-death signal); a later run's sweep reclaims it.
+reset_state
+rm -f "${T}/token"
+"${OWNER_CMD[@]}" direct create awgv5 "${T}/token" hold &
+OWNER_PID=$!
+wait_until 10 test -s "${T}/token"
+TOKEN="$(cat "${T}/token")"
+DAEMON="$(record_get "${TOKEN}" child CHILD_PID)"
+kill -KILL "$(record_get "${TOKEN}" guard GUARD_PID)"
+kill -KILL "${OWNER_PID}"
+wait "${OWNER_PID}" 2>/dev/null
+sleep 0.3
+assert_true "S3c: (the daemon survives its guardian and owner)" pid_alive "${DAEMON}"
+owner direct sweep
+assert_true "S3c: the next sweep stops it by its recorded identity" wait_until 5 pid_gone "${DAEMON}"
+assert_true "S3c: and removes its sockets and records" scratch_gone awgv5 "${TOKEN}"
+rm -f "${MOCKBIN}/setpriv"
+# S3d: systemd-run is delayed while both guardian and owner die; the unit it
+# creates late is reclaimed by the next sweep.
+reset_state
+rm -f "${T}/token"
+touch "${S}/systemd-run-hold"
+"${OWNER_CMD[@]}" unit create awgp7 "${T}/token" &
+OWNER_PID=$!
+wait_until 5 test -e "${S}/systemd-run-waiting"
+TOKEN="$(basename "$(ls "${SCRATCH_DIR}"/*.owner)" .owner)"
+wait_until 5 test -n "$(record_get "${TOKEN}" guard CLIENT_PID)"
+kill -KILL "$(record_get "${TOKEN}" guard GUARD_PID)" "${OWNER_PID}"
+wait "${OWNER_PID}" 2>/dev/null
+touch "${S}/systemd-run-release"
+wait_until 5 compgen -G "${S}/units/amneziawg-scratch-awgp7-${TOKEN}" >/dev/null
+assert_true "S3d: (the unit was created after guardian and owner died)" test -e "${S}/units/amneziawg-scratch-awgp7-${TOKEN}"
+owner unit sweep
+assert_true "S3d: the next sweep reclaims the late unit" scratch_gone awgp7 "${TOKEN}"
+rm -f "${S}"/systemd-run-*
+# A foreign socket at a scratch instance's UAPI path is never taken for its own.
+reset_state
+AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"
+echo foreign >"${S}/fake-mode"
+run awgBackendCreateScratchInterface awgv5
+FOREIGN_PID="$(cat "${S}/foreign-pid" 2>/dev/null)"
+assert_rc 1 "${RC}" "S2: a scratch daemon whose UAPI path another process holds never becomes ready"
+assert_true "S2: and the competitor's socket is left in place" test -S "${AWG_BT_WG_SOCKET_DIR}/awgv5.sock"
+kill -KILL "${FOREIGN_PID}" 2>/dev/null
+rm -f "${S}/fake-mode" "${AWG_BT_WG_SOCKET_DIR}/awgv5.sock"
+AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_PRESENT}"
+
 # A zombie owner: its parent never reaps it.
 reset_state
 rm -f "${T}/token"
@@ -2181,6 +2561,7 @@ service_start "${IF}"
 PID="$(state_get "${IF}" PID)"
 touch "${S}/active-awg-quick@${IF}"
 echo "${PID}" >"${S}/mainpid-awg-quick@${IF}"
+echo "${INVOCATION_ID}" >"${S}/invocation-awg-quick@${IF}"
 run in_subshell ensureAwgBackendReady 1
 assert_rc 0 "${RC}" "S6: an active awg-quick@<if> served by its tracked BoringTun daemon is accepted"
 assert_not_contains "systemctl start" "$(cat "${S}/log")" "S6: without starting it again"
@@ -2212,7 +2593,8 @@ write_server_config "${IF}"
 run awgBackendQuickUp "${AWG_BT_CONFIG_DIR}/${IF}.conf"
 assert_rc 0 "${RC}" "quick-up brings up a verified BoringTun instance"
 assert_contains "awg-quick up ${AWG_BT_CONFIG_DIR}/${IF}.conf impl=${LAUNCH}" "$(cat "${S}/log")" "with the launcher as awg-quick's userspace implementation"
-assert_eq "up" "$(state_get "${IF}" PHASE)" "and records the attempt as up"
+adopt_attempt "${IF}"
+assert_true "and records its own attempt as up" flag_is "${IF}" up
 "${CTL}" stop "${IF}"
 "${CTL}" poststop "${IF}"
 assert_true "and it comes down cleanly" nothing_left "${IF}"
@@ -2228,7 +2610,7 @@ mkdir -p "${AWG_BT_SYS_DIR}/module/amneziawg"
 run awgBackendQuickUp "${AWG_BT_CONFIG_DIR}/${IF}.conf"
 assert_rc 1 "${RC}" "quick-up runs the same precheck as the service"
 assert_not_contains "awg-quick up" "$(cat "${S}/log")" "and stops before awg-quick when it fails"
-assert_true "and leaves no state" test ! -e "${AWG_BT_RUN_DIR}/${IF}.state"
+assert_true "and leaves no state" test -z "$(compgen -G "${AWG_BT_RUN_DIR}/${IF}@*")"
 rm -rf "${AWG_BT_SYS_DIR}/module/amneziawg"
 AWG_BACKEND=kernel
 _AWG_BORINGTUN_RUNTIME_INTERNAL=0
