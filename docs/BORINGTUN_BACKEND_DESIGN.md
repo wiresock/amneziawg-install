@@ -1823,8 +1823,8 @@ and is the only process that starts the instance:
    and has not reclaimed the attempt. Under systemd that is a transient unit
    named `amneziawg-scratch-<name>-<token>` with `RuntimeMaxSec=900`. The
    guardian forks the `systemd-run` client, which records its own PID and start
-   time in `<token>.client`, checks that the guardian still lives, and only then
-   execs `systemd-run`: no process that can submit the unit is ever unrecorded,
+   time in `<token>.client`, checks that no reclaim has begun and that the
+   guardian still lives, and only then execs `systemd-run`: no process that can submit the unit is ever unrecorded,
    and the guardian never infers the client from `$!`. The guardian goes on
    only once that record exists, and waits for the client even if the owner
    dies meanwhile, so a unit created late is still torn down; a unit whose
@@ -1833,7 +1833,8 @@ and is the only process that starts the instance:
    `<token>.reclaim` does not, so a unit that systemd creates after a reclaim
    began, or after the records are gone, exits before BoringTun. Without systemd the
    guardian forks a child that writes its own PID and start time to
-   `<token>.child`, checks that the guardian still lives, and only then execs
+   `<token>.child`, checks that no reclaim has begun and that the guardian
+   still lives, and only then execs
    BoringTun under `setpriv --pdeathsig KILL`, with the guardian's ignored
    signals reset. The guardian goes on only once that record exists. A daemon
    therefore never runs without a durable record, whenever the guardian dies;
@@ -1847,8 +1848,12 @@ and is the only process that starts the instance:
 
 The owner's destroy writes the stop request and waits for the guardian to
 finish before it reaps it. A guardian that is gone, or hangs for 30 seconds, is
-replaced by a reclaim from the records in the owner. A reclaim of a unit
-attempt first writes `<token>.reclaim`, which closes the unit's gate. A
+replaced by a reclaim from the records in the owner. A reclaim first writes
+`<token>.reclaim`, before it reads any record; it closes the unit's gate. A
+child or client records itself first and reads that mark afterwards, so either
+the reclaim sees its record or it sees the mark and starts nothing, even when
+a reclaim runs while the guardian is still alive (the owner's reclaim after a
+guardian that did not die within 3 seconds of `SIGKILL`). A
 registered `systemd-run` client that is still the same process (PID and start
 time) may yet create the unit, so the reclaim waits for it for up to 35 seconds
 and, while it lives, keeps every record and stops nothing by name; the client
@@ -1950,6 +1955,7 @@ runs a PostDown hook twice.
 | Guardian and owner killed, direct daemon alive | The next sweep stops it by its recorded identity and removes its proven nodes. |
 | Owner killed while `systemd-run` is pending | The guardian waits for `systemd-run`, sees the owner gone and stops the late unit. |
 | Guardian and owner killed while `systemd-run` is pending | The next sweep waits for the registered client and stops the late unit. |
+| A reclaim and a registering client race | The reclaim marks, then reads; the client records, then reads the mark. Either the reclaim sees the client and keeps everything, or the client sees the mark and submits nothing. |
 | Client registered, not yet in `systemd-run`, or blocked inside it | While it lives every sweep marks the attempt as being reclaimed, keeps all records and never signals it; a single inactive answer about the unit is never trusted. |
 | Owner and guardian killed while the registered client lives | As above; the unit it submits later starts behind the closed gate and exits before BoringTun; the sweep after the client exits stops the unit by name and removes the records. |
 | Unit created, `systemd-run` answer lost, or failure reported but the unit appeared | The client has exited; the reclaim stops the unit by its token name and checks it is inactive. |
