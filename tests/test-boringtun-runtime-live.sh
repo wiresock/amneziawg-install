@@ -104,7 +104,6 @@ function cleanup() {
 	local NAME
 	mountpoint -q "${AWG_BT_RUN_DIR}" && umount "${AWG_BT_RUN_DIR}"
 	mountpoint -q "${AWG_BT_RUN_DIR}" && umount "${AWG_BT_RUN_DIR}"
-	[[ -n "${WORK_DIR}" ]] && mountpoint -q "${WORK_DIR}/run-orig" && umount "${WORK_DIR}/run-orig"
 	for NAME in "${IF}" "${IF2}" "${IF3}" "${IF4}" "${FOREIGN}"; do
 		systemctl stop "awg-quick@${NAME}.service" >/dev/null 2>&1
 		systemctl reset-failed "awg-quick@${NAME}.service" >/dev/null 2>&1
@@ -493,10 +492,13 @@ INVOCATION_ID="${FULL_ATTEMPT}" "${CTL}" precheck "${IF4}" "${AWG_BT_CONFIG_DIR}
 	INVOCATION_ID="${FULL_ATTEMPT}" WG_QUICK_USERSPACE_IMPLEMENTATION="${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" \
 		awg-quick up "${AWG_BT_CONFIG_DIR}/${IF4}.conf" >/dev/null 2>&1
 check "${IF4} is up with the launcher" test -e "/sys/class/net/${IF4}/tun_flags"
-mkdir -p "${WORK_DIR}/run-orig"
-mount --bind "${AWG_BT_RUN_DIR}" "${WORK_DIR}/run-orig"
+# The attempt's files are copied, not bind-mounted: with shared mount
+# propagation (as on a systemd host) a bind of the directory would show the
+# tmpfs too.
+mkdir -p "${WORK_DIR}/full-before" "${WORK_DIR}/full-after"
+cp -a "${AWG_BT_RUN_DIR}/${IF4}@${FULL_ATTEMPT}".* "${WORK_DIR}/full-before/"
 mount -t tmpfs -o size=4k,mode=0700,uid=0,gid=0 awgbt-full "${AWG_BT_RUN_DIR}"
-cp -a "${WORK_DIR}/run-orig/${IF4}@${FULL_ATTEMPT}".* "${AWG_BT_RUN_DIR}/"
+cp -a "${WORK_DIR}/full-before/${IF4}@${FULL_ATTEMPT}".* "${AWG_BT_RUN_DIR}/"
 rm -f "${AWG_BT_RUN_DIR}/${IF4}@${FULL_ATTEMPT}.up-pending"
 check "(the runtime directory can make a directory but not store a file in it)" \
 	bash -c 'mkdir "$1/probe" && ! { echo x >"$1/probe/f"; } 2>/dev/null; RC=$?; rm -rf "$1/probe"; exit "${RC}"' _ "${AWG_BT_RUN_DIR}"
@@ -508,10 +510,10 @@ check "from a complete copy made again in /tmp after the failed write" grep -q "
 check "while the failed copy's directory was already removed" test "$(grep -c "^${AWG_BT_RUN_DIR}/down\." "${HOOK_LOG}")" -eq 0
 check "and the /tmp copy is removed too" test -z "$(find /tmp -maxdepth 1 -name 'awg-boringtun-down.*')"
 # What the attempt recorded goes back to the real runtime directory.
-rm -f "${WORK_DIR}/run-orig/${IF4}@${FULL_ATTEMPT}".*
-cp -a "${AWG_BT_RUN_DIR}/${IF4}@${FULL_ATTEMPT}".* "${WORK_DIR}/run-orig/"
+cp -a "${AWG_BT_RUN_DIR}/${IF4}@${FULL_ATTEMPT}".* "${WORK_DIR}/full-after/"
 umount "${AWG_BT_RUN_DIR}"
-umount "${WORK_DIR}/run-orig"
+rm -f "${AWG_BT_RUN_DIR}/${IF4}@${FULL_ATTEMPT}".*
+cp -a "${WORK_DIR}/full-after/${IF4}@${FULL_ATTEMPT}".* "${AWG_BT_RUN_DIR}/"
 INVOCATION_ID="${FULL_ATTEMPT}" "${CTL}" poststop "${IF4}" 2>/dev/null
 check "the following poststop runs PostDown no second time" test "$(grep -c "^down-${IF4}$" "${HOOK_LOG}")" -eq 1
 check "and removes the finished attempt" test -z "$(find "${AWG_BT_RUN_DIR}" -maxdepth 1 -name "${IF4}@*")"
