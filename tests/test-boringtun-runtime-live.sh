@@ -477,13 +477,18 @@ echo "=== Emergency cleanup when the runtime directory cannot store the down cop
 # The runtime directory is a one-page tmpfs holding only the attempt's state:
 # the down copy's directory can be made there, but writing the copy fails with
 # ENOSPC. The up flag cannot be raised either. The whole copy is made again in
-# /tmp.
+# /tmp. The config ends with SaveConfig = false, so a write error that the
+# filter did not propagate would have left an empty copy passing for complete.
 {
 	sed -n '/^\[Interface\]/,/^\[Peer\]/{/^\[Peer\]/!p}' "${AWG_BT_CONFIG_DIR}/${IF}.conf" |
-		sed -e "s/^ListenPort = .*/ListenPort = ${PORT4}/" -e 's/^Address = .*/Address = 10.96.0.1\/24/' -e '/^PostUp\|^PostDown/d'
+		sed -e "s/^ListenPort = .*/ListenPort = ${PORT4}/" -e 's/^Address = .*/Address = 10.96.0.1\/24/' \
+			-e '/^PostUp\|^PostDown/d' -e '/^[[:space:]]*[Ss][Aa][Vv][Ee][Cc][Oo][Nn][Ff][Ii][Gg]/d' -e '/^[[:space:]]*$/d'
 	printf 'PostUp = echo up-%%i >>%s\n' "${HOOK_LOG}"
 	printf 'PostDown = echo down-%%i >>%s; ls -d /tmp/awg-boringtun-down.*/%%i.conf >>%s; ls -d %s/down.* >>%s 2>/dev/null || true\n' \
 		"${HOOK_LOG}" "${HOOK_LOG}" "${AWG_BT_RUN_DIR}" "${HOOK_LOG}"
+	printf 'PostDown = grep -q "^PostDown" /tmp/awg-boringtun-down.*/%%i.conf && echo copy-has-postdown-%%i >>%s; grep -qi "^SaveConfig" /tmp/awg-boringtun-down.*/%%i.conf || echo copy-without-saveconfig-%%i >>%s\n' \
+		"${HOOK_LOG}" "${HOOK_LOG}"
+	printf 'SaveConfig = false\n'
 } >"${AWG_BT_CONFIG_DIR}/${IF4}.conf"
 chmod 0600 "${AWG_BT_CONFIG_DIR}/${IF4}.conf"
 _awgBtInstallServiceFiles "${IF4}" >/dev/null
@@ -507,6 +512,8 @@ check "poststart fails when it cannot record that ${IF4} is up" test "$?" -ne 0
 check "and brings ${IF4} down itself" wait_for 10 test ! -e "/sys/class/net/${IF4}"
 check "with PostDown run exactly once" test "$(grep -c "^down-${IF4}$" "${HOOK_LOG}")" -eq 1
 check "from a complete copy made again in /tmp after the failed write" grep -q "^/tmp/awg-boringtun-down\..*/${IF4}.conf$" "${HOOK_LOG}"
+check "that copy held the whole config, PostDown hooks included" grep -q "^copy-has-postdown-${IF4}$" "${HOOK_LOG}"
+check "and no SaveConfig line" grep -q "^copy-without-saveconfig-${IF4}$" "${HOOK_LOG}"
 check "while the failed copy's directory was already removed" test "$(grep -c "^${AWG_BT_RUN_DIR}/down\." "${HOOK_LOG}")" -eq 0
 check "and the /tmp copy is removed too" test -z "$(find /tmp -maxdepth 1 -name 'awg-boringtun-down.*')"
 # What the attempt recorded goes back to the real runtime directory.

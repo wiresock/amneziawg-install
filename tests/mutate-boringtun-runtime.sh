@@ -85,6 +85,14 @@ mutant s9_emergency_needs_run_dir 'if WORK="$(_awgBtTryDownCopy "${AWG_BT_TMP_DI
 mutant s9_down_copy_no_retry_after_write \
 	$'\tif _awgBtPrepareRunDir && WORK="$(_awgBtTryDownCopy "${AWG_BT_RUN_DIR}/down.XXXXXX" "$1" "$2")"; then' \
 	$'\tif _awgBtPrepareRunDir && WORK="$(mktemp -d "${AWG_BT_RUN_DIR}/down.XXXXXX" 2>/dev/null)"; then\n\t\trm -rf -- "${WORK}"\n\t\tWORK="$(_awgBtTryDownCopy "${AWG_BT_RUN_DIR}/down.XXXXXX" "$1" "$2")" || return 1'
+# A failed replay is not terminal, and the SaveConfig filter fails on any
+# failed write.
+mutant s9_replay_result_ignored 'if ! _awgBtReplayPostDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}"; then' \
+	'_awgBtReplayPostDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}"; if false; then'
+mutant s9_done_after_failed_replay 'cleanup is incomplete, and its hooks are never run again"' \
+	'cleanup is incomplete, and its hooks are never run again"; _awgBtFlagRaise "${INTERFACE_NAME}" "done"'
+mutant s9_filter_masks_write_error $'\t\tif ! printf \'%s\\n\' "${LINE}"; then\n\t\t\tRC=1\n\t\t\tbreak\n\t\tfi\n' \
+	$'\t\tprintf \'%s\\n\' "${LINE}"\n'
 mutant s9_remove_incomplete_state 'if ((TERMINAL && ! KEEP)); then' 'if ((! KEEP)); then'
 mutant s9_missing_up_is_terminal $'elif ! _awgBtFlagIs "${INTERFACE_NAME}" up; then\n\t\t\t_awgBtErr "awg-quick up of' \
 	$'elif ! _awgBtFlagIs "${INTERFACE_NAME}" up; then\n\t\t\tTERMINAL=1\n\t\t\t_awgBtErr "awg-quick up of'
@@ -130,6 +138,13 @@ mutant s3_reclaim_marks_after_reading \
 	$'\tif [[ ! -e "${DIR}/${TOKEN}.reclaim" ]] && ! _awgBtWriteState "${DIR}/${TOKEN}.reclaim" ""; then\n\t\t_awgBtErr "cannot mark scratch attempt ${TOKEN} as being reclaimed; its records are kept"\n\t\tLEFT=1\n\tfi\n' '' \
 	$'\t# A live registered systemd-run client may still create the unit: wait for\n' \
 	$'\tif [[ ! -e "${DIR}/${TOKEN}.reclaim" ]] && ! _awgBtWriteState "${DIR}/${TOKEN}.reclaim" ""; then\n\t\tLEFT=1\n\tfi\n\t# A live registered systemd-run client may still create the unit: wait for\n'
+# A registrant must see both the owner record and no mark; the reclaim removes
+# the owner record before the mark.
+mutant s3_child_skips_owner_check $'\t_awgBtScratchOwnerRecordValid || return 1\n' ''
+mutant s3_child_ignores_owner_and_mark \
+	$'\t[[ ! -e "${DIR}/${TOKEN}.reclaim" ]] || return 1\n\t_awgBtScratchOwnerRecordValid || return 1\n' ''
+mutant s3_reclaim_unmarks_first $'\trm -f -- "${DIR}/${TOKEN}.owner" || return 1\n' \
+	$'\trm -f -- "${DIR}/${TOKEN}.reclaim"\n\trm -f -- "${DIR}/${TOKEN}.owner" || return 1\n'
 mutant s3_sweep_reclaims_while_client_lives \
 	$'the records are kept"\n\t\t\treturn 1' $'the records are kept"'
 mutant s3_unit_without_gate \

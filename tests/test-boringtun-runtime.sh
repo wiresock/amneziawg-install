@@ -505,14 +505,43 @@ exec "${REAL}" "$@"
 EOF
 # mv, rm and chmod fail when their arguments contain the text in
 # $S/<tool>-fail.
+# $S/<tool>-hold blocks a matching call once until $S/<tool>-release exists,
+# before it runs; $S/<tool>-hold-after does the same after it ran. Each
+# touches $S/<tool>-waiting or $S/<tool>-waiting-after while it waits.
 for TOOL in mv rm chmod; do
 	cat >"${MOCKBIN}/${TOOL}" <<EOF
 #!/bin/bash
-if [[ -f '${S}/${TOOL}-fail' && "\$*" == *"\$(cat '${S}/${TOOL}-fail')"* ]]; then
+S='${S}'
+TOOL='${TOOL}'
+REAL='$(command -v "${TOOL}")'
+REAL_RM='$(command -v rm)'
+EOF
+	cat >>"${MOCKBIN}/${TOOL}" <<'EOF'
+if [[ -f "${S}/${TOOL}-fail" && "$*" == *"$(cat "${S}/${TOOL}-fail")"* ]]; then
 	echo "${TOOL}: injected failure" >&2
 	exit 1
 fi
-exec '$(command -v "${TOOL}")' "\$@"
+BEFORE=0
+AFTER=0
+if [[ -f "${S}/${TOOL}-hold" && "$*" == *"$(cat "${S}/${TOOL}-hold")"* ]]; then
+	"${REAL_RM}" -f "${S}/${TOOL}-hold"
+	BEFORE=1
+fi
+if [[ -f "${S}/${TOOL}-hold-after" && "$*" == *"$(cat "${S}/${TOOL}-hold-after")"* ]]; then
+	"${REAL_RM}" -f "${S}/${TOOL}-hold-after"
+	AFTER=1
+fi
+if ((BEFORE)); then
+	: >"${S}/${TOOL}-waiting"
+	while [[ ! -f "${S}/${TOOL}-release" ]]; do sleep 0.02; done
+fi
+"${REAL}" "$@"
+RC=$?
+if ((AFTER)); then
+	: >"${S}/${TOOL}-waiting-after"
+	while [[ ! -f "${S}/${TOOL}-release-after" ]]; do sleep 0.02; done
+fi
+exit "${RC}"
 EOF
 done
 for TOOL in nft iptables ip6tables iptables-save ip6tables-save iptables-restore ip6tables-restore; do
@@ -1642,6 +1671,11 @@ assert_contains "PostDown = echo down" "${ERR}" "S9d: and names the PostDown tha
 # S9e/S9f: the runtime directory allocates the copy, but writing it (S9e) or
 # setting its mode (S9f) fails: the whole copy is made again in
 # AWG_BT_TMP_DIR, not TMPDIR, and only the failed attempt's directory goes.
+# The config ends its [Interface] section with SaveConfig = false.
+write_server_config "${IF}" "PostUp = echo up >>${HOOK_LOG}
+PreDown = echo predown >>${HOOK_LOG}
+PostDown = echo down >>${HOOK_LOG}
+SaveConfig = false"
 for CASE in write chmod; do
 	reset_state
 	: >"${HOOK_LOG}"
@@ -1661,6 +1695,8 @@ for CASE in write chmod; do
 	assert_eq "${AWG_BT_TMP_DIR}" "$(dirname "$(dirname "$(cat "${S}/down-path")")")" "S9 (${CASE}): (not in TMPDIR)"
 	assert_eq "${IF}.conf" "$(basename "$(cat "${S}/down-path")")" "S9 (${CASE}): the copy keeps the interface's file name"
 	assert_eq "$(id -u) 700 $(id -u) 600 " "$(cat "${S}/down-modes")" "S9 (${CASE}): a 0700 directory and a 0600 copy of the trusted user"
+	assert_eq "$(grep -vi '^SaveConfig' "${AWG_BT_CONFIG_DIR}/${IF}.conf")" "$(cat "${S}/down-config")" \
+		"S9 (${CASE}): the copy awg-quick down read is the complete config, hooks included, without SaveConfig"
 	assert_eq "up
 predown
 down" "$(cat "${HOOK_LOG}")" "S9 (${CASE}): the emergency down runs PreDown and PostDown once"
@@ -1670,6 +1706,9 @@ down" "$(cat "${HOOK_LOG}")" "S9 (${CASE}): the emergency down runs PreDown and 
 	assert_eq "3" "$(wc -l <"${HOOK_LOG}")" "S9 (${CASE}): poststop runs no hook again"
 	assert_true "S9 (${CASE}): and the completed cleanup leaves nothing" nothing_left "${IF}"
 done
+write_server_config "${IF}" "PostUp = echo up >>${HOOK_LOG}
+PreDown = echo predown >>${HOOK_LOG}
+PostDown = echo down >>${HOOK_LOG}"
 # S9g: the exact recorded socket of the dead daemon cannot be unlinked: the
 # attempt is kept and the cleanup reported incomplete; a later poststop
 # removes the socket and finishes the attempt without running a hook again.
@@ -1693,6 +1732,27 @@ assert_true "S9g: a later poststop removes the socket" test ! -e "${AWG_BT_WG_SO
 assert_eq "up
 down" "$(cat "${HOOK_LOG}")" "S9g: without running PostDown again"
 assert_true "S9g: and finishes the attempt" nothing_left "${IF}"
+# S9h: the PostDown replay cannot read the config. The replay was recorded as
+# started, so its hooks are never run again, and no done flag and no removal
+# follow a replay that did not complete.
+reset_state
+: >"${HOOK_LOG}"
+service_start "${IF}"
+PID="$(state_get "${IF}" PID)"
+kill -KILL "${PID}"
+wait_until 3 pid_gone "${PID}"
+"${CTL}" stop "${IF}" 2>/dev/null
+mv "${AWG_BT_CONFIG_DIR}/${IF}.conf" "${T}/config-away"
+run "${CTL}" poststop "${IF}"
+mv "${T}/config-away" "${AWG_BT_CONFIG_DIR}/${IF}.conf"
+assert_true "S9h: a replay that could not read the config keeps the attempt" test -f "$(state_file "${IF}")"
+assert_true "S9h: raises no done flag" test ! -e "${AWG_BT_RUN_DIR}/${IF}@${INVOCATION_ID}.done"
+assert_eq "up" "$(cat "${HOOK_LOG}")" "S9h: (no PostDown hook ran)"
+assert_contains "did not complete" "${ERR}" "S9h: and reports the cleanup as incomplete"
+run "${CTL}" poststop "${IF}"
+assert_eq "up" "$(cat "${HOOK_LOG}")" "S9h: a later poststop, with the config back, starts no second replay"
+assert_true "S9h: and keeps the attempt for the operator" test -f "$(state_file "${IF}")"
+assert_contains "never run again" "${ERR}" "S9h: saying why"
 # The state directory replaced by a file.
 reset_state
 : >"${HOOK_LOG}"
@@ -1959,6 +2019,15 @@ assert_true "S2: poststop keeps a socket that replaced the dead daemon's" test -
 assert_true "S2: and removes the dead daemon's other, recorded node" test ! -L "${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock"
 
 echo "=== S5: SaveConfig never writes a keyless config over the real one ==="
+# S9: a failed write in the filter is never masked by a later line that is
+# left out, such as a final SaveConfig = false.
+printf '[Interface]\nAddress = 10.1.1.1/24\nPostDown = echo down\nSaveConfig = false\n' >"${T}/filter.conf"
+( _awgBtWithoutSaveConfig "${T}/filter.conf" >/dev/full ) 2>"${T}/filter.err"
+assert_rc 1 "$?" "S9: the SaveConfig filter fails when writing its output fails, even before a final SaveConfig line"
+assert_contains "No space left on device" "$(cat "${T}/filter.err")" "S9: (the write error really occurred)"
+assert_eq "[Interface]
+Address = 10.1.1.1/24
+PostDown = echo down" "$(_awgBtWithoutSaveConfig "${T}/filter.conf")" "S9: and writes the whole config but SaveConfig when it can"
 reset_state
 : >"${HOOK_LOG}"
 write_server_config "${IF}" "PostDown = echo down >>${HOOK_LOG}"
@@ -2599,6 +2668,74 @@ wait "${OWNER_PID}" 2>/dev/null
 assert_true "S3i: the unit submitted after the mark never runs BoringTun" test ! -e "${S}/argv-awgp7"
 assert_true "S3i: and the attempt is then torn down completely" wait_until 15 scratch_gone awgp7 "${TOKEN}"
 rm -f "${S}"/mktemp-* "${S}"/systemd-run-*
+# S3j/S3k: a direct child registers while its guardian's own teardown reclaims
+# the attempt. The child is held before it records itself; its owner dies;
+# the guardian's wait for the registration runs out and its reclaim is held
+# just before it removes the records; the child records itself and is held
+# again before its checks. S3j resumes the child after the reclaim finished,
+# S3k while the reclaim is still held. The guardian is alive (in wait) in both.
+for CASE in S3j S3k; do
+	reset_state
+	rm -f "${T}/token"
+	echo ".child." >"${S}/mktemp-hold"
+	"${OWNER_CMD[@]}" direct create awgp7 "${T}/token" &
+	OWNER_PID=$!
+	wait_until 5 test -s "${S}/mktemp-waiting"
+	TOKEN="$(basename "$(ls "${SCRATCH_DIR}"/*.owner)" .owner)"
+	GUARD="$(record_get "${TOKEN}" guard GUARD_PID)"
+	echo "${TOKEN}.owner" >"${S}/rm-hold"
+	echo "${TOKEN}.child" >"${S}/mv-hold-after"
+	kill -KILL "${OWNER_PID}"
+	wait "${OWNER_PID}" 2>/dev/null
+	assert_true "${CASE}: (the guardian's reclaim is held before it removes the records)" \
+		wait_until $((AWG_BT_READY_TIMEOUT + 10)) test -e "${S}/rm-waiting"
+	touch "${S}/mktemp-release"
+	assert_true "${CASE}: (the child recorded itself after the reclaim read the records)" \
+		wait_until 5 test -e "${S}/mv-waiting-after"
+	CHILD="$(record_get "${TOKEN}" child CHILD_PID)"
+	assert_true "${CASE}: (the reclaim's read of the records did not see it)" test -n "${CHILD}"
+	if [[ "${CASE}" == S3j ]]; then
+		touch "${S}/rm-release"
+		assert_true "${CASE}: (the reclaim removed every record)" wait_until 5 test ! -e "${SCRATCH_DIR}/${TOKEN}.owner" -a ! -e "${SCRATCH_DIR}/${TOKEN}.reclaim"
+		assert_true "${CASE}: (the guardian still lives)" pid_alive "${GUARD}"
+		touch "${S}/mv-release-after"
+	else
+		touch "${S}/mv-release-after"
+		assert_true "${CASE}: (the child finished its checks while the reclaim is held)" wait_until 5 pid_gone "${CHILD}"
+		touch "${S}/rm-release"
+	fi
+	assert_true "${CASE}: the late child exits" wait_until 5 pid_gone "${CHILD}"
+	assert_true "${CASE}: without ever running BoringTun" test ! -e "${S}/argv-awgp7"
+	assert_true "${CASE}: and the guardian finishes" wait_until 5 pid_gone "${GUARD}"
+	assert_true "${CASE}: leaving no daemon, socket, link or record" scratch_gone awgp7 "${TOKEN}"
+	kill -KILL "${CHILD}" 2>/dev/null
+	rm -f "${S}"/mktemp-* "${S}"/rm-* "${S}"/mv-*
+done
+# S3l: its guardian killed, the owner's destroy begins a reclaim, held while the
+# owner record is still valid. The child, released only then, sees the
+# cancellation and starts nothing, with no guardian to rely on.
+reset_state
+rm -f "${T}/token"
+echo ".child." >"${S}/mktemp-hold"
+"${OWNER_CMD[@]}" direct create awgp7 "${T}/token" &
+OWNER_PID=$!
+wait_until 5 test -s "${S}/mktemp-waiting"
+TOKEN="$(basename "$(ls "${SCRATCH_DIR}"/*.owner)" .owner)"
+echo "${TOKEN}.owner" >"${S}/rm-hold"
+kill -KILL "$(record_get "${TOKEN}" guard GUARD_PID)"
+assert_true "S3l: (the owner's reclaim is held before it removes the records)" wait_until 10 test -e "${S}/rm-waiting"
+assert_true "S3l: (the owner record is still valid and the attempt marked as being reclaimed)" \
+	test -n "$(record_get "${TOKEN}" owner OWNER_PID)" -a -e "${SCRATCH_DIR}/${TOKEN}.reclaim"
+touch "${S}/mktemp-release"
+wait_until 5 test -n "$(record_get "${TOKEN}" child CHILD_PID)"
+CHILD="$(record_get "${TOKEN}" child CHILD_PID)"
+assert_true "S3l: a child of a cancelled attempt exits although its owner record is valid" wait_until 5 pid_gone "${CHILD}"
+assert_true "S3l: without running BoringTun" test ! -e "${S}/argv-awgp7"
+touch "${S}/rm-release"
+wait "${OWNER_PID}" 2>/dev/null
+assert_true "S3l: and the owner's reclaim leaves nothing" wait_until 10 scratch_gone awgp7 "${TOKEN}"
+kill -KILL "${CHILD}" 2>/dev/null
+rm -f "${S}"/mktemp-* "${S}"/rm-*
 # A foreign socket at a scratch instance's UAPI path is never taken for its own.
 reset_state
 AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"
