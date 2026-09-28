@@ -6044,6 +6044,10 @@ function _awgBtScratchRegisterSelf() { # <CHILD|CLIENT>
 	# shellcheck disable=SC2034 # read by _awgBtScratchSave through its name
 	SELF_RECORD=([FORMAT]=1 [TOKEN]="${TOKEN}" ["$1_PID"]="${SELF}" ["$1_START"]="${START}")
 	_awgBtScratchSave "${DIR}/${TOKEN}.${1,,}" "${!KEYS}" SELF_RECORD || return 1
+	# A reclaim marks the attempt before it reads the records, and this
+	# process records itself before it reads the mark: either the reclaim
+	# sees this record, or this process sees the mark and starts nothing.
+	[[ ! -e "${DIR}/${TOKEN}.reclaim" ]] || return 1
 	_awgBtProcessIs "${GUARD_RECORD[GUARD_PID]}" "${GUARD_RECORD[GUARD_START]}"
 }
 
@@ -6111,11 +6115,13 @@ function _awgBtScratchRecordSockets() {
 	((CHANGED == 0)) || _awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
 }
 
-# Remove what remains of one attempt, as its records say. Under systemd it
-# first marks the attempt as being reclaimed (<token>.reclaim), which the
-# unit's own command checks, then waits for a registered systemd-run client
-# that still lives: while it lives it may still create the unit, so the
-# records are kept (it is never signalled). Then it removes the TUN link only
+# Remove what remains of one attempt, as its records say. It first marks the
+# attempt as being reclaimed (<token>.reclaim), before it reads any record: a
+# process that registers itself later sees the mark and starts nothing
+# (_awgBtScratchRegisterSelf), and the unit's own command checks it too. Then
+# it waits for a registered systemd-run client that still lives: while it
+# lives it may still create the unit, so the records are kept (it is never
+# signalled). Then it removes the TUN link only
 # while it has the recorded ifindex, the transient unit by its attempt-unique
 # name, the daemon (from the guardian's record or the direct child's own) only
 # while it is the recorded process, and socket nodes only while they are the
@@ -6127,6 +6133,10 @@ function _awgBtScratchReclaim() { # <token>
 	local HAVE_OWNER=0 HAVE_GUARD=0 HAVE_CHILD=0 HAVE_CLIENT=0
 	local -A OWNER_RECORD=() GUARD_RECORD=() CHILD_RECORD=() CLIENT_RECORD=()
 	DIR="$(_awgBtScratchDir)"
+	if [[ ! -e "${DIR}/${TOKEN}.reclaim" ]] && ! _awgBtWriteState "${DIR}/${TOKEN}.reclaim" ""; then
+		_awgBtErr "cannot mark scratch attempt ${TOKEN} as being reclaimed; its records are kept"
+		LEFT=1
+	fi
 	_awgBtScratchLoad "${DIR}/${TOKEN}.owner" "${_AWG_BT_SCRATCH_OWNER_KEYS}" OWNER_RECORD && HAVE_OWNER=1
 	_awgBtScratchLoad "${DIR}/${TOKEN}.guard" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD && HAVE_GUARD=1
 	_awgBtScratchLoad "${DIR}/${TOKEN}.child" "${_AWG_BT_SCRATCH_CHILD_KEYS}" CHILD_RECORD && HAVE_CHILD=1
@@ -6145,7 +6155,6 @@ function _awgBtScratchReclaim() { # <token>
 	# A live registered systemd-run client may still create the unit: wait for
 	# it, and keep everything while it lives.
 	if ((HAVE_CLIENT)); then
-		[[ -e "${DIR}/${TOKEN}.reclaim" ]] || _awgBtWriteState "${DIR}/${TOKEN}.reclaim" "" || LEFT=1
 		for ((I = 0; I < _AWG_BT_SCRATCH_CLIENT_WAIT * 10; I++)); do
 			_awgBtProcessIs "${CLIENT_RECORD[CLIENT_PID]}" "${CLIENT_RECORD[CLIENT_START]}" || break
 			sleep 0.1
@@ -6159,6 +6168,7 @@ function _awgBtScratchReclaim() { # <token>
 		if ((HAVE_CHILD)) && _awgBtProcessIs "${CHILD_RECORD[CHILD_PID]}" "${CHILD_RECORD[CHILD_START]}"; then
 			_awgBtStopProcess "${CHILD_RECORD[CHILD_PID]}" "${CHILD_RECORD[CHILD_START]}" || return 1
 		fi
+		((LEFT == 0)) || return 1
 		rm -f -- "${DIR}/${TOKEN}.child" "${DIR}/${TOKEN}.client" "${DIR}/${TOKEN}.stop" "${DIR}/${TOKEN}.reclaim"
 		return 0
 	fi
@@ -6171,9 +6181,6 @@ function _awgBtScratchReclaim() { # <token>
 		MODE="${OWNER_RECORD[MODE]}"
 		UNIT="${OWNER_RECORD[UNIT]}"
 		GUARD_RECORD=([DAEMON_PID]="" [DAEMON_START]="" [IFINDEX]="" [WG_SOCK]="" [AWG_SOCK]="")
-	fi
-	if [[ "${MODE}" == unit && ! -e "${DIR}/${TOKEN}.reclaim" ]]; then
-		_awgBtWriteState "${DIR}/${TOKEN}.reclaim" "" || LEFT=1
 	fi
 	if [[ -z "${GUARD_RECORD[DAEMON_PID]}" ]] && ((HAVE_CHILD)); then
 		GUARD_RECORD[DAEMON_PID]="${CHILD_RECORD[CHILD_PID]}"
