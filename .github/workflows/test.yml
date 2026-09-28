@@ -25,6 +25,7 @@ jobs:
           bash tests/test-awg3.sh
           bash tests/test-backend.sh
           bash tests/test-boringtun-artifact.sh
+          bash tests/test-boringtun-release.sh
           bash tests/test-boringtun-foreground-launcher.sh
           bash tests/test-boringtun-runtime.sh
           bash tests/test-cargo-build-common.sh
