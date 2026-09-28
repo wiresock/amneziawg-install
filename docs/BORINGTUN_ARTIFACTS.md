@@ -36,8 +36,18 @@ The file is data: `scripts/boringtun-artifact.sh` parses it with a strict
 through that script, and a unit test fails if the commit appears in any other
 script, workflow or configuration file.
 
-The current pin is `e4e4dc85ec039d40bbc92b3667b7fc92966b1b0a` (boringtun-cli
-0.7.1), the upstream `master` that the backend design was validated against.
+The current pin is `71d88784ad29dc95871c105e26cc62f6acdd565b` (boringtun-cli
+0.7.1, tree `6f0f0a32a197fe71fb66c074cb1e56caf7024dd8`), the frozen baseline
+for the first `amneziawg-install` integration. Upstream also tags it
+`awg3.1-integration-2026-09-28` (tag object
+`eb30d9694381f3da97f569cbde7b09aad256cd4b`); the tag is informational only, and
+builds and installer trust anchors use the commit. It descends from
+`e4e4dc85ec039d40bbc92b3667b7fc92966b1b0a`, the commit the backend design was
+validated against, by upstream pull requests #58 to #66: noise and device fixes,
+including transactional listen-port rebinding (#65) and releasing a device's
+write intent when a mutation unwinds (#66), and JNI bindings. Its shipped
+dependency graph is unchanged: the one lockfile change is a test-only
+dependency.
 
 A pin bump is a reviewed change to `pin.env`, together with any policy change in
 `packaging/boringtun/`. The artifact workflow runs automatically for it.
@@ -67,7 +77,7 @@ changes the build recipe, and so the build number of the next release.
 
 Archives are named
 `boringtun-cli-<version>-g<commit12>-linux-<arch>-musl.tar.gz`, for example
-`boringtun-cli-0.7.1-ge4e4dc85ec03-linux-x86_64-musl.tar.gz`. Each holds one
+`boringtun-cli-0.7.1-g71d88784ad29-linux-x86_64-musl.tar.gz`. Each holds one
 directory with the same name, containing:
 
 | File | Content |
@@ -315,9 +325,10 @@ strict grammar as `pin.env` and refuses any disagreement with the pin:
 `<ARCH>` is `X86_64` and `AARCH64`. The release title is derived:
 `BoringTun CLI <version> (WireSock <commit12>), build <build> (experimental)`.
 A published tag is never reused or moved, so once a build is public, any other
-bytes need a new build number. The contract currently holds a `candidate` of
-build 2 of the current pin (build 1 had the incomplete notices and must never be
-published); the pin is expected to change before the first release.
+bytes need a new build number. The contract holds a `candidate` of build 1 of
+the frozen integration baseline. Nothing built from the earlier pin
+`e4e4dc85ec03` is ever to be published: its archives lacked the
+curve25519-dalek notices, and it is no longer the pin.
 
 ### The BoringTun Release workflow
 
