@@ -1711,6 +1711,10 @@ is removed by an EXIT trap of the subshell that runs `awg-quick`. Making the
 copy is one operation (directory, owner and mode check, write, `chmod`, final
 check): if any step fails in the runtime directory, that attempt's own
 directory is removed and the whole operation is repeated in `AWG_BT_TMP_DIR`.
+The SaveConfig filter checks every write it makes, so an error such as ENOSPC
+fails it even when the lines after it, a final `SaveConfig = false` for
+example, are left out; a copy that is empty while the config is not is
+refused as well.
 
 **stop.** For an attempt with `up` and no `down`, whose link (by ifindex) is
 still the owned TUN link, it runs the guarded down and raises `done` on
@@ -1725,8 +1729,10 @@ journal.
 **poststop and terminal states.** It runs after every stop, crash and failed
 start and reads only the current attempt's state. It removes the state only
 because of a positive terminal fact: `PHASE=started`, `PHASE=launch-failed`,
-the `done` flag, or a PostDown replay that finished in this run (which raises
-`done`). The absence of an expected flag, `up` in particular, is never one, and
+or the `done` flag, which is raised only after an `awg-quick down` or a
+PostDown replay that completed. A replay that fails, for example because the
+config cannot be read, raises no `done`: the attempt is kept, and since the
+replay was recorded as started its hooks are never run again. The absence of an expected flag, `up` in particular, is never one, and
 neither is a cleanup step that left an owned resource behind:
 
 | Situation | Action | State |
@@ -1823,8 +1829,9 @@ and is the only process that starts the instance:
    and has not reclaimed the attempt. Under systemd that is a transient unit
    named `amneziawg-scratch-<name>-<token>` with `RuntimeMaxSec=900`. The
    guardian forks the `systemd-run` client, which records its own PID and start
-   time in `<token>.client`, checks that no reclaim has begun and that the
-   guardian still lives, and only then execs `systemd-run`: no process that can submit the unit is ever unrecorded,
+   time in `<token>.client`, checks that no reclaim has begun, that its
+   attempt's owner record still exists, and that the guardian still lives,
+   and only then execs `systemd-run`: no process that can submit the unit is ever unrecorded,
    and the guardian never infers the client from `$!`. The guardian goes on
    only once that record exists, and waits for the client even if the owner
    dies meanwhile, so a unit created late is still torn down; a unit whose
@@ -1833,8 +1840,8 @@ and is the only process that starts the instance:
    `<token>.reclaim` does not, so a unit that systemd creates after a reclaim
    began, or after the records are gone, exits before BoringTun. Without systemd the
    guardian forks a child that writes its own PID and start time to
-   `<token>.child`, checks that no reclaim has begun and that the guardian
-   still lives, and only then execs
+   `<token>.child`, checks that no reclaim has begun, that its attempt's owner
+   record still exists, and that the guardian still lives, and only then execs
    BoringTun under `setpriv --pdeathsig KILL`, with the guardian's ignored
    signals reset. The guardian goes on only once that record exists. A daemon
    therefore never runs without a durable record, whenever the guardian dies;
@@ -1853,7 +1860,12 @@ replaced by a reclaim from the records in the owner. A reclaim first writes
 child or client records itself first and reads that mark afterwards, so either
 the reclaim sees its record or it sees the mark and starts nothing, even when
 a reclaim runs while the guardian is still alive (the owner's reclaim after a
-guardian that did not die within 3 seconds of `SIGKILL`). A
+guardian that did not die within 3 seconds of `SIGKILL`). A finished reclaim
+removes the owner record first and the mark last, and a token's owner record
+is written once and never again, so a registrant that reads the mark and then
+the owner record finds one of them telling it to stop: a child that registers
+after the reclaim read the records starts nothing, even while its guardian
+still lives (waiting for it) and after the mark itself is gone. A
 registered `systemd-run` client that is still the same process (PID and start
 time) may yet create the unit, so the reclaim waits for it for up to 35 seconds
 and, while it lives, keeps every record and stops nothing by name; the client
@@ -1930,6 +1942,7 @@ recommends, so no kernel module is present, and runs
 | `awg-quick down` fails before deleting the link | owned link at the down | the down, once | replayed once after the cgroup kill | terminal after the replay | none needed |
 | `replay` cannot be recorded | owned attempt | none | no hook runs | kept | a later `poststop` of the same attempt may replay once |
 | Replay interrupted after some hooks | owned attempt | none | never run again; named | kept | operator |
+| Replay fails before its hooks (the config cannot be read) | owned attempt | none | not run; never run again automatically | kept; no `done`; incomplete cleanup reported | operator |
 | Replay done, state cannot be removed | owned attempt | none | never run again | kept | none needed |
 | Foreign socket at the UAPI path | fd and diagnostics proof fails | none; the node is never recorded | not applicable (the start fails) | terminal (`started` when precheck sees the node, `launch-failed` when it appears later) | the name stays refused until the operator removes the node |
 | Launcher fails before readiness | child by PID and start time, nodes by proof | child stopped, its proven nodes removed | none (no PostUp ran) | terminal (`launch-failed`); kept if a node cannot be removed | none needed |
@@ -1955,7 +1968,7 @@ runs a PostDown hook twice.
 | Guardian and owner killed, direct daemon alive | The next sweep stops it by its recorded identity and removes its proven nodes. |
 | Owner killed while `systemd-run` is pending | The guardian waits for `systemd-run`, sees the owner gone and stops the late unit. |
 | Guardian and owner killed while `systemd-run` is pending | The next sweep waits for the registered client and stops the late unit. |
-| A reclaim and a registering client race | The reclaim marks, then reads; the client records, then reads the mark. Either the reclaim sees the client and keeps everything, or the client sees the mark and submits nothing. |
+| A reclaim and a registering child or client race | The reclaim marks, then reads, and removes the owner record before the mark; the registrant records itself, then reads the mark and then the owner record. Either the reclaim sees the registrant and keeps everything, or the registrant finds the mark or a missing owner record and starts nothing, whether or not its guardian lives. |
 | Client registered, not yet in `systemd-run`, or blocked inside it | While it lives every sweep marks the attempt as being reclaimed, keeps all records and never signals it; a single inactive answer about the unit is never trusted. |
 | Owner and guardian killed while the registered client lives | As above; the unit it submits later starts behind the closed gate and exits before BoringTun; the sweep after the client exits stops the unit by name and removes the records. |
 | Unit created, `systemd-run` answer lost, or failure reported but the unit appeared | The client has exited; the reclaim stops the unit by its token name and checks it is inactive. |
