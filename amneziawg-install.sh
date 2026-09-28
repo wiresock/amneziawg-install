@@ -4961,7 +4961,12 @@ function _awgBtWithoutSaveConfig() { # <config>
 		if ((IN_INTERFACE)) && [[ "${KEY}" == SaveConfig ]]; then
 			continue
 		fi
-		printf '%s\n' "${LINE}"
+		# Every write is checked: the loop's own status is that of its last
+		# iteration, which may be a SaveConfig line left out.
+		if ! printf '%s\n' "${LINE}"; then
+			RC=1
+			break
+		fi
 	done <"$1" || RC=1
 	((RESTORE_NOCASE)) && shopt -u nocasematch
 	return "${RC}"
@@ -4969,8 +4974,9 @@ function _awgBtWithoutSaveConfig() { # <config>
 
 # One complete attempt at the private down copy under TEMPLATE's directory: a
 # new mktemp directory that must be a 0700 directory of the trusted user, the
-# config without SaveConfig written into it as <if>.conf, set to 0600 and
-# checked. Any failure removes this attempt's own directory and fails.
+# config without SaveConfig written into it as <if>.conf (the filter fails on
+# any failed write), set to 0600 and checked, and not empty unless the config
+# is. Any failure removes this attempt's own directory and fails.
 function _awgBtTryDownCopy() { # <mktemp template> <interface> <config>
 	local WORK OWNER="" MODE=""
 	WORK="$(mktemp -d "$1" 2>/dev/null)" || return 1
@@ -4979,7 +4985,8 @@ function _awgBtTryDownCopy() { # <mktemp template> <interface> <config>
 		{ _awgBtWithoutSaveConfig "$3" >"${WORK}/$2.conf"; } 2>/dev/null &&
 		chmod 0600 -- "${WORK}/$2.conf" 2>/dev/null; then
 		read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${WORK}/$2.conf")"
-		if [[ ! -L "${WORK}/$2.conf" && -f "${WORK}/$2.conf" && "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${MODE}" == 600 ]]; then
+		if [[ ! -L "${WORK}/$2.conf" && -f "${WORK}/$2.conf" && "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${MODE}" == 600 ]] &&
+			[[ -s "${WORK}/$2.conf" || ! -s "$3" ]]; then
 			printf '%s\n' "${WORK}"
 			return 0
 		fi
@@ -5431,8 +5438,8 @@ function _awgBtCtlStop() { # <interface>
 #  - precheck refused or failed (PHASE=started): awg-quick up never ran;
 #  - the launcher failed and cleaned up (PHASE=launch-failed): awg-quick up
 #    stops at its first step, before any PostUp hook;
-#  - the interface's cleanup completed (the done flag: a successful
-#    awg-quick down, or a finished replay), or a replay completed now.
+#  - the interface's cleanup completed: the done flag, raised only after an
+#    awg-quick down or a replay that completed. A failed replay raises none.
 # Anything else keeps the state and says why. In particular a missing up flag
 # is not terminal: awg-quick up may have run PostUp even though poststart
 # could not record it. Along the way:
@@ -5488,8 +5495,11 @@ function _awgBtCtlPoststop() { # <interface>
 			RC=$?
 			case "${RC}" in
 				0)
-					_awgBtFlagRaise "${INTERFACE_NAME}" "done" || true
-					TERMINAL=1
+					if _awgBtFlagRaise "${INTERFACE_NAME}" "done"; then
+						TERMINAL=1
+					else
+						_awgBtErr "cannot record that awg-quick down of ${INTERFACE_NAME} succeeded"
+					fi
 					;;
 				1)
 					_awgBtRecordFailedDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[IFINDEX]}"
@@ -5509,9 +5519,15 @@ function _awgBtCtlPoststop() { # <interface>
 		fi
 		if ((REPLAY)); then
 			if _awgBtFlagRaise "${INTERFACE_NAME}" replay; then
-				_awgBtReplayPostDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}"
-				_awgBtFlagRaise "${INTERFACE_NAME}" "done" || _awgBtErr "cannot record that the PostDown replay of ${INTERFACE_NAME} finished"
-				TERMINAL=1
+				# done only after a replay that completed; a replay that failed
+				# is recorded as started, so its hooks are never run again.
+				if ! _awgBtReplayPostDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}"; then
+					_awgBtErr "the PostDown replay of ${INTERFACE_NAME} did not complete; cleanup is incomplete, and its hooks are never run again"
+				elif _awgBtFlagRaise "${INTERFACE_NAME}" "done"; then
+					TERMINAL=1
+				else
+					_awgBtErr "cannot record that the PostDown replay of ${INTERFACE_NAME} finished"
+				fi
 			else
 				_awgBtErr "cannot record that the PostDown replay of ${INTERFACE_NAME} starts, so none of its hooks is run"
 			fi
