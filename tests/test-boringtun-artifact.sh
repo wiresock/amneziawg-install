@@ -142,7 +142,7 @@ case "${1:-}" in
 		if [[ "${template##*/}" == "about-crates.hbs" ]]; then
 			cat "${STATE}/crates" >"${output}"
 		else
-			printf 'THIRD-PARTY LICENSES FOR boringtun-cli\n\nMIT License (1)\n\nUsed by:\n  ring 0.17.14\n' >"${output}"
+			cat "${STATE}/third-party" >"${output}"
 		fi
 		;;
 esac
@@ -183,6 +183,27 @@ EOF
 	chmod 0755 "$2"
 }
 write_fake_binary 0.7.1 "${STATE}/binary"
+
+# A THIRD-PARTY-LICENSES in cargo-about's generated layout, carrying the notices
+# that packaging/boringtun/required-notices requires (or not, with "bare").
+write_third_party() { # <file> [bare]
+	local EQ DASH
+	EQ="$(printf '%80s' '' | tr ' ' '=')"
+	DASH="$(printf '%80s' '' | tr ' ' '-')"
+	{
+		printf 'THIRD-PARTY LICENSES FOR boringtun-cli\n\nMIT License (1)\n\n'
+		printf '%s\nMIT License (MIT)\n\nUsed by:\n  ring 0.17.14 <https://github.com/briansmith/ring>\n%s\nCopyright 2015-2025 Brian Smith.\n\n' "${EQ}" "${DASH}"
+		printf '%s\nBSD 3-Clause "New" or "Revised" License (BSD-3-Clause)\n\nUsed by:\n  curve25519-dalek 4.1.3 <https://github.com/dalek-cryptography/curve25519-dalek>\n%s\n' "${EQ}" "${DASH}"
+		if [[ "${2:-}" == bare ]]; then
+			printf 'Copyright (c) <year> <owner>.\n'
+		else
+			printf 'Copyright (c) 2016-2021 isis agora lovecruft. All rights reserved.\n'
+			printf 'Copyright (c) 2016-2021 Henry de Valence. All rights reserved.\n'
+			printf 'Copyright (c) 2012 The Go Authors. All rights reserved.\n'
+		fi
+	} >"$1"
+}
+write_third_party "${STATE}/third-party"
 
 # ── Fixture BoringTun source ─────────────────────────────────────────────────
 SOURCE="${TEST_ROOT}/work/boringtun-src"
@@ -235,11 +256,14 @@ else
 	not_ok "the repository's own pin file is valid"
 fi
 # Scripts, workflows and configuration must read the commit from pin.env rather
-# than repeat it; documentation may quote it.
-assert_eq "packaging/boringtun/pin.env" \
+# than repeat it; documentation may quote it. The one exception is the release
+# contract, a reviewed statement of what a release contains, which the release
+# script refuses when it disagrees with the pin.
+assert_eq "packaging/boringtun/pin.env
+packaging/boringtun/release.env" \
 	"$(cd "${PROJECT_ROOT}" && grep -rlF --exclude-dir=.git --exclude-dir=target --exclude='*.md' \
-		-e "${REPO_PIN_COMMIT:-unset}" . | sed 's#^\./##')" \
-	"the pinned commit is defined only in packaging/boringtun/pin.env"
+		-e "${REPO_PIN_COMMIT:-unset}" . | sed 's#^\./##' | LC_ALL=C sort)" \
+	"the pinned commit is defined only in pin.env and restated only in the release contract"
 
 # Each case: a label, then the complete pin file content.
 check_bad_pin() {
@@ -427,7 +451,7 @@ rm -f "${STATE}/machine"
 echo "=== Package ==="
 
 THIRD_PARTY="${TEST_ROOT}/THIRD-PARTY-LICENSES"
-printf 'THIRD-PARTY LICENSES FOR boringtun-cli\n\nfixture\n' >"${THIRD_PARTY}"
+write_third_party "${THIRD_PARTY}"
 mkdir -p "${TEST_ROOT}/out-1" "${TEST_ROOT}/out-2"
 run_script package "${BUILD}" "${SOURCE}" "${THIRD_PARTY}" "${TEST_ROOT}/out-1"
 assert_succeeds "a build packages"
@@ -551,6 +575,15 @@ else
 fi
 make_variant license; printf 'not the license\n' >"${VARIANT_DIR}/LICENSE"; pack_variant
 check_variant license "not the expected notice" "an archive without the BSD-3-Clause notice is rejected"
+make_variant notices; write_third_party "${VARIANT_DIR}/THIRD-PARTY-LICENSES" bare; pack_variant
+check_variant notices "lacks required copyright notices" "an archive without the required curve25519-dalek notices is rejected"
+make_variant version; write_fake_binary 0.7.0 "${VARIANT_DIR}/boringtun-cli"
+sed -i "s/^binary_sha256=.*/binary_sha256=$(sha256sum "${VARIANT_DIR}/boringtun-cli" | cut -d' ' -f1)/" "${VARIANT_DIR}/MANIFEST"; pack_variant
+check_variant version "expected 'boringtun 0.7.1'" "verify-archive runs the binary"
+run_script verify-archive-static "${VARIANT_ARCHIVE}" "${TEST_ROOT}/extract-static"
+assert_succeeds "verify-archive-static checks everything but never runs the binary"
+run_script verify-archive-static "${TEST_ROOT}/variants/notices/${STEM}.tar.gz" "${TEST_ROOT}/extract-static-notices"
+assert_fails_with "lacks required copyright notices" "verify-archive-static still checks the notices"
 cp "${ARCHIVE}" "${TEST_ROOT}/boringtun-cli-0.7.1-g0123456789ab-linux-x86_64-musl.tar.gz"
 run_script verify-archive "${TEST_ROOT}/boringtun-cli-0.7.1-g0123456789ab-linux-x86_64-musl.tar.gz" "${TEST_ROOT}/extract-name"
 assert_fails_with "not the artifact of the pinned version and commit" "an archive named for another commit is rejected"
@@ -599,6 +632,15 @@ if [[ ! -e "${TEST_ROOT}/licenses-deny" ]]; then
 else
 	not_ok "a failed gate writes no THIRD-PARTY-LICENSES"
 fi
+write_third_party "${STATE}/third-party" bare
+run_script licenses "${SOURCE}" "${TEST_ROOT}/licenses-bare"
+assert_fails_with "lacks required copyright notices" "generated notices without the required curve25519-dalek notices fail the gate"
+if [[ ! -e "${TEST_ROOT}/licenses-bare" && ! -e "${TEST_ROOT}/licenses-bare.tmp" ]]; then
+	ok "  and nothing is written"
+else
+	not_ok "  and nothing is written"
+fi
+write_third_party "${STATE}/third-party"
 printf 'notice\n' >"${CRATE_DIR}/NOTICE"
 run_script licenses "${SOURCE}" "${TEST_ROOT}/licenses-notice"
 assert_fails_with "ring 0.17.14 ships NOTICE" "a crate shipping an Apache NOTICE file fails the gate"

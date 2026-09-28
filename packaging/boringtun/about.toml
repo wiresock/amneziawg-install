@@ -18,3 +18,18 @@ ignore-build-dependencies = true
 # The script runs cargo-about with --frozen, so license texts come only from the
 # crate sources in the lockfile and from its bundled SPDX texts, never from the
 # network, and the output is deterministic for a given pin.
+
+# curve25519-dalek ships one LICENSE file with two BSD-3-Clause notices: its
+# authors' (isis agora lovecruft, Henry de Valence) and, for code derived from
+# Adam Langley's Go ed25519, The Go Authors'. cargo-about does not match that
+# combined file and would print the bare SPDX BSD-3-Clause text, which names no
+# copyright holder. This reproduces the file verbatim. The checksum pins it: a
+# crate version with a different LICENSE fails generation until it is reviewed.
+# required-notices lists the lines that must appear.
+[curve25519-dalek.clarify]
+license = "BSD-3-Clause"
+
+[[curve25519-dalek.clarify.files]]
+path = "LICENSE"
+license = "BSD-3-Clause"
+checksum = "cca0bd3c4fcdba74145ef9d49c62337e2c9fbf9368288f11d0547f1b0273219f"

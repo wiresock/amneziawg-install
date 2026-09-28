@@ -1,0 +1,14 @@
+# Copyright notices that THIRD-PARTY-LICENSES must reproduce, each in the
+# section that lists its crate. scripts/boringtun-artifact.sh checks them when
+# it generates the file and again when it verifies an archive, so a change of
+# cargo-about, of its license matching or of a crate cannot silently drop them.
+# The same check fails for any crate other than BoringTun's own that only a
+# placeholder notice ("Copyright (c) <year> <owner>") attributes.
+#
+# Format: <crate> <version> | <copyright line, verbatim>
+#
+# curve25519-dalek: BSD-3-Clause only, and its LICENSE file is not matched by
+# cargo-about on its own; see the clarification in about.toml.
+curve25519-dalek 4.1.3 | Copyright (c) 2016-2021 isis agora lovecruft. All rights reserved.
+curve25519-dalek 4.1.3 | Copyright (c) 2016-2021 Henry de Valence. All rights reserved.
+curve25519-dalek 4.1.3 | Copyright (c) 2012 The Go Authors. All rights reserved.
