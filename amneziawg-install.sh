@@ -4470,16 +4470,19 @@ function _awgBtPathId() {
 }
 
 # Remove the node at PATH only if it is still the node recorded as ID and the
-# process PID/START that created it is gone. A replaced node, an unrecorded one
-# and one whose daemon may still serve it are left alone. A failed awg query is
-# never evidence that a socket is stale.
+# process PID/START that created it is gone. A node that no longer exists, a
+# replacement, an unrecorded node and one whose daemon may still serve it are
+# all left alone, and none of that is a failure. It fails (1) only when the
+# exact recorded node of a dead owner is still there after the removal: that
+# cleanup is incomplete. A failed awg query is never evidence either way.
 function _awgBtRemoveOwnedPath() { # <path> <id> <pid> <start time>
 	local CURRENT
 	[[ -n "$2" && -n "$3" && -n "$4" ]] || return 0
 	_awgBtProcessIs "$3" "$4" && return 0
 	CURRENT="$(_awgBtPathId "$1")" || return 0
 	[[ "${CURRENT}" == "$2" ]] || return 0
-	rm -f -- "$1"
+	rm -f -- "$1" 2>/dev/null
+	[[ "$(_awgBtPathId "$1")" != "$2" ]]
 }
 
 # The node at PATH is a UNIX socket that the live process PID/START holds open:
@@ -4628,7 +4631,7 @@ function _awgBtStateValueValid() { # <key> <value>
 		ATTEMPT) [[ "$2" =~ ^[0-9a-f]{32}$ ]] ;;
 		CONFIG) [[ "$2" =~ ^/[^[:cntrl:]]*\.conf$ ]] ;;
 		PRE_EXISTING) [[ "$2" == 0 || "$2" == 1 ]] ;;
-		PHASE) [[ "$2" =~ ^(started|prechecked|launching|launched)$ ]] ;;
+		PHASE) [[ "$2" =~ ^(started|prechecked|launching|launched|launch-failed)$ ]] ;;
 		PID | IFINDEX) [[ "$2" =~ ^([1-9][0-9]{0,9})?$ ]] ;;
 		PID_START) [[ "$2" =~ ^([0-9]{1,20})?$ ]] ;;
 		WG_SOCK | AWG_SOCK) [[ "$2" =~ ^([0-9]+:[0-9]+:[0-9a-f]+:[0-9]+\.[0-9]{9})?$ ]] ;;
@@ -4747,11 +4750,15 @@ function awgBoringtunLaunchMain() {
 	AWG_PATH="${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock"
 	if _awgBtLinkExists "${INTERFACE_NAME}" || [[ -e "${WG_PATH}" || -L "${WG_PATH}" || -e "${AWG_PATH}" || -L "${AWG_PATH}" ]]; then
 		_awgBtErr "refusing to start BoringTun: a link or UAPI socket named ${INTERFACE_NAME} appeared after precheck; it is left untouched"
+		_awgBtLaunchRefused "${INTERFACE_NAME}"
 		return 1
 	fi
 	PID_FILE="$(_awgBtPidFile "${INTERFACE_NAME}")"
 	rm -f -- "${PID_FILE}"
-	_awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${INTERFACE_NAME}" || return 1
+	if ! _awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${INTERFACE_NAME}"; then
+		_awgBtLaunchRefused "${INTERFACE_NAME}"
+		return 1
+	fi
 	(
 		_awgBtCloseInheritedFds
 		exec "${_AWG_BT_ARGV[@]}" </dev/null
@@ -4823,18 +4830,34 @@ function _awgBtRecordSocketNodes() { # <interface>
 	((CHANGED == 0)) || _awgBtStateSave "$1"
 }
 
-# Stop and reap the launcher's child, then remove the socket nodes it was seen
-# to create and the PID file. The state keeps the record for poststop.
+# The launcher refused before it started anything: the attempt owns nothing,
+# and awg-quick up stops before any PostUp hook, so poststop may finish it.
+function _awgBtLaunchRefused() { # <interface>
+	_AWG_BT_STATE[PHASE]=launch-failed
+	_awgBtStateSave "$1" || _awgBtErr "cannot record that the launch of $1 failed"
+}
+
+# Stop and reap the launcher's child, then remove the socket nodes proven to be
+# that child's and the PID file. When all of that succeeded, the attempt is
+# recorded as launch-failed: awg-quick up then fails at once, before any
+# PostUp hook, which lets poststop finish the attempt.
 function _awgBtLaunchFailed() { # <interface> <child pid>
+	local CLEAN=1
 	# A child whose start time could not be read had already exited and been
 	# reaped, so its PID may name another process by now: it is not signalled.
 	if [[ -n "${_AWG_BT_STATE[PID_START]-}" ]]; then
-		_awgBtStopProcess "$2" "${_AWG_BT_STATE[PID_START]}"
+		_awgBtStopProcess "$2" "${_AWG_BT_STATE[PID_START]}" || CLEAN=0
 	fi
 	wait "$2" 2>/dev/null
-	_awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/$1.sock" "${_AWG_BT_STATE[WG_SOCK]-}" "$2" "${_AWG_BT_STATE[PID_START]-}"
-	_awgBtRemoveOwnedPath "${AWG_BT_AWG_SOCKET_DIR}/$1.sock" "${_AWG_BT_STATE[AWG_SOCK]-}" "$2" "${_AWG_BT_STATE[PID_START]-}"
+	_awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/$1.sock" "${_AWG_BT_STATE[WG_SOCK]-}" "$2" "${_AWG_BT_STATE[PID_START]-}" || CLEAN=0
+	_awgBtRemoveOwnedPath "${AWG_BT_AWG_SOCKET_DIR}/$1.sock" "${_AWG_BT_STATE[AWG_SOCK]-}" "$2" "${_AWG_BT_STATE[PID_START]-}" || CLEAN=0
 	rm -f -- "$(_awgBtPidFile "$1")"
+	if ((CLEAN)); then
+		_AWG_BT_STATE[PHASE]=launch-failed
+		_awgBtStateSave "$1" || _awgBtErr "cannot record that the launch of $1 failed"
+	else
+		_awgBtErr "what the failed launch of $1 created is not completely removed; its state is kept"
+	fi
 }
 
 # Print each value of KEY in the [Interface] section of an awg-quick config,
@@ -4944,40 +4967,51 @@ function _awgBtWithoutSaveConfig() { # <config>
 	return "${RC}"
 }
 
+# One complete attempt at the private down copy under TEMPLATE's directory: a
+# new mktemp directory that must be a 0700 directory of the trusted user, the
+# config without SaveConfig written into it as <if>.conf, set to 0600 and
+# checked. Any failure removes this attempt's own directory and fails.
+function _awgBtTryDownCopy() { # <mktemp template> <interface> <config>
+	local WORK OWNER="" MODE=""
+	WORK="$(mktemp -d "$1" 2>/dev/null)" || return 1
+	read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${WORK}")"
+	if [[ ! -L "${WORK}" && -d "${WORK}" && "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${MODE}" == 700 ]] &&
+		{ _awgBtWithoutSaveConfig "$3" >"${WORK}/$2.conf"; } 2>/dev/null &&
+		chmod 0600 -- "${WORK}/$2.conf" 2>/dev/null; then
+		read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${WORK}/$2.conf")"
+		if [[ ! -L "${WORK}/$2.conf" && -f "${WORK}/$2.conf" && "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${MODE}" == 600 ]]; then
+			printf '%s\n' "${WORK}"
+			return 0
+		fi
+	fi
+	rm -rf -- "${WORK}"
+	return 1
+}
+
 # A private copy of CONFIG for awg-quick down, <dir>/<if>.conf without its
 # SaveConfig lines. BoringTun's UAPI never returns the private key, so a save
 # during down would write a keyless configuration over the real one, whatever
 # the file said when the interface started. The copy keeps the interface's file
 # name, so awg-quick derives the same interface and runs the same hooks. The
-# private directory is a new mktemp directory in the runtime directory, or in
-# AWG_BT_TMP_DIR when the runtime directory cannot allocate one, and must be a
-# 0700 directory of the trusted user. Prints the directory.
+# whole copy is made in the runtime directory, and if any step of that fails,
+# made again from scratch in AWG_BT_TMP_DIR (/tmp, not an inherited TMPDIR).
+# Prints the directory.
 function _awgBtDownCopy() { # <interface> <config>
-	local WORK="" OWNER="" MODE=""
+	local WORK=""
 	if [[ ! -f "$2" || ! -r "$2" ]]; then
 		_awgBtErr "cannot bring $1 down: $2 is not readable"
 		return 1
 	fi
-	if _awgBtPrepareRunDir; then
-		WORK="$(mktemp -d "${AWG_BT_RUN_DIR}/down.XXXXXX" 2>/dev/null)" || WORK=""
+	if _awgBtPrepareRunDir && WORK="$(_awgBtTryDownCopy "${AWG_BT_RUN_DIR}/down.XXXXXX" "$1" "$2")"; then
+		printf '%s\n' "${WORK}"
+		return 0
 	fi
-	if [[ -z "${WORK}" ]]; then
-		WORK="$(mktemp -d "${AWG_BT_TMP_DIR}/awg-boringtun-down.XXXXXX" 2>/dev/null)" || WORK=""
+	if WORK="$(_awgBtTryDownCopy "${AWG_BT_TMP_DIR}/awg-boringtun-down.XXXXXX" "$1" "$2")"; then
+		printf '%s\n' "${WORK}"
+		return 0
 	fi
-	if [[ -z "${WORK}" ]]; then
-		_awgBtErr "cannot create a private directory for the down copy of $1 in ${AWG_BT_RUN_DIR} or ${AWG_BT_TMP_DIR}"
-		return 1
-	fi
-	read -r OWNER MODE <<<"$(_awgBtStatOwnerMode "${WORK}")"
-	if [[ -L "${WORK}" || ! -d "${WORK}" || "${OWNER}" != "${AWG_BT_TRUSTED_UID}" || "${MODE}" != 700 ]]; then
-		_awgBtErr "${WORK} is not a private directory"
-		return 1
-	fi
-	if ! _awgBtWithoutSaveConfig "$2" >"${WORK}/$1.conf" || ! chmod 0600 -- "${WORK}/$1.conf"; then
-		rm -rf -- "${WORK}"
-		return 1
-	fi
-	printf '%s\n' "${WORK}"
+	_awgBtErr "cannot make a private down copy of $1 in ${AWG_BT_RUN_DIR} or ${AWG_BT_TMP_DIR}"
+	return 1
 }
 
 # The link of the name is still the owned one: it has the owned ifindex, is of
@@ -5393,26 +5427,28 @@ function _awgBtCtlStop() { # <interface>
 
 # ExecStopPost, after every stop, crash and failed start. It acts only on the
 # current attempt's state and only on what that attempt owns, and removes the
-# state only once cleanup reached a terminal, known-safe state:
-#  - no state of the current attempt: nothing is touched;
-#  - precheck refused or failed (PHASE=started): nothing was started (terminal);
+# state only because of a positive terminal fact:
+#  - precheck refused or failed (PHASE=started): awg-quick up never ran;
+#  - the launcher failed and cleaned up (PHASE=launch-failed): awg-quick up
+#    stops at its first step, before any PostUp hook;
+#  - the interface's cleanup completed (the done flag: a successful
+#    awg-quick down, or a finished replay), or a replay completed now.
+# Anything else keeps the state and says why. In particular a missing up flag
+# is not terminal: awg-quick up may have run PostUp even though poststart
+# could not record it. Along the way:
 #  - the recorded daemon is stopped if it still runs (awgBackendQuickUp has no
 #    cgroup for systemd to end); a daemon that does not stop keeps the state;
-#  - awg-quick up never succeeded (no up flag): as with awg-quick itself, no
-#    PostDown is owed (terminal);
-#  - a down succeeded (done flag): terminal;
-#  - a down or a replay was started and did not provably finish: its hooks
-#    may have run in part, so they are named, never run again, and the state
-#    is kept;
+#  - a down or a replay that was started and did not provably finish has its
+#    hooks named, never run again;
 #  - a kernel link that awg-quick created for this attempt (the recorded
 #    ifindex, not a TUN device) is brought down through _awgBtGuardedDown;
 #  - PostDown is replayed once when no link of the name exists any more and no
 #    down reached PostDown; the replay flag is raised first, and if it cannot
-#    be raised no hook runs and the state is kept;
+#    be raised no hook runs;
 #  - a different link that took the name is left alone, and PostDown, which
-#    may address the interface by name, is not replayed while it exists.
-# Socket nodes are removed only if they are the recorded nodes of a daemon that
-# is gone.
+#    may address the interface by name, is not replayed while it exists;
+#  - socket nodes are removed only if they are the recorded, proven nodes of a
+#    daemon that is gone; if such a node cannot be removed, the state is kept.
 function _awgBtCtlPoststop() { # <interface>
 	local INTERFACE_NAME="$1" INDEX="" PID START KEEP=0 TERMINAL=0 REPLAY=0 RC
 	if ! _awgBtCurrentAttempt || ! _awgBtPrepareRunDir || ! _awgBtStateLoad "${INTERFACE_NAME}"; then
@@ -5422,7 +5458,7 @@ function _awgBtCtlPoststop() { # <interface>
 	fi
 	PID="${_AWG_BT_STATE[PID]}"
 	START="${_AWG_BT_STATE[PID_START]}"
-	if [[ "${_AWG_BT_STATE[PHASE]}" == started ]]; then
+	if [[ "${_AWG_BT_STATE[PHASE]}" == started || "${_AWG_BT_STATE[PHASE]}" == launch-failed ]]; then
 		TERMINAL=1
 	else
 		if [[ -n "${PID}" && -n "${START}" ]] && ! _awgBtStopProcess "${PID}" "${START}"; then
@@ -5430,8 +5466,11 @@ function _awgBtCtlPoststop() { # <interface>
 			KEEP=1
 		fi
 		INDEX="$(_awgBtLinkIndex "${INTERFACE_NAME}")" || INDEX=""
-		if ! _awgBtFlagIs "${INTERFACE_NAME}" up || _awgBtFlagIs "${INTERFACE_NAME}" "done"; then
+		if _awgBtFlagIs "${INTERFACE_NAME}" "done"; then
 			TERMINAL=1
+		elif ! _awgBtFlagIs "${INTERFACE_NAME}" up; then
+			_awgBtErr "awg-quick up of ${INTERFACE_NAME} did not complete, or its completion could not be recorded: PostUp may have run, so PostDown is neither run nor ruled out, and the attempt is kept"
+			_awgBtReportUnfinishedDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}"
 		elif _awgBtFlagIs "${INTERFACE_NAME}" replay; then
 			_awgBtErr "a PostDown replay of ${INTERFACE_NAME} was started earlier and may not have finished; it is never run again"
 			_awgBtReportUnfinishedDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}"
@@ -5471,19 +5510,23 @@ function _awgBtCtlPoststop() { # <interface>
 		if ((REPLAY)); then
 			if _awgBtFlagRaise "${INTERFACE_NAME}" replay; then
 				_awgBtReplayPostDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}"
+				_awgBtFlagRaise "${INTERFACE_NAME}" "done" || _awgBtErr "cannot record that the PostDown replay of ${INTERFACE_NAME} finished"
 				TERMINAL=1
 			else
 				_awgBtErr "cannot record that the PostDown replay of ${INTERFACE_NAME} starts, so none of its hooks is run"
 			fi
 		fi
 	fi
-	_awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[WG_SOCK]}" "${PID}" "${START}"
-	_awgBtRemoveOwnedPath "${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[AWG_SOCK]}" "${PID}" "${START}"
+	if ! _awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[WG_SOCK]}" "${PID}" "${START}" ||
+		! _awgBtRemoveOwnedPath "${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[AWG_SOCK]}" "${PID}" "${START}"; then
+		_awgBtErr "a UAPI socket node of the dead BoringTun daemon of ${INTERFACE_NAME} cannot be removed; cleanup is incomplete"
+		KEEP=1
+	fi
 	rm -f -- "$(_awgBtPidFile "${INTERFACE_NAME}")"
 	if ((TERMINAL && ! KEEP)); then
 		_awgBtAttemptRemove "${INTERFACE_NAME}" || _awgBtErr "cannot remove the finished state of ${INTERFACE_NAME}"
 	else
-		_awgBtErr "the state of this attempt of ${INTERFACE_NAME} is kept for diagnosis: $(_awgBtStateFile "${INTERFACE_NAME}")"
+		_awgBtErr "the state of this attempt of ${INTERFACE_NAME} is kept: $(_awgBtStateFile "${INTERFACE_NAME}")"
 	fi
 	return 0
 }
@@ -5527,8 +5570,8 @@ function awgBackendCtlMain() {
 
 # Functions the generated helpers carry. Keep in step with their callers.
 _AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtRemoveOwnedPath _awgBtSocketHeldBy _awgBtSymlinkToNode _awgBtProveUapiNodes _awgBtNewToken _awgBtCurrentAttempt _awgBtAttemptBase _awgBtStateFile _awgBtFlagsArm _awgBtFlagRaise _awgBtFlagIs _awgBtAttemptRemove _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
-_AWG_BT_LAUNCH_FUNCTIONS="awgBoringtunLaunchMain _awgBtRecordSocketNodes _awgBtLaunchFailed"
-_AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtWithoutSaveConfig _awgBtDownCopy _awgBtLinkIsOwned _awgBtGuardedDown _awgBtRecordFailedDown _awgBtReplayPostDown _awgBtReportUnfinishedDown _awgBtFilteredStrip _awgBtSync _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtVerifyActiveInstance _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
+_AWG_BT_LAUNCH_FUNCTIONS="awgBoringtunLaunchMain _awgBtRecordSocketNodes _awgBtLaunchRefused _awgBtLaunchFailed"
+_AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtWithoutSaveConfig _awgBtTryDownCopy _awgBtDownCopy _awgBtLinkIsOwned _awgBtGuardedDown _awgBtRecordFailedDown _awgBtReplayPostDown _awgBtReportUnfinishedDown _awgBtFilteredStrip _awgBtSync _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtVerifyActiveInstance _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
 
 # Emit a generated helper: a fixed header, the embedded AWG_BT_* settings, the
 # installer's own functions and a call to the entry point. The output depends
