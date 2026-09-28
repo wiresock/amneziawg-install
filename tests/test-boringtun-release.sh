@@ -369,6 +369,8 @@ while (( $# > 0 )); do
 done
 printf 'curl %s\n' "${url}" >>"${MOCK}/calls"
 cp -- "${MOCK}/assets/${url##*/}" "${out}"
+[[ -f "${MOCK}/tamper-public" ]] && printf 'x' >>"${out}"
+exit 0
 EOF
 chmod +x "${BIN_DIR}/gh" "${BIN_DIR}/curl"
 
@@ -527,6 +529,8 @@ for VARIANT in extra symlink traversal notices manifest-commit; do
 		notices) check_set "lacks required copyright notices" "an archive without the curve25519-dalek notices is refused" ;;
 		manifest-commit) check_set "MANIFEST does not describe the pinned artifact" "an archive whose MANIFEST names another source commit is refused" ;;
 	esac
+	# Refused by the archive check itself, not only by a later hash comparison.
+	assert_fails_with "${X_NAME} failed archive verification" "  by the archive verification (${VARIANT})"
 done
 if [[ ! -e "${TEST_ROOT}/escape" && -z "$(find "${TEST_ROOT}" -maxdepth 3 -name escape -path '*verify-*')" ]]; then
 	ok "a traversal member is never extracted"
@@ -667,6 +671,10 @@ pub_fails "already exists; a release tag is never reused" "a tag that appears wh
 	'printf "boringtun-cli-0.7.1-g%s-b2\n" "${C12}" >"${MOCK}/tag-after-uploads"'
 pub_fails "has no valid build provenance attestation" "publication repeats every dry-run check" \
 	'touch "${MOCK}/attestation-fail"'
+reset_mock "${GOOD}"; touch "${MOCK}/tamper-public"
+run_release publish "${RUN_ID}" "${ARTIFACTS_COMMIT}" "${TEST_ROOT}/pub-public"
+assert_fails_with "the public download of ${X_NAME} does not match the verified asset" \
+	"a public download URL that serves other bytes fails the publication check"
 run_release publish "${RUN_ID}" "${ARTIFACTS_COMMIT}" "${TEST_ROOT}/pub-ok"
 assert_fails_with "work directory must be new or empty" "a used work directory is refused"
 
