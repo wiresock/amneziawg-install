@@ -277,6 +277,7 @@ case "$1" in
 		config_of "$2"
 		cp "${CONF}" "${S}/down-config"
 		echo "${CONF}" >"${S}/down-path"
+		stat -c '%u %a' -- "${CONF%/*}" "${CONF}" | tr '\n' ' ' >"${S}/down-modes"
 		[[ -f "${S}/down-rc" ]] && exit "$(cat "${S}/down-rc")"
 		[[ " $(awg show interfaces) " == *" ${NAME} "* ]] || { echo "awg-quick: \`${NAME}' is not a WireGuard interface" >&2; exit 1; }
 		run_hooks "${CONF}" PreDown "${NAME}" || exit 1
@@ -365,7 +366,8 @@ EOF
 # $S/systemd-run-release (after touching $S/systemd-run-waiting);
 # $S/systemd-run-lost starts the unit but reports failure; $S/systemd-run-fail
 # fails without starting anything, after creating the link a concurrent creator
-# named in it made.
+# named in it made. As with --collect, a unit whose main process exited is
+# gone; $S/unit-pids lists every main process started.
 cat >"${MOCKBIN}/systemd-run" <<EOF
 #!/bin/bash
 S='${S}'
@@ -389,7 +391,14 @@ if [[ -f "${S}/systemd-run-fail" ]]; then
 	exit 1
 fi
 "$@" </dev/null >/dev/null 2>&1 &
-echo "$!" >"${S}/units/${UNIT}"
+MAIN=$!
+echo "${MAIN}" >"${S}/units/${UNIT}"
+echo "${MAIN}" >>"${S}/unit-pids"
+# --collect: the unit goes away once its main process has exited.
+(
+	while kill -0 "${MAIN}" 2>/dev/null; do sleep 0.05; done
+	[[ "$(cat "${S}/units/${UNIT}" 2>/dev/null)" != "${MAIN}" ]] || rm -f "${S}/units/${UNIT}"
+) </dev/null >/dev/null 2>&1 &
 [[ -f "${S}/systemd-run-lost" ]] && exit 1
 exit 0
 EOF
@@ -474,6 +483,14 @@ if [[ -f "${S}/mktemp-fail" ]]; then
 	while IFS= read -r PATTERN; do
 		[[ -n "${PATTERN}" && "$*" == *"${PATTERN}"* ]] && { echo "mktemp: injected failure" >&2; exit 1; }
 	done <"${S}/mktemp-fail"
+fi
+# $S/mktemp-obstruct: make a matching directory as asked, with a directory in
+# the way of the file named in $S/mktemp-obstruct-name, so writing it fails.
+if [[ -f "${S}/mktemp-obstruct" && "$*" == *"$(cat "${S}/mktemp-obstruct")"* ]]; then
+	DIR="$("${REAL}" "$@")" || exit 1
+	mkdir -- "${DIR}/$(cat "${S}/mktemp-obstruct-name")"
+	printf '%s\n' "${DIR}"
+	exit 0
 fi
 # $S/mktemp-hold: once, block a matching call until $S/mktemp-release exists.
 if [[ -f "${S}/mktemp-hold" && "$*" == *"$(cat "${S}/mktemp-hold")"* ]]; then
@@ -1243,6 +1260,7 @@ assert_true "and the launch gives up after the bounded wait" test "${SECONDS}" -
 HANG_PID="$(cat "${S}/hang-pid" 2>/dev/null)"
 assert_true "and the tracked daemon was stopped" wait_until 3 pid_gone "${HANG_PID}"
 assert_true "and no PID file is left" test ! -e "${AWG_BT_RUN_DIR}/boringtun-${IF}.pid"
+assert_eq "launch-failed" "$(state_get "${IF}" PHASE)" "S9: the cleaned-up failed launch is recorded as launch-failed"
 install_helpers
 
 reset_state
@@ -1251,7 +1269,14 @@ ctl_precheck "${IF}"
 bind_socket "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
 launch_expect_refused "the launcher refuses a socket that appeared after precheck" "appeared after precheck"
 assert_true "and leaves that socket alone" test -S "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+assert_eq "launch-failed" "$(state_get "${IF}" PHASE)" "S9: a launcher that started nothing records the attempt as launch-failed"
+run "${CTL}" poststop "${IF}"
+assert_true "S9: which poststop finishes: nothing owned was created" test ! -e "$(state_file "${IF}")"
+assert_true "S9: and leaves the foreign socket alone" test -S "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
 rm -f "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+reset_state
+write_runtime_file "${IF}"
+ctl_precheck "${IF}"
 mkdir "${NET}/${IF}"
 launch_expect_refused "the launcher refuses a link that appeared after precheck" "appeared after precheck"
 assert_true "and leaves that link alone" test -d "${NET}/${IF}"
@@ -1591,6 +1616,80 @@ for ROUND in 1 2; do
 done
 assert_contains "its PostDown hooks are owed" "${ERR}" "S9c: the owed cleanup is reported"
 ip link delete dev "${IF}"
+# S9d: PostUp ran, the up flag cannot be raised and no emergency copy can be
+# made; storage then recovers. The missing up flag is not terminal: poststop
+# keeps the attempt and names the owed PostDown instead of forgetting it.
+reset_state
+: >"${HOOK_LOG}"
+launch_up
+echo ".up-pending" >"${S}/mv-fail"
+printf '%s\n' "${AWG_BT_RUN_DIR}/" "${AWG_BT_TMP_DIR}/" >"${S}/mktemp-fail"
+run "${CTL}" poststart "${IF}"
+rm -f "${S}/mv-fail" "${S}/mktemp-fail"
+assert_rc 1 "${RC}" "S9d: poststart fails when neither the up flag nor a down copy can be made"
+assert_eq "up" "$(cat "${HOOK_LOG}")" "S9d: (PostUp ran; no PreDown or PostDown is claimed)"
+assert_true "S9d: (the up flag is missing)" test ! -e "${AWG_BT_RUN_DIR}/${IF}@${INVOCATION_ID}.up"
+for ROUND in 1 2; do
+	run "${CTL}" poststop "${IF}"
+	assert_true "S9d: poststop (${ROUND}) keeps the attempt: a missing up flag is not terminal" test -f "$(state_file "${IF}")"
+	assert_eq "up" "$(cat "${HOOK_LOG}")" "S9d: and runs no hook blindly (${ROUND})"
+done
+assert_contains "PostUp may have run" "${ERR}" "S9d: poststop says PostUp may have run"
+assert_contains "PostDown = echo down" "${ERR}" "S9d: and names the PostDown that is owed"
+# S9e/S9f: the runtime directory allocates the copy, but writing it (S9e) or
+# setting its mode (S9f) fails: the whole copy is made again in
+# AWG_BT_TMP_DIR, not TMPDIR, and only the failed attempt's directory goes.
+for CASE in write chmod; do
+	reset_state
+	: >"${HOOK_LOG}"
+	launch_up
+	echo ".up-pending" >"${S}/mv-fail"
+	if [[ "${CASE}" == write ]]; then
+		echo "${AWG_BT_RUN_DIR}/down." >"${S}/mktemp-obstruct"
+		echo "${IF}.conf" >"${S}/mktemp-obstruct-name"
+	else
+		echo "${AWG_BT_RUN_DIR}/down." >"${S}/chmod-fail"
+	fi
+	run env TMPDIR="${T}/elsewhere" "${CTL}" poststart "${IF}"
+	rm -f "${S}/mv-fail" "${S}/mktemp-obstruct" "${S}/mktemp-obstruct-name" "${S}/chmod-fail"
+	assert_rc 1 "${RC}" "S9 (${CASE}): poststart fails when it cannot record that the interface is up"
+	assert_contains "awg-quick down ${AWG_BT_TMP_DIR}/awg-boringtun-down." "$(cat "${S}/log")" \
+		"S9 (${CASE}): a failed ${CASE} of the runtime copy is retried whole in AWG_BT_TMP_DIR"
+	assert_eq "${AWG_BT_TMP_DIR}" "$(dirname "$(dirname "$(cat "${S}/down-path")")")" "S9 (${CASE}): (not in TMPDIR)"
+	assert_eq "${IF}.conf" "$(basename "$(cat "${S}/down-path")")" "S9 (${CASE}): the copy keeps the interface's file name"
+	assert_eq "$(id -u) 700 $(id -u) 600 " "$(cat "${S}/down-modes")" "S9 (${CASE}): a 0700 directory and a 0600 copy of the trusted user"
+	assert_eq "up
+predown
+down" "$(cat "${HOOK_LOG}")" "S9 (${CASE}): the emergency down runs PreDown and PostDown once"
+	assert_eq "" "$(find "${AWG_BT_RUN_DIR}" "${AWG_BT_TMP_DIR}" -name 'down.*' -o -name 'awg-boringtun-down.*')" \
+		"S9 (${CASE}): both the failed and the used copy directories are removed"
+	run "${CTL}" poststop "${IF}"
+	assert_eq "3" "$(wc -l <"${HOOK_LOG}")" "S9 (${CASE}): poststop runs no hook again"
+	assert_true "S9 (${CASE}): and the completed cleanup leaves nothing" nothing_left "${IF}"
+done
+# S9g: the exact recorded socket of the dead daemon cannot be unlinked: the
+# attempt is kept and the cleanup reported incomplete; a later poststop
+# removes the socket and finishes the attempt without running a hook again.
+reset_state
+: >"${HOOK_LOG}"
+service_start "${IF}"
+PID="$(state_get "${IF}" PID)"
+kill -KILL "${PID}"
+wait_until 3 pid_gone "${PID}"
+"${CTL}" stop "${IF}" 2>/dev/null
+echo "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" >"${S}/rm-fail"
+run "${CTL}" poststop "${IF}"
+rm -f "${S}/rm-fail"
+assert_true "S9g: (the owned socket could not be removed)" test -S "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+assert_true "S9g: the attempt is kept while its owned socket remains" test -f "$(state_file "${IF}")"
+assert_contains "cleanup is incomplete" "${ERR}" "S9g: and the cleanup is reported incomplete"
+assert_eq "up
+down" "$(cat "${HOOK_LOG}")" "S9g: (PostDown was replayed once)"
+run "${CTL}" poststop "${IF}"
+assert_true "S9g: a later poststop removes the socket" test ! -e "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+assert_eq "up
+down" "$(cat "${HOOK_LOG}")" "S9g: without running PostDown again"
+assert_true "S9g: and finishes the attempt" nothing_left "${IF}"
 # The state directory replaced by a file.
 reset_state
 : >"${HOOK_LOG}"
@@ -1630,7 +1729,8 @@ assert_not_contains "awg-quick up" "$(cat "${S}/log")" "S9: and nothing is broug
 assert_eq "" "$(cat "${HOOK_LOG}")" "S9: and no hook runs"
 rm -f "${AWG_BT_RUN_DIR}"
 # A PostUp hook that fails part way: awg-quick's own trap deletes the link and,
-# as upstream, runs no PostDown; poststop replays nothing either.
+# as upstream, runs no PostDown; poststop replays nothing either. A missing up
+# flag is no proof that no PostUp ran, so the attempt is kept.
 reset_state
 : >"${HOOK_LOG}"
 write_server_config "${IF}" "PostUp = echo up1 >>${HOOK_LOG}
@@ -1639,7 +1739,9 @@ PostDown = echo down >>${HOOK_LOG}"
 run service_start "${IF}"
 assert_rc 1 "${RC}" "S9: a failing second PostUp fails the start"
 assert_eq "up1" "$(cat "${HOOK_LOG}")" "S9: as with awg-quick itself, PostDown is not run for a partial PostUp"
-assert_true "S9: and nothing is left" nothing_left "${IF}"
+assert_true "S9: the link is gone" test ! -e "${NET}/${IF}"
+assert_true "S9: and the attempt is kept, because PostUp may have run" test -f "$(state_file "${IF}")"
+assert_contains "PostUp may have run" "${ERR}" "S9: and poststop says why"
 
 echo "=== Stop, crash and poststop (S1, S2) ==="
 write_server_config "${IF}" "PostUp = echo up >>${HOOK_LOG}
@@ -2076,9 +2178,9 @@ assert_rc 1 "${RC}" "a scratch name outside [a-zA-Z0-9_-] is refused"
 # records_gone <token>: neither record of the attempt remains.
 records_gone() {
 	[[ ! -e "${SCRATCH_DIR}/$1.owner" && ! -e "${SCRATCH_DIR}/$1.guard" && ! -e "${SCRATCH_DIR}/$1.child" &&
-		! -e "${SCRATCH_DIR}/$1.stop" ]]
+		! -e "${SCRATCH_DIR}/$1.client" && ! -e "${SCRATCH_DIR}/$1.stop" && ! -e "${SCRATCH_DIR}/$1.reclaim" ]]
 }
-record_get() { # <token> <owner|guard> <key>
+record_get() { # <token> <owner|guard|child|client> <key>
 	sed -n "s/^$3=//p" "${SCRATCH_DIR}/$1.$2" 2>/dev/null
 }
 scratch_gone() { # <name> <token>
@@ -2093,8 +2195,8 @@ awgBackendCreateScratchInterface awgp1 2>"${T}/err"
 assert_rc 0 "$?" "under systemd a scratch interface starts in a transient unit"
 TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp1]}"
 UNIT="amneziawg-scratch-awgp1-${TOKEN}"
-assert_eq "systemd-run --quiet --collect --unit=${UNIT} -p Type=exec -p RuntimeMaxSec=900 -- $(command -v env) -i PATH=${AWG_BT_PATH} NO_COLOR=1 ${VERIFIED_BIN} --foreground --disable-drop-privileges --verbosity error awgp1" \
-	"$(grep '^systemd-run' "${S}/log")" "the unit is named after the attempt's token, has a hard lifetime and runs the production command line"
+assert_eq "systemd-run --quiet --collect --unit=${UNIT} -p Type=exec -p RuntimeMaxSec=900 -- $(command -v bash) -c [[ -e \"\$1\" && ! -e \"\$2\" ]] || exit 0; shift 2; exec \"\$@\" awg-scratch-unit ${SCRATCH_DIR}/${TOKEN}.owner ${SCRATCH_DIR}/${TOKEN}.reclaim $(command -v env) -i PATH=${AWG_BT_PATH} NO_COLOR=1 ${VERIFIED_BIN} --foreground --disable-drop-privileges --verbosity error awgp1" \
+	"$(grep '^systemd-run' "${S}/log")" "the unit is named after the attempt's token, has a hard lifetime and runs the production command line behind the attempt's gate"
 UNIT_PID="$(cat "${S}/units/${UNIT}")"
 assert_true "and the daemon is running" pid_alive "${UNIT_PID}"
 GUARD_PID="${_AWG_BT_SCRATCH_GUARDS[awgp1]}"
@@ -2186,6 +2288,7 @@ source "$1"
 source "$2"
 if [[ "$3" == unit ]]; then AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_PRESENT}"; else AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"; fi
 PATH="${MOCKBIN}:${PATH}"
+[[ -z "${CLIENT_WAIT:-}" ]] || _AWG_BT_SCRATCH_CLIENT_WAIT="${CLIENT_WAIT}"
 _awgInternalSelectBoringtunRuntimeForTesting
 case "$4" in
 	create)
@@ -2250,7 +2353,7 @@ touch "${S}/systemd-run-hold"
 OWNER_PID=$!
 wait_until 5 test -e "${S}/systemd-run-waiting"
 TOKEN="$(basename "$(ls "${SCRATCH_DIR}"/*.owner)" .owner)"
-wait_until 5 test -n "$(record_get "${TOKEN}" guard CLIENT_PID)"
+wait_until 5 test -n "$(record_get "${TOKEN}" client CLIENT_PID)"
 kill -KILL "$(record_get "${TOKEN}" guard GUARD_PID)"
 touch "${S}/systemd-run-release"
 wait "${OWNER_PID}"
@@ -2385,7 +2488,7 @@ touch "${S}/systemd-run-hold"
 OWNER_PID=$!
 wait_until 5 test -e "${S}/systemd-run-waiting"
 TOKEN="$(basename "$(ls "${SCRATCH_DIR}"/*.owner)" .owner)"
-wait_until 5 test -n "$(record_get "${TOKEN}" guard CLIENT_PID)"
+wait_until 5 test -n "$(record_get "${TOKEN}" client CLIENT_PID)"
 kill -KILL "$(record_get "${TOKEN}" guard GUARD_PID)" "${OWNER_PID}"
 wait "${OWNER_PID}" 2>/dev/null
 touch "${S}/systemd-run-release"
@@ -2394,6 +2497,53 @@ assert_true "S3d: (the unit was created after guardian and owner died)" test -e 
 owner unit sweep
 assert_true "S3d: the next sweep reclaims the late unit" scratch_gone awgp7 "${TOKEN}"
 rm -f "${S}"/systemd-run-*
+# S3e: the systemd-run client registered itself and is held before it submits
+# the unit while owner and guardian are killed. The sweep keeps every record
+# and never signals the client; the unit it submits after that never runs
+# BoringTun; the next sweep leaves nothing.
+reset_state
+rm -f "${T}/token"
+touch "${S}/systemd-run-hold"
+"${OWNER_CMD[@]}" unit create awgp7 "${T}/token" &
+OWNER_PID=$!
+wait_until 5 test -e "${S}/systemd-run-waiting"
+TOKEN="$(basename "$(ls "${SCRATCH_DIR}"/*.owner)" .owner)"
+CLIENT="$(record_get "${TOKEN}" client CLIENT_PID)"
+assert_true "S3e: the process in systemd-run is the client that registered itself" \
+	grep -q systemd-run "/proc/${CLIENT}/cmdline"
+assert_eq "$(_awgBtProcessStartTime "${CLIENT}")" "$(record_get "${TOKEN}" client CLIENT_START)" "S3e: by its PID and start time"
+kill -KILL "$(record_get "${TOKEN}" guard GUARD_PID)" "${OWNER_PID}"
+wait "${OWNER_PID}" 2>/dev/null
+CLIENT_WAIT=1 owner unit sweep
+assert_true "S3e: a sweep keeps every record while the registered client lives" \
+	test -f "${SCRATCH_DIR}/${TOKEN}.owner" -a -f "${SCRATCH_DIR}/${TOKEN}.guard" -a -f "${SCRATCH_DIR}/${TOKEN}.client"
+assert_true "S3e: and never signals the client" pid_alive "${CLIENT}"
+touch "${S}/systemd-run-release"
+assert_true "S3e: (the client then submits the unit and exits)" wait_until 5 pid_gone "${CLIENT}"
+assert_true "S3e: (the late unit was created)" wait_until 5 test -s "${S}/unit-pids"
+assert_true "S3e: the late unit exits at once" wait_until 5 pid_gone "$(cat "${S}/unit-pids")"
+assert_true "S3e: without running BoringTun" test ! -e "${S}/argv-awgp7"
+CLIENT_WAIT=1 owner unit sweep
+assert_true "S3e: the next sweep leaves nothing" scratch_gone awgp7 "${TOKEN}"
+sleep 0.3
+assert_true "S3e: and nothing comes back" scratch_gone awgp7 "${TOKEN}"
+rm -f "${S}"/systemd-run-*
+# S3f: the client's own record is durable before anything can be submitted:
+# while that write is held, systemd-run is never invoked.
+reset_state
+rm -f "${T}/token"
+echo ".client." >"${S}/mktemp-hold"
+"${OWNER_CMD[@]}" unit create awgp7 "${T}/token" &
+OWNER_PID=$!
+wait_until 5 test -e "${S}/mktemp-waiting"
+sleep 0.5
+assert_eq "" "$(grep '^systemd-run' "${S}/log")" "S3f: no systemd-run is invoked before the client's own record is durable"
+touch "${S}/mktemp-release"
+wait "${OWNER_PID}"
+assert_rc 0 "$?" "S3f: and the creation then succeeds"
+TOKEN="$(cat "${T}/token")"
+assert_true "S3f: and its owner's exit still tears it down" wait_until 10 scratch_gone awgp7 "${TOKEN}"
+rm -f "${S}"/mktemp-*
 # A foreign socket at a scratch instance's UAPI path is never taken for its own.
 reset_state
 AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"
@@ -2465,12 +2615,45 @@ reset_state
 mkdir -p "${SCRATCH_DIR}"
 chmod 0700 "${SCRATCH_DIR}"
 printf 'FORMAT=1\nTOKEN=%s\nNAME=awgp4\nMODE=direct\nUNIT=\nOWNER_PID=%s\nOWNER_START=1\n' "${BOGUS}" "${DECOY_PID}" >"${SCRATCH_DIR}/${BOGUS}.owner"
-printf 'FORMAT=1\nTOKEN=%s\nNAME=awgp4\nMODE=direct\nUNIT=\nGUARD_PID=%s\nGUARD_START=1\nPHASE=created\nCLIENT_PID=\nCLIENT_START=\nDAEMON_PID=%s\nDAEMON_START=1\nIFINDEX=\nWG_SOCK=\nAWG_SOCK=\n' \
+printf 'FORMAT=1\nTOKEN=%s\nNAME=awgp4\nMODE=direct\nUNIT=\nGUARD_PID=%s\nGUARD_START=1\nPHASE=created\nDAEMON_PID=%s\nDAEMON_START=1\nIFINDEX=\nWG_SOCK=\nAWG_SOCK=\n' \
 	"${BOGUS}" "${DECOY_PID}" "${DECOY_PID}" >"${SCRATCH_DIR}/${BOGUS}.guard"
 chmod 0600 "${SCRATCH_DIR}/${BOGUS}".*
 owner direct sweep
 assert_true "a sweep never signals a process that reused a recorded daemon, guardian or owner PID" pid_alive "${DECOY_PID}"
 assert_true "and it removes the dead attempt's records" records_gone "${BOGUS}"
+# S3g: a reused systemd-run client PID. Owner, guardian and client records
+# all name a live process whose start time differs: the sweep neither waits
+# for it nor signals it, and reclaims the attempt.
+reset_state
+mkdir -p "${SCRATCH_DIR}"
+chmod 0700 "${SCRATCH_DIR}"
+BOGUS_UNIT="amneziawg-scratch-awgp4-${BOGUS}"
+printf 'FORMAT=1\nTOKEN=%s\nNAME=awgp4\nMODE=unit\nUNIT=%s\nOWNER_PID=%s\nOWNER_START=1\n' "${BOGUS}" "${BOGUS_UNIT}" "${DECOY_PID}" >"${SCRATCH_DIR}/${BOGUS}.owner"
+printf 'FORMAT=1\nTOKEN=%s\nNAME=awgp4\nMODE=unit\nUNIT=%s\nGUARD_PID=%s\nGUARD_START=1\nPHASE=starting\nDAEMON_PID=\nDAEMON_START=\nIFINDEX=\nWG_SOCK=\nAWG_SOCK=\n' \
+	"${BOGUS}" "${BOGUS_UNIT}" "${DECOY_PID}" >"${SCRATCH_DIR}/${BOGUS}.guard"
+printf 'FORMAT=1\nTOKEN=%s\nCLIENT_PID=%s\nCLIENT_START=%s\n' "${BOGUS}" "${DECOY_PID}" "$((DECOY_START + 1))" >"${SCRATCH_DIR}/${BOGUS}.client"
+chmod 0600 "${SCRATCH_DIR}/${BOGUS}".*
+SECONDS=0
+CLIENT_WAIT=30 owner unit sweep
+assert_true "S3g: a sweep never signals a process that reused a recorded client PID" pid_alive "${DECOY_PID}"
+assert_true "S3g: and does not wait for it as for a live client" test "${SECONDS}" -lt 10
+assert_true "S3g: and removes the dead attempt's records" records_gone "${BOGUS}"
+# The same records naming the live process by its real start time: it is a
+# registered client that may still submit the unit. The sweep keeps every
+# record, never signals it, and bars the unit from starting BoringTun.
+printf 'FORMAT=1\nTOKEN=%s\nNAME=awgp4\nMODE=unit\nUNIT=%s\nOWNER_PID=%s\nOWNER_START=1\n' "${BOGUS}" "${BOGUS_UNIT}" "${DECOY_PID}" >"${SCRATCH_DIR}/${BOGUS}.owner"
+printf 'FORMAT=1\nTOKEN=%s\nNAME=awgp4\nMODE=unit\nUNIT=%s\nGUARD_PID=%s\nGUARD_START=1\nPHASE=starting\nDAEMON_PID=\nDAEMON_START=\nIFINDEX=\nWG_SOCK=\nAWG_SOCK=\n' \
+	"${BOGUS}" "${BOGUS_UNIT}" "${DECOY_PID}" >"${SCRATCH_DIR}/${BOGUS}.guard"
+printf 'FORMAT=1\nTOKEN=%s\nCLIENT_PID=%s\nCLIENT_START=%s\n' "${BOGUS}" "${DECOY_PID}" "${DECOY_START}" >"${SCRATCH_DIR}/${BOGUS}.client"
+chmod 0600 "${SCRATCH_DIR}/${BOGUS}".*
+: >"${S}/log"
+CLIENT_WAIT=1 owner unit sweep
+assert_true "S3g: a sweep keeps the records while a registered client lives" \
+	test -f "${SCRATCH_DIR}/${BOGUS}.owner" -a -f "${SCRATCH_DIR}/${BOGUS}.guard" -a -f "${SCRATCH_DIR}/${BOGUS}.client"
+assert_true "S3g: and marks the attempt as being reclaimed" test -f "${SCRATCH_DIR}/${BOGUS}.reclaim"
+assert_true "S3g: and never signals the client" pid_alive "${DECOY_PID}"
+assert_eq "" "$(grep "^systemctl stop ${BOGUS_UNIT}" "${S}/log")" "S3g: and does not trust a stop of the unit while its client may still submit it"
+rm -f "${SCRATCH_DIR}/${BOGUS}".*
 # A reused guardian PID in the owner's tracking.
 AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"
 awgBackendCreateScratchInterface awgv4 2>/dev/null

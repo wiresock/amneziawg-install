@@ -21,12 +21,19 @@ if [[ "${1:-}" == -j ]]; then
 	shift 2
 fi
 
-declare -a NAMES=() OLDS=() NEWS=()
-# mutant <name> <exact text, present exactly once> <replacement>
+declare -a NAMES=() EDITS=()
+SEP=$'\x1f'
+# mutant <name> <exact text, present exactly once> <replacement> [<text> <replacement>]...
+# Several edits make one mutant; each must apply exactly once.
 mutant() {
+	local EDIT=""
 	NAMES+=("$1")
-	OLDS+=("$2")
-	NEWS+=("$3")
+	shift
+	while (($# >= 2)); do
+		EDIT+="$1${SEP}$2${SEP}"
+		shift 2
+	done
+	EDITS+=("${EDIT}")
 }
 
 T=$'\t'
@@ -72,15 +79,24 @@ mutant s1_replay_after_partial_down \
 # Emergency cleanup and nonterminal state (S9).
 mutant s9_no_emergency_down '"${INTERFACE_NAME}" "${CONFIG_FILE}" any "${_AWG_BT_STATE[IFINDEX]:-${INDEX}}" noflag' \
 	'"${INTERFACE_NAME}" /nonexistent any "${_AWG_BT_STATE[IFINDEX]:-${INDEX}}" noflag'
-mutant s9_emergency_needs_run_dir 'WORK="$(mktemp -d "${AWG_BT_TMP_DIR}/awg-boringtun-down.XXXXXX" 2>/dev/null)" || WORK=""' 'WORK=""'
+mutant s9_emergency_needs_run_dir 'if WORK="$(_awgBtTryDownCopy "${AWG_BT_TMP_DIR}/awg-boringtun-down.XXXXXX" "$1" "$2")"; then' 'if false; then'
+# The old ordering: /tmp only when the runtime directory cannot allocate, so a
+# failed write or chmod there ends the down copy.
+mutant s9_down_copy_no_retry_after_write \
+	$'\tif _awgBtPrepareRunDir && WORK="$(_awgBtTryDownCopy "${AWG_BT_RUN_DIR}/down.XXXXXX" "$1" "$2")"; then' \
+	$'\tif _awgBtPrepareRunDir && WORK="$(mktemp -d "${AWG_BT_RUN_DIR}/down.XXXXXX" 2>/dev/null)"; then\n\t\trm -rf -- "${WORK}"\n\t\tWORK="$(_awgBtTryDownCopy "${AWG_BT_RUN_DIR}/down.XXXXXX" "$1" "$2")" || return 1'
 mutant s9_remove_incomplete_state 'if ((TERMINAL && ! KEEP)); then' 'if ((! KEEP)); then'
+mutant s9_missing_up_is_terminal $'elif ! _awgBtFlagIs "${INTERFACE_NAME}" up; then\n\t\t\t_awgBtErr "awg-quick up of' \
+	$'elif ! _awgBtFlagIs "${INTERFACE_NAME}" up; then\n\t\t\tTERMINAL=1\n\t\t\t_awgBtErr "awg-quick up of'
+mutant s9_socket_unlink_failure_ignored \
+	$'cannot be removed; cleanup is incomplete"\n\t\tKEEP=1' $'cannot be removed; cleanup is incomplete"'
 # Socket ownership (S2).
 mutant s2_remove_replaced_node '[[ "${CURRENT}" == "$2" ]] || return 0' ':'
 mutant s2_remove_while_owner_lives '_awgBtProcessIs "$3" "$4" && return 0' ':'
 mutant s2_record_without_fd_proof 'ss -xlHe 2>/dev/null | awk' 'true || ss -xlHe 2>/dev/null | awk'
 mutant s2_inode_only_identity "stat -c '%d:%i:%f:%.9Z'" "stat -c '%d:%i:%f:0.000000000'"
 # SaveConfig (S5).
-mutant s5_down_keeps_saveconfig '_awgBtWithoutSaveConfig "$2" >"${WORK}/$1.conf"' 'cat -- "$2" >"${WORK}/$1.conf"'
+mutant s5_down_keeps_saveconfig '_awgBtWithoutSaveConfig "$3" >"${WORK}/$2.conf"' 'cat -- "$3" >"${WORK}/$2.conf"'
 mutant s5_quickup_default_config 'if ! INVOCATION_ID="${ATTEMPT}" "${CTL}" precheck "${INTERFACE_NAME}" "${CONFIG_FILE}"; then' 'if ! INVOCATION_ID="${ATTEMPT}" "${CTL}" precheck "${INTERFACE_NAME}"; then'
 # ensureAwgBackendReady (S6).
 mutant s6_no_active_check 'if ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}"; then' 'if false; then'
@@ -95,9 +111,19 @@ mutant s4_zombie_counts_as_alive '[[ -n "${FIELDS[0]:-}" && "${FIELDS[0]}" != [Z
 # Scratch lifecycle (S3) and the sweep.
 mutant s3_no_scratch_collision_check '_awgBtErr "refusing to start scratch interface ${NAME}: the name is already in use"'$'\n'"${T}${T}return 1" ':'
 mutant s3_no_pdeathsig 'exec setpriv --pdeathsig KILL -- "${_AWG_BT_ARGV[@]}"' 'exec "${_AWG_BT_ARGV[@]}"'
-mutant s3_daemon_keeps_ignored_signals $'\t\ttrap - HUP INT TERM\n\t\t_awgBtCloseInheritedFds\n\t\t_awgBtScratchRegisterChild' $'\t\t_awgBtCloseInheritedFds\n\t\t_awgBtScratchRegisterChild'
+mutant s3_daemon_keeps_ignored_signals $'\t\ttrap - HUP INT TERM\n\t\t_awgBtCloseInheritedFds\n\t\t_awgBtScratchRegisterSelf CHILD' $'\t\t_awgBtCloseInheritedFds\n\t\t_awgBtScratchRegisterSelf CHILD'
 mutant s3_child_execs_without_guardian $'\t_awgBtProcessIs "${GUARD_RECORD[GUARD_PID]}" "${GUARD_RECORD[GUARD_START]}"\n}' $'\ttrue\n}'
-mutant s3_child_not_registered $'\t\t_awgBtScratchRegisterChild || exit 1\n' ''
+mutant s3_child_not_registered $'\t\t_awgBtScratchRegisterSelf CHILD || exit 1\n' ''
+# The old ordering: the guardian records the systemd-run client after the
+# fork, so the client can submit the unit before any record names it.
+mutant s3_parent_records_client \
+	$'\t\t\t_awgBtScratchRegisterSelf CLIENT || exit 1\n' '' \
+	'_awgBtScratchAwaitRegistration CLIENT "${CLIENT}" || { wait "${CLIENT}"; return 1; }' \
+	'local -A CLIENT_RECORD=(); local CLIENT_START; if CLIENT_START="$(_awgBtProcessStartTime "${CLIENT}")"; then CLIENT_RECORD=([FORMAT]=1 [TOKEN]="${TOKEN}" [CLIENT_PID]="${CLIENT}" [CLIENT_START]="${CLIENT_START}"); _awgBtScratchSave "${DIR}/${TOKEN}.client" "${_AWG_BT_SCRATCH_CLIENT_KEYS}" CLIENT_RECORD; fi'
+mutant s3_sweep_reclaims_while_client_lives \
+	$'the records are kept"\n\t\t\treturn 1' $'the records are kept"'
+mutant s3_unit_without_gate \
+	"'[[ -e \"\$1\" && ! -e \"\$2\" ]] || exit 0; shift 2; exec \"\$@\"'" "'shift 2; exec \"\$@\"'"
 mutant s3_reclaim_leaves_unit $'\t\tsystemctl stop "${UNIT}.service" >/dev/null 2>&1\n' ''
 mutant s3_sweep_ignores_liveness '((ALIVE)) && continue' ':'
 mutant s3_no_sweep $'\t_awgBtScratchSweep\n\t_awgBtVerifyStore || return 1' $'\t_awgBtVerifyStore || return 1'
@@ -123,18 +149,24 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/boringtun-mutants.XXXXXX")"
 trap 'rm -rf -- "${WORK}"' EXIT
 
 run_one() { # <index>
-	local I="$1" DIR="${WORK}/m$1" OUT RC SUMMARY
+	local I="$1" DIR="${WORK}/m$1" OUT RC SUMMARY P
+	local -a PAIRS=()
 	mkdir -p "${DIR}/tests" "${DIR}/scripts"
 	cp "${PROJECT_ROOT}/tests/test-boringtun-runtime.sh" "${DIR}/tests/"
 	cp "${PROJECT_ROOT}/scripts/boringtun-artifact.sh" "${DIR}/scripts/"
-	if ! OLD="${OLDS[I]}" NEW="${NEWS[I]}" perl -0777 -ne '
-		my $o = $ENV{OLD}; my $n = $ENV{NEW};
-		my $c = () = /\Q$o\E/g;
-		die "matches $c times\n" unless $c == 1;
-		s/\Q$o\E/$n/; print;' "${PROJECT_ROOT}/amneziawg-install.sh" >"${DIR}/amneziawg-install.sh" 2>"${DIR}/apply.err"; then
-		printf '%-38s DID NOT APPLY (%s)\n' "${NAMES[I]}" "$(cat "${DIR}/apply.err")"
-		return
-	fi
+	cp "${PROJECT_ROOT}/amneziawg-install.sh" "${DIR}/amneziawg-install.sh"
+	mapfile -d "${SEP}" -t PAIRS < <(printf '%s' "${EDITS[I]}")
+	for ((P = 0; P + 1 < ${#PAIRS[@]}; P += 2)); do
+		if ! OLD="${PAIRS[P]}" NEW="${PAIRS[P + 1]}" perl -0777 -ne '
+			my $o = $ENV{OLD}; my $n = $ENV{NEW};
+			my $c = () = /\Q$o\E/g;
+			die "edit '"$((P / 2 + 1))"' matches $c times\n" unless $c == 1;
+			s/\Q$o\E/$n/; print;' "${DIR}/amneziawg-install.sh" >"${DIR}/mutated.sh" 2>"${DIR}/apply.err"; then
+			printf '%-38s DID NOT APPLY (%s)\n' "${NAMES[I]}" "$(cat "${DIR}/apply.err")"
+			return
+		fi
+		mv -- "${DIR}/mutated.sh" "${DIR}/amneziawg-install.sh"
+	done
 	OUT="$(cd "${DIR}" && timeout 900 bash tests/test-boringtun-runtime.sh 2>&1)"
 	RC=$?
 	SUMMARY="$(grep 'runtime tests:' <<<"${OUT}" | tail -n 1)"

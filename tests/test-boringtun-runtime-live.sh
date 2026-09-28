@@ -31,9 +31,12 @@ UNIT="awg-quick@${IF}.service"
 IF2="awgbt2"
 PORT2=51898
 FOREIGN="awgbt9"
-# An interface for the emergency cleanup with a read-only runtime directory.
+# An interface for the emergency cleanup with a read-only runtime directory,
+# and one for a runtime directory that cannot store the down copy.
 IF3="awgbt3"
 PORT3=51896
+IF4="awgbt4"
+PORT4=51895
 HOOK_LOG="/run/awgbt-live-hooks.log"
 RULE_COMMENT="awgbt-live-test"
 WORK_DIR=""
@@ -100,7 +103,9 @@ function cleanup() {
 	trap - EXIT
 	local NAME
 	mountpoint -q "${AWG_BT_RUN_DIR}" && umount "${AWG_BT_RUN_DIR}"
-	for NAME in "${IF}" "${IF2}" "${IF3}" "${FOREIGN}"; do
+	mountpoint -q "${AWG_BT_RUN_DIR}" && umount "${AWG_BT_RUN_DIR}"
+	[[ -n "${WORK_DIR}" ]] && mountpoint -q "${WORK_DIR}/run-orig" && umount "${WORK_DIR}/run-orig"
+	for NAME in "${IF}" "${IF2}" "${IF3}" "${IF4}" "${FOREIGN}"; do
 		systemctl stop "awg-quick@${NAME}.service" >/dev/null 2>&1
 		systemctl reset-failed "awg-quick@${NAME}.service" >/dev/null 2>&1
 		ip link delete "${NAME}" >/dev/null 2>&1
@@ -365,6 +370,11 @@ check "its recorded daemon is the unit's main process" \
 check "and runs the verified binary" test "$(readlink "/proc/${SCRATCH_PID}/exe")" = "${_AWG_BT_VERIFIED_BIN}"
 check "its TUN link exists" test -e "/sys/class/net/${SCRATCH_NAME}/tun_flags"
 check "its UAPI answers" awg show "${SCRATCH_NAME}" listen-port
+CLIENT_RECORD="${AWG_BT_RUN_DIR}/scratch/${TOKEN}.client"
+check "its systemd-run client registered itself by PID and start time" \
+	grep -qE '^CLIENT_START=[0-9]+$' "${CLIENT_RECORD}"
+check "the unit runs BoringTun behind the attempt's gate" \
+	grep -q "${AWG_BT_RUN_DIR}/scratch/${TOKEN}.reclaim" <<<"$(systemctl show -p ExecStart --value "${SCRATCH_UNIT}")"
 kill -KILL "${OWNER_PID}"
 wait "${OWNER_PID}" 2>/dev/null
 function scratch_unit_gone() {
@@ -377,10 +387,30 @@ check "that transient unit stops" wait_for 20 scratch_unit_gone
 check "that daemon is gone" wait_for 10 scratch_daemon_gone
 check "that link is gone" wait_for 10 test ! -e "/sys/class/net/${SCRATCH_NAME}"
 check "its sockets are gone" test ! -e "/var/run/wireguard/${SCRATCH_NAME}.sock" -a ! -e "/var/run/amneziawg/${SCRATCH_NAME}.sock"
-check "its records are gone" wait_for 10 test ! -e "${GUARD_RECORD}" -a ! -e "${AWG_BT_RUN_DIR}/scratch/${TOKEN}.owner"
+check "its records are gone" wait_for 10 test ! -e "${GUARD_RECORD}" -a ! -e "${AWG_BT_RUN_DIR}/scratch/${TOKEN}.owner" \
+	-a ! -e "${CLIENT_RECORD}" -a ! -e "${AWG_BT_RUN_DIR}/scratch/${TOKEN}.reclaim"
 check "no scratch unit remains" test -z "$(systemctl list-units --all --plain --no-legend 'amneziawg-scratch-*' 2>/dev/null)"
 check "no scratch link remains" test -z "$(ip -o link show 2>/dev/null | grep -oE ' awg[pv][0-9]+' || true)"
 check "no scratch socket remains" test -z "$(find /var/run/wireguard /var/run/amneziawg -name 'awg[pv]*' 2>/dev/null)"
+
+echo "=== A scratch unit that systemd creates after its attempt is being reclaimed"
+# The unit a delayed systemd-run client submits once a reclaim has begun: real
+# systemd starts it, and its gate ends it before BoringTun runs.
+LATE_NAME="awgp9003"
+LATE_TOKEN="$(_awgBtNewToken)"
+LATE_UNIT="amneziawg-scratch-${LATE_NAME}-${LATE_TOKEN}.service"
+_awgBtPrepareScratchDir
+printf 'FORMAT=1\nTOKEN=%s\nNAME=%s\nMODE=unit\nUNIT=%s\nOWNER_PID=1\nOWNER_START=0\n' \
+	"${LATE_TOKEN}" "${LATE_NAME}" "${LATE_UNIT%.service}" >"${AWG_BT_RUN_DIR}/scratch/${LATE_TOKEN}.owner"
+: >"${AWG_BT_RUN_DIR}/scratch/${LATE_TOKEN}.reclaim"
+chmod 0600 "${AWG_BT_RUN_DIR}/scratch/${LATE_TOKEN}".*
+_awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${LATE_NAME}" && _awgBtScratchUnitArgv "${LATE_TOKEN}"
+systemd-run --quiet --collect --unit="${LATE_UNIT%.service}" -p Type=exec -p RuntimeMaxSec=60 -- "${_AWG_BT_UNIT_ARGV[@]}" </dev/null >/dev/null 2>&1
+check "systemd accepts the late unit" test "$?" -eq 0
+check "which ends at once and is collected" wait_for 10 test "$(systemctl show -p LoadState --value "${LATE_UNIT}")" = not-found
+check "without creating the scratch link" test ! -e "/sys/class/net/${LATE_NAME}"
+check "or its sockets" test ! -e "/var/run/wireguard/${LATE_NAME}.sock" -a ! -e "/var/run/amneziawg/${LATE_NAME}.sock"
+rm -f "${AWG_BT_RUN_DIR}/scratch/${LATE_TOKEN}".*
 
 echo "=== A failed start leaves an interface that existed before it alone"
 ip tuntap add dev "${FOREIGN}" mode tun
@@ -434,10 +464,58 @@ check "and brings ${IF3} down itself" wait_for 10 test ! -e "/sys/class/net/${IF
 check "with PostDown run exactly once" test "$(grep -c "^down-${IF3}$" "${HOOK_LOG}")" -eq 1
 check "from a private copy outside the runtime directory, which is removed" test -z "$(find /tmp -maxdepth 1 -name 'awg-boringtun-down.*')"
 umount "${AWG_BT_RUN_DIR}"
-INVOCATION_ID="${EMERGENCY_ATTEMPT}" "${CTL}" poststop "${IF3}" 2>/dev/null
+INVOCATION_ID="${EMERGENCY_ATTEMPT}" "${CTL}" poststop "${IF3}" 2>"${WORK_DIR}/emergency-poststop.err"
 check "the following poststop runs PostDown no second time" test "$(grep -c "^down-${IF3}$" "${HOOK_LOG}")" -eq 1
-check "and removes the finished attempt" test -z "$(find "${AWG_BT_RUN_DIR}" -maxdepth 1 -name "${IF3}@*")"
+# Neither up nor done could be recorded on the read-only directory: no
+# positive terminal fact exists, so the attempt is kept, not guessed finished.
+check "and keeps the attempt, of which nothing terminal could be recorded" \
+	test -f "${AWG_BT_RUN_DIR}/${IF3}@${EMERGENCY_ATTEMPT}.state"
+check "saying that PostUp may have run" grep -q "PostUp may have run" "${WORK_DIR}/emergency-poststop.err"
+rm -f "${AWG_BT_RUN_DIR}/${IF3}@${EMERGENCY_ATTEMPT}".*
 cat "${WORK_DIR}/emergency.err"
+
+echo "=== Emergency cleanup when the runtime directory cannot store the down copy"
+# The runtime directory is a one-page tmpfs holding only the attempt's state:
+# the down copy's directory can be made there, but writing the copy fails with
+# ENOSPC. The up flag cannot be raised either. The whole copy is made again in
+# /tmp.
+{
+	sed -n '/^\[Interface\]/,/^\[Peer\]/{/^\[Peer\]/!p}' "${AWG_BT_CONFIG_DIR}/${IF}.conf" |
+		sed -e "s/^ListenPort = .*/ListenPort = ${PORT4}/" -e 's/^Address = .*/Address = 10.96.0.1\/24/' -e '/^PostUp\|^PostDown/d'
+	printf 'PostUp = echo up-%%i >>%s\n' "${HOOK_LOG}"
+	printf 'PostDown = echo down-%%i >>%s; ls -d /tmp/awg-boringtun-down.*/%%i.conf >>%s; ls -d %s/down.* >>%s 2>/dev/null || true\n' \
+		"${HOOK_LOG}" "${HOOK_LOG}" "${AWG_BT_RUN_DIR}" "${HOOK_LOG}"
+} >"${AWG_BT_CONFIG_DIR}/${IF4}.conf"
+chmod 0600 "${AWG_BT_CONFIG_DIR}/${IF4}.conf"
+_awgBtInstallServiceFiles "${IF4}" >/dev/null
+FULL_ATTEMPT="$(_awgBtNewToken)"
+INVOCATION_ID="${FULL_ATTEMPT}" "${CTL}" precheck "${IF4}" "${AWG_BT_CONFIG_DIR}/${IF4}.conf" &&
+	INVOCATION_ID="${FULL_ATTEMPT}" WG_QUICK_USERSPACE_IMPLEMENTATION="${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" \
+		awg-quick up "${AWG_BT_CONFIG_DIR}/${IF4}.conf" >/dev/null 2>&1
+check "${IF4} is up with the launcher" test -e "/sys/class/net/${IF4}/tun_flags"
+mkdir -p "${WORK_DIR}/run-orig"
+mount --bind "${AWG_BT_RUN_DIR}" "${WORK_DIR}/run-orig"
+mount -t tmpfs -o size=4k,mode=0700,uid=0,gid=0 awgbt-full "${AWG_BT_RUN_DIR}"
+cp -a "${WORK_DIR}/run-orig/${IF4}@${FULL_ATTEMPT}".* "${AWG_BT_RUN_DIR}/"
+rm -f "${AWG_BT_RUN_DIR}/${IF4}@${FULL_ATTEMPT}.up-pending"
+check "(the runtime directory can make a directory but not store a file in it)" \
+	bash -c 'mkdir "$1/probe" && ! { echo x >"$1/probe/f"; } 2>/dev/null; RC=$?; rm -rf "$1/probe"; exit "${RC}"' _ "${AWG_BT_RUN_DIR}"
+INVOCATION_ID="${FULL_ATTEMPT}" "${CTL}" poststart "${IF4}" "${AWG_BT_CONFIG_DIR}/${IF4}.conf" 2>"${WORK_DIR}/full.err"
+check "poststart fails when it cannot record that ${IF4} is up" test "$?" -ne 0
+check "and brings ${IF4} down itself" wait_for 10 test ! -e "/sys/class/net/${IF4}"
+check "with PostDown run exactly once" test "$(grep -c "^down-${IF4}$" "${HOOK_LOG}")" -eq 1
+check "from a complete copy made again in /tmp after the failed write" grep -q "^/tmp/awg-boringtun-down\..*/${IF4}.conf$" "${HOOK_LOG}"
+check "while the failed copy's directory was already removed" test "$(grep -c "^${AWG_BT_RUN_DIR}/down\." "${HOOK_LOG}")" -eq 0
+check "and the /tmp copy is removed too" test -z "$(find /tmp -maxdepth 1 -name 'awg-boringtun-down.*')"
+# What the attempt recorded goes back to the real runtime directory.
+rm -f "${WORK_DIR}/run-orig/${IF4}@${FULL_ATTEMPT}".*
+cp -a "${AWG_BT_RUN_DIR}/${IF4}@${FULL_ATTEMPT}".* "${WORK_DIR}/run-orig/"
+umount "${AWG_BT_RUN_DIR}"
+umount "${WORK_DIR}/run-orig"
+INVOCATION_ID="${FULL_ATTEMPT}" "${CTL}" poststop "${IF4}" 2>/dev/null
+check "the following poststop runs PostDown no second time" test "$(grep -c "^down-${IF4}$" "${HOOK_LOG}")" -eq 1
+check "and removes the finished attempt" test -z "$(find "${AWG_BT_RUN_DIR}" -maxdepth 1 -name "${IF4}@*")"
+cat "${WORK_DIR}/full.err"
 
 echo "=== A direct scratch instance records its own identity before it is ready"
 (
