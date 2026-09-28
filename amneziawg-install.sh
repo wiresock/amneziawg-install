@@ -4083,6 +4083,8 @@ _AWG_BT_HELPER_VARIABLES="AWG_BT_STORE_DIR AWG_BT_LIBEXEC_DIR AWG_BT_RUN_DIR AWG
 _AWG_BT_VERIFIED_BIN=""
 _AWG_BT_FILE_CHANGED=0
 _AWG_BT_ARGV=()
+# The command line of a transient scratch unit (_awgBtScratchUnitArgv).
+_AWG_BT_UNIT_ARGV=()
 # The start attempt a helper works for (_awgBtCurrentAttempt), its ownership
 # state (_awgBtStateLoad), and the UAPI nodes last proven to be a daemon's
 # (_awgBtProveUapiNodes).
@@ -5795,8 +5797,12 @@ function _awgBtQuickUp() {
 # runs. Nothing is ever matched by interface name alone.
 
 _AWG_BT_SCRATCH_OWNER_KEYS="FORMAT TOKEN NAME MODE UNIT OWNER_PID OWNER_START"
-_AWG_BT_SCRATCH_GUARD_KEYS="FORMAT TOKEN NAME MODE UNIT GUARD_PID GUARD_START PHASE CLIENT_PID CLIENT_START DAEMON_PID DAEMON_START IFINDEX WG_SOCK AWG_SOCK"
+_AWG_BT_SCRATCH_GUARD_KEYS="FORMAT TOKEN NAME MODE UNIT GUARD_PID GUARD_START PHASE DAEMON_PID DAEMON_START IFINDEX WG_SOCK AWG_SOCK"
 _AWG_BT_SCRATCH_CHILD_KEYS="FORMAT TOKEN CHILD_PID CHILD_START"
+_AWG_BT_SCRATCH_CLIENT_KEYS="FORMAT TOKEN CLIENT_PID CLIENT_START"
+# How long a reclaim waits for a registered systemd-run client to exit before
+# it keeps the attempt's records for a later sweep.
+_AWG_BT_SCRATCH_CLIENT_WAIT=35
 # The hard lifetime of a transient scratch unit in seconds, which bounds what an
 # instance can cost when every other cleanup fails.
 _AWG_BT_SCRATCH_MAX_SECONDS=900
@@ -5824,11 +5830,11 @@ function _awgBtScratchValueValid() { # <key> <value>
 		NAME) [[ "$2" =~ ^[a-zA-Z0-9_-]{1,15}$ ]] ;;
 		MODE) [[ "$2" == unit || "$2" == direct ]] ;;
 		UNIT) [[ "$2" =~ ^(amneziawg-scratch-[a-zA-Z0-9_-]{1,15}-[0-9a-f]{32})?$ ]] ;;
-		OWNER_PID | GUARD_PID | CHILD_PID) [[ "$2" =~ ^[1-9][0-9]{0,9}$ ]] ;;
-		OWNER_START | GUARD_START | CHILD_START) [[ "$2" =~ ^[0-9]{1,20}$ ]] ;;
+		OWNER_PID | GUARD_PID | CHILD_PID | CLIENT_PID) [[ "$2" =~ ^[1-9][0-9]{0,9}$ ]] ;;
+		OWNER_START | GUARD_START | CHILD_START | CLIENT_START) [[ "$2" =~ ^[0-9]{1,20}$ ]] ;;
 		PHASE) [[ "$2" =~ ^(starting|created|teardown)$ ]] ;;
-		CLIENT_PID | DAEMON_PID | IFINDEX) [[ "$2" =~ ^([1-9][0-9]{0,9})?$ ]] ;;
-		CLIENT_START | DAEMON_START) [[ "$2" =~ ^([0-9]{1,20})?$ ]] ;;
+		DAEMON_PID | IFINDEX) [[ "$2" =~ ^([1-9][0-9]{0,9})?$ ]] ;;
+		DAEMON_START) [[ "$2" =~ ^([0-9]{1,20})?$ ]] ;;
 		WG_SOCK | AWG_SOCK) [[ "$2" =~ ^([0-9]+:[0-9]+:[0-9a-f]+:[0-9]+\.[0-9]{9})?$ ]] ;;
 		*) return 1 ;;
 	esac
@@ -5899,7 +5905,7 @@ function _awgBtScratchGuardian() { # <token>
 	GUARD_START="$(_awgBtProcessStartTime "${SELF}")" || exit 1
 	GUARD_RECORD=([FORMAT]=1 [TOKEN]="${TOKEN}" [NAME]="${OWNER_RECORD[NAME]}" [MODE]="${OWNER_RECORD[MODE]}"
 		[UNIT]="${OWNER_RECORD[UNIT]}" [GUARD_PID]="${SELF}" [GUARD_START]="${GUARD_START}" [PHASE]=starting
-		[CLIENT_PID]="" [CLIENT_START]="" [DAEMON_PID]="" [DAEMON_START]="" [IFINDEX]="" [WG_SOCK]="" [AWG_SOCK]="")
+		[DAEMON_PID]="" [DAEMON_START]="" [IFINDEX]="" [WG_SOCK]="" [AWG_SOCK]="")
 	_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD || exit 1
 	if _awgBtScratchOwnerWants && _awgBtScratchStart && _awgBtScratchAwaitReady; then
 		while _awgBtScratchOwnerWants; do
@@ -5923,61 +5929,92 @@ function _awgBtScratchOwnerWants() {
 }
 
 function _awgBtScratchStart() {
-	local CLIENT DAEMON START="" I LIMIT
-	local -A CHILD_RECORD=()
+	local CLIENT DAEMON
 	if [[ "${GUARD_RECORD[MODE]}" == unit ]]; then
-		systemd-run --quiet --collect --unit="${GUARD_RECORD[UNIT]}" -p Type=exec \
-			-p RuntimeMaxSec="${_AWG_BT_SCRATCH_MAX_SECONDS}" -- "${_AWG_BT_ARGV[@]}" </dev/null >/dev/null 2>&1 &
+		# The systemd-run client registers itself (<token>.client) before it
+		# can submit anything, and submits only while this guardian lives:
+		# no process that could create the unit is ever unrecorded. The
+		# unit's own command refuses to start BoringTun once the attempt is
+		# being reclaimed or its records are gone (_awgBtScratchUnitArgv).
+		(
+			trap - HUP INT TERM
+			_awgBtCloseInheritedFds
+			_awgBtScratchRegisterSelf CLIENT || exit 1
+			exec systemd-run --quiet --collect --unit="${GUARD_RECORD[UNIT]}" -p Type=exec \
+				-p RuntimeMaxSec="${_AWG_BT_SCRATCH_MAX_SECONDS}" -- "${_AWG_BT_UNIT_ARGV[@]}" </dev/null >/dev/null 2>&1
+		) &
 		CLIENT=$!
-		START="$(_awgBtProcessStartTime "${CLIENT}")" || START=""
-		GUARD_RECORD[CLIENT_PID]="${CLIENT}"
-		GUARD_RECORD[CLIENT_START]="${START}"
-		_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
 		# Wait for systemd-run whatever the owner does meanwhile: a unit it
 		# still creates must be torn down, not left behind. Whether it
 		# reported success does not matter; readiness decides.
+		_awgBtScratchAwaitRegistration CLIENT "${CLIENT}" || { wait "${CLIENT}"; return 1; }
 		wait "${CLIENT}"
-		GUARD_RECORD[CLIENT_PID]=""
-		GUARD_RECORD[CLIENT_START]=""
-		_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
 		return 0
 	fi
-	# The child registers itself before it becomes BoringTun: it writes its own
-	# PID and start time to <token>.child, then execs the daemon only while
-	# this guardian still lives. A daemon therefore never runs without a
-	# durable record, whenever the guardian dies; the parent-death signal is
-	# only a second line.
+	# Likewise the direct child registers itself (<token>.child) before it
+	# becomes BoringTun, and only while this guardian lives. A daemon therefore
+	# never runs without a durable record, whenever the guardian dies; the
+	# parent-death signal is only a second line.
 	(
 		trap - HUP INT TERM
 		_awgBtCloseInheritedFds
-		_awgBtScratchRegisterChild || exit 1
+		_awgBtScratchRegisterSelf CHILD || exit 1
 		exec setpriv --pdeathsig KILL -- "${_AWG_BT_ARGV[@]}" </dev/null >/dev/null 2>&1
 	) &
 	DAEMON=$!
+	_awgBtScratchAwaitRegistration CHILD "${DAEMON}" || return 1
+	GUARD_RECORD[DAEMON_PID]="${DAEMON}"
+	GUARD_RECORD[DAEMON_START]="${_AWG_BT_REGISTERED_START}"
+	_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
+	return 0
+}
+
+# Wait until the forked process has durably registered itself as CHILD or
+# CLIENT (<token>.child or .client naming its PID), or is gone. Sets
+# _AWG_BT_REGISTERED_START.
+function _awgBtScratchAwaitRegistration() { # <CHILD|CLIENT> <pid>
+	local I LIMIT FILE KEYS
+	local -A REGISTERED_RECORD=()
+	FILE="${DIR}/${TOKEN}.${1,,}"
+	KEYS="_AWG_BT_SCRATCH_$1_KEYS"
+	KEYS="${!KEYS}"
+	_AWG_BT_REGISTERED_START=""
 	LIMIT=$((AWG_BT_READY_TIMEOUT * 20))
 	for ((I = 0; I < LIMIT; I++)); do
-		if _awgBtScratchLoad "${DIR}/${TOKEN}.child" "${_AWG_BT_SCRATCH_CHILD_KEYS}" CHILD_RECORD &&
-			[[ "${CHILD_RECORD[CHILD_PID]}" == "${DAEMON}" ]]; then
-			GUARD_RECORD[DAEMON_PID]="${DAEMON}"
-			GUARD_RECORD[DAEMON_START]="${CHILD_RECORD[CHILD_START]}"
-			_awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
+		if _awgBtScratchLoad "${FILE}" "${KEYS}" REGISTERED_RECORD && [[ "${REGISTERED_RECORD[$1_PID]}" == "$2" ]]; then
+			_AWG_BT_REGISTERED_START="${REGISTERED_RECORD[$1_START]}"
 			return 0
 		fi
-		[[ -d "${AWG_BT_PROC_DIR}/${DAEMON}" ]] || return 1
+		[[ -d "${AWG_BT_PROC_DIR}/$2" ]] || return 1
 		sleep 0.05
 	done
 	return 1
 }
 
-# In the direct child, before it execs BoringTun: record the child's own
-# identity durably, then go on only for a guardian that still lives.
-function _awgBtScratchRegisterChild() {
-	local START SELF="${BASHPID}"
-	local -A CHILD_RECORD=()
+# In the forked child or systemd-run client, before it execs: record its own
+# identity durably as <token>.child or .client, then go on only for a
+# guardian that still lives.
+function _awgBtScratchRegisterSelf() { # <CHILD|CLIENT>
+	local START SELF="${BASHPID}" KEYS="_AWG_BT_SCRATCH_$1_KEYS"
+	local -A SELF_RECORD=()
 	START="$(_awgBtProcessStartTime "${SELF}")" || return 1
-	CHILD_RECORD=([FORMAT]=1 [TOKEN]="${TOKEN}" [CHILD_PID]="${SELF}" [CHILD_START]="${START}")
-	_awgBtScratchSave "${DIR}/${TOKEN}.child" "${_AWG_BT_SCRATCH_CHILD_KEYS}" CHILD_RECORD || return 1
+	# shellcheck disable=SC2034 # read by _awgBtScratchSave through its name
+	SELF_RECORD=([FORMAT]=1 [TOKEN]="${TOKEN}" ["$1_PID"]="${SELF}" ["$1_START"]="${START}")
+	_awgBtScratchSave "${DIR}/${TOKEN}.${1,,}" "${!KEYS}" SELF_RECORD || return 1
 	_awgBtProcessIs "${GUARD_RECORD[GUARD_PID]}" "${GUARD_RECORD[GUARD_START]}"
+}
+
+# The command line of a transient scratch unit: the production command line,
+# behind a check that the attempt's owner record still exists and no reclaim
+# has begun. A unit that systemd creates late, after its attempt was
+# reclaimed, therefore exits at once instead of running BoringTun.
+function _awgBtScratchUnitArgv() { # <token>
+	local BASH_BIN DIR
+	BASH_BIN="$(command -v bash)" || return 1
+	DIR="$(_awgBtScratchDir)"
+	# shellcheck disable=SC2016 # expanded by the unit's bash, not here
+	_AWG_BT_UNIT_ARGV=("${BASH_BIN}" -c '[[ -e "$1" && ! -e "$2" ]] || exit 0; shift 2; exec "$@"' awg-scratch-unit
+		"${DIR}/$1.owner" "${DIR}/$1.reclaim" "${_AWG_BT_ARGV[@]}")
 }
 
 # Wait until the daemon serves the name, recording what it provably owns,
@@ -6031,25 +6068,30 @@ function _awgBtScratchRecordSockets() {
 	((CHANGED == 0)) || _awgBtScratchSave "${GUARD_FILE}" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD
 }
 
-# Remove what remains of one attempt, as its records say: the TUN link only
+# Remove what remains of one attempt, as its records say. Under systemd it
+# first marks the attempt as being reclaimed (<token>.reclaim), which the
+# unit's own command checks, then waits for a registered systemd-run client
+# that still lives: while it lives it may still create the unit, so the
+# records are kept (it is never signalled). Then it removes the TUN link only
 # while it has the recorded ifindex, the transient unit by its attempt-unique
 # name, the daemon (from the guardian's record or the direct child's own) only
 # while it is the recorded process, and socket nodes only while they are the
-# recorded nodes, proven the daemon's, and their daemon is gone. A
-# systemd-run client that still runs may yet create the unit, so it is waited
-# for first. The records are removed only when nothing of the attempt is left,
-# so an interrupted or incomplete reclaim is retried later.
+# recorded nodes, proven the daemon's, and their daemon is gone. The records
+# are removed only when nothing of the attempt is left, so an interrupted or
+# incomplete reclaim is retried later.
 function _awgBtScratchReclaim() { # <token>
 	local TOKEN="$1" DIR NAME MODE UNIT WG_NODE AWG_NODE STATE="" MAIN="" START="" I LEFT=0
-	local HAVE_OWNER=0 HAVE_GUARD=0 HAVE_CHILD=0
-	local -A OWNER_RECORD=() GUARD_RECORD=() CHILD_RECORD=()
+	local HAVE_OWNER=0 HAVE_GUARD=0 HAVE_CHILD=0 HAVE_CLIENT=0
+	local -A OWNER_RECORD=() GUARD_RECORD=() CHILD_RECORD=() CLIENT_RECORD=()
 	DIR="$(_awgBtScratchDir)"
 	_awgBtScratchLoad "${DIR}/${TOKEN}.owner" "${_AWG_BT_SCRATCH_OWNER_KEYS}" OWNER_RECORD && HAVE_OWNER=1
 	_awgBtScratchLoad "${DIR}/${TOKEN}.guard" "${_AWG_BT_SCRATCH_GUARD_KEYS}" GUARD_RECORD && HAVE_GUARD=1
 	_awgBtScratchLoad "${DIR}/${TOKEN}.child" "${_AWG_BT_SCRATCH_CHILD_KEYS}" CHILD_RECORD && HAVE_CHILD=1
+	_awgBtScratchLoad "${DIR}/${TOKEN}.client" "${_AWG_BT_SCRATCH_CLIENT_KEYS}" CLIENT_RECORD && HAVE_CLIENT=1
 	if { ((HAVE_OWNER == 0)) && [[ -e "${DIR}/${TOKEN}.owner" || -L "${DIR}/${TOKEN}.owner" ]]; } ||
 		{ ((HAVE_GUARD == 0)) && [[ -e "${DIR}/${TOKEN}.guard" || -L "${DIR}/${TOKEN}.guard" ]]; } ||
-		{ ((HAVE_CHILD == 0)) && [[ -e "${DIR}/${TOKEN}.child" || -L "${DIR}/${TOKEN}.child" ]]; }; then
+		{ ((HAVE_CHILD == 0)) && [[ -e "${DIR}/${TOKEN}.child" || -L "${DIR}/${TOKEN}.child" ]]; } ||
+		{ ((HAVE_CLIENT == 0)) && [[ -e "${DIR}/${TOKEN}.client" || -L "${DIR}/${TOKEN}.client" ]]; }; then
 		_awgBtErr "the records of scratch attempt ${TOKEN} are unreadable; they and anything they describe are left alone"
 		return 1
 	fi
@@ -6057,11 +6099,24 @@ function _awgBtScratchReclaim() { # <token>
 		_awgBtErr "the records of scratch attempt ${TOKEN} are inconsistent; they and anything they describe are left alone"
 		return 1
 	fi
+	# A live registered systemd-run client may still create the unit: wait for
+	# it, and keep everything while it lives.
+	if ((HAVE_CLIENT)); then
+		[[ -e "${DIR}/${TOKEN}.reclaim" ]] || _awgBtWriteState "${DIR}/${TOKEN}.reclaim" "" || LEFT=1
+		for ((I = 0; I < _AWG_BT_SCRATCH_CLIENT_WAIT * 10; I++)); do
+			_awgBtProcessIs "${CLIENT_RECORD[CLIENT_PID]}" "${CLIENT_RECORD[CLIENT_START]}" || break
+			sleep 0.1
+		done
+		if _awgBtProcessIs "${CLIENT_RECORD[CLIENT_PID]}" "${CLIENT_RECORD[CLIENT_START]}"; then
+			_awgBtErr "the systemd-run client of scratch attempt ${TOKEN} still runs and may still create its unit; the records are kept"
+			return 1
+		fi
+	fi
 	if ((HAVE_OWNER == 0 && HAVE_GUARD == 0)); then
 		if ((HAVE_CHILD)) && _awgBtProcessIs "${CHILD_RECORD[CHILD_PID]}" "${CHILD_RECORD[CHILD_START]}"; then
 			_awgBtStopProcess "${CHILD_RECORD[CHILD_PID]}" "${CHILD_RECORD[CHILD_START]}" || return 1
 		fi
-		rm -f -- "${DIR}/${TOKEN}.child" "${DIR}/${TOKEN}.stop"
+		rm -f -- "${DIR}/${TOKEN}.child" "${DIR}/${TOKEN}.client" "${DIR}/${TOKEN}.stop" "${DIR}/${TOKEN}.reclaim"
 		return 0
 	fi
 	if ((HAVE_GUARD)); then
@@ -6072,7 +6127,10 @@ function _awgBtScratchReclaim() { # <token>
 		NAME="${OWNER_RECORD[NAME]}"
 		MODE="${OWNER_RECORD[MODE]}"
 		UNIT="${OWNER_RECORD[UNIT]}"
-		GUARD_RECORD=([CLIENT_PID]="" [CLIENT_START]="" [DAEMON_PID]="" [DAEMON_START]="" [IFINDEX]="" [WG_SOCK]="" [AWG_SOCK]="")
+		GUARD_RECORD=([DAEMON_PID]="" [DAEMON_START]="" [IFINDEX]="" [WG_SOCK]="" [AWG_SOCK]="")
+	fi
+	if [[ "${MODE}" == unit && ! -e "${DIR}/${TOKEN}.reclaim" ]]; then
+		_awgBtWriteState "${DIR}/${TOKEN}.reclaim" "" || LEFT=1
 	fi
 	if [[ -z "${GUARD_RECORD[DAEMON_PID]}" ]] && ((HAVE_CHILD)); then
 		GUARD_RECORD[DAEMON_PID]="${CHILD_RECORD[CHILD_PID]}"
@@ -6080,13 +6138,6 @@ function _awgBtScratchReclaim() { # <token>
 	fi
 	WG_NODE="${AWG_BT_WG_SOCKET_DIR}/${NAME}.sock"
 	AWG_NODE="${AWG_BT_AWG_SOCKET_DIR}/${NAME}.sock"
-	if [[ -n "${GUARD_RECORD[CLIENT_PID]}" ]]; then
-		for ((I = 0; I < 300; I++)); do
-			_awgBtProcessIs "${GUARD_RECORD[CLIENT_PID]}" "${GUARD_RECORD[CLIENT_START]}" || break
-			sleep 0.1
-		done
-		_awgBtProcessIs "${GUARD_RECORD[CLIENT_PID]}" "${GUARD_RECORD[CLIENT_START]}" && LEFT=1
-	fi
 	# A daemon that was never recorded is the main process of the attempt's
 	# own unit. Socket nodes it holds but that were not recorded yet are
 	# recorded now, while it provably still runs and holds them.
@@ -6129,7 +6180,8 @@ function _awgBtScratchReclaim() { # <token>
 		_awgBtErr "scratch interface ${NAME} is not completely removed yet; its records are kept for a later sweep"
 		return 1
 	fi
-	rm -f -- "${DIR}/${TOKEN}.owner" "${DIR}/${TOKEN}.guard" "${DIR}/${TOKEN}.child" "${DIR}/${TOKEN}.stop"
+	rm -f -- "${DIR}/${TOKEN}.owner" "${DIR}/${TOKEN}.guard" "${DIR}/${TOKEN}.child" "${DIR}/${TOKEN}.client" \
+		"${DIR}/${TOKEN}.stop" "${DIR}/${TOKEN}.reclaim"
 }
 
 # Reclaim every attempt whose owner and guardian are both gone: the owner was
@@ -6142,7 +6194,7 @@ function _awgBtScratchSweep() {
 	DIR="$(_awgBtScratchDir)"
 	[[ -d "${DIR}" && ! -L "${DIR}" ]] || return 0
 	for FILE in "${DIR}"/*; do
-		[[ "${FILE##*/}" =~ ^([0-9a-f]{32})\.(owner|guard|child|stop)$ ]] || continue
+		[[ "${FILE##*/}" =~ ^([0-9a-f]{32})\.(owner|guard|child|client|stop|reclaim)$ ]] || continue
 		TOKEN="${BASH_REMATCH[1]}"
 		[[ -z "${SWEPT[${TOKEN}]+set}" ]] || continue
 		SWEPT["${TOKEN}"]=1
@@ -6200,6 +6252,7 @@ function _awgBtScratchCreate() {
 	if [[ -d "${AWG_BT_SYSTEMD_RUNTIME_DIR}" ]] && command -v systemd-run >/dev/null 2>&1; then
 		MODE=unit
 		UNIT="amneziawg-scratch-${NAME}-${TOKEN}"
+		_awgBtScratchUnitArgv "${TOKEN}" || return 1
 		if [[ "$(systemctl show -p LoadState --value "${UNIT}.service" 2>/dev/null)" != not-found ]]; then
 			_awgBtErr "refusing to start scratch interface ${NAME}: the unit ${UNIT} already exists"
 			return 1
