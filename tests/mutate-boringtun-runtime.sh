@@ -120,6 +120,16 @@ mutant s3_parent_records_client \
 	$'\t\t\t_awgBtScratchRegisterSelf CLIENT || exit 1\n' '' \
 	'_awgBtScratchAwaitRegistration CLIENT "${CLIENT}" || { wait "${CLIENT}"; return 1; }' \
 	'local -A CLIENT_RECORD=(); local CLIENT_START; if CLIENT_START="$(_awgBtProcessStartTime "${CLIENT}")"; then CLIENT_RECORD=([FORMAT]=1 [TOKEN]="${TOKEN}" [CLIENT_PID]="${CLIENT}" [CLIENT_START]="${CLIENT_START}"); _awgBtScratchSave "${DIR}/${TOKEN}.client" "${_AWG_BT_SCRATCH_CLIENT_KEYS}" CLIENT_RECORD; fi'
+# Either side of the reclaim handshake alone: the client ignores the mark, or
+# the reclaim reads the records before it marks the attempt. Not a mutant:
+# marking between the record loads and their existence check, because a
+# record that appears after its load then fails that check as unreadable and
+# the reclaim keeps everything.
+mutant s3_client_ignores_reclaim_mark $'\t[[ ! -e "${DIR}/${TOKEN}.reclaim" ]] || return 1\n' ''
+mutant s3_reclaim_marks_after_reading \
+	$'\tif [[ ! -e "${DIR}/${TOKEN}.reclaim" ]] && ! _awgBtWriteState "${DIR}/${TOKEN}.reclaim" ""; then\n\t\t_awgBtErr "cannot mark scratch attempt ${TOKEN} as being reclaimed; its records are kept"\n\t\tLEFT=1\n\tfi\n' '' \
+	$'\t# A live registered systemd-run client may still create the unit: wait for\n' \
+	$'\tif [[ ! -e "${DIR}/${TOKEN}.reclaim" ]] && ! _awgBtWriteState "${DIR}/${TOKEN}.reclaim" ""; then\n\t\tLEFT=1\n\tfi\n\t# A live registered systemd-run client may still create the unit: wait for\n'
 mutant s3_sweep_reclaims_while_client_lives \
 	$'the records are kept"\n\t\t\treturn 1' $'the records are kept"'
 mutant s3_unit_without_gate \

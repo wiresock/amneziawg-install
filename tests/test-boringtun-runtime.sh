@@ -492,12 +492,15 @@ if [[ -f "${S}/mktemp-obstruct" && "$*" == *"$(cat "${S}/mktemp-obstruct")"* ]];
 	printf '%s\n' "${DIR}"
 	exit 0
 fi
-# $S/mktemp-hold: once, block a matching call until $S/mktemp-release exists.
-if [[ -f "${S}/mktemp-hold" && "$*" == *"$(cat "${S}/mktemp-hold")"* ]]; then
-	rm -f "${S}/mktemp-hold"
-	echo "$$" >"${S}/mktemp-waiting"
-	while [[ ! -f "${S}/mktemp-release" ]]; do sleep 0.02; done
-fi
+# $S/mktemp-hold: once, block a matching call until $S/mktemp-release exists;
+# $S/mktemp-hold-b, -waiting-b and -release-b are a second, independent slot.
+for SLOT in "" -b; do
+	if [[ -f "${S}/mktemp-hold${SLOT}" && "$*" == *"$(cat "${S}/mktemp-hold${SLOT}")"* ]]; then
+		rm -f "${S}/mktemp-hold${SLOT}"
+		echo "$$" >"${S}/mktemp-waiting${SLOT}"
+		while [[ ! -f "${S}/mktemp-release${SLOT}" ]]; do sleep 0.02; done
+	fi
+done
 exec "${REAL}" "$@"
 EOF
 # mv, rm and chmod fail when their arguments contain the text in
@@ -2284,6 +2287,7 @@ cat >"${T}/owner.sh" <<'EOF'
 #!/bin/bash
 # owner.sh <installer> <settings> unit|direct create <name> <token file> [hold]
 # owner.sh <installer> <settings> unit|direct sweep
+# owner.sh <installer> <settings> unit|direct reclaim <token>
 source "$1"
 source "$2"
 if [[ "$3" == unit ]]; then AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_PRESENT}"; else AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"; fi
@@ -2299,6 +2303,9 @@ case "$4" in
 		;;
 	sweep)
 		_awgBtScratchSweep
+		;;
+	reclaim)
+		_awgBtScratchReclaim "$5"
 		;;
 esac
 EOF
@@ -2544,6 +2551,54 @@ assert_rc 0 "$?" "S3f: and the creation then succeeds"
 TOKEN="$(cat "${T}/token")"
 assert_true "S3f: and its owner's exit still tears it down" wait_until 10 scratch_gone awgp7 "${TOKEN}"
 rm -f "${S}"/mktemp-*
+# S3h: a reclaim marks the attempt before it reads any record, and the client
+# reads the mark after recording itself. A client that registers after a
+# reclaim began sees the mark and submits nothing.
+reset_state
+rm -f "${T}/token"
+echo ".client." >"${S}/mktemp-hold"
+"${OWNER_CMD[@]}" unit create awgp7 "${T}/token" &
+OWNER_PID=$!
+wait_until 5 test -e "${S}/mktemp-waiting"
+TOKEN="$(basename "$(ls "${SCRATCH_DIR}"/*.owner)" .owner)"
+printf '' >"${SCRATCH_DIR}/${TOKEN}.reclaim"
+chmod 0600 "${SCRATCH_DIR}/${TOKEN}.reclaim"
+touch "${S}/mktemp-release"
+wait "${OWNER_PID}"
+assert_rc 1 "$?" "S3h: a creation whose attempt is being reclaimed fails"
+assert_eq "" "$(grep '^systemd-run' "${S}/log")" "S3h: its client, registered after the reclaim mark, submits nothing"
+assert_true "S3h: and nothing of the attempt is left" wait_until 10 scratch_gone awgp7 "${TOKEN}"
+rm -f "${S}"/mktemp-*
+# S3i: the other order. A reclaim is held before it marks the attempt while
+# the client is held before it records itself; the client then registers and
+# blocks in systemd-run, and the reclaim goes on: it sees the client, keeps
+# every record and never signals it.
+reset_state
+rm -f "${T}/token"
+touch "${S}/systemd-run-hold"
+echo ".client." >"${S}/mktemp-hold"
+"${OWNER_CMD[@]}" unit create awgp7 "${T}/token" &
+OWNER_PID=$!
+wait_until 5 test -e "${S}/mktemp-waiting"
+TOKEN="$(basename "$(ls "${SCRATCH_DIR}"/*.owner)" .owner)"
+echo ".reclaim." >"${S}/mktemp-hold-b"
+CLIENT_WAIT=1 owner unit reclaim "${TOKEN}" &
+RECLAIM_PID=$!
+wait_until 5 test -e "${S}/mktemp-waiting-b"
+touch "${S}/mktemp-release"
+wait_until 5 test -e "${S}/systemd-run-waiting"
+CLIENT="$(record_get "${TOKEN}" client CLIENT_PID)"
+touch "${S}/mktemp-release-b"
+wait "${RECLAIM_PID}"
+assert_rc 1 "$?" "S3i: a reclaim racing a registering client does not finish"
+assert_true "S3i: it keeps every record while the client that registered meanwhile lives" \
+	test -f "${SCRATCH_DIR}/${TOKEN}.owner" -a -f "${SCRATCH_DIR}/${TOKEN}.guard" -a -f "${SCRATCH_DIR}/${TOKEN}.client"
+assert_true "S3i: and never signals it" pid_alive "${CLIENT}"
+touch "${S}/systemd-run-release"
+wait "${OWNER_PID}" 2>/dev/null
+assert_true "S3i: the unit submitted after the mark never runs BoringTun" test ! -e "${S}/argv-awgp7"
+assert_true "S3i: and the attempt is then torn down completely" wait_until 15 scratch_gone awgp7 "${TOKEN}"
+rm -f "${S}"/mktemp-* "${S}"/systemd-run-*
 # A foreign socket at a scratch instance's UAPI path is never taken for its own.
 reset_state
 AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"
