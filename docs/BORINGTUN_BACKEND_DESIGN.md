@@ -1795,7 +1795,10 @@ with `SaveConfig = true` still loses the key; the runtime cannot prevent that.
 
 **Sync filter.** As §6.4. It fails without calling `awg syncconf` when
 `awg-quick strip` fails, when `[Interface]` has more than one `ListenPort` or an
-invalid one, or when the live port cannot be read.
+invalid one, or when the live port cannot be read. Upstream #65, in the pinned
+`71d88784ad29`, makes listen-port rebinding transactional, so an unfiltered
+sync no longer leaks sockets there; the live test checks that. The filter
+stays: it costs nothing and keeps a sync from rebinding the port at all.
 
 **Staged validation.** Correction to §20 and §8.4, found by the live test: the
 kernel module binds `ListenPort` only when a link is brought up, so a kernel
