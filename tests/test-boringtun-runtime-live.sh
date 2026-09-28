@@ -31,6 +31,9 @@ UNIT="awg-quick@${IF}.service"
 IF2="awgbt2"
 PORT2=51898
 FOREIGN="awgbt9"
+# An interface for the emergency cleanup with a read-only runtime directory.
+IF3="awgbt3"
+PORT3=51896
 HOOK_LOG="/run/awgbt-live-hooks.log"
 RULE_COMMENT="awgbt-live-test"
 WORK_DIR=""
@@ -96,7 +99,8 @@ function cleanup() {
 	local RC=$?
 	trap - EXIT
 	local NAME
-	for NAME in "${IF}" "${IF2}" "${FOREIGN}"; do
+	mountpoint -q "${AWG_BT_RUN_DIR}" && umount "${AWG_BT_RUN_DIR}"
+	for NAME in "${IF}" "${IF2}" "${IF3}" "${FOREIGN}"; do
 		systemctl stop "awg-quick@${NAME}.service" >/dev/null 2>&1
 		systemctl reset-failed "awg-quick@${NAME}.service" >/dev/null 2>&1
 		ip link delete "${NAME}" >/dev/null 2>&1
@@ -185,13 +189,19 @@ function check_running() {
 	check "${LABEL}: ${IF} is a TUN device" test -e "/sys/class/net/${IF}/tun_flags"
 	check "${LABEL}: the UAPI answers with the configured port" test "$(awg show "${IF}" listen-port 2>/dev/null)" = "${PORT}"
 	check "${LABEL}: awg show lists the server config's peer" grep -q "${PEER_PUB}" <<<"$(awg show "${IF}" peers 2>/dev/null)"
-	check "${LABEL}: the start attempt is recorded as up, with the MainPID and its start time" \
-		test "$(state_get PHASE) $(state_get PID) $(state_get PID_START)" = "up ${PID} $(_awgBtProcessStartTime "${PID}")"
+	check "${LABEL}: the unit's current attempt is recorded as up, with the MainPID and its start time" \
+		test -e "$(attempt_base).up" -a "$(state_get PID) $(state_get PID_START)" = "${PID} $(_awgBtProcessStartTime "${PID}")"
 	check "${LABEL}: exactly one firewall rule from PostUp is present" test "$(rule_count)" -eq 1
 }
 
+# The state of the unit's current activation, whose attempt identity is its
+# InvocationID.
+function attempt_base() {
+	printf '%s/%s@%s\n' "${AWG_BT_RUN_DIR}" "${IF}" "$(systemctl show -p InvocationID --value "${UNIT}")"
+}
+
 function state_get() { # <key>
-	sed -n "s/^$1=//p" "${AWG_BT_RUN_DIR}/${IF}.state" 2>/dev/null
+	sed -n "s/^$1=//p" "$(attempt_base).state" 2>/dev/null
 }
 
 function wait_for() { # <seconds> <command...>
@@ -214,7 +224,8 @@ function unit_inactive() {
 
 function nothing_left() {
 	[[ ! -e "/sys/class/net/${IF}" && ! -e "/var/run/wireguard/${IF}.sock" && ! -e "/var/run/amneziawg/${IF}.sock" &&
-		! -e "${AWG_BT_RUN_DIR}/boringtun-${IF}.pid" && ! -e "${AWG_BT_RUN_DIR}/${IF}.state" && "$(rule_count)" -eq 0 ]]
+		! -e "${AWG_BT_RUN_DIR}/boringtun-${IF}.pid" && -z "$(find "${AWG_BT_RUN_DIR}" -maxdepth 1 -name "${IF}@*")" &&
+		"$(rule_count)" -eq 0 ]]
 }
 
 echo "=== Start"
@@ -374,6 +385,14 @@ check "no scratch socket remains" test -z "$(find /var/run/wireguard /var/run/am
 echo "=== A failed start leaves an interface that existed before it alone"
 ip tuntap add dev "${FOREIGN}" mode tun
 FOREIGN_INDEX="$(cat "/sys/class/net/${FOREIGN}/ifindex")"
+# State that an earlier attempt left behind, claiming that link as its own.
+STALE="${AWG_BT_RUN_DIR}/${FOREIGN}@00000000000000000000000000000001"
+install -d -m 0700 "${AWG_BT_RUN_DIR}"
+printf 'FORMAT=1\nATTEMPT=00000000000000000000000000000001\nCONFIG=%s\nPRE_EXISTING=0\nPHASE=launched\nPID=\nPID_START=\nIFINDEX=%s\nWG_SOCK=\nAWG_SOCK=\nDOWN=none\n' \
+	"${AWG_BT_CONFIG_DIR}/${FOREIGN}.conf" "${FOREIGN_INDEX}" >"${STALE}.state"
+: >"${STALE}.up"
+chmod 0600 "${STALE}.state" "${STALE}.up"
+STALE_SUM="$(cat "${STALE}.state" "${STALE}.up" | sha256sum)"
 sed -e "s/^ListenPort = .*/ListenPort = 51897/" -e '/^PostUp\|^PostDown/d' "${AWG_BT_CONFIG_DIR}/${IF}.conf" >"${AWG_BT_CONFIG_DIR}/${FOREIGN}.conf"
 sed -i "/^\[Interface\]$/a PostDown = echo down-%i >>${HOOK_LOG}" "${AWG_BT_CONFIG_DIR}/${FOREIGN}.conf"
 chmod 0600 "${AWG_BT_CONFIG_DIR}/${FOREIGN}.conf"
@@ -384,9 +403,60 @@ sleep 4
 check "the pre-existing link survives, as the same link" test "$(cat "/sys/class/net/${FOREIGN}/ifindex" 2>/dev/null)" = "${FOREIGN_INDEX}"
 check "and none of its PostDown hooks ran" test "$(grep -c "^down-${FOREIGN}$" "${HOOK_LOG}")" -eq 0
 check "precheck said why" grep -q "already exists" <<<"$(journalctl -u "awg-quick@${FOREIGN}.service" --no-pager -n 50)"
+check "the earlier attempt's state neither authorised any cleanup nor was removed" \
+	test "$(cat "${STALE}.state" "${STALE}.up" 2>/dev/null | sha256sum)" = "${STALE_SUM}"
+rm -f "${STALE}.state" "${STALE}.up"
 systemctl stop "awg-quick@${FOREIGN}.service" >/dev/null 2>&1
 systemctl reset-failed "awg-quick@${FOREIGN}.service" >/dev/null 2>&1
 ip link delete "${FOREIGN}"
+
+echo "=== Emergency cleanup when the runtime directory cannot record anything"
+{
+	sed -n '/^\[Interface\]/,/^\[Peer\]/{/^\[Peer\]/!p}' "${AWG_BT_CONFIG_DIR}/${IF}.conf" |
+		sed -e "s/^ListenPort = .*/ListenPort = ${PORT3}/" -e 's/^Address = .*/Address = 10.97.0.1\/24/' -e '/^PostUp\|^PostDown/d'
+	printf 'PostUp = echo up-%%i >>%s\nPostDown = echo down-%%i >>%s\n' "${HOOK_LOG}" "${HOOK_LOG}"
+} >"${AWG_BT_CONFIG_DIR}/${IF3}.conf"
+chmod 0600 "${AWG_BT_CONFIG_DIR}/${IF3}.conf"
+_awgBtInstallServiceFiles "${IF3}" >/dev/null
+CTL="${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl"
+EMERGENCY_ATTEMPT="$(_awgBtNewToken)"
+INVOCATION_ID="${EMERGENCY_ATTEMPT}" "${CTL}" precheck "${IF3}" "${AWG_BT_CONFIG_DIR}/${IF3}.conf" &&
+	INVOCATION_ID="${EMERGENCY_ATTEMPT}" WG_QUICK_USERSPACE_IMPLEMENTATION="${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" \
+		awg-quick up "${AWG_BT_CONFIG_DIR}/${IF3}.conf" >/dev/null 2>&1
+check "${IF3} is up with the launcher" test -e "/sys/class/net/${IF3}/tun_flags"
+mount --bind "${AWG_BT_RUN_DIR}" "${AWG_BT_RUN_DIR}"
+mount -o remount,bind,ro "${AWG_BT_RUN_DIR}"
+check "(the runtime directory can no longer allocate or rename)" test "$(touch "${AWG_BT_RUN_DIR}/probe" 2>/dev/null; echo $?)" -ne 0
+check "(while the attempt's state is still readable)" test -r "${AWG_BT_RUN_DIR}/${IF3}@${EMERGENCY_ATTEMPT}.state"
+INVOCATION_ID="${EMERGENCY_ATTEMPT}" "${CTL}" poststart "${IF3}" "${AWG_BT_CONFIG_DIR}/${IF3}.conf" 2>"${WORK_DIR}/emergency.err"
+check "poststart fails when it cannot record that ${IF3} is up" test "$?" -ne 0
+check "and brings ${IF3} down itself" wait_for 10 test ! -e "/sys/class/net/${IF3}"
+check "with PostDown run exactly once" test "$(grep -c "^down-${IF3}$" "${HOOK_LOG}")" -eq 1
+check "from a private copy outside the runtime directory, which is removed" test -z "$(find /tmp -maxdepth 1 -name 'awg-boringtun-down.*')"
+umount "${AWG_BT_RUN_DIR}"
+INVOCATION_ID="${EMERGENCY_ATTEMPT}" "${CTL}" poststop "${IF3}" 2>/dev/null
+check "the following poststop runs PostDown no second time" test "$(grep -c "^down-${IF3}$" "${HOOK_LOG}")" -eq 1
+check "and removes the finished attempt" test -z "$(find "${AWG_BT_RUN_DIR}" -maxdepth 1 -name "${IF3}@*")"
+cat "${WORK_DIR}/emergency.err"
+
+echo "=== A direct scratch instance records its own identity before it is ready"
+(
+	# shellcheck disable=SC2034 # read by awgBackendCreateScratchInterface: no systemd, a direct daemon
+	AWG_BT_SYSTEMD_RUNTIME_DIR="/nonexistent-systemd"
+	awgBackendCreateScratchInterface awgp9002 >/dev/null 2>&1 || exit 1
+	TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp9002]}"
+	echo "${TOKEN}" >"${WORK_DIR}/direct-token"
+	sed -n 's/^CHILD_PID=//p; s/^CHILD_START=//p' "${AWG_BT_RUN_DIR}/scratch/${TOKEN}.child" | tr '\n' ' ' >"${WORK_DIR}/direct-child"
+	sed -n 's/^DAEMON_PID=//p; s/^PHASE=//p' "${AWG_BT_RUN_DIR}/scratch/${TOKEN}.guard" | tr '\n' ' ' >"${WORK_DIR}/direct-guard"
+	awgBackendDestroyScratchInterface awgp9002
+)
+check "a direct scratch instance starts" test "$?" -eq 0
+read -r CHILD_PID CHILD_START <"${WORK_DIR}/direct-child"
+read -r GUARD_PHASE GUARD_DAEMON <"${WORK_DIR}/direct-guard"
+check "its daemon recorded its own PID and start time (${CHILD_PID} ${CHILD_START})" test -n "${CHILD_PID}" -a -n "${CHILD_START}"
+check "and the guardian's ready record names that same daemon" test "${GUARD_PHASE} ${GUARD_DAEMON}" = "created ${CHILD_PID}"
+check "which is gone after destroy, with every record" \
+	test ! -d "/proc/${CHILD_PID}" -a -z "$(find "${AWG_BT_RUN_DIR}/scratch" -name "$(cat "${WORK_DIR}/direct-token").*")"
 
 echo "=== A partial awg-quick down never runs a PostDown hook twice"
 {
