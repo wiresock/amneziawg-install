@@ -4,8 +4,10 @@ name: BoringTun Artifacts
 # in packaging/boringtun/pin.env, natively on x86_64 and aarch64. Every job reads
 # the pin through scripts/boringtun-artifact.sh, which also does the building,
 # packaging and checking; this file only acquires sources and tools and
-# orchestrates. The archives are uploaded as workflow artifacts only: nothing is
-# released, tagged or pushed. See docs/BORINGTUN_ARTIFACTS.md.
+# orchestrates. The archives are uploaded as workflow artifacts and, except for
+# pull requests, given a build provenance attestation; nothing is released,
+# tagged or pushed. Publication is the separate, manually dispatched BoringTun
+# Release workflow. See docs/BORINGTUN_ARTIFACTS.md.
 
 on:
   # Pushes to any branch, so that a pipeline change builds before it is merged;
@@ -428,3 +430,36 @@ jobs:
             dist/*.tar.gz
             dist/SHA256SUMS
           if-no-files-found: error
+
+  # Signed SLSA build provenance for the two archives, the subjects a release
+  # publishes: it binds each archive's SHA-256 to this workflow, this commit
+  # and this run. The archives are attested exactly as uploaded, so no byte
+  # changes. Only this job can mint an OIDC token or write attestations, and it
+  # never runs for a pull request (from a fork), whose code is untrusted.
+  attest:
+    name: Build provenance attestation
+    needs: checksums
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: boringtun-cli-artifacts
+          path: dist
+
+      - name: Check the archives against SHA256SUMS
+        working-directory: dist
+        run: |
+          expected="$({ echo SHA256SUMS; awk '{ print $2 }' SHA256SUMS; } | LC_ALL=C sort)"
+          [ "$(find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort)" = "$expected" ]
+          [ "$(wc -l <SHA256SUMS)" -eq 2 ]
+          sha256sum --strict -c SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/boringtun-cli-*.tar.gz
