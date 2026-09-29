@@ -47,9 +47,12 @@ jobs:
       # asset, a wrong tag or an unpublished release fails here.
       - name: Download the embedded release anonymously and verify it
         run: |
-          value() { sed -n "s/^$1=\"\\(.*\\)\"\$/\\1/p" amneziawg-install.sh; }
-          contract() { sed -n "s/^$1=//p" packaging/boringtun/release.env; }
+          # Absolute paths: the downloads happen in another directory.
+          REPO_ROOT="$GITHUB_WORKSPACE"
+          value() { sed -n "s/^$1=\"\\(.*\\)\"\$/\\1/p" "$REPO_ROOT/amneziawg-install.sh"; }
+          contract() { sed -n "s/^$1=//p" "$REPO_ROOT/packaging/boringtun/release.env"; }
           BASE="$(value AWG_BT_RELEASE_BASE_URL)"
+          test -n "$BASE"
           mkdir -p "$RUNNER_TEMP/release"
           cd "$RUNNER_TEMP/release"
           for KEY in X86_64 AARCH64; do
@@ -59,6 +62,7 @@ jobs:
             test "$(value "AWG_BT_RELEASE_ARCHIVE_SHA256_${KEY}")" = "$(contract "BORINGTUN_RELEASE_ARCHIVE_SHA256_${KEY}")"
             STEM="${ASSET%.tar.gz}"
             test "$(tar -xzOf "$ASSET" "$STEM/boringtun-cli" | sha256sum | cut -d' ' -f1)" = "$(value "AWG_BT_RELEASE_BINARY_SHA256_${KEY}")"
+            test "$(value "AWG_BT_RELEASE_BINARY_SHA256_${KEY}")" = "$(contract "BORINGTUN_RELEASE_BINARY_SHA256_${KEY}")"
             test "$(tar -xzOf "$ASSET" "$STEM/MANIFEST" | sed -n 's/^source_commit=//p')" = "$(value AWG_BT_RELEASE_SOURCE_COMMIT)"
             echo "verified $ASSET"
           done
