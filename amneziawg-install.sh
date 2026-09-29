@@ -5174,28 +5174,54 @@ function _awgBtSync() {
 }
 
 # The installer's load override for an AmneziaWG kernel module installed on a
-# BoringTun host. An install command, unlike a blacklist line, also stops an
-# explicit `modprobe amneziawg`; the BoringTun coexistence test shows that it
-# stops the rtnl-link autoload of `ip link add … type amneziawg` as well.
+# BoringTun host. A blacklist line stops only the rtnl-link autoload of
+# `ip link add … type amneziawg`; an install command also stops an explicit
+# `modprobe amneziawg`. The BoringTun coexistence test shows both on a real
+# DKMS module.
 function _awgBtRenderModprobeOverride() {
 	printf '# Managed by amneziawg-install (backend: boringtun). Removed by its uninstall.\n'
 	printf '# Stops the AmneziaWG kernel module from loading, so that awg-quick starts BoringTun.\n'
 	printf 'install amneziawg /bin/false\n'
 }
 
+# Loading <module or alias> ends in the override's install command. The dry
+# run lists, one per line and with a trailing space, what modprobe would do:
+# an insmod for each dependency that is not loaded yet, then the action for the
+# module itself. The output is parsed as data: every line but the last must
+# insmod a dependency by absolute path, none of them AmneziaWG itself, and the
+# last must be exactly `install /bin/false`. Anything else counts as not
+# blocked.
+function _awgBtModprobeActionBlocked() { # <module or alias>
+	local OUTPUT LINE MODULE
+	local -a LINES=() ACTIONS=()
+	OUTPUT="$(modprobe -n -v "$1" 2>/dev/null)" || return 1
+	mapfile -t LINES <<<"${OUTPUT}"
+	for LINE in "${LINES[@]}"; do
+		LINE="${LINE%"${LINE##*[![:space:]]}"}"
+		[[ -z "${LINE}" ]] || ACTIONS+=("${LINE}")
+	done
+	((${#ACTIONS[@]} > 0)) || return 1
+	[[ "${ACTIONS[-1]}" == "install /bin/false" ]] || return 1
+	for LINE in "${ACTIONS[@]:0:${#ACTIONS[@]}-1}"; do
+		[[ "${LINE}" =~ ^insmod\ (/[^[:space:]]+\.ko(\.(gz|xz|zst))?)(\ .*)?$ ]] || return 1
+		MODULE="${BASH_REMATCH[1]##*/}"
+		[[ "${MODULE%%.ko*}" != amneziawg ]] || return 1
+	done
+	return 0
+}
+
 # The override is in force: the installer's file is in place, trusted and
 # unchanged, and modprobe resolves both the module and the rtnl-link alias that
 # `ip link add … type amneziawg` requests to that install command.
 function _awgBtKernelModuleBlocked() {
-	local NAME OUTPUT
+	local NAME
 	if ! _awgBtTrustedAncestors "${AWG_BT_MODPROBE_OVERRIDE}" || ! _awgBtTrustedNode "${AWG_BT_MODPROBE_OVERRIDE}" file ||
 		[[ "$(cat -- "${AWG_BT_MODPROBE_OVERRIDE}" 2>/dev/null)" != "$(_awgBtRenderModprobeOverride)" ]]; then
 		return 1
 	fi
 	command -v modprobe >/dev/null 2>&1 || return 1
 	for NAME in amneziawg rtnl-link-amneziawg; do
-		OUTPUT="$(modprobe -n -v "${NAME}" 2>/dev/null)" || return 1
-		[[ "${OUTPUT}" =~ ^install\ /bin/false[[:space:]]*$ ]] || return 1
+		_awgBtModprobeActionBlocked "${NAME}" || return 1
 	done
 	return 0
 }
@@ -5640,7 +5666,7 @@ function awgBackendCtlMain() {
 # Functions the generated helpers carry. Keep in step with their callers.
 _AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtRemoveOwnedPath _awgBtSocketHeldBy _awgBtSymlinkToNode _awgBtProveUapiNodes _awgBtNewToken _awgBtCurrentAttempt _awgBtAttemptBase _awgBtStateFile _awgBtFlagsArm _awgBtFlagRaise _awgBtFlagIs _awgBtAttemptRemove _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
 _AWG_BT_LAUNCH_FUNCTIONS="awgBoringtunLaunchMain _awgBtRecordSocketNodes _awgBtLaunchRefused _awgBtLaunchFailed"
-_AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtWithoutSaveConfig _awgBtTryDownCopy _awgBtDownCopy _awgBtLinkIsOwned _awgBtGuardedDown _awgBtRecordFailedDown _awgBtReplayPostDown _awgBtReportUnfinishedDown _awgBtFilteredStrip _awgBtSync _awgBtRenderModprobeOverride _awgBtKernelModuleBlocked _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtVerifyActiveInstance _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
+_AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtWithoutSaveConfig _awgBtTryDownCopy _awgBtDownCopy _awgBtLinkIsOwned _awgBtGuardedDown _awgBtRecordFailedDown _awgBtReplayPostDown _awgBtReportUnfinishedDown _awgBtFilteredStrip _awgBtSync _awgBtRenderModprobeOverride _awgBtModprobeActionBlocked _awgBtKernelModuleBlocked _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtVerifyActiveInstance _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
 
 # Emit a generated helper: a fixed header, the embedded AWG_BT_* settings, the
 # installer's own functions and a call to the entry point. The output depends
@@ -6807,7 +6833,7 @@ function installBoringtunModprobeOverride() {
 		return 1
 	fi
 	if ! _awgBtKernelModuleBlocked; then
-		echo -e "${RED}ERROR: ${AWG_BT_MODPROBE_OVERRIDE} is not in force: modprobe does not resolve amneziawg to 'install /bin/false'. Another modprobe configuration may take precedence.${NC}" >&2
+		echo -e "${RED}ERROR: ${AWG_BT_MODPROBE_OVERRIDE} is not in force: modprobe -n -v does not show loading amneziawg and rtnl-link-amneziawg ending in 'install /bin/false'. Another modprobe configuration may take precedence.${NC}" >&2
 		return 1
 	fi
 }

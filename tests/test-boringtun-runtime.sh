@@ -1409,6 +1409,62 @@ rm -f "${S}/modprobe-amneziawg"
 echo "insmod /lib/modules/x/amneziawg.ko" >"${S}/modprobe-rtnl-link-amneziawg"
 module_check 1 "an override that does not cover the rtnl-link alias does not count"
 rm -f "${S}/modprobe-rtnl-link-amneziawg"
+
+# modprobe -n -v as the Ubuntu 26.04 coexistence job printed it: the
+# dependencies it would load first, then the block command, each line ending
+# in a space. The dependency lines disappear once those modules are loaded.
+REAL_DEPS=(
+	"insmod /lib/modules/7.0.0-1012-azure/kernel/net/ipv4/udp_tunnel.ko.zst"
+	"insmod /lib/modules/7.0.0-1012-azure/kernel/net/ipv6/ip6_udp_tunnel.ko.zst"
+	"insmod /lib/modules/7.0.0-1012-azure/kernel/lib/crypto/libcurve25519.ko.zst"
+)
+modprobe_output() { # <name> <line>..., each written with modprobe's trailing space
+	local NAME="$1"
+	shift
+	if (($#)); then printf '%s \n' "$@"; fi >"${S}/modprobe-${NAME}"
+}
+modprobe_reset() {
+	rm -f "${S}/modprobe-amneziawg" "${S}/modprobe-rtnl-link-amneziawg"
+}
+modprobe_output amneziawg "${REAL_DEPS[@]}" "install /bin/false"
+assert_eq "insmod /lib/modules/7.0.0-1012-azure/kernel/net/ipv4/udp_tunnel.ko.zst " "$(head -n 1 "${S}/modprobe-amneziawg")" "the fixture keeps modprobe's trailing space"
+module_check 0 "the real output with dependency insmods before 'install /bin/false' counts for the module"
+modprobe_reset
+modprobe_output rtnl-link-amneziawg "${REAL_DEPS[@]}" "install /bin/false"
+module_check 0 "and for the rtnl-link alias"
+modprobe_output amneziawg "${REAL_DEPS[@]}" "install /bin/false"
+module_check 0 "and for both at once"
+install_helpers
+precheck_ok_with_override "the generated precheck accepts the real output too"
+modprobe_output amneziawg "insmod /lib/modules/x/kernel/net/ipv4/udp_tunnel.ko.zst opt=1" "install /bin/false"
+module_check 0 "a dependency insmod with module options is still a dependency"
+refused_output() { # <label> <line>... of the output for amneziawg
+	local LABEL="$1"
+	shift
+	modprobe_reset
+	modprobe_output amneziawg "$@"
+	module_check 1 "${LABEL}"
+}
+refused_output "dependencies followed by a real insmod of amneziawg.ko do not count" \
+	"${REAL_DEPS[@]}" "insmod /lib/modules/7.0.0-1012-azure/updates/dkms/amneziawg.ko.zst"
+refused_output "an insmod of amneziawg before 'install /bin/false' does not count" \
+	"insmod /lib/modules/x/updates/dkms/amneziawg.ko.zst" "install /bin/false"
+refused_output "an uncompressed amneziawg.ko among the dependencies does not count" \
+	"${REAL_DEPS[0]}" "insmod /lib/modules/x/extra/amneziawg.ko" "install /bin/false"
+refused_output "'install /bin/true' does not count" "${REAL_DEPS[@]}" "install /bin/true"
+refused_output "'install /usr/bin/false' does not count" "install /usr/bin/false"
+refused_output "'install sh -c false' does not count" "install sh -c false"
+refused_output "'install /bin/false' followed by another action does not count" \
+	"install /bin/false" "insmod /lib/modules/x/kernel/net/ipv4/udp_tunnel.ko.zst"
+refused_output "'install /bin/false' twice does not count" "install /bin/false" "install /bin/false"
+refused_output "'install /bin/false' with more on its line does not count" "install /bin/false; insmod /x/amneziawg.ko"
+refused_output "a dependency action that is not an insmod does not count" "rmmod udp_tunnel" "install /bin/false"
+refused_output "a dependency's own install command, which can load anything, does not count" \
+	"install /sbin/modprobe --ignore-install amneziawg" "install /bin/false"
+refused_output "a relative insmod path does not count" "insmod udp_tunnel.ko" "install /bin/false"
+refused_output "empty output does not count"
+refused_output "output of blank lines only does not count" "" " "
+modprobe_reset
 echo 1 >"${S}/modprobe-rc"
 module_check 1 "a failing modprobe dry run does not count"
 rm -f "${S}/modprobe-rc"

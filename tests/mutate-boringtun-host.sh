@@ -90,7 +90,19 @@ mutant module_blocked_without_consent test-boringtun-host "${INSTALLER}" \
 mutant installed_module_takes_kernel_path test-boringtun-runtime "${INSTALLER}" \
 	'if modinfo -n amneziawg >/dev/null 2>&1 && ! _awgBtKernelModuleBlocked; then' 'if false; then'
 mutant override_not_proven_in_force test-boringtun-runtime "${INSTALLER}" \
-	$'\tfor NAME in amneziawg rtnl-link-amneziawg; do\n\t\tOUTPUT="$(modprobe -n -v "${NAME}" 2>/dev/null)" || return 1\n\t\t[[ "${OUTPUT}" =~ ^install\\ /bin/false[[:space:]]*$ ]] || return 1\n\tdone\n' ''
+	$'\tfor NAME in amneziawg rtnl-link-amneziawg; do\n\t\t_awgBtModprobeActionBlocked "${NAME}" || return 1\n\tdone\n' ''
+# The modprobe dry run, parsed as data. The first mutant restores the check
+# that refused the real Ubuntu 26.04 output, where dependency insmods precede
+# the install command.
+mutant modprobe_output_exact_match test-boringtun-host "${INSTALLER}" \
+	$'\tmapfile -t LINES <<<"${OUTPUT}"\n' \
+	$'\t[[ "${OUTPUT}" =~ ^install\\ /bin/false[[:space:]]*$ ]] || return 1\n\tmapfile -t LINES <<<"${OUTPUT}"\n'
+mutant any_final_install_accepted test-boringtun-runtime "${INSTALLER}" \
+	'[[ "${ACTIONS[-1]}" == "install /bin/false" ]] || return 1' '[[ "${ACTIONS[-1]}" == install\ * ]] || return 1'
+mutant dependency_lines_unchecked test-boringtun-runtime "${INSTALLER}" \
+	$'\tfor LINE in "${ACTIONS[@]:0:${#ACTIONS[@]}-1}"; do\n\t\t[[ "${LINE}" =~ ^insmod\\ (/[^[:space:]]+\\.ko(\\.(gz|xz|zst))?)(\\ .*)?$ ]] || return 1\n\t\tMODULE="${BASH_REMATCH[1]##*/}"\n\t\t[[ "${MODULE%%.ko*}" != amneziawg ]] || return 1\n\tdone\n' ''
+mutant amneziawg_insmod_counts_as_dependency test-boringtun-runtime "${INSTALLER}" \
+	$'\t\t[[ "${MODULE%%.ko*}" != amneziawg ]] || return 1\n' ''
 # Deliberate restarts and the drop-in's start rate limit.
 mutant restart_keeps_start_limit test-backend "${INSTALLER}" \
 	$'\t\t\tsystemctl reset-failed "awg-quick@${SERVER_AWG_NIC}.service" >/dev/null 2>&1 || true\n' $'\t\t\t:\n'

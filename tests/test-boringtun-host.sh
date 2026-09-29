@@ -619,6 +619,19 @@ printf '#!/bin/bash\necho "insmod /lib/modules/x/amneziawg.ko"\n' >"${MOCKBIN}/m
 run installBoringtunModprobeOverride
 assert_rc 1 "${RC}" "an override that modprobe does not apply fails the install"
 assert_contains "is not in force" "${ERR}" "and says so"
+# The dry run on the Ubuntu 26.04 coexistence job, while the module's
+# dependencies were not loaded yet.
+printf '#!/bin/bash\nprintf "%%s \\n" %s %s %s "install /bin/false"\n' \
+	"'insmod /lib/modules/7.0.0-1012-azure/kernel/net/ipv4/udp_tunnel.ko.zst'" \
+	"'insmod /lib/modules/7.0.0-1012-azure/kernel/net/ipv6/ip6_udp_tunnel.ko.zst'" \
+	"'insmod /lib/modules/7.0.0-1012-azure/kernel/lib/crypto/libcurve25519.ko.zst'" >"${MOCKBIN}/modprobe"
+run installBoringtunModprobeOverride
+assert_rc 0 "${RC}" "an override in force behind dependency insmods, as on Ubuntu 26.04, passes"
+printf '#!/bin/bash\nprintf "%%s \\n" %s %s\n' \
+	"'insmod /lib/modules/7.0.0-1012-azure/kernel/net/ipv4/udp_tunnel.ko.zst'" \
+	"'insmod /lib/modules/7.0.0-1012-azure/updates/dkms/amneziawg.ko.zst'" >"${MOCKBIN}/modprobe"
+run installBoringtunModprobeOverride
+assert_rc 1 "${RC}" "dependency insmods followed by the module's own insmod fail the install"
 printf '#!/bin/bash\necho "modprobe $*" >>%s/log\necho "install /bin/false "\n' "${S}" >"${MOCKBIN}/modprobe"
 rm -f "${AWG_BT_MODPROBE_OVERRIDE}"
 
