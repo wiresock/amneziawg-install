@@ -163,7 +163,8 @@ home paths.
 sha256sum -c SHA256SUMS
 bash scripts/boringtun-artifact.sh verify-archive boringtun-cli-*-linux-"$(uname -m)"-musl.tar.gz /tmp/boringtun-check
 gh attestation verify boringtun-cli-*-linux-"$(uname -m)"-musl.tar.gz --repo wiresock/amneziawg-install \
-    --signer-workflow wiresock/amneziawg-install/.github/workflows/boringtun-artifacts.yml
+    --cert-identity https://github.com/wiresock/amneziawg-install/.github/workflows/boringtun-artifacts.yml@refs/heads/main \
+    --source-digest <commit> --source-ref refs/heads/main --deny-self-hosted-runners
 ```
 
 `verify-archive` checks the archive name against the pin, the exact member list,
@@ -176,7 +177,11 @@ required-notices check, for the BoringTun Runtime workflow's never-uploaded
 test archive with placeholder notices; nothing that is published uses it.
 `gh attestation verify` checks the archive's
 build provenance: that this repository's artifacts workflow built exactly these
-bytes, and from which commit and run. As root,
+bytes, on a GitHub-hosted runner, from `<commit>` of `main` (for a release, the
+commit its tag points at). `--cert-identity` must equal the signing workflow's
+identity exactly; `--signer-workflow` would only match its beginning, so a
+workflow whose file name merely starts with `boringtun-artifacts.yml` would
+pass it. As root,
 `device-smoke <binary>` also creates a TUN device, queries its UAPI socket and
 checks that the device disappears when the daemon stops.
 
@@ -350,9 +355,10 @@ refuses unless:
   binary's SHA-256 against `MANIFEST` and against the contract, the license
   files and their required notices, and a static binary of the right
   architecture;
-- each archive has a build provenance attestation signed by the artifacts
-  workflow of this repository, for that commit and `refs/heads/main`, from a
-  GitHub-hosted runner;
+- each archive has a build provenance attestation signed by exactly the
+  artifacts workflow of this repository on `main` (the certificate identity
+  `https://github.com/<repo>/.github/workflows/boringtun-artifacts.yml@refs/heads/main`),
+  for that commit and `refs/heads/main`, from a GitHub-hosted runner;
 - no tag of that name exists and no release has that tag or title.
 
 It then prints the exact tag, title, assets, archive and binary hashes and

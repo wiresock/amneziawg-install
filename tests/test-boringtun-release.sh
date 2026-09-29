@@ -352,6 +352,39 @@ case "${1:-}" in
 	attestation)
 		[[ -f "${M}/attestation-fail" ]] && fail "no matching attestation"
 		printf '%s\n' "$*" >>"${M}/attestation-args"
+		# Checked against the one attestation in attestation.json the way gh
+		# checks it: --cert-identity must equal the certificate's identity,
+		# --signer-workflow only anchors its start, the source constraints must
+		# match exactly, and the archive must be one of the subjects.
+		[[ "${2:-}" == verify ]] || fail "unexpected attestation command"
+		file="$3"
+		shift 3
+		declare -A opt=()
+		deny=0
+		while (( $# > 0 )); do
+			case "$1" in
+				--deny-self-hosted-runners) deny=1; shift ;;
+				--repo | --cert-identity | --signer-workflow | --source-digest | --source-ref) opt[$1]="$2"; shift 2 ;;
+				*) fail "unexpected attestation option $1" ;;
+			esac
+		done
+		att() { jq -r "$1" "${M}/attestation.json"; }
+		identity="$(att .identity)"
+		[[ "${opt[--repo]:-}" == "$(att .repo)" ]] || fail "no attestation in ${opt[--repo]:-}"
+		jq -e --arg d "$(sha256sum -- "${file}" | cut -d' ' -f1)" '.subjects | index($d)' "${M}/attestation.json" >/dev/null ||
+			fail "no attestation for ${file##*/}"
+		if [[ -n "${opt[--cert-identity]+x}" ]]; then
+			[[ "${identity}" == "${opt[--cert-identity]}" ]] || fail "certificate identity ${identity} is not ${opt[--cert-identity]}"
+		elif [[ -n "${opt[--signer-workflow]+x}" ]]; then
+			[[ "${identity}" == "https://github.com/${opt[--signer-workflow]}"* ]] ||
+				fail "certificate identity ${identity} does not start with the signer workflow"
+		else
+			[[ "${identity}" == "https://github.com/${opt[--repo]}/"* ]] || fail "certificate identity ${identity} is not of the repository"
+		fi
+		[[ -z "${opt[--source-digest]+x}" || "${opt[--source-digest]}" == "$(att .digest)" ]] || fail "source digest $(att .digest)"
+		[[ -z "${opt[--source-ref]+x}" || "${opt[--source-ref]}" == "$(att .ref)" ]] || fail "source ref $(att .ref)"
+		(( deny == 0 )) || [[ "$(att .runner)" == github-hosted ]] || fail "built on a self-hosted runner"
+		printf 'Verification succeeded! (%s)\n' "${identity}"
 		;;
 	*) printf 'mock gh: unexpected command: %s\n' "$*" >&2; exit 98 ;;
 esac
@@ -375,7 +408,8 @@ EOF
 chmod +x "${BIN_DIR}/gh" "${BIN_DIR}/curl"
 
 # A clean GitHub: the run is good, the commit is on the branch, no tag and no
-# release, the artifact holds the given directory.
+# release, the artifact holds the given directory, and the artifacts workflow
+# attested its archives on a GitHub-hosted runner.
 reset_mock() { # <artifact-dir> [branch]
 	rm -rf -- "${MOCK}" && mkdir -p "${MOCK}/artifact"
 	cp -a -- "$1/." "${MOCK}/artifact/"
@@ -383,6 +417,11 @@ reset_mock() { # <artifact-dir> [branch]
 		repository: {full_name: $repo}, head_repository: {full_name: $repo},
 		path: ".github/workflows/boringtun-artifacts.yml", status: "completed", conclusion: "success",
 		head_sha: $sha, head_branch: $branch, event: "push"}' >"${MOCK}/run.json"
+	find "$1" -maxdepth 1 -type f -name '*.tar.gz' -exec sha256sum -- {} + | cut -d' ' -f1 |
+		jq -R . | jq -s --arg repo "${REPO}" --arg sha "${ARTIFACTS_COMMIT}" --arg branch "${2:-main}" '{
+		identity: "https://github.com/\($repo)/.github/workflows/boringtun-artifacts.yml@refs/heads/\($branch)",
+		repo: $repo, digest: $sha, ref: "refs/heads/\($branch)", runner: "github-hosted", subjects: .}' \
+		>"${MOCK}/attestation.json"
 	printf 'ahead\n' >"${MOCK}/compare-status"
 	printf '[]\n' >"${MOCK}/tags.json"
 	printf '[]\n' >"${MOCK}/releases.json"
@@ -390,6 +429,9 @@ reset_mock() { # <artifact-dir> [branch]
 }
 edit_run() { # <jq filter>
 	jq "$1" "${MOCK}/run.json" >"${MOCK}/run.json.new" && mv "${MOCK}/run.json.new" "${MOCK}/run.json"
+}
+edit_attestation() { # <jq filter>
+	jq "$1" "${MOCK}/attestation.json" >"${MOCK}/attestation.json.new" && mv "${MOCK}/attestation.json.new" "${MOCK}/attestation.json"
 }
 
 echo "=== Required notices (scripts/boringtun-artifact.sh) ==="
@@ -610,8 +652,9 @@ else
 	not_ok "the dry run prints the would-be tag, run, assets and notes"
 fi
 assert_true "a dry run makes no change on GitHub" no_mutation
-assert_eq "2" "$(grep -c -- "--signer-workflow ${REPO}/.github/workflows/boringtun-artifacts.yml --source-digest ${ARTIFACTS_COMMIT} --source-ref refs/heads/main --deny-self-hosted-runners" "${MOCK}/attestation-args")" \
-	"both archives' provenance is verified against the artifacts workflow, commit and branch"
+IDENTITY="https://github.com/${REPO}/.github/workflows/boringtun-artifacts.yml@refs/heads/main"
+assert_eq "2" "$(grep -c -- "--repo ${REPO} --cert-identity ${IDENTITY} --source-digest ${ARTIFACTS_COMMIT} --source-ref refs/heads/main --deny-self-hosted-runners$" "${MOCK}/attestation-args")" \
+	"both archives' provenance is verified against the exact workflow identity, commit and branch"
 
 dry_fails() { # <message> <label>
 	run_release dry-run "${RUN_ID}" "${ARTIFACTS_COMMIT}" main "${TEST_ROOT}/dry-${RANDOM}${RANDOM}"
@@ -635,6 +678,37 @@ reset_mock "${GOOD}"; printf 'diverged\n' >"${MOCK}/compare-status"
 dry_fails "is not part of main" "a reviewed commit that is not on main is refused"
 reset_mock "${GOOD}"; touch "${MOCK}/attestation-fail"
 dry_fails "has no valid build provenance attestation" "an archive without provenance attestation is refused"
+
+# An attestation that differs from the artifacts workflow's in one respect.
+attestation_refused() { # <jq edit> <gh's reason> <label>
+	reset_mock "${GOOD}"; edit_attestation "$1"
+	dry_fails "has no valid build provenance attestation" "$3"
+	assert_fails_with "$2" "  for the reason gh gives"
+}
+LOOKALIKE="https://github.com/${REPO}/.github/workflows/boringtun-artifacts.yml-copy.yml@refs/heads/main"
+attestation_refused ".identity = \"${LOOKALIKE}\"" "certificate identity ${LOOKALIKE} is not ${IDENTITY}" \
+	"an attestation by a workflow whose identity only starts with the artifacts workflow's is refused"
+reset_mock "${GOOD}"; edit_attestation ".identity = \"${LOOKALIKE}\""
+if env MOCK="${MOCK}" "${BIN_DIR}/gh" attestation verify "${GOOD}/${X_NAME}" --repo "${REPO}" \
+	--signer-workflow "${REPO}/.github/workflows/boringtun-artifacts.yml" >/dev/null 2>&1; then
+	ok "  (which --signer-workflow, a prefix match in gh, would accept)"
+else
+	not_ok "  (which --signer-workflow, a prefix match in gh, would accept)"
+fi
+attestation_refused ".identity = \"https://github.com/${REPO}/.github/workflows/boringtun-runtime.yml@refs/heads/main\"" \
+	"certificate identity" "an attestation by another workflow of this repository is refused"
+attestation_refused ".identity |= sub(\"refs/heads/main\$\"; \"refs/heads/feature\")" \
+	"certificate identity" "an attestation by the artifacts workflow of another branch is refused"
+attestation_refused '.ref = "refs/heads/feature"' "source ref refs/heads/feature" \
+	"an attestation of a build from another branch is refused"
+attestation_refused '.digest = "fedcba9876543210fedcba9876543210fedcba98"' "source digest fedcba98" \
+	"an attestation of a build of another commit is refused"
+attestation_refused '.repo = "someone/fork" | .identity |= sub("wiresock/amneziawg-install"; "someone/fork")' \
+	"no attestation in ${REPO}" "an attestation of another repository is refused"
+attestation_refused '.runner = "self-hosted"' "built on a self-hosted runner" \
+	"an attestation from a self-hosted runner is refused"
+attestation_refused '.subjects = []' "no attestation for" "an attestation that does not cover the archive is refused"
+
 reset_mock "${GOOD}"; touch "${MOCK}/download-fail"
 dry_fails "could not download" "a failed artifact download is refused"
 reset_mock "${TEST_ROOT}/sets/hash"

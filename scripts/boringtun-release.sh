@@ -399,7 +399,7 @@ btr_dry_run() {
         name="${BTR[BORINGTUN_RELEASE_ASSET_${k}]}"
         bta_info "verifying the build provenance attestation of ${name}"
         if ! gh attestation verify "${work}/assets/${name}" --repo "${BTR_REPO}" \
-            --signer-workflow "${BTR_REPO}/${BTR_ARTIFACTS_WORKFLOW}" \
+            --cert-identity "https://github.com/${BTR_REPO}/${BTR_ARTIFACTS_WORKFLOW}@refs/heads/${branch}" \
             --source-digest "${commit}" --source-ref "refs/heads/${branch}" \
             --deny-self-hosted-runners >"${work}/attestation-${arch}.txt" 2>&1; then
             sed 's/^/    /' "${work}/attestation-${arch}.txt" >&2
