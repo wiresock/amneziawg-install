@@ -432,6 +432,86 @@ optional `MaxHandshakeAttempts`; this installer does not manage that field
 
 ---
 
+## 🧪 Experimental: BoringTun Userspace Backend
+
+> [!WARNING]
+> **Experimental.** The kernel module stays the default and the recommended
+> backend. BoringTun is chosen only by an explicit `AWG_BACKEND=boringtun` on a
+> **fresh** install, and existing installations are never moved to it.
+
+Instead of the AmneziaWG kernel module (built with DKMS), a server can run
+[WireSock BoringTun](https://github.com/Wiresock-Foundation/wiresock-boringtun),
+a userspace AmneziaWG implementation that serves the interface through a TUN
+device. Nothing is compiled on the server: no Rust toolchain, no DKMS and no
+kernel headers.
+
+```bash
+# Fresh install with the BoringTun backend
+sudo AWG_BACKEND=boringtun AUTO_INSTALL=y ./amneziawg-install.sh
+
+# Interactive install with the BoringTun backend
+sudo AWG_BACKEND=boringtun ./amneziawg-install.sh
+```
+
+**Where it runs:** Debian 11+ and Ubuntu 22.04+ hosts (virtual machines or bare
+metal) with systemd, on x86_64 or aarch64, with `/dev/net/tun` and the IPv6
+socket family available. Containers and LXC are not supported. Other
+architectures are refused before anything is changed.
+
+**What it installs:**
+
+- `amneziawg-tools` from the Amnezia PPA with `--no-install-recommends`, so the
+  kernel module package (`amneziawg-dkms`) is not pulled in, plus `nftables`,
+  `iptables` and `qrencode`. No `amneziawg`, DKMS, headers or `deb-src` sources.
+- `boringtun-cli` from this repository's immutable public release
+  [`boringtun-cli-0.7.1-g71d88784ad29-b1`](https://github.com/wiresock/amneziawg-install/releases/tag/boringtun-cli-0.7.1-g71d88784ad29-b1),
+  built from WireSock BoringTun `71d88784ad29dc95871c105e26cc62f6acdd565b`. The
+  installer downloads the archive for its architecture from that exact URL and
+  checks it against SHA-256 values embedded in the script before extracting
+  anything; then it checks the archive's layout, its `MANIFEST`, the binary's
+  SHA-256 and `boringtun-cli --version`. No "latest" lookup and no GitHub API.
+  The release notes describe how to verify its build provenance yourself.
+- The binary into `/usr/local/lib/amneziawg-install/boringtun/`, and two
+  generated helpers into `/usr/local/libexec/amneziawg-install/` that supervise
+  the daemon inside the usual `awg-quick@<interface>` service.
+
+Before any VPN configuration is written, a preflight starts a temporary
+BoringTun instance with the chosen AWG 2.0 parameters and removes it again. If
+the download, a check or the preflight fails, nothing is configured. If the
+service does not start, the installer stops with BoringTun diagnostics; it
+never falls back to the kernel module.
+
+**Managing it:** everything else works as usual: clients, `--enable-awg3`,
+`--enable-awg31`, `--disable-awg3` and uninstall. Use `systemctl` or this
+script to start and stop the interface: a plain `awg-quick up awg0` does not
+start BoringTun. A newer installer version never replaces an installed
+BoringTun binary on its own; upgrades will be an explicit command. Exporting
+`AWG_BACKEND` has no effect on an existing installation, whichever backend it
+uses.
+
+**Kernel module on the host:** if the AmneziaWG kernel module is loaded, the
+install refuses and never unloads it. If the module is only installed (for
+example `amneziawg-dkms` from an earlier kernel install), `awg-quick` would load
+it instead of starting BoringTun, so the install asks before blocking it with
+`/etc/modprobe.d/amneziawg-install-boringtun.conf`
+(`install amneziawg /bin/false`); with `AUTO_INSTALL`, set
+`AWG_BORINGTUN_BLOCK_KERNEL_MODULE=y` to agree. Uninstalling removes that file.
+Kernel module packages that the BoringTun install did not install are never
+removed.
+
+**Not with the standalone proxy:** BoringTun cannot run behind
+`amneziawg-proxy`, because it always listens on every address. The install
+refuses while the proxy (or its `proxy.toml`) is present, and the proxy
+installer refuses a BoringTun host. Keep the kernel backend for proxy setups.
+
+**Web panel:** a BoringTun host needs a web panel whose copy of this script
+(`/usr/local/bin/amneziawg-install.sh`) is at least this version; the install
+refuses while an older copy is installed.
+
+Built-in protocol imitation is **not** available yet.
+
+---
+
 ## 📦 Requirements
 
 Supported Linux distributions:
