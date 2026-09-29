@@ -12,7 +12,8 @@
 # Commands:
 #   contract                                  print the validated release contract
 #   plan                                      print the tag, title, assets and hashes
-#   notes                                     print the release notes
+#   notes <commit>                            print the release notes for archives built
+#                                             at <commit> (full SHA) on main
 #   check-run <run.json> <commit> <branch>    check workflow run metadata (API JSON)
 #   verify-assets <asset-dir> <work-dir>      check a downloaded artifact set
 #   dry-run <run-id> <commit> <branch> <work-dir>
@@ -168,7 +169,17 @@ btr_print_plan() {
     printf 'asset=SHA256SUMS sha256=%s\n' "$(btr_sums_sha256)"
 }
 
-btr_print_notes() {
+# The certificate identity of the artifacts workflow on a branch, which
+# attestations must match exactly (--signer-workflow would match a prefix).
+btr_signer_identity() { # <branch>
+    printf 'https://github.com/%s/%s@refs/heads/%s\n' "${BTR_REPO}" "${BTR_ARTIFACTS_WORKFLOW}" "$1"
+}
+
+# The release notes of archives that the artifacts workflow built at <commit>
+# of this repository on <branch>. Their provenance command names exactly what
+# the dry run verified: that commit, not BoringTun's source commit.
+btr_print_notes() { # <artifacts-commit> <branch>
+    local commit="$1" branch="$2"
     cat <<EOF
 Static \`boringtun-cli\` binaries built by this repository from
 [WireSock BoringTun](${BTA_REPOSITORY}) commit \`${BTA_COMMIT}\`
@@ -202,11 +213,25 @@ dependency of \`boringtun-cli\`, is unmaintained. It is not a disclosed
 vulnerability. The crate runs only when \`boringtun-cli\` daemonizes itself,
 and \`amneziawg-install\` runs it exclusively in the foreground.
 
-Verify the archives with \`sha256sum -c SHA256SUMS\` and their provenance with
-\`gh attestation verify <archive> --repo ${BTR_REPO:-<owner>/<repo>}\`.
+Verify the archives with \`sha256sum -c SHA256SUMS\`:
 
 \`\`\`
 $(btr_expected_sums)
+\`\`\`
+
+and the build provenance of each archive with the GitHub CLI. The
+certificate identity must match exactly, and the source digest is the
+\`amneziawg-install\` commit whose BoringTun Artifacts run built the archives
+(not the BoringTun source commit above):
+
+\`\`\`
+gh attestation verify <archive> \\
+  --repo ${BTR_REPO} \\
+  --cert-identity \\
+    $(btr_signer_identity "${branch}") \\
+  --source-digest ${commit} \\
+  --source-ref refs/heads/${branch} \\
+  --deny-self-hosted-runners
 \`\`\`
 
 Binary SHA-256 (\`binary_sha256\` in each \`MANIFEST\`):
@@ -218,12 +243,23 @@ ${BTR[BORINGTUN_RELEASE_BINARY_SHA256_AARCH64]}  aarch64 boringtun-cli
 EOF
 }
 
-btr_need_repo() {
+btr_repo_from_env() {
     BTR_REPO="${GITHUB_REPOSITORY:-}"
     if [[ ! "${BTR_REPO}" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$ ]]; then
         bta_err "GITHUB_REPOSITORY must be set to owner/repo"
         return 1
     fi
+}
+
+btr_check_commit() {
+    if [[ ! "$1" =~ ^[0-9a-f]{40}$ ]]; then
+        bta_err "the artifacts commit must be a full 40-character commit SHA"
+        return 1
+    fi
+}
+
+btr_need_repo() {
+    btr_repo_from_env || return 1
     local tool
     for tool in gh jq curl; do
         if ! command -v "${tool}" >/dev/null 2>&1; then
@@ -251,10 +287,7 @@ btr_check_run() {
     local repo head_repo path status conclusion head_sha head_branch event
 
     [[ -n "${BTR_REPO}" ]] || btr_need_repo || return 1
-    if [[ ! "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
-        bta_err "the artifacts commit must be a full 40-character commit SHA"
-        return 1
-    fi
+    btr_check_commit "${commit}" || return 1
     if ! fields="$(jq -er '[.repository.full_name, .head_repository.full_name, .path, .status,
             (.conclusion // "none"), .head_sha, .head_branch, .event] | map(tostring) | @tsv' <"${json}" 2>/dev/null)"; then
         bta_err "the workflow run record is not the expected JSON"
@@ -399,7 +432,7 @@ btr_dry_run() {
         name="${BTR[BORINGTUN_RELEASE_ASSET_${k}]}"
         bta_info "verifying the build provenance attestation of ${name}"
         if ! gh attestation verify "${work}/assets/${name}" --repo "${BTR_REPO}" \
-            --cert-identity "https://github.com/${BTR_REPO}/${BTR_ARTIFACTS_WORKFLOW}@refs/heads/${branch}" \
+            --cert-identity "$(btr_signer_identity "${branch}")" \
             --source-digest "${commit}" --source-ref "refs/heads/${branch}" \
             --deny-self-hosted-runners >"${work}/attestation-${arch}.txt" 2>&1; then
             sed 's/^/    /' "${work}/attestation-${arch}.txt" >&2
@@ -409,7 +442,7 @@ btr_dry_run() {
     done
 
     btr_check_destination "${BTR[BORINGTUN_RELEASE_TAG]}" "${BTR_TITLE}" || return 1
-    btr_print_notes >"${work}/notes.md"
+    btr_print_notes "${commit}" "${branch}" >"${work}/notes.md"
     bta_info "all checks passed; nothing was created"
     btr_print_plan
     printf 'artifacts_run=%s\nartifacts_commit=%s\n' "${run_id}" "${commit}"
@@ -543,7 +576,7 @@ btr_main() {
     case "${command}:$#" in
         contract:0) btr_print_contract ;;
         plan:0) btr_print_plan ;;
-        notes:0) BTR_REPO="${GITHUB_REPOSITORY:-}" btr_print_notes ;;
+        notes:1) btr_repo_from_env && btr_check_commit "$1" && btr_print_notes "$1" "${BTR_PUBLISH_BRANCH}" ;;
         check-run:3) btr_need_repo && btr_check_run "$@" ;;
         verify-assets:2) btr_verify_assets "$@" ;;
         dry-run:4) btr_dry_run "$@" ;;
