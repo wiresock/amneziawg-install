@@ -36,25 +36,18 @@ AWG31_DEFAULT_DISABLE_COOKIES="off"
 # with renderAwgProtocolFields and the config match helpers.
 AWG_PROTOCOL_CONFIG_KEYS="HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|RandomTrailers|DisableCookies"
 
-# AWG backend (datapath) state. Params written before backends existed have no
-# AWG_BACKEND, and that always means the kernel module. This installer version
-# supports only the kernel backend: validatePersistedAwgBackendState rejects
-# every other persisted value, and the runtime dispatchers refuse to operate on
-# an unset or unknown backend. The assignment below is the default until params
-# are loaded; validateParamsFile then re-derives the backend from params alone.
-# It also discards an AWG_BACKEND inherited from the caller's environment, so
-# the environment can never select a backend.
+# AWG backend (datapath) state: the AmneziaWG kernel module ("kernel") or the
+# userspace WireSock BoringTun daemon ("boringtun", experimental). Params
+# written before backends existed have no AWG_BACKEND, and that always means the
+# kernel module. Every other value fails closed, and the runtime dispatchers
+# refuse to operate on an unset or unknown backend. The assignment below is the
+# default until params are loaded; validateParamsFile then re-derives the
+# backend from params alone. It also discards an AWG_BACKEND inherited from the
+# caller's environment, so the environment never selects a backend. Fresh
+# installs select the kernel backend.
 AWG_BACKEND_KERNEL="kernel"
-AWG_BACKEND="${AWG_BACKEND_KERNEL}"
-
-# BoringTun runtime layer. This installer version does not support BoringTun as
-# a backend: params validation still rejects it, and nothing in an ordinary run
-# selects it. Its runtime branches exist for internal testing only and are
-# reachable solely through _awgInternalSelectBoringtunRuntimeForTesting, called
-# by test code that sources this file. The flag below is assigned, never read
-# from the environment, each time the installer is loaded.
 AWG_BACKEND_BORINGTUN="boringtun"
-_AWG_BORINGTUN_RUNTIME_INTERNAL=0
+AWG_BACKEND="${AWG_BACKEND_KERNEL}"
 
 # Where the BoringTun runtime lives. The generated helpers embed these values
 # when they are written, so a helper never reads a path from its environment.
@@ -1897,21 +1890,23 @@ function reportUnsupportedAwgBackend() {
 	if [[ -z "${BACKEND_VALUE}" ]]; then
 		echo "ERROR: the AWG backend is not set; refusing to operate on an unknown backend" >&2
 	elif [[ "${BACKEND_VALUE}" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
-		echo "ERROR: AWG backend '${BACKEND_VALUE}' is not supported by this installer version (supported: ${AWG_BACKEND_KERNEL})" >&2
+		echo "ERROR: AWG backend '${BACKEND_VALUE}' is not supported by this installer version (supported: ${AWG_BACKEND_KERNEL}, ${AWG_BACKEND_BORINGTUN})" >&2
 	else
-		echo "ERROR: the configured AWG backend is not supported by this installer version (supported: ${AWG_BACKEND_KERNEL})" >&2
+		echo "ERROR: the configured AWG backend is not supported by this installer version (supported: ${AWG_BACKEND_KERNEL}, ${AWG_BACKEND_BORINGTUN})" >&2
 	fi
 }
 
 # Normalize the persisted backend. A missing or empty value is the kernel
 # backend, which is what every params file written before backends existed
-# means. Every other value, including backends that later installer versions
-# may add, fails closed instead of being reinterpreted as the kernel backend.
+# means; kernel and boringtun stay as they are. Every other value, including
+# backends that later installer versions may add, fails closed instead of
+# being reinterpreted as the kernel backend.
 function normalizeAwgBackend() {
 	case "${AWG_BACKEND:-}" in
 		""|"${AWG_BACKEND_KERNEL}")
 			AWG_BACKEND="${AWG_BACKEND_KERNEL}"
 			;;
+		"${AWG_BACKEND_BORINGTUN}") ;;
 		*)
 			reportUnsupportedAwgBackend "${AWG_BACKEND}"
 			return 1
@@ -2715,12 +2710,14 @@ function serializeParams() {
 		echo "ERROR: serializeParams() requires an output file path" >&2
 		return 1
 	fi
-	# Only the kernel backend is a supported persisted value. The internal
-	# BoringTun runtime selection must never reach params.
-	if [[ -n "${AWG_BACKEND:-}" && "${AWG_BACKEND}" != "${AWG_BACKEND_KERNEL}" ]]; then
-		reportUnsupportedAwgBackend "${AWG_BACKEND}"
-		return 1
-	fi
+	# Only supported backends are persisted; unset means the kernel backend.
+	case "${AWG_BACKEND:-}" in
+		""|"${AWG_BACKEND_KERNEL}"|"${AWG_BACKEND_BORINGTUN}") ;;
+		*)
+			reportUnsupportedAwgBackend "${AWG_BACKEND}"
+			return 1
+			;;
+	esac
 	# Apply a restrictive umask only while writing the params file to disk,
 	# so that subprocesses (apt/dnf, dkms, etc.) are not affected.
 	local OLD_UMASK
@@ -3927,10 +3924,6 @@ function ensureAwgBackendReady() {
 			ensureAmneziawgKernelModule "$@"
 			;;
 		"${AWG_BACKEND_BORINGTUN}")
-			if ! _awgBtRuntimeSelected; then
-				reportUnsupportedAwgBackend "${AWG_BACKEND}"
-				exit 1
-			fi
 			_awgBtEnsureReady "$@"
 			;;
 		*)
@@ -3951,10 +3944,6 @@ function awgBackendCreateScratchInterface() {
 			ip link add dev "${INTERFACE_NAME}" type amneziawg
 			;;
 		"${AWG_BACKEND_BORINGTUN}")
-			if ! _awgBtRuntimeSelected; then
-				reportUnsupportedAwgBackend "${AWG_BACKEND}"
-				return 1
-			fi
 			_awgBtScratchCreate "${INTERFACE_NAME}"
 			;;
 		*)
@@ -3972,10 +3961,6 @@ function awgBackendDestroyScratchInterface() {
 			ip link delete dev "${INTERFACE_NAME}"
 			;;
 		"${AWG_BACKEND_BORINGTUN}")
-			if ! _awgBtRuntimeSelected; then
-				reportUnsupportedAwgBackend "${AWG_BACKEND}"
-				return 1
-			fi
 			_awgBtScratchDestroy "${INTERFACE_NAME}"
 			;;
 		*)
@@ -3996,10 +3981,6 @@ function awgBackendQuickUp() {
 			awg-quick up "${CONFIG_FILE}"
 			;;
 		"${AWG_BACKEND_BORINGTUN}")
-			if ! _awgBtRuntimeSelected; then
-				reportUnsupportedAwgBackend "${AWG_BACKEND}"
-				return 1
-			fi
 			_awgBtQuickUp "${CONFIG_FILE}"
 			;;
 		*)
@@ -4037,10 +4018,6 @@ function awgSyncInterfaceConfig() {
 			esac
 			;;
 		"${AWG_BACKEND_BORINGTUN}")
-			if ! _awgBtRuntimeSelected; then
-				reportUnsupportedAwgBackend "${AWG_BACKEND}"
-				return 1
-			fi
 			_awgBtSync "${INTERFACE_NAME}" "${SYNCCONF_STDERR}"
 			;;
 		*)
@@ -4069,9 +4046,8 @@ function awgSyncInterfaceConfig() {
 # PID and start time, socket nodes by device and inode, links by ifindex.
 # Without that evidence a resource is left alone.
 #
-# Nothing here is reachable in an ordinary run. The seam dispatches to it only
-# after _awgInternalSelectBoringtunRuntimeForTesting, and params validation
-# still rejects a persisted AWG_BACKEND=boringtun.
+# The seam dispatches here when AWG_BACKEND is boringtun, which only validated
+# params can set.
 
 # MANIFEST keys of artifact format 1, in the order scripts/boringtun-artifact.sh
 # writes them (BTA_MANIFEST_KEYS). A unit test keeps the two lists equal.
@@ -4097,21 +4073,6 @@ _AWG_BT_AWG_ID=""
 declare -gA _AWG_BT_SCRATCH_TOKENS=()
 declare -gA _AWG_BT_SCRATCH_GUARDS=()
 declare -gA _AWG_BT_SCRATCH_GUARD_STARTS=()
-
-# Internal, undocumented: select the BoringTun runtime for this shell only, so
-# tests that source the installer can exercise its branches. It is not reachable
-# from the command line, the menu, params or the environment, and
-# serializeParams refuses to persist it. Normal backend selection replaces it.
-function _awgInternalSelectBoringtunRuntimeForTesting() {
-	_AWG_BORINGTUN_RUNTIME_INTERNAL=1
-	AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
-}
-
-# The BoringTun branches refuse to run unless that internal selection happened
-# in this shell, whatever AWG_BACKEND says.
-function _awgBtRuntimeSelected() {
-	[[ "${_AWG_BORINGTUN_RUNTIME_INTERNAL}" == 1 && "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]
-}
 
 function _awgBtErr() {
 	printf '%s: %s\n' "${_AWG_BT_PROG:-amneziawg-install}" "$*" >&2

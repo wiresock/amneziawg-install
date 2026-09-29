@@ -277,7 +277,7 @@ expected_rejection() {
 			printf '%s' "ERROR: the AWG backend is not set; refusing to operate on an unknown backend"
 			;;
 		*)
-			printf '%s' "ERROR: AWG backend '$1' is not supported by this installer version (supported: kernel)"
+			printf '%s' "ERROR: AWG backend '$1' is not supported by this installer version (supported: kernel, boringtun)"
 			;;
 	esac
 }
@@ -424,11 +424,14 @@ assert_eq "0|kernel" "$(backend_state_case normalizeAwgBackend empty)" \
 assert_eq "0|kernel" "$(backend_state_case normalizeAwgBackend kernel)" \
 	"AWG_BACKEND=kernel is valid"
 assert_eq "" "$(cat "${STATE_ERR_FILE}")" "a valid AWG_BACKEND prints nothing"
-assert_eq "1|boringtun" "$(backend_state_case normalizeAwgBackend boringtun)" \
-	"AWG_BACKEND=boringtun is rejected and left unchanged"
-assert_eq "$(expected_rejection boringtun)" "$(cat "${STATE_ERR_FILE}")" \
-	"the boringtun rejection says this installer version does not support it"
-for BACKEND_VALUE in userspace Kernel KERNEL " kernel" "kernel " kernel0 wireguard-go; do
+assert_eq "0|boringtun" "$(backend_state_case normalizeAwgBackend boringtun)" \
+	"AWG_BACKEND=boringtun is valid and stays boringtun"
+assert_eq "" "$(cat "${STATE_ERR_FILE}")" "normalizing AWG_BACKEND=boringtun prints nothing"
+assert_eq "1|userspace" "$(backend_state_case normalizeAwgBackend userspace)" \
+	"an unknown AWG_BACKEND is rejected and left unchanged"
+assert_eq "$(expected_rejection userspace)" "$(cat "${STATE_ERR_FILE}")" \
+	"the rejection names the supported backends"
+for BACKEND_VALUE in userspace Kernel KERNEL " kernel" "kernel " kernel0 wireguard-go BoringTun " boringtun" "boringtun " boringtun0; do
 	assert_eq "1|${BACKEND_VALUE}" "$(backend_state_case normalizeAwgBackend "${BACKEND_VALUE}")" \
 		"AWG_BACKEND='${BACKEND_VALUE}' is rejected, not normalized"
 done
@@ -438,15 +441,15 @@ if [[ "$(backend_state_case normalizeAwgBackend "${UNSAFE_BACKEND_VALUE}")" == "
 else
 	not_ok "a backend value with control characters is rejected"
 fi
-assert_eq "ERROR: the configured AWG backend is not supported by this installer version (supported: kernel)" \
+assert_eq "ERROR: the configured AWG backend is not supported by this installer version (supported: kernel, boringtun)" \
 	"$(cat "${STATE_ERR_FILE}")" "the rejection does not echo a value that contains control characters"
 
 assert_eq "0|kernel" "$(backend_state_case validatePersistedAwgBackendState unset)" \
 	"persisted state without AWG_BACKEND validates as the kernel backend"
 assert_eq "0|kernel" "$(backend_state_case validatePersistedAwgBackendState kernel)" \
 	"persisted AWG_BACKEND=kernel validates"
-assert_eq "1|boringtun" "$(backend_state_case validatePersistedAwgBackendState boringtun)" \
-	"persisted AWG_BACKEND=boringtun fails validation"
+assert_eq "0|boringtun" "$(backend_state_case validatePersistedAwgBackendState boringtun)" \
+	"persisted AWG_BACKEND=boringtun validates"
 assert_eq "1|userspace" "$(backend_state_case validatePersistedAwgBackendState userspace)" \
 	"a persisted AWG_BACKEND with an arbitrary value fails validation"
 
@@ -515,7 +518,20 @@ install_params "${LEGACY_PARAMS}" "AWG_BACKEND=''"
 assert_eq "0|kernel" "$(run_validate_params plain)" \
 	"an empty persisted AWG_BACKEND loads as the kernel backend"
 
-for BACKEND_VALUE in boringtun userspace; do
+install_params "${LEGACY_PARAMS}" "AWG_BACKEND='boringtun'"
+assert_eq "0|boringtun" "$(run_validate_params plain)" \
+	"params with AWG_BACKEND='boringtun' load as the BoringTun backend"
+assert_eq "0|boringtun" "$(
+	(
+		PATH="${STAT_BIN_DIR}:${PATH}"
+		AMNEZIAWG_DIR="${PARAMS_FIXTURE}/state"
+		export AWG_BACKEND="kernel"
+		validateParamsFile >/dev/null 2>&1
+		printf '%s|%s' "$?" "${AWG_BACKEND-<unset>}"
+	)
+)" "an exported AWG_BACKEND=kernel does not override AWG_BACKEND='boringtun' in params"
+
+for BACKEND_VALUE in userspace BoringTun; do
 	install_params "${LEGACY_PARAMS}" "AWG_BACKEND='${BACKEND_VALUE}'"
 	VALIDATE_RESULT="$(run_validate_params plain)"
 	VALIDATE_ERR="$(cat "${VALIDATE_ERR_FILE}")"
@@ -530,7 +546,7 @@ done
 
 # Load params the way management operations do (0 0 are the loadParams
 # defaults), then attempt datapath operations that must never run.
-install_params "${LEGACY_PARAMS}" "AWG_BACKEND='boringtun'"
+install_params "${LEGACY_PARAMS}" "AWG_BACKEND='userspace'"
 reset_calls
 LOAD_ERR="$(
 	(
@@ -628,7 +644,7 @@ else
 	not_ok "a fatal kernel readiness failure still ends the calling shell (rc ${ENSURE_RC}, calls '$(raw_calls)')"
 fi
 
-for BACKEND_CASE in unset empty boringtun userspace; do
+for BACKEND_CASE in unset empty userspace; do
 	run_ensure_case "${BACKEND_CASE}" 1
 	if (( ENSURE_RC == 1 )) && [[ ! -s "${BT_CALL_LOG}" ]] && \
 		[[ "$(cat "${ENSURE_ERR_FILE}")" == "$(expected_rejection "${BACKEND_CASE}")" ]]; then
@@ -643,7 +659,7 @@ done
 reset_calls
 (
 	ensureAmneziawgKernelModule() { printf 'fn ensureAmneziawgKernelModule[%s]\n' "$*" >>"${BT_CALL_LOG}"; }
-	AWG_BACKEND="boringtun"
+	AWG_BACKEND="userspace"
 	ensureAwgBackendReady 0 >/dev/null 2>&1 || true
 	printf 'continued\n' >>"${BT_CALL_LOG}"
 )
@@ -683,7 +699,7 @@ check_rejected_operation() {
 	fi
 }
 
-for BACKEND_CASE in unset empty boringtun; do
+for BACKEND_CASE in unset empty userspace; do
 	check_rejected_operation "${BACKEND_CASE}" "scratch interface creation" \
 		awgBackendCreateScratchInterface awgp4242
 	check_rejected_operation "${BACKEND_CASE}" "scratch interface deletion" \

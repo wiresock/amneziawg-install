@@ -918,32 +918,26 @@ bind_socket() { # <path>
 	python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"
 }
 
-echo "=== The internal activation boundary ==="
-assert_eq "kernel 0" "${AWG_BACKEND} ${_AWG_BORINGTUN_RUNTIME_INTERNAL}" \
-	"a sourced installer starts on the kernel backend with the BoringTun runtime off"
-assert_eq "kernel 0" \
-	"$(env AWG_BACKEND=boringtun _AWG_BORINGTUN_RUNTIME_INTERNAL=1 bash -c 'source "$1"; echo "${AWG_BACKEND} ${_AWG_BORINGTUN_RUNTIME_INTERNAL}"' _ "${INSTALLER}")" \
-	"exported AWG_BACKEND and _AWG_BORINGTUN_RUNTIME_INTERNAL are discarded when the installer loads"
-assert_eq "0" "$(grep -v '^[[:space:]]*#' "${INSTALLER}" | grep -v '^function _awgInternalSelectBoringtunRuntimeForTesting()' |
-	grep -c '_awgInternalSelectBoringtunRuntimeForTesting')" "nothing in the installer calls the internal selection"
-run bash -c 'source "$1"; AWG_BACKEND=boringtun; normalizeAwgBackend' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "a persisted AWG_BACKEND=boringtun is still unsupported"
-run bash -c 'source "$1"; _awgInternalSelectBoringtunRuntimeForTesting; validatePersistedAwgBackendState' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "params validation rejects boringtun even after the internal selection"
-run bash -c 'source "$1"; AWG_BACKEND=boringtun; awgBackendCreateScratchInterface awgp1' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "without the internal selection a BoringTun scratch interface is refused"
-assert_contains "not supported by this installer version" "${ERR}" "and reported as an unsupported backend"
-run bash -c 'source "$1"; AWG_BACKEND=boringtun; ensureAwgBackendReady 0' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "without the internal selection ensureAwgBackendReady exits 1"
-run bash -c 'source "$1"; AWG_BACKEND=boringtun; awgSyncInterfaceConfig awg0' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "without the internal selection awgSyncInterfaceConfig refuses"
-run bash -c 'source "$1"; AWG_BACKEND=boringtun; awgBackendQuickUp /etc/amnezia/amneziawg/awg0.conf' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "without the internal selection awgBackendQuickUp refuses"
-run bash -c 'source "$1"; _awgInternalSelectBoringtunRuntimeForTesting; SERVER_PUB_IP=x; serializeParams "$2"' _ "${INSTALLER}" "${T}/params-out"
-assert_rc 1 "${RC}" "serializeParams refuses to persist the internal BoringTun selection"
-assert_true "and writes no params file" test ! -e "${T}/params-out"
-run bash -c 'source "$1"; _AWG_BORINGTUN_RUNTIME_INTERNAL=1; AWG_BACKEND=kernel; declare -f awgBackendCreateScratchInterface >/dev/null; _awgBtRuntimeSelected' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "the internal flag alone does not select BoringTun while AWG_BACKEND is kernel"
+echo "=== The activation boundary ==="
+assert_eq "kernel" "${AWG_BACKEND}" "a sourced installer starts on the kernel backend"
+assert_eq "kernel" \
+	"$(env AWG_BACKEND=boringtun _AWG_BORINGTUN_RUNTIME_INTERNAL=1 bash -c 'source "$1"; echo "${AWG_BACKEND}"' _ "${INSTALLER}")" \
+	"an exported AWG_BACKEND is discarded when the installer loads"
+assert_eq "0" "$(grep -c '_AWG_BORINGTUN_RUNTIME_INTERNAL\|_awgInternalSelectBoringtunRuntimeForTesting\|_awgBtRuntimeSelected' "${INSTALLER}")" \
+	"the installer has no internal activation flag or selector any more"
+# Exported variables, including the removed internal flag, never reach the
+# BoringTun branches: the dispatchers still take the kernel path.
+run env AWG_BACKEND=boringtun _AWG_BORINGTUN_RUNTIME_INTERNAL=1 bash -c \
+	'source "$1"; ip() { echo "ip $*"; }; awgBackendCreateScratchInterface awgp1' _ "${INSTALLER}"
+assert_eq "ip link add dev awgp1 type amneziawg" "${OUT}" "exported AWG_BACKEND=boringtun and the old internal flag still dispatch to the kernel"
+run bash -c 'source "$1"; AWG_BACKEND=boringtun; normalizeAwgBackend && echo "${AWG_BACKEND}"' _ "${INSTALLER}"
+assert_rc 0 "${RC}" "a persisted AWG_BACKEND=boringtun is supported"
+assert_eq "boringtun" "${OUT}" "and normalizes to boringtun"
+run bash -c 'source "$1"; AWG_BACKEND=boringtun; SERVER_PUB_IP=x; serializeParams "$2"' _ "${INSTALLER}" "${T}/params-out"
+assert_rc 0 "${RC}" "serializeParams persists the BoringTun backend"
+assert_eq "AWG_BACKEND='boringtun'" "$(grep '^AWG_BACKEND=' "${T}/params-out")" "as AWG_BACKEND='boringtun'"
+run bash -c 'source "$1"; AWG_BACKEND=boringtun; ip() { echo "ip $*"; }; _awgBtScratchCreate() { echo "bt-scratch $*"; }; awgBackendCreateScratchInterface awgp1' _ "${INSTALLER}"
+assert_eq "bt-scratch awgp1" "${OUT}" "a validated AWG_BACKEND=boringtun dispatches to the BoringTun runtime, never to the kernel"
 
 echo "=== Kernel invariance of shared text and the kernel drop-in ==="
 assert_eq "could not create a temporary amneziawg interface (load the amneziawg kernel module for this kernel)
@@ -2047,7 +2041,7 @@ mkdir -p "${T}/alt"
 chmod 0700 "${T}/alt"
 write_server_config "${IF}" "SaveConfig = true" "${T}/alt"
 write_server_config "${IF}"
-_awgInternalSelectBoringtunRuntimeForTesting
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 reset_state
 run awgBackendQuickUp "${T}/alt/${IF}.conf"
 assert_rc 1 "${RC}" "S5: quick-up checks SaveConfig in the exact config it is given"
@@ -2067,7 +2061,6 @@ assert_eq "$(grep -v SaveConfig "${T}/alt/${IF}.conf")" "$(cat "${S}/down-config
 "${CTL}" poststop "${IF}"
 write_server_config "${IF}"
 AWG_BACKEND=kernel
-_AWG_BORINGTUN_RUNTIME_INTERNAL=0
 
 if [[ -n "${AWG_QUICK_REFERENCE:-}" && -r "${AWG_QUICK_REFERENCE}" ]]; then
 	# awg-quick itself, unchanged except that it does not re-exec through sudo.
@@ -2196,7 +2189,7 @@ rm -f "${S}/strip-fail"
 
 echo 51821 >"${S}/port/${IF}"
 printf '[Interface]\nListenPort = 51821\n' >"${S}/strip/${IF}"
-_awgInternalSelectBoringtunRuntimeForTesting
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 run awgSyncInterfaceConfig "${IF}" --stderr-to-stdout
 assert_eq "syncconf-error-line" "${OUT}" "--stderr-to-stdout puts awg syncconf's stderr on stdout"
 run awgSyncInterfaceConfig "${IF}" "${T}/sync.err"
@@ -2210,7 +2203,6 @@ printf '[Interface]\nListenPort = 1\nListenPort = 2\n' >"${S}/strip/${IF}"
 run awgSyncInterfaceConfig "${IF}" "${T}/sync.err"
 assert_contains "more than once" "$(cat "${T}/sync.err")" "filter diagnostics go where awg syncconf's stderr goes"
 AWG_BACKEND=kernel
-_AWG_BORINGTUN_RUNTIME_INTERNAL=0
 : >"${S}/log"
 printf '[Interface]\nListenPort = 51821\n' >"${S}/strip/${IF}"
 run awgSyncInterfaceConfig "${IF}"
@@ -2219,7 +2211,7 @@ ListenPort = 51821" "$(cat "${S}/syncconf-input")" "the kernel sync still sends 
 assert_not_contains "listen-port" "$(cat "${S}/log")" "and never asks for the live port"
 
 echo "=== Scratch interfaces: collisions and the lifecycle ==="
-_awgInternalSelectBoringtunRuntimeForTesting
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 reset_state
 SYSTEMD_PRESENT="${T}/run/systemd-present"
 SYSTEMD_ABSENT="${T}/run/systemd-absent"
@@ -2362,7 +2354,7 @@ source "$2"
 if [[ "$3" == unit ]]; then AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_PRESENT}"; else AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"; fi
 PATH="${MOCKBIN}:${PATH}"
 [[ -z "${CLIENT_WAIT:-}" ]] || _AWG_BT_SCRATCH_CLIENT_WAIT="${CLIENT_WAIT}"
-_awgInternalSelectBoringtunRuntimeForTesting
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 case "$4" in
 	create)
 		awgBackendCreateScratchInterface "$5" >/dev/null 2>&1 || exit 1
@@ -2894,7 +2886,6 @@ for PORT_LINE in "ListenPort =" "ListenPort = abc" "ListenPort = -1" "ListenPort
 	assert_true "S7: before anything is applied" test ! -e "${S}/setconf-input"
 done
 AWG_BACKEND=kernel
-_AWG_BORINGTUN_RUNTIME_INTERNAL=0
 reset_state
 staged "ListenPort = 51820"
 assert_rc 0 "${RC}" "kernel staged validation still passes"
@@ -2902,7 +2893,7 @@ assert_contains "ListenPort = 51820" "$(cat "${S}/setconf-input")" "and the kern
 assert_contains "type amneziawg" "$(cat "${S}/log")" "with a kernel scratch link"
 staged "ListenPort = abc"
 assert_contains "ListenPort = abc" "$(cat "${S}/setconf-input")" "the kernel path still leaves ListenPort to awg setconf, unchanged"
-_awgInternalSelectBoringtunRuntimeForTesting
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 
 echo "=== ensureAwgBackendReady (S6) and awgBackendQuickUp ==="
 reset_state
@@ -2988,7 +2979,6 @@ assert_not_contains "awg-quick up" "$(cat "${S}/log")" "and stops before awg-qui
 assert_true "and leaves no state" test -z "$(compgen -G "${AWG_BT_RUN_DIR}/${IF}@*")"
 rm -rf "${AWG_BT_SYS_DIR}/module/amneziawg"
 AWG_BACKEND=kernel
-_AWG_BORINGTUN_RUNTIME_INTERNAL=0
 
 echo
 echo "BoringTun runtime tests: ${PASS} passed, ${FAIL} failed"

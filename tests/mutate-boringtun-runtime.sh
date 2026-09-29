@@ -39,7 +39,6 @@ mutant() {
 T=$'\t'
 
 # Activation boundary and store verification.
-mutant dispatch_without_internal_flag '[[ "${_AWG_BORINGTUN_RUNTIME_INTERNAL}" == 1 && "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]' 	'[[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]'
 mutant no_sha_check 'if [[ "${ACTUAL_SHA}" != "${FIELDS[binary_sha256]}" ]]; then' 'if false; then'
 mutant no_mode_check '(((8#${MODE} & 8#022) == 0)) || return 1' ':'
 mutant no_ancestor_check $'function _awgBtTrustedAncestors() {\n' $'function _awgBtTrustedAncestors() {\n\treturn 0\n'

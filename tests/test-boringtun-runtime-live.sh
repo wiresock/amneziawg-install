@@ -2,8 +2,8 @@
 # Live test of the supervised BoringTun runtime on a disposable systemd host,
 # for example a GitHub-hosted Ubuntu runner. It is not an installer smoke test:
 # the host is provisioned by hand. The test unpacks a packaged boringtun-cli
-# archive into the runtime store, selects the BoringTun runtime through the
-# installer's internal test hook, and drives awg-quick@<if>.service through
+# archive into the runtime store, selects the BoringTun backend in the shell
+# that sources the installer, and drives awg-quick@<if>.service through
 # start, reload, restart, stop, a SIGKILL crash, an operator's `ip link del`,
 # repeated unchanged-port syncs and AWG 2.0/3.0/3.1 validation on scratch
 # instances, and the ownership rules of the runtime: a failed start never
@@ -167,7 +167,8 @@ AllowedIPs = 10.99.0.2/32
 EOF
 chmod 0600 "${AWG_BT_CONFIG_DIR}/${IF}.conf"
 : >"${HOOK_LOG}"
-_awgInternalSelectBoringtunRuntimeForTesting
+# shellcheck disable=SC2034 # read by ensureAwgBackendReady
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 # shellcheck disable=SC2034 # read by ensureAwgBackendReady
 SERVER_AWG_NIC="${IF}"
 (ensureAwgBackendReady 1)
