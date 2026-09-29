@@ -28,6 +28,7 @@ jobs:
           bash tests/test-boringtun-release.sh
           bash tests/test-boringtun-foreground-launcher.sh
           bash tests/test-boringtun-runtime.sh
+          bash tests/test-boringtun-host.sh
           bash tests/test-cargo-build-common.sh
           bash tests/test-ubuntu-ppa.sh
           bash tests/test-proxy-scripts.sh
@@ -98,6 +99,14 @@ jobs:
             -w /workspace \
             ${{ matrix.distro }} \
             bash -lc '${{ matrix.prepare }} && bash tests/test-install-mock.sh'
+
+      - name: Run BoringTun host install test in Docker
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace:ro" \
+            -w /workspace \
+            ${{ matrix.distro }} \
+            bash tests/test-boringtun-install-mock.sh
 
   resolute-live:
     name: Ubuntu 26.04 PPA + DKMS Live Smoke

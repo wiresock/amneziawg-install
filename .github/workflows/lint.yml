@@ -36,7 +36,13 @@ jobs:
           bash -n tests/test-boringtun-foreground-launcher.sh
           bash -n tests/test-boringtun-runtime.sh
           bash -n tests/test-boringtun-runtime-live.sh
+          bash -n tests/test-boringtun-host.sh
+          bash -n tests/test-boringtun-install-mock.sh
+          bash -n tests/test-boringtun-host-live.sh
+          bash -n tests/test-boringtun-kernel-coexistence.sh
+          bash -n .github/scripts/boringtun-host-diagnostics.sh
           bash -n tests/mutate-boringtun-runtime.sh
+          bash -n tests/mutate-boringtun-host.sh
           bash -n tests/helpers/boringtun-foreground-launcher.sh
           bash -n tests/test-proxy-bootstrap.sh
           bash -n tests/test-ubuntu-ppa.sh
@@ -76,7 +82,13 @@ jobs:
           shellcheck --severity=warning tests/test-boringtun-foreground-launcher.sh
           shellcheck --severity=warning tests/test-boringtun-runtime.sh
           shellcheck --severity=warning tests/test-boringtun-runtime-live.sh
+          shellcheck --severity=warning tests/test-boringtun-host.sh
+          shellcheck --severity=warning tests/test-boringtun-install-mock.sh
+          shellcheck --severity=warning tests/test-boringtun-host-live.sh
+          shellcheck --severity=warning tests/test-boringtun-kernel-coexistence.sh
+          shellcheck --severity=warning .github/scripts/boringtun-host-diagnostics.sh
           shellcheck --severity=warning tests/mutate-boringtun-runtime.sh
+          shellcheck --severity=warning tests/mutate-boringtun-host.sh
           shellcheck --severity=warning tests/helpers/boringtun-foreground-launcher.sh
           shellcheck --severity=warning tests/test-proxy-bootstrap.sh
           shellcheck --severity=warning tests/test-ubuntu-ppa.sh

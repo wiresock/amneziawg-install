@@ -1,9 +1,9 @@
 name: BoringTun Runtime
 
-# Live test of the internal, supervised BoringTun runtime layer of
-# amneziawg-install.sh on a systemd host. BoringTun is not an installer
-# backend yet: the host is provisioned by hand, and the runtime is selected
-# through the installer's internal test hook. The binary is built and packaged
+# Live test of the supervised BoringTun runtime layer of amneziawg-install.sh
+# on a systemd host. The host is provisioned by hand and the test selects the
+# runtime in the shell that sources the installer; the installer's own fresh
+# install is tested by the BoringTun Host workflow. The binary is built and packaged
 # by scripts/boringtun-artifact.sh at the commit pinned in
 # packaging/boringtun/pin.env; nothing is uploaded or released. See
 # docs/BORINGTUN_BACKEND_DESIGN.md.
