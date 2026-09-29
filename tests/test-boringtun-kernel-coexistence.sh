@@ -12,7 +12,8 @@
 #      module, and neither does `modprobe amneziawg`;
 # plus: scratch probes stay on BoringTun, a module loaded behind the override's
 # back makes the service's precheck refuse (never the kernel path), and
-# uninstall removes the override but not amneziawg-dkms.
+# uninstall removes the override but neither amneziawg-dkms nor an
+# administrator's /etc/modules-load.d/amneziawg.conf.
 #
 # Requirements: root, systemd, Ubuntu with the running kernel's headers
 # available, network access, AWG_DISPOSABLE_HOST_TEST=1.
@@ -152,6 +153,13 @@ check "  and without installing anything" test ! -e /etc/amnezia/amneziawg/param
 unload_module
 
 echo "=== B. an installed, unloaded module ==="
+# The kernel install's boot entry, here as an administrator's own file: a
+# BoringTun install never writes it, so its uninstall must leave it as it is.
+MODULES_LOAD=/etc/modules-load.d/amneziawg.conf
+[[ ! -e "${MODULES_LOAD}" ]] || die "${MODULES_LOAD} already exists on this host"
+mkdir -p "${MODULES_LOAD%/*}"
+printf '# the administrator'"'"'s own boot entry\namneziawg\n' >"${MODULES_LOAD}"
+MODULES_LOAD_SHA="$(sha256sum "${MODULES_LOAD}")"
 run_install install-no-consent.log
 RC=$?
 check "without consent the install refuses" test "${RC}" -ne 0
@@ -211,6 +219,9 @@ check "the uninstall succeeds" test "${RC}" -eq 0
 check "  and removes the installer's load override" test ! -e "${OVERRIDE}"
 check "  but not amneziawg-dkms, which it did not install" bash -c 'dpkg-query -W -f="\${Status}" amneziawg-dkms | grep -q "install ok installed"'
 check "  so the module is loadable again" bash -c 'modprobe amneziawg && [[ -e /sys/module/amneziawg ]]'
+check "  and ${MODULES_LOAD}, which it did not write, is byte for byte as it was" \
+	test "$(sha256sum "${MODULES_LOAD}" 2>/dev/null)" = "${MODULES_LOAD_SHA}"
+rm -f "${MODULES_LOAD}"
 unload_module
 
 echo

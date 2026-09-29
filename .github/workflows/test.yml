@@ -35,6 +35,13 @@ jobs:
           sudo bash tests/test-proxy-bootstrap.sh
 
       - name: Run proxy Rust tests
+      # As root the BoringTun host unit tests run only in a disposable
+      # container, and there they must change nothing outside their test root.
+      - name: BoringTun host unit tests as root touch only their test root
+        run: |
+          docker run --rm -v "$PWD:/workspace:ro" -w /workspace ubuntu:24.04 bash -c \
+            'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 iproute2 >/dev/null && bash tests/test-boringtun-host-root-safety.sh'
+
         working-directory: amneziawg-proxy
         run: |
           cargo test

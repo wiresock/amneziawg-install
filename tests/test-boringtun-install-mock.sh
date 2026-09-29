@@ -66,7 +66,7 @@ mock() { # <name> <body>
 export PATH="${MOCK}/bin:${PATH}"
 
 mock apt-get "echo \"apt-get \$*\" >>${LOG}; exit 0"
-mock apt "echo \"apt \$*\" >>${LOG}; exit 0"
+mock apt "echo \"apt \$*\" >>${LOG}; [[ \"\$1\" == remove && -e ${MOCK}/apt-remove-fails ]] && exit 100; exit 0"
 mock apt-cache '
 if [[ "$*" == "show --no-all-versions amneziawg-tools" ]]; then
 	printf "Package: amneziawg-tools\nArchitecture: %s\nVersion: 1.0-mock\nFilename: pool/main/a/amneziawg/amneziawg-tools_1.0-mock.deb\n\n" "$(dpkg --print-architecture)"
@@ -286,13 +286,34 @@ check "without downloading it again" bash -c '! grep -q "^curl .*releases/downlo
 
 echo "--- uninstall"
 : >"${LOG}"
-mkdir -p /etc/modprobe.d
+mkdir -p /etc/modprobe.d /etc/modules-load.d
 run_installer 'loadParams >/dev/null && _awgBtRenderModprobeOverride >/etc/modprobe.d/amneziawg-install-boringtun.conf'
-printf 'y\n' | run_installer 'loadParams && uninstallAmneziaWG' >"${MOCK}/uninstall.out" 2>&1
+# An administrator's module boot entry: never the BoringTun install's file.
+printf '# the administrator'"'"'s own\namneziawg\n' >/etc/modules-load.d/amneziawg.conf
+MODULES_LOAD_SHA="$(sha256sum /etc/modules-load.d/amneziawg.conf)"
+# The first attempt's package removal fails: params stay, so the next run of
+# the installer is a management run that offers the uninstall again.
+: >"${MOCK}/apt-remove-fails"
+printf 'y\n' | run_installer 'loadParams && uninstallAmneziaWG' >"${MOCK}/uninstall-failed.out" 2>&1
+RC=$?
+rm -f "${MOCK}/apt-remove-fails"
+tail -3 "${MOCK}/uninstall-failed.out" | sed 's/^/    | /'
+check "an uninstall whose package removal fails fails" test "${RC}" -ne 0
+check "  and keeps params and the server config" test -e /etc/amnezia/amneziawg/params -a -e /etc/amnezia/amneziawg/awg0.conf
+check "  and says so" grep -q "was kept, so the uninstall can be run again" "${MOCK}/uninstall-failed.out"
+: >"${LOG}"
+printf '6\ny\n' | bash "${INSTALLER}" >"${MOCK}/uninstall.out" 2>&1
 RC=$?
 tail -3 "${MOCK}/uninstall.out" | sed 's/^/    | /'
+check "the next run of the installer is a management run" grep -q "It looks like AmneziaWG is already installed" "${MOCK}/uninstall.out"
 check "the uninstall succeeds" test "${RC}" -eq 0
-check "the unit is stopped and disabled first" test "$(grep '^systemctl ' "${LOG}" | head -2 | tr '\n' ' ')" = "systemctl stop awg-quick@awg0 systemctl disable awg-quick@awg0 "
+first_line() { # <exact line>: its line number in the log
+	grep -nxF -- "$1" "${LOG}" | head -n 1 | cut -d: -f1
+}
+check "the unit is stopped and disabled before any package is removed" \
+	test -n "$(first_line 'systemctl stop awg-quick@awg0')" -a -n "$(first_line 'systemctl disable awg-quick@awg0')" -a \
+	"$(first_line 'systemctl stop awg-quick@awg0')" -lt "$(first_line 'apt remove -y amneziawg-tools')" -a \
+	"$(first_line 'systemctl disable awg-quick@awg0')" -lt "$(first_line 'apt remove -y amneziawg-tools')"
 check "the store is removed" test ! -e "${STORE}" -a ! -e /usr/local/lib/amneziawg-install
 check "the helpers are removed" test ! -e "${LIBEXEC}"
 check "the drop-in is removed" test ! -e "${DROPIN}" -a ! -d /etc/systemd/system/awg-quick@awg0.service.d
@@ -300,6 +321,9 @@ check "the configuration, params and runtime file are removed" test ! -e /etc/am
 check "the installer's load override is removed" test ! -e /etc/modprobe.d/amneziawg-install-boringtun.conf
 check "only amneziawg-tools is removed" grep -qx 'apt remove -y amneziawg-tools' "${LOG}"
 check "the kernel module package someone else installed stays" bash -c '! grep -q "amneziawg-dkms" "$1"' _ "${LOG}"
+check "the administrator's /etc/modules-load.d/amneziawg.conf is byte for byte as it was" \
+	test "$(sha256sum /etc/modules-load.d/amneziawg.conf 2>/dev/null)" = "${MODULES_LOAD_SHA}"
+rm -f /etc/modules-load.d/amneziawg.conf
 if [[ "${ID}" == debian ]]; then
 	check "Debian: the managed source and keyring are removed" test ! -e /etc/apt/sources.list.d/amneziawg.sources.list -a ! -e /etc/apt/keyrings/amneziawg.gpg
 fi

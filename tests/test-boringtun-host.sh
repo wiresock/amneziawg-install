@@ -19,6 +19,14 @@ INSTALLER="${PROJECT_ROOT}/amneziawg-install.sh"
 RELEASE_CONTRACT="${PROJECT_ROOT}/packaging/boringtun/release.env"
 PIN_FILE="${PROJECT_ROOT}/packaging/boringtun/pin.env"
 
+# Every path the suite touches is redirected below its private test root, and
+# still it refuses root outside a disposable host, before anything is sourced:
+# a path that a later change forgets to redirect must never reach /etc.
+if [[ "${EUID}" -eq 0 && "${AWG_DISPOSABLE_HOST_TEST:-}" != 1 ]]; then
+	echo "ERROR: run the BoringTun host tests as an unprivileged user; as root they run only on a disposable host with AWG_DISPOSABLE_HOST_TEST=1" >&2
+	exit 2
+fi
+
 for TOOL in python3 ss; do
 	if ! command -v "${TOOL}" >/dev/null 2>&1; then
 		echo "ERROR: ${TOOL} is required for the BoringTun host tests" >&2
@@ -211,6 +219,14 @@ AWG_PROXY_INSTALL_PATHS="${T}/etc/systemd/system/amneziawg-proxy.service ${T}/us
 WEB_PANEL_SYSTEMD_UNIT="${T}/etc/systemd/system/amneziawg-web.service"
 WEB_PANEL_ENV_FILE="${T}/etc/amneziawg-web/env.conf"
 WEB_PANEL_LIFECYCLE_SCRIPT="${T}/usr/local/bin/amneziawg-install.sh"
+AMNEZIAWG_DIR="${T}/etc/amnezia/amneziawg"
+AWG_SYSTEMD_UNIT_DIR="${T}/etc/systemd/system"
+AWG_MODULES_LOAD_FILE="${T}/etc/modules-load.d/amneziawg.conf"
+AWG_SYSCTL_FILE="${T}/etc/sysctl.d/awg.conf"
+AWG_APT_KEYRING_FILE="${T}/etc/apt/keyrings/amneziawg.gpg"
+AMNEZIA_PPA_SOURCES_DIR="${T}/etc/apt/sources.list.d"
+APT_FORCE_IPV4_CONF="${T}/etc/apt/apt.conf.d/99amneziawg-force-ipv4"
+GAI_CONF="${T}/etc/gai.conf"
 TMPDIR="${T}/tmp"
 }
 mkdir -p "${T}/usr/local/lib" "${T}/usr/local/bin" "${T}/etc" "${T}/run" "${T}/tmp" "${T}/sys/module"
@@ -1049,22 +1065,72 @@ assert_eq "" "${OUT}" "  and installs nothing"
 echo "=== Uninstall ==="
 AWG_BT_PROC_DIR="/proc"
 IF="awgu0"
-reset_store
-serve "${T}/good.tar.gz"
-installBoringtunRelease >/dev/null 2>&1
-_awgBtInstallHelpers
-mkdir -p "${AWG_BT_MODPROBE_OVERRIDE%/*}" "${AWG_BT_RUN_DIR}/scratch" "${AWG_BT_WG_SOCKET_DIR}" "${AWG_BT_AWG_SOCKET_DIR}"
-_awgBtRenderModprobeOverride >"${AWG_BT_MODPROBE_OVERRIDE}"
-: >"${AWG_BT_RUN_DIR}/${IF}@0123456789abcdef0123456789abcdef.state"
-: >"$(_awgBtPidFile "${IF}")"
-python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
-ln -s "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock"
-# A socket another process serves for another interface stays.
-python3 -c 'import socket, sys, time
+WG_SOCK="${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+AWG_SOCK="${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock"
+ATTEMPT=0123456789abcdef0123456789abcdef
+DEAD_PID=999999
+# install_runtime: a verified store, the generated helpers and the load
+# override, as a BoringTun install leaves them.
+install_runtime() {
+	reset_store
+	serve "${T}/good.tar.gz"
+	installBoringtunRelease >/dev/null 2>&1
+	_awgBtInstallHelpers
+	mkdir -p "${AWG_BT_MODPROBE_OVERRIDE%/*}" "${AWG_BT_WG_SOCKET_DIR}" "${AWG_BT_AWG_SOCKET_DIR}"
+	_awgBtRenderModprobeOverride >"${AWG_BT_MODPROBE_OVERRIDE}"
+}
+# record_attempt <phase> [flag...]: a start attempt of IF as poststop leaves
+# it, recording the UAPI nodes now at the interface's paths and a daemon that
+# is gone.
+record_attempt() {
+	local PHASE="$1" FLAG
+	shift
+	(
+		_AWG_BT_ATTEMPT="${ATTEMPT}"
+		_awgBtPrepareRunDir || exit 1
+		_awgBtStateNew "${AWG_BT_CONFIG_DIR}/${IF}.conf" || exit 1
+		_AWG_BT_STATE[PHASE]="${PHASE}"
+		_AWG_BT_STATE[PID]="${DEAD_PID}"
+		_AWG_BT_STATE[PID_START]=1
+		_AWG_BT_STATE[WG_SOCK]="$(_awgBtPathId "${WG_SOCK}")"
+		_AWG_BT_STATE[AWG_SOCK]="$(_awgBtPathId "${AWG_SOCK}")"
+		_awgBtStateSave "${IF}" && _awgBtFlagsArm "${IF}" || exit 1
+		for FLAG in "$@"; do
+			_awgBtFlagRaise "${IF}" "${FLAG}" || exit 1
+		done
+	) || not_ok "(fixture: recording attempt ${PHASE} $*)"
+}
+attempt_files() {
+	find "${AWG_BT_RUN_DIR}" -maxdepth 1 -name "${IF}@*" 2>/dev/null | wc -l
+}
+dead_socket() { # <path>: a UNIX socket node nobody serves
+	python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"
+}
+LISTENER_N=0
+listening_socket() { # <path>: a UNIX socket another process listens on
+	LISTENER_N=$((LISTENER_N + 1))
+	python3 -c 'import socket, sys, time
 s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); open(sys.argv[2], "w").close(); time.sleep(120)' \
-	"${AWG_BT_WG_SOCKET_DIR}/other0.sock" "${T}/listening" &
-echo "$!" >>"${T}/background"
-for _ in $(seq 50); do [[ -e "${T}/listening" ]] && break; sleep 0.1; done
+		"$1" "${T}/listening-${LISTENER_N}" &
+	echo "$!" >>"${T}/background"
+	LAST_LISTENER=$!
+	for _ in $(seq 50); do [[ -e "${T}/listening-${LISTENER_N}" ]] && break; sleep 0.1; done
+}
+stop_listener() {
+	kill -KILL "${LAST_LISTENER}" 2>/dev/null
+	wait "${LAST_LISTENER}" 2>/dev/null
+}
+clear_uapi() {
+	rm -f "${WG_SOCK}" "${AWG_SOCK}"
+	rm -f "${AWG_BT_RUN_DIR}/${IF}@"*
+}
+runtime_kept() {
+	[[ -d "${AWG_BT_STORE_DIR}" && -e "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" && -e "${AWG_BT_MODPROBE_OVERRIDE}" ]]
+}
+
+install_runtime
+# A socket another process serves for another interface stays.
+listening_socket "${AWG_BT_WG_SOCKET_DIR}/other0.sock"
 # A daemon of the interface still runs: nothing is removed.
 cp -- "$(command -v bash)" "${AWG_BT_STORE_DIR}/${FIXTURE_ID}/boringtun-cli.running"
 "${AWG_BT_STORE_DIR}/${FIXTURE_ID}/boringtun-cli.running" -c 'sleep 120; :' fake "${IF}" &
@@ -1075,56 +1141,221 @@ assert_eq "${DAEMON_PID}" "$(boringtunDaemonsOf "${IF}")" "a running BoringTun d
 assert_eq "" "$(boringtunDaemonsOf other0)" "and only for its own interface"
 run uninstallBoringtunRuntime "${IF}"
 assert_rc 1 "${RC}" "the BoringTun uninstall refuses while a daemon of the interface runs"
-assert_true "  and removes nothing" test -d "${AWG_BT_STORE_DIR}" -a -e "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" -a -e "${AWG_BT_MODPROBE_OVERRIDE}"
+assert_true "  and removes nothing" runtime_kept
 kill -KILL "${DAEMON_PID}"
 wait "${DAEMON_PID}" 2>/dev/null
 rm -f "${AWG_BT_STORE_DIR}/${FIXTURE_ID}/boringtun-cli.running"
-printf '#!/bin/bash\n# not ours\n' >"${AWG_BT_LIBEXEC_DIR}/awg-custom"
-# An operator's own file at a helper's path is not the installer's to delete.
-printf '#!/bin/bash\n# awg-boringtun-launch replaced by hand\n' >"${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
+
+echo "--- S1: unfinished teardown evidence is kept"
+# Exactly the review's case: poststop returns 0, and the attempt it keeps
+# records a PostDown replay that did not finish (its config is unreadable).
+(
+	export INVOCATION_ID="${ATTEMPT}"
+	_awgBtCurrentAttempt && _awgBtPrepareRunDir &&
+		_awgBtStateNew "${T}/missing/${IF}.conf" && _AWG_BT_STATE[PHASE]=launched &&
+		_awgBtStateSave "${IF}" && _awgBtFlagsArm "${IF}" && _awgBtFlagRaise "${IF}" up
+) || not_ok "(fixture: an up attempt)"
+INVOCATION_ID="${ATTEMPT}" run _awgBtCtlPoststop "${IF}"
+assert_rc 0 "${RC}" "(fixture: poststop returns 0)"
+assert_true "(fixture: poststop keeps the attempt, its replay flag raised and no done flag)" \
+	test -e "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT}.replay" -a ! -e "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT}.done"
+FILES_BEFORE="$(attempt_files)"
 run uninstallBoringtunRuntime "${IF}"
-assert_true "  a hand-written file at a helper's path stays" grep -q 'replaced by hand' "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
-assert_contains "awg-boringtun-launch was not generated by this installer" "${OUT}" "  and the operator is told"
-rm -f "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
-assert_rc 0 "${RC}" "the BoringTun uninstall succeeds once no daemon of the interface runs"
+assert_rc 1 "${RC}" "an attempt whose PostDown replay did not finish fails the BoringTun uninstall"
+assert_contains "did not finish" "${ERR}" "  saying the teardown did not finish"
+assert_contains "rerun the uninstall" "${ERR}" "  and how to go on"
+assert_eq "${FILES_BEFORE}" "$(attempt_files)" "  every record of the attempt is kept"
+assert_true "  and nothing else is removed" runtime_kept
+run boringtunTeardownFinished "${IF}"
+assert_rc 1 "${RC}" "  boringtunTeardownFinished agrees"
+# The operator finished the cleanup by hand; the attempt is now terminal.
+mv "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT}.done-pending" "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT}.done"
+run boringtunTeardownFinished "${IF}"
+assert_rc 0 "${RC}" "once the attempt is terminal (done), the teardown counts as finished"
+clear_uapi
+for PHASE_FLAGS in "launched up" "launched up down" "prechecked"; do
+	clear_uapi
+	# shellcheck disable=SC2086 # the phase and its flags
+	record_attempt ${PHASE_FLAGS}
+	run boringtunTeardownFinished "${IF}"
+	assert_rc 1 "${RC}" "an attempt '${PHASE_FLAGS}' without the done flag is not finished"
+done
+clear_uapi
+: >"${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT}.state"
+run boringtunTeardownFinished "${IF}"
+assert_rc 1 "${RC}" "an attempt whose state cannot be read is not proven finished"
+clear_uapi
+: >"${AWG_BT_RUN_DIR}/${IF}@not-an-attempt.state"
+run boringtunTeardownFinished "${IF}"
+assert_rc 1 "${RC}" "a record at the interface's name that is no attempt is not proven finished"
+clear_uapi
+for PHASE_FLAGS in "started" "launch-failed" "launched up done"; do
+	clear_uapi
+	# shellcheck disable=SC2086 # the phase and its flags
+	record_attempt ${PHASE_FLAGS}
+	run boringtunTeardownFinished "${IF}"
+	assert_rc 0 "${RC}" "an attempt '${PHASE_FLAGS}' is terminal"
+done
+clear_uapi
+
+echo "--- B2: UAPI nodes are removed only on positive proof"
+# E: the dead socket and its alias that a finished attempt recorded go.
+dead_socket "${WG_SOCK}"
+ln -s "${WG_SOCK}" "${AWG_SOCK}"
+record_attempt launched up "done"
+run uninstallBoringtunRuntime "${IF}"
+assert_rc 0 "${RC}" "E: the BoringTun uninstall succeeds with a finished attempt"
+assert_true "  its recorded, dead UAPI socket and alias are removed" test ! -e "${WG_SOCK}" -a ! -L "${AWG_SOCK}"
+assert_eq "0" "$(attempt_files)" "  and so is the finished attempt"
 assert_true "  the store is removed" test ! -e "${AWG_BT_STORE_DIR}"
 assert_true "  both generated helpers are removed" test ! -e "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" -a ! -e "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
-assert_true "  a foreign file in the helper directory stays" test -e "${AWG_BT_LIBEXEC_DIR}/awg-custom"
 assert_true "  the installer's load override is removed" test ! -e "${AWG_BT_MODPROBE_OVERRIDE}"
-assert_true "  the interface's runtime state is removed" test ! -e "$(_awgBtPidFile "${IF}")" -a ! -e "${AWG_BT_RUN_DIR}/${IF}@0123456789abcdef0123456789abcdef.state"
-assert_true "  its idle UAPI socket and link are removed" test ! -e "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" -a ! -L "${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock"
+assert_true "  the PID file is removed" test ! -e "$(_awgBtPidFile "${IF}")"
 assert_true "  a socket another process listens on stays" test -S "${AWG_BT_WG_SOCKET_DIR}/other0.sock"
 run uninstallBoringtunRuntime "${IF}"
 assert_rc 0 "${RC}" "the BoringTun uninstall can be run again"
-# A listener on the interface's own socket path is someone else's: it stays,
-# and the uninstall reports that something remains.
-python3 -c 'import socket, sys, time
-s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); open(sys.argv[2], "w").close(); time.sleep(120)' \
-	"${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "${T}/listening-own" &
-echo "$!" >>"${T}/background"
-for _ in $(seq 50); do [[ -e "${T}/listening-own" ]] && break; sleep 0.1; done
+# uapi_case <label> <expected socket present> <expected alias present>: run
+# the runtime uninstall and check what it left.
+uapi_kept() { # <label>
+	run uninstallBoringtunRuntime "${IF}"
+	assert_rc 1 "${RC}" "$1"
+	assert_contains "is not provably an idle UAPI node" "${ERR}" "  reported as a remainder"
+}
+# A: a process listens on the very socket node the attempt recorded.
+install_runtime
+listening_socket "${WG_SOCK}"
+record_attempt launched up "done"
+uapi_kept "A: a recorded socket that a live process listens on is kept"
+assert_true "  and the live socket stays" test -S "${WG_SOCK}"
+stop_listener
+clear_uapi
+# B: the AmneziaWG path is an alias of a live socket.
+install_runtime
+listening_socket "${WG_SOCK}"
+ln -s "${WG_SOCK}" "${AWG_SOCK}"
+record_attempt launched up "done"
+uapi_kept "B: an alias of a live socket is kept while it is listened on"
+assert_true "  the alias stays" test -L "${AWG_SOCK}"
+assert_true "  and the live socket stays" test -S "${WG_SOCK}"
+stop_listener
+clear_uapi
+# The alias resolves outside the UAPI directories.
+install_runtime
+mkdir -p "${T}/elsewhere"
+dead_socket "${T}/elsewhere/x.sock"
+ln -s "${T}/elsewhere/x.sock" "${AWG_SOCK}"
+record_attempt launched up "done"
+uapi_kept "an alias that resolves outside the UAPI socket directories is kept"
+assert_true "  and so is its target" test -S "${T}/elsewhere/x.sock" -a -L "${AWG_SOCK}"
+clear_uapi
+# C: ss fails. D: ss prints something that is not a UNIX socket list.
+for SS_CASE in "C:exit 1" "D:echo 'garbage without a netid'" "D:printf 'u_str LISTEN\\n'"; do
+	install_runtime
+	dead_socket "${WG_SOCK}"
+	record_attempt launched up "done"
+	printf '#!/bin/bash\n%s\n' "${SS_CASE#*:}" >"${MOCKBIN}/ss"
+	chmod 0755 "${MOCKBIN}/ss"
+	PATH="${MOCKBIN}:${PATH}" uapi_kept "${SS_CASE%%:*}: when ss says '${SS_CASE#*:}', the recorded socket is kept"
+	assert_true "  it stays" test -S "${WG_SOCK}"
+	rm -f "${MOCKBIN}/ss"
+	clear_uapi
+done
+# F: a dead socket that no attempt records.
+install_runtime
+dead_socket "${WG_SOCK}"
+uapi_kept "F: a dead socket without an attempt's record is kept"
+assert_true "  it stays" test -S "${WG_SOCK}"
+clear_uapi
+# A node that replaced the recorded one.
+install_runtime
+dead_socket "${WG_SOCK}"
+record_attempt launched up "done"
+rm -f "${WG_SOCK}"
+dead_socket "${WG_SOCK}"
+uapi_kept "a socket that replaced the recorded node is kept"
+clear_uapi
+# The recorded daemon (same PID and start time) still lives.
+install_runtime
+dead_socket "${WG_SOCK}"
+(
+	_AWG_BT_ATTEMPT="${ATTEMPT}"
+	_awgBtPrepareRunDir && _awgBtStateNew "${AWG_BT_CONFIG_DIR}/${IF}.conf" || exit 1
+	_AWG_BT_STATE[PHASE]=launched
+	_AWG_BT_STATE[PID]="$$"
+	_AWG_BT_STATE[PID_START]="$(_awgBtProcessStartTime "$$")"
+	_AWG_BT_STATE[WG_SOCK]="$(_awgBtPathId "${WG_SOCK}")"
+	_awgBtStateSave "${IF}" && _awgBtFlagsArm "${IF}" && _awgBtFlagRaise "${IF}" up && _awgBtFlagRaise "${IF}" "done"
+) || not_ok "(fixture: an attempt of a live daemon)"
+uapi_kept "a recorded socket whose recorded daemon still lives is kept"
+clear_uapi
+
+echo "--- B3/S2: generated helpers"
+install_runtime
+printf '\n' >>"${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl"
+printf '#!/bin/bash\n# not ours\n' >"${AWG_BT_LIBEXEC_DIR}/awg-custom"
 run uninstallBoringtunRuntime "${IF}"
-assert_rc 1 "${RC}" "a served socket at the interface's path makes the uninstall report a remainder"
-assert_true "  and the served socket stays" test -S "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+assert_rc 0 "${RC}" "a helper changed after the install does not fail the uninstall"
+assert_true "  a helper changed by one byte stays" test -e "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl"
+assert_contains "awg-backend-ctl is not the file this installer generates" "${OUT}" "  and the operator is told"
+assert_true "  the unchanged helper is removed" test ! -e "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
+assert_true "  a foreign file in the helper directory stays" test -e "${AWG_BT_LIBEXEC_DIR}/awg-custom"
+rm -f "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl"
+install_runtime
+{
+	printf '#!/bin/bash\n# awg-boringtun-launch: generated by amneziawg-install from its own functions.\n'
+	printf 'echo "an operator'"'"'s launcher that carries the header"\n'
+} >"${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
+run uninstallBoringtunRuntime "${IF}"
+assert_true "a pre-existing file that carries the installer's header line stays" \
+	grep -q "carries the header" "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
+rm -f "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
+install_runtime
+ln -sf "${AWG_BT_LIBEXEC_DIR}/awg-custom" "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
+run uninstallBoringtunRuntime "${IF}"
+assert_true "a symlink at a helper's path stays" test -L "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
+rm -f "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
+# S2: a generated helper that cannot be removed fails the uninstall.
+install_runtime
+run eval 'rm() { [[ "${*: -1}" == */awg-backend-ctl ]] && return 1; command rm "$@"; }; uninstallBoringtunRuntime "${IF}"'
+assert_rc 1 "${RC}" "S2: a generated helper that cannot be removed fails the BoringTun uninstall"
+assert_contains "awg-backend-ctl could not be removed" "${ERR}" "  and names it"
+assert_true "  (it is still there)" test -e "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl"
+install_runtime
+run eval 'rm() { [[ "${*: -1}" == */awg-boringtun-launch ]] && return 1; command rm "$@"; }; uninstallBoringtunRuntime "${IF}"'
+assert_rc 1 "${RC}" "S2: and so does the launcher"
+run uninstallBoringtunRuntime "${IF}"
+assert_rc 0 "${RC}" "the rerun removes them"
+assert_true "  both are absent afterwards" test ! -e "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" -a ! -e "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
+rm -f "${AWG_BT_LIBEXEC_DIR}/awg-custom"
+
+echo "--- The load override"
+install_runtime
 printf 'install amneziawg /bin/false\n# changed\n' >"${AWG_BT_MODPROBE_OVERRIDE}"
 run uninstallBoringtunRuntime "${IF}"
-assert_true "a changed load override is left in place" test -e "${AWG_BT_MODPROBE_OVERRIDE}"
+assert_rc 0 "${RC}" "a changed load override does not fail the uninstall"
+assert_true "  it is left in place" test -e "${AWG_BT_MODPROBE_OVERRIDE}"
 assert_contains "was changed after it was installed" "${OUT}" "  and the operator is told"
 rm -f "${AWG_BT_MODPROBE_OVERRIDE}"
 
-# uninstallAmneziaWG on a BoringTun host: packages and foreign DKMS.
+# uninstallAmneziaWG on a BoringTun host: packages and foreign DKMS, the
+# order of its steps and what a failure keeps. PACKAGES_RC and PPA_RC make
+# the package or repository step fail.
 uninstall_flow() {
 	checkOS() { :; }
 	systemctl() { echo "systemctl $*" >>"${S}/un"; [[ "$1" == is-active ]] && return 1; return 0; }
-	removeInstalledAptPackages() { echo "remove-packages $*" >>"${S}/un"; }
-	removeAmneziaPpaSourceEntries() { :; }
+	removeInstalledAptPackages() {
+		echo "remove-packages $*" >>"${S}/un"
+		[[ -e "${AMNEZIAWG_DIR}/params" ]] && echo "params present at package removal" >>"${S}/un"
+		return "${PACKAGES_RC:-0}"
+	}
+	removeAmneziaPpaSourceEntries() { return "${PPA_RC:-0}"; }
 	enable_apt_ipv4() { :; }
 	disable_apt_ipv4() { :; }
 	apt-get() { :; }
 	apt() { echo "apt $*" >>"${S}/un"; }
 	uninstallBoringtunRuntime() { echo "uninstallBoringtunRuntime $*" >>"${S}/un"; return "${BT_UNINSTALL_RC:-0}"; }
 	boringtunDaemonsOf() { cat "${S}/daemons" 2>/dev/null; }
-	AMNEZIAWG_DIR="${T}/etc/amnezia/amneziawg"
+	[[ -n "${REAL_TEARDOWN_CHECK:-}" ]] || boringtunTeardownFinished() { echo "boringtunTeardownFinished $*" >>"${S}/un"; }
 	mkdir -p "${AMNEZIAWG_DIR}"
 	: >"${AMNEZIAWG_DIR}/params"
 	# shellcheck disable=SC2034 # read by uninstallAmneziaWG
@@ -1134,24 +1365,43 @@ uninstall_flow() {
 for UN_OS in ubuntu debian; do
 	: >"${S}/un"
 	OS="${UN_OS}" AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+	assert_rc 0 "${RC}" "${UN_OS}: a BoringTun uninstall succeeds"
 	assert_contains "remove-packages amneziawg-tools" "$(cat "${S}/un")" "${UN_OS}: a BoringTun uninstall removes amneziawg-tools"
 	assert_eq "remove-packages amneziawg-tools" "$(grep '^remove-packages' "${S}/un")" \
 		"${UN_OS}: and no module or DKMS package it did not install"
 	assert_contains "uninstallBoringtunRuntime awg0" "$(cat "${S}/un")" "${UN_OS}: the BoringTun runtime is removed"
+	assert_contains "params present at package removal" "$(cat "${S}/un")" "${UN_OS}: the configuration is still there while packages are removed"
+	assert_true "${UN_OS}: and is removed at the end" test ! -e "${AMNEZIAWG_DIR}"
 done
 : >"${S}/un"
 OS=ubuntu AWG_BACKEND=kernel RUN_INPUT=y run uninstall_flow
 assert_eq "remove-packages amneziawg amneziawg-tools amneziawg-dkms" "$(grep '^remove-packages' "${S}/un")" \
 	"Ubuntu kernel uninstall keeps removing exactly its three packages"
 assert_not_contains "uninstallBoringtunRuntime" "$(cat "${S}/un")" "and never runs the BoringTun removal"
+assert_not_contains "boringtunTeardownFinished" "$(cat "${S}/un")" "or the BoringTun teardown check"
+assert_not_contains "params present at package removal" "$(cat "${S}/un")" "the kernel uninstall keeps removing the configuration before its packages"
 : >"${S}/un"
 OS=debian AWG_BACKEND=kernel RUN_INPUT=y run uninstall_flow
 assert_eq "remove-packages amneziawg amneziawg-tools" "$(grep '^remove-packages' "${S}/un")" \
 	"Debian kernel uninstall keeps removing exactly its two packages"
+# S3: a failed package or repository step keeps the configuration.
+for FAILING in PACKAGES_RC PPA_RC; do
+	: >"${S}/un"
+	declare "${FAILING}=1"
+	OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+	unset "${FAILING}"
+	assert_rc 1 "${RC}" "S3: a BoringTun uninstall whose ${FAILING%_RC} step fails fails"
+	assert_true "  and keeps params, so a rerun uninstalls again" test -e "${AMNEZIAWG_DIR}/params"
+	assert_contains "was kept, so the uninstall can be run again" "${OUT}" "  and says so"
+done
+: >"${S}/un"
+PACKAGES_RC=1 OS=ubuntu AWG_BACKEND=kernel RUN_INPUT=y run uninstall_flow
+assert_rc 1 "${RC}" "a kernel uninstall whose package step fails still fails"
+assert_true "  and, as before, has already removed its configuration" test ! -e "${AMNEZIAWG_DIR}/params"
 : >"${S}/un"
 OS=ubuntu AWG_BACKEND=boringtun BT_UNINSTALL_RC=1 RUN_INPUT=y run uninstall_flow
 assert_rc 1 "${RC}" "a failed BoringTun removal fails the uninstall"
-assert_true "  and keeps the configuration, so the uninstall can be rerun" test -e "${T}/etc/amnezia/amneziawg/params"
+assert_true "  and keeps the configuration, so the uninstall can be rerun" test -e "${AMNEZIAWG_DIR}/params"
 assert_not_contains "remove-packages" "$(cat "${S}/un")" "  and removes no package"
 echo 4242 >"${S}/daemons"
 : >"${S}/un"
@@ -1161,6 +1411,31 @@ assert_contains "PID 4242" "${OUT}" "  naming the daemon"
 assert_eq "systemctl stop awg-quick@awg0
 systemctl disable awg-quick@awg0" "$(cat "${S}/un")" "  before anything is removed"
 rm -f "${S}/daemons"
+# S1 through the whole uninstall: an unfinished attempt stops it before
+# anything is removed.
+mkdir -p "${AWG_SYSTEMD_UNIT_DIR}/awg-quick@awg0.service.d" "${AWG_SYSCTL_FILE%/*}"
+: >"${AWG_SYSTEMD_UNIT_DIR}/awg-quick@awg0.service.d/override.conf"
+: >"${AWG_SYSCTL_FILE}"
+IF=awg0
+record_attempt launched up replay
+: >"${S}/un"
+REAL_TEARDOWN_CHECK=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+assert_rc 1 "${RC}" "S1: an unfinished BoringTun teardown fails the whole uninstall"
+assert_true "  before the drop-in, the sysctl file or params are removed" \
+	test -e "${AWG_SYSTEMD_UNIT_DIR}/awg-quick@awg0.service.d/override.conf" -a -e "${AWG_SYSCTL_FILE}" -a -e "${AMNEZIAWG_DIR}/params"
+assert_not_contains "uninstallBoringtunRuntime" "$(cat "${S}/un")" "  and before the BoringTun removal"
+assert_true "  the attempt's records stay" test -e "${AWG_BT_RUN_DIR}/awg0@${ATTEMPT}.state"
+rm -f "${AWG_BT_RUN_DIR}/awg0@"*
+IF=awgu0
+# modules-load: the kernel install's boot entry is never a BoringTun file.
+mkdir -p "${AWG_MODULES_LOAD_FILE%/*}"
+printf '# the administrator'"'"'s own\namneziawg\n' >"${AWG_MODULES_LOAD_FILE}"
+MODULES_LOAD_SHA="$(sha256sum "${AWG_MODULES_LOAD_FILE}")"
+OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+assert_eq "${MODULES_LOAD_SHA}" "$(sha256sum "${AWG_MODULES_LOAD_FILE}" 2>/dev/null)" \
+	"a BoringTun uninstall leaves ${AWG_MODULES_LOAD_FILE##*/} byte for byte as it was"
+OS=ubuntu AWG_BACKEND=kernel RUN_INPUT=y run uninstall_flow
+assert_true "a kernel uninstall still removes it" test ! -e "${AWG_MODULES_LOAD_FILE}"
 
 echo
 echo "BoringTun host tests: ${PASS} passed, ${FAIL} failed"
