@@ -71,7 +71,7 @@ EOF
 # Run a script with the mocks first in PATH, the fixture pin and contract, and
 # GITHUB_REPOSITORY. Sets RUN_RC, RUN_OUT and RUN_ERR.
 run_release() {
-	env PATH="${BIN_DIR}:${PATH}" MOCK="${MOCK}" GITHUB_REPOSITORY="${REPO}" \
+	env PATH="${BIN_DIR}:${PATH}" MOCK="${MOCK}" GITHUB_REPOSITORY="${RUN_REPO-${REPO}}" \
 		BORINGTUN_PIN_FILE="${PIN_FILE}" BORINGTUN_RELEASE_FILE="${CONTRACT}" \
 		bash "${RELEASE_SCRIPT}" "$@" >"${TEST_ROOT}/run.out" 2>"${TEST_ROOT}/run.err"
 	RUN_RC=$?
@@ -496,7 +496,8 @@ asset=${X_NAME} archive_sha256=$(sha_of "${GOOD}/${X_NAME}") binary_sha256=$(bin
 asset=${A_NAME} archive_sha256=$(sha_of "${GOOD}/${A_NAME}") binary_sha256=$(binary_sha_of "${GOOD}/${A_NAME}")
 asset=SHA256SUMS sha256=$(sha_of "${GOOD}/SHA256SUMS")" "${RUN_OUT}" \
 	"the plan names the exact tag, title, assets and hashes"
-run_release notes
+run_release notes "${ARTIFACTS_COMMIT}"
+assert_succeeds "notes for a full artifacts commit are printed"
 if [[ "${RUN_OUT}" == *"$(cat "${GOOD}/SHA256SUMS")"* && "${RUN_OUT}" == *RUSTSEC-2025-0069* && \
 	"${RUN_OUT}" == *"not position-independent"* && "${RUN_OUT}" == *"does not yet install BoringTun"* && \
 	"${RUN_OUT}" == *"not published or endorsed"* ]]; then
@@ -504,6 +505,39 @@ if [[ "${RUN_OUT}" == *"$(cat "${GOOD}/SHA256SUMS")"* && "${RUN_OUT}" == *RUSTSE
 else
 	not_ok "the notes carry the checksums, the advisory, the aarch64 non-PIE status and the scope"
 fi
+
+# The provenance command of the notes: every "gh attestation verify" line with
+# its continuation lines.
+notes_command() { # <notes>
+	awk '/gh attestation verify/ { on = 1 } on { print } on && !/\\$/ { on = 0 }' <<<"$1"
+}
+# The command the notes must give for archives built at <commit> on main.
+expected_command() { # <commit>
+	printf '%s\n' "gh attestation verify <archive> \\" "  --repo ${REPO} \\" "  --cert-identity \\" \
+		"    https://github.com/${REPO}/.github/workflows/boringtun-artifacts.yml@refs/heads/main \\" \
+		"  --source-digest $1 \\" "  --source-ref refs/heads/main \\" "  --deny-self-hosted-runners"
+}
+assert_eq "$(expected_command "${ARTIFACTS_COMMIT}")" "$(notes_command "${RUN_OUT}")" \
+	"the notes give one provenance command with the exact repository, identity, artifacts commit, ref and hosted runners"
+if [[ "$(grep -c 'gh attestation verify' <<<"${RUN_OUT}")" == 1 && "${RUN_OUT}" != *--signer-workflow* ]] &&
+	! grep -qE 'gh attestation verify [^\\]*--repo [^ ]+`?\.?$' <<<"${RUN_OUT}"; then
+	ok "  and no weaker command (repository only, or a prefix-matching signer workflow)"
+else
+	not_ok "  and no weaker command (repository only, or a prefix-matching signer workflow)"
+fi
+assert_true "  and its source digest is not BoringTun's source commit" \
+	test "$(notes_command "${RUN_OUT}" | grep -c -- "${PIN_COMMIT}")" -eq 0
+for BAD_COMMIT in "${ARTIFACTS_COMMIT:0:12}" "${ARTIFACTS_COMMIT^^}" "${ARTIFACTS_COMMIT:0:39}g" "${ARTIFACTS_COMMIT}0" ""; do
+	run_release notes "${BAD_COMMIT}"
+	assert_fails_with "the artifacts commit must be a full 40-character commit SHA" \
+		"notes refuse the artifacts commit '${BAD_COMMIT}'"
+done
+run_release notes
+assert_fails_with "notes <commit>" "notes refuse a missing artifacts commit"
+run_release notes "${ARTIFACTS_COMMIT}" main
+assert_fails_with "notes <commit>" "notes refuse an extra argument"
+RUN_REPO="" run_release notes "${ARTIFACTS_COMMIT}"
+assert_fails_with "GITHUB_REPOSITORY must be set to owner/repo" "notes refuse to print a command without the repository"
 
 check_contract() { # <message> <label> [overrides]...
 	local MESSAGE="$1" LABEL="$2"
@@ -656,6 +690,25 @@ IDENTITY="https://github.com/${REPO}/.github/workflows/boringtun-artifacts.yml@r
 assert_eq "2" "$(grep -c -- "--repo ${REPO} --cert-identity ${IDENTITY} --source-digest ${ARTIFACTS_COMMIT} --source-ref refs/heads/main --deny-self-hosted-runners$" "${MOCK}/attestation-args")" \
 	"both archives' provenance is verified against the exact workflow identity, commit and branch"
 
+# The notes a dry run writes, and publication uploads, name the commit the dry
+# run verified: not BoringTun's source commit, this checkout's HEAD or any other.
+assert_eq "$(expected_command "${ARTIFACTS_COMMIT}")" "$(notes_command "$(cat "${TEST_ROOT}/dry-ok/notes.md")")" \
+	"the dry run's notes give the provenance command for the verified artifacts commit"
+OTHER_COMMIT="fedcba9876543210fedcba9876543210fedcba98"
+reset_mock "${GOOD}"; edit_run ".head_sha = \"${OTHER_COMMIT}\""; edit_attestation ".digest = \"${OTHER_COMMIT}\""
+run_release dry-run "${RUN_ID}" "${OTHER_COMMIT}" main "${TEST_ROOT}/dry-other"
+assert_succeeds "a dry run of the same archives built at another commit passes"
+NOTES="$(cat "${TEST_ROOT}/dry-other/notes.md")"
+assert_eq "$(expected_command "${OTHER_COMMIT}")" "$(notes_command "${NOTES}")" \
+	"  and its notes name that commit as the source digest"
+HEAD_COMMIT="$(git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || true)"
+if [[ "${NOTES}" != *"${ARTIFACTS_COMMIT}"* && "$(notes_command "${NOTES}")" != *"${PIN_COMMIT}"* && \
+	( -z "${HEAD_COMMIT}" || "${NOTES}" != *"${HEAD_COMMIT}"* ) ]]; then
+	ok "  and neither the other run's commit, BoringTun's source commit nor this checkout's HEAD"
+else
+	not_ok "  and neither the other run's commit, BoringTun's source commit nor this checkout's HEAD"
+fi
+
 dry_fails() { # <message> <label>
 	run_release dry-run "${RUN_ID}" "${ARTIFACTS_COMMIT}" main "${TEST_ROOT}/dry-${RANDOM}${RANDOM}"
 	assert_fails_with "$1" "$2"
@@ -740,6 +793,12 @@ if grep -q -- '-F draft=true' "${MOCK}/calls" && grep -q -- '-F prerelease=true'
 	ok "the release is created as a draft pre-release for the reviewed commit"
 else
 	not_ok "the release is created as a draft pre-release for the reviewed commit"
+fi
+if grep -q -- "-F body=@${TEST_ROOT}/pub-ok/notes.md" "${MOCK}/calls" && \
+	[[ "$(notes_command "$(cat "${TEST_ROOT}/pub-ok/notes.md")")" == "$(expected_command "${ARTIFACTS_COMMIT}")" ]]; then
+	ok "the published notes give the provenance command for the published commit"
+else
+	not_ok "the published notes give the provenance command for the published commit"
 fi
 assert_eq "3" "$(grep -c '^api -H Accept: application/octet-stream repos/.*/releases/assets/' "${MOCK}/calls")" \
 	"every draft asset is read back before publication"
