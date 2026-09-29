@@ -332,6 +332,19 @@ awg_protocol_is_proxy_compatible() {
     esac
 }
 
+# The proxy runs only in front of the kernel backend. A missing or empty
+# AWG_BACKEND is the installer's legacy default (kernel). BoringTun, and every
+# other or malformed value, fails closed.
+awg_backend_is_proxy_compatible() {
+    local backend="${1:-}"
+    backend="${backend#"${backend%%[![:space:]]*}"}"
+    backend="${backend%"${backend##*[![:space:]]}"}"
+    case "${backend}" in
+        ""|kernel) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Detect the active AmneziaWG interface and its config file.
 # Sets AWG_NIC, AWG_CONF_FILE, and LISTEN_PORT (if not already set).
 detect_awg_config() {
@@ -342,10 +355,26 @@ detect_awg_config() {
     # Try to read the params file saved by amneziawg-install.sh
     if validate_params_file "${params_file}"; then
         # Source params in a subshell to avoid polluting current environment.
-        local nic port proto
+        # AWG_BACKEND is unset first, so an exported value cannot stand in for
+        # a params file written before backends existed.
+        local nic port proto backend
         nic="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_AWG_NIC:-}"' _ "${params_file}")"
         port="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_PORT:-}"' _ "${params_file}")"
         proto="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${AWG_PROTOCOL_VERSION-}"' _ "${params_file}")"
+        backend="$(bash -c 'unset AWG_BACKEND; . "$1" 2>/dev/null && printf "%s" "${AWG_BACKEND-}"' _ "${params_file}")"
+
+        if ! awg_backend_is_proxy_compatible "${backend}"; then
+            if [[ "${backend}" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
+                error "AmneziaWG backend '${backend}' detected in ${params_file}."
+            else
+                error "An unsupported AmneziaWG backend is configured in ${params_file}."
+            fi
+            die "amneziawg-proxy runs only in front of the AmneziaWG kernel backend.
+The BoringTun backend cannot be used behind the standalone proxy: BoringTun
+always listens on every address, so the backend port the proxy moves AWG to
+would stay public. Keep this host without the proxy, or reinstall AmneziaWG
+with the kernel backend."
+        fi
 
         if [[ -n "${nic}" ]]; then
             AWG_NIC="${nic}"

@@ -568,6 +568,68 @@ assert_rc 1 _proxy_proto "2.1"
 assert_rc 1 _proxy_proto "30"
 assert_rc 1 _proxy_proto "3.1-rc"
 
+# ── awg_backend_is_proxy_compatible / detect_awg_config backend guard ─────────
+
+echo "=== awg_backend_is_proxy_compatible ==="
+_proxy_backend() { run_install_helper awg_backend_is_proxy_compatible "$@"; }
+# Missing/empty backend state is the installer's legacy default (kernel).
+assert_rc 0 _proxy_backend ""
+assert_rc 0 _proxy_backend "kernel"
+assert_rc 0 _proxy_backend " kernel "
+# BoringTun and any other or malformed backend must fail closed.
+assert_rc 1 _proxy_backend "boringtun"
+assert_rc 1 _proxy_backend " boringtun "
+assert_rc 1 _proxy_backend "BoringTun"
+assert_rc 1 _proxy_backend "Kernel"
+assert_rc 1 _proxy_backend "kernel0"
+assert_rc 1 _proxy_backend "userspace"
+assert_rc 1 _proxy_backend $'kernel\nboringtun'
+
+echo "=== detect_awg_config backend guard ==="
+# detect_awg_config against a params file with the given extra lines; the file
+# is not root-owned here, so the ownership check is stubbed. Prints
+# "<rc>|<its output on one line>".
+_detect_with_params() { # <exported AWG_BACKEND or -> <params lines...>
+    local exported="$1"
+    shift
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    printf '%s\n' "SERVER_AWG_NIC='awg0'" "SERVER_PORT='51820'" "$@" > "${tmpdir}/params"
+    (
+        set --
+        if [[ "${exported}" != "-" ]]; then
+            export AWG_BACKEND="${exported}"
+        fi
+        source "${INSTALL_SCRIPT}"
+        info()  { :; }
+        warn()  { :; }
+        step()  { :; }
+        validate_params_file() { return 0; }
+        AWG_DIR="${tmpdir}"
+        LISTEN_PORT=""
+        detect_awg_config >/dev/null
+    ) >"${tmpdir}/out" 2>&1
+    printf '%s|%s' "$?" "$(tr '\n' ' ' <"${tmpdir}/out")"
+    rm -rf -- "${tmpdir}"
+}
+_detect_rc() { _detect_with_params "$@" | cut -d'|' -f1; }
+assert_eq "0" "$(_detect_rc - "AWG_BACKEND='kernel'")" "detect_awg_config: kernel backend accepted"
+assert_eq "0" "$(_detect_rc - "AWG_BACKEND=''")" "detect_awg_config: empty backend (legacy default) accepted"
+assert_eq "0" "$(_detect_rc -)" "detect_awg_config: params without AWG_BACKEND accepted"
+assert_eq "0" "$(_detect_rc boringtun)" \
+    "detect_awg_config: an exported AWG_BACKEND=boringtun does not stand in for legacy params"
+assert_eq "0" "$(_detect_rc - "AWG_BACKEND='kernel'" "AWG_PROTOCOL_VERSION='2'")" \
+    "detect_awg_config: kernel + AWG 2.0 stays accepted"
+assert_eq "1" "$(_detect_rc - "AWG_BACKEND='boringtun'")" "detect_awg_config: BoringTun backend refused"
+assert_eq "1" "$(_detect_rc kernel "AWG_BACKEND='boringtun'")" \
+    "detect_awg_config: an exported AWG_BACKEND=kernel does not hide a BoringTun params file"
+assert_eq "1" "$(_detect_rc - "AWG_BACKEND='userspace'")" "detect_awg_config: unknown backend refused"
+DETECT_BT_OUTPUT="$(_detect_with_params - "AWG_BACKEND='boringtun'" | cut -d'|' -f2-)"
+assert_eq "1" "$(grep -c 'runs only in front of the AmneziaWG kernel backend' <<<"${DETECT_BT_OUTPUT}")" \
+    "detect_awg_config: the refusal explains that the proxy needs the kernel backend"
+assert_eq "1" "$(_detect_rc - "AWG_BACKEND='kernel'" "AWG_PROTOCOL_VERSION='3'")" \
+    "detect_awg_config: the AWG 3.x refusal is unchanged"
+
 # ── _validate_dns_upstream ────────────────────────────────────────────────────
 
 echo "=== _validate_dns_upstream ==="
