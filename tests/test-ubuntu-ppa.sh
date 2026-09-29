@@ -1217,7 +1217,12 @@ assert_contains "suite 'noble' and architecture 'arm64'" "${CANDIDATE_ERR}" "pre
 
 # The Ubuntu install flow refreshes the lists, then checks the candidate, then
 # installs; the Debian and Raspberry Pi branch is untouched by the pinning.
+# The PPA preparation and the Debian APT source are functions that the kernel
+# and BoringTun installs share; they are read inline at their call sites.
+shopt -u patsub_replacement 2>/dev/null || true
 INSTALL_BODY="$(declare -f installAmneziaWG)"
+INSTALL_BODY="${INSTALL_BODY/prepareUbuntuAmneziaPpaForInstall;/$(declare -f prepareUbuntuAmneziaPpaForInstall)}"
+INSTALL_BODY="${INSTALL_BODY/configureDebianAmneziaAptSource 1;/$(declare -f configureDebianAmneziaAptSource)}"
 UBUNTU_BRANCH="$(awk '/OS.* == .debian. /{exit} /OS.* == .ubuntu. /{p=1} p' <<< "${INSTALL_BODY}")"
 DEBIAN_BRANCH="$(awk '/OS.* == .fedora. /{exit} /OS.* == .debian. /{p=1} p' <<< "${INSTALL_BODY}")"
 UPDATE_LINE=$(grep -n 'APT::Update::Error-Mode=any update' <<< "${UBUNTU_BRANCH}" | head -1 | cut -d: -f1)

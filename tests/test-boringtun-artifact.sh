@@ -256,10 +256,14 @@ else
 	not_ok "the repository's own pin file is valid"
 fi
 # Scripts, workflows and configuration must read the commit from pin.env rather
-# than repeat it; documentation may quote it. The one exception is the release
+# than repeat it; documentation may quote it. The exceptions are the release
 # contract, a reviewed statement of what a release contains, which the release
-# script refuses when it disagrees with the pin.
-assert_eq "packaging/boringtun/pin.env
+# script refuses when it disagrees with the pin, and amneziawg-install.sh,
+# which embeds the published release as its trust anchor because it is used as
+# a single downloaded file; tests/test-boringtun-host.sh keeps those embedded
+# values equal to pin.env and the release contract.
+assert_eq "amneziawg-install.sh
+packaging/boringtun/pin.env
 packaging/boringtun/release.env" \
 	"$(cd "${PROJECT_ROOT}" && grep -rlF --exclude-dir=.git --exclude-dir=target --exclude='*.md' \
 		-e "${REPO_PIN_COMMIT:-unset}" . | sed 's#^\./##' | LC_ALL=C sort)" \
