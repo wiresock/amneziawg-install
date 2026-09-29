@@ -550,6 +550,28 @@ check_set "not exactly the two archives and SHA256SUMS" "a symlink in place of a
 bad_set dup-sums; printf '%s  %s\n' "$(sha_of "${GOOD}/${X_NAME}")" "${X_NAME}" >>"${BAD}/SHA256SUMS"
 check_set "SHA256SUMS is not the one the release contract gives" "a SHA256SUMS with a duplicate entry is refused"
 
+# SHA256SUMS is compared byte for byte, trailing newlines included, before any
+# archive is looked at.
+sums_differ() { # <label>
+	check_set "SHA256SUMS is not the one the release contract gives" "$1"
+	if [[ "${RUN_ERR}" != *"failed archive verification"* && "${RUN_ERR}" != *"verified "* ]]; then
+		ok "  by the SHA256SUMS comparison, before any archive is checked"
+	else
+		not_ok "  by the SHA256SUMS comparison, before any archive is checked"
+	fi
+}
+bad_set sums-blank-line; printf '\n' >>"${BAD}/SHA256SUMS"
+sums_differ "a SHA256SUMS with an extra blank line at the end is refused"
+bad_set sums-no-newline; truncate -s -1 "${BAD}/SHA256SUMS"
+assert_true "(fixture: that SHA256SUMS ends without a newline)" test "$(tail -c 1 "${BAD}/SHA256SUMS" | wc -l)" -eq 0
+sums_differ "a SHA256SUMS without its final newline is refused"
+bad_set sums-crlf; sed -i 's/$/\r/' "${BAD}/SHA256SUMS"
+sums_differ "a SHA256SUMS with CRLF line ends is refused"
+bad_set sums-exact
+printf '%s  %s\n' "$(sha_of "${GOOD}/${A_NAME}")" "${A_NAME}" "$(sha_of "${GOOD}/${X_NAME}")" "${X_NAME}" >"${BAD}/SHA256SUMS"
+run_release verify-assets "${BAD}" "${TEST_ROOT}/verify-sums-exact"
+assert_succeeds "a SHA256SUMS of exactly the contract's bytes is accepted"
+
 echo "=== Workflow run ==="
 
 reset_mock "${GOOD}"

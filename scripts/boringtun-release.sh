@@ -293,7 +293,7 @@ btr_check_run() {
 # through the artifact script (without running the binaries, which may be of
 # another architecture), with the binary's SHA-256 from the contract.
 btr_verify_assets() {
-    local dir="$1" work="$2" arch k name archive binary listing expected
+    local dir="$1" work="$2" arch k name archive binary listing expected sums
 
     if [[ ! -d "${dir}" || -L "${dir}" ]]; then
         bta_err "asset directory is missing: ${dir}"
@@ -306,7 +306,10 @@ btr_verify_assets() {
         bta_err "the artifact set is not exactly the two archives and SHA256SUMS, as regular files"
         return 1
     fi
-    if [[ "$(cat -- "${dir}/SHA256SUMS")" != "$(btr_expected_sums)" ]]; then
+    # Compared as files: a command substitution would drop trailing newlines.
+    sums="${work}/SHA256SUMS.expected"
+    btr_expected_sums >"${sums}" || return 1
+    if ! cmp -s -- "${dir}/SHA256SUMS" "${sums}"; then
         bta_err "SHA256SUMS is not the one the release contract gives"
         return 1
     fi
