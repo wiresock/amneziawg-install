@@ -39,6 +39,8 @@ mutant() {
 T=$'\t'
 
 # Activation boundary and store verification.
+mutant env_selects_backend $'_AWG_BACKEND_REQUESTED="${AWG_BACKEND-}"\nAWG_BACKEND="${AWG_BACKEND_KERNEL}"' \
+	$'_AWG_BACKEND_REQUESTED="${AWG_BACKEND-}"\nAWG_BACKEND="${AWG_BACKEND:-${AWG_BACKEND_KERNEL}}"'
 mutant no_sha_check 'if [[ "${ACTUAL_SHA}" != "${FIELDS[binary_sha256]}" ]]; then' 'if false; then'
 mutant no_mode_check '(((8#${MODE} & 8#022) == 0)) || return 1' ':'
 mutant no_ancestor_check $'function _awgBtTrustedAncestors() {\n' $'function _awgBtTrustedAncestors() {\n\treturn 0\n'

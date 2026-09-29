@@ -140,6 +140,7 @@ AWG_BT_PATH="${MOCKBIN}:/usr/local/bin:/usr/bin:/bin"
 AWG_BT_READY_TIMEOUT=5
 AWG_BT_HOST_ARCH="x86_64"
 AWG_BT_TMP_DIR="${T}/tmp"
+AWG_BT_MODPROBE_OVERRIDE="${T}/etc/modprobe.d/amneziawg-install-boringtun.conf"
 NET="${AWG_BT_SYS_DIR}/class/net"
 mkdir -p "${T}/lib" "${T}/run" "${AWG_BT_CONFIG_DIR}" "${AWG_BT_SYSTEMD_DIR}" \
 	"${T}/usr/lib/systemd" "${AWG_BT_WG_SOCKET_DIR}" "${AWG_BT_AWG_SOCKET_DIR}" "${NET}" \
@@ -311,6 +312,16 @@ cat >"${MOCKBIN}/modinfo" <<EOF
 #!/bin/bash
 echo "modinfo \$*" >>'${S}/log'
 exit "\$(cat '${S}/modinfo-rc' 2>/dev/null || echo 1)"
+EOF
+
+# modprobe -n -v <name>: what modprobe would do. By default both the module and
+# its rtnl-link alias resolve to the installer's install command.
+cat >"${MOCKBIN}/modprobe" <<EOF
+#!/bin/bash
+echo "modprobe \$*" >>'${S}/log'
+NAME="\${!#}"
+if [[ -f "${S}/modprobe-\${NAME}" ]]; then cat "${S}/modprobe-\${NAME}"; else echo 'install /bin/false '; fi
+exit "\$(cat '${S}/modprobe-rc' 2>/dev/null || echo 0)"
 EOF
 
 cat >"${MOCKBIN}/ip" <<EOF
@@ -968,7 +979,7 @@ FIRST_LAUNCH="$(cat "${LAUNCH}")"
 _awgBtInstallHelpers
 assert_eq "0" "${_AWG_BT_FILE_CHANGED}" "regenerating unchanged helpers leaves them alone"
 assert_eq "${FIRST_LAUNCH}" "$(_awgBtRenderHelper launch)" "helper output is deterministic"
-assert_eq "${FIRST_LAUNCH}" "$(env SERVER_PRIV_KEY=secret WG_LOG_FILE=/x AWG_BT_STORE_DIR=/evil TMPD="${AWG_BT_TMP_DIR}" bash -c 'source "$1"; AWG_BT_TRUST_ANCHOR="$2"; AWG_BT_TRUSTED_UID="$3"; AWG_BT_STORE_DIR="$4"; AWG_BT_LIBEXEC_DIR="$5"; AWG_BT_RUN_DIR="$6"; AWG_BT_CONFIG_DIR="$7"; AWG_BT_SYSTEMD_DIR="$8"; AWG_BT_UNIT_DIRS="$9"; shift 9; AWG_BT_SYSTEMD_RUNTIME_DIR="$1"; AWG_BT_WG_SOCKET_DIR="$2"; AWG_BT_AWG_SOCKET_DIR="$3"; AWG_BT_SYS_DIR="$4"; AWG_BT_PROC_DIR="$5"; AWG_BT_TUN_DEVICE="$6"; AWG_BT_PATH="$7"; AWG_BT_READY_TIMEOUT="$8"; AWG_BT_HOST_ARCH="$9"; AWG_BT_TMP_DIR="${TMPD}"; _awgBtRenderHelper launch' _ \
+assert_eq "${FIRST_LAUNCH}" "$(env SERVER_PRIV_KEY=secret WG_LOG_FILE=/x AWG_BT_STORE_DIR=/evil AWG_BT_MODPROBE_OVERRIDE=/evil TMPD="${AWG_BT_TMP_DIR}" MPO="${AWG_BT_MODPROBE_OVERRIDE}" bash -c 'source "$1"; AWG_BT_TRUST_ANCHOR="$2"; AWG_BT_TRUSTED_UID="$3"; AWG_BT_STORE_DIR="$4"; AWG_BT_LIBEXEC_DIR="$5"; AWG_BT_RUN_DIR="$6"; AWG_BT_CONFIG_DIR="$7"; AWG_BT_SYSTEMD_DIR="$8"; AWG_BT_UNIT_DIRS="$9"; shift 9; AWG_BT_SYSTEMD_RUNTIME_DIR="$1"; AWG_BT_WG_SOCKET_DIR="$2"; AWG_BT_AWG_SOCKET_DIR="$3"; AWG_BT_SYS_DIR="$4"; AWG_BT_PROC_DIR="$5"; AWG_BT_TUN_DEVICE="$6"; AWG_BT_PATH="$7"; AWG_BT_READY_TIMEOUT="$8"; AWG_BT_HOST_ARCH="$9"; AWG_BT_TMP_DIR="${TMPD}"; AWG_BT_MODPROBE_OVERRIDE="${MPO}"; _awgBtRenderHelper launch' _ \
 	"${INSTALLER}" "${AWG_BT_TRUST_ANCHOR}" "${AWG_BT_TRUSTED_UID}" "${AWG_BT_STORE_DIR}" "${AWG_BT_LIBEXEC_DIR}" \
 	"${AWG_BT_RUN_DIR}" "${AWG_BT_CONFIG_DIR}" "${AWG_BT_SYSTEMD_DIR}" "${AWG_BT_UNIT_DIRS}" "${AWG_BT_SYSTEMD_RUNTIME_DIR}" \
 	"${AWG_BT_WG_SOCKET_DIR}" "${AWG_BT_AWG_SOCKET_DIR}" "${AWG_BT_SYS_DIR}" "${AWG_BT_PROC_DIR}" "${AWG_BT_TUN_DEVICE}" \
@@ -1349,6 +1360,68 @@ else
 	ok "precheck fails closed when modinfo is unavailable (skipped: a real modinfo is on the helper PATH)"
 fi
 mv "${T}/modinfo.saved" "${MOCKBIN}/modinfo"
+
+# An installed module is accepted only while the installer's load override is
+# in force: its exact, trusted file, and modprobe resolving both the module and
+# the rtnl-link alias to that install command.
+OVERRIDE="${AWG_BT_MODPROBE_OVERRIDE}"
+module_check() { # <expected rc> <label>
+	run _awgBtCheckKernelModule
+	assert_rc "$1" "${RC}" "$2"
+}
+mkdir -p "${OVERRIDE%/*}"
+chmod 0755 "${T}/etc" "${OVERRIDE%/*}"
+echo 0 >"${S}/modinfo-rc"
+_awgBtRenderModprobeOverride >"${OVERRIDE}"
+chmod 0644 "${OVERRIDE}"
+: >"${S}/log"
+module_check 0 "an installed module blocked by the installer's override passes the module check"
+assert_contains "modprobe -n -v amneziawg" "$(cat "${S}/log")" "the override is checked for the module name"
+assert_contains "modprobe -n -v rtnl-link-amneziawg" "$(cat "${S}/log")" "and for the rtnl-link alias that ip link add requests"
+assert_eq "install amneziawg /bin/false" "$(grep -v '^#' "${OVERRIDE}")" "the override's only directive is 'install amneziawg /bin/false'"
+precheck_ok_with_override() {
+	run ctl_precheck "${IF}"
+	if [[ "${ERR}" != *"kernel module"* && "${ERR}" != *"autoload"* ]]; then ok "$1"; else not_ok "$1 (rc=${RC}: ${ERR})"; fi
+}
+precheck_ok_with_override "precheck does not refuse a module that the override blocks"
+mkdir -p "${AWG_BT_SYS_DIR}/module/amneziawg"
+precheck_refused "a loaded module is refused even with the override in place" "kernel module is loaded"
+rmdir "${AWG_BT_SYS_DIR}/module/amneziawg"
+printf '%s\n# local edit\n' "$(_awgBtRenderModprobeOverride)" >"${OVERRIDE}"
+module_check 1 "a changed override file does not count"
+printf 'blacklist amneziawg\n' >"${OVERRIDE}"
+module_check 1 "a blacklist line instead of the install command does not count"
+_awgBtRenderModprobeOverride >"${OVERRIDE}"
+chmod 0664 "${OVERRIDE}"
+module_check 1 "a group-writable override file does not count"
+chmod 0644 "${OVERRIDE}"
+mv "${OVERRIDE}" "${T}/override.real"
+ln -s "${T}/override.real" "${OVERRIDE}"
+module_check 1 "an override that is a symlink does not count"
+rm -f "${OVERRIDE}"
+mv "${T}/override.real" "${OVERRIDE}"
+chmod 0777 "${OVERRIDE%/*}"
+module_check 1 "an override in a directory writable by others does not count"
+chmod 0755 "${OVERRIDE%/*}"
+echo "insmod /lib/modules/x/amneziawg.ko" >"${S}/modprobe-amneziawg"
+module_check 1 "an override that another modprobe configuration outranks does not count"
+rm -f "${S}/modprobe-amneziawg"
+echo "insmod /lib/modules/x/amneziawg.ko" >"${S}/modprobe-rtnl-link-amneziawg"
+module_check 1 "an override that does not cover the rtnl-link alias does not count"
+rm -f "${S}/modprobe-rtnl-link-amneziawg"
+echo 1 >"${S}/modprobe-rc"
+module_check 1 "a failing modprobe dry run does not count"
+rm -f "${S}/modprobe-rc"
+mv "${MOCKBIN}/modprobe" "${T}/modprobe.saved"
+if ! PATH="${AWG_BT_PATH}" command -v modprobe >/dev/null 2>&1; then
+	module_check 1 "without modprobe the override cannot be proven in force"
+else
+	ok "without modprobe the override cannot be proven in force (skipped: a real modprobe is on the helper PATH)"
+fi
+mv "${T}/modprobe.saved" "${MOCKBIN}/modprobe"
+module_check 0 "the restored override passes again"
+rm -f "${OVERRIDE}" "${S}/modinfo-rc"
+module_check 0 "without an installed module the override is irrelevant"
 
 AWG_BT_TUN_DEVICE="${T}/no-tun"
 install_helpers

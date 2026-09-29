@@ -597,9 +597,53 @@ FRESH_BACKEND="$(
 	printf '%s' "${AWG_BACKEND}"
 )"
 assert_eq "kernel" "${FRESH_BACKEND}" \
-	"AUTO_INSTALL answers select the kernel backend even with AWG_BACKEND=boringtun exported"
+	"AUTO_INSTALL answers ignore an AWG_BACKEND=boringtun exported after the installer loaded"
 assert_eq "AWG_BACKEND='kernel'" "$(grep '^AWG_BACKEND=' "${FRESH_PARAMS}" 2>/dev/null)" \
 	"a fresh installation persists AWG_BACKEND='kernel'"
+
+# A fresh install takes the backend from AWG_BACKEND as it was when the
+# installer loaded: unset or empty is the kernel default.
+fresh_selection() { # <env assignment or "unset">
+	# shellcheck disable=SC2016
+	if [[ "$1" == unset ]]; then
+		env -u AWG_BACKEND bash -c 'source "$1" && selectFreshInstallBackend && printf "%s" "${AWG_BACKEND}"' _ "${INSTALLER}" 2>/dev/null
+	else
+		env "$1" bash -c 'source "$1" && selectFreshInstallBackend && printf "%s" "${AWG_BACKEND}"' _ "${INSTALLER}" 2>/dev/null
+	fi
+	printf '|%s' "$?"
+}
+assert_eq "kernel|0" "$(fresh_selection unset)" "a fresh install without AWG_BACKEND selects the kernel backend"
+assert_eq "kernel|0" "$(fresh_selection AWG_BACKEND=)" "a fresh install with an empty AWG_BACKEND selects the kernel backend"
+assert_eq "kernel|0" "$(fresh_selection AWG_BACKEND=kernel)" "a fresh install with AWG_BACKEND=kernel selects the kernel backend"
+assert_eq "boringtun|0" "$(fresh_selection AWG_BACKEND=boringtun)" "a fresh install with AWG_BACKEND=boringtun selects BoringTun"
+for BACKEND_VALUE in userspace BoringTun "boringtun " kernel0; do
+	assert_eq "|1" "$(fresh_selection "AWG_BACKEND=${BACKEND_VALUE}")" \
+		"a fresh install refuses AWG_BACKEND='${BACKEND_VALUE}' instead of falling back to the kernel"
+done
+FRESH_BT_PARAMS="${TEST_ROOT}/params.fresh-boringtun"
+# shellcheck disable=SC2016
+env AWG_BACKEND=boringtun bash -c 'source "$1" || exit 1
+	AUTO_INSTALL=y SERVER_PUB_IP=198.51.100.20 SERVER_PUB_NIC=eth0 SERVER_AWG_NIC=awg0 SERVER_PORT=51820 ENABLE_IPV6=n
+	installQuestions >/dev/null 2>&1 || exit 1
+	serializeParams "$2"' _ "${INSTALLER}" "${FRESH_BT_PARAMS}"
+assert_eq "AWG_BACKEND='boringtun'" "$(grep '^AWG_BACKEND=' "${FRESH_BT_PARAMS}" 2>/dev/null)" \
+	"a fresh BoringTun installation persists AWG_BACKEND='boringtun'"
+
+# Existing installations: persisted state wins over an AWG_BACKEND that was in
+# the caller's environment when the installer loaded, in both directions.
+persisted_wins() { # <persisted value> <exported value>
+	install_params "${LEGACY_PARAMS}" "AWG_BACKEND='$1'"
+	# shellcheck disable=SC2016
+	env "AWG_BACKEND=$2" PATH="${STAT_BIN_DIR}:${PATH}" bash -c 'source "$1" || exit 1
+		AMNEZIAWG_DIR="$2"
+		validateParamsFile >/dev/null 2>&1 || exit 1
+		printf "%s" "${AWG_BACKEND}"' _ "${INSTALLER}" "${PARAMS_FIXTURE}/state"
+}
+assert_eq "kernel" "$(persisted_wins kernel boringtun)" \
+	"an existing kernel installation stays kernel when AWG_BACKEND=boringtun is exported"
+assert_eq "boringtun" "$(persisted_wins boringtun kernel)" \
+	"an existing BoringTun installation stays BoringTun when AWG_BACKEND=kernel is exported"
+install_params "${CURRENT_PARAMS}"
 
 echo "=== Backend readiness dispatch ==="
 
@@ -1217,6 +1261,31 @@ run_captured with_wrapped_seam scenario_migration_reload
 assert_datapath_through_seam "a legacy parameter migration reaches the datapath only through the seam"
 run_captured with_wrapped_seam scenario_protocol_mode
 assert_datapath_through_seam "enabling AWG 3.0 reaches the datapath only through the seam"
+
+echo "=== Deliberate service starts ==="
+
+# The BoringTun drop-in's start rate limit is for crash loops; a management
+# operation that restarts the unit resets it first. The kernel unit is left
+# alone: its path runs no extra command.
+prepare_start_case() { # <backend case>
+	reset_calls
+	(
+		systemctl() { printf 'systemctl %s\n' "$*" >>"${BT_CALL_LOG}"; }
+		apply_backend_case "$1"
+		SERVER_AWG_NIC="awgt0"
+		awgBackendPrepareServiceStart
+	) >/dev/null 2>&1
+	raw_calls
+}
+assert_eq "" "$(prepare_start_case kernel)" "a deliberate kernel start runs no extra command"
+assert_eq "systemctl reset-failed awgt0.service" "$(prepare_start_case boringtun | sed 's/awg-quick@//')" \
+	"a deliberate BoringTun start first resets the unit's start rate limit"
+assert_eq "" "$(prepare_start_case userspace)" "an unknown backend gets no reset"
+TRANSACTION_BODY="$(declare -f applyAwgProtocolTransaction)"
+assert_eq "2" "$(grep -c 'awgBackendPrepareServiceStart' <<<"${TRANSACTION_BODY}")" \
+	"the protocol transaction prepares both its restart and its rollback restart"
+assert_eq "1" "$(declare -f ensureAwgQuickRunning | grep -c 'awgBackendPrepareServiceStart')" \
+	"ensureAwgQuickRunning prepares its start"
 
 printf '\n%d tests, %d failures\n' "$((PASS + FAIL))" "${FAIL}"
 (( FAIL == 0 ))
