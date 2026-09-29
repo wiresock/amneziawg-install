@@ -4222,11 +4222,9 @@ function _awgBtHostArch() {
 # start. Between it and the exec only root can change these files, because no
 # path component is writable by anyone else.
 function _awgBtVerifyStore() {
-	local STORE="${AWG_BT_STORE_DIR}" RELEASE_ID="" RELEASE BINARY MANIFEST LINE KEY VALUE
-	local ARCH OWNER="" MODE="" ACTUAL_SHA="" CANONICAL_STORE CANONICAL_BINARY
-	local -A FIELDS=()
+	local STORE="${AWG_BT_STORE_DIR}" RELEASE_ID="" OWNER="" MODE=""
 	_AWG_BT_VERIFIED_BIN=""
-	if ! ARCH="$(_awgBtHostArch)"; then
+	if ! _awgBtHostArch >/dev/null; then
 		_awgBtErr "BoringTun artifacts exist only for x86_64 and aarch64 hosts"
 		return 1
 	fi
@@ -4243,6 +4241,29 @@ function _awgBtVerifyStore() {
 	if [[ "${OWNER}" != "${AWG_BT_TRUSTED_UID}" ]] || \
 		! [[ "${RELEASE_ID}" =~ ^boringtun-cli-[0-9]+\.[0-9]+\.[0-9]+-g[0-9a-f]{12}-linux-(x86_64|aarch64)-musl$ ]]; then
 		_awgBtErr "${STORE}/current must be a root-owned link to a release directory in the store"
+		return 1
+	fi
+	_awgBtVerifyRelease "${RELEASE_ID}"
+}
+
+# The checks of _awgBtVerifyStore for the release directory RELEASE_ID of the
+# store, whether or not current selects it: the installer runs them before it
+# points current at a release. Sets _AWG_BT_VERIFIED_BIN.
+function _awgBtVerifyRelease() { # <release id>
+	local STORE="${AWG_BT_STORE_DIR}" RELEASE_ID="$1" RELEASE BINARY MANIFEST LINE KEY VALUE
+	local ARCH ACTUAL_SHA="" CANONICAL_STORE CANONICAL_BINARY
+	local -A FIELDS=()
+	_AWG_BT_VERIFIED_BIN=""
+	if ! ARCH="$(_awgBtHostArch)"; then
+		_awgBtErr "BoringTun artifacts exist only for x86_64 and aarch64 hosts"
+		return 1
+	fi
+	if ! _awgBtTrustedAncestors "${STORE}" || ! _awgBtTrustedNode "${STORE}" dir; then
+		_awgBtErr "the BoringTun store ${STORE} is missing, or it or a parent directory is writable by someone other than root"
+		return 1
+	fi
+	if ! [[ "${RELEASE_ID}" =~ ^boringtun-cli-[0-9]+\.[0-9]+\.[0-9]+-g[0-9a-f]{12}-linux-(x86_64|aarch64)-musl$ ]]; then
+		_awgBtErr "${RELEASE_ID} is not the name of a BoringTun release directory"
 		return 1
 	fi
 	RELEASE="${STORE}/${RELEASE_ID}"
@@ -5664,7 +5685,7 @@ function awgBackendCtlMain() {
 }
 
 # Functions the generated helpers carry. Keep in step with their callers.
-_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtRemoveOwnedPath _awgBtSocketHeldBy _awgBtSymlinkToNode _awgBtProveUapiNodes _awgBtNewToken _awgBtCurrentAttempt _awgBtAttemptBase _awgBtStateFile _awgBtFlagsArm _awgBtFlagRaise _awgBtFlagIs _awgBtAttemptRemove _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
+_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtVerifyRelease _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtRemoveOwnedPath _awgBtSocketHeldBy _awgBtSymlinkToNode _awgBtProveUapiNodes _awgBtNewToken _awgBtCurrentAttempt _awgBtAttemptBase _awgBtStateFile _awgBtFlagsArm _awgBtFlagRaise _awgBtFlagIs _awgBtAttemptRemove _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
 _AWG_BT_LAUNCH_FUNCTIONS="awgBoringtunLaunchMain _awgBtRecordSocketNodes _awgBtLaunchRefused _awgBtLaunchFailed"
 _AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtWithoutSaveConfig _awgBtTryDownCopy _awgBtDownCopy _awgBtLinkIsOwned _awgBtGuardedDown _awgBtRecordFailedDown _awgBtReplayPostDown _awgBtReportUnfinishedDown _awgBtFilteredStrip _awgBtSync _awgBtRenderModprobeOverride _awgBtModprobeActionBlocked _awgBtKernelModuleBlocked _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtVerifyActiveInstance _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
 
@@ -6660,11 +6681,9 @@ function installBoringtunHostPackages() {
 
 # Check a release directory against the embedded contract: exactly the four
 # regular files, a MANIFEST that describes this exact release (read as data),
-# and a binary with the embedded SHA-256 that, unless RUN is 0, reports the
-# release version. The binary runs only after its hash has matched, and only
-# in the store: the download directory may be on a noexec /tmp.
-function _awgBtCheckReleaseDir() { # <dir> <arch> [RUN]
-	local DIR="$1" ARCH="$2" RUN="${3:-1}" FILE LINE KEY VALUE ACTUAL VERSION
+# and a binary with the embedded SHA-256. Nothing in it runs.
+function _awgBtCheckReleaseDir() { # <dir> <arch>
+	local DIR="$1" ARCH="$2" FILE LINE KEY VALUE ACTUAL
 	local -A FIELDS=()
 	for FILE in LICENSE MANIFEST THIRD-PARTY-LICENSES boringtun-cli; do
 		if [[ -L "${DIR}/${FILE}" || ! -f "${DIR}/${FILE}" ]]; then
@@ -6706,8 +6725,46 @@ function _awgBtCheckReleaseDir() { # <dir> <arch> [RUN]
 		echo "ERROR: boringtun-cli does not have the SHA-256 embedded in this installer (${_AWG_BT_REL_BINARY_SHA256})" >&2
 		return 1
 	fi
-	[[ "${RUN}" != 0 ]] || return 0
-	chmod 0755 -- "${DIR}/boringtun-cli" || return 1
+}
+
+# The one verification boundary for a release directory in the store, staged
+# or already there, before anything in it runs:
+#  1. the trusted path: every directory from the trust anchor down, the
+#     release directory itself, and exactly the four members as trusted
+#     regular files (the binary executable) with a single link each, so no
+#     symlink or hard link stands in for them and only root can change them;
+#  2. the embedded contract (_awgBtCheckReleaseDir), which reads the MANIFEST
+#     as data and hashes the binary;
+#  3. the binary is still the node that was hashed and still trusted, and only
+#     then does it run, to report the release version.
+# A directory that fails is never run and never made current. Between the last
+# check and the exec only root could replace the binary.
+function _awgBtVerifyCandidate() { # <release dir> <arch>
+	local DIR="$1" ARCH="$2" FILE KIND MEMBERS NODE_ID VERSION
+	if ! _awgBtTrustedAncestors "${DIR}" || ! _awgBtTrustedNode "${DIR}" dir; then
+		echo "ERROR: the BoringTun release directory ${DIR}, or a directory above it, is not root-owned or is writable by others" >&2
+		return 1
+	fi
+	MEMBERS="$(find "${DIR}" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | LC_ALL=C sort)" || MEMBERS=""
+	if [[ "${MEMBERS}" != $'LICENSE\nMANIFEST\nTHIRD-PARTY-LICENSES\nboringtun-cli' ]]; then
+		echo "ERROR: the BoringTun release directory ${DIR} does not hold exactly the release's four files" >&2
+		return 1
+	fi
+	for FILE in LICENSE MANIFEST THIRD-PARTY-LICENSES boringtun-cli; do
+		KIND="file"
+		[[ "${FILE}" != boringtun-cli ]] || KIND="exec"
+		if ! _awgBtTrustedNode "${DIR}/${FILE}" "${KIND}" || [[ "$(stat -c '%h' -- "${DIR}/${FILE}" 2>/dev/null)" != 1 ]]; then
+			echo "ERROR: ${DIR}/${FILE} is not a root-owned, single-link regular file that only root can write" >&2
+			return 1
+		fi
+	done
+	NODE_ID="$(_awgBtPathId "${DIR}/boringtun-cli")" || return 1
+	_awgBtCheckReleaseDir "${DIR}" "${ARCH}" || return 1
+	if [[ "$(_awgBtPathId "${DIR}/boringtun-cli")" != "${NODE_ID}" ]] || ! _awgBtTrustedNode "${DIR}/boringtun-cli" exec ||
+		! _awgBtTrustedNode "${DIR}" dir; then
+		echo "ERROR: ${DIR}/boringtun-cli changed while it was verified; it is not run" >&2
+		return 1
+	fi
 	VERSION="$("${DIR}/boringtun-cli" --version 2>/dev/null)" || VERSION=""
 	if [[ "${VERSION}" != "boringtun ${AWG_BT_RELEASE_VERSION}" ]]; then
 		echo "ERROR: boringtun-cli --version printed '${VERSION}', not 'boringtun ${AWG_BT_RELEASE_VERSION}'" >&2
@@ -6746,12 +6803,14 @@ function _awgBtFetchRelease() { # <work dir> <arch>
 		echo "ERROR: could not unpack ${_AWG_BT_REL_ASSET}" >&2
 		return 1
 	fi
-	_awgBtCheckReleaseDir "${WORK}/unpacked/${_AWG_BT_REL_ID}" "${ARCH}" 0
+	# The download directory may be on a noexec /tmp: nothing runs here.
+	_awgBtCheckReleaseDir "${WORK}/unpacked/${_AWG_BT_REL_ID}" "${ARCH}"
 }
 
 # Put a checked release directory into the store as <store>/<release id>: it is
-# staged as a root-owned directory next to its final name and renamed into
-# place, so a partial copy never has the release's name.
+# staged as a root-owned directory next to its final name, verified there as a
+# candidate and renamed into place, so a partial copy never has the release's
+# name.
 function _awgBtStoreRelease() { # <checked release dir> <arch>
 	local SOURCE="$1" ARCH="$2" STAGE FILE
 	STAGE="$(mktemp -d "${AWG_BT_STORE_DIR}/.${_AWG_BT_REL_ID}.tmp.XXXXXX")" || return 1
@@ -6760,7 +6819,7 @@ function _awgBtStoreRelease() { # <checked release dir> <arch>
 	done
 	if ! cp -- "${SOURCE}/boringtun-cli" "${STAGE}/boringtun-cli" || ! chmod 0755 -- "${STAGE}/boringtun-cli" "${STAGE}" ||
 		{ [[ "${EUID}" -eq 0 ]] && ! chown -R 0:0 -- "${STAGE}"; } ||
-		! _awgBtCheckReleaseDir "${STAGE}" "${ARCH}" || ! mv -T -- "${STAGE}" "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}"; then
+		! _awgBtVerifyCandidate "${STAGE}" "${ARCH}" || ! mv -T -- "${STAGE}" "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}"; then
 		rm -rf -- "${STAGE}"
 		return 1
 	fi
@@ -6776,6 +6835,10 @@ function _awgBtSwitchCurrent() {
 }
 
 # Install the embedded release into the store, or reuse the one already there.
+# Verify, then commit: a release directory is verified as a candidate (trust
+# before anything runs, then its version) and by the runtime's own release
+# checks before current is pointed at it, so every failure leaves current as
+# it was, or absent.
 function installBoringtunRelease() {
 	local ARCH WORK RC=0 CANONICAL_STORE
 	if ! ARCH="$(_awgBtHostArch)" || ! _awgBtSelectRelease "${ARCH}"; then
@@ -6789,7 +6852,7 @@ function installBoringtunRelease() {
 	CANONICAL_STORE="$(readlink -f -- "${AWG_BT_STORE_DIR}")" || return 1
 	if [[ -e "${AWG_BT_STORE_DIR}/current" || -L "${AWG_BT_STORE_DIR}/current" ]]; then
 		if _awgBtVerifyStore && [[ "${_AWG_BT_VERIFIED_BIN}" == "${CANONICAL_STORE}/${_AWG_BT_REL_ID}/boringtun-cli" ]] &&
-			_awgBtCheckReleaseDir "${CANONICAL_STORE}/${_AWG_BT_REL_ID}" "${ARCH}"; then
+			_awgBtVerifyCandidate "${CANONICAL_STORE}/${_AWG_BT_REL_ID}" "${ARCH}"; then
 			echo "The BoringTun release ${AWG_BT_RELEASE_TAG} is already installed and verified; it is reused."
 			return 0
 		fi
@@ -6798,8 +6861,9 @@ function installBoringtunRelease() {
 		return 1
 	fi
 	if [[ -e "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}" || -L "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}" ]]; then
-		# An earlier install stopped between the rename and the link.
-		if [[ -L "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}" ]] || ! _awgBtCheckReleaseDir "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}" "${ARCH}"; then
+		# An earlier install stopped between the rename and the link. The
+		# directory is verified as a candidate, trust first, before it runs.
+		if ! _awgBtVerifyCandidate "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}" "${ARCH}"; then
 			echo -e "${RED}ERROR: ${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID} exists but is not the verified release. Remove it and rerun.${NC}" >&2
 			return 1
 		fi
@@ -6815,8 +6879,12 @@ function installBoringtunRelease() {
 			return 1
 		fi
 	fi
-	if ! _awgBtSwitchCurrent || ! _awgBtVerifyStore || [[ "${_AWG_BT_VERIFIED_BIN}" != "${CANONICAL_STORE}/${_AWG_BT_REL_ID}/boringtun-cli" ]]; then
-		echo -e "${RED}ERROR: the installed BoringTun release does not verify.${NC}" >&2
+	if ! _awgBtVerifyRelease "${_AWG_BT_REL_ID}" || [[ "${_AWG_BT_VERIFIED_BIN}" != "${CANONICAL_STORE}/${_AWG_BT_REL_ID}/boringtun-cli" ]]; then
+		echo -e "${RED}ERROR: the installed BoringTun release does not verify; current was not changed.${NC}" >&2
+		return 1
+	fi
+	if ! _awgBtSwitchCurrent; then
+		echo -e "${RED}ERROR: cannot point ${AWG_BT_STORE_DIR}/current at ${_AWG_BT_REL_ID}.${NC}" >&2
 		return 1
 	fi
 	echo -e "${GREEN}Installed the BoringTun release ${AWG_BT_RELEASE_TAG} (${_AWG_BT_REL_ID}).${NC}"

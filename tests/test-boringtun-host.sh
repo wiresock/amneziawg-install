@@ -489,6 +489,123 @@ run installBoringtunRelease
 assert_rc 1 "${RC}" "a damaged release directory of that name is refused"
 assert_true "and not made current" test ! -e "${AWG_BT_STORE_DIR}/current"
 
+# A release directory that is already in the store is a candidate: it must be
+# trusted before anything in it runs, and fully verified before current points
+# at it. Every failure leaves current as it was.
+echo "=== Candidate release in the store: verify, then run, then commit ==="
+stage_candidate() { # a verified release in the store, without current
+	reset_store
+	serve "${T}/good.tar.gz"
+	installBoringtunRelease >/dev/null 2>&1
+	rm -f "${AWG_BT_STORE_DIR}/current" "${EXEC_LOG}"
+	: >"${S}/log"
+}
+CANDIDATE="${AWG_BT_STORE_DIR}/${FIXTURE_ID}"
+candidate_refused() { # <label>
+	run installBoringtunRelease
+	assert_rc 1 "${RC}" "$1"
+	assert_true "  its binary never runs" test ! -e "${EXEC_LOG}"
+	assert_true "  and current stays absent" test ! -e "${AWG_BT_STORE_DIR}/current" -a ! -L "${AWG_BT_STORE_DIR}/current"
+}
+stage_candidate
+chmod 0777 "${CANDIDATE}"
+candidate_refused "A: a release directory writable by others, current absent, is refused"
+assert_contains "not root-owned or is writable by others" "${ERR}" "  as untrusted"
+stage_candidate
+chmod 0775 "${CANDIDATE}/boringtun-cli"
+candidate_refused "a group-writable binary in the release directory is refused"
+stage_candidate
+chmod 0666 "${CANDIDATE}/MANIFEST"
+candidate_refused "a MANIFEST writable by others is refused"
+stage_candidate
+mv "${CANDIDATE}/LICENSE" "${T}/license.real"
+ln -s "${T}/license.real" "${CANDIDATE}/LICENSE"
+candidate_refused "a member that is a symlink is refused"
+rm -f "${T}/license.real"
+stage_candidate
+ln "${CANDIDATE}/boringtun-cli" "${T}/hardlink-to-binary"
+candidate_refused "a binary with a second hard link is refused"
+rm -f "${T}/hardlink-to-binary"
+stage_candidate
+: >"${CANDIDATE}/extra"
+candidate_refused "a release directory with an extra member is refused"
+stage_candidate
+chmod 0755 "${AWG_BT_STORE_DIR%/*}"
+chmod 0777 "${AWG_BT_STORE_DIR}"
+candidate_refused "a store directory writable by others is refused before anything runs"
+chmod 0755 "${AWG_BT_STORE_DIR}"
+# B: another release is current; a candidate that fails leaves it selected.
+stage_candidate
+cp -a -- "${CANDIDATE}" "${AWG_BT_STORE_DIR}/${OTHER_ID}"
+write_manifest "${AWG_BT_STORE_DIR}/${OTHER_ID}" version=0.7.2 source_commit=0123456789abcdef0123456789abcdef01234567
+ln -s "${OTHER_ID}" "${AWG_BT_STORE_DIR}/current"
+chmod 0777 "${CANDIDATE}"
+run installBoringtunRelease
+assert_rc 1 "${RC}" "B: with another release current, an untrusted candidate is refused"
+assert_eq "${OTHER_ID}" "$(readlink "${AWG_BT_STORE_DIR}/current")" "  and current still selects the other release"
+assert_true "  and no binary runs" test ! -e "${EXEC_LOG}"
+# C: the binary is replaced right after its digest is taken. The replacement
+# never runs: the node is checked again, trust included, just before the exec.
+stage_candidate
+cat >"${MOCKBIN}/sha256sum" <<EOF
+#!/bin/bash
+/usr/bin/sha256sum "\$@"
+RC=\$?
+for F in "\$@"; do
+	if [[ "\$F" == "${CANDIDATE}/boringtun-cli" && ! -e "${S}/swapped" ]]; then
+		printf '#!/bin/sh\necho "SWAPPED \$0" >>${EXEC_LOG}\necho "boringtun ${AWG_BT_RELEASE_VERSION}"\n' >"\$F.new"
+		chmod 0755 "\$F.new"
+		mv -f -- "\$F.new" "\$F"
+		: >"${S}/swapped"
+	fi
+done
+exit \$RC
+EOF
+chmod 0755 "${MOCKBIN}/sha256sum"
+run installBoringtunRelease
+rm -f "${MOCKBIN}/sha256sum"
+assert_true "(fixture: the binary was swapped after its digest)" test -e "${S}/swapped"
+rm -f "${S}/swapped"
+assert_rc 1 "${RC}" "C: a binary replaced between its digest and its run is refused"
+assert_contains "changed while it was verified" "${ERR}" "  because it changed"
+assert_true "  the replacement never runs" test ! -e "${EXEC_LOG}"
+assert_true "  and current stays absent" test ! -e "${AWG_BT_STORE_DIR}/current"
+# D: the version check fails.
+stage_candidate
+make_release_dir "${CANDIDATE}" 'boringtun 0.7.0'
+chmod 0755 "${CANDIDATE}/boringtun-cli"
+write_manifest "${CANDIDATE}"
+SAVED_BINARY_SHA256="${AWG_BT_RELEASE_BINARY_SHA256_X86_64}"
+AWG_BT_RELEASE_BINARY_SHA256_X86_64="$(sha256sum "${CANDIDATE}/boringtun-cli" | cut -d' ' -f1)"
+run installBoringtunRelease
+AWG_BT_RELEASE_BINARY_SHA256_X86_64="${SAVED_BINARY_SHA256}"
+assert_rc 1 "${RC}" "D: a candidate whose version check fails is refused"
+assert_contains "--version printed 'boringtun 0.7.0'" "${ERR}" "  by its version"
+assert_true "  after it ran from the store, trust first" test -s "${EXEC_LOG}"
+assert_true "  and current stays absent" test ! -e "${AWG_BT_STORE_DIR}/current"
+# E: the runtime's own release verification refuses after the candidate checks.
+stage_candidate
+run eval '_awgBtVerifyRelease() { echo "final verifier refuses" >&2; return 1; }; installBoringtunRelease'
+assert_rc 1 "${RC}" "E: a candidate that the final release verification refuses is refused"
+assert_contains "current was not changed" "${ERR}" "  and says current was not changed"
+assert_true "  current stays absent" test ! -e "${AWG_BT_STORE_DIR}/current"
+reset_store
+serve "${T}/good.tar.gz"
+run eval '_awgBtVerifyRelease() { return 1; }; installBoringtunRelease'
+assert_rc 1 "${RC}" "E: a downloaded release that the final verification refuses is refused"
+assert_true "  and current is never created" test ! -e "${AWG_BT_STORE_DIR}/current"
+# A failure to switch leaves no link.
+stage_candidate
+run eval '_awgBtSwitchCurrent() { return 1; }; installBoringtunRelease'
+assert_rc 1 "${RC}" "a failed switch of current fails the install"
+assert_true "  and leaves current absent" test ! -e "${AWG_BT_STORE_DIR}/current"
+# The verified candidate completes.
+stage_candidate
+run installBoringtunRelease
+assert_rc 0 "${RC}" "a trusted, verified candidate is made current"
+assert_eq "${FIXTURE_ID}" "$(readlink "${AWG_BT_STORE_DIR}/current")" "  selecting that release"
+assert_eq "0" "$(grep -c '^curl ' "${S}/log")" "  without a download"
+
 # A staging failure leaves no half-installed release under its final name.
 reset_store
 serve "${T}/good.tar.gz"
