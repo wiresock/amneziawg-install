@@ -19,6 +19,55 @@
 
 set -uo pipefail
 
+# Everything this test prints lands in public CI logs. It therefore runs
+# itself under a scan of its own output: once it has finished, no private or
+# preshared key of the server or of a client (the test records them in a
+# private file, never printing them), no client config and no QR code may
+# appear in what it printed. Client configs and QR codes are only ever written
+# to private files.
+if [[ -z "${AWG_LIVE_SECRET_SCAN:-}" ]]; then
+	SCAN_DIR="$(mktemp -d)" || exit 2
+	chmod 0700 "${SCAN_DIR}"
+	: >"${SCAN_DIR}/secrets"
+	AWG_LIVE_SECRET_SCAN="${SCAN_DIR}/secrets" bash "${BASH_SOURCE[0]}" "$@" 2>&1 | tee "${SCAN_DIR}/public.log"
+	RC=${PIPESTATUS[0]}
+	echo "=== Secret scan of this test's output"
+	if [[ ! -s "${SCAN_DIR}/secrets" ]]; then
+		echo "  FAIL: no key was recorded to look for"
+		RC=1
+	elif grep -qF -f "${SCAN_DIR}/secrets" "${SCAN_DIR}/public.log"; then
+		echo "  FAIL: a private or preshared key appears in this test's output"
+		RC=1
+	else
+		echo "  OK: none of the $(grep -c . "${SCAN_DIR}/secrets") recorded private and preshared keys appears in this test's output"
+	fi
+	if grep -qE '(Private|Preshared)Key[[:space:]]*=|^\[(Interface|Peer)\]' "${SCAN_DIR}/public.log"; then
+		echo "  FAIL: a client or server config appears in this test's output"
+		RC=1
+	else
+		echo "  OK: no config appears in this test's output"
+	fi
+	if grep -q '[▀▄█]' "${SCAN_DIR}/public.log"; then
+		echo "  FAIL: QR code rows appear in this test's output"
+		RC=1
+	else
+		echo "  OK: no QR code appears in this test's output"
+	fi
+	rm -rf -- "${SCAN_DIR}"
+	exit "${RC}"
+fi
+# record_secret <value>: a key the output scan looks for, never printed.
+record_secret() {
+	[[ -n "$1" ]] && printf '%s\n' "$1" >>"${AWG_LIVE_SECRET_SCAN}"
+}
+# record_config_secrets <config>: its private and preshared keys.
+record_config_secrets() {
+	local KEY
+	while IFS= read -r KEY; do
+		record_secret "${KEY}"
+	done < <(sed -n 's/^[[:space:]]*\(PrivateKey\|PresharedKey\)[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\2/p' "$1")
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INSTALLER="${PROJECT_ROOT}/amneziawg-install.sh"
@@ -97,8 +146,21 @@ fd_count() {
 peer_count() {
 	awg show "${IF}" peers 2>/dev/null | grep -c .
 }
-nft_rule_count() {
-	nft list ruleset 2>/dev/null | grep -c .
+# The firewall rules this interface's PostUp hooks added, as the firewall
+# lists them: its own nft table when the installer chose nftables, otherwise
+# the iptables rules that name the interface, its port or the masquerade on
+# the public interface. A rule duplicated by a restart shows as a difference.
+# Fails when the rules cannot be read.
+owned_firewall() {
+	local TABLE SAVED
+	TABLE="$(sed -n 's/^PostUp = nft add table \(ip\|inet\) \(awg-[A-Za-z0-9_.-]*\)$/\1 \2/p' "/etc/amnezia/amneziawg/${IF}.conf" | head -n 1)"
+	if [[ -n "${TABLE}" ]]; then
+		# shellcheck disable=SC2086 # the family and the table's name
+		nft list table ${TABLE}
+		return
+	fi
+	SAVED="$(iptables-save)" || return 1
+	grep -E -- "(-[io] ${IF}( |$)|--dport ${PORT}( |$)|-o ${PUBLIC_NIC} -j MASQUERADE)" <<<"${SAVED}" | LC_ALL=C sort
 }
 no_kernel_module() {
 	[[ ! -e /sys/module/amneziawg ]]
@@ -162,13 +224,18 @@ PUBLIC_NIC="$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i =
 [[ -n "${PUBLIC_NIC}" ]] || die "no default route"
 
 echo "=== Fresh install: AWG_BACKEND=boringtun AUTO_INSTALL=y"
+# Without an initial client, so that the install output holds no client
+# config or QR code; the client is added below, its output kept private.
 env AWG_BACKEND=boringtun AUTO_INSTALL=y SERVER_PUB_IP="${HOST_ADDR}" SERVER_PUB_NIC="${PUBLIC_NIC}" \
-	SERVER_AWG_NIC="${IF}" SERVER_PORT="${PORT}" ENABLE_IPV6=n CREATE_INITIAL_CLIENT=y \
+	SERVER_AWG_NIC="${IF}" SERVER_PORT="${PORT}" ENABLE_IPV6=n CREATE_INITIAL_CLIENT=n \
 	bash "${INSTALLER}" >"${WORK}/install.log" 2>&1 </dev/null
 INSTALL_RC=$?
 tail -n 25 "${WORK}/install.log" | sed 's/^/    | /'
 check "the installer completes" test "${INSTALL_RC}" -eq 0
 ((INSTALL_RC == 0)) || die "the install failed; nothing more to test"
+record_secret "$(sed -n "s/^SERVER_PRIV_KEY='\\(.*\\)'\$/\\1/p" /etc/amnezia/amneziawg/params)"
+bash "${INSTALLER}" --add-client client >"${WORK}/client-add.private" 2>&1 </dev/null
+check "--add-client creates the test client (its output, config and QR code stay private)" test "$?" -eq 0
 check "it downloaded the public release ${RELEASE_TAG}" \
 	grep -qF "Downloading https://github.com/wiresock/amneziawg-install/releases/download/${RELEASE_TAG}/${ASSET}" "${WORK}/install.log"
 check "the BoringTun preflight passed" grep -qF "BoringTun preflight passed" "${WORK}/install.log"
@@ -211,7 +278,8 @@ check "awg show all dump lists the interface" bash -c "awg show all dump | grep 
 # uninstall's daemon check never mistakes it for the server) in the namespace.
 cp -- "${STORE}/${RELEASE_ID}/boringtun-cli" "${CLIENT_BIN}"
 CLIENT_CONF="$(find /root /home -maxdepth 2 -name "${IF}-client-client.conf" 2>/dev/null | head -n 1)"
-[[ -n "${CLIENT_CONF}" ]] || die "the installer did not write the initial client config"
+[[ -n "${CLIENT_CONF}" ]] || die "the installer did not write the test client's config"
+record_config_secrets "${CLIENT_CONF}"
 CLIENT_TUNNEL_ADDR="$(sed -n 's/^Address = \([0-9.]*\)\/32.*/\1/p' "${CLIENT_CONF}" | head -n 1)"
 
 stop_client() {
@@ -316,29 +384,37 @@ done
 FDS_AFTER="$(fd_count "${PID}")"
 check "BoringTun's descriptor count is stable over 10 add/remove cycles (${FDS_BEFORE} -> ${FDS_AFTER})" test "${FDS_AFTER}" -eq "${FDS_BEFORE}"
 check "and the same daemon still serves the interface" test "$(main_pid)" = "${PID}"
-check "the initial client still reaches the server" wait_for 10 tunnel_ping
+check "the test client still reaches the server" wait_for 10 tunnel_ping
 
 # ── Service lifecycle ───────────────────────────────────────────────────────
-NFT_RULES="$(nft_rule_count)"
+FIREWALL="$(owned_firewall)"
+check "the interface's own firewall rules can be read and are present ($(grep -c . <<<"${FIREWALL}") lines)" test -n "${FIREWALL}"
+same_firewall() { # <after what>
+	local NOW
+	NOW="$(owned_firewall)" || NOW="(unreadable)"
+	check "the interface's own firewall rules are exactly as before, none duplicated, $1" test "${NOW}" = "${FIREWALL}"
+}
 systemctl restart "${UNIT}"
 check "restart succeeds" test "$?" -eq 0
 check "restart starts a new daemon" test "$(main_pid)" != "${PID}"
 check_served "after restart"
 check "the client reconnects after the restart" wait_for 20 tunnel_ping
+same_firewall "after restart"
 systemctl stop "${UNIT}"
 check "stop leaves the unit inactive" bash -c "! systemctl is-active --quiet '${UNIT}'"
 check "and removes the link and sockets" test ! -e "/sys/class/net/${IF}" -a ! -e "/var/run/wireguard/${IF}.sock"
+check "and the interface's firewall rules" test -z "$(owned_firewall 2>/dev/null)"
 systemctl start "${UNIT}"
 check "start succeeds again" test "$?" -eq 0
 check_served "after stop and start"
+same_firewall "after stop and start"
 PID="$(main_pid)"
 RESTARTS="$(systemctl show -p NRestarts --value "${UNIT}")"
 kill -KILL "${PID}"
 check "systemd restarts the unit after SIGKILL" \
 	wait_for 30 bash -c "[[ \"\$(systemctl show -p NRestarts --value '${UNIT}')\" -gt ${RESTARTS} ]] && systemctl is-active --quiet '${UNIT}'"
 check_served "after SIGKILL recovery"
-check "the firewall rule count is unchanged by restart, stop/start and SIGKILL (${NFT_RULES} -> $(nft_rule_count))" \
-	test "$(nft_rule_count)" -eq "${NFT_RULES}"
+same_firewall "after SIGKILL recovery"
 check "the client reconnects after the crash" wait_for 20 tunnel_ping
 
 # ── Protocol modes ──────────────────────────────────────────────────────────
