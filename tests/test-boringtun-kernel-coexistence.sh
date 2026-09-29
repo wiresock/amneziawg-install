@@ -79,11 +79,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Every installer run is bounded, so that a failure cannot leave the installer
+# waiting at a prompt until the job times out.
+INSTALLER_TIMEOUT=900
 run_install() { # <log> [VAR=value...]
 	local LOG="$1"
 	shift
-	env "$@" AWG_BACKEND=boringtun AUTO_INSTALL=y SERVER_PUB_IP=192.0.2.1 SERVER_AWG_NIC="${IF}" SERVER_PORT=51820 \
-		ENABLE_IPV6=n CREATE_INITIAL_CLIENT=n bash "${INSTALLER}" >"${WORK}/${LOG}" 2>&1 </dev/null
+	timeout --kill-after=30 "${INSTALLER_TIMEOUT}" env "$@" AWG_BACKEND=boringtun AUTO_INSTALL=y SERVER_PUB_IP=192.0.2.1 \
+		SERVER_AWG_NIC="${IF}" SERVER_PORT=51820 ENABLE_IPV6=n CREATE_INITIAL_CLIENT=n bash "${INSTALLER}" >"${WORK}/${LOG}" 2>&1 </dev/null
+}
+run_managed() { # <log> <installer argument>
+	timeout --kill-after=30 "${INSTALLER_TIMEOUT}" bash "${INSTALLER}" "$2" >"${WORK}/$1" 2>&1 </dev/null
 }
 
 echo "=== Build and install the AmneziaWG kernel module (amneziawg-dkms) ==="
@@ -163,6 +169,8 @@ check "  its MainPID runs the verified BoringTun binary" \
 check "  the kernel module stayed unloaded" bash -c '! [[ -e /sys/module/amneziawg ]]'
 
 echo "=== C. the override in force ==="
+echo "    modprobe -n -v amneziawg: $(modprobe -n -v amneziawg 2>&1 | tr '\n' ' ')"
+echo "    modprobe -n -v rtnl-link-amneziawg: $(modprobe -n -v rtnl-link-amneziawg 2>&1 | tr '\n' ' ')"
 check "ip link add … type amneziawg fails" bash -c '! ip link add awgprobe0 type amneziawg 2>/dev/null'
 check "  and does not load the module" bash -c '! [[ -e /sys/module/amneziawg ]]'
 check "modprobe amneziawg fails" bash -c '! modprobe amneziawg 2>/dev/null'
@@ -170,8 +178,8 @@ check "  and does not load the module" bash -c '! [[ -e /sys/module/amneziawg ]]
 check "the installer's check sees the override in force" bash -c 'source "$1" && _awgBtKernelModuleBlocked' _ "${INSTALLER}"
 
 echo "=== Scratch probes stay on BoringTun with the module installed ==="
-check "--enable-awg3 succeeds" bash -c "bash '${INSTALLER}' --enable-awg3 >'${WORK}/awg3.log' 2>&1 </dev/null"
-check "--disable-awg3 succeeds" bash -c "bash '${INSTALLER}' --disable-awg3 >'${WORK}/awg2.log' 2>&1 </dev/null"
+check "--enable-awg3 succeeds" run_managed awg3.log --enable-awg3
+check "--disable-awg3 succeeds" run_managed awg2.log --disable-awg3
 check "  and the module was never loaded" bash -c '! [[ -e /sys/module/amneziawg ]]'
 check "  the unit is still served by BoringTun" test -e "/sys/class/net/${IF}/tun_flags"
 
@@ -190,9 +198,15 @@ systemctl start "${UNIT}"
 check "once the module is unloaded, BoringTun starts again" test -e "/sys/class/net/${IF}/tun_flags"
 
 echo "=== Uninstall ==="
-printf '6\ny\n' | bash "${INSTALLER}" >"${WORK}/uninstall.log" 2>&1
-RC=$?
-tail -n 5 "${WORK}/uninstall.log" | sed 's/^/    | /'
+# Without params the menu would start a fresh interactive install instead.
+if [[ -e /etc/amnezia/amneziawg/params ]]; then
+	printf '6\ny\n' | timeout --kill-after=30 "${INSTALLER_TIMEOUT}" bash "${INSTALLER}" >"${WORK}/uninstall.log" 2>&1
+	RC=$?
+	tail -n 5 "${WORK}/uninstall.log" | sed 's/^/    | /'
+else
+	echo "    (no params: the install did not complete, so there is nothing to uninstall through the menu)"
+	RC=1
+fi
 check "the uninstall succeeds" test "${RC}" -eq 0
 check "  and removes the installer's load override" test ! -e "${OVERRIDE}"
 check "  but not amneziawg-dkms, which it did not install" bash -c 'dpkg-query -W -f="\${Status}" amneziawg-dkms | grep -q "install ok installed"'
