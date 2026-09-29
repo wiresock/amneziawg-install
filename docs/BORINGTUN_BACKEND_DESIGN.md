@@ -695,13 +695,13 @@ namespace (INFERRED).
    preflight detects existing module packages and offers the load override.
 
 **Which load override (DECIDED in PR 4: `install amneziawg /bin/false`; see §21.2).** A modprobe
-`blacklist amneziawg` line makes modprobe ignore the module's aliases. It is not established
-that this also stops the kernel's own `rtnl-link-amneziawg` request, which is what
-`ip link add … type amneziawg` triggers. `install amneziawg /bin/false` blocks every load that
-goes through modprobe, including an explicit `modprobe amneziawg`. It is therefore the safer
-choice, but a later migration back to the kernel must remove it first (§20). Note that
-`modprobe -n` succeeds for a module with an `install` override, so the precheck must look for
-the override file rather than rely on a dry run.
+`blacklist amneziawg` line makes modprobe ignore the module's aliases. The PR 4 coexistence
+job showed that this stops the kernel's own `rtnl-link-amneziawg` request, which is what
+`ip link add … type amneziawg` triggers, but not an explicit `modprobe amneziawg`.
+`install amneziawg /bin/false` blocked both. It is therefore the safer choice, but a later
+migration back to the kernel must remove it first (§20). Note that `modprobe -n` succeeds for
+a module with an `install` override, so the precheck checks the override file and parses the
+actions the dry run lists rather than relying on its exit status.
 5. **Scratch interfaces for probes and validation launch BoringTun directly.** They never call
    `ip link add … type amneziawg`, so they are deterministic regardless of the module.
 
@@ -2117,21 +2117,30 @@ no kernel fallback.
 
 **Kernel module.** The coexistence test (`tests/test-boringtun-kernel-coexistence.sh`
 on the Ubuntu 26.04 runner, where the DKMS module builds) settled §7.11. Without
-an override, `ip link add … type amneziawg` autoloads the module. The test records
-what a `blacklist amneziawg` line does to that autoload and to an explicit
-`modprobe amneziawg`. It requires that `install amneziawg /bin/false` blocks both,
-and PR 4 lands only that form: it is proven to stop the rtnl-link autoload, and
-unlike a blacklist it also stops an explicit `modprobe`, for example from a
-leftover kernel drop-in or `modules-load.d` entry. The installer's file is
-`/etc/modprobe.d/amneziawg-install-boringtun.conf`. The runtime precheck accepts an
-installed module only while that file is in force (`_awgBtKernelModuleBlocked`):
-the exact rendered content, a trusted root-owned file, and `modprobe -n -v` that
-resolves both `amneziawg` and `rtnl-link-amneziawg` to `install /bin/false`, so
-another modprobe configuration that outranks it counts as no override. A loaded
-module is always refused and never unloaded. An installed module is blocked only
-with consent: an interactive prompt that defaults to no, or
-`AWG_BORINGTUN_BLOCK_KERNEL_MODULE=y` with `AUTO_INSTALL`. Uninstall removes the
-file only if its content is still the installer's.
+an override, `ip link add … type amneziawg` autoloads the module. On that runner,
+a `blacklist amneziawg` line stopped the autoload (`ip link add` failed, the module
+stayed unloaded) but not an explicit `modprobe amneziawg`, which loaded it.
+`install amneziawg /bin/false` stopped both. The test requires the install form
+to block both, and PR 4 lands only that form, because it also stops an explicit
+`modprobe`, for example from a leftover kernel drop-in or `modules-load.d`
+entry. The installer's file is `/etc/modprobe.d/amneziawg-install-boringtun.conf`.
+The runtime precheck accepts an installed module only while that file is in
+force (`_awgBtKernelModuleBlocked`): the exact rendered content, a trusted
+root-owned file, and a `modprobe -n -v` dry run for both `amneziawg` and
+`rtnl-link-amneziawg` that ends in the install command
+(`_awgBtModprobeActionBlocked`). The dry run first lists an `insmod` for each
+dependency that is not loaded yet (on that runner `udp_tunnel`, `ip6_udp_tunnel`
+and `libcurve25519`), each line with a trailing space, so its output is parsed
+as data and never evaluated: the dry run must succeed, the last non-blank action
+must be exactly `install /bin/false`, and every earlier one must `insmod` a
+dependency by absolute path that is not the AmneziaWG module itself. Anything
+else, including an empty output, another install command or an action after
+`install /bin/false`, counts as no override, so another modprobe configuration
+that outranks the file counts as none. A loaded module is always refused and
+never unloaded. An installed module is blocked only with consent: an
+interactive prompt that defaults to no, or `AWG_BORINGTUN_BLOCK_KERNEL_MODULE=y`
+with `AUTO_INSTALL`. Uninstall removes the file only if its content is still the
+installer's.
 
 **Guards.** The installer refuses BoringTun while any of
 `/etc/systemd/system/amneziawg-proxy.service`, `/usr/local/bin/amneziawg-proxy`
@@ -2262,7 +2271,7 @@ the public release anonymously.
 | R18 | Whether to expose the log level, thread count and probe-reply rate. | OPEN | Not in the first versions. |
 | R19 | Firewall rule duplication after an operator deletes a kernel link is pre-existing and not addressed for the kernel. | Pre-existing | Out of scope. |
 | R20 | Upstream `awg-quick` could offer a way to force userspace. | Upstream idea | Optional request; the design does not depend on it. |
-| R21 | Whether a modprobe `blacklist` line stops the kernel-initiated `rtnl-link-amneziawg` autoload, or whether `install amneziawg /bin/false` is needed. | OPEN | Decide in the PR 4 coexistence test (§7.11, §18.6). |
+| R21 | Whether a modprobe `blacklist` line stops the kernel-initiated `rtnl-link-amneziawg` autoload, or whether `install amneziawg /bin/false` is needed. | DECIDED in PR 4 | The coexistence test showed that a blacklist stops the autoload but not an explicit `modprobe`, and the install command stops both; PR 4 uses the install command (§7.11, §21.2). |
 
 ---
 
