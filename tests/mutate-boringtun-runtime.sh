@@ -51,8 +51,9 @@ mutant no_foreground '"$1" --foreground --disable-drop-privileges' '"$1" --disab
 mutant descriptors_not_closed $'function _awgBtCloseInheritedFds() {\n' $'function _awgBtCloseInheritedFds() {\n\treturn 0\n'
 mutant launch_without_precheck '[[ "${_AWG_BT_STATE[PHASE]}" != prechecked ]]' 'false'
 # precheck.
-mutant no_module_loaded_check 'if [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then' 'if false; then'
-mutant no_autoload_check 'if modinfo -n amneziawg >/dev/null 2>&1; then' 'if false; then'
+mutant no_module_loaded_check $'if [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then\n\t\t_awgBtErr "the amneziawg kernel module is loaded' \
+	$'if false; then\n\t\t_awgBtErr "the amneziawg kernel module is loaded'
+mutant no_autoload_check 'if modinfo -n amneziawg >/dev/null 2>&1 && ! _awgBtKernelModuleBlocked; then' 'if false; then'
 mutant no_saveconfig_check '_awgBtSaveConfigEnabled "${CONFIG_FILE}" || RC=$?' 'RC=1'
 mutant b1_no_preexisting_refusal 'if [[ -n "${PRESENT}" ]]; then' 'if false; then'
 # poststart and the shared active-instance check.
