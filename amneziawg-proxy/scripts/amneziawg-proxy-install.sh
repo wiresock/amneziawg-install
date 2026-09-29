@@ -352,6 +352,22 @@ detect_awg_config() {
 
     local params_file="${AWG_DIR}/params"
 
+    # Only a params file that does not exist at all lets the legacy .conf
+    # discovery below stand in for it. One that exists but cannot be trusted
+    # or read (a symlink, another owner, a group- or world-accessible mode, a
+    # file that does not load) leaves the backend unknown: the proxy may only
+    # run in front of the kernel backend, so that fails closed.
+    if [[ -e "${params_file}" || -L "${params_file}" ]]; then
+        if ! validate_params_file "${params_file}" ||
+            ! bash -c '. "$1" >/dev/null 2>&1' _ "${params_file}"; then
+            die "${params_file} exists but cannot be trusted or read, so the
+AmneziaWG backend of this host cannot be established. amneziawg-proxy runs only
+in front of the kernel backend. Fix the params file (a regular file owned by
+root, mode 600 or 400, as amneziawg-install.sh writes it), then rerun this
+installer."
+        fi
+    fi
+
     # Try to read the params file saved by amneziawg-install.sh
     if validate_params_file "${params_file}"; then
         # Source params in a subshell to avoid polluting current environment.

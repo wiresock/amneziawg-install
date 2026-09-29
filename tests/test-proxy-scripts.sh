@@ -630,6 +630,78 @@ assert_eq "1" "$(grep -c 'runs only in front of the AmneziaWG kernel backend' <<
 assert_eq "1" "$(_detect_rc - "AWG_BACKEND='kernel'" "AWG_PROTOCOL_VERSION='3'")" \
     "detect_awg_config: the AWG 3.x refusal is unchanged"
 
+# The real validate_params_file: an existing params file that cannot be
+# trusted leaves the backend unknown and fails closed; it never lets the
+# legacy .conf discovery decide. stat reports the given owner, since the test
+# cannot create root-owned files.
+_detect_untrusted() { # <owner uid> <mode> <symlink|unloadable|-> <params lines...>
+    local test_params_owner="$1" mode="$2" shape="$3"
+    shift 3
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    printf '%s\n' "SERVER_AWG_NIC='awg0'" "SERVER_PORT='51820'" "$@" >"${tmpdir}/params.real"
+    printf '[Interface]\nListenPort = 51820\n' >"${tmpdir}/awg0.conf"
+    case "${shape}" in
+        symlink) ln -s "${tmpdir}/params.real" "${tmpdir}/params" ;;
+        unloadable) printf 'SERVER_AWG_NIC=(\n' >"${tmpdir}/params" ;;
+        *) mv "${tmpdir}/params.real" "${tmpdir}/params" ;;
+    esac
+    chmod "${mode}" "${tmpdir}/params" "${tmpdir}/params.real" 2>/dev/null
+    (
+        set --
+        source "${INSTALL_SCRIPT}"
+        info()  { :; }
+        warn()  { :; }
+        step()  { :; }
+        stat() { if [[ "$2" == %u ]]; then echo "${test_params_owner}"; else command stat "$@"; fi; }
+        AWG_DIR="${tmpdir}"
+        LISTEN_PORT=""
+        detect_awg_config >/dev/null
+        echo "CONTINUED AWG_CONF_FILE=${AWG_CONF_FILE:-}"
+    ) >"${tmpdir}/out" 2>&1
+    printf '%s|%s' "$?" "$(tr '\n' ' ' <"${tmpdir}/out")"
+    rm -rf -- "${tmpdir}"
+}
+_untrusted_rc() { _detect_untrusted "$@" | cut -d'|' -f1; }
+assert_eq "1" "$(_untrusted_rc 0 600 - "AWG_BACKEND='boringtun'")" \
+    "detect_awg_config: valid root-owned 0600 BoringTun params are refused as BoringTun"
+assert_eq "1" "$(_untrusted_rc 0 644 - "AWG_BACKEND='boringtun'")" \
+    "detect_awg_config: the same BoringTun params at 0644 are refused too, never read as legacy"
+UNTRUSTED_OUTPUT="$(_detect_untrusted 0 644 - "AWG_BACKEND='boringtun'" | cut -d'|' -f2-)"
+assert_eq "1" "$(grep -c 'cannot be trusted or read' <<<"${UNTRUSTED_OUTPUT}")" \
+    "detect_awg_config: the refusal says the params file cannot be trusted"
+assert_eq "0" "$(grep -c 'CONTINUED' <<<"${UNTRUSTED_OUTPUT}")" \
+    "detect_awg_config: and the legacy .conf discovery never runs"
+assert_eq "1" "$(_untrusted_rc 0 644 - "AWG_BACKEND='kernel'")" \
+    "detect_awg_config: kernel params at 0644 are refused as untrusted too"
+assert_eq "1" "$(_untrusted_rc 1000 600 - "AWG_BACKEND='boringtun'")" \
+    "detect_awg_config: params owned by another user are refused"
+assert_eq "1" "$(_untrusted_rc 0 600 symlink "AWG_BACKEND='boringtun'")" \
+    "detect_awg_config: params that are a symlink are refused"
+assert_eq "1" "$(_untrusted_rc 0 600 unloadable)" \
+    "detect_awg_config: params that do not load are refused"
+assert_eq "0" "$(_untrusted_rc 0 600 - "AWG_BACKEND='kernel'")" \
+    "detect_awg_config: valid root-owned 0600 kernel params are still accepted"
+_detect_absent() {
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    printf '[Interface]\nListenPort = 51820\n' >"${tmpdir}/awg0.conf"
+    (
+        set --
+        source "${INSTALL_SCRIPT}"
+        info()  { :; }
+        warn()  { :; }
+        step()  { :; }
+        AWG_DIR="${tmpdir}"
+        LISTEN_PORT=""
+        detect_awg_config >/dev/null
+        printf '%s %s' "${AWG_NIC:-}" "${LISTEN_PORT:-}"
+    ) 2>/dev/null
+    rm -rf -- "${tmpdir}"
+}
+assert_eq "awg0 51820" "$(_detect_absent)" \
+    "detect_awg_config: without any params file, legacy .conf discovery still finds the interface"
+
 # ── _validate_dns_upstream ────────────────────────────────────────────────────
 
 echo "=== _validate_dns_upstream ==="
