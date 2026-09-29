@@ -13,7 +13,10 @@ exclude-dev = true
 # an unchanged pin. That is intended: review it before shipping. Exceptions
 # must name one advisory and say why the artifact is still acceptable.
 ignore = [
-    { id = "RUSTSEC-2025-0069", reason = "daemonize 0.5.0 is unmaintained (no fix available). It is a direct dependency of boringtun-cli, used only when the daemon is not run with --foreground; this project does not modify BoringTun. Tracked in docs/BORINGTUN_ARTIFACTS.md." },
+    # Accepted by the maintainers for the experimental release; see
+    # docs/BORINGTUN_ARTIFACTS.md. Remove once upstream removes or replaces
+    # daemonize.
+    { id = "RUSTSEC-2025-0069", reason = "daemonize 0.5.0 is unmaintained, not a disclosed vulnerability (no fix available). It is a direct dependency of boringtun-cli that runs only without --foreground, and WireSock runs boringtun-cli exclusively in foreground mode. Accepted for the experimental release; pinned to this advisory." },
 ]
 
 [licenses]

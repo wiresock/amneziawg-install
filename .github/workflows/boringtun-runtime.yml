@@ -73,7 +73,8 @@ jobs:
       # The same build and packaging as the BoringTun Artifacts workflow. The
       # runtime reads only the binary and MANIFEST, so the licence notices are
       # a labelled placeholder here instead of a cargo-about run; this archive
-      # is never uploaded.
+      # is never uploaded. verify-test-archive therefore checks everything but
+      # the required notices, which only published archives must carry.
       - name: Build and package boringtun-cli with the repository script
         run: |
           bash scripts/boringtun-artifact.sh build boringtun-src x86_64-unknown-linux-musl "$RUNNER_TEMP/build"
@@ -83,7 +84,7 @@ jobs:
           } >"$RUNNER_TEMP/THIRD-PARTY-LICENSES"
           mkdir -p "$RUNNER_TEMP/dist"
           bash scripts/boringtun-artifact.sh package "$RUNNER_TEMP/build" boringtun-src "$RUNNER_TEMP/THIRD-PARTY-LICENSES" "$RUNNER_TEMP/dist"
-          bash scripts/boringtun-artifact.sh verify-archive "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP/extract"
+          bash scripts/boringtun-artifact.sh verify-test-archive "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP/extract"
           sha256sum "$RUNNER_TEMP/build/boringtun-cli" "$RUNNER_TEMP"/dist/*.tar.gz
 
       # awg, awg-quick and awg-quick@.service only. --no-install-recommends

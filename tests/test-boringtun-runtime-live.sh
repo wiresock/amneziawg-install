@@ -317,10 +317,15 @@ done
 FDS_AFTER="$(fd_count "${PID}")"
 check "50 filtered syncs keep BoringTun's descriptor count (${FDS_BEFORE} -> ${FDS_AFTER})" test "${FDS_AFTER}" -eq "${FDS_BEFORE}"
 check "and the same daemon" test "$(main_pid)" = "${PID}"
+# Before upstream #65, every set=1 carrying listen_port bound new sockets
+# without closing the old ones, which is why the sync filter exists. The pinned
+# build makes rebinding transactional, so unfiltered syncs must not leak either.
 awg syncconf "${IF}" <(awg-quick strip "${IF}")
 awg syncconf "${IF}" <(awg-quick strip "${IF}")
 FDS_UNFILTERED="$(fd_count "${PID}")"
-check "for contrast, two unfiltered syncs leak descriptors (${FDS_AFTER} -> ${FDS_UNFILTERED})" test "${FDS_UNFILTERED}" -gt "${FDS_AFTER}"
+check "two unfiltered syncs no longer leak descriptors with the pinned BoringTun (${FDS_AFTER} -> ${FDS_UNFILTERED})" \
+	test "${FDS_UNFILTERED}" -eq "${FDS_AFTER}"
+check "and the same daemon still serves the interface" test "$(main_pid)" = "${PID}" -a "$(awg show "${IF}" listen-port)" = "${PORT}"
 systemctl restart "${UNIT}"
 check_running "after the sync checks"
 

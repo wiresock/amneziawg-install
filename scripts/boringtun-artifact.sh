@@ -15,17 +15,27 @@
 #   package <build-dir> <source> <third-party-licenses> <out-dir>
 #                                               write a deterministic .tar.gz into <out-dir>
 #   verify-archive <archive> <extract-dir>      extract safely and check contents and binary
+#   verify-archive-static <archive> <extract-dir>
+#                                               the same checks without running the binary,
+#                                               for an archive of another architecture
+#   verify-test-archive <archive> <extract-dir>
+#                                               the verify-archive checks except the required
+#                                               notices, for a test-only archive packaged with
+#                                               placeholder notices; never for a published one
+#   check-notices <third-party-licenses>        check the required copyright notices
 #   device-smoke <boringtun-cli>                as root: create a TUN device and query its UAPI
 #   checksums <dir>                             write <dir>/SHA256SUMS for the archives in <dir>
 #
 # The script never modifies the BoringTun source, never runs `cargo update`,
 # installs nothing and writes only below the directories it is given.
 #
-# BORINGTUN_PIN_FILE overrides the pin location (used by the tests).
+# BORINGTUN_PIN_FILE and BORINGTUN_NOTICES_FILE override the pin and the
+# required-notices list (used by the tests).
 
 BTA_ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BTA_PIN_FILE="${BORINGTUN_PIN_FILE:-${BTA_ROOT}/packaging/boringtun/pin.env}"
 BTA_CONFIG_DIR="${BTA_ROOT}/packaging/boringtun"
+BTA_NOTICES_FILE="${BORINGTUN_NOTICES_FILE:-${BTA_CONFIG_DIR}/required-notices}"
 BTA_PACKAGE="boringtun-cli"
 BTA_SUPPORTED_TARGETS="x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
 # Recorded verbatim in MANIFEST. The placeholders stand for the local source and
@@ -272,10 +282,12 @@ bta_elf_machine() {
     esac
 }
 
-# Check that a binary is a static executable for the target's architecture and
-# that it is the pinned boringtun-cli with its device (TUN/UAPI) interface.
+# Check that a binary is a static executable for the target's architecture and,
+# unless $3 is 0, run it to check that it is the pinned boringtun-cli with its
+# device (TUN/UAPI) interface. Without running it, an archive of another
+# architecture can still be checked on the host.
 bta_verify_binary() {
-    local binary="$1" target="$2"
+    local binary="$1" target="$2" execute="${3:-1}"
     local arch machine header output
 
     arch="$(bta_target_arch "${target}")" || return 1
@@ -301,6 +313,7 @@ bta_verify_binary() {
         bta_err "${binary} depends on shared libraries"
         return 1
     fi
+    [[ "${execute}" == 0 ]] && return 0
     output="$("${binary}" --version 2>&1)" || true
     if [[ "${output}" != "boringtun ${BTA_VERSION}" ]]; then
         bta_err "${binary} --version printed '${output}', expected 'boringtun ${BTA_VERSION}'"
@@ -407,6 +420,95 @@ bta_build() {
     bta_info "built ${build_abs}/${BTA_PACKAGE}"
 }
 
+# Check THIRD-PARTY-LICENSES against packaging/boringtun/required-notices: each
+# listed copyright line must appear in the section that lists its crate. And no
+# crate but BoringTun's own, whose notice ships as LICENSE, may be attributed
+# only through a placeholder notice such as "Copyright (c) <year> <owner>":
+# that is the bare SPDX text cargo-about falls back to when it cannot match a
+# crate's license file, and it names no copyright holder. A tool or crate
+# change can then not silently drop notices that the license requires.
+bta_check_notices() {
+    local file="$1" notices="${BTA_NOTICES_FILE}" line line_no=0 count=0 problems
+
+    if [[ ! -f "${file}" || -L "${file}" ]]; then
+        bta_err "THIRD-PARTY-LICENSES is missing or not a regular file: ${file}"
+        return 1
+    fi
+    if [[ ! -f "${notices}" || -L "${notices}" ]]; then
+        bta_err "the required-notices list is missing: ${notices}"
+        return 1
+    fi
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line_no=$((line_no + 1))
+        [[ "${line}" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        if [[ ! "${line}" =~ ^[A-Za-z0-9_-]+\ [0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*\ \|\ Copyright\ [^[:cntrl:]]*[^[:space:][:cntrl:]]$ ]]; then
+            bta_err "${notices}: line ${line_no} is not '<crate> <version> | Copyright ...'"
+            return 1
+        fi
+        count=$((count + 1))
+    done <"${notices}"
+    if (( count == 0 )); then
+        bta_err "${notices} lists no notice"
+        return 1
+    fi
+    # Sections are separated by a line of 80 '='; a line of 80 '-' ends the
+    # section's "Used by:" crate list and starts its license text.
+    problems="$(LC_ALL=C awk -v workspace=" boringtun ${BTA_PACKAGE} " '
+        BEGIN { eq = sprintf("%80s", ""); gsub(/ /, "=", eq); dash = eq; gsub(/=/, "-", dash) }
+        FNR == NR {
+            if ($0 ~ /^[ \t]*(#|$)/) next
+            sep = index($0, " | ")
+            nreq++
+            req_crate[nreq] = substr($0, 1, sep - 1)
+            req_line[nreq] = substr($0, sep + 3)
+            next
+        }
+        {
+            line = $0
+            sub(/[ \t\r]+$/, "", line)
+            if (line == eq) { sec++; header = 1; next }
+            if (!sec) next
+            if (header && line == dash) { header = 0; next }
+            if (header) {
+                if (line ~ /^  [A-Za-z0-9_-]+ [0-9][^ ]*( |$)/) {
+                    split(line, f, " ")
+                    crates[sec] = crates[sec] "|" f[1] " " f[2] "|"
+                }
+                next
+            }
+            body[sec] = body[sec] "\n" line "\n"
+            lower = tolower(line)
+            if (lower ~ /copyright.*<(year|owner|copyright holders?)>/) placeholder[sec] = 1
+        }
+        END {
+            for (i = 1; i <= nreq; i++) {
+                found = 0
+                for (s = 1; s <= sec; s++) {
+                    if (index(crates[s], "|" req_crate[i] "|") && index(body[s], "\n" req_line[i] "\n")) { found = 1; break }
+                }
+                if (!found) print "missing required notice of " req_crate[i] ": " req_line[i]
+            }
+            for (s = 1; s <= sec; s++) {
+                if (!placeholder[s]) continue
+                n = split(crates[s], c, "|")
+                for (k = 1; k <= n; k++) {
+                    if (c[k] == "") continue
+                    split(c[k], nv, " ")
+                    if (index(workspace, " " nv[1] " ") == 0) print "only a placeholder notice (no copyright holder) attributes " c[k]
+                }
+            }
+        }' "${notices}" "${file}")" || {
+        bta_err "could not check the notices in ${file}"
+        return 1
+    }
+    if [[ -n "${problems}" ]]; then
+        while IFS= read -r line; do
+            bta_err "THIRD-PARTY-LICENSES: ${line}"
+        done <<<"${problems}"
+        return 1
+    fi
+}
+
 # Gate the dependency graph with cargo-deny (advisories, bans, licenses and
 # sources) and generate THIRD-PARTY-LICENSES with cargo-about, offline and
 # deterministic for a given pin. Fails when a crate linked into the binary ships
@@ -476,6 +578,11 @@ bta_licenses() {
         ! grep -q '^  ring ' "${output_abs}.tmp"; then
         rm -f -- "${output_abs}.tmp"
         bta_err "generated THIRD-PARTY-LICENSES is incomplete"
+        return 1
+    fi
+    if ! bta_check_notices "${output_abs}.tmp"; then
+        rm -f -- "${output_abs}.tmp"
+        bta_err "generated THIRD-PARTY-LICENSES lacks required copyright notices (packaging/boringtun/required-notices)"
         return 1
     fi
     mv -- "${output_abs}.tmp" "${output_abs}"
@@ -606,10 +713,12 @@ bta_package() {
 
 # Check an archive against the pin without trusting its contents: the name,
 # the exact member list, member types, modes and owners, then extract into a
-# new directory and check the manifest, the license files and the binary.
-# Prints the path of the extracted binary.
+# new directory and check the manifest, the license files and their required
+# notices, and the binary, which is also run unless $3 is 0. The notices are
+# checked unless $4 is 0, which only the test-only command does. Prints the
+# path of the extracted binary.
 bta_verify_archive() {
-    local archive="$1" extract_dir="$2"
+    local archive="$1" extract_dir="$2" execute="${3:-1}" notices="${4:-1}"
     local name stem arch expected listing line mode path binary
     local -A manifest=()
 
@@ -684,7 +793,11 @@ bta_verify_archive() {
         bta_err "${name}: LICENSE or THIRD-PARTY-LICENSES is not the expected notice"
         return 1
     fi
-    bta_verify_binary "${binary}" "${manifest[target]}" || return 1
+    if [[ "${notices}" != 0 ]] && ! bta_check_notices "${extract_dir}/${stem}/THIRD-PARTY-LICENSES"; then
+        bta_err "${name}: THIRD-PARTY-LICENSES lacks required copyright notices"
+        return 1
+    fi
+    bta_verify_binary "${binary}" "${manifest[target]}" "${execute}" || return 1
     printf '%s\n' "${binary}"
 }
 
@@ -812,6 +925,9 @@ bta_main() {
         licenses:2) bta_licenses "$@" ;;
         package:4) bta_package "$@" ;;
         verify-archive:2) bta_verify_archive "$@" ;;
+        verify-archive-static:2) bta_verify_archive "$1" "$2" 0 ;;
+        verify-test-archive:2) bta_verify_archive "$1" "$2" 1 0 ;;
+        check-notices:1) bta_check_notices "$@" ;;
         device-smoke:1) bta_device_smoke "$@" ;;
         checksums:1) bta_checksums "$@" ;;
         *)

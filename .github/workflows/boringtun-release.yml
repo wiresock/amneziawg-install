@@ -1,0 +1,100 @@
+name: BoringTun Release
+
+# Publishes the boringtun-cli archives that one successful, attested run of the
+# BoringTun Artifacts workflow built, as described by the release contract in
+# packaging/boringtun/release.env. It never builds anything, and it runs only
+# when a maintainer dispatches it: never on a push, a tag or a schedule.
+#
+# mode=dry-run (the default) performs every check and prints the exact release
+# it would create, without changing anything on GitHub. mode=publish repeats
+# every check in a job with write access, for an approved contract only, then
+# creates a draft release, uploads the three assets, reads them back, checks
+# again that the tag and release are still free, and only then publishes.
+# Nothing is ever deleted or overwritten. See docs/BORINGTUN_ARTIFACTS.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifacts_run_id:
+        description: "ID of the successful BoringTun Artifacts run that built the archives"
+        required: true
+        type: string
+      artifacts_commit:
+        description: "Full SHA of the reviewed commit that run built (on main)"
+        required: true
+        type: string
+      mode:
+        description: "dry-run checks and prints the release; publish creates it"
+        required: true
+        type: choice
+        options:
+          - dry-run
+          - publish
+        default: dry-run
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+# One release operation at a time; never cancel one part way.
+concurrency:
+  group: boringtun-release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify (dry run)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check every release condition without changing anything
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.artifacts_run_id }}
+          COMMIT: ${{ inputs.artifacts_commit }}
+        run: |
+          set -o pipefail
+          bash scripts/boringtun-release.sh dry-run "$RUN_ID" "$COMMIT" main "$RUNNER_TEMP/release" | tee "$RUNNER_TEMP/plan.txt"
+          { echo '## BoringTun release dry run'; echo; echo '```'; cat "$RUNNER_TEMP/plan.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish
+    needs: verify
+    if: inputs.mode == 'publish'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    steps:
+      - name: Publish only from main, with main's release contract
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::publish from main only (dispatched on $GITHUB_REF)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify again, then draft, upload, read back and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.artifacts_run_id }}
+          COMMIT: ${{ inputs.artifacts_commit }}
+        run: |
+          set -o pipefail
+          bash scripts/boringtun-release.sh publish "$RUN_ID" "$COMMIT" "$RUNNER_TEMP/release" | tee "$RUNNER_TEMP/published.txt"
+          { echo '## BoringTun release published'; echo; echo '```'; cat "$RUNNER_TEMP/published.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"

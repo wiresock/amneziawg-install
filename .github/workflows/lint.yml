@@ -23,6 +23,7 @@ jobs:
           bash -n amneziawg-proxy.sh
           bash -n scripts/amneziawg-cargo-build.sh
           bash -n scripts/boringtun-artifact.sh
+          bash -n scripts/boringtun-release.sh
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-common.sh
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-install.sh
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh
@@ -31,6 +32,7 @@ jobs:
           bash -n tests/test-awg3.sh
           bash -n tests/test-backend.sh
           bash -n tests/test-boringtun-artifact.sh
+          bash -n tests/test-boringtun-release.sh
           bash -n tests/test-boringtun-foreground-launcher.sh
           bash -n tests/test-boringtun-runtime.sh
           bash -n tests/test-boringtun-runtime-live.sh
@@ -61,6 +63,7 @@ jobs:
           shellcheck --severity=warning amneziawg-proxy.sh
           shellcheck --severity=warning scripts/amneziawg-cargo-build.sh
           shellcheck --severity=warning scripts/boringtun-artifact.sh
+          shellcheck --severity=warning -x scripts/boringtun-release.sh
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-common.sh
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-install.sh
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-uninstall.sh
@@ -69,6 +72,7 @@ jobs:
           shellcheck --severity=warning tests/test-awg3.sh
           shellcheck --severity=warning tests/test-backend.sh
           shellcheck --severity=warning tests/test-boringtun-artifact.sh
+          shellcheck --severity=warning tests/test-boringtun-release.sh
           shellcheck --severity=warning tests/test-boringtun-foreground-launcher.sh
           shellcheck --severity=warning tests/test-boringtun-runtime.sh
           shellcheck --severity=warning tests/test-boringtun-runtime-live.sh
