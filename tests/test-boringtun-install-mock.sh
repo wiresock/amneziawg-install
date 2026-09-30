@@ -238,6 +238,15 @@ run_installer() {
 			eval "$1"' _ "${INSTALLER}" "$*"
 }
 
+echo "--- a kernel install refuses protocol imitation before it changes anything"
+env AWG_BACKEND=kernel AUTO_INSTALL=y AWG_BORINGTUN_IMITATE_PROTOCOL=dns SERVER_PUB_IP=198.51.100.1 SERVER_PUB_NIC=eth0 \
+	bash -c 'source "$1" && initialCheck && installAmneziaWG' _ "${INSTALLER}" >"${MOCK}/kernel-imitation.out" 2>&1
+RC=$?
+check "a kernel AUTO_INSTALL with AWG_BORINGTUN_IMITATE_PROTOCOL=dns fails" test "${RC}" -ne 0
+check "  and says imitation needs BoringTun" grep -q "only with the BoringTun backend" "${MOCK}/kernel-imitation.out"
+check "  before any package step" test ! -s "${LOG}"
+check "  or any configuration" test ! -e /etc/amnezia/amneziawg
+
 echo "--- fresh install"
 run_installer installAmneziaWG >"${MOCK}/install.out" 2>&1
 RC=$?
@@ -293,6 +302,53 @@ run_installer 'loadParams >/dev/null && installBoringtunRelease' >/dev/null 2>&1
 check "a second release install reuses the verified release" test "$(stat -c '%i %Y' "${STORE}/${REL_ID}/boringtun-cli")" = "${BEFORE}"
 check "without downloading it again" bash -c '! grep -q "^curl .*releases/download" "$1"' _ "${LOG}"
 
+echo "--- protocol imitation"
+# The transaction runs for real, as root, on the installed files. Only the
+# scratch validation and the proof of a restarted daemon need the real binary,
+# so they are stubbed and logged.
+set_imitation() {
+	run_installer 'validateStagedAwgConfigs() { echo "validateStagedAwgConfigs ${AWG_BORINGTUN_IMITATE_PROTOCOL}" >>"${LOG}"; }
+		verifyBoringtunImitationServed() { echo "verifyBoringtunImitationServed $*" >>"${LOG}"; }
+		setBoringtunImitation '"$*"
+}
+client_hashes() {
+	sha256sum /etc/amnezia/amneziawg/awg0.conf /etc/amnezia/amneziawg/clients/*.conf 2>/dev/null
+}
+CLIENTS_BEFORE="$(client_hashes)"
+: >"${LOG}"
+set_imitation dns example.com >"${MOCK}/imitation.out" 2>&1
+RC=$?
+check "--set-boringtun-imitation dns example.com succeeds on the active unit" test "${RC}" -eq 0
+check "  params persist it" grep -qx "AWG_BORINGTUN_IMITATE_PROTOCOL='dns'" /etc/amnezia/amneziawg/params
+check "  with its hostname" grep -qx "AWG_BORINGTUN_IMITATE_DOMAIN='example.com'" /etc/amnezia/amneziawg/params
+check "  params stay root-owned, mode 0600" test "$(stat -c '%u %a' /etc/amnezia/amneziawg/params)" = "0 600"
+check "  the runtime file carries it" test "$(grep -v '^#' /etc/amnezia/amneziawg/awg0.boringtun | tr '\n' ' ')" = "FORMAT=1 IMITATE_PROTOCOL=dns IMITATE_DOMAIN=example.com "
+check "  and stays root-owned, mode 0600" test "$(stat -c '%u %a' /etc/amnezia/amneziawg/awg0.boringtun)" = "0 600"
+check "  the new imitation is validated first" grep -qx 'validateStagedAwgConfigs dns' "${LOG}"
+check "  then the unit is restarted" grep -qx 'systemctl restart awg-quick@awg0.service' "${LOG}"
+check "  and the restarted daemon verified" grep -qx 'verifyBoringtunImitationServed dns example.com' "${LOG}"
+check "  the warnings name the probe replies" grep -q "SERVFAIL" "${MOCK}/imitation.out"
+check "  server and client configs are unchanged" test "$(client_hashes)" = "${CLIENTS_BEFORE}"
+check "  no transaction directory is left" bash -c '! compgen -G "/etc/amnezia/amneziawg/.awg-imitation.*" >/dev/null'
+run_installer 'printBackendStatus' >"${MOCK}/status.out" 2>&1
+RC=$?
+check "--backend-status succeeds" test "${RC}" -eq 0
+check "  and reports the backend and imitation" grep -qx 'backend=boringtun' "${MOCK}/status.out"
+check "  imitation_protocol=dns" grep -qx 'imitation_protocol=dns' "${MOCK}/status.out"
+check "  imitation_domain_mode=configured" grep -qx 'imitation_domain_mode=configured' "${MOCK}/status.out"
+check "  the installed and pinned release" test "$(grep -c "_release=${REL_ID}$" "${MOCK}/status.out")" -eq 2
+check "  and no key" bash -c '! grep -qE "YWJjZGVm|PrivateKey|PRIV" "$1"' _ "${MOCK}/status.out"
+: >"${LOG}"
+rm -f "${MOCK}/active"
+set_imitation stun >"${MOCK}/imitation.out" 2>&1
+RC=$?
+check "with the unit inactive, stun is persisted" test "${RC}" -eq 0 -a "$(grep -v '^#' /etc/amnezia/amneziawg/awg0.boringtun | tr '\n' ' ')" = "FORMAT=1 IMITATE_PROTOCOL=stun "
+check "  and the unit is not started" bash -c '! grep -qE "^systemctl (start|restart) " "$1"' _ "${LOG}"
+: >"${MOCK}/active"
+set_imitation none >/dev/null 2>&1
+check "none renders the earlier runtime file again" test "$(grep -v '^#' /etc/amnezia/amneziawg/awg0.boringtun)" = "FORMAT=1"
+check "  and params say none" grep -qx "AWG_BORINGTUN_IMITATE_PROTOCOL='none'" /etc/amnezia/amneziawg/params
+
 echo "--- uninstall"
 : >"${LOG}"
 mkdir -p /etc/modprobe.d /etc/modules-load.d
@@ -336,6 +392,16 @@ rm -f /etc/modules-load.d/amneziawg.conf
 if [[ "${ID}" == debian ]]; then
 	check "Debian: the managed source and keyring are removed" test ! -e /etc/apt/sources.list.d/amneziawg.sources.list -a ! -e /etc/apt/keyrings/amneziawg.gpg
 fi
+
+echo "--- fresh install with protocol imitation"
+: >"${LOG}"
+AWG_BORINGTUN_IMITATE_PROTOCOL=sip AWG_BORINGTUN_IMITATE_DOMAIN=pbx.example run_installer installAmneziaWG >"${MOCK}/install-sip.out" 2>&1
+RC=$?
+check "an AUTO_INSTALL with AWG_BORINGTUN_IMITATE_PROTOCOL=sip completes without a prompt" test "${RC}" -eq 0
+check "  params persist the requested imitation" \
+	test "$(grep '^AWG_BORINGTUN_' /etc/amnezia/amneziawg/params | tr '\n' ' ')" = "AWG_BORINGTUN_IMITATE_PROTOCOL='sip' AWG_BORINGTUN_IMITATE_DOMAIN='pbx.example' "
+check "  the runtime file carries it" test "$(grep -v '^#' /etc/amnezia/amneziawg/awg0.boringtun | tr '\n' ' ')" = "FORMAT=1 IMITATE_PROTOCOL=sip IMITATE_DOMAIN=pbx.example "
+check "  and the trade-offs were printed" grep -q "no SIP responder" "${MOCK}/install-sip.out"
 
 echo
 echo "BoringTun install mock (${ID} ${VERSION_ID}): ${PASS} passed, ${FAIL} failed"

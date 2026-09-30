@@ -188,7 +188,7 @@ function check_running() {
 		test "$(readlink "/proc/${PID}/exe")" = "${_AWG_BT_VERIFIED_BIN}"
 	CMDLINE="$(tr '\0' ' ' <"/proc/${PID}/cmdline")"
 	check "${LABEL}: BoringTun runs in the foreground with the production flags" \
-		test "${CMDLINE}" = "${_AWG_BT_VERIFIED_BIN} --foreground --disable-drop-privileges --verbosity error ${IF} "
+		test "${CMDLINE}" = "${_AWG_BT_VERIFIED_BIN} --foreground --disable-drop-privileges --verbosity error --imitate-protocol none ${IF} "
 	ENVIRONMENT="$(tr '\0' '\n' <"/proc/${PID}/environ" | cut -d= -f1 | sort | tr '\n' ' ')"
 	check "${LABEL}: BoringTun's environment is only NO_COLOR and PATH (${ENVIRONMENT})" test "${ENVIRONMENT}" = "NO_COLOR PATH "
 	check "${LABEL}: ${IF} is a TUN device" test -e "/sys/class/net/${IF}/tun_flags"
