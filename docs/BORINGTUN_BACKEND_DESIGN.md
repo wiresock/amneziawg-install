@@ -2209,7 +2209,7 @@ removal of the configuration:
 1. The backend comes from params.
 2. `stop` and `disable` run the crash-safe teardown; a failed `disable` stops
    the uninstall before anything is removed (a failed `stop` shows as a daemon
-   that still runs, or as an active unit at the end).
+   that still runs, or as a unit not proven inactive at the end).
 3. No BoringTun daemon of the interface may still run.
 4. The teardown must be terminal (`boringtunTeardownFinished`): every start
    attempt the runtime directory still records is loaded with the runtime's own
@@ -2244,21 +2244,42 @@ removal of the configuration:
    unknown, or not removable) is reported and fails the uninstall, and the
    attempt that recorded it keeps its record: the record is the proof of
    ownership that the next uninstall needs, and it goes only after every node
-   it proves is gone. An unrecorded node is kept and fails the uninstall. A
+   it proves is gone. What is at a recorded path is ABSENT (proven by a
+   successful listing of its directory, `_awgBtPathAbsent`, since `[[ -e ]]` is
+   false on any error too), DIFFERENT (its identity was read and differs: a
+   replacement, left alone, and the record's obligation is resolved), MATCH
+   (read and equal: the node goes only on proof that it is idle) or UNKNOWN (its
+   identity cannot be read): an UNKNOWN node stays, and so does the record; a
+   failed identity query is never taken for a different node. An unrecorded
+   node is kept and fails the uninstall. A
    generated helper goes only when it is byte for byte what
    this installer generates; a helper that differs (edited, someone else's, or
    written by another installer version) is left in place and reported, which is
    not a failure, but a generated helper that cannot be removed is. Then the
    store and the load override (only if unchanged).
 7. Packages: `amneziawg-tools` only; kernel module packages found on a
-   BoringTun host were installed by someone else. A failed removal fails the
-   uninstall.
+   BoringTun host were installed by someone else. They are removed by
+   `removeBoringtunAptPackages`, which reads the whole package database once
+   (`dpkg-query -W -f='${Package}\t${db:Status-Abbrev}\n'`, the same format on
+   dpkg 1.20 to 1.23): the read must succeed, every row must be a package name
+   and a status abbreviation, and dpkg itself must be listed as installed,
+   since dpkg-query reads a missing database as an empty one without an error.
+   Only then does a package that is not listed as installed count as absent. A
+   failed or malformed read, or a failed removal, fails the uninstall. The
+   kernel uninstall keeps its own package removal.
 8. The Amnezia repository entries: the PPA entries, and managed source and
    keyring files, each of which must be gone afterwards. The APT index refresh
    after them is not mandatory.
-9. Only when every step succeeded and the unit is inactive is
-   `/etc/amnezia/amneziawg` removed. Until then params stay, so the next run of
-   the installer is a management run that offers the uninstall again.
+9. Only when every step succeeded and the unit is positively not running is
+   `/etc/amnezia/amneziawg` removed. `boringtunServiceInactive` needs a
+   successful `systemctl show -p ActiveState --value` whose answer is
+   `inactive` or `failed`; systemd answers that also once the unit file is
+   gone. A failed query or any other answer fails the uninstall. `systemctl
+   is-active` is not used for this: its exit status for an inactive unit
+   differs between systemd versions (3 on systemd 252, 4 on 255 for a removed
+   unit), and a failed query exits 1. Until the commit, params stay, so the
+   next run of the installer is a management run that offers the uninstall
+   again.
 
 What is preserved on purpose, and reported, without failing the uninstall: a
 helper that is not byte for byte this installer's, a load override that was
