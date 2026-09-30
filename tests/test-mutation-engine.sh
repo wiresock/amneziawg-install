@@ -70,16 +70,33 @@ source ./tool.sh
 [[ "${EARLY:-}" == 1 ]] && exit 1
 echo "Early tests: 1 passed, 0 failed"
 EOF
+# Infrastructure text that merely contains "failed": no summary, no assertion.
+cat >"${REPO}/tests/test-prereq.sh" <<'EOF'
+#!/bin/bash
+source ./tool.sh
+if [[ "${PREREQ:-}" == 1 ]]; then echo "ERROR: 1 failed prerequisite check"; exit 2; fi
+if [[ "${GENERIC:-}" == 1 ]]; then echo "12 failures encountered"; exit 1; fi
+if [[ "${NOASSERT:-}" == 1 ]]; then echo "Prereq tests: 0 passed, 1 failed"; exit 1; fi
+echo "Prereq tests: 1 passed, 0 failed"
+EOF
+# A suite for which no runner declares a format.
+cat >"${REPO}/tests/test-undeclared.sh" <<'EOF'
+#!/bin/bash
+echo "Undeclared tests: 1 passed, 0 failed"
+EOF
 (cd "${REPO}" && git init -q && git add -A) || { echo "ERROR: git is required" >&2; exit 1; }
 
-# run_toy <label> <mutant declarations...>: a runner with these mutants.
-# Sets RC and OUT.
+# run_toy <label> <mutant declarations...>: a runner with these mutants and
+# the toy suites' formats. Sets RC and OUT.
 run_toy() {
-	local NAME="$1"
+	local NAME="$1" SUITE
 	shift
 	{
 		echo 'set -uo pipefail'
 		echo 'source "$(dirname "${BASH_SOURCE[0]}")/helpers/mutation-engine.sh"'
+		for SUITE in toy runs slow early prereq; do
+			printf "mutation_suite test-%s '^%s tests: ([0-9]+) passed, ([0-9]+) failed\$' '^  FAIL: '\n" "${SUITE}" "${SUITE^}"
+		done
 		printf '%s\n' "$@"
 		echo 'mutation_main "Toy" "${ROOT}" -j 2'
 	} >"${REPO}/tests/mutate-${NAME}.sh"
@@ -105,12 +122,39 @@ check "and fails the run" test "${RC}" -ne 0
 run_toy twice "mutation_add twice test-toy tool.sh '' 'o' 'x'"
 check "an edit that matches more than once is INVALID" grep -q 'twice *INVALID (did not apply: edit 1 matches' <<<"${OUT}"
 
-echo "=== A mutant that breaks the syntax"
+echo "=== E: a mutant that breaks the syntax"
 run_toy syntax "mutation_add broken test-toy tool.sh '' 'double() {' 'double() {{ ('"
-check "is INVALID (syntax error), not caught" grep -q 'broken *INVALID (the mutated file has a syntax error' <<<"${OUT}"
+check "is INVALID (syntax error), not caught" grep -q 'broken *INVALID (the mutated file has a syntax error, so no behaviour was tested' <<<"${OUT}"
 check "and fails the run" test "${RC}" -ne 0
 run_toy syntaxok "mutation_add broken_on_purpose test-toy tool.sh @syntax 'double() {' 'double() {{ ('"
-check "unless the syntax error is the mutation (@syntax)" grep -q 'broken_on_purpose *CAUGHT' <<<"${OUT}"
+check "a syntax error is INVALID whatever the mutant expects (no @syntax exception)" \
+	grep -q 'broken_on_purpose *INVALID (the mutated file has a syntax error' <<<"${OUT}"
+check "  and never counts as caught" bash -c '! grep -q CAUGHT <<<"$1"' _ "${OUT}"
+
+echo "=== A: infrastructure text is no result"
+run_toy prereq "mutation_add prereq_text test-prereq tool.sh '' 'RUNNER=true' \$'RUNNER=true\nPREREQ=1'"
+check "'ERROR: 1 failed prerequisite check' with exit 2 is INVALID, never caught" \
+	grep -q 'prereq_text *INVALID (test-prereq printed no summary in its format; exit 2)' <<<"${OUT}"
+check "  and fails the run" test "${RC}" -ne 0
+
+echo "=== B: a generic count is no summary"
+run_toy generic "mutation_add generic_text test-prereq tool.sh '' 'RUNNER=true' \$'RUNNER=true\nGENERIC=1'"
+check "'12 failures encountered' is INVALID" grep -q 'generic_text *INVALID (test-prereq printed no summary in its format; exit 1)' <<<"${OUT}"
+check "  and fails the run" test "${RC}" -ne 0
+
+echo "=== C: a summary without an assertion failure"
+run_toy noassert "mutation_add no_assertion test-prereq tool.sh '' 'RUNNER=true' \$'RUNNER=true\nNOASSERT=1'"
+check "a summary of 1 failed without any FAIL line is INVALID" \
+	grep -q 'no_assertion *INVALID (test-prereq summarised 1 failed, but printed no assertion failure)' <<<"${OUT}"
+check "  and fails the run" test "${RC}" -ne 0
+
+echo "=== D: an assertion failure and its summary"
+run_toy caught2 "mutation_add breaks_double test-toy tool.sh '' '\$((\$1 * 2))' '\$((\$1 * 3))'"
+check "a FAIL line and a summary of 1 failed is CAUGHT" grep -q 'breaks_double *CAUGHT by test-toy (1 failed): FAIL: double 2 is 4' <<<"${OUT}"
+
+echo "=== F: exit 126"
+run_toy exit126 "mutation_add not_executable test-runs tool.sh '' 'RUNNER=true' 'RUNNER=/'"
+check "is INVALID (could not run), not caught" grep -q 'not_executable *INVALID (test-runs could not run: exit 126)' <<<"${OUT}"
 
 echo "=== A timeout"
 MUTATION_TIMEOUT=2 run_toy timeout "mutation_add slow test-slow tool.sh '' 'RUNNER=true' \$'RUNNER=true\nSLOW=1'"
@@ -124,7 +168,7 @@ check "and fails the run" test "${RC}" -ne 0
 
 echo "=== No summary"
 run_toy early "mutation_add exits_early test-early tool.sh '' 'RUNNER=true' \$'RUNNER=true\nEARLY=1'"
-check "a suite that stops without its summary is INVALID" grep -q 'exits_early *INVALID (test-early printed no summary; exit 1)' <<<"${OUT}"
+check "a suite that stops without its summary is INVALID" grep -q 'exits_early *INVALID (test-early printed no summary in its format; exit 1)' <<<"${OUT}"
 check "and fails the run" test "${RC}" -ne 0
 
 echo "=== The wrong failing assertion"
@@ -134,6 +178,10 @@ check "is INVALID when no failing assertion names the expected one" \
 check "and fails the run" test "${RC}" -ne 0
 
 echo "=== Harness failures"
+run_toy undeclared "mutation_add undeclared_suite test-undeclared tool.sh '' 'A toy tool.' 'x'"
+check "a suite without a declared format is a harness failure" \
+	grep -q 'HARNESS FAILURE: test-undeclared has no declared summary and failure format' <<<"${OUT}"
+check "  exit 2" test "${RC}" -eq 2
 run_toy nosuite "mutation_add no_suite test-missing tool.sh '' 'A toy tool.' 'x'"
 check "a missing suite is a harness failure" grep -q 'HARNESS FAILURE: the snapshot has no tests/test-missing.sh' <<<"${OUT}"
 check "  exit 2" test "${RC}" -eq 2

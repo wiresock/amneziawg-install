@@ -18,6 +18,10 @@ PROJECT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 # shellcheck source=helpers/mutation-engine.sh
 source "${SCRIPT_DIR}/helpers/mutation-engine.sh"
 
+# How each suite reports: its final summary line (the last group is the number
+# of failed assertions) and its assertion-failure lines.
+mutation_suite test-boringtun-runtime '^BoringTun runtime tests: ([0-9]+) passed, ([0-9]+) failed$' '^  FAIL: '
+
 # mutant <name> <exact text, present exactly once> <replacement> [<text> <replacement>]...
 # Several edits make one mutant; each must apply exactly once.
 mutant() {

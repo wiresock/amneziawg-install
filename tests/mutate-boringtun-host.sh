@@ -17,8 +17,17 @@ PROJECT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 # shellcheck source=helpers/mutation-engine.sh
 source "${SCRIPT_DIR}/helpers/mutation-engine.sh"
 
+# How each suite reports: its final summary line (the last group is the number
+# of failed assertions) and its assertion-failure lines.
+mutation_suite test-boringtun-host '^BoringTun host tests: ([0-9]+) passed, ([0-9]+) failed$' '^  FAIL: '
+mutation_suite test-boringtun-runtime '^BoringTun runtime tests: ([0-9]+) passed, ([0-9]+) failed$' '^  FAIL: '
+mutation_suite test-backend '^([0-9]+) tests, ([0-9]+) failures$' '^  FAIL: '
+mutation_suite test-proxy-scripts '^Results: ([0-9]+)/([0-9]+) passed, ([0-9]+) failed$' '^  FAIL: '
+mutation_suite test-boringtun-live-firewall '^BoringTun live firewall tests: ([0-9]+) passed, ([0-9]+) failed$' '^  FAIL: '
+
 INSTALLER=amneziawg-install.sh
 PROXY_INSTALLER=amneziawg-proxy/scripts/amneziawg-proxy-install.sh
+LIVE_FIREWALL=tests/helpers/boringtun-live-firewall.sh
 # mutant <name> <suite> <file> <exact text, present exactly once> <replacement>
 mutant() {
 	mutation_add "$1" "$2" "$3" "" "$4" "$5"
@@ -92,14 +101,20 @@ mutant web_marker_substring test-boringtun-host "${INSTALLER}" \
 	'grep -qxF "AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST=' 'grep -qF "AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST='
 mutant proxy_installer_accepts_boringtun test-proxy-scripts "${PROXY_INSTALLER}" \
 	'if ! awg_backend_is_proxy_compatible "${backend}"; then' 'if false; then'
-mutant proxy_installer_reads_env_backend test-proxy-scripts "${PROXY_INSTALLER}" \
-	"backend=\"\$(bash -c 'unset AWG_BACKEND; . \"\$1\"" "backend=\"\$(bash -c '. \"\$1\""
+mutant_expect proxy_installer_reads_env_backend test-proxy-scripts "${PROXY_INSTALLER}" "does not stand in for legacy params" \
+	'backend="${PARAMS_VALUES[AWG_BACKEND]-}"' 'backend="${PARAMS_VALUES[AWG_BACKEND]-${AWG_BACKEND:-}}"'
 # S4: an existing params file that cannot be trusted never falls through to
 # the legacy .conf discovery.
 mutant_expect proxy_untrusted_params_fall_through test-proxy-scripts "${PROXY_INSTALLER}" "refused too, never read as legacy" \
 	'    if [[ -e "${params_file}" || -L "${params_file}" ]]; then' '    if false; then'
-mutant_expect proxy_unloadable_params_accepted test-proxy-scripts "${PROXY_INSTALLER}" "refused as unreadable, with the reason" \
-	$' ||\n            ! bash -c \'. "$1" >/dev/null 2>&1\' _ "${params_file}"; then' '; then'
+mutant_expect proxy_unparsable_params_accepted test-proxy-scripts "${PROXY_INSTALLER}" "before valid lines is refused, never read as legacy" \
+	'if ! validate_params_file "${params_file}" || ! parse_params_file "${params_file}"; then' \
+	'if ! validate_params_file "${params_file}" || ! { parse_params_file "${params_file}" || true; }; then'
+mutant_expect proxy_params_duplicate_accepted test-proxy-scripts "${PROXY_INSTALLER}" "a duplicate key is refused, never read as its last value" \
+	$'        [[ -z "${PARAMS_VALUES[${key}]+set}" ]] || return 1\n' ''
+mutant_expect proxy_params_spaced_assignment_accepted test-proxy-scripts "${PROXY_INSTALLER}" "the params line AWG_BACKEND= kernel is refused" \
+	$'local plain_re=\'^([A-Z][A-Z0-9_]*)=([]A-Za-z0-9._:/,@+%=[-]*)$\'' \
+	$'local plain_re=\'^([A-Z][A-Z0-9_]*)[[:space:]]*=[[:space:]]*([]A-Za-z0-9._:/,@+%=[-]*)$\''
 # Kernel module.
 mutant loaded_module_accepted test-boringtun-host "${INSTALLER}" \
 	$'\tif [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then\n\t\techo -e "${RED}ERROR: the AmneziaWG kernel module is loaded, so awg-quick would use it' \
@@ -144,8 +159,14 @@ mutant_expect uninstall_removes_served_socket test-boringtun-host "${INSTALLER}"
 	$'\t\t_awgBtSocketListenedOn "${SOCKET}"\n\t\t[[ $? -eq 1 ]] || return 1' $'\t\t:'
 mutant_expect ss_failure_treated_as_idle test-boringtun-host "${INSTALLER}" "C: when ss says 'exit 1'" \
 	'OUTPUT="$(ss -xlHe 2>/dev/null)" || return 2' 'OUTPUT="$(ss -xlHe 2>/dev/null)" || return 1'
-mutant_expect malformed_ss_output_accepted test-boringtun-host "${INSTALLER}" "D: when ss says" \
-	'END { if (bad) exit 2; exit found ? 0 : 1 }' 'END { exit found ? 0 : 1 }'
+# The weak check the second review found: a familiar first token and enough
+# fields count as a valid row, the fifth field as the path.
+mutation_add weak_ss_row_check test-boringtun-host "${INSTALLER}" "D: a malformed row ('u_str invalid invalid invalid /unrelated') keeps a live socket" \
+	$'\t\t[[ "${LINE}" =~ ${_AWG_BT_SS_ROW} ]] || return 2\n' \
+	$'\t\t[[ "${LINE}" =~ ^(u_str|u_dgr|u_seq)[[:space:]]+([^[:space:]]+)[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+([^[:space:]]+)()()()() ]] || return 2\n' \
+	$'\t\tcase "${LOCAL}" in\n\t\t\t/*) [[ -n "${VINO}" ]] || return 2 ;;\n\t\t\t@?* | \\*) [[ -z "${VINO}" ]] || return 2 ;;\n\t\t\t*) return 2 ;;\n\t\tesac\n' ''
+mutant_expect unrelated_malformed_row_ignored test-boringtun-host "${INSTALLER}" "G: a valid unrelated row next to a malformed one keeps a live socket" \
+	$'\t\t[[ "${LINE}" =~ ${_AWG_BT_SS_ROW} ]] || return 2\n' $'\t\t[[ "${LINE}" =~ ${_AWG_BT_SS_ROW} ]] || continue\n'
 mutant_expect alias_target_liveness_unchecked test-boringtun-host "${INSTALLER}" "  the alias stays" \
 	$'\tif [[ -e "${SOCKET}" || -L "${SOCKET}" ]]; then\n\t\t_awgBtSocketListenedOn' \
 	$'\tif [[ ! -L "${NODE}" ]] && [[ -e "${SOCKET}" || -L "${SOCKET}" ]]; then\n\t\t_awgBtSocketListenedOn'
@@ -154,8 +175,29 @@ mutant_expect alias_outside_uapi_dirs_followed test-boringtun-host "${INSTALLER}
 # The node's identity is checked first and again right before the unlink;
 # without the record, both go.
 mutation_add unrecorded_node_removed test-boringtun-host "${INSTALLER}" "replaced the recorded node" \
-	$'\tif [[ -z "$2" || "$(_awgBtPathId "${NODE}")" != "$2" ]]; then\n\t\treturn 1' $'\tif false; then\n\t\treturn 1' \
+	$'\tif [[ -z "$2" || "$(_awgBtPathId "${NODE}")" != "$2" ]]; then\n\t\treturn 0\n\tfi\n' '' \
 	$'\t[[ "$(_awgBtPathId "${NODE}")" == "$2" ]] || return 1\n\trm -f' $'\trm -f'
+# N1: an attempt's record stays while a node it proves to be BoringTun's does.
+mutant_expect attempt_record_dropped_with_node_kept test-boringtun-host "${INSTALLER}" "and the attempt's record stays, as the proof of ownership" \
+	$'\t\tif ((KEEP)); then\n' $'\t\tif false; then\n'
+# N2: each removal before the BoringTun commit is checked.
+mutant_expect dropin_removal_unchecked test-boringtun-host "${INSTALLER}" "N2: a drop-in that cannot be removed fails" \
+	'for LEFT_FILE in "${OVERRIDE_FILE}" "${AWG_SYSCTL_FILE}"; do' 'for LEFT_FILE in "${AWG_SYSCTL_FILE}"; do'
+mutant_expect sysctl_removal_unchecked test-boringtun-host "${INSTALLER}" "N2: a sysctl file that cannot be removed fails" \
+	'for LEFT_FILE in "${OVERRIDE_FILE}" "${AWG_SYSCTL_FILE}"; do' 'for LEFT_FILE in "${OVERRIDE_FILE}"; do'
+mutant_expect daemon_reload_unchecked test-boringtun-host "${INSTALLER}" "N2: a failed systemctl daemon-reload fails" \
+	'if [[ -n "${LEFT_BEHIND}" || ${DAEMON_RELOAD_RC} -ne 0 ]]; then' 'if [[ -n "${LEFT_BEHIND}" ]]; then'
+mutant_expect disable_unchecked test-boringtun-host "${INSTALLER}" "N2: a failed systemctl disable fails" \
+	$'\t\t\tif ((DISABLE_RC != 0)); then' $'\t\t\tif false; then'
+mutant_expect managed_source_removal_unchecked test-boringtun-host "${INSTALLER}" "N2: a managed APT source that cannot be removed fails" \
+	$'\t\t\t\t\t[[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]] || [[ ! -e "${MANAGED_SOURCE}" ]] || UNINSTALL_FAILED=1\n' ''
+# F3: the live test's firewall inspection never takes a failed query as a result.
+mutant_expect firewall_listing_failure_ignored test-boringtun-live-firewall "${LIVE_FIREWALL}" "exits 42 with no output, which is no proof of absence" \
+	'TABLES="$(nft list tables)" || return 1' 'TABLES="$(nft list tables)"'
+mutant_expect firewall_table_failure_ignored test-boringtun-live-firewall "${LIVE_FIREWALL}" "baseline: nft list table exits 42 after partial output" \
+	'RULES="$(nft list table "${FAMILY}" "${TABLE}")" || return 1' 'RULES="$(nft list table "${FAMILY}" "${TABLE}")"'
+mutant_expect iptables_save_failure_ignored test-boringtun-live-firewall "${LIVE_FIREWALL}" "stopped: iptables-save exits 42 with no output" \
+	'SAVED="$(iptables-save)" || return 1' 'SAVED="$(iptables-save)"'
 # B3: helpers go only when they are byte for byte the installer's.
 mutant_expect helper_header_is_ownership test-boringtun-host "${INSTALLER}" "a helper changed by one byte stays" \
 	$'cmp -s -- "${FILE}" <(printf \'%s\\n\' "${CONTENT}")' \
