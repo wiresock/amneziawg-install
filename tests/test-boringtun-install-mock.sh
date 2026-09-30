@@ -83,6 +83,13 @@ if [[ "$1" == -W && "$2" == "-f=\${db:Status-Abbrev}" ]]; then
 		*) exit 1 ;;
 	esac
 fi
+# The whole-database inventory the BoringTun uninstall reads: the real one,
+# plus the two AmneziaWG packages.
+if [[ "$1" == -W && "$2" == "-f=\${Package}\t\${db:Status-Abbrev}\n" && $# -eq 2 ]]; then
+	/usr/bin/dpkg-query "$@" || exit
+	printf "amneziawg-tools\tii \namneziawg-dkms\tii \n"
+	exit 0
+fi
 exec /usr/bin/dpkg-query "$@"'
 mock add-apt-repository '
 source /etc/os-release
@@ -130,7 +137,9 @@ esac"
 mock systemctl "
 echo \"systemctl \$*\" >>${LOG}
 case \"\$1\" in
-	show) exit 1 ;;
+	show)
+		[[ \"\$2 \$3 \$4\" == '-p ActiveState --value' ]] || exit 1
+		if [[ -f ${MOCK}/active ]]; then echo active; else echo inactive; fi ;;
 	is-active) [[ -f ${MOCK}/active ]] ;;
 	start) : >${MOCK}/active ;;
 	stop) rm -f ${MOCK}/active ;;

@@ -7133,16 +7133,26 @@ function _awgBtSocketListenedOn() { # <node>
 # recorded as ID, the daemon PID/START that created it is gone, and no process
 # listens on it (for the AmneziaWG path, a symlink, on the socket it resolves
 # to, which must be in one of the UAPI socket directories). Anything else is
-# left in place. Returns 0 when the recorded node is gone (removed now, absent,
-# or replaced by a node the attempt did not record), and 1 while the recorded
-# node is still there: the attempt's record is then the proof of ownership a
+# left in place. What is at PATH is one of:
+#   ABSENT     proven absent (_awgBtPathAbsent): the obligation is resolved;
+#   DIFFERENT  its identity was read and is not ID: a replacement the attempt
+#              did not record, left alone; the obligation is resolved;
+#   MATCH      its identity was read and is ID: the node goes only on proof
+#              that it is idle;
+#   UNKNOWN    its identity cannot be read: it stays, and so must the record.
+# A failed identity query is never taken for a different node. Returns 0 when
+# the recorded node is gone (removed now, absent, or replaced), and 1 while it
+# may still be there: the attempt's record is then the proof of ownership a
 # later uninstall needs, and must be kept.
 function _awgBtRemoveProvenIdleNode() { # <path> <recorded id> <pid> <start time>
-	local NODE="$1" SOCKET TARGET_DIR
-	[[ -e "${NODE}" || -L "${NODE}" ]] || return 0
-	if [[ -z "$2" || "$(_awgBtPathId "${NODE}")" != "$2" ]]; then
-		return 0
+	local NODE="$1" SOCKET TARGET_DIR CURRENT
+	_awgBtPathAbsent "${NODE}" && return 0
+	[[ -n "$2" ]] || return 0
+	if ! CURRENT="$(_awgBtPathId "${NODE}")" || [[ ! "${CURRENT}" =~ ^[0-9]+:[0-9]+:[0-9a-f]+:[0-9]+\.[0-9]{9}$ ]]; then
+		_awgBtPathAbsent "${NODE}" && return 0
+		return 1
 	fi
+	[[ "${CURRENT}" == "$2" ]] || return 0
 	if [[ -n "$3" && -n "$4" ]] && _awgBtProcessIs "$3" "$4"; then
 		return 1
 	fi
@@ -7155,13 +7165,27 @@ function _awgBtRemoveProvenIdleNode() { # <path> <recorded id> <pid> <start time
 			return 1
 		fi
 	fi
-	if [[ -e "${SOCKET}" || -L "${SOCKET}" ]]; then
+	if ! _awgBtPathAbsent "${SOCKET}"; then
 		_awgBtSocketListenedOn "${SOCKET}"
 		[[ $? -eq 1 ]] || return 1
 	fi
 	[[ "$(_awgBtPathId "${NODE}")" == "$2" ]] || return 1
 	rm -f -- "${NODE}" 2>/dev/null
-	[[ ! -e "${NODE}" && ! -L "${NODE}" ]]
+	_awgBtPathAbsent "${NODE}"
+}
+
+# PATH is positively absent: its directory was listed and does not hold it, or
+# the directory itself is positively absent. A test like [[ -e ]] is false on
+# any error, so it proves nothing; a listing that fails proves nothing either.
+function _awgBtPathAbsent() { # <path>
+	local DIR="${1%/*}" NAME="${1##*/}" LIST
+	[[ -n "${DIR}" ]] || DIR=/
+	[[ -n "${NAME}" && "${NAME}" != . && "${NAME}" != .. ]] || return 1
+	if LIST="$(find -H "${DIR}" -mindepth 1 -maxdepth 1 -name "${NAME}" -print 2>/dev/null)"; then
+		[[ -z "${LIST}" ]]
+		return
+	fi
+	[[ "${DIR}" != / ]] && _awgBtPathAbsent "${DIR}"
 }
 
 # The start attempts of INTERFACE that the runtime directory still records,
@@ -7259,7 +7283,7 @@ function uninstallBoringtunRuntime() { # <interface>
 	done < <(_awgBtRecordedAttempts "${INTERFACE_NAME}")
 	_AWG_BT_ATTEMPT=""
 	for NODE in "${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock"; do
-		if [[ -e "${NODE}" || -L "${NODE}" ]]; then
+		if ! _awgBtPathAbsent "${NODE}"; then
 			echo -e "${RED}ERROR: ${NODE} is not provably an idle UAPI node of this installation (a process may serve it, or nothing records it as BoringTun's); it is left in place. If nothing uses it, remove it and rerun the uninstall.${NC}" >&2
 			RC=1
 		fi
@@ -9463,6 +9487,67 @@ function removeInstalledAptPackages() {
 	apt remove -y "${INSTALLED_PACKAGES[@]}"
 }
 
+# BoringTun: remove the PACKAGES that the package database lists as installed,
+# after one complete, successful read of it. Every row of the inventory must be
+# a package name and a dpkg status abbreviation, and dpkg itself must be listed
+# as installed, because dpkg-query reads a missing database as an empty one
+# without an error. A failed or malformed read is an error, never "not
+# installed"; so is a failed removal.
+function removeBoringtunAptPackages() { # <package>...
+	local INVENTORY LINE PACKAGE
+	local ROW=$'^([a-z0-9][a-z0-9+.-]+)\t([uihrp][ncHUFWti][ R]?)$'
+	local -A STATE=()
+	local -a INSTALLED_PACKAGES=()
+	# shellcheck disable=SC2016 # dpkg-query fields, not shell variables
+	if ! INVENTORY="$(dpkg-query -W -f='${Package}\t${db:Status-Abbrev}\n' 2>/dev/null)"; then
+		echo -e "${RED}ERROR: the package database cannot be read (dpkg-query failed).${NC}"
+		return 1
+	fi
+	while IFS= read -r LINE; do
+		[[ -n "${LINE}" ]] || continue
+		if [[ ! "${LINE}" =~ ${ROW} ]]; then
+			echo -e "${RED}ERROR: dpkg-query printed a line that is not a package status: ${LINE}${NC}"
+			return 1
+		fi
+		# A package listed for several architectures is installed when any is.
+		[[ "${STATE[${BASH_REMATCH[1]}]:-}" == i* ]] || STATE["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+	done <<<"${INVENTORY}"
+	if [[ "${STATE[dpkg]:-}" != ii* ]]; then
+		echo -e "${RED}ERROR: the package database read does not list dpkg as installed, so it is not the system's.${NC}"
+		return 1
+	fi
+	for PACKAGE in "$@"; do
+		[[ "${STATE[${PACKAGE}]:-}" == i* ]] && INSTALLED_PACKAGES+=("${PACKAGE}")
+	done
+	[[ "${#INSTALLED_PACKAGES[@]}" -gt 0 ]] || return 0
+	apt remove -y "${INSTALLED_PACKAGES[@]}" || return 1
+}
+
+# BoringTun: the unit is positively not running. systemd must answer its
+# ActiveState, which it does also once the unit file is gone, and the answer
+# must be inactive or failed. systemctl is-active is not used: its exit status
+# for an inactive unit differs between systemd versions (3 on 252, 4 on 255
+# for a removed unit), while a failed query exits 1. A failed query or any
+# other state is no proof.
+function boringtunServiceInactive() { # <interface>
+	local UNIT="awg-quick@$1.service" STATE
+	if ! STATE="$(systemctl show -p ActiveState --value "${UNIT}" 2>/dev/null)"; then
+		echo -e "${RED}ERROR: the state of ${UNIT} cannot be read.${NC}"
+		return 1
+	fi
+	case "${STATE}" in
+		inactive | failed) return 0 ;;
+		active | activating | deactivating | reloading | refreshing)
+			echo -e "${RED}ERROR: ${UNIT} is still ${STATE}.${NC}"
+			return 1
+			;;
+		*)
+			echo -e "${RED}ERROR: systemd reports an unexpected state for ${UNIT}: '${STATE}'.${NC}"
+			return 1
+			;;
+	esac
+}
+
 function uninstallAmneziaWG() {
 	echo ""
 	echo -e "\n${RED}WARNING: This will uninstall AmneziaWG and remove all the configuration files!${NC}"
@@ -9561,9 +9646,13 @@ function uninstallAmneziaWG() {
 		local -a AWG_APT_PACKAGES=(amneziawg amneziawg-tools amneziawg-dkms)
 		[[ "${OS}" == 'debian' ]] && AWG_APT_PACKAGES=(amneziawg amneziawg-tools)
 		[[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]] && AWG_APT_PACKAGES=(amneziawg-tools)
+		# BoringTun removes them strictly: a failed package database read is an
+		# error, never "not installed".
+		local REMOVE_APT_PACKAGES=removeInstalledAptPackages
+		[[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]] && REMOVE_APT_PACKAGES=removeBoringtunAptPackages
 
 		if [[ ${OS} == 'ubuntu' ]]; then
-			if ! removeInstalledAptPackages "${AWG_APT_PACKAGES[@]}"; then
+			if ! "${REMOVE_APT_PACKAGES}" "${AWG_APT_PACKAGES[@]}"; then
 				echo -e "${RED}ERROR: Failed to remove one or more installed AmneziaWG packages.${NC}"
 				UNINSTALL_FAILED=1
 			fi
@@ -9589,7 +9678,7 @@ function uninstallAmneziaWG() {
 			apt-get update || echo -e "${ORANGE}WARNING: Failed to refresh APT indexes after removing the Amnezia PPA.${NC}"
 			disable_apt_ipv4
 		elif [[ ${OS} == 'debian' ]]; then
-			if ! removeInstalledAptPackages "${AWG_APT_PACKAGES[@]}"; then
+			if ! "${REMOVE_APT_PACKAGES}" "${AWG_APT_PACKAGES[@]}"; then
 				echo -e "${RED}ERROR: Failed to remove one or more installed AmneziaWG packages.${NC}"
 				UNINSTALL_FAILED=1
 			fi
@@ -9618,9 +9707,15 @@ function uninstallAmneziaWG() {
 			dnf copr disable -y amneziavpn/amneziawg
 		fi
 
-		# Check if AmneziaWG is running
-		systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"
-		AWG_RUNNING=$?
+		# Check if AmneziaWG is running. BoringTun needs positive proof that the
+		# unit is not running: a failed query is not "inactive".
+		if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+			AWG_RUNNING=0
+			boringtunServiceInactive "${SERVER_AWG_NIC}" && AWG_RUNNING=1
+		else
+			systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"
+			AWG_RUNNING=$?
+		fi
 
 		# BoringTun: the configuration goes last, as the commit of an
 		# uninstall whose every step succeeded. Until then it stays, so the

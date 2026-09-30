@@ -1413,7 +1413,10 @@ uninstall_flow() {
 	systemctl() {
 		echo "systemctl $*" >>"${S}/un"
 		[[ "$1" == is-active ]] && return 1
-		[[ "$1" != "${SYSTEMCTL_FAILS:-}" ]]
+		[[ "$1" != "${SYSTEMCTL_FAILS:-}" ]] || return 1
+		# SERVICE_STATE is what systemd answers for ActiveState.
+		[[ "${1:-} ${2:-} ${3:-}" != "show -p ActiveState" ]] || printf '%s\n' "${SERVICE_STATE-inactive}"
+		return 0
 	}
 	[[ -z "${RM_FAILS:-}" ]] || rm() { [[ "${*: -1}" == "${RM_FAILS}" ]] && return 1; command rm "$@"; }
 	removeInstalledAptPackages() {
@@ -1421,11 +1424,12 @@ uninstall_flow() {
 		[[ -e "${AMNEZIAWG_DIR}/params" ]] && echo "params present at package removal" >>"${S}/un"
 		return "${PACKAGES_RC:-0}"
 	}
+	[[ -n "${REAL_BT_PACKAGES:-}" ]] || removeBoringtunAptPackages() { removeInstalledAptPackages "$@"; }
 	removeAmneziaPpaSourceEntries() { return "${PPA_RC:-0}"; }
 	enable_apt_ipv4() { :; }
 	disable_apt_ipv4() { :; }
 	apt-get() { :; }
-	apt() { echo "apt $*" >>"${S}/un"; }
+	apt() { echo "apt $*" >>"${S}/un"; return "${APT_RC:-0}"; }
 	[[ -n "${REAL_BT_RUNTIME:-}" ]] || uninstallBoringtunRuntime() { echo "uninstallBoringtunRuntime $*" >>"${S}/un"; return "${BT_UNINSTALL_RC:-0}"; }
 	boringtunDaemonsOf() { cat "${S}/daemons" 2>/dev/null; }
 	[[ -n "${REAL_TEARDOWN_CHECK:-}" ]] || boringtunTeardownFinished() { echo "boringtunTeardownFinished $*" >>"${S}/un"; }
@@ -1557,9 +1561,138 @@ REAL_BT_RUNTIME=1 REAL_TEARDOWN_CHECK=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPU
 assert_rc 0 "${RC}" "N1: the rerun of the whole uninstall finishes"
 assert_true "  the socket, the record and the configuration are gone" \
 	test ! -e "${WG_SOCK}" -a "$(attempt_files)" -eq 0 -a ! -e "${AMNEZIAWG_DIR}"
+
+echo "--- N1: a failed identity query is UNKNOWN, never a different node"
+# The recorded node's identity cannot be read: the node and the attempt's
+# record stay, and the retry, with the same record, finishes.
+# shellcheck disable=SC2034 # read by the stat stub in IDENTITY_FAILS
+N1_FAIL_NODE="${WG_SOCK}"
+IDENTITY_FAILS='stat() { [[ "${*: -1}" == "${N1_FAIL_NODE}" && "$2" == "%d:%i:%f:%.9Z" ]] && return 1; command stat "$@"; }'
+install_runtime
+dead_socket "${WG_SOCK}"
+record_attempt launched up "done"
+cp -- "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT}.state" "${T}/n1-state.before"
+run eval "${IDENTITY_FAILS}; uninstallBoringtunRuntime \"\${IF}\""
+assert_rc 1 "${RC}" "N1: a recorded node whose identity cannot be read fails the BoringTun uninstall"
+assert_true "  the node stays" test -S "${WG_SOCK}"
+assert_true "  and so does the attempt's record" test "$(attempt_files)" -gt 0
+REAL_BT_RUNTIME=1 REAL_TEARDOWN_CHECK=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run eval "${IDENTITY_FAILS}; uninstall_flow"
+assert_rc 1 "${RC}" "N1: through the whole uninstall too"
+assert_true "  params, the node and the record stay" test -e "${AMNEZIAWG_DIR}/params" -a -S "${WG_SOCK}" -a "$(attempt_files)" -gt 0
+assert_not_contains "uninstalled successfully" "${OUT}" "  and it does not report success"
+assert_true "  the record is the one written before, not rebuilt" cmp -s "${T}/n1-state.before" "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT}.state"
+REAL_BT_RUNTIME=1 REAL_TEARDOWN_CHECK=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+assert_rc 0 "${RC}" "N1: with identity inspection restored, the rerun proves the node and finishes"
+assert_true "  the node, then its record, then the configuration are gone" \
+	test ! -e "${WG_SOCK}" -a "$(attempt_files)" -eq 0 -a ! -e "${AMNEZIAWG_DIR}"
+# The record resolves when its node is already absent.
+install_runtime
+dead_socket "${WG_SOCK}"
+record_attempt launched up "done"
+rm -f "${WG_SOCK}"
+run uninstallBoringtunRuntime "${IF}"
+assert_rc 0 "${RC}" "N1: a recorded node that is already absent resolves the record"
+assert_eq "0" "$(attempt_files)" "  the record goes"
+# A node whose identity was read and differs is a replacement: it stays, and
+# the record's obligation is resolved.
+install_runtime
+dead_socket "${WG_SOCK}"
+record_attempt launched up "done"
+rm -f "${WG_SOCK}"
+dead_socket "${WG_SOCK}"
+run uninstallBoringtunRuntime "${IF}"
+assert_true "N1: a replacement with a different identity stays" test -S "${WG_SOCK}"
+assert_eq "0" "$(attempt_files)" "  and the old record's obligation is resolved"
+clear_uapi
+# _awgBtPathAbsent: absence only from a successful listing.
+mkdir -p "${T}/pa/dir"
+: >"${T}/pa/dir/present"
+assert_true "a path absent from a listed directory is absent" _awgBtPathAbsent "${T}/pa/dir/missing"
+assert_true "a path in a missing directory is absent" _awgBtPathAbsent "${T}/pa/nodir/missing"
+if _awgBtPathAbsent "${T}/pa/dir/present"; then not_ok "a present path is not absent"; else ok "a present path is not absent"; fi
+if [[ "${EUID}" -ne 0 ]]; then
+	chmod 000 "${T}/pa/dir"
+	if _awgBtPathAbsent "${T}/pa/dir/missing"; then not_ok "a path in an unreadable directory is not proven absent"; else ok "a path in an unreadable directory is not proven absent"; fi
+	chmod 0755 "${T}/pa/dir"
+fi
 IF=awgu0
 WG_SOCK="${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
 AWG_SOCK="${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock"
+
+echo "--- N2-A: only a positively inactive unit lets the uninstall commit"
+n2a() { # <label> <expected rc> <env...>
+	local LABEL="$1" WANT="$2"
+	shift 2
+	: >"${S}/un"
+	for ASSIGNMENT in "$@"; do export "${ASSIGNMENT?}"; done
+	OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+	for ASSIGNMENT in "$@"; do unset "${ASSIGNMENT%%=*}"; done
+	assert_rc "${WANT}" "${RC}" "N2-A: ${LABEL}"
+	if [[ "${WANT}" == 0 ]]; then
+		assert_true "  the configuration is removed" test ! -e "${AMNEZIAWG_DIR}"
+	else
+		assert_true "  the configuration stays" test -e "${AMNEZIAWG_DIR}/params"
+		assert_not_contains "uninstalled successfully" "${OUT}" "  and it does not report success"
+	fi
+}
+n2a "A: a unit that systemd reports inactive commits" 0 SERVICE_STATE=inactive
+n2a "A: a unit that systemd reports failed commits" 0 SERVICE_STATE=failed
+n2a "B: a unit that systemd reports active fails the uninstall" 1 SERVICE_STATE=active
+n2a "B: a unit that is deactivating fails the uninstall" 1 SERVICE_STATE=deactivating
+n2a "C: a service-state query that fails fails the uninstall" 1 SYSTEMCTL_FAILS=show
+n2a "D: an unexpected state fails the uninstall" 1 "SERVICE_STATE=garbage state"
+n2a "D: an empty answer fails the uninstall" 1 SERVICE_STATE=
+n2a "E: the rerun with a healthy query commits" 0 SERVICE_STATE=inactive
+: >"${S}/un"
+OS=ubuntu AWG_BACKEND=kernel RUN_INPUT=y run uninstall_flow
+assert_not_contains "show -p ActiveState" "$(cat "${S}/un")" "the kernel uninstall keeps its is-active check"
+assert_contains "systemctl is-active --quiet awg-quick@awg0" "$(cat "${S}/un")" "  (systemctl is-active)"
+
+echo "--- N2-B: a failed package database read is never \"not installed\""
+# dpkg-query and apt, driven by DPKG_OUT/DPKG_RC and APT_RC.
+pkg_mocks='dpkg-query() { echo "dpkg-query $*" >>"${S}/pkg"; printf "%s" "${DPKG_OUT}"; return "${DPKG_RC:-0}"; }
+apt() { echo "apt $*" >>"${S}/pkg"; return "${APT_RC:-0}"; }'
+pkg_case() { # <label> <expected rc> <expected apt call or ""> <inventory> [rc of dpkg-query] [rc of apt]
+	: >"${S}/pkg"
+	DPKG_OUT="$4" DPKG_RC="${5:-0}" APT_RC="${6:-0}" run eval "${pkg_mocks}; removeBoringtunAptPackages amneziawg-tools"
+	assert_rc "$2" "${RC}" "N2-B: $1"
+	if [[ -n "$3" ]]; then
+		assert_contains "$3" "$(cat "${S}/pkg")" "  runs: $3"
+	else
+		assert_not_contains "apt remove" "$(cat "${S}/pkg")" "  and removes nothing"
+	fi
+}
+TAB=$'\t'
+pkg_case "A: an installed package is removed" 0 "apt remove -y amneziawg-tools" "dpkg${TAB}ii "$'\n'"amneziawg-tools${TAB}ii "$'\n'
+pkg_case "B: a package the complete database lacks is a no-op" 0 "" "dpkg${TAB}ii "$'\n'"bash${TAB}ii "$'\n'
+pkg_case "B: a package with only its config files left is not installed" 0 "" "dpkg${TAB}ii "$'\n'"amneziawg-tools${TAB}rc "$'\n'
+pkg_case "A: a package installed for one of two architectures is removed" 0 "apt remove -y amneziawg-tools" \
+	"dpkg${TAB}ii "$'\n'"amneziawg-tools${TAB}rc "$'\n'"amneziawg-tools${TAB}ii "$'\n'
+pkg_case "C: a failing dpkg-query fails" 1 "" "" 2
+pkg_case "C: dpkg-query that fails after partial output fails" 1 "" "dpkg${TAB}ii "$'\n' 2
+pkg_case "D: a malformed inventory line fails" 1 "" "dpkg${TAB}ii "$'\n'"amneziawg-tools ii"$'\n'
+pkg_case "D: an unknown status fails" 1 "" "dpkg${TAB}ii "$'\n'"amneziawg-tools${TAB}zz "$'\n'
+pkg_case "D: an empty inventory (a database dpkg-query read as empty) fails" 1 "" ""
+pkg_case "D: an inventory without dpkg fails" 1 "" "bash${TAB}ii "$'\n'"amneziawg-tools${TAB}ii "$'\n'
+pkg_case "E: a failing apt remove fails" 1 "apt remove -y amneziawg-tools" "dpkg${TAB}ii "$'\n'"amneziawg-tools${TAB}ii "$'\n' 0 100
+# Through the whole uninstall, with the strict helper.
+: >"${S}/un"
+DPKG_OUT="" DPKG_RC=2 REAL_BT_PACKAGES=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run eval "${pkg_mocks}; uninstall_flow"
+assert_rc 1 "${RC}" "N2-B: a failed package database read fails the whole uninstall"
+assert_true "  the configuration stays" test -e "${AMNEZIAWG_DIR}/params"
+assert_not_contains "uninstalled successfully" "${OUT}" "  and it does not report success"
+DPKG_OUT="dpkg${TAB}ii "$'\n'"amneziawg-tools${TAB}ii "$'\n' APT_RC=100 REAL_BT_PACKAGES=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y \
+	run eval "${pkg_mocks}; uninstall_flow"
+assert_rc 1 "${RC}" "N2-B: a failed apt remove fails the whole uninstall"
+assert_true "  the configuration stays" test -e "${AMNEZIAWG_DIR}/params"
+DPKG_OUT="dpkg${TAB}ii "$'\n'"amneziawg-tools${TAB}ii "$'\n' REAL_BT_PACKAGES=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y \
+	run eval "${pkg_mocks}; uninstall_flow"
+assert_rc 0 "${RC}" "N2-B: F: with the database read and the removal restored, the rerun commits"
+assert_true "  the configuration is removed" test ! -e "${AMNEZIAWG_DIR}"
+: >"${S}/un"
+DPKG_RC=2 OS=ubuntu AWG_BACKEND=kernel RUN_INPUT=y run eval "${pkg_mocks}; uninstall_flow"
+assert_contains "remove-packages amneziawg amneziawg-tools amneziawg-dkms" "$(cat "${S}/un")" \
+	"the kernel uninstall keeps its own package removal"
 # modules-load: the kernel install's boot entry is never a BoringTun file.
 mkdir -p "${AWG_MODULES_LOAD_FILE%/*}"
 printf '# the administrator'"'"'s own\namneziawg\n' >"${AWG_MODULES_LOAD_FILE}"
