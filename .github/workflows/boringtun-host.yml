@@ -15,6 +15,7 @@ on:
       - packaging/boringtun/release.env
       - tests/test-boringtun-host-live.sh
       - tests/test-boringtun-kernel-coexistence.sh
+      - tests/helpers/boringtun-live-firewall.sh
       - .github/workflows/boringtun-host.yml
   pull_request:
     branches: [main]
@@ -23,6 +24,7 @@ on:
       - packaging/boringtun/release.env
       - tests/test-boringtun-host-live.sh
       - tests/test-boringtun-kernel-coexistence.sh
+      - tests/helpers/boringtun-live-firewall.sh
       - .github/workflows/boringtun-host.yml
   workflow_dispatch:
 
