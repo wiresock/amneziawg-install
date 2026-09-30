@@ -1289,6 +1289,72 @@ dead_socket "${WG_SOCK}"
 uapi_kept "a recorded socket whose recorded daemon still lives is kept"
 clear_uapi
 
+echo "--- B2: ss rows are LIVE, ABSENT or UNKNOWN; only ABSENT removes a node"
+# A real listener at the recorded node, whose recorded daemon is gone: only the
+# liveness proof stands between it and an unlink. The mocked ss prints the
+# given rows, and every row must have the shape the supported iproute2 prints.
+VALID_ROW="u_str LISTEN 0      4096          /run/unrelated.sock 5504 * 0 <-> ino:7 dev:0/63 peers:"
+ss_rows() { # <row>...
+	printf '%s\n' "$@" >"${T}/ss-rows"
+	printf '#!/bin/bash\ncat %q\n' "${T}/ss-rows" >"${MOCKBIN}/ss"
+	chmod 0755 "${MOCKBIN}/ss"
+}
+live_unknown() { # <label> <row>...
+	local LABEL="$1"
+	shift
+	install_runtime
+	listening_socket "${WG_SOCK}"
+	record_attempt launched up "done"
+	ss_rows "$@"
+	PATH="${MOCKBIN}:${PATH}" uapi_kept "${LABEL}"
+	assert_true "  the live socket stays" test -S "${WG_SOCK}"
+	assert_true "  and so does the attempt's record" test "$(attempt_files)" -gt 0
+	stop_listener
+	rm -f "${MOCKBIN}/ss"
+	clear_uapi
+}
+live_unknown "D: a malformed row ('u_str invalid invalid invalid /unrelated') keeps a live socket" \
+	"u_str invalid invalid invalid /unrelated"
+live_unknown "E: a truncated row keeps a live socket" "u_str LISTEN 0      1          ${WG_SOCK} 30113973 * 0"
+live_unknown "E: a row cut off after the inode keeps a live socket" "u_str LISTEN 0 1 /run/unrelated.sock 123 * 0 <-> ino:7"
+live_unknown "F: an invalid inode field keeps a live socket" "u_str LISTEN 0 1 /run/unrelated.sock 123 * 0 <-> ino:x7 dev:0/63 peers:"
+live_unknown "F: an invalid device field keeps a live socket" "u_str LISTEN 0 1 /run/unrelated.sock 123 * 0 <-> ino:7 dev:0:63 peers:"
+live_unknown "a row in another state keeps a live socket" "u_str ESTAB 0 0 /run/unrelated.sock 123 * 0 <-> ino:7 dev:0/63 peers:"
+live_unknown "a path row without its inode and device keeps a live socket" "u_str LISTEN 0 1 /run/unrelated.sock 123 * 0 <-> peers:"
+live_unknown "G: a valid unrelated row next to a malformed one keeps a live socket" \
+	"${VALID_ROW}" "u_str invalid invalid invalid /unrelated"
+# H: a complete, valid enumeration without the node proves it idle.
+install_runtime
+dead_socket "${WG_SOCK}"
+record_attempt launched up "done"
+ss_rows "${VALID_ROW}" "u_dgr UNCONN 0      0           /run/other-dgram.sock 5505 * 0 <-> ino:8 dev:0/63" \
+	"u_str LISTEN 0      1              @abstract-name 5506 * 0 <-> peers:" \
+	"u_str LISTEN 0      1      /run/with space.sock 5507 * 0 <-> ino:9 dev:0/63 peers: 5508"
+PATH="${MOCKBIN}:${PATH}" run uninstallBoringtunRuntime "${IF}"
+assert_rc 0 "${RC}" "H: a fully valid listing without the node lets the recorded, dead socket go"
+assert_true "  it is removed" test ! -e "${WG_SOCK}"
+assert_eq "0" "$(attempt_files)" "  and so is its attempt's record, afterwards"
+rm -f "${MOCKBIN}/ss"
+clear_uapi
+
+echo "--- N1: an attempt's record stays until the node it proves is gone"
+install_runtime
+dead_socket "${WG_SOCK}"
+record_attempt launched up "done"
+printf '#!/bin/bash\nexit 1\n' >"${MOCKBIN}/ss"
+chmod 0755 "${MOCKBIN}/ss"
+PATH="${MOCKBIN}:${PATH}" run uninstallBoringtunRuntime "${IF}"
+rm -f "${MOCKBIN}/ss"
+assert_rc 1 "${RC}" "N1: a recorded socket that cannot be inspected fails the BoringTun uninstall"
+assert_true "  the socket stays" test -S "${WG_SOCK}"
+assert_true "  and the attempt's record stays, as the proof of ownership" test "$(attempt_files)" -gt 0
+assert_contains "the attempt's record is kept as the proof of ownership" "${ERR}" "  and the operator is told"
+run uninstallBoringtunRuntime "${IF}"
+assert_rc 0 "${RC}" "N1: once ss works again, the rerun finishes"
+assert_true "  the recorded socket is removed" test ! -e "${WG_SOCK}"
+assert_eq "0" "$(attempt_files)" "  and then its record"
+clear_uapi
+
 echo "--- B3/S2: generated helpers"
 install_runtime
 printf '\n' >>"${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl"

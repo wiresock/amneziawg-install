@@ -7082,13 +7082,21 @@ function _awgBtRemoveGeneratedHelper() { # <file> <launch|ctl>
 	return 0
 }
 
-# Whether a process listens on the UNIX socket NODE, by ss's socket
-# diagnostics: a listening socket bound to NODE's inode and device, or listed
-# under NODE's path. 0: it is listened on; 1: provably not; 2: unknown, because
-# ss is missing or fails, NODE cannot be examined, or ss prints a line that is
-# not a UNIX socket. Only 1 allows a removal.
+# Whether a process listens on the UNIX socket NODE, from ss's socket
+# diagnostics (ss -xlHe). Three outcomes, and only ABSENT allows a removal:
+#   0 LIVE     a valid listing row names NODE's path, or its inode and device;
+#   1 ABSENT   ss succeeded, every row it printed is valid and none names NODE;
+#   2 UNKNOWN  anything else: ss missing or failing, NODE not examinable, or
+#              any row, related to NODE or not, that is not exactly the shape
+#              iproute2 5.9 to 6.19 print for these flags (Debian 11 and 12,
+#              Ubuntu 22.04, 24.04 and 26.04):
+#   <u_str|u_dgr|u_seq> <LISTEN|UNCONN> <recv-q> <send-q> <local> <inode> * <port> <->[ ino:<n> dev:<major>/<minor>][ peers:[ <inode>]...]
+# where <local> is an absolute path, which always comes with ino and dev, or
+# an @abstract name or * without them. Rows are matched as data, never
+# evaluated; the path may hold spaces, so the row is anchored on its tail.
+_AWG_BT_SS_ROW='^(u_str|u_dgr|u_seq)[[:space:]]+(LISTEN|UNCONN)[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+(.+)[[:space:]]+[0-9]+[[:space:]]+\*[[:space:]]+[0-9]+[[:space:]]+<->([[:space:]]+ino:([0-9]+)[[:space:]]+dev:([0-9]+)/([0-9]+))?([[:space:]]+peers:([[:space:]]+[0-9]+)*)?$'
 function _awgBtSocketListenedOn() { # <node>
-	local NODE="$1" FS_DEV="" FS_INO="" MAJOR MINOR OUTPUT RC=0
+	local NODE="$1" FS_DEV="" FS_INO="" MAJOR MINOR OUTPUT LINE LOCAL VINO VMAJ VMIN FOUND=0
 	[[ -S "${NODE}" && ! -L "${NODE}" ]] || return 2
 	command -v ss >/dev/null 2>&1 || return 2
 	read -r FS_DEV FS_INO <<<"$(stat -c '%d %i' -- "${NODE}" 2>/dev/null)"
@@ -7096,19 +7104,28 @@ function _awgBtSocketListenedOn() { # <node>
 	MAJOR=$(((FS_DEV >> 8) & 0xfff))
 	MINOR=$(((FS_DEV & 0xff) | ((FS_DEV >> 12) & 0xfff00)))
 	OUTPUT="$(ss -xlHe 2>/dev/null)" || return 2
-	awk -v node="${NODE}" -v ino="${FS_INO}" -v dev="${FS_DEV}" -v major="${MAJOR}" -v minor="${MINOR}" '
-		NF == 0 { next }
-		$1 !~ /^u_(str|seq|dgr)$/ || NF < 5 { bad = 1; next }
-		{
-			vino = ""; vmaj = ""; vmin = ""
-			for (i = 1; i <= NF; i++) {
-				if ($i ~ /^ino:[0-9]+$/) vino = substr($i, 5)
-				if ($i ~ /^dev:[0-9]+\/[0-9]+$/) { split(substr($i, 5), d, "/"); vmaj = d[1]; vmin = d[2] }
-			}
-			if ($5 == node || (vino == ino && ((vmaj == 0 && vmin == dev) || (vmaj == major && vmin == minor)))) found = 1
-		}
-		END { if (bad) exit 2; exit found ? 0 : 1 }' <<<"${OUTPUT}" || RC=$?
-	return "${RC}"
+	while IFS= read -r LINE; do
+		LINE="${LINE%"${LINE##*[![:space:]]}"}"
+		[[ -n "${LINE}" ]] || continue
+		[[ "${LINE}" =~ ${_AWG_BT_SS_ROW} ]] || return 2
+		LOCAL="${BASH_REMATCH[3]}"
+		LOCAL="${LOCAL#"${LOCAL%%[![:space:]]*}"}"
+		LOCAL="${LOCAL%"${LOCAL##*[![:space:]]}"}"
+		VINO="${BASH_REMATCH[5]}"
+		VMAJ="${BASH_REMATCH[6]}"
+		VMIN="${BASH_REMATCH[7]}"
+		case "${LOCAL}" in
+			/*) [[ -n "${VINO}" ]] || return 2 ;;
+			@?* | \*) [[ -z "${VINO}" ]] || return 2 ;;
+			*) return 2 ;;
+		esac
+		if [[ "${LOCAL}" == "${NODE}" ]] || { [[ "${VINO}" == "${FS_INO}" ]] &&
+			{ [[ "${VMAJ}" == 0 && "${VMIN}" == "${FS_DEV}" ]] || [[ "${VMAJ}" == "${MAJOR}" && "${VMIN}" == "${MINOR}" ]]; }; }; then
+			FOUND=1
+		fi
+	done <<<"${OUTPUT}"
+	((FOUND)) && return 0
+	return 1
 }
 
 # Remove the UAPI node at PATH only on positive proof that it is this
@@ -7116,12 +7133,15 @@ function _awgBtSocketListenedOn() { # <node>
 # recorded as ID, the daemon PID/START that created it is gone, and no process
 # listens on it (for the AmneziaWG path, a symlink, on the socket it resolves
 # to, which must be in one of the UAPI socket directories). Anything else is
-# left in place. Returns 1 when a node is left at PATH.
+# left in place. Returns 0 when the recorded node is gone (removed now, absent,
+# or replaced by a node the attempt did not record), and 1 while the recorded
+# node is still there: the attempt's record is then the proof of ownership a
+# later uninstall needs, and must be kept.
 function _awgBtRemoveProvenIdleNode() { # <path> <recorded id> <pid> <start time>
 	local NODE="$1" SOCKET TARGET_DIR
 	[[ -e "${NODE}" || -L "${NODE}" ]] || return 0
 	if [[ -z "$2" || "$(_awgBtPathId "${NODE}")" != "$2" ]]; then
-		return 1
+		return 0
 	fi
 	if [[ -n "$3" && -n "$4" ]] && _awgBtProcessIs "$3" "$4"; then
 		return 1
@@ -7210,7 +7230,7 @@ function boringtunTeardownFinished() { # <interface>
 # anything it owns, or anything at the interface's UAPI paths, remains, so the
 # configuration stays and the uninstall can be rerun.
 function uninstallBoringtunRuntime() { # <interface>
-	local INTERFACE_NAME="$1" RC=0 ATTEMPT FILE NODE
+	local INTERFACE_NAME="$1" RC=0 ATTEMPT FILE NODE KEEP
 	boringtunTeardownFinished "${INTERFACE_NAME}" || return 1
 	while IFS= read -r ATTEMPT; do
 		[[ -n "${ATTEMPT}" ]] || continue
@@ -7219,10 +7239,18 @@ function uninstallBoringtunRuntime() { # <interface>
 			RC=1
 			continue
 		fi
+		# The record goes only after every node it proves to be BoringTun's is
+		# gone; while one is kept, the record stays for the next uninstall.
+		KEEP=0
 		_awgBtRemoveProvenIdleNode "${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[AWG_SOCK]}" \
-			"${_AWG_BT_STATE[PID]}" "${_AWG_BT_STATE[PID_START]}" || true
+			"${_AWG_BT_STATE[PID]}" "${_AWG_BT_STATE[PID_START]}" || KEEP=1
 		_awgBtRemoveProvenIdleNode "${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[WG_SOCK]}" \
-			"${_AWG_BT_STATE[PID]}" "${_AWG_BT_STATE[PID_START]}" || true
+			"${_AWG_BT_STATE[PID]}" "${_AWG_BT_STATE[PID_START]}" || KEEP=1
+		if ((KEEP)); then
+			echo -e "${RED}ERROR: a UAPI node that start attempt ${ATTEMPT} of ${INTERFACE_NAME} recorded could not be proven idle or removed; the attempt's record is kept as the proof of ownership for the next uninstall.${NC}" >&2
+			RC=1
+			continue
+		fi
 		_awgBtAttemptRemove "${INTERFACE_NAME}" 2>/dev/null
 		if [[ -n "$(_awgBtRecordedAttempts "${INTERFACE_NAME}" | grep -x "${ATTEMPT}")" ]]; then
 			echo -e "${RED}ERROR: the finished start attempt ${ATTEMPT} of ${INTERFACE_NAME} could not be removed from ${AWG_BT_RUN_DIR}.${NC}" >&2
