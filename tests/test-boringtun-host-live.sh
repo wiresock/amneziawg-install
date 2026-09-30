@@ -47,7 +47,9 @@ if [[ -z "${AWG_LIVE_SECRET_SCAN:-}" ]]; then
 	else
 		echo "  OK: no config appears in this test's output"
 	fi
-	if grep -q '[▀▄█]' "${SCAN_DIR}/public.log"; then
+	# Fixed strings: in the C locale a bracket expression would match single
+	# bytes of other UTF-8 characters, such as the arrow systemd prints.
+	if grep -qF -e '▀' -e '▄' -e '█' "${SCAN_DIR}/public.log"; then
 		echo "  FAIL: QR code rows appear in this test's output"
 		RC=1
 	else
@@ -277,9 +279,17 @@ check "awg show all dump lists the interface" bash -c "awg show all dump | grep 
 # The client is a copy of the verified binary (outside the store, so the
 # uninstall's daemon check never mistakes it for the server) in the namespace.
 cp -- "${STORE}/${RELEASE_ID}/boringtun-cli" "${CLIENT_BIN}"
-CLIENT_CONF="$(find /root /home -maxdepth 2 -name "${IF}-client-client.conf" 2>/dev/null | head -n 1)"
+CLIENT_CONF="$(find /etc/amnezia/amneziawg/clients /root /home -maxdepth 2 -name "${IF}-client-client.conf" 2>/dev/null | head -n 1)"
 [[ -n "${CLIENT_CONF}" ]] || die "the installer did not write the test client's config"
 record_config_secrets "${CLIENT_CONF}"
+# Positive controls for the output scan, on private files only: its key list
+# finds the keys in the client's config, and its QR pattern finds the rows of
+# that config's QR code.
+check "the output scan's key list matches the test client's config (private control)" \
+	grep -qF -f "${AWG_LIVE_SECRET_SCAN}" "${CLIENT_CONF}"
+qrencode -t ansiutf8 -l L <"${CLIENT_CONF}" >"${WORK}/qr.private" 2>/dev/null
+check "the output scan's QR pattern matches a real client QR code (private control)" \
+	grep -qF -e '▀' -e '▄' -e '█' "${WORK}/qr.private"
 CLIENT_TUNNEL_ADDR="$(sed -n 's/^Address = \([0-9.]*\)\/32.*/\1/p' "${CLIENT_CONF}" | head -n 1)"
 
 stop_client() {
