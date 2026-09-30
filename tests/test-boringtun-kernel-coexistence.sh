@@ -15,6 +15,17 @@
 # uninstall removes the override but neither amneziawg-dkms nor an
 # administrator's /etc/modules-load.d/amneziawg.conf.
 #
+# It also measures interoperability of AmneziaWG kernel clients with the
+# BoringTun server's protocol imitation under AWG 3.0: BoringTun is started
+# while the module is unloaded, the module is then loaded behind the
+# override's back (the running daemon is unaffected), and a kernel client in a
+# network namespace, configured with an installer-generated client config,
+# sends a sweep of UDP datagram sizes to an echo service on the server's
+# tunnel address, once per imitation (none, dns, quic, stun). The loss is
+# reported for each. SIP is refused under AWG 3.0 while any S size is 31 or
+# more; a kernel module that rejects AWG 3.0 is reported, and the sweep then
+# runs under AWG 2.0.
+#
 # Requirements: root, systemd, Ubuntu with the running kernel's headers
 # available, network access, AWG_DISPOSABLE_HOST_TEST=1.
 #
@@ -74,6 +85,9 @@ cleanup() {
 		journalctl -u "${UNIT}" --no-pager -n 60 2>&1
 		cat "${WORK}"/*.log 2>/dev/null | tail -n 80
 	fi
+	[[ -z "${ECHO_PID:-}" ]] || kill "${ECHO_PID}" 2>/dev/null
+	ip netns delete awgk 2>/dev/null
+	ip link delete awgkh0 2>/dev/null
 	rm -f "${PROBE_CONF}"
 	rm -rf "${WORK}"
 	exit "${RC}"
@@ -128,6 +142,9 @@ probe_override() { # <label> <modprobe.d line>
 	modprobe amneziawg >/dev/null 2>&1
 	module_loaded && LOADED_BY_MODPROBE=yes || LOADED_BY_MODPROBE=no
 	unload_module
+	[[ -z "${ECHO_PID:-}" ]] || kill "${ECHO_PID}" 2>/dev/null
+	ip netns delete awgk 2>/dev/null
+	ip link delete awgkh0 2>/dev/null
 	rm -f "${PROBE_CONF}"
 	note "${LABEL}: ip link add … type amneziawg exited ${ADD_RC}, module loaded by it: ${LOADED_BY_LINK}; explicit modprobe loaded it: ${LOADED_BY_MODPROBE}"
 	printf '%s %s %s\n' "${ADD_RC}" "${LOADED_BY_LINK}" "${LOADED_BY_MODPROBE}"
@@ -204,6 +221,135 @@ unload_module
 systemctl reset-failed "${UNIT}" >/dev/null 2>&1
 systemctl start "${UNIT}"
 check "once the module is unloaded, BoringTun starts again" test -e "/sys/class/net/${IF}/tun_flags"
+
+echo "=== Interop: an AmneziaWG kernel client with BoringTun's protocol imitation ==="
+KNS="awgk"
+KIF="awgk0"
+KVETH_HOST="awgkh0"
+KVETH_CLIENT="awgkc0"
+ECHO_PORT=40007
+SERVER_TUNNEL_ADDR=10.66.66.1
+load_module_behind_override() {
+	mv "${OVERRIDE}" "${WORK}/override.saved" && modprobe amneziawg
+	local RC=$?
+	mv "${WORK}/override.saved" "${OVERRIDE}"
+	return "${RC}"
+}
+kernel_client_down() {
+	ip -n "${KNS}" link delete "${KIF}" 2>/dev/null
+	return 0
+}
+# The client: a kernel amneziawg interface in the namespace, configured from
+# the generated client config (never printed).
+kernel_client_up() {
+	install -m 0600 "${KCLIENT_CONF}" "${WORK}/${KIF}.conf" &&
+		awg-quick strip "${WORK}/${KIF}.conf" >"${WORK}/${KIF}.setconf" 2>"${WORK}/kclient-strip.err" &&
+		ip -n "${KNS}" link add "${KIF}" type amneziawg &&
+		ip netns exec "${KNS}" awg setconf "${KIF}" "${WORK}/${KIF}.setconf" 2>"${WORK}/kclient-setconf.err" &&
+		ip -n "${KNS}" addr add "${KCLIENT_ADDR}/32" dev "${KIF}" &&
+		ip -n "${KNS}" link set "${KIF}" up &&
+		ip -n "${KNS}" route add "${SERVER_TUNNEL_ADDR}/32" dev "${KIF}"
+}
+kernel_reachable() {
+	local I
+	for ((I = 0; I < 40; I++)); do
+		kernel_ping && return 0
+		sleep 0.5
+	done
+	return 1
+}
+kernel_ping() {
+	ip netns exec "${KNS}" ping -c 1 -W 1 "${SERVER_TUNNEL_ADDR}" >/dev/null 2>&1
+}
+# Every UDP payload size from 8 to 1300 bytes, three times over, to the echo
+# service; prints "<sent> <lost> <lost sizes...>".
+loss_sweep() {
+	ip netns exec "${KNS}" python3 - "${SERVER_TUNNEL_ADDR}" "${ECHO_PORT}" <<'PY'
+import socket, struct, sys, time
+dst = (sys.argv[1], int(sys.argv[2]))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setblocking(False)
+sizes = list(range(8, 1301)); got = set(); seq = 0
+def drain():
+    while True:
+        try:
+            data = s.recv(65535)
+        except BlockingIOError:
+            return
+        if len(data) >= 4:
+            got.add(struct.unpack(">I", data[:4])[0])
+for _ in range(3):
+    for size in sizes:
+        s.sendto(struct.pack(">I", seq) + bytes(size - 4), dst); seq += 1
+        if seq % 20 == 0:
+            time.sleep(0.004); drain()
+end = time.time() + 4
+while time.time() < end:
+    drain(); time.sleep(0.05)
+lost = [i for i in range(seq) if i not in got]
+print(seq, len(lost), *sorted(set(sizes[i % len(sizes)] for i in lost))[:20])
+PY
+}
+set_imitation_managed() { # <log> <protocol>
+	timeout --kill-after=30 "${INSTALLER_TIMEOUT}" bash "${INSTALLER}" --set-boringtun-imitation "$2" >"${WORK}/$1" 2>&1 </dev/null
+}
+
+timeout --kill-after=30 "${INSTALLER_TIMEOUT}" bash "${INSTALLER}" --add-client kclient >"${WORK}/kclient-add.private" 2>&1 </dev/null
+check "--add-client creates the kernel client's config (kept private)" test "$?" -eq 0
+ip netns add "${KNS}"
+ip link add "${KVETH_HOST}" type veth peer name "${KVETH_CLIENT}"
+ip link set "${KVETH_CLIENT}" netns "${KNS}"
+ip addr add 192.0.2.1/24 dev "${KVETH_HOST}"
+ip link set "${KVETH_HOST}" up
+ip -n "${KNS}" addr add 192.0.2.2/24 dev "${KVETH_CLIENT}"
+ip -n "${KNS}" link set "${KVETH_CLIENT}" up
+ip -n "${KNS}" link set lo up
+python3 -c 'import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((sys.argv[1], int(sys.argv[2])))
+while True:
+    data, peer = s.recvfrom(65535); s.sendto(data, peer)' "${SERVER_TUNNEL_ADDR}" "${ECHO_PORT}" &
+ECHO_PID=$!
+check "--enable-awg3 succeeds for the interop" run_managed interop-awg3.log --enable-awg3
+KCLIENT_CONF="$(find /etc/amnezia/amneziawg/clients /root /home -maxdepth 2 -name "${IF}-client-kclient.conf" 2>/dev/null | head -n 1)"
+KCLIENT_ADDR="$(sed -n 's/^Address = \([0-9.]*\)\/32.*/\1/p' "${KCLIENT_CONF}" | head -n 1)"
+INTEROP_PROTOCOL="AWG 3.0"
+check "(the module is loaded behind the override for the client)" load_module_behind_override
+if ! kernel_client_up; then
+	note "the kernel client does not accept the AWG 3.0 config: $(head -c 300 "${WORK}/kclient-setconf.err" | tr '\n' ' ')"
+	kernel_client_down
+	unload_module
+	check "back to AWG 2.0 for the interop" run_managed interop-awg2.log --disable-awg3
+	INTEROP_PROTOCOL="AWG 2.0"
+	check "(the module is loaded behind the override again)" load_module_behind_override
+	kernel_client_up
+fi
+for PROTOCOL in none dns quic stun; do
+	if [[ "${PROTOCOL}" != none ]]; then
+		kernel_client_down
+		unload_module
+		check "${INTEROP_PROTOCOL}: --set-boringtun-imitation ${PROTOCOL} succeeds with the module unloaded" \
+			set_imitation_managed "interop-${PROTOCOL}.log" "${PROTOCOL}"
+		check "  (the module is loaded behind the override again)" load_module_behind_override
+		kernel_client_up
+	fi
+	check "${INTEROP_PROTOCOL} + ${PROTOCOL}: the running server is still BoringTun" test -e "/sys/class/net/${IF}/tun_flags"
+	check "${INTEROP_PROTOCOL} + ${PROTOCOL}: the daemon runs --imitate-protocol ${PROTOCOL}" \
+		bash -c '[[ "$(tr "\0" " " <"/proc/$(systemctl show -p MainPID --value "$1")/cmdline")" == *"--imitate-protocol $2 "* ]]' _ "${UNIT}" "${PROTOCOL}"
+	if kernel_reachable; then
+		ok "${INTEROP_PROTOCOL} + ${PROTOCOL}: the kernel client completes a handshake and reaches the server"
+		read -r SENT LOST LOST_SIZES <<<"$(loss_sweep)"
+		note "${INTEROP_PROTOCOL} + ${PROTOCOL} imitation, kernel client: ${LOST:-?} of ${SENT:-?} echoed datagrams lost${LOST_SIZES:+ (payload sizes ${LOST_SIZES})}"
+		check "${INTEROP_PROTOCOL} + ${PROTOCOL}: loss stays below 1% (${LOST:-?}/${SENT:-?})" \
+			test -n "${SENT}" -a "$((${LOST:-${SENT}} * 100))" -lt "${SENT:-0}"
+	else
+		bad "${INTEROP_PROTOCOL} + ${PROTOCOL}: the kernel client completes a handshake and reaches the server"
+	fi
+done
+kill "${ECHO_PID}" 2>/dev/null
+kernel_client_down
+ip netns delete "${KNS}" 2>/dev/null
+ip link delete "${KVETH_HOST}" 2>/dev/null
+unload_module
+check "the module is unloaded again" bash -c '! [[ -e /sys/module/amneziawg ]]'
 
 echo "=== Uninstall ==="
 # Without params the menu would start a fresh interactive install instead.

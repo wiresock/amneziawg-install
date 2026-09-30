@@ -3,7 +3,11 @@ name: BoringTun Host
 # End-to-end tests of the experimental BoringTun host backend of
 # amneziawg-install.sh: the installer itself installs amneziawg-tools and the
 # immutable public BoringTun release on disposable runners, moves traffic
-# through the tunnel, switches protocol modes and uninstalls. A separate job
+# through the tunnel, switches protocol modes, cycles the built-in protocol
+# imitation (checking the server's datagrams and the probe replies on the wire)
+# and uninstalls. The x86_64 job installs with the last installer version
+# without protocol imitation and manages the host with this one, the upgrade
+# path; the aarch64 and Debian jobs install with this one. A separate job
 # downloads the public release anonymously, and one proves coexistence with an
 # installed AmneziaWG kernel module. See docs/BORINGTUN_BACKEND_DESIGN.md.
 
@@ -16,6 +20,7 @@ on:
       - tests/test-boringtun-host-live.sh
       - tests/test-boringtun-kernel-coexistence.sh
       - tests/helpers/boringtun-live-firewall.sh
+      - tests/helpers/boringtun-imitation-wire.py
       - .github/workflows/boringtun-host.yml
   pull_request:
     branches: [main]
@@ -25,6 +30,7 @@ on:
       - tests/test-boringtun-host-live.sh
       - tests/test-boringtun-kernel-coexistence.sh
       - tests/helpers/boringtun-live-firewall.sh
+      - tests/helpers/boringtun-imitation-wire.py
       - .github/workflows/boringtun-host.yml
   workflow_dispatch:
 
@@ -86,8 +92,10 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
+            upgrade: true
           - arch: aarch64
             runner: ubuntu-24.04-arm
+            upgrade: false
     steps:
       - uses: actions/checkout@v6
         with:
@@ -100,8 +108,18 @@ jobs:
           uname -m
           test "$(uname -m)" = "$EXPECTED"
 
+      # The upgrade path starts from main at the last commit before protocol
+      # imitation (the BoringTun host install as released), fetched by its
+      # fixed SHA so that it never follows main.
+      - name: Fetch the last installer without protocol imitation
+        if: matrix.upgrade
+        run: |
+          git fetch --no-tags --depth=1 origin 9f5a1afb87f73fd44b83e8abc8a0388efceeb8d5
+          git show FETCH_HEAD:amneziawg-install.sh >"$RUNNER_TEMP/previous-installer.sh"
+          echo "AWG_LIVE_PREVIOUS_INSTALLER=$RUNNER_TEMP/previous-installer.sh" >>"$GITHUB_ENV"
+
       - name: Install, use and uninstall BoringTun through the installer (as root)
-        run: sudo env AWG_DISPOSABLE_HOST_TEST=1 bash tests/test-boringtun-host-live.sh
+        run: sudo env AWG_DISPOSABLE_HOST_TEST=1 AWG_LIVE_PREVIOUS_INSTALLER="${AWG_LIVE_PREVIOUS_INSTALLER:-}" bash tests/test-boringtun-host-live.sh
 
       - name: Collect diagnostics
         if: failure()
