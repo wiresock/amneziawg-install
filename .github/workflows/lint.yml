@@ -46,6 +46,8 @@ jobs:
           bash -n tests/mutate-boringtun-host.sh
           bash -n tests/helpers/mutation-engine.sh
           bash -n tests/test-mutation-engine.sh
+          bash -n tests/helpers/boringtun-live-firewall.sh
+          bash -n tests/test-boringtun-live-firewall.sh
           bash -n tests/equivalence/run-kernel-equivalence.sh
           bash -n tests/equivalence/kernel-scenarios.sh
           bash -n tests/equivalence/kernel-install-uninstall.sh
@@ -98,6 +100,8 @@ jobs:
           shellcheck --severity=warning tests/mutate-boringtun-host.sh
           shellcheck --severity=warning tests/helpers/mutation-engine.sh
           shellcheck --severity=warning tests/test-mutation-engine.sh
+          shellcheck --severity=warning tests/helpers/boringtun-live-firewall.sh
+          shellcheck --severity=warning tests/test-boringtun-live-firewall.sh
           shellcheck --severity=warning tests/equivalence/run-kernel-equivalence.sh
           shellcheck --severity=warning tests/equivalence/kernel-scenarios.sh
           shellcheck --severity=warning tests/equivalence/kernel-install-uninstall.sh

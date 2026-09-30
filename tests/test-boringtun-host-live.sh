@@ -148,21 +148,13 @@ fd_count() {
 peer_count() {
 	awg show "${IF}" peers 2>/dev/null | grep -c .
 }
-# The firewall rules this interface's PostUp hooks added, as the firewall
-# lists them: its own nft table when the installer chose nftables, otherwise
-# the iptables rules that name the interface, its port or the masquerade on
-# the public interface. A rule duplicated by a restart shows as a difference.
-# Fails when the rules cannot be read.
-owned_firewall() {
-	local TABLE SAVED
-	TABLE="$(sed -n 's/^PostUp = nft add table \(ip\|inet\) \(awg-[A-Za-z0-9_.-]*\)$/\1 \2/p' "/etc/amnezia/amneziawg/${IF}.conf" | head -n 1)"
-	if [[ -n "${TABLE}" ]]; then
-		# shellcheck disable=SC2086 # the family and the table's name
-		nft list table ${TABLE}
-		return
-	fi
-	SAVED="$(iptables-save)" || return 1
-	grep -E -- "(-[io] ${IF}( |$)|--dport ${PORT}( |$)|-o ${PUBLIC_NIC} -j MASQUERADE)" <<<"${SAVED}" | LC_ALL=C sort
+# The firewall rules this interface's PostUp hooks added (its own nft table,
+# or the iptables rules that name it), read by fw_* in
+# helpers/boringtun-live-firewall.sh: a failed query is never a result.
+# shellcheck source=helpers/boringtun-live-firewall.sh
+source "${SCRIPT_DIR}/helpers/boringtun-live-firewall.sh"
+fw_args() {
+	FW_ARGS=("/etc/amnezia/amneziawg/${IF}.conf" "${IF}" "${PORT}" "${PUBLIC_NIC}")
 }
 no_kernel_module() {
 	[[ ! -e /sys/module/amneziawg ]]
@@ -397,12 +389,13 @@ check "and the same daemon still serves the interface" test "$(main_pid)" = "${P
 check "the test client still reaches the server" wait_for 10 tunnel_ping
 
 # ── Service lifecycle ───────────────────────────────────────────────────────
-FIREWALL="$(owned_firewall)"
-check "the interface's own firewall rules can be read and are present ($(grep -c . <<<"${FIREWALL}") lines)" test -n "${FIREWALL}"
+fw_args
+FIREWALL=""
+check "the interface's own firewall rules are read successfully and are present" fw_baseline FIREWALL "${FW_ARGS[@]}"
+echo "    (${IF} owns $(grep -c . <<<"${FIREWALL}") firewall lines)"
 same_firewall() { # <after what>
-	local NOW
-	NOW="$(owned_firewall)" || NOW="(unreadable)"
-	check "the interface's own firewall rules are exactly as before, none duplicated, $1" test "${NOW}" = "${FIREWALL}"
+	check "the interface's own firewall rules are read successfully and are exactly as before, none duplicated, $1" \
+		fw_unchanged "${FIREWALL}" "${FW_ARGS[@]}"
 }
 systemctl restart "${UNIT}"
 check "restart succeeds" test "$?" -eq 0
@@ -413,7 +406,7 @@ same_firewall "after restart"
 systemctl stop "${UNIT}"
 check "stop leaves the unit inactive" bash -c "! systemctl is-active --quiet '${UNIT}'"
 check "and removes the link and sockets" test ! -e "/sys/class/net/${IF}" -a ! -e "/var/run/wireguard/${IF}.sock"
-check "and the interface's firewall rules" test -z "$(owned_firewall 2>/dev/null)"
+check "and the interface's firewall rules, which a successful query proves absent" fw_absent "${FW_ARGS[@]}"
 systemctl start "${UNIT}"
 check "start succeeds again" test "$?" -eq 0
 check_served "after stop and start"
