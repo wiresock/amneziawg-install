@@ -95,7 +95,8 @@ mutant s9_missing_up_is_terminal $'elif ! _awgBtFlagIs "${INTERFACE_NAME}" up; t
 mutant s9_socket_unlink_failure_ignored \
 	$'cannot be removed; cleanup is incomplete"\n\t\tKEEP=1' $'cannot be removed; cleanup is incomplete"'
 # Socket ownership (S2).
-mutant s2_remove_replaced_node '[[ "${CURRENT}" == "$2" ]] || return 0' ':'
+mutant s2_remove_replaced_node $'\tCURRENT="$(_awgBtPathId "$1")" || return 0\n\t[[ "${CURRENT}" == "$2" ]] || return 0' \
+	$'\tCURRENT="$(_awgBtPathId "$1")" || return 0\n\t:'
 mutant s2_remove_while_owner_lives '_awgBtProcessIs "$3" "$4" && return 0' ':'
 mutant s2_record_without_fd_proof 'ss -xlHe 2>/dev/null | awk' 'true || ss -xlHe 2>/dev/null | awk'
 mutant s2_inode_only_identity "stat -c '%d:%i:%f:%.9Z'" "stat -c '%d:%i:%f:0.000000000'"

@@ -168,16 +168,40 @@ mutation_add weak_ss_row_check test-boringtun-host "${INSTALLER}" "D: a malforme
 mutant_expect unrelated_malformed_row_ignored test-boringtun-host "${INSTALLER}" "G: a valid unrelated row next to a malformed one keeps a live socket" \
 	$'\t\t[[ "${LINE}" =~ ${_AWG_BT_SS_ROW} ]] || return 2\n' $'\t\t[[ "${LINE}" =~ ${_AWG_BT_SS_ROW} ]] || continue\n'
 mutant_expect alias_target_liveness_unchecked test-boringtun-host "${INSTALLER}" "  the alias stays" \
-	$'\tif [[ -e "${SOCKET}" || -L "${SOCKET}" ]]; then\n\t\t_awgBtSocketListenedOn' \
-	$'\tif [[ ! -L "${NODE}" ]] && [[ -e "${SOCKET}" || -L "${SOCKET}" ]]; then\n\t\t_awgBtSocketListenedOn'
+	$'\tif ! _awgBtPathAbsent "${SOCKET}"; then\n\t\t_awgBtSocketListenedOn' \
+	$'\tif [[ ! -L "${NODE}" ]] && ! _awgBtPathAbsent "${SOCKET}"; then\n\t\t_awgBtSocketListenedOn'
 mutant_expect alias_outside_uapi_dirs_followed test-boringtun-host "${INSTALLER}" "resolves outside the UAPI socket directories" \
 	$'\t\tif [[ "${TARGET_DIR}" != "$(readlink -f -- "${AWG_BT_WG_SOCKET_DIR}" 2>/dev/null)" &&' $'\t\tif false &&'
 # The node's identity is checked first and again right before the unlink;
 # without the record, both go.
 mutation_add unrecorded_node_removed test-boringtun-host "${INSTALLER}" "replaced the recorded node" \
-	$'\tif [[ -z "$2" || "$(_awgBtPathId "${NODE}")" != "$2" ]]; then\n\t\treturn 0\n\tfi\n' '' \
+	$'\t[[ "${CURRENT}" == "$2" ]] || return 0\n\tif [[ -n "$3" && -n "$4" ]] && _awgBtProcessIs' $'\tif [[ -n "$3" && -n "$4" ]] && _awgBtProcessIs' \
 	$'\t[[ "$(_awgBtPathId "${NODE}")" == "$2" ]] || return 1\n\trm -f' $'\trm -f'
 # N1: an attempt's record stays while a node it proves to be BoringTun's does.
+# N1: a failed identity query is UNKNOWN; the mutant restores the conflation
+# of a failed query with a different node.
+mutant_expect identity_query_failure_resolved test-boringtun-host "${INSTALLER}" "with identity inspection restored, the rerun proves the node and finishes" \
+	$'\tif ! CURRENT="$(_awgBtPathId "${NODE}")" || [[ ! "${CURRENT}" =~ ^[0-9]+:[0-9]+:[0-9a-f]+:[0-9]+\\.[0-9]{9}$ ]]; then\n\t\t_awgBtPathAbsent "${NODE}" && return 0\n\t\treturn 1\n\tfi\n\t[[ "${CURRENT}" == "$2" ]] || return 0\n' \
+	$'\tif [[ "$(_awgBtPathId "${NODE}")" != "$2" ]]; then\n\t\treturn 0\n\tfi\n'
+mutant_expect absence_from_failed_test test-boringtun-host "${INSTALLER}" "a path in an unreadable directory is not proven absent" \
+	$'\tif LIST="$(find -H "${DIR}" -mindepth 1 -maxdepth 1 -name "${NAME}" -print 2>/dev/null)"; then' \
+	$'\t[[ -e "$1" || -L "$1" ]] || return 0\n\tif LIST="$(find -H "${DIR}" -mindepth 1 -maxdepth 1 -name "${NAME}" -print 2>/dev/null)"; then'
+# N2-A: only a positively inactive unit lets the BoringTun uninstall commit;
+# the mutant restores "any nonzero is-active is inactive".
+mutant_expect service_query_failure_inactive test-boringtun-host "${INSTALLER}" "C: a service-state query that fails fails the uninstall" \
+	$'\t\t\tAWG_RUNNING=0\n\t\t\tboringtunServiceInactive "${SERVER_AWG_NIC}" && AWG_RUNNING=1\n' \
+	$'\t\t\tsystemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"\n\t\t\tAWG_RUNNING=$?\n'
+mutant_expect unexpected_service_state_inactive test-boringtun-host "${INSTALLER}" "D: an unexpected state fails the uninstall" \
+	$'\t\tinactive | failed) return 0 ;;\n' $'\t\tinactive | failed | *[!a-z]* | "") return 0 ;;\n'
+# N2-B: a failed package database read is never "not installed".
+mutant_expect package_query_failure_absent test-boringtun-host "${INSTALLER}" "C: a failing dpkg-query fails" \
+	$'the package database cannot be read (dpkg-query failed).${NC}"\n\t\treturn 1' \
+	$'the package database cannot be read (dpkg-query failed).${NC}"\n\t\treturn 0'
+mutant_expect package_inventory_without_dpkg_accepted test-boringtun-host "${INSTALLER}" "D: an empty inventory (a database dpkg-query read as empty) fails" \
+	$'\tif [[ "${STATE[dpkg]:-}" != ii* ]]; then' $'\tif false; then'
+mutant_expect malformed_package_row_accepted test-boringtun-host "${INSTALLER}" "D: a malformed inventory line fails" \
+	$'\t\tif [[ ! "${LINE}" =~ ${ROW} ]]; then\n\t\t\techo -e "${RED}ERROR: dpkg-query printed' \
+	$'\t\tif [[ ! "${LINE}" =~ ${ROW} ]]; then\n\t\t\tcontinue\n\t\t\techo -e "${RED}ERROR: dpkg-query printed'
 mutant_expect attempt_record_dropped_with_node_kept test-boringtun-host "${INSTALLER}" "and the attempt's record stays, as the proof of ownership" \
 	$'\t\tif ((KEEP)); then\n' $'\t\tif false; then\n'
 # N2: each removal before the BoringTun commit is checked.
