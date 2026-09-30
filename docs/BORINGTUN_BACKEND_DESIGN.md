@@ -2068,11 +2068,30 @@ the real assets anonymously and checks them. The transaction, in order:
 6. `MANIFEST` is read as data: exactly the format-1 keys, and format, name,
    version, source repository and commit, target, architecture, OS, libc,
    linkage, binary name and `binary_sha256` must match the embedded contract.
-7. The binary's SHA-256 must equal the embedded value; only then is it run,
-   and `--version` must print `boringtun 0.7.1`.
-8. The files are copied into a root-owned `<store>/.<release>.tmp.XXXXXX`, checked
-   again and renamed to `<store>/<release>`; `current` is replaced by renaming a
-   new relative link over it; `_awgBtVerifyStore` must then pass.
+7. The binary's SHA-256 must equal the embedded value. Nothing runs in the
+   download directory, which may be on a `noexec` `/tmp`.
+8. The files are copied into a root-owned `<store>/.<release>.tmp.XXXXXX`, which
+   is verified as a candidate and renamed to `<store>/<release>`.
+9. The runtime's own release checks (`_awgBtVerifyRelease`, the part of
+   `_awgBtVerifyStore` after reading `current`) must pass for that release, and
+   only then is `current` pointed at it, by renaming a new relative link over
+   it. Verify, then commit: every failure leaves `current` as it was, or absent;
+   there is no switch followed by a rollback.
+
+A release directory in the store, the staged one or one an interrupted install
+left under its final name, goes through one verification boundary,
+`_awgBtVerifyCandidate`, before anything in it runs: every directory from the
+trust anchor down and the release directory are root-owned and not writable by
+others; it holds exactly the four files, each a root-owned regular file with a
+single link that only root can write (the binary executable), so no symlink or
+hard link stands in for a member; the embedded contract (`MANIFEST` read as
+data, the binary's SHA-256) holds; and the binary is still the same trusted node
+(device, inode, mode and nanosecond ctime) that was hashed. Only then does
+`--version` run, and it must print `boringtun 0.7.1`. Between that last check
+and the exec only root could replace the binary. An exec through the hashed
+file descriptor (`/proc/self/fd`) was considered and not used: with no path
+component writable by anyone but root it would close no window a non-root user
+can reach.
 
 The published archive already has the store layout and the runtime's `MANIFEST`
 format, so nothing is converted: the store holds the release's own `MANIFEST`,
@@ -2147,7 +2166,11 @@ installer's.
 or `/etc/amneziawg-proxy/proxy.toml` exists; the proxy's uninstaller keeps
 `proxy.toml` unless `--purge-config` is given, and a leftover one counts. The
 proxy installer reads `AWG_BACKEND` from params the way it reads the protocol,
-with the variable unset first, and refuses anything but empty or `kernel`. Web
+with the variable unset first, and refuses anything but empty or `kernel`. Only
+a params file that does not exist lets its legacy `.conf` discovery stand in;
+one that exists but fails its checks (a symlink, another owner, a mode other
+than 600 or 400, a file that does not load) leaves the backend unknown, and the
+proxy installer refuses. Web
 lifecycle freshness (§4.6) is an exact line,
 `AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"`, that the web
 panel's copy of the installer (its configured `AWG_INSTALL_SCRIPT`, by default
@@ -2174,15 +2197,45 @@ synced unchanged. The pinned BoringTun includes upstream #65, so this is
 consistency and defense in depth, not a leak fix, and a same-port set is a no-op
 for the kernel module.
 
-**Uninstall.** After `stop` and `disable` (which run the crash-safe teardown),
-the uninstall refuses to remove anything while a BoringTun daemon of the
-interface still runs. It then removes the drop-in and sysctl file as before, and
-`uninstallBoringtunRuntime` removes this interface's runtime state, its UAPI
-socket paths when no process listens on them, the generated helpers (only files
-with the installer's header), the store and the load override. If any of that
-fails, params stay, so the uninstall can run again. Packages: `amneziawg-tools`
-only; kernel module packages found on a BoringTun host were installed by someone
-else.
+**Uninstall.** The BoringTun uninstall is a transaction whose commit is the
+removal of the configuration:
+
+1. The backend comes from params.
+2. `stop` and `disable` run the crash-safe teardown.
+3. No BoringTun daemon of the interface may still run.
+4. The teardown must be terminal (`boringtunTeardownFinished`): every start
+   attempt the runtime directory still records is loaded with the runtime's own
+   parser (`_awgBtStateLoad`) and must carry one of the terminal facts on which
+   poststop removes an attempt (`_awgBtAttemptTerminal`: it never got past the
+   precheck or the launcher, or its `done` flag is raised). poststop keeps an
+   attempt exactly when its cleanup is unfinished, for example a PostDown replay
+   that may have run in part; such an attempt, or one whose state cannot be
+   read, stops the uninstall before anything is removed, names the PostDown
+   hooks to check and keeps every record, so that the operator can finish the
+   cleanup by hand and rerun the uninstall.
+5. The drop-in and the sysctl file go as before. The kernel install's
+   `/etc/modules-load.d/amneziawg.conf` is never a BoringTun file and is left
+   alone.
+6. `uninstallBoringtunRuntime` removes only what is provably this
+   installation's. A UAPI node goes only when a terminal attempt recorded it
+   (device, inode, mode and ctime), the daemon that created it is gone, and
+   `ss` positively shows no listener on it: `ss` must succeed and print only
+   UNIX socket lines, and for the AmneziaWG path, a symlink, the socket it
+   resolves to must be in one of the UAPI directories and idle. Inspection
+   failures, live listeners and unrecorded nodes are kept, reported, and fail
+   the uninstall. A generated helper goes only when it is byte for byte what
+   this installer generates; a helper that differs (edited, someone else's, or
+   written by another installer version) is left in place and reported, which is
+   not a failure, but a generated helper that cannot be removed is. Then the
+   store and the load override (only if unchanged).
+7. Packages: `amneziawg-tools` only; kernel module packages found on a
+   BoringTun host were installed by someone else.
+8. The Amnezia repository entries.
+9. Only when every step succeeded and the unit is inactive is
+   `/etc/amnezia/amneziawg` removed. Until then params stay, so the next run of
+   the installer is a management run that offers the uninstall again.
+
+The kernel uninstall keeps its order and its commands.
 
 **Tests.** `tests/test-boringtun-host.sh` (unit: contract consistency, the
 transaction against a fixture archive and hostile variants, guards, packages,
@@ -2194,7 +2247,21 @@ Debian 12 systemd container: the real installer and public release, datapath
 under AWG 2.0, 3.0, 3.1 and 2.0 again, client management, restart, stop and
 start, SIGKILL recovery, descriptor stability, uninstall and a leftover audit);
 `tests/test-boringtun-kernel-coexistence.sh` (above); and a job that downloads
-the public release anonymously.
+the public release anonymously. The live test runs under a scan of its own
+output: it installs without an initial client, adds its test client with the
+output kept private, and fails if any recorded private or preshared key, any
+config or any QR code row appears in what it printed. Its firewall check
+compares the interface's own rules (its nft table, or the iptables rules that
+name it) after restart, stop and start, and SIGKILL recovery.
+`tests/test-boringtun-host-root-safety.sh` runs the unit suite as root in a
+container with sentinel files at the real paths and requires that nothing
+outside its test root changes; outside a disposable host the suite refuses
+root. The mutation runners (`tests/mutate-boringtun-host.sh`,
+`tests/mutate-boringtun-runtime.sh`) share `tests/helpers/mutation-engine.sh`,
+which counts a mutant as caught only after a passing baseline and a failed
+assertion of the mutated suite (`tests/test-mutation-engine.sh`).
+`tests/equivalence/run-kernel-equivalence.sh <base>` compares the kernel path
+with a base revision.
 
 ## 22. Current functions and files that will need modification
 

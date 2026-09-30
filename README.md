@@ -497,7 +497,14 @@ it instead of starting BoringTun, so the install asks before blocking it with
 (`install amneziawg /bin/false`); with `AUTO_INSTALL`, set
 `AWG_BORINGTUN_BLOCK_KERNEL_MODULE=y` to agree. Uninstalling removes that file.
 Kernel module packages that the BoringTun install did not install are never
-removed.
+removed, and neither is `/etc/modules-load.d/amneziawg.conf`.
+
+**Uninstall:** it removes only what it can prove is this installation's: a
+UAPI socket that a process may still serve, or a helper script changed after
+the install, is left in place and reported. If a step fails, or the service's
+teardown did not finish (for example PostDown hooks that may have run only in
+part), the configuration in `/etc/amnezia/amneziawg` is kept, so running the
+installer again offers the uninstall again once the cause is fixed.
 
 **Not with the standalone proxy:** BoringTun cannot run behind
 `amneziawg-proxy`, because it always listens on every address. The install
