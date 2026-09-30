@@ -2165,12 +2165,18 @@ installer's.
 `/etc/systemd/system/amneziawg-proxy.service`, `/usr/local/bin/amneziawg-proxy`
 or `/etc/amneziawg-proxy/proxy.toml` exists; the proxy's uninstaller keeps
 `proxy.toml` unless `--purge-config` is given, and a leftover one counts. The
-proxy installer reads `AWG_BACKEND` from params the way it reads the protocol,
-with the variable unset first, and refuses anything but empty or `kernel`. Only
-a params file that does not exist lets its legacy `.conf` discovery stand in;
-one that exists but fails its checks (a symlink, another owner, a mode other
-than 600 or 400, a file that does not load) leaves the backend unknown, and the
-proxy installer refuses. Web
+proxy installer reads params as data, never sourcing them
+(`parse_params_file`): every line that is not blank or a comment must be an
+assignment in a form the installer writes, `KEY='value'` (a single quote in the
+value as `'"'"'`) or, from installers before 7c2e7dd, `KEY=value` with a plain
+value; a duplicate key or any other line (spaces around `=`, command words,
+substitutions, several statements, a malformed quote) fails. It refuses any
+backend but empty or `kernel`, and an exported `AWG_BACKEND` never stands in
+for a missing one. Only a params file that does not exist lets its legacy
+`.conf` discovery stand in; one that exists but fails its checks (a symlink,
+another owner, a mode other than 600 or 400, an unreadable file, a line the
+parser refuses) leaves the backend unknown, and the proxy installer refuses.
+Web
 lifecycle freshness (§4.6) is an exact line,
 `AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"`, that the web
 panel's copy of the installer (its configured `AWG_INSTALL_SCRIPT`, by default
@@ -2201,7 +2207,9 @@ for the kernel module.
 removal of the configuration:
 
 1. The backend comes from params.
-2. `stop` and `disable` run the crash-safe teardown.
+2. `stop` and `disable` run the crash-safe teardown; a failed `disable` stops
+   the uninstall before anything is removed (a failed `stop` shows as a daemon
+   that still runs, or as an active unit at the end).
 3. No BoringTun daemon of the interface may still run.
 4. The teardown must be terminal (`boringtunTeardownFinished`): every start
    attempt the runtime directory still records is loaded with the runtime's own
@@ -2213,29 +2221,49 @@ removal of the configuration:
    read, stops the uninstall before anything is removed, names the PostDown
    hooks to check and keeps every record, so that the operator can finish the
    cleanup by hand and rerun the uninstall.
-5. The drop-in and the sysctl file go as before. The kernel install's
+5. The drop-in and the sysctl file go as before, then `daemon-reload`; a
+   drop-in or sysctl file that stays, or a failed `daemon-reload`, fails the
+   uninstall with the configuration kept. The kernel install's
    `/etc/modules-load.d/amneziawg.conf` is never a BoringTun file and is left
    alone.
 6. `uninstallBoringtunRuntime` removes only what is provably this
    installation's. A UAPI node goes only when a terminal attempt recorded it
-   (device, inode, mode and ctime), the daemon that created it is gone, and
-   `ss` positively shows no listener on it: `ss` must succeed and print only
-   UNIX socket lines, and for the AmneziaWG path, a symlink, the socket it
-   resolves to must be in one of the UAPI directories and idle. Inspection
-   failures, live listeners and unrecorded nodes are kept, reported, and fail
-   the uninstall. A generated helper goes only when it is byte for byte what
+   (device, inode, mode and ctime), the daemon that created it is gone, and the
+   socket diagnostics prove it idle (for the AmneziaWG path, a symlink, the
+   socket it resolves to, which must be in one of the UAPI directories).
+   `_awgBtSocketListenedOn` has three outcomes, and only ABSENT allows a
+   removal: LIVE when a valid `ss -xlHe` row names the node's path or its inode
+   and device; ABSENT when `ss` succeeded, every row it printed is valid and
+   none names the node; UNKNOWN otherwise: `ss` missing or failing, or any row,
+   related to the node or not, that is not exactly the shape iproute2 5.9 to
+   6.19 print for these flags on the supported releases,
+   `<u_str|u_dgr|u_seq> <LISTEN|UNCONN> <recv-q> <send-q> <local> <inode> * <port> <->[ ino:<n> dev:<major>/<minor>][ peers:[ <inode>]...]`,
+   with `<local>` an absolute path that comes with `ino` and `dev`, or an
+   `@abstract` name or `*` without them. Rows are matched as data and anchored
+   on their tail, since a path may hold spaces. A node that stays (live,
+   unknown, or not removable) is reported and fails the uninstall, and the
+   attempt that recorded it keeps its record: the record is the proof of
+   ownership that the next uninstall needs, and it goes only after every node
+   it proves is gone. An unrecorded node is kept and fails the uninstall. A
+   generated helper goes only when it is byte for byte what
    this installer generates; a helper that differs (edited, someone else's, or
    written by another installer version) is left in place and reported, which is
    not a failure, but a generated helper that cannot be removed is. Then the
    store and the load override (only if unchanged).
 7. Packages: `amneziawg-tools` only; kernel module packages found on a
-   BoringTun host were installed by someone else.
-8. The Amnezia repository entries.
+   BoringTun host were installed by someone else. A failed removal fails the
+   uninstall.
+8. The Amnezia repository entries: the PPA entries, and managed source and
+   keyring files, each of which must be gone afterwards. The APT index refresh
+   after them is not mandatory.
 9. Only when every step succeeded and the unit is inactive is
    `/etc/amnezia/amneziawg` removed. Until then params stay, so the next run of
    the installer is a management run that offers the uninstall again.
 
-The kernel uninstall keeps its order and its commands.
+What is preserved on purpose, and reported, without failing the uninstall: a
+helper that is not byte for byte this installer's, a load override that was
+changed, other files in the drop-in directory, and state of other instances in
+the runtime directory. The kernel uninstall keeps its order and its commands.
 
 **Tests.** `tests/test-boringtun-host.sh` (unit: contract consistency, the
 transaction against a fixture archive and hostile variants, guards, packages,
@@ -2251,15 +2279,23 @@ the public release anonymously. The live test runs under a scan of its own
 output: it installs without an initial client, adds its test client with the
 output kept private, and fails if any recorded private or preshared key, any
 config or any QR code row appears in what it printed. Its firewall check
-compares the interface's own rules (its nft table, or the iptables rules that
-name it) after restart, stop and start, and SIGKILL recovery.
+(`tests/helpers/boringtun-live-firewall.sh`, unit-tested with mocked queries by
+`tests/test-boringtun-live-firewall.sh`) compares the interface's own rules
+(its nft table, or the iptables rules that name it) after restart, stop and
+start, and SIGKILL recovery, and a failed query is never a result: the
+baseline needs a successful query that finds the rules, and a stopped unit
+needs a successful `nft list tables` (or `iptables-save`) that proves them
+absent.
 `tests/test-boringtun-host-root-safety.sh` runs the unit suite as root in a
 container with sentinel files at the real paths and requires that nothing
 outside its test root changes; outside a disposable host the suite refuses
 root. The mutation runners (`tests/mutate-boringtun-host.sh`,
 `tests/mutate-boringtun-runtime.sh`) share `tests/helpers/mutation-engine.sh`,
-which counts a mutant as caught only after a passing baseline and a failed
-assertion of the mutated suite (`tests/test-mutation-engine.sh`).
+which counts a mutant as caught only after a passing baseline, a mutated file
+that still parses (a syntax error is INVALID, never caught), the suite's own
+final summary in the format the runner declares for it, counting a failed
+assertion, and at least one assertion-failure line; text that merely contains
+"failed" counts for nothing (`tests/test-mutation-engine.sh`).
 `tests/equivalence/run-kernel-equivalence.sh <base>` compares the kernel path
 with a base revision.
 
