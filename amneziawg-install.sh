@@ -9475,12 +9475,17 @@ function uninstallAmneziaWG() {
 
 		systemctl stop "awg-quick@${SERVER_AWG_NIC}"
 		systemctl disable "awg-quick@${SERVER_AWG_NIC}"
+		local DISABLE_RC=$?
 
 		# With BoringTun, the stop above ran the crash-safe teardown of the
 		# supervised daemon. Keep every file while a daemon of the interface
 		# still runs, so that a later uninstall can finish the job.
 		local BORINGTUN_DAEMONS=""
 		if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+			if ((DISABLE_RC != 0)); then
+				echo -e "${RED}ERROR: awg-quick@${SERVER_AWG_NIC} could not be disabled; nothing was removed. Fix the cause and rerun the uninstall.${NC}"
+				exit 1
+			fi
 			BORINGTUN_DAEMONS="$(boringtunDaemonsOf "${SERVER_AWG_NIC}")"
 			if [[ -n "${BORINGTUN_DAEMONS}" ]]; then
 				echo -e "${RED}ERROR: a BoringTun daemon of ${SERVER_AWG_NIC} is still running (PID ${BORINGTUN_DAEMONS//$'\n'/, }) after stopping awg-quick@${SERVER_AWG_NIC}.${NC}"
@@ -9507,6 +9512,7 @@ function uninstallAmneziaWG() {
 			rmdir "${DROPIN_DIR}"
 		fi
 		systemctl daemon-reload
+		local DAEMON_RELOAD_RC=$?
 
 		# Remove module auto-load entry. Only the kernel install writes it; a
 		# BoringTun install never does, so there it is someone else's.
@@ -9519,6 +9525,21 @@ function uninstallAmneziaWG() {
 		# other services (Docker, libvirt, other VPNs) may depend on forwarding.
 		# The setting will revert to the system default on next reboot.
 		rm -f "${AWG_SYSCTL_FILE}"
+
+		# BoringTun: every removal before the commit either worked or fails the
+		# uninstall, with the configuration kept for a rerun.
+		if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+			local LEFT_BEHIND="" LEFT_FILE
+			for LEFT_FILE in "${OVERRIDE_FILE}" "${AWG_SYSCTL_FILE}"; do
+				[[ ! -e "${LEFT_FILE}" && ! -L "${LEFT_FILE}" ]] || LEFT_BEHIND+=" ${LEFT_FILE}"
+			done
+			if [[ -n "${LEFT_BEHIND}" || ${DAEMON_RELOAD_RC} -ne 0 ]]; then
+				[[ -z "${LEFT_BEHIND}" ]] || echo -e "${RED}ERROR: could not remove${LEFT_BEHIND}.${NC}"
+				[[ ${DAEMON_RELOAD_RC} -eq 0 ]] || echo -e "${RED}ERROR: systemctl daemon-reload failed after the drop-in was removed.${NC}"
+				echo -e "${ORANGE}The configuration in ${AMNEZIAWG_DIR} was kept. Fix the cause and rerun the uninstall.${NC}"
+				exit 1
+			fi
+		fi
 
 		# BoringTun: the helpers, the binary store, the load override and runtime
 		# state. On failure params stay, so the uninstall can be run again.
@@ -9558,6 +9579,8 @@ function uninstallAmneziaWG() {
 				"${AMNEZIA_PPA_SOURCES_DIR}/amneziawg.sources.list"; do
 				if [[ -f "${MANAGED_SOURCE}" ]] && head -1 "${MANAGED_SOURCE}" | grep -q '# Managed by amneziawg-install'; then
 					rm -f "${MANAGED_SOURCE}"
+					# BoringTun: a managed repository file that stays blocks the commit.
+					[[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]] || [[ ! -e "${MANAGED_SOURCE}" ]] || UNINSTALL_FAILED=1
 				elif [[ -f "${MANAGED_SOURCE}" ]]; then
 					echo -e "${ORANGE}NOTE: ${MANAGED_SOURCE} was not created by this installer (missing sentinel). Leaving it in place.${NC}"
 				fi
@@ -9575,12 +9598,16 @@ function uninstallAmneziaWG() {
 			if [[ -f "${DEBIAN_SOURCE}" ]] && head -1 "${DEBIAN_SOURCE}" | grep -q '# Managed by amneziawg-install'; then
 				rm -f "${DEBIAN_SOURCE}"
 				rm -f "${AWG_APT_KEYRING_FILE}"
+				# BoringTun: a managed repository file that stays blocks the commit.
+				[[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]] || [[ ! -e "${DEBIAN_SOURCE}" && ! -e "${AWG_APT_KEYRING_FILE}" ]] || UNINSTALL_FAILED=1
 			elif [[ -f "${DEBIAN_SOURCE}" ]]; then
 				echo -e "${ORANGE}NOTE: ${DEBIAN_SOURCE} was not created by this installer (missing sentinel). Leaving it and keyring in place.${NC}"
 			elif [[ -f "${AWG_APT_KEYRING_FILE}" ]]; then
 				# Source file is gone (manually deleted) but orphaned keyring remains
 				echo -e "${ORANGE}NOTE: Managed source file not found but orphaned keyring detected. Removing keyring.${NC}"
 				rm -f "${AWG_APT_KEYRING_FILE}"
+				# BoringTun: a managed repository file that stays blocks the commit.
+				[[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]] || [[ ! -e "${AWG_APT_KEYRING_FILE}" ]] || UNINSTALL_FAILED=1
 			fi
 			apt update
 		elif [[ ${OS} == 'fedora' ]]; then

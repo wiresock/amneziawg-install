@@ -1405,10 +1405,17 @@ rm -f "${AWG_BT_MODPROBE_OVERRIDE}"
 
 # uninstallAmneziaWG on a BoringTun host: packages and foreign DKMS, the
 # order of its steps and what a failure keeps. PACKAGES_RC and PPA_RC make
-# the package or repository step fail.
+# the package or repository step fail, RM_FAILS makes rm fail on that path,
+# SYSTEMCTL_FAILS makes that systemctl command fail, and REAL_BT_RUNTIME runs
+# the real BoringTun removal.
 uninstall_flow() {
 	checkOS() { :; }
-	systemctl() { echo "systemctl $*" >>"${S}/un"; [[ "$1" == is-active ]] && return 1; return 0; }
+	systemctl() {
+		echo "systemctl $*" >>"${S}/un"
+		[[ "$1" == is-active ]] && return 1
+		[[ "$1" != "${SYSTEMCTL_FAILS:-}" ]]
+	}
+	[[ -z "${RM_FAILS:-}" ]] || rm() { [[ "${*: -1}" == "${RM_FAILS}" ]] && return 1; command rm "$@"; }
 	removeInstalledAptPackages() {
 		echo "remove-packages $*" >>"${S}/un"
 		[[ -e "${AMNEZIAWG_DIR}/params" ]] && echo "params present at package removal" >>"${S}/un"
@@ -1419,7 +1426,7 @@ uninstall_flow() {
 	disable_apt_ipv4() { :; }
 	apt-get() { :; }
 	apt() { echo "apt $*" >>"${S}/un"; }
-	uninstallBoringtunRuntime() { echo "uninstallBoringtunRuntime $*" >>"${S}/un"; return "${BT_UNINSTALL_RC:-0}"; }
+	[[ -n "${REAL_BT_RUNTIME:-}" ]] || uninstallBoringtunRuntime() { echo "uninstallBoringtunRuntime $*" >>"${S}/un"; return "${BT_UNINSTALL_RC:-0}"; }
 	boringtunDaemonsOf() { cat "${S}/daemons" 2>/dev/null; }
 	[[ -n "${REAL_TEARDOWN_CHECK:-}" ]] || boringtunTeardownFinished() { echo "boringtunTeardownFinished $*" >>"${S}/un"; }
 	mkdir -p "${AMNEZIAWG_DIR}"
@@ -1493,6 +1500,66 @@ assert_not_contains "uninstallBoringtunRuntime" "$(cat "${S}/un")" "  and before
 assert_true "  the attempt's records stay" test -e "${AWG_BT_RUN_DIR}/awg0@${ATTEMPT}.state"
 rm -f "${AWG_BT_RUN_DIR}/awg0@"*
 IF=awgu0
+# N2: every BoringTun removal before the commit is checked. A failure fails
+# the uninstall and keeps the configuration; the rerun finishes.
+DROPIN_FILE="${AWG_SYSTEMD_UNIT_DIR}/awg-quick@awg0.service.d/override.conf"
+n2_retry() { # <label> <file that stays or ""> <VAR=value that makes a step fail>
+	local LABEL="$1" FILE="$2" FAULT="$3"
+	mkdir -p "${DROPIN_FILE%/*}" "${AWG_SYSCTL_FILE%/*}"
+	: >"${DROPIN_FILE}"
+	: >"${AWG_SYSCTL_FILE}"
+	: >"${S}/un"
+	export "${FAULT?}"
+	OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+	unset "${FAULT%%=*}"
+	assert_rc 1 "${RC}" "N2: ${LABEL} fails the BoringTun uninstall"
+	[[ -z "${FILE}" ]] || assert_true "  ${FILE##*/} stays" test -e "${FILE}"
+	assert_true "  params and config stay" test -e "${AMNEZIAWG_DIR}/params"
+	assert_not_contains "uninstalled successfully" "${OUT}" "  and it does not report success"
+	OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+	assert_rc 0 "${RC}" "N2: after ${LABEL}, the rerun succeeds"
+	assert_true "  the drop-in, the sysctl file and the configuration are gone" \
+		test ! -e "${DROPIN_FILE}" -a ! -e "${AWG_SYSCTL_FILE}" -a ! -e "${AMNEZIAWG_DIR}"
+}
+n2_retry "a drop-in that cannot be removed" "${DROPIN_FILE}" "RM_FAILS=${DROPIN_FILE}"
+n2_retry "a sysctl file that cannot be removed" "${AWG_SYSCTL_FILE}" "RM_FAILS=${AWG_SYSCTL_FILE}"
+n2_retry "a failed systemctl daemon-reload" "" "SYSTEMCTL_FAILS=daemon-reload"
+n2_retry "a failed systemctl disable" "${DROPIN_FILE}" "SYSTEMCTL_FAILS=disable"
+MANAGED_SOURCE_FILE="${AMNEZIA_PPA_SOURCES_DIR}/amneziawg.sources"
+mkdir -p "${AMNEZIA_PPA_SOURCES_DIR}"
+printf '# Managed by amneziawg-install\n' >"${MANAGED_SOURCE_FILE}"
+n2_retry "a managed APT source that cannot be removed" "${MANAGED_SOURCE_FILE}" "RM_FAILS=${MANAGED_SOURCE_FILE}"
+assert_true "  and the rerun removed it" test ! -e "${MANAGED_SOURCE_FILE}"
+: >"${S}/un"
+mkdir -p "${DROPIN_FILE%/*}" "${AWG_SYSCTL_FILE%/*}"
+: >"${DROPIN_FILE}"
+: >"${AWG_SYSCTL_FILE}"
+RM_FAILS="${DROPIN_FILE}" OS=ubuntu AWG_BACKEND=kernel RUN_INPUT=y run uninstall_flow
+assert_true "the kernel uninstall keeps its behaviour on the same failure: configuration removed as before" \
+	test ! -e "${AMNEZIAWG_DIR}/params"
+rm -f "${DROPIN_FILE}" "${AWG_SYSCTL_FILE}"
+# N1 through the whole uninstall: a recorded socket that cannot be inspected
+# keeps params and the attempt's record; the rerun, with ss working, finishes.
+IF=awg0
+WG_SOCK="${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+AWG_SOCK="${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock"
+install_runtime
+dead_socket "${WG_SOCK}"
+record_attempt launched up "done"
+printf '#!/bin/bash\nexit 1\n' >"${MOCKBIN}/ss"
+chmod 0755 "${MOCKBIN}/ss"
+REAL_BT_RUNTIME=1 REAL_TEARDOWN_CHECK=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+rm -f "${MOCKBIN}/ss"
+assert_rc 1 "${RC}" "N1: the whole uninstall fails while a recorded socket cannot be inspected"
+assert_true "  params, the socket and the attempt's record stay" \
+	test -e "${AMNEZIAWG_DIR}/params" -a -S "${WG_SOCK}" -a "$(attempt_files)" -gt 0
+REAL_BT_RUNTIME=1 REAL_TEARDOWN_CHECK=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+assert_rc 0 "${RC}" "N1: the rerun of the whole uninstall finishes"
+assert_true "  the socket, the record and the configuration are gone" \
+	test ! -e "${WG_SOCK}" -a "$(attempt_files)" -eq 0 -a ! -e "${AMNEZIAWG_DIR}"
+IF=awgu0
+WG_SOCK="${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+AWG_SOCK="${AWG_BT_AWG_SOCKET_DIR}/${IF}.sock"
 # modules-load: the kernel install's boot entry is never a BoringTun file.
 mkdir -p "${AWG_MODULES_LOAD_FILE%/*}"
 printf '# the administrator'"'"'s own\namneziawg\n' >"${AWG_MODULES_LOAD_FILE}"
