@@ -1,0 +1,187 @@
+name: BoringTun Host
+
+# End-to-end tests of the experimental BoringTun host backend of
+# amneziawg-install.sh: the installer itself installs amneziawg-tools and the
+# immutable public BoringTun release on disposable runners, moves traffic
+# through the tunnel, switches protocol modes and uninstalls. A separate job
+# downloads the public release anonymously, and one proves coexistence with an
+# installed AmneziaWG kernel module. See docs/BORINGTUN_BACKEND_DESIGN.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - amneziawg-install.sh
+      - packaging/boringtun/release.env
+      - tests/test-boringtun-host-live.sh
+      - tests/test-boringtun-kernel-coexistence.sh
+      - tests/helpers/boringtun-live-firewall.sh
+      - .github/workflows/boringtun-host.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - amneziawg-install.sh
+      - packaging/boringtun/release.env
+      - tests/test-boringtun-host-live.sh
+      - tests/test-boringtun-kernel-coexistence.sh
+      - tests/helpers/boringtun-live-firewall.sh
+      - .github/workflows/boringtun-host.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  public-release:
+    name: Public release download
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # The exact URLs the installer uses, without credentials: a renamed
+      # asset, a wrong tag or an unpublished release fails here.
+      - name: Download the embedded release anonymously and verify it
+        run: |
+          # Absolute paths: the downloads happen in another directory.
+          REPO_ROOT="$GITHUB_WORKSPACE"
+          value() { sed -n "s/^$1=\"\\(.*\\)\"\$/\\1/p" "$REPO_ROOT/amneziawg-install.sh"; }
+          contract() { sed -n "s/^$1=//p" "$REPO_ROOT/packaging/boringtun/release.env"; }
+          BASE="$(value AWG_BT_RELEASE_BASE_URL)"
+          test -n "$BASE"
+          mkdir -p "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/release"
+          for KEY in X86_64 AARCH64; do
+            ASSET="$(value "AWG_BT_RELEASE_ASSET_${KEY}")"
+            curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 -o "$ASSET" "$BASE/$ASSET"
+            test "$(sha256sum "$ASSET" | cut -d' ' -f1)" = "$(value "AWG_BT_RELEASE_ARCHIVE_SHA256_${KEY}")"
+            test "$(value "AWG_BT_RELEASE_ARCHIVE_SHA256_${KEY}")" = "$(contract "BORINGTUN_RELEASE_ARCHIVE_SHA256_${KEY}")"
+            STEM="${ASSET%.tar.gz}"
+            test "$(tar -xzOf "$ASSET" "$STEM/boringtun-cli" | sha256sum | cut -d' ' -f1)" = "$(value "AWG_BT_RELEASE_BINARY_SHA256_${KEY}")"
+            test "$(value "AWG_BT_RELEASE_BINARY_SHA256_${KEY}")" = "$(contract "BORINGTUN_RELEASE_BINARY_SHA256_${KEY}")"
+            test "$(tar -xzOf "$ASSET" "$STEM/MANIFEST" | sed -n 's/^source_commit=//p')" = "$(value AWG_BT_RELEASE_SOURCE_COMMIT)"
+            echo "verified $ASSET"
+          done
+          curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 -o SHA256SUMS "$BASE/SHA256SUMS"
+          printf '%s  %s\n%s  %s\n' \
+            "$(value AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64)" "$(value AWG_BT_RELEASE_ASSET_AARCH64)" \
+            "$(value AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64)" "$(value AWG_BT_RELEASE_ASSET_X86_64)" >expected-sums
+          cmp SHA256SUMS expected-sums
+          sha256sum -c SHA256SUMS
+          echo "verified SHA256SUMS $(sha256sum SHA256SUMS | cut -d' ' -f1)"
+
+  live:
+    name: Fresh host install (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check the runner's architecture
+        env:
+          EXPECTED: ${{ matrix.arch }}
+        run: |
+          uname -m
+          test "$(uname -m)" = "$EXPECTED"
+
+      - name: Install, use and uninstall BoringTun through the installer (as root)
+        run: sudo env AWG_DISPOSABLE_HOST_TEST=1 bash tests/test-boringtun-host-live.sh
+
+      - name: Collect diagnostics
+        if: failure()
+        run: bash .github/scripts/boringtun-host-diagnostics.sh "$RUNNER_TEMP/diagnostics"
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: boringtun-host-diagnostics-${{ matrix.arch }}
+          path: ${{ runner.temp }}/diagnostics
+          retention-days: 7
+
+  debian:
+    name: Fresh host install (Debian 12, systemd container)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # A privileged Debian 12 container with systemd as PID 1 is the CI
+      # mechanism for a real Debian userland; it is not a supported deployment.
+      - name: Start a Debian 12 container with systemd
+        run: |
+          docker build -t awg-debian12-systemd - <<'EOF'
+          FROM debian:12
+          RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                systemd systemd-sysv dbus ca-certificates curl gnupg iproute2 iputils-ping kmod python3 procps nftables \
+              && rm -rf /var/lib/apt/lists/*
+          CMD ["/sbin/init"]
+          EOF
+          docker run -d --name awg-debian --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
+            -v "$PWD:/workspace:ro" awg-debian12-systemd
+          for _ in $(seq 1 30); do
+            docker exec awg-debian systemctl is-system-running 2>/dev/null | grep -qE 'running|degraded' && break
+            sleep 1
+          done
+          docker exec awg-debian systemctl is-system-running || true
+
+      - name: Install, use and uninstall BoringTun through the installer
+        run: docker exec -w /workspace -e AWG_DISPOSABLE_HOST_TEST=1 awg-debian bash tests/test-boringtun-host-live.sh
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          docker cp .github/scripts/boringtun-host-diagnostics.sh awg-debian:/tmp/diagnostics.sh
+          docker exec awg-debian bash /tmp/diagnostics.sh /tmp/diagnostics
+          docker cp awg-debian:/tmp/diagnostics "$RUNNER_TEMP/diagnostics"
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: boringtun-host-diagnostics-debian12
+          path: ${{ runner.temp }}/diagnostics
+          retention-days: 7
+
+  coexistence:
+    name: Kernel module coexistence (Ubuntu 26.04, DKMS)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Block or refuse the installed kernel module (as root)
+        run: sudo env AWG_DISPOSABLE_HOST_TEST=1 bash tests/test-boringtun-kernel-coexistence.sh
+
+      - name: Collect diagnostics
+        if: failure()
+        run: bash .github/scripts/boringtun-host-diagnostics.sh "$RUNNER_TEMP/diagnostics"
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: boringtun-coexistence-diagnostics
+          path: ${{ runner.temp }}/diagnostics
+          retention-days: 7

@@ -572,10 +572,44 @@ emit_safe_server_state() {
     done < "${path}"
 }
 
+# Print the index of the [Interface] ListenPort line when syncing it would not
+# change the running interface: exactly one such line, a valid port, equal to
+# the live listen port. Anything else prints nothing, and the line is synced as
+# before. A same-port set is a no-op for the kernel module; the BoringTun
+# backend rebinds its sockets on every ListenPort it is given, so omitting the
+# unchanged line keeps web operations from churning them (as the installer's
+# own sync does).
+unchanged_listen_port_index() {
+    local interface="$1"
+    shift
+    local -a lines=("$@")
+    local index clean in_interface="false" count=0 port_index="" configured="" live
+
+    for index in "${!lines[@]}"; do
+        clean="${lines[index]%%#*}"
+        clean="${clean//[[:space:]]/}"
+        if [[ "${clean}" == "["* ]]; then
+            in_interface="false"
+            [[ "${clean,,}" == "[interface]" ]] && in_interface="true"
+        elif [[ "${in_interface}" == "true" && "${clean,,}" == listenport=* ]]; then
+            count=$((count + 1))
+            port_index="${index}"
+            configured="${clean#*=}"
+        fi
+    done
+    [[ "${count}" -eq 1 ]] || return 0
+    [[ "${configured}" =~ ^[0-9]{1,5}$ ]] && (( 10#${configured} <= 65535 )) || return 0
+    live="$("${AWG_BIN}" show "${interface}" listen-port 2>/dev/null)" || return 0
+    [[ "${live}" =~ ^[0-9]{1,5}$ ]] || return 0
+    if (( 10#${configured} == 10#${live} )); then
+        printf '%s\n' "${port_index}"
+    fi
+}
+
 reconcile_interface() {
     local interface="$1"
     local path="${AWG_CONFIG_ROOT}/${interface}.conf"
-    local stripped line trimmed key
+    local stripped line trimmed key index skip_index
     local in_peer="false"
     local peer_disabled="false"
     local -a config_lines=() peer_lines=()
@@ -591,11 +625,14 @@ reconcile_interface() {
         fail "could not strip the trusted interface config"
     fi
     mapfile -t config_lines <<< "${stripped}"
+    skip_index="$(unchanged_listen_port_index "${interface}" "${config_lines[@]}")"
 
     TEMPORARY_FILE="$("${MKTEMP_BIN}" "${AWG_CONFIG_ROOT}/.${interface}.sync.XXXXXX")" \
         || fail "could not create a temporary sync config"
 
-    for line in "${config_lines[@]}"; do
+    for index in "${!config_lines[@]}"; do
+        line="${config_lines[index]}"
+        [[ "${index}" == "${skip_index}" ]] && continue
         trimmed="${line#"${line%%[![:space:]]*}"}"
         trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
 

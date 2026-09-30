@@ -694,14 +694,14 @@ namespace (INFERRED).
 4. **Package hygiene.** `--no-install-recommends` keeps DKMS off BoringTun hosts. The install
    preflight detects existing module packages and offers the load override.
 
-**Which load override (OPEN, decided by the PR 4 coexistence test, §18.6).** A modprobe
-`blacklist amneziawg` line makes modprobe ignore the module's aliases. It is not established
-that this also stops the kernel's own `rtnl-link-amneziawg` request, which is what
-`ip link add … type amneziawg` triggers. `install amneziawg /bin/false` blocks every load that
-goes through modprobe, including an explicit `modprobe amneziawg`. It is therefore the safer
-choice, but a later migration back to the kernel must remove it first (§20). Note that
-`modprobe -n` succeeds for a module with an `install` override, so the precheck must look for
-the override file rather than rely on a dry run.
+**Which load override (DECIDED in PR 4: `install amneziawg /bin/false`; see §21.2).** A modprobe
+`blacklist amneziawg` line makes modprobe ignore the module's aliases. The PR 4 coexistence
+job showed that this stops the kernel's own `rtnl-link-amneziawg` request, which is what
+`ip link add … type amneziawg` triggers, but not an explicit `modprobe amneziawg`.
+`install amneziawg /bin/false` blocked both. It is therefore the safer choice, but a later
+migration back to the kernel must remove it first (§20). Note that `modprobe -n` succeeds for
+a module with an `install` override, so the precheck checks the override file and parses the
+actions the dry run lists rather than relying on its exit status.
 5. **Scratch interfaces for probes and validation launch BoringTun directly.** They never call
    `ip link add … type amneziawg`, so they are deterministic regardless of the module.
 
@@ -1427,8 +1427,9 @@ backend guard.
 6. Descriptor count stable over 100 add/remove cycles.
 7. `--enable-awg3`, `--enable-awg31` and `--disable-awg3`, each followed by a data transfer
    and a check that no scratch leftovers remain.
-8. `--set-boringtun-imitation dns …`. The probe responder answers a non-loopback DNS probe;
-   the wire prefix is DNS-shaped.
+8. *(PR 5, not PR 4)* `--set-boringtun-imitation dns …`. The probe responder answers a
+   non-loopback DNS probe; the wire prefix is DNS-shaped. PR 4 exposes no imitation, so its
+   live test runs AWG 2.0, 3.0 and 3.1 with imitation off.
 9. Uninstall, then assert that no process, socket, drop-in, helper or store remains.
 
 **Reboot semantics:** an optional nightly job boots a cloud image in QEMU/KVM on the runner,
@@ -1452,8 +1453,8 @@ source-build only and untested.
   `blacklist` and the `install … /bin/false` forms, which settles the open choice in §7.11.
 - Scratch probes stay on BoringTun even with the module loaded.
 - Interop: a BoringTun server run directly in a namespace against a kernel client in
-  another namespace, for AWG 2.0, 3.0 and 3.1, with and without imitation. This yields the
-  measurement asked for in §9.4.
+  another namespace, for AWG 2.0, 3.0 and 3.1. The "with imitation" runs, and with them the
+  measurement asked for in §9.4, belong to PR 5.
 
 ### 18.7 Container (PR 9)
 
@@ -1536,8 +1537,8 @@ artefacts can be staged, validated and swapped.
 | **1. Backend seam (kernel only)** | See "Proposed first PR scope" below. | No | — |
 | **2. Pinned BoringTun artefacts (CI only)** | A workflow builds the pinned commit for x86_64 and aarch64 (musl) on native runners, checks reproducibility, runs `cargo deny`, generates licenses and publishes `SHA256SUMS` and a provenance attestation. A smoke job runs the upstream interop harnesses and a descriptor-leak regression check against the artefact. The pin is recorded where the installer will read it. | No | — (parallel with 1) |
 | **3. BoringTun runtime layer** | `awg-backend-ctl` and launcher, generated from installer functions; the drop-in renderer; scratch interfaces (transient units); `ensureAwgBackendReady`, `awgSyncInterfaceConfig` filter and `awgBackendQuickUp` for BoringTun; probe and validation messages; supervision and crash-safe teardown. Mocked tests, plus a live CI job that provisions a host manually. | No (reachable only through an undocumented test hook) | 1, 2 |
-| **4. BoringTun host install and uninstall (experimental)** | `AWG_BACKEND=boringtun` for fresh Debian and Ubuntu installs (VM or bare metal); packages without recommends; binary acquisition and verification; uninstall; proxy and web-lifecycle guards; the web helper `ListenPort` filter; the proxy installer backend guard; the full live CI job (§18.3–18.6); README section marked experimental. | Yes | 3 |
-| **5. Built-in imitation** | Params keys, validation, install-time selection, `--set-boringtun-imitation` transaction, warnings and advisory, `--backend-status`, menu display. | Yes | 4 |
+| **4. BoringTun host install and uninstall (experimental)** | `AWG_BACKEND=boringtun` for fresh Debian and Ubuntu installs (VM or bare metal); packages without recommends; binary acquisition and verification; uninstall; proxy and web-lifecycle guards; the web helper `ListenPort` filter; the proxy installer backend guard; the live CI jobs (§18.3–18.6 without their imitation steps); README section marked experimental. No imitation. Implemented as recorded in §21.2. | Yes | 3 |
+| **5. Built-in imitation** | Params keys, validation, install-time selection, `--set-boringtun-imitation` transaction, warnings and advisory, `--backend-status`, menu display. The imitation steps of §18.3 (step 8) and §18.6 ("with imitation" interop). | Yes | 4 |
 | **6. BoringTun binary lifecycle** | `--upgrade-boringtun` and `--rollback-boringtun` transactions. | Yes | 4 |
 | **7. Virtualization** | Backend-aware `checkVirt` with LXC and nspawn support for BoringTun after preflight; LXC hints; an LXC CI test if feasible (LXD on the runner). | Yes | 4 |
 | **8. Web panel and proxy UX, plus kernel-side guard** | Web wording, version display and read-only backend status (helper allowlist); proxy docs; refuse AWG 3.x with the proxy installed (a flagged behaviour change). | Yes | 4 |
@@ -2018,6 +2019,307 @@ runs a PostDown hook twice.
 
 ---
 
+### 21.2 Host install as implemented (PR 4)
+
+PR 4 makes BoringTun a backend a fresh Debian or Ubuntu install can choose. This
+section records what it implements and where it differs from the proposals above.
+
+**Selection and persistence.** `normalizeAwgBackend` accepts `kernel` and
+`boringtun`; empty means `kernel`, and every other value fails closed. The
+installer keeps a copy of the caller's `AWG_BACKEND` from the moment it loads
+(`_AWG_BACKEND_REQUESTED`) and resets the live variable to `kernel`, as before.
+Only a fresh install reads that copy (`selectFreshInstallBackend`); existing
+installations re-derive the backend from params alone, so an exported value
+never switches one, in either direction. `serializeParams` persists
+`AWG_BACKEND='boringtun'`. PR 3's internal activation flag and
+`_awgInternalSelectBoringtunRuntimeForTesting` are gone: the seam dispatches on
+the validated `AWG_BACKEND` only. There is no interactive backend prompt, so the
+interactive kernel install asks exactly the questions it asked before; an
+operator selects BoringTun with `AWG_BACKEND=boringtun`, interactively or with
+`AUTO_INSTALL`.
+
+**Kernel path.** `installAmneziaWG` hands a BoringTun install to
+`installBoringtunHost` before its first question. The kernel flow runs the same
+commands in the same order; three blocks it shares with BoringTun moved
+unchanged into functions (`prepareUbuntuAmneziaPpaForInstall`,
+`configureDebianAmneziaAptSource`, `writeAwgServerInstallState`), and the Debian
+`deb-src` PPA line is written only when the kernel flow asks for it. The kernel
+uninstall removes exactly the packages it removed before.
+
+**Release.** The installer embeds the release tag, base URL, version, source
+repository and commit, and per architecture the asset name, archive SHA-256 and
+binary SHA-256 (`AWG_BT_RELEASE_*`). `tests/test-boringtun-host.sh` keeps them
+equal to `packaging/boringtun/release.env` and `pin.env`, and a CI job downloads
+the real assets anonymously and checks them. The transaction, in order:
+
+1. `uname -m` maps to x86_64 (`x86_64`, `amd64`) or aarch64 (`aarch64`,
+   `arm64`); anything else is refused before any change.
+2. `curl --proto =https --proto-redir =https` fetches
+   `<base URL>/<asset>` into a private directory, inside the installer's APT
+   IPv4 window.
+3. The archive's SHA-256 must equal the embedded value before anything else
+   reads it.
+4. `tar -tzf` must list exactly the release directory and its four files, in
+   packaging order, and `tar -tv` must show a directory and four regular files.
+   An exact list rules out absolute paths, `..`, other top-level names,
+   duplicates and extra members; the type column rules out links, devices and
+   FIFOs.
+5. The archive is extracted with `--no-same-owner --no-same-permissions`.
+6. `MANIFEST` is read as data: exactly the format-1 keys, and format, name,
+   version, source repository and commit, target, architecture, OS, libc,
+   linkage, binary name and `binary_sha256` must match the embedded contract.
+7. The binary's SHA-256 must equal the embedded value. Nothing runs in the
+   download directory, which may be on a `noexec` `/tmp`.
+8. The files are copied into a root-owned `<store>/.<release>.tmp.XXXXXX`, which
+   is verified as a candidate and renamed to `<store>/<release>`.
+9. The runtime's own release checks (`_awgBtVerifyRelease`, the part of
+   `_awgBtVerifyStore` after reading `current`) must pass for that release, and
+   only then is `current` pointed at it, by renaming a new relative link over
+   it. Verify, then commit: every failure leaves `current` as it was, or absent;
+   there is no switch followed by a rollback.
+
+A release directory in the store, the staged one or one an interrupted install
+left under its final name, goes through one verification boundary,
+`_awgBtVerifyCandidate`, before anything in it runs: every directory from the
+trust anchor down and the release directory are root-owned and not writable by
+others; it holds exactly the four files, each a root-owned regular file with a
+single link that only root can write (the binary executable), so no symlink or
+hard link stands in for a member; the embedded contract (`MANIFEST` read as
+data, the binary's SHA-256) holds; and the binary is still the same trusted node
+(device, inode, mode and nanosecond ctime) that was hashed. Only then does
+`--version` run, and it must print `boringtun 0.7.1`. Between that last check
+and the exec only root could replace the binary. An exec through the hashed
+file descriptor (`/proc/self/fd`) was considered and not used: with no path
+component writable by anyone but root it would close no window a non-root user
+can reach.
+
+The published archive already has the store layout and the runtime's `MANIFEST`
+format, so nothing is converted: the store holds the release's own `MANIFEST`,
+`LICENSE` and `THIRD-PARTY-LICENSES`. There is no `previous` link and no
+channel field: upgrade, rollback and other channels are PR 6. A store whose
+`current` already selects the verified embedded release is reused without a
+download; one that selects anything else is refused, never replaced. The
+provenance attestation is not checked on the host; the release notes give
+operators the exact `gh attestation verify` command.
+
+**Packages.** Ubuntu runs the same PPA preparation as the kernel flow, then
+`apt-get install -y --no-install-recommends amneziawg-tools` and
+`apt-get install -y iptables nftables qrencode`. Debian adds the PPA source and
+signing key as the kernel flow does but without any `deb-src` entry, installs
+`curl` if missing, then the same two installs. No headers, DKMS, `amneziawg` or
+`amneziawg-dkms`.
+
+**Order of a fresh install** (`installBoringtunHost`):
+
+1. Host checks before any question or change: Debian or Ubuntu, a release for
+   the architecture, systemd, no standalone proxy, a current web lifecycle
+   script, `/dev/net/tun` and IPv6, and the kernel-module decision.
+2. The usual questions (`installQuestions`).
+3. Packages, then the release, inside the APT IPv4 window.
+4. The load override, when the operator accepted it.
+5. The helpers.
+6. The preflight: module, platform, store, helpers and base-unit checks, then
+   a scratch instance (the runtime layer's own) that must be a TUN device,
+   answer its UAPI and accept `awg setconf` of the chosen AWG 2.0 parameters,
+   and whose teardown must leave no link, socket or record.
+7. Params, server config, firewall hooks and sysctls
+   (`writeAwgServerInstallState`).
+8. The runtime file (`FORMAT=1`, no imitation) and the drop-in, then
+   `daemon-reload`.
+9. `enable`, `start`, and `_awgBtCheckServedByBoringtun`: a unit that is active
+   but not served by the verified daemon is stopped again.
+10. The initial client.
+
+A failure before step 7 leaves no VPN state. A start failure leaves the unit
+enabled but stopped, as the kernel install does, with BoringTun diagnostics and
+no kernel fallback.
+
+**Kernel module.** The coexistence test (`tests/test-boringtun-kernel-coexistence.sh`
+on the Ubuntu 26.04 runner, where the DKMS module builds) settled §7.11. Without
+an override, `ip link add … type amneziawg` autoloads the module. On that runner,
+a `blacklist amneziawg` line stopped the autoload (`ip link add` failed, the module
+stayed unloaded) but not an explicit `modprobe amneziawg`, which loaded it.
+`install amneziawg /bin/false` stopped both. The test requires the install form
+to block both, and PR 4 lands only that form, because it also stops an explicit
+`modprobe`, for example from a leftover kernel drop-in or `modules-load.d`
+entry. The installer's file is `/etc/modprobe.d/amneziawg-install-boringtun.conf`.
+The runtime precheck accepts an installed module only while that file is in
+force (`_awgBtKernelModuleBlocked`): the exact rendered content, a trusted
+root-owned file, and a `modprobe -n -v` dry run for both `amneziawg` and
+`rtnl-link-amneziawg` that ends in the install command
+(`_awgBtModprobeActionBlocked`). The dry run first lists an `insmod` for each
+dependency that is not loaded yet (on that runner `udp_tunnel`, `ip6_udp_tunnel`
+and `libcurve25519`), each line with a trailing space, so its output is parsed
+as data and never evaluated: the dry run must succeed, the last non-blank action
+must be exactly `install /bin/false`, and every earlier one must `insmod` a
+dependency by absolute path that is not the AmneziaWG module itself. Anything
+else, including an empty output, another install command or an action after
+`install /bin/false`, counts as no override, so another modprobe configuration
+that outranks the file counts as none. A loaded module is always refused and
+never unloaded. An installed module is blocked only with consent: an
+interactive prompt that defaults to no, or `AWG_BORINGTUN_BLOCK_KERNEL_MODULE=y`
+with `AUTO_INSTALL`. Uninstall removes the file only if its content is still the
+installer's.
+
+**Guards.** The installer refuses BoringTun while any of
+`/etc/systemd/system/amneziawg-proxy.service`, `/usr/local/bin/amneziawg-proxy`
+or `/etc/amneziawg-proxy/proxy.toml` exists; the proxy's uninstaller keeps
+`proxy.toml` unless `--purge-config` is given, and a leftover one counts. The
+proxy installer reads params as data, never sourcing them
+(`parse_params_file`): every line that is not blank or a comment must be an
+assignment in a form the installer writes, `KEY='value'` (a single quote in the
+value as `'"'"'`) or, from installers before 7c2e7dd, `KEY=value` with a plain
+value; a duplicate key or any other line (spaces around `=`, command words,
+substitutions, several statements, a malformed quote) fails. It refuses any
+backend but empty or `kernel`, and an exported `AWG_BACKEND` never stands in
+for a missing one. Only a params file that does not exist lets its legacy
+`.conf` discovery stand in; one that exists but fails its checks (a symlink,
+another owner, a mode other than 600 or 400, an unreadable file, a line the
+parser refuses) leaves the backend unknown, and the proxy installer refuses.
+Web
+lifecycle freshness (§4.6) is an exact line,
+`AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"`, that the web
+panel's copy of the installer (its configured `AWG_INSTALL_SCRIPT`, by default
+`/usr/local/bin/amneziawg-install.sh`) must contain; the copy is read as data
+and never overwritten. Later installer versions keep the line.
+
+**Deliberate restarts.** The PR 3 drop-in limits starts to five in 120 seconds
+(`StartLimitBurst`, `StartLimitIntervalSec`) so that a crashing daemon cannot
+restart forever. The live test showed that the limit also counts restarts that
+management operations make on purpose: after a restart, a stop and start, a
+recovered crash and an AWG 3.0 migration, the AWG 3.1 migration's restart hit
+`start-limit-hit`, and so did its rollback. Management operations therefore call
+`awgBackendPrepareServiceStart` before they start or restart the unit
+(`ensureAwgQuickRunning` and the protocol transaction's restart and rollback). For
+BoringTun it runs `systemctl reset-failed awg-quick@<if>.service`, which resets
+the unit's start counter; automatic `Restart=on-failure` restarts stay limited.
+For the kernel it does nothing, so the kernel path runs exactly the commands it
+ran before.
+
+**Web helper.** `reconcile_interface` in the privileged helper leaves out the
+`[Interface]` `ListenPort` line only when there is exactly one, it is a valid
+port and it equals `awg show <if> listen-port`; otherwise the stripped config is
+synced unchanged. The pinned BoringTun includes upstream #65, so this is
+consistency and defense in depth, not a leak fix, and a same-port set is a no-op
+for the kernel module.
+
+**Uninstall.** The BoringTun uninstall is a transaction whose commit is the
+removal of the configuration:
+
+1. The backend comes from params.
+2. `stop` and `disable` run the crash-safe teardown; a failed `disable` stops
+   the uninstall before anything is removed (a failed `stop` shows as a daemon
+   that still runs, or as a unit not proven inactive at the end).
+3. No BoringTun daemon of the interface may still run.
+4. The teardown must be terminal (`boringtunTeardownFinished`): every start
+   attempt the runtime directory still records is loaded with the runtime's own
+   parser (`_awgBtStateLoad`) and must carry one of the terminal facts on which
+   poststop removes an attempt (`_awgBtAttemptTerminal`: it never got past the
+   precheck or the launcher, or its `done` flag is raised). poststop keeps an
+   attempt exactly when its cleanup is unfinished, for example a PostDown replay
+   that may have run in part; such an attempt, or one whose state cannot be
+   read, stops the uninstall before anything is removed, names the PostDown
+   hooks to check and keeps every record, so that the operator can finish the
+   cleanup by hand and rerun the uninstall.
+5. The drop-in and the sysctl file go as before, then `daemon-reload`; a
+   drop-in or sysctl file that stays, or a failed `daemon-reload`, fails the
+   uninstall with the configuration kept. The kernel install's
+   `/etc/modules-load.d/amneziawg.conf` is never a BoringTun file and is left
+   alone.
+6. `uninstallBoringtunRuntime` removes only what is provably this
+   installation's. A UAPI node goes only when a terminal attempt recorded it
+   (device, inode, mode and ctime), the daemon that created it is gone, and the
+   socket diagnostics prove it idle (for the AmneziaWG path, a symlink, the
+   socket it resolves to, which must be in one of the UAPI directories).
+   `_awgBtSocketListenedOn` has three outcomes, and only ABSENT allows a
+   removal: LIVE when a valid `ss -xlHe` row names the node's path or its inode
+   and device; ABSENT when `ss` succeeded, every row it printed is valid and
+   none names the node; UNKNOWN otherwise: `ss` missing or failing, or any row,
+   related to the node or not, that is not exactly the shape iproute2 5.9 to
+   6.19 print for these flags on the supported releases,
+   `<u_str|u_dgr|u_seq> <LISTEN|UNCONN> <recv-q> <send-q> <local> <inode> * <port> <->[ ino:<n> dev:<major>/<minor>][ peers:[ <inode>]...]`,
+   with `<local>` an absolute path that comes with `ino` and `dev`, or an
+   `@abstract` name or `*` without them. Rows are matched as data and anchored
+   on their tail, since a path may hold spaces. A node that stays (live,
+   unknown, or not removable) is reported and fails the uninstall, and the
+   attempt that recorded it keeps its record: the record is the proof of
+   ownership that the next uninstall needs, and it goes only after every node
+   it proves is gone. What is at a recorded path is ABSENT (proven by a
+   successful listing of its directory, `_awgBtPathAbsent`, since `[[ -e ]]` is
+   false on any error too), DIFFERENT (its identity was read and differs: a
+   replacement, left alone, and the record's obligation is resolved), MATCH
+   (read and equal: the node goes only on proof that it is idle) or UNKNOWN (its
+   identity cannot be read): an UNKNOWN node stays, and so does the record; a
+   failed identity query is never taken for a different node. An unrecorded
+   node is kept and fails the uninstall. A
+   generated helper goes only when it is byte for byte what
+   this installer generates; a helper that differs (edited, someone else's, or
+   written by another installer version) is left in place and reported, which is
+   not a failure, but a generated helper that cannot be removed is. Then the
+   store and the load override (only if unchanged).
+7. Packages: `amneziawg-tools` only; kernel module packages found on a
+   BoringTun host were installed by someone else. They are removed by
+   `removeBoringtunAptPackages`, which reads the whole package database once
+   (`dpkg-query -W -f='${Package}\t${db:Status-Abbrev}\n'`, the same format on
+   dpkg 1.20 to 1.23): the read must succeed, every row must be a package name
+   and a status abbreviation, and dpkg itself must be listed as installed,
+   since dpkg-query reads a missing database as an empty one without an error.
+   Only then does a package that is not listed as installed count as absent. A
+   failed or malformed read, or a failed removal, fails the uninstall. The
+   kernel uninstall keeps its own package removal.
+8. The Amnezia repository entries: the PPA entries, and managed source and
+   keyring files, each of which must be gone afterwards. The APT index refresh
+   after them is not mandatory.
+9. Only when every step succeeded and the unit is positively not running is
+   `/etc/amnezia/amneziawg` removed. `boringtunServiceInactive` needs a
+   successful `systemctl show -p ActiveState --value` whose answer is
+   `inactive` or `failed`; systemd answers that also once the unit file is
+   gone. A failed query or any other answer fails the uninstall. `systemctl
+   is-active` is not used for this: its exit status for an inactive unit
+   differs between systemd versions (3 on systemd 252, 4 on 255 for a removed
+   unit), and a failed query exits 1. Until the commit, params stay, so the
+   next run of the installer is a management run that offers the uninstall
+   again.
+
+What is preserved on purpose, and reported, without failing the uninstall: a
+helper that is not byte for byte this installer's, a load override that was
+changed, other files in the drop-in directory, and state of other instances in
+the runtime directory. The kernel uninstall keeps its order and its commands.
+
+**Tests.** `tests/test-boringtun-host.sh` (unit: contract consistency, the
+transaction against a fixture archive and hostile variants, guards, packages,
+preflight, install order and failure injection, uninstall);
+`tests/test-boringtun-install-mock.sh` (the five-distro Docker matrix: a mocked
+fresh install and uninstall with real files and APT sources);
+`tests/test-boringtun-host-live.sh` (x86_64 and native aarch64 runners, and a
+Debian 12 systemd container: the real installer and public release, datapath
+under AWG 2.0, 3.0, 3.1 and 2.0 again, client management, restart, stop and
+start, SIGKILL recovery, descriptor stability, uninstall and a leftover audit);
+`tests/test-boringtun-kernel-coexistence.sh` (above); and a job that downloads
+the public release anonymously. The live test runs under a scan of its own
+output: it installs without an initial client, adds its test client with the
+output kept private, and fails if any recorded private or preshared key, any
+config or any QR code row appears in what it printed. Its firewall check
+(`tests/helpers/boringtun-live-firewall.sh`, unit-tested with mocked queries by
+`tests/test-boringtun-live-firewall.sh`) compares the interface's own rules
+(its nft table, or the iptables rules that name it) after restart, stop and
+start, and SIGKILL recovery, and a failed query is never a result: the
+baseline needs a successful query that finds the rules, and a stopped unit
+needs a successful `nft list tables` (or `iptables-save`) that proves them
+absent.
+`tests/test-boringtun-host-root-safety.sh` runs the unit suite as root in a
+container with sentinel files at the real paths and requires that nothing
+outside its test root changes; outside a disposable host the suite refuses
+root. The mutation runners (`tests/mutate-boringtun-host.sh`,
+`tests/mutate-boringtun-runtime.sh`) share `tests/helpers/mutation-engine.sh`,
+which counts a mutant as caught only after a passing baseline, a mutated file
+that still parses (a syntax error is INVALID, never caught), the suite's own
+final summary in the format the runner declares for it, counting a failed
+assertion, and at least one assertion-failure line; text that merely contains
+"failed" counts for nothing (`tests/test-mutation-engine.sh`).
+`tests/equivalence/run-kernel-equivalence.sh <base>` compares the kernel path
+with a base revision.
+
 ## 22. Current functions and files that will need modification
 
 ### `amneziawg-install.sh` (line numbers at `67fd5ce`)
@@ -2093,7 +2395,7 @@ runs a PostDown hook twice.
 | R18 | Whether to expose the log level, thread count and probe-reply rate. | OPEN | Not in the first versions. |
 | R19 | Firewall rule duplication after an operator deletes a kernel link is pre-existing and not addressed for the kernel. | Pre-existing | Out of scope. |
 | R20 | Upstream `awg-quick` could offer a way to force userspace. | Upstream idea | Optional request; the design does not depend on it. |
-| R21 | Whether a modprobe `blacklist` line stops the kernel-initiated `rtnl-link-amneziawg` autoload, or whether `install amneziawg /bin/false` is needed. | OPEN | Decide in the PR 4 coexistence test (§7.11, §18.6). |
+| R21 | Whether a modprobe `blacklist` line stops the kernel-initiated `rtnl-link-amneziawg` autoload, or whether `install amneziawg /bin/false` is needed. | DECIDED in PR 4 | The coexistence test showed that a blacklist stops the autoload but not an explicit `modprobe`, and the install command stops both; PR 4 uses the install command (§7.11, §21.2). |
 
 ---
 

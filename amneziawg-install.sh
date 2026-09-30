@@ -13,6 +13,8 @@ WEB_PANEL_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
 WEB_PANEL_ENV_FILE="/etc/amneziawg-web/env.conf"
 WEB_PANEL_SYSTEMD_UNIT="/etc/systemd/system/amneziawg-web.service"
 WEB_PANEL_DATA_DIR="/var/lib/amneziawg-web"
+# The web panel's lifecycle-script copy when its configuration names none.
+WEB_PANEL_LIFECYCLE_SCRIPT="/usr/local/bin/amneziawg-install.sh"
 
 # Protocol state is deliberately independent from package/tool versions. A
 # missing value in an older params file always means AWG 2.0; AWG 3.0 and
@@ -36,25 +38,47 @@ AWG31_DEFAULT_DISABLE_COOKIES="off"
 # with renderAwgProtocolFields and the config match helpers.
 AWG_PROTOCOL_CONFIG_KEYS="HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|RandomTrailers|DisableCookies"
 
-# AWG backend (datapath) state. Params written before backends existed have no
-# AWG_BACKEND, and that always means the kernel module. This installer version
-# supports only the kernel backend: validatePersistedAwgBackendState rejects
-# every other persisted value, and the runtime dispatchers refuse to operate on
-# an unset or unknown backend. The assignment below is the default until params
+# AWG backend (datapath) state: the AmneziaWG kernel module ("kernel") or the
+# userspace WireSock BoringTun daemon ("boringtun", experimental). Params
+# written before backends existed have no AWG_BACKEND, and that always means the
+# kernel module. Every other value fails closed, and the runtime dispatchers
+# refuse to operate on an unset or unknown backend.
+#
+# The backend of an installation is chosen once, by a fresh install, and params
+# are authoritative afterwards. The assignment below is the default until params
 # are loaded; validateParamsFile then re-derives the backend from params alone.
 # It also discards an AWG_BACKEND inherited from the caller's environment, so
-# the environment can never select a backend.
+# the environment never changes the backend of an existing installation. Only a
+# fresh install reads the caller's request, from the copy taken here
+# (selectFreshInstallBackend).
 AWG_BACKEND_KERNEL="kernel"
+AWG_BACKEND_BORINGTUN="boringtun"
+_AWG_BACKEND_REQUESTED="${AWG_BACKEND-}"
 AWG_BACKEND="${AWG_BACKEND_KERNEL}"
 
-# BoringTun runtime layer. This installer version does not support BoringTun as
-# a backend: params validation still rejects it, and nothing in an ordinary run
-# selects it. Its runtime branches exist for internal testing only and are
-# reachable solely through _awgInternalSelectBoringtunRuntimeForTesting, called
-# by test code that sources this file. The flag below is assigned, never read
-# from the environment, each time the installer is loaded.
-AWG_BACKEND_BORINGTUN="boringtun"
-_AWG_BORINGTUN_RUNTIME_INTERNAL=0
+# Capability marker. The web panel runs its own copy of this script for client
+# lifecycle operations. A fresh BoringTun install requires that copy to carry
+# this exact line, read as data (webPanelLifecycleScriptSupportsBoringtun),
+# because an older copy would treat a BoringTun host as a kernel host. Later
+# installer versions must keep the line unchanged.
+AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"
+
+# The immutable public BoringTun release that fresh BoringTun installs download.
+# These values are the installer's only trust anchor for the binary: they are
+# embedded here, never read from the network, the environment or a file.
+# tests/test-boringtun-host.sh keeps them equal to the release contract,
+# packaging/boringtun/release.env, and to packaging/boringtun/pin.env.
+AWG_BT_RELEASE_TAG="boringtun-cli-0.7.1-g71d88784ad29-b1"
+AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/amneziawg-install/releases/download/boringtun-cli-0.7.1-g71d88784ad29-b1"
+AWG_BT_RELEASE_VERSION="0.7.1"
+AWG_BT_RELEASE_SOURCE_REPOSITORY="https://github.com/Wiresock-Foundation/wiresock-boringtun"
+AWG_BT_RELEASE_SOURCE_COMMIT="71d88784ad29dc95871c105e26cc62f6acdd565b"
+AWG_BT_RELEASE_ASSET_X86_64="boringtun-cli-0.7.1-g71d88784ad29-linux-x86_64-musl.tar.gz"
+AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64="f519b535b177d703e4b1a64610943a69c040a858364fa995c311e29a5db17630"
+AWG_BT_RELEASE_BINARY_SHA256_X86_64="127b633d0b98568d8f686421ea8b3a4133de260e49de71cc470008759cf78721"
+AWG_BT_RELEASE_ASSET_AARCH64="boringtun-cli-0.7.1-g71d88784ad29-linux-aarch64-musl.tar.gz"
+AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64="7ad1e2b6c24d667b2e39ed6ad4620f1dfb94de3cf648a9733dcff3625559305d"
+AWG_BT_RELEASE_BINARY_SHA256_AARCH64="16b04cbebc3ba5fe45e8d5c940620522ed49d731642791e84368bfa393509c6b"
 
 # Where the BoringTun runtime lives. The generated helpers embed these values
 # when they are written, so a helper never reads a path from its environment.
@@ -79,6 +103,11 @@ AWG_BT_HOST_ARCH=""
 # Where the SaveConfig-free copy for an emergency awg-quick down goes when the
 # runtime directory cannot allocate a new one.
 AWG_BT_TMP_DIR="/tmp"
+# The installer's load override for an AmneziaWG kernel module that is
+# installed on a BoringTun host (_awgBtKernelModuleBlocked).
+AWG_BT_MODPROBE_OVERRIDE="/etc/modprobe.d/amneziawg-install-boringtun.conf"
+# The standalone amneziawg-proxy, which cannot run in front of BoringTun.
+AWG_PROXY_INSTALL_PATHS="/etc/systemd/system/amneziawg-proxy.service /usr/local/bin/amneziawg-proxy /etc/amneziawg-proxy/proxy.toml"
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
@@ -116,6 +145,11 @@ GAI_CONF_IPV4_RULE="precedence ::ffff:0:0/96 100"
 GAI_CONF_IPV4_RULE_REGEX='^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]*(#.*)?)?$'
 AMNEZIA_PPA_URI="https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu"
 AMNEZIA_PPA_SOURCES_DIR="/etc/apt/sources.list.d"
+# Files the uninstall removes; tests point them below a test root.
+AWG_SYSTEMD_UNIT_DIR="/etc/systemd/system"
+AWG_MODULES_LOAD_FILE="/etc/modules-load.d/amneziawg.conf"
+AWG_SYSCTL_FILE="/etc/sysctl.d/awg.conf"
+AWG_APT_KEYRING_FILE="/etc/apt/keyrings/amneziawg.gpg"
 AMNEZIA_PPA_SOURCE_CREATED=0
 # Suite and architecture chosen by the last successful configureUbuntuAmneziaPpa.
 AMNEZIA_PPA_SELECTED_SUITE=""
@@ -1897,26 +1931,40 @@ function reportUnsupportedAwgBackend() {
 	if [[ -z "${BACKEND_VALUE}" ]]; then
 		echo "ERROR: the AWG backend is not set; refusing to operate on an unknown backend" >&2
 	elif [[ "${BACKEND_VALUE}" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
-		echo "ERROR: AWG backend '${BACKEND_VALUE}' is not supported by this installer version (supported: ${AWG_BACKEND_KERNEL})" >&2
+		echo "ERROR: AWG backend '${BACKEND_VALUE}' is not supported by this installer version (supported: ${AWG_BACKEND_KERNEL}, ${AWG_BACKEND_BORINGTUN})" >&2
 	else
-		echo "ERROR: the configured AWG backend is not supported by this installer version (supported: ${AWG_BACKEND_KERNEL})" >&2
+		echo "ERROR: the configured AWG backend is not supported by this installer version (supported: ${AWG_BACKEND_KERNEL}, ${AWG_BACKEND_BORINGTUN})" >&2
 	fi
 }
 
 # Normalize the persisted backend. A missing or empty value is the kernel
 # backend, which is what every params file written before backends existed
-# means. Every other value, including backends that later installer versions
-# may add, fails closed instead of being reinterpreted as the kernel backend.
+# means; kernel and boringtun stay as they are. Every other value, including
+# backends that later installer versions may add, fails closed instead of
+# being reinterpreted as the kernel backend.
 function normalizeAwgBackend() {
 	case "${AWG_BACKEND:-}" in
 		""|"${AWG_BACKEND_KERNEL}")
 			AWG_BACKEND="${AWG_BACKEND_KERNEL}"
 			;;
+		"${AWG_BACKEND_BORINGTUN}") ;;
 		*)
 			reportUnsupportedAwgBackend "${AWG_BACKEND}"
 			return 1
 			;;
 	esac
+}
+
+# Choose the backend of a fresh installation from the caller's AWG_BACKEND, as
+# it was when the installer was loaded: unset or empty means the kernel
+# backend, the default; kernel and boringtun select that backend; anything else
+# fails closed. Existing installations never come here: their params decide.
+function selectFreshInstallBackend() {
+	AWG_BACKEND="${_AWG_BACKEND_REQUESTED}"
+	if ! normalizeAwgBackend; then
+		echo "ERROR: set AWG_BACKEND to '${AWG_BACKEND_KERNEL}' (the default) or '${AWG_BACKEND_BORINGTUN}' (experimental) for a fresh installation." >&2
+		return 1
+	fi
 }
 
 # Validate the persisted backend after params are sourced. Backends with their
@@ -2715,12 +2763,14 @@ function serializeParams() {
 		echo "ERROR: serializeParams() requires an output file path" >&2
 		return 1
 	fi
-	# Only the kernel backend is a supported persisted value. The internal
-	# BoringTun runtime selection must never reach params.
-	if [[ -n "${AWG_BACKEND:-}" && "${AWG_BACKEND}" != "${AWG_BACKEND_KERNEL}" ]]; then
-		reportUnsupportedAwgBackend "${AWG_BACKEND}"
-		return 1
-	fi
+	# Only supported backends are persisted; unset means the kernel backend.
+	case "${AWG_BACKEND:-}" in
+		""|"${AWG_BACKEND_KERNEL}"|"${AWG_BACKEND_BORINGTUN}") ;;
+		*)
+			reportUnsupportedAwgBackend "${AWG_BACKEND}"
+			return 1
+			;;
+	esac
 	# Apply a restrictive umask only while writing the params file to disk,
 	# so that subprocesses (apt/dnf, dkms, etc.) are not affected.
 	local OLD_UMASK
@@ -3772,6 +3822,7 @@ function installKernelHeaders() {
 function ensureAwgQuickRunning() {
 	if [[ -n "${SERVER_AWG_NIC:-}" ]] && ! systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
 		echo -e "${ORANGE}Starting awg-quick@${SERVER_AWG_NIC} (was not running)...${NC}"
+		awgBackendPrepareServiceStart
 		if ! systemctl start "awg-quick@${SERVER_AWG_NIC}"; then
 			echo -e "${RED}ERROR: Failed to start awg-quick@${SERVER_AWG_NIC}.${NC}"
 			echo -e "${ORANGE}Check service status with: systemctl status awg-quick@${SERVER_AWG_NIC}${NC}"
@@ -3927,16 +3978,26 @@ function ensureAwgBackendReady() {
 			ensureAmneziawgKernelModule "$@"
 			;;
 		"${AWG_BACKEND_BORINGTUN}")
-			if ! _awgBtRuntimeSelected; then
-				reportUnsupportedAwgBackend "${AWG_BACKEND}"
-				exit 1
-			fi
 			_awgBtEnsureReady "$@"
 			;;
 		*)
 			reportUnsupportedAwgBackend "${AWG_BACKEND:-}"
 			exit 1
 			;;
+	esac
+}
+
+# Prepare a deliberate start or restart of awg-quick@<if> by a management
+# operation. The BoringTun drop-in rate-limits starts (StartLimitBurst) so that
+# a crashing daemon cannot restart forever; a deliberate restart is not a crash
+# loop, so the unit's start counter is reset first. Automatic restarts stay
+# limited. The kernel unit is left exactly as it was.
+function awgBackendPrepareServiceStart() {
+	case "${AWG_BACKEND:-}" in
+		"${AWG_BACKEND_BORINGTUN}")
+			systemctl reset-failed "awg-quick@${SERVER_AWG_NIC}.service" >/dev/null 2>&1 || true
+			;;
+		*) ;;
 	esac
 }
 
@@ -3951,10 +4012,6 @@ function awgBackendCreateScratchInterface() {
 			ip link add dev "${INTERFACE_NAME}" type amneziawg
 			;;
 		"${AWG_BACKEND_BORINGTUN}")
-			if ! _awgBtRuntimeSelected; then
-				reportUnsupportedAwgBackend "${AWG_BACKEND}"
-				return 1
-			fi
 			_awgBtScratchCreate "${INTERFACE_NAME}"
 			;;
 		*)
@@ -3972,10 +4029,6 @@ function awgBackendDestroyScratchInterface() {
 			ip link delete dev "${INTERFACE_NAME}"
 			;;
 		"${AWG_BACKEND_BORINGTUN}")
-			if ! _awgBtRuntimeSelected; then
-				reportUnsupportedAwgBackend "${AWG_BACKEND}"
-				return 1
-			fi
 			_awgBtScratchDestroy "${INTERFACE_NAME}"
 			;;
 		*)
@@ -3996,10 +4049,6 @@ function awgBackendQuickUp() {
 			awg-quick up "${CONFIG_FILE}"
 			;;
 		"${AWG_BACKEND_BORINGTUN}")
-			if ! _awgBtRuntimeSelected; then
-				reportUnsupportedAwgBackend "${AWG_BACKEND}"
-				return 1
-			fi
 			_awgBtQuickUp "${CONFIG_FILE}"
 			;;
 		*)
@@ -4037,10 +4086,6 @@ function awgSyncInterfaceConfig() {
 			esac
 			;;
 		"${AWG_BACKEND_BORINGTUN}")
-			if ! _awgBtRuntimeSelected; then
-				reportUnsupportedAwgBackend "${AWG_BACKEND}"
-				return 1
-			fi
 			_awgBtSync "${INTERFACE_NAME}" "${SYNCCONF_STDERR}"
 			;;
 		*)
@@ -4069,16 +4114,15 @@ function awgSyncInterfaceConfig() {
 # PID and start time, socket nodes by device and inode, links by ifindex.
 # Without that evidence a resource is left alone.
 #
-# Nothing here is reachable in an ordinary run. The seam dispatches to it only
-# after _awgInternalSelectBoringtunRuntimeForTesting, and params validation
-# still rejects a persisted AWG_BACKEND=boringtun.
+# The seam dispatches here when AWG_BACKEND is boringtun, which only a fresh
+# BoringTun install (selectFreshInstallBackend) or validated params can set.
 
 # MANIFEST keys of artifact format 1, in the order scripts/boringtun-artifact.sh
 # writes them (BTA_MANIFEST_KEYS). A unit test keeps the two lists equal.
 AWG_BT_MANIFEST_KEYS="artifact_format name version source_repository source_commit source_date_epoch target os arch libc linkage rust_toolchain rustc cargo build_command build_profile rustflags binary binary_sha256 license third_party_licenses"
 
 # Settings embedded in both helpers, in this order.
-_AWG_BT_HELPER_VARIABLES="AWG_BT_STORE_DIR AWG_BT_LIBEXEC_DIR AWG_BT_RUN_DIR AWG_BT_CONFIG_DIR AWG_BT_SYSTEMD_DIR AWG_BT_UNIT_DIRS AWG_BT_WG_SOCKET_DIR AWG_BT_AWG_SOCKET_DIR AWG_BT_SYS_DIR AWG_BT_PROC_DIR AWG_BT_TUN_DEVICE AWG_BT_TRUST_ANCHOR AWG_BT_TRUSTED_UID AWG_BT_PATH AWG_BT_READY_TIMEOUT AWG_BT_HOST_ARCH AWG_BT_TMP_DIR AWG_BT_MANIFEST_KEYS"
+_AWG_BT_HELPER_VARIABLES="AWG_BT_STORE_DIR AWG_BT_LIBEXEC_DIR AWG_BT_RUN_DIR AWG_BT_CONFIG_DIR AWG_BT_SYSTEMD_DIR AWG_BT_UNIT_DIRS AWG_BT_WG_SOCKET_DIR AWG_BT_AWG_SOCKET_DIR AWG_BT_SYS_DIR AWG_BT_PROC_DIR AWG_BT_TUN_DEVICE AWG_BT_TRUST_ANCHOR AWG_BT_TRUSTED_UID AWG_BT_PATH AWG_BT_READY_TIMEOUT AWG_BT_HOST_ARCH AWG_BT_TMP_DIR AWG_BT_MODPROBE_OVERRIDE AWG_BT_MANIFEST_KEYS"
 
 _AWG_BT_VERIFIED_BIN=""
 _AWG_BT_FILE_CHANGED=0
@@ -4097,21 +4141,6 @@ _AWG_BT_AWG_ID=""
 declare -gA _AWG_BT_SCRATCH_TOKENS=()
 declare -gA _AWG_BT_SCRATCH_GUARDS=()
 declare -gA _AWG_BT_SCRATCH_GUARD_STARTS=()
-
-# Internal, undocumented: select the BoringTun runtime for this shell only, so
-# tests that source the installer can exercise its branches. It is not reachable
-# from the command line, the menu, params or the environment, and
-# serializeParams refuses to persist it. Normal backend selection replaces it.
-function _awgInternalSelectBoringtunRuntimeForTesting() {
-	_AWG_BORINGTUN_RUNTIME_INTERNAL=1
-	AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
-}
-
-# The BoringTun branches refuse to run unless that internal selection happened
-# in this shell, whatever AWG_BACKEND says.
-function _awgBtRuntimeSelected() {
-	[[ "${_AWG_BORINGTUN_RUNTIME_INTERNAL}" == 1 && "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]
-}
 
 function _awgBtErr() {
 	printf '%s: %s\n' "${_AWG_BT_PROG:-amneziawg-install}" "$*" >&2
@@ -4198,11 +4227,9 @@ function _awgBtHostArch() {
 # start. Between it and the exec only root can change these files, because no
 # path component is writable by anyone else.
 function _awgBtVerifyStore() {
-	local STORE="${AWG_BT_STORE_DIR}" RELEASE_ID="" RELEASE BINARY MANIFEST LINE KEY VALUE
-	local ARCH OWNER="" MODE="" ACTUAL_SHA="" CANONICAL_STORE CANONICAL_BINARY
-	local -A FIELDS=()
+	local STORE="${AWG_BT_STORE_DIR}" RELEASE_ID="" OWNER="" MODE=""
 	_AWG_BT_VERIFIED_BIN=""
-	if ! ARCH="$(_awgBtHostArch)"; then
+	if ! _awgBtHostArch >/dev/null; then
 		_awgBtErr "BoringTun artifacts exist only for x86_64 and aarch64 hosts"
 		return 1
 	fi
@@ -4219,6 +4246,29 @@ function _awgBtVerifyStore() {
 	if [[ "${OWNER}" != "${AWG_BT_TRUSTED_UID}" ]] || \
 		! [[ "${RELEASE_ID}" =~ ^boringtun-cli-[0-9]+\.[0-9]+\.[0-9]+-g[0-9a-f]{12}-linux-(x86_64|aarch64)-musl$ ]]; then
 		_awgBtErr "${STORE}/current must be a root-owned link to a release directory in the store"
+		return 1
+	fi
+	_awgBtVerifyRelease "${RELEASE_ID}"
+}
+
+# The checks of _awgBtVerifyStore for the release directory RELEASE_ID of the
+# store, whether or not current selects it: the installer runs them before it
+# points current at a release. Sets _AWG_BT_VERIFIED_BIN.
+function _awgBtVerifyRelease() { # <release id>
+	local STORE="${AWG_BT_STORE_DIR}" RELEASE_ID="$1" RELEASE BINARY MANIFEST LINE KEY VALUE
+	local ARCH ACTUAL_SHA="" CANONICAL_STORE CANONICAL_BINARY
+	local -A FIELDS=()
+	_AWG_BT_VERIFIED_BIN=""
+	if ! ARCH="$(_awgBtHostArch)"; then
+		_awgBtErr "BoringTun artifacts exist only for x86_64 and aarch64 hosts"
+		return 1
+	fi
+	if ! _awgBtTrustedAncestors "${STORE}" || ! _awgBtTrustedNode "${STORE}" dir; then
+		_awgBtErr "the BoringTun store ${STORE} is missing, or it or a parent directory is writable by someone other than root"
+		return 1
+	fi
+	if ! [[ "${RELEASE_ID}" =~ ^boringtun-cli-[0-9]+\.[0-9]+\.[0-9]+-g[0-9a-f]{12}-linux-(x86_64|aarch64)-musl$ ]]; then
+		_awgBtErr "${RELEASE_ID} is not the name of a BoringTun release directory"
 		return 1
 	fi
 	RELEASE="${STORE}/${RELEASE_ID}"
@@ -5149,9 +5199,64 @@ function _awgBtSync() {
 	return "${RC}"
 }
 
+# The installer's load override for an AmneziaWG kernel module installed on a
+# BoringTun host. A blacklist line stops only the rtnl-link autoload of
+# `ip link add … type amneziawg`; an install command also stops an explicit
+# `modprobe amneziawg`. The BoringTun coexistence test shows both on a real
+# DKMS module.
+function _awgBtRenderModprobeOverride() {
+	printf '# Managed by amneziawg-install (backend: boringtun). Removed by its uninstall.\n'
+	printf '# Stops the AmneziaWG kernel module from loading, so that awg-quick starts BoringTun.\n'
+	printf 'install amneziawg /bin/false\n'
+}
+
+# Loading <module or alias> ends in the override's install command. The dry
+# run lists, one per line and with a trailing space, what modprobe would do:
+# an insmod for each dependency that is not loaded yet, then the action for the
+# module itself. The output is parsed as data: every line but the last must
+# insmod a dependency by absolute path, none of them AmneziaWG itself, and the
+# last must be exactly `install /bin/false`. Anything else counts as not
+# blocked.
+function _awgBtModprobeActionBlocked() { # <module or alias>
+	local OUTPUT LINE MODULE
+	local -a LINES=() ACTIONS=()
+	OUTPUT="$(modprobe -n -v "$1" 2>/dev/null)" || return 1
+	mapfile -t LINES <<<"${OUTPUT}"
+	for LINE in "${LINES[@]}"; do
+		LINE="${LINE%"${LINE##*[![:space:]]}"}"
+		[[ -z "${LINE}" ]] || ACTIONS+=("${LINE}")
+	done
+	((${#ACTIONS[@]} > 0)) || return 1
+	[[ "${ACTIONS[-1]}" == "install /bin/false" ]] || return 1
+	for LINE in "${ACTIONS[@]:0:${#ACTIONS[@]}-1}"; do
+		[[ "${LINE}" =~ ^insmod\ (/[^[:space:]]+\.ko(\.(gz|xz|zst))?)(\ .*)?$ ]] || return 1
+		MODULE="${BASH_REMATCH[1]##*/}"
+		[[ "${MODULE%%.ko*}" != amneziawg ]] || return 1
+	done
+	return 0
+}
+
+# The override is in force: the installer's file is in place, trusted and
+# unchanged, and modprobe resolves both the module and the rtnl-link alias that
+# `ip link add … type amneziawg` requests to that install command.
+function _awgBtKernelModuleBlocked() {
+	local NAME
+	if ! _awgBtTrustedAncestors "${AWG_BT_MODPROBE_OVERRIDE}" || ! _awgBtTrustedNode "${AWG_BT_MODPROBE_OVERRIDE}" file ||
+		[[ "$(cat -- "${AWG_BT_MODPROBE_OVERRIDE}" 2>/dev/null)" != "$(_awgBtRenderModprobeOverride)" ]]; then
+		return 1
+	fi
+	command -v modprobe >/dev/null 2>&1 || return 1
+	for NAME in amneziawg rtnl-link-amneziawg; do
+		_awgBtModprobeActionBlocked "${NAME}" || return 1
+	done
+	return 0
+}
+
 # awg-quick tries `ip link add <if> type amneziawg` first and uses the
 # userspace implementation only when that fails and the module is not loaded.
-# A loaded module, or one it can autoload, would therefore win silently.
+# A loaded module, or one it can autoload, would therefore win silently. An
+# installed module is accepted only while the installer's load override is in
+# force.
 function _awgBtCheckKernelModule() {
 	if [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then
 		_awgBtErr "the amneziawg kernel module is loaded, so awg-quick would create a kernel interface instead of starting BoringTun; unload it with: modprobe -r amneziawg"
@@ -5161,8 +5266,8 @@ function _awgBtCheckKernelModule() {
 		_awgBtErr "modinfo is unavailable, so an autoloadable amneziawg kernel module cannot be ruled out"
 		return 1
 	fi
-	if modinfo -n amneziawg >/dev/null 2>&1; then
-		_awgBtErr "the amneziawg kernel module is installed and awg-quick would autoload it instead of starting BoringTun; remove amneziawg-dkms or the module first"
+	if modinfo -n amneziawg >/dev/null 2>&1 && ! _awgBtKernelModuleBlocked; then
+		_awgBtErr "the amneziawg kernel module is installed and awg-quick would autoload it instead of starting BoringTun; remove amneziawg-dkms, or block the module with the installer's load override ${AWG_BT_MODPROBE_OVERRIDE}"
 		return 1
 	fi
 	return 0
@@ -5585,9 +5690,9 @@ function awgBackendCtlMain() {
 }
 
 # Functions the generated helpers carry. Keep in step with their callers.
-_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtRemoveOwnedPath _awgBtSocketHeldBy _awgBtSymlinkToNode _awgBtProveUapiNodes _awgBtNewToken _awgBtCurrentAttempt _awgBtAttemptBase _awgBtStateFile _awgBtFlagsArm _awgBtFlagRaise _awgBtFlagIs _awgBtAttemptRemove _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
+_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtVerifyRelease _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtRemoveOwnedPath _awgBtSocketHeldBy _awgBtSymlinkToNode _awgBtProveUapiNodes _awgBtNewToken _awgBtCurrentAttempt _awgBtAttemptBase _awgBtStateFile _awgBtFlagsArm _awgBtFlagRaise _awgBtFlagIs _awgBtAttemptRemove _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
 _AWG_BT_LAUNCH_FUNCTIONS="awgBoringtunLaunchMain _awgBtRecordSocketNodes _awgBtLaunchRefused _awgBtLaunchFailed"
-_AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtWithoutSaveConfig _awgBtTryDownCopy _awgBtDownCopy _awgBtLinkIsOwned _awgBtGuardedDown _awgBtRecordFailedDown _awgBtReplayPostDown _awgBtReportUnfinishedDown _awgBtFilteredStrip _awgBtSync _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtVerifyActiveInstance _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
+_AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtWithoutSaveConfig _awgBtTryDownCopy _awgBtDownCopy _awgBtLinkIsOwned _awgBtGuardedDown _awgBtRecordFailedDown _awgBtReplayPostDown _awgBtReportUnfinishedDown _awgBtFilteredStrip _awgBtSync _awgBtRenderModprobeOverride _awgBtModprobeActionBlocked _awgBtKernelModuleBlocked _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtVerifyActiveInstance _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
 
 # Emit a generated helper: a fixed header, the embedded AWG_BT_* settings, the
 # installer's own functions and a call to the entry point. The output depends
@@ -6418,6 +6523,803 @@ function _awgBtScratchDestroy() {
 	return "${RC}"
 }
 
+# ── BoringTun host installation (experimental) ───────────────────────────────
+# A fresh BoringTun install on a Debian or Ubuntu host with systemd, and its
+# uninstall. Management of an installed host goes through the runtime layer
+# above. Nothing here runs for the kernel backend.
+#
+# The binary comes from the immutable public release named by the
+# AWG_BT_RELEASE_* constants: one exact URL per architecture, the archive
+# checked against its embedded SHA-256 before anything is extracted, then the
+# archive layout, the MANIFEST, the binary's SHA-256 and its version, and only
+# then an atomic install into the store that _awgBtVerifyStore checks at every
+# start. A store that already holds a valid release is reused as it is and
+# never replaced: upgrades are not part of this installer version.
+
+# The release asset for an architecture (x86_64 or aarch64): sets
+# _AWG_BT_REL_ASSET, _AWG_BT_REL_ID (the archive's top-level directory and the
+# store's release directory), _AWG_BT_REL_ARCHIVE_SHA256 and
+# _AWG_BT_REL_BINARY_SHA256.
+function _awgBtSelectRelease() {
+	case "$1" in
+		x86_64)
+			_AWG_BT_REL_ASSET="${AWG_BT_RELEASE_ASSET_X86_64}"
+			_AWG_BT_REL_ARCHIVE_SHA256="${AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64}"
+			_AWG_BT_REL_BINARY_SHA256="${AWG_BT_RELEASE_BINARY_SHA256_X86_64}"
+			;;
+		aarch64)
+			_AWG_BT_REL_ASSET="${AWG_BT_RELEASE_ASSET_AARCH64}"
+			_AWG_BT_REL_ARCHIVE_SHA256="${AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64}"
+			_AWG_BT_REL_BINARY_SHA256="${AWG_BT_RELEASE_BINARY_SHA256_AARCH64}"
+			;;
+		*) return 1 ;;
+	esac
+	_AWG_BT_REL_ID="${_AWG_BT_REL_ASSET%.tar.gz}"
+}
+
+# Print the paths that show a standalone amneziawg-proxy installation. Its
+# uninstaller keeps proxy.toml unless --purge-config is given, and even a
+# leftover proxy.toml counts: removing it is the operator's decision.
+function boringtunProxyInstallPaths() {
+	local CANDIDATE
+	for CANDIDATE in ${AWG_PROXY_INSTALL_PATHS}; do
+		if [[ -e "${CANDIDATE}" || -L "${CANDIDATE}" ]]; then
+			printf '%s\n' "${CANDIDATE}"
+		fi
+	done
+}
+
+# The web panel's lifecycle-script copy, as its service configuration names it.
+function webPanelLifecycleScriptPath() {
+	local SCRIPT=""
+	SCRIPT="$(readWebPanelSetting AWG_INSTALL_SCRIPT 2>/dev/null)" || SCRIPT=""
+	printf '%s\n' "${SCRIPT:-${WEB_PANEL_LIFECYCLE_SCRIPT}}"
+}
+
+# Succeed when no web panel is installed, or when its lifecycle-script copy
+# carries this installer's BoringTun host capability line. The copy is read as
+# data, never sourced or run.
+function webPanelLifecycleScriptSupportsBoringtun() {
+	local SCRIPT
+	isWebPanelInstalled || return 0
+	SCRIPT="$(webPanelLifecycleScriptPath)"
+	[[ -f "${SCRIPT}" && -r "${SCRIPT}" ]] || return 1
+	grep -qxF "AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST=\"${AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST}\"" -- "${SCRIPT}"
+}
+
+# Decide about an AmneziaWG kernel module before anything is installed. A
+# loaded module is never unloaded, and an installed one is blocked only with
+# the operator's explicit consent: a prompt, or AWG_BORINGTUN_BLOCK_KERNEL_MODULE=y
+# with AUTO_INSTALL. Sets _AWG_BT_WRITE_MODPROBE_OVERRIDE.
+function boringtunKernelModuleDecision() {
+	local ANSWER=""
+	_AWG_BT_WRITE_MODPROBE_OVERRIDE=0
+	if [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then
+		echo -e "${RED}ERROR: the AmneziaWG kernel module is loaded, so awg-quick would use it instead of BoringTun.${NC}" >&2
+		echo -e "${ORANGE}This installer never unloads it. Keep the kernel backend, or stop what uses the module, run 'modprobe -r amneziawg', remove amneziawg-dkms and rerun.${NC}" >&2
+		return 1
+	fi
+	if ! command -v modinfo >/dev/null 2>&1; then
+		echo -e "${RED}ERROR: modinfo (kmod) is required to rule out an AmneziaWG kernel module that awg-quick would load instead of BoringTun.${NC}" >&2
+		return 1
+	fi
+	if ! modinfo -n amneziawg >/dev/null 2>&1 || _awgBtKernelModuleBlocked; then
+		return 0
+	fi
+	echo -e "${ORANGE}An AmneziaWG kernel module is installed on this host (for example by amneziawg-dkms).${NC}" >&2
+	echo -e "${ORANGE}awg-quick would load it and create a kernel interface instead of starting BoringTun.${NC}" >&2
+	echo -e "${ORANGE}The installer can block it with ${AWG_BT_MODPROBE_OVERRIDE} ('install amneziawg /bin/false'). That stops every use of the module on this host until the file is removed; uninstalling this BoringTun installation removes it.${NC}" >&2
+	if [[ "${AUTO_INSTALL,,}" == "y" ]]; then
+		if [[ "${AWG_BORINGTUN_BLOCK_KERNEL_MODULE:-}" != "y" ]]; then
+			echo -e "${RED}ERROR: refusing to block the kernel module without consent. Remove amneziawg-dkms first, or rerun with AWG_BORINGTUN_BLOCK_KERNEL_MODULE=y.${NC}" >&2
+			return 1
+		fi
+	else
+		read -rp "Block the AmneziaWG kernel module on this host? [y/N]: " -e ANSWER
+		if [[ "${ANSWER}" != [yY] ]]; then
+			echo -e "${RED}ERROR: the kernel module stays usable, so BoringTun cannot be installed. Remove amneziawg-dkms first, or accept the block.${NC}" >&2
+			return 1
+		fi
+	fi
+	_AWG_BT_WRITE_MODPROBE_OVERRIDE=1
+}
+
+# Everything that must hold before a BoringTun install asks its questions or
+# changes the host.
+function checkBoringtunHostSupport() {
+	local ARCH PROXY_PATHS SCRIPT
+	if [[ "${OS}" != "ubuntu" && "${OS}" != "debian" ]]; then
+		echo -e "${RED}ERROR: the BoringTun backend is supported only on Debian and Ubuntu hosts.${NC}" >&2
+		return 1
+	fi
+	if ! ARCH="$(_awgBtHostArch)" || ! _awgBtSelectRelease "${ARCH}"; then
+		echo -e "${RED}ERROR: BoringTun releases exist only for x86_64 and aarch64 hosts, not for $(uname -m 2>/dev/null).${NC}" >&2
+		return 1
+	fi
+	if [[ ! -d "${AWG_BT_SYSTEMD_RUNTIME_DIR}" ]]; then
+		echo -e "${RED}ERROR: the BoringTun backend needs a host running systemd.${NC}" >&2
+		return 1
+	fi
+	PROXY_PATHS="$(boringtunProxyInstallPaths)"
+	if [[ -n "${PROXY_PATHS}" ]]; then
+		echo -e "${RED}ERROR: the standalone amneziawg-proxy is installed (${PROXY_PATHS//$'\n'/, }).${NC}" >&2
+		echo -e "${ORANGE}The BoringTun backend cannot be used behind the standalone proxy. Keep the kernel backend, or uninstall the proxy first with amneziawg-proxy-uninstall.sh --restore-awg --purge-config.${NC}" >&2
+		return 1
+	fi
+	if ! webPanelLifecycleScriptSupportsBoringtun; then
+		SCRIPT="$(webPanelLifecycleScriptPath)"
+		if [[ -f "${SCRIPT}" ]]; then
+			echo -e "${RED}ERROR: the installed web panel runs ${SCRIPT} for client operations, and that copy predates BoringTun host support.${NC}" >&2
+			echo -e "${ORANGE}It would treat a BoringTun host as a kernel host. Upgrade the web panel so that it installs this version of amneziawg-install.sh, then rerun.${NC}" >&2
+		else
+			echo -e "${RED}ERROR: the installed web panel names ${SCRIPT} for client operations, but that copy of amneziawg-install.sh is missing, so its BoringTun support cannot be checked.${NC}" >&2
+			echo -e "${ORANGE}Reinstall or upgrade the web panel so that it installs this version of amneziawg-install.sh, then rerun.${NC}" >&2
+		fi
+		return 1
+	fi
+	if ! _awgBtCheckPlatform; then
+		echo -e "${RED}ERROR: this host cannot run BoringTun.${NC}" >&2
+		return 1
+	fi
+	boringtunKernelModuleDecision
+}
+
+# amneziawg-tools and the firewall and QR tools, never the kernel module: the
+# tools only recommend amneziawg-dkms, so --no-install-recommends keeps DKMS,
+# headers and the module off the host. Runs inside the APT IPv4 window.
+function installBoringtunHostPackages() {
+	if [[ ${OS} == 'ubuntu' ]]; then
+		prepareUbuntuAmneziaPpaForInstall
+		apt-get install -y --no-install-recommends amneziawg-tools || { echo -e "${RED}ERROR: amneziawg-tools could not be installed.${NC}"; exit 1; }
+		apt-get install -y iptables nftables qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+	elif [[ ${OS} == 'debian' ]]; then
+		if ! command -v curl &>/dev/null; then
+			apt-get update
+			apt-get install -y curl || { echo -e "${RED}ERROR: Failed to install curl, which downloads the BoringTun release.${NC}"; exit 1; }
+		fi
+		configureDebianAmneziaAptSource 0
+		apt-get update || { echo -e "${RED}ERROR: Failed to update package index.${NC}"; exit 1; }
+		apt-get install -y --no-install-recommends amneziawg-tools || { echo -e "${RED}ERROR: amneziawg-tools could not be installed.${NC}"; exit 1; }
+		apt-get install -y qrencode iptables nftables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+	fi
+}
+
+# Check a release directory against the embedded contract: exactly the four
+# regular files, a MANIFEST that describes this exact release (read as data),
+# and a binary with the embedded SHA-256. Nothing in it runs.
+function _awgBtCheckReleaseDir() { # <dir> <arch>
+	local DIR="$1" ARCH="$2" FILE LINE KEY VALUE ACTUAL
+	local -A FIELDS=()
+	for FILE in LICENSE MANIFEST THIRD-PARTY-LICENSES boringtun-cli; do
+		if [[ -L "${DIR}/${FILE}" || ! -f "${DIR}/${FILE}" ]]; then
+			echo "ERROR: the BoringTun release has no regular file ${FILE}" >&2
+			return 1
+		fi
+	done
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		if [[ ! "${LINE}" =~ ^([a-z0-9_]+)=([^[:cntrl:]]*)$ ]]; then
+			echo "ERROR: the BoringTun release MANIFEST has a malformed line" >&2
+			return 1
+		fi
+		KEY="${BASH_REMATCH[1]}"
+		VALUE="${BASH_REMATCH[2]}"
+		if [[ " ${AWG_BT_MANIFEST_KEYS} " != *" ${KEY} "* || -n "${FIELDS[${KEY}]+set}" ]]; then
+			echo "ERROR: the BoringTun release MANIFEST has an unexpected or repeated key ${KEY}" >&2
+			return 1
+		fi
+		FIELDS["${KEY}"]="${VALUE}"
+	done <"${DIR}/MANIFEST"
+	for KEY in ${AWG_BT_MANIFEST_KEYS}; do
+		if [[ -z "${FIELDS[${KEY}]+set}" ]]; then
+			echo "ERROR: the BoringTun release MANIFEST has no ${KEY}" >&2
+			return 1
+		fi
+	done
+	if [[ "${FIELDS[artifact_format]}" != 1 || "${FIELDS[name]}" != boringtun-cli ||
+		"${FIELDS[version]}" != "${AWG_BT_RELEASE_VERSION}" ||
+		"${FIELDS[source_repository]}" != "${AWG_BT_RELEASE_SOURCE_REPOSITORY}" ||
+		"${FIELDS[source_commit]}" != "${AWG_BT_RELEASE_SOURCE_COMMIT}" ||
+		"${FIELDS[target]}" != "${ARCH}-unknown-linux-musl" || "${FIELDS[arch]}" != "${ARCH}" ||
+		"${FIELDS[os]}" != linux || "${FIELDS[libc]}" != musl || "${FIELDS[linkage]}" != static ||
+		"${FIELDS[binary]}" != boringtun-cli || "${FIELDS[binary_sha256]}" != "${_AWG_BT_REL_BINARY_SHA256}" ]]; then
+		echo "ERROR: the BoringTun release MANIFEST does not describe ${_AWG_BT_REL_ID} (${AWG_BT_RELEASE_SOURCE_COMMIT})" >&2
+		return 1
+	fi
+	ACTUAL="$(sha256sum -- "${DIR}/boringtun-cli" 2>/dev/null)" || ACTUAL=""
+	if [[ "${ACTUAL%% *}" != "${_AWG_BT_REL_BINARY_SHA256}" ]]; then
+		echo "ERROR: boringtun-cli does not have the SHA-256 embedded in this installer (${_AWG_BT_REL_BINARY_SHA256})" >&2
+		return 1
+	fi
+}
+
+# The one verification boundary for a release directory in the store, staged
+# or already there, before anything in it runs:
+#  1. the trusted path: every directory from the trust anchor down, the
+#     release directory itself, and exactly the four members as trusted
+#     regular files (the binary executable) with a single link each, so no
+#     symlink or hard link stands in for them and only root can change them;
+#  2. the embedded contract (_awgBtCheckReleaseDir), which reads the MANIFEST
+#     as data and hashes the binary;
+#  3. the binary is still the node that was hashed and still trusted, and only
+#     then does it run, to report the release version.
+# A directory that fails is never run and never made current. Between the last
+# check and the exec only root could replace the binary.
+function _awgBtVerifyCandidate() { # <release dir> <arch>
+	local DIR="$1" ARCH="$2" FILE KIND MEMBERS NODE_ID VERSION
+	if ! _awgBtTrustedAncestors "${DIR}" || ! _awgBtTrustedNode "${DIR}" dir; then
+		echo "ERROR: the BoringTun release directory ${DIR}, or a directory above it, is not root-owned or is writable by others" >&2
+		return 1
+	fi
+	MEMBERS="$(find "${DIR}" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | LC_ALL=C sort)" || MEMBERS=""
+	if [[ "${MEMBERS}" != $'LICENSE\nMANIFEST\nTHIRD-PARTY-LICENSES\nboringtun-cli' ]]; then
+		echo "ERROR: the BoringTun release directory ${DIR} does not hold exactly the release's four files" >&2
+		return 1
+	fi
+	for FILE in LICENSE MANIFEST THIRD-PARTY-LICENSES boringtun-cli; do
+		KIND="file"
+		[[ "${FILE}" != boringtun-cli ]] || KIND="exec"
+		if ! _awgBtTrustedNode "${DIR}/${FILE}" "${KIND}" || [[ "$(stat -c '%h' -- "${DIR}/${FILE}" 2>/dev/null)" != 1 ]]; then
+			echo "ERROR: ${DIR}/${FILE} is not a root-owned, single-link regular file that only root can write" >&2
+			return 1
+		fi
+	done
+	NODE_ID="$(_awgBtPathId "${DIR}/boringtun-cli")" || return 1
+	_awgBtCheckReleaseDir "${DIR}" "${ARCH}" || return 1
+	if [[ "$(_awgBtPathId "${DIR}/boringtun-cli")" != "${NODE_ID}" ]] || ! _awgBtTrustedNode "${DIR}/boringtun-cli" exec ||
+		! _awgBtTrustedNode "${DIR}" dir; then
+		echo "ERROR: ${DIR}/boringtun-cli changed while it was verified; it is not run" >&2
+		return 1
+	fi
+	VERSION="$("${DIR}/boringtun-cli" --version 2>/dev/null)" || VERSION=""
+	if [[ "${VERSION}" != "boringtun ${AWG_BT_RELEASE_VERSION}" ]]; then
+		echo "ERROR: boringtun-cli --version printed '${VERSION}', not 'boringtun ${AWG_BT_RELEASE_VERSION}'" >&2
+		return 1
+	fi
+}
+
+# Download the release archive for ARCH into WORK and unpack it there,
+# refusing any archive that is not byte for byte the embedded release.
+function _awgBtFetchRelease() { # <work dir> <arch>
+	local WORK="$1" ARCH="$2" ARCHIVE ACTUAL NAMES TYPES EXPECTED
+	ARCHIVE="${WORK}/${_AWG_BT_REL_ASSET}"
+	echo "Downloading ${AWG_BT_RELEASE_BASE_URL}/${_AWG_BT_REL_ASSET}"
+	if ! curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 600 \
+		-o "${ARCHIVE}" "${AWG_BT_RELEASE_BASE_URL}/${_AWG_BT_REL_ASSET}"; then
+		echo "ERROR: could not download the BoringTun release ${AWG_BT_RELEASE_TAG}" >&2
+		return 1
+	fi
+	ACTUAL="$(sha256sum -- "${ARCHIVE}" 2>/dev/null)" || ACTUAL=""
+	if [[ "${ACTUAL%% *}" != "${_AWG_BT_REL_ARCHIVE_SHA256}" ]]; then
+		echo "ERROR: the downloaded ${_AWG_BT_REL_ASSET} does not have the SHA-256 embedded in this installer; nothing was installed" >&2
+		return 1
+	fi
+	# Exactly the release layout, in the order it was packaged: one top-level
+	# directory and four regular files. An exact name list also rules out
+	# absolute paths, "..", other directories, duplicates and extra members.
+	EXPECTED="${_AWG_BT_REL_ID}/"$'\n'"${_AWG_BT_REL_ID}/LICENSE"$'\n'"${_AWG_BT_REL_ID}/MANIFEST"$'\n'"${_AWG_BT_REL_ID}/THIRD-PARTY-LICENSES"$'\n'"${_AWG_BT_REL_ID}/boringtun-cli"
+	NAMES="$(tar -tzf "${ARCHIVE}" 2>/dev/null)" || NAMES=""
+	TYPES="$(tar --numeric-owner -tvzf "${ARCHIVE}" 2>/dev/null | cut -c1)" || TYPES=""
+	if [[ "${NAMES}" != "${EXPECTED}" || "${TYPES}" != $'d\n-\n-\n-\n-' ]]; then
+		echo "ERROR: ${_AWG_BT_REL_ASSET} does not have the expected release layout; nothing was extracted" >&2
+		return 1
+	fi
+	mkdir -m 0700 -- "${WORK}/unpacked" || return 1
+	if ! tar -xzf "${ARCHIVE}" -C "${WORK}/unpacked" --no-same-owner --no-same-permissions; then
+		echo "ERROR: could not unpack ${_AWG_BT_REL_ASSET}" >&2
+		return 1
+	fi
+	# The download directory may be on a noexec /tmp: nothing runs here.
+	_awgBtCheckReleaseDir "${WORK}/unpacked/${_AWG_BT_REL_ID}" "${ARCH}"
+}
+
+# Put a checked release directory into the store as <store>/<release id>: it is
+# staged as a root-owned directory next to its final name, verified there as a
+# candidate and renamed into place, so a partial copy never has the release's
+# name.
+function _awgBtStoreRelease() { # <checked release dir> <arch>
+	local SOURCE="$1" ARCH="$2" STAGE FILE
+	STAGE="$(mktemp -d "${AWG_BT_STORE_DIR}/.${_AWG_BT_REL_ID}.tmp.XXXXXX")" || return 1
+	for FILE in LICENSE MANIFEST THIRD-PARTY-LICENSES; do
+		cp -- "${SOURCE}/${FILE}" "${STAGE}/${FILE}" && chmod 0644 -- "${STAGE}/${FILE}" || { rm -rf -- "${STAGE}"; return 1; }
+	done
+	if ! cp -- "${SOURCE}/boringtun-cli" "${STAGE}/boringtun-cli" || ! chmod 0755 -- "${STAGE}/boringtun-cli" "${STAGE}" ||
+		{ [[ "${EUID}" -eq 0 ]] && ! chown -R 0:0 -- "${STAGE}"; } ||
+		! _awgBtVerifyCandidate "${STAGE}" "${ARCH}" || ! mv -T -- "${STAGE}" "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}"; then
+		rm -rf -- "${STAGE}"
+		return 1
+	fi
+}
+
+# Point <store>/current at the release atomically: a new link, renamed over it.
+function _awgBtSwitchCurrent() {
+	local LINK="${AWG_BT_STORE_DIR}/.current.tmp.$$"
+	rm -f -- "${LINK}"
+	ln -s -- "${_AWG_BT_REL_ID}" "${LINK}" && mv -T -f -- "${LINK}" "${AWG_BT_STORE_DIR}/current" && return 0
+	rm -f -- "${LINK}"
+	return 1
+}
+
+# Install the embedded release into the store, or reuse the one already there.
+# Verify, then commit: a release directory is verified as a candidate (trust
+# before anything runs, then its version) and by the runtime's own release
+# checks before current is pointed at it, so every failure leaves current as
+# it was, or absent.
+function installBoringtunRelease() {
+	local ARCH WORK RC=0 CANONICAL_STORE
+	if ! ARCH="$(_awgBtHostArch)" || ! _awgBtSelectRelease "${ARCH}"; then
+		echo -e "${RED}ERROR: BoringTun releases exist only for x86_64 and aarch64 hosts.${NC}" >&2
+		return 1
+	fi
+	if ! _awgBtEnsureDirectory "${AWG_BT_STORE_DIR%/*}" 0755 || ! _awgBtEnsureDirectory "${AWG_BT_STORE_DIR}" 0755; then
+		echo -e "${RED}ERROR: cannot prepare the BoringTun store ${AWG_BT_STORE_DIR}.${NC}" >&2
+		return 1
+	fi
+	CANONICAL_STORE="$(readlink -f -- "${AWG_BT_STORE_DIR}")" || return 1
+	if [[ -e "${AWG_BT_STORE_DIR}/current" || -L "${AWG_BT_STORE_DIR}/current" ]]; then
+		if _awgBtVerifyStore && [[ "${_AWG_BT_VERIFIED_BIN}" == "${CANONICAL_STORE}/${_AWG_BT_REL_ID}/boringtun-cli" ]] &&
+			_awgBtVerifyCandidate "${CANONICAL_STORE}/${_AWG_BT_REL_ID}" "${ARCH}"; then
+			echo "The BoringTun release ${AWG_BT_RELEASE_TAG} is already installed and verified; it is reused."
+			return 0
+		fi
+		echo -e "${RED}ERROR: ${AWG_BT_STORE_DIR} already selects a BoringTun release that is not the verified ${_AWG_BT_REL_ID}.${NC}" >&2
+		echo -e "${ORANGE}This installer version never replaces an installed BoringTun binary. Remove ${AWG_BT_STORE_DIR} if nothing uses it, then rerun.${NC}" >&2
+		return 1
+	fi
+	if [[ -e "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}" || -L "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}" ]]; then
+		# An earlier install stopped between the rename and the link. The
+		# directory is verified as a candidate, trust first, before it runs.
+		if ! _awgBtVerifyCandidate "${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID}" "${ARCH}"; then
+			echo -e "${RED}ERROR: ${AWG_BT_STORE_DIR}/${_AWG_BT_REL_ID} exists but is not the verified release. Remove it and rerun.${NC}" >&2
+			return 1
+		fi
+	else
+		WORK="$(mktemp -d "${TMPDIR:-/tmp}/amneziawg-boringtun.XXXXXX")" || return 1
+		chmod 0700 -- "${WORK}"
+		if ! _awgBtFetchRelease "${WORK}" "${ARCH}" || ! _awgBtStoreRelease "${WORK}/unpacked/${_AWG_BT_REL_ID}" "${ARCH}"; then
+			RC=1
+		fi
+		rm -rf -- "${WORK}"
+		if ((RC)); then
+			echo -e "${RED}ERROR: the BoringTun release ${AWG_BT_RELEASE_TAG} could not be installed.${NC}" >&2
+			return 1
+		fi
+	fi
+	if ! _awgBtVerifyRelease "${_AWG_BT_REL_ID}" || [[ "${_AWG_BT_VERIFIED_BIN}" != "${CANONICAL_STORE}/${_AWG_BT_REL_ID}/boringtun-cli" ]]; then
+		echo -e "${RED}ERROR: the installed BoringTun release does not verify; current was not changed.${NC}" >&2
+		return 1
+	fi
+	if ! _awgBtSwitchCurrent; then
+		echo -e "${RED}ERROR: cannot point ${AWG_BT_STORE_DIR}/current at ${_AWG_BT_REL_ID}.${NC}" >&2
+		return 1
+	fi
+	echo -e "${GREEN}Installed the BoringTun release ${AWG_BT_RELEASE_TAG} (${_AWG_BT_REL_ID}).${NC}"
+}
+
+# Write the installer's kernel-module load override and require it to be in
+# force (_awgBtKernelModuleBlocked).
+function installBoringtunModprobeOverride() {
+	local CONTENT
+	CONTENT="$(_awgBtRenderModprobeOverride)" || return 1
+	if ! _awgBtEnsureDirectory "${AWG_BT_MODPROBE_OVERRIDE%/*}" 0755 ||
+		! _awgBtWriteManagedFile "${AWG_BT_MODPROBE_OVERRIDE}" 0644 <<<"${CONTENT}"; then
+		echo -e "${RED}ERROR: could not write ${AWG_BT_MODPROBE_OVERRIDE}.${NC}" >&2
+		return 1
+	fi
+	if ! _awgBtKernelModuleBlocked; then
+		echo -e "${RED}ERROR: ${AWG_BT_MODPROBE_OVERRIDE} is not in force: modprobe -n -v does not show loading amneziawg and rtnl-link-amneziawg ending in 'install /bin/false'. Another modprobe configuration may take precedence.${NC}" >&2
+		return 1
+	fi
+}
+
+# Before any VPN state is written: prove that BoringTun can serve an AWG 2.0
+# interface with the server's chosen parameters here, with a scratch instance
+# of the verified binary (the runtime layer's own), and that its teardown
+# leaves nothing behind.
+function boringtunHostPreflight() {
+	local IFACE="awgb$((BASHPID % 100000000))" WORK KEY TOKEN RC=1 CREATED=0 DETAIL=""
+	echo "Checking that BoringTun can serve AmneziaWG on this host..."
+	if ! _awgBtCheckKernelModule || ! _awgBtCheckPlatform || ! _awgBtVerifyStore || ! _awgBtCheckHelpers ||
+		! _awgBtCheckBaseUnit "${SERVER_AWG_NIC}"; then
+		echo -e "${RED}ERROR: the BoringTun preflight failed; no VPN configuration was written.${NC}" >&2
+		return 1
+	fi
+	KEY="$(awg genkey 2>/dev/null)" || KEY=""
+	WORK="$(mktemp -d "${TMPDIR:-/tmp}/amneziawg-preflight.XXXXXX")" || return 1
+	chmod 0700 -- "${WORK}"
+	(
+		umask 077
+		cat >"${WORK}/preflight.conf" <<EOF
+[Interface]
+PrivateKey = ${KEY}
+Jc = ${SERVER_AWG_JC}
+Jmin = ${SERVER_AWG_JMIN}
+Jmax = ${SERVER_AWG_JMAX}
+S1 = ${SERVER_AWG_S1}
+S2 = ${SERVER_AWG_S2}
+S3 = ${SERVER_AWG_S3}
+S4 = ${SERVER_AWG_S4}
+H1 = ${SERVER_AWG_H1}
+H2 = ${SERVER_AWG_H2}
+H3 = ${SERVER_AWG_H3}
+H4 = ${SERVER_AWG_H4}
+EOF
+	)
+	if [[ -z "${KEY}" ]]; then
+		DETAIL="awg genkey failed"
+	elif ! awgBackendCreateScratchInterface "${IFACE}" >/dev/null; then
+		DETAIL="a scratch BoringTun instance could not be started"
+	else
+		CREATED=1
+		TOKEN="${_AWG_BT_SCRATCH_TOKENS[${IFACE}]:-}"
+		if ! _awgBtLinkIsTun "${IFACE}"; then
+			DETAIL="the scratch interface is not a TUN device"
+		elif ! _awgBtUapiReady "${IFACE}"; then
+			DETAIL="the scratch instance's UAPI does not answer"
+		elif ! awg setconf "${IFACE}" "${WORK}/preflight.conf" >/dev/null; then
+			DETAIL="awg setconf rejected the AWG 2.0 configuration"
+		elif ! _awgBtListenPort "${IFACE}" >/dev/null || ! awg show "${IFACE}" dump >/dev/null 2>&1; then
+			DETAIL="awg show did not read the applied configuration back"
+		else
+			RC=0
+		fi
+	fi
+	if ((CREATED)) && ! awgBackendDestroyScratchInterface "${IFACE}" >/dev/null; then
+		RC=1
+		DETAIL="${DETAIL:+${DETAIL}; }the scratch instance was not torn down cleanly"
+	fi
+	if ((CREATED)) && { _awgBtLinkExists "${IFACE}" || [[ -e "${AWG_BT_WG_SOCKET_DIR}/${IFACE}.sock" || -L "${AWG_BT_AWG_SOCKET_DIR}/${IFACE}.sock" ]] ||
+		compgen -G "$(_awgBtScratchDir)/${TOKEN:-none}.*" >/dev/null; }; then
+		RC=1
+		DETAIL="${DETAIL:+${DETAIL}; }the scratch instance left its link, sockets or records behind"
+	fi
+	rm -rf -- "${WORK}"
+	if ((RC)); then
+		echo -e "${RED}ERROR: the BoringTun preflight failed: ${DETAIL}. No VPN configuration was written.${NC}" >&2
+		return 1
+	fi
+	echo -e "${GREEN}BoringTun preflight passed: TUN, UAPI and an AWG 2.0 configuration work with the verified binary.${NC}"
+}
+
+# A fresh BoringTun installation (AWG_BACKEND=boringtun). The order keeps VPN
+# state unwritten until the verified binary has run a scratch interface with
+# the chosen parameters; see docs/BORINGTUN_BACKEND_DESIGN.md, section 15.2.
+function installBoringtunHost() {
+	local ACTIVE=0
+	if ! checkBoringtunHostSupport; then
+		echo -e "${RED}Nothing was installed.${NC}" >&2
+		exit 1
+	fi
+	installQuestions
+
+	enable_apt_ipv4
+	installBoringtunHostPackages
+	if ! installBoringtunRelease; then
+		disable_apt_ipv4
+		exit 1
+	fi
+	disable_apt_ipv4
+
+	if ((_AWG_BT_WRITE_MODPROBE_OVERRIDE)) && ! installBoringtunModprobeOverride; then
+		exit 1
+	fi
+	if ! _awgBtInstallHelpers; then
+		echo -e "${RED}ERROR: could not install the BoringTun helpers into ${AWG_BT_LIBEXEC_DIR}.${NC}" >&2
+		exit 1
+	fi
+	if ! boringtunHostPreflight; then
+		exit 1
+	fi
+
+	writeAwgServerInstallState
+
+	if ! _awgBtInstallServiceFiles "${SERVER_AWG_NIC}"; then
+		echo -e "${RED}ERROR: could not write the BoringTun service files for awg-quick@${SERVER_AWG_NIC}.${NC}" >&2
+		exit 1
+	fi
+	systemctl enable "awg-quick@${SERVER_AWG_NIC}"
+	if systemctl start "awg-quick@${SERVER_AWG_NIC}"; then
+		if _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}"; then
+			ACTIVE=1
+		else
+			echo -e "${RED}ERROR: awg-quick@${SERVER_AWG_NIC} is active but not served by the verified BoringTun daemon; stopping it.${NC}" >&2
+			systemctl stop "awg-quick@${SERVER_AWG_NIC}"
+		fi
+	fi
+
+	if ((ACTIVE)); then
+		if shouldCreateInitialClient; then
+			newClient
+			echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
+		else
+			echo -e "${ORANGE}Skipping initial client generation. You can add users later from this script or the web panel.${NC}"
+		fi
+		echo -e "\n${GREEN}AmneziaWG is running on the BoringTun backend (experimental).${NC}"
+		echo -e "${GREEN}You can check the status of AmneziaWG with: systemctl status awg-quick@${SERVER_AWG_NIC}\n\n${NC}"
+		echo -e "${ORANGE}Manage the interface with systemctl or this script; a plain 'awg-quick up' does not start BoringTun.${NC}"
+	else
+		echo -e "\n${RED}WARNING: AmneziaWG with the BoringTun backend did not start. The service is enabled but stopped; it never falls back to the kernel module.${NC}"
+		echo -e "${ORANGE}Skipping client generation because the server interface is not active.${NC}"
+		echo -e "${ORANGE}Check: systemctl status awg-quick@${SERVER_AWG_NIC} and journalctl -u awg-quick@${SERVER_AWG_NIC}${NC}"
+		exit 1
+	fi
+}
+
+# The BoringTun daemons of INTERFACE that still run: PIDs whose executable is a
+# binary in the store and whose last argument is the interface.
+function boringtunDaemonsOf() {
+	local INTERFACE_NAME="$1" PROC_PID EXE STORE LAST
+	local -a ARGS=()
+	STORE="$(readlink -f -- "${AWG_BT_STORE_DIR}" 2>/dev/null)" || STORE=""
+	[[ -n "${STORE}" ]] || STORE="${AWG_BT_STORE_DIR}"
+	for PROC_PID in "${AWG_BT_PROC_DIR}"/[0-9]*; do
+		EXE="$(readlink -- "${PROC_PID}/exe" 2>/dev/null)" || continue
+		[[ "${EXE}" == "${STORE}/"*"/boringtun-cli"* || "${EXE}" == "${AWG_BT_STORE_DIR}/"*"/boringtun-cli"* ]] || continue
+		mapfile -d '' -t ARGS <"${PROC_PID}/cmdline" 2>/dev/null || continue
+		((${#ARGS[@]})) || continue
+		LAST="${ARGS[${#ARGS[@]} - 1]}"
+		[[ "${LAST}" == "${INTERFACE_NAME}" ]] && printf '%s\n' "${PROC_PID##*/}"
+	done
+	return 0
+}
+
+# Remove a generated helper only if it is byte for byte what this installer
+# generates. A file that differs (edited by hand, not the installer's, or
+# written by another installer version) is not the installer's to delete: it
+# is left in place and reported, and that is not a failure. Returns 1 only when
+# a generated helper cannot be removed.
+function _awgBtRemoveGeneratedHelper() { # <file> <launch|ctl>
+	local FILE="$1" CONTENT
+	[[ -e "${FILE}" || -L "${FILE}" ]] || return 0
+	CONTENT="$(_awgBtRenderHelper "$2")" || return 1
+	if [[ -f "${FILE}" && ! -L "${FILE}" ]] && cmp -s -- "${FILE}" <(printf '%s\n' "${CONTENT}"); then
+		if ! rm -f -- "${FILE}" || [[ -e "${FILE}" || -L "${FILE}" ]]; then
+			echo -e "${RED}ERROR: ${FILE} could not be removed.${NC}" >&2
+			return 1
+		fi
+		return 0
+	fi
+	echo -e "${ORANGE}NOTE: ${FILE} is not the file this installer generates (it was edited, or written by someone else or another installer version); it is left in place.${NC}"
+	return 0
+}
+
+# Whether a process listens on the UNIX socket NODE, from ss's socket
+# diagnostics (ss -xlHe). Three outcomes, and only ABSENT allows a removal:
+#   0 LIVE     a valid listing row names NODE's path, or its inode and device;
+#   1 ABSENT   ss succeeded, every row it printed is valid and none names NODE;
+#   2 UNKNOWN  anything else: ss missing or failing, NODE not examinable, or
+#              any row, related to NODE or not, that is not exactly the shape
+#              iproute2 5.9 to 6.19 print for these flags (Debian 11 and 12,
+#              Ubuntu 22.04, 24.04 and 26.04):
+#   <u_str|u_dgr|u_seq> <LISTEN|UNCONN> <recv-q> <send-q> <local> <inode> * <port> <->[ ino:<n> dev:<major>/<minor>][ peers:[ <inode>]...]
+# where <local> is an absolute path, which always comes with ino and dev, or
+# an @abstract name or * without them. Rows are matched as data, never
+# evaluated; the path may hold spaces, so the row is anchored on its tail.
+_AWG_BT_SS_ROW='^(u_str|u_dgr|u_seq)[[:space:]]+(LISTEN|UNCONN)[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+(.+)[[:space:]]+[0-9]+[[:space:]]+\*[[:space:]]+[0-9]+[[:space:]]+<->([[:space:]]+ino:([0-9]+)[[:space:]]+dev:([0-9]+)/([0-9]+))?([[:space:]]+peers:([[:space:]]+[0-9]+)*)?$'
+function _awgBtSocketListenedOn() { # <node>
+	local NODE="$1" FS_DEV="" FS_INO="" MAJOR MINOR OUTPUT LINE LOCAL VINO VMAJ VMIN FOUND=0
+	[[ -S "${NODE}" && ! -L "${NODE}" ]] || return 2
+	command -v ss >/dev/null 2>&1 || return 2
+	read -r FS_DEV FS_INO <<<"$(stat -c '%d %i' -- "${NODE}" 2>/dev/null)"
+	[[ "${FS_DEV}" =~ ^[0-9]+$ && "${FS_INO}" =~ ^[0-9]+$ ]] || return 2
+	MAJOR=$(((FS_DEV >> 8) & 0xfff))
+	MINOR=$(((FS_DEV & 0xff) | ((FS_DEV >> 12) & 0xfff00)))
+	OUTPUT="$(ss -xlHe 2>/dev/null)" || return 2
+	while IFS= read -r LINE; do
+		LINE="${LINE%"${LINE##*[![:space:]]}"}"
+		[[ -n "${LINE}" ]] || continue
+		[[ "${LINE}" =~ ${_AWG_BT_SS_ROW} ]] || return 2
+		LOCAL="${BASH_REMATCH[3]}"
+		LOCAL="${LOCAL#"${LOCAL%%[![:space:]]*}"}"
+		LOCAL="${LOCAL%"${LOCAL##*[![:space:]]}"}"
+		VINO="${BASH_REMATCH[5]}"
+		VMAJ="${BASH_REMATCH[6]}"
+		VMIN="${BASH_REMATCH[7]}"
+		case "${LOCAL}" in
+			/*) [[ -n "${VINO}" ]] || return 2 ;;
+			@?* | \*) [[ -z "${VINO}" ]] || return 2 ;;
+			*) return 2 ;;
+		esac
+		if [[ "${LOCAL}" == "${NODE}" ]] || { [[ "${VINO}" == "${FS_INO}" ]] &&
+			{ [[ "${VMAJ}" == 0 && "${VMIN}" == "${FS_DEV}" ]] || [[ "${VMAJ}" == "${MAJOR}" && "${VMIN}" == "${MINOR}" ]]; }; }; then
+			FOUND=1
+		fi
+	done <<<"${OUTPUT}"
+	((FOUND)) && return 0
+	return 1
+}
+
+# Remove the UAPI node at PATH only on positive proof that it is this
+# installation's and idle: it is still the node that the start attempt
+# recorded as ID, the daemon PID/START that created it is gone, and no process
+# listens on it (for the AmneziaWG path, a symlink, on the socket it resolves
+# to, which must be in one of the UAPI socket directories). Anything else is
+# left in place. What is at PATH is one of:
+#   ABSENT     proven absent (_awgBtPathAbsent): the obligation is resolved;
+#   DIFFERENT  its identity was read and is not ID: a replacement the attempt
+#              did not record, left alone; the obligation is resolved;
+#   MATCH      its identity was read and is ID: the node goes only on proof
+#              that it is idle;
+#   UNKNOWN    its identity cannot be read: it stays, and so must the record.
+# A failed identity query is never taken for a different node. Returns 0 when
+# the recorded node is gone (removed now, absent, or replaced), and 1 while it
+# may still be there: the attempt's record is then the proof of ownership a
+# later uninstall needs, and must be kept.
+function _awgBtRemoveProvenIdleNode() { # <path> <recorded id> <pid> <start time>
+	local NODE="$1" SOCKET TARGET_DIR CURRENT
+	_awgBtPathAbsent "${NODE}" && return 0
+	[[ -n "$2" ]] || return 0
+	if ! CURRENT="$(_awgBtPathId "${NODE}")" || [[ ! "${CURRENT}" =~ ^[0-9]+:[0-9]+:[0-9a-f]+:[0-9]+\.[0-9]{9}$ ]]; then
+		_awgBtPathAbsent "${NODE}" && return 0
+		return 1
+	fi
+	[[ "${CURRENT}" == "$2" ]] || return 0
+	if [[ -n "$3" && -n "$4" ]] && _awgBtProcessIs "$3" "$4"; then
+		return 1
+	fi
+	SOCKET="${NODE}"
+	if [[ -L "${NODE}" ]]; then
+		SOCKET="$(readlink -f -- "${NODE}" 2>/dev/null)" || return 1
+		TARGET_DIR="${SOCKET%/*}"
+		if [[ "${TARGET_DIR}" != "$(readlink -f -- "${AWG_BT_WG_SOCKET_DIR}" 2>/dev/null)" &&
+			"${TARGET_DIR}" != "$(readlink -f -- "${AWG_BT_AWG_SOCKET_DIR}" 2>/dev/null)" ]]; then
+			return 1
+		fi
+	fi
+	if ! _awgBtPathAbsent "${SOCKET}"; then
+		_awgBtSocketListenedOn "${SOCKET}"
+		[[ $? -eq 1 ]] || return 1
+	fi
+	[[ "$(_awgBtPathId "${NODE}")" == "$2" ]] || return 1
+	rm -f -- "${NODE}" 2>/dev/null
+	_awgBtPathAbsent "${NODE}"
+}
+
+# PATH is positively absent: its directory was listed and does not hold it, or
+# the directory itself is positively absent. A test like [[ -e ]] is false on
+# any error, so it proves nothing; a listing that fails proves nothing either.
+function _awgBtPathAbsent() { # <path>
+	local DIR="${1%/*}" NAME="${1##*/}" LIST
+	[[ -n "${DIR}" ]] || DIR=/
+	[[ -n "${NAME}" && "${NAME}" != . && "${NAME}" != .. ]] || return 1
+	if LIST="$(find -H "${DIR}" -mindepth 1 -maxdepth 1 -name "${NAME}" -print 2>/dev/null)"; then
+		[[ -z "${LIST}" ]]
+		return
+	fi
+	[[ "${DIR}" != / ]] && _awgBtPathAbsent "${DIR}"
+}
+
+# The start attempts of INTERFACE that the runtime directory still records,
+# one per line: the <attempt> of every <if>@<attempt>.* entry.
+function _awgBtRecordedAttempts() { # <interface>
+	local FILE NAME
+	for FILE in "${AWG_BT_RUN_DIR}/$1@"*; do
+		[[ -e "${FILE}" || -L "${FILE}" ]] || continue
+		NAME="${FILE##*/}"
+		NAME="${NAME#"$1@"}"
+		printf '%s\n' "${NAME%%.*}"
+	done | LC_ALL=C sort -u
+}
+
+# The attempt loaded in _AWG_BT_STATE is finished by the runtime's own terminal
+# facts, the ones on which awg-backend-ctl poststop removes an attempt: its
+# start never got past the precheck or the launcher, or the interface's
+# cleanup completed (the done flag).
+function _awgBtAttemptTerminal() { # <interface>
+	[[ "${_AWG_BT_STATE[PHASE]}" == started || "${_AWG_BT_STATE[PHASE]}" == launch-failed ]] || _awgBtFlagIs "$1" "done"
+}
+
+# Uninstall may remove BoringTun state only after the teardown finished: no
+# daemon of INTERFACE runs, and every start attempt the runtime directory still
+# records is terminal. poststop keeps an attempt precisely when its cleanup is
+# unfinished, for example a PostDown replay that may have run in part; such an
+# attempt, or one whose state cannot be read, stops the uninstall before
+# anything is removed, with the hooks to check named. Nothing is changed here.
+function boringtunTeardownFinished() { # <interface>
+	local INTERFACE_NAME="$1" DAEMONS ATTEMPT RC=0
+	DAEMONS="$(boringtunDaemonsOf "${INTERFACE_NAME}")"
+	if [[ -n "${DAEMONS}" ]]; then
+		echo -e "${RED}ERROR: a BoringTun daemon of ${INTERFACE_NAME} is still running (PID ${DAEMONS//$'\n'/, }).${NC}" >&2
+		return 1
+	fi
+	while IFS= read -r ATTEMPT; do
+		[[ -n "${ATTEMPT}" ]] || continue
+		_AWG_BT_ATTEMPT=""
+		if [[ ! "${ATTEMPT}" =~ ^[0-9a-f]{32}$ ]]; then
+			echo -e "${RED}ERROR: ${AWG_BT_RUN_DIR} holds ${INTERFACE_NAME}@${ATTEMPT}.*, which is not a start attempt's record.${NC}" >&2
+			RC=1
+			continue
+		fi
+		_AWG_BT_ATTEMPT="${ATTEMPT}"
+		if ! _awgBtStateLoad "${INTERFACE_NAME}" 2>/dev/null; then
+			echo -e "${RED}ERROR: the state of start attempt ${ATTEMPT} of ${INTERFACE_NAME} cannot be read, so its teardown cannot be proven finished.${NC}" >&2
+			RC=1
+		elif ! _awgBtAttemptTerminal "${INTERFACE_NAME}"; then
+			echo -e "${RED}ERROR: the teardown of start attempt ${ATTEMPT} of ${INTERFACE_NAME} did not finish.${NC}" >&2
+			_awgBtReportUnfinishedDown "${INTERFACE_NAME}" "${_AWG_BT_STATE[CONFIG]}"
+			RC=1
+		fi
+	done < <(_awgBtRecordedAttempts "${INTERFACE_NAME}")
+	_AWG_BT_ATTEMPT=""
+	if ((RC)); then
+		echo -e "${ORANGE}The records in ${AWG_BT_RUN_DIR} and the configuration are kept. Check what the named PostDown hooks undo, finish it by hand, then remove ${AWG_BT_RUN_DIR}/${INTERFACE_NAME}@<attempt>.* and rerun the uninstall.${NC}" >&2
+	fi
+	return "${RC}"
+}
+
+# The BoringTun part of an uninstall, after the unit is stopped and
+# boringtunTeardownFinished: this interface's finished start attempts, with the
+# UAPI nodes they prove to be theirs and idle; the scratch records; the
+# generated helpers; the store; the load override. It removes only what is
+# provably this installation's, reports everything else, and returns 1 when
+# anything it owns, or anything at the interface's UAPI paths, remains, so the
+# configuration stays and the uninstall can be rerun.
+function uninstallBoringtunRuntime() { # <interface>
+	local INTERFACE_NAME="$1" RC=0 ATTEMPT FILE NODE KEEP
+	boringtunTeardownFinished "${INTERFACE_NAME}" || return 1
+	while IFS= read -r ATTEMPT; do
+		[[ -n "${ATTEMPT}" ]] || continue
+		_AWG_BT_ATTEMPT="${ATTEMPT}"
+		if ! _awgBtStateLoad "${INTERFACE_NAME}" 2>/dev/null || ! _awgBtAttemptTerminal "${INTERFACE_NAME}"; then
+			RC=1
+			continue
+		fi
+		# The record goes only after every node it proves to be BoringTun's is
+		# gone; while one is kept, the record stays for the next uninstall.
+		KEEP=0
+		_awgBtRemoveProvenIdleNode "${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[AWG_SOCK]}" \
+			"${_AWG_BT_STATE[PID]}" "${_AWG_BT_STATE[PID_START]}" || KEEP=1
+		_awgBtRemoveProvenIdleNode "${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[WG_SOCK]}" \
+			"${_AWG_BT_STATE[PID]}" "${_AWG_BT_STATE[PID_START]}" || KEEP=1
+		if ((KEEP)); then
+			echo -e "${RED}ERROR: a UAPI node that start attempt ${ATTEMPT} of ${INTERFACE_NAME} recorded could not be proven idle or removed; the attempt's record is kept as the proof of ownership for the next uninstall.${NC}" >&2
+			RC=1
+			continue
+		fi
+		_awgBtAttemptRemove "${INTERFACE_NAME}" 2>/dev/null
+		if [[ -n "$(_awgBtRecordedAttempts "${INTERFACE_NAME}" | grep -x "${ATTEMPT}")" ]]; then
+			echo -e "${RED}ERROR: the finished start attempt ${ATTEMPT} of ${INTERFACE_NAME} could not be removed from ${AWG_BT_RUN_DIR}.${NC}" >&2
+			RC=1
+		fi
+	done < <(_awgBtRecordedAttempts "${INTERFACE_NAME}")
+	_AWG_BT_ATTEMPT=""
+	for NODE in "${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock"; do
+		if ! _awgBtPathAbsent "${NODE}"; then
+			echo -e "${RED}ERROR: ${NODE} is not provably an idle UAPI node of this installation (a process may serve it, or nothing records it as BoringTun's); it is left in place. If nothing uses it, remove it and rerun the uninstall.${NC}" >&2
+			RC=1
+		fi
+	done
+	FILE="$(_awgBtPidFile "${INTERFACE_NAME}")"
+	[[ ! -e "${FILE}" && ! -L "${FILE}" ]] || rm -f -- "${FILE}" || RC=1
+	_awgBtScratchSweep 2>/dev/null || true
+	rmdir -- "$(_awgBtScratchDir)" 2>/dev/null
+	rmdir -- "${AWG_BT_RUN_DIR}" 2>/dev/null
+	if [[ -d "${AWG_BT_RUN_DIR}" ]]; then
+		echo -e "${ORANGE}NOTE: ${AWG_BT_RUN_DIR} still holds state of other instances; it is left in place.${NC}"
+	fi
+	_awgBtRemoveGeneratedHelper "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" launch || RC=1
+	_awgBtRemoveGeneratedHelper "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" ctl || RC=1
+	rmdir -- "${AWG_BT_LIBEXEC_DIR}" 2>/dev/null
+	if [[ -e "${AWG_BT_STORE_DIR}" || -L "${AWG_BT_STORE_DIR}" ]]; then
+		rm -rf -- "${AWG_BT_STORE_DIR}" || RC=1
+	fi
+	rmdir -- "${AWG_BT_STORE_DIR%/*}" 2>/dev/null
+	FILE=""
+	if [[ -f "${AWG_BT_MODPROBE_OVERRIDE}" && ! -L "${AWG_BT_MODPROBE_OVERRIDE}" &&
+		"$(cat -- "${AWG_BT_MODPROBE_OVERRIDE}" 2>/dev/null)" == "$(_awgBtRenderModprobeOverride)" ]]; then
+		rm -f -- "${AWG_BT_MODPROBE_OVERRIDE}"
+		FILE="${AWG_BT_MODPROBE_OVERRIDE}"
+	elif [[ -e "${AWG_BT_MODPROBE_OVERRIDE}" || -L "${AWG_BT_MODPROBE_OVERRIDE}" ]]; then
+		echo -e "${ORANGE}NOTE: ${AWG_BT_MODPROBE_OVERRIDE} was changed after it was installed; it is left in place.${NC}"
+	fi
+	for FILE in "${AWG_BT_STORE_DIR}" "$(_awgBtPidFile "${INTERFACE_NAME}")" ${FILE:+"${FILE}"}; do
+		if [[ -e "${FILE}" || -L "${FILE}" ]]; then
+			echo -e "${RED}ERROR: ${FILE} could not be removed.${NC}" >&2
+			RC=1
+		fi
+	done
+	return "${RC}"
+}
+
 function readJminAndJmax() {
 	SERVER_AWG_JMIN=0
 	SERVER_AWG_JMAX=0
@@ -6865,9 +7767,10 @@ function installQuestions() {
 	# capability-gated migration.
 	AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_2}"
 	clearAwg3Params
-	# Fresh installs always use the kernel backend. This installer version has no
-	# other backend and never takes one from the caller's environment.
-	AWG_BACKEND="${AWG_BACKEND_KERNEL}"
+	# The backend comes from the caller's request as it was when the installer
+	# was loaded (kernel unless AWG_BACKEND=boringtun was exported), never from
+	# a later assignment.
+	selectFreshInstallBackend || exit 1
 
 	# Non-interactive mode: use environment variable overrides or sensible defaults
 	# Set AUTO_INSTALL=y to skip all prompts
@@ -7369,8 +8272,222 @@ function formatClientAllowedIPs() {
 	printf '%s\n' "${OUT}"
 }
 
+# Configure the Amnezia PPA for a fresh Ubuntu install and refresh the package
+# indexes: shared by both backends, before their own package installs.
+function prepareUbuntuAmneziaPpaForInstall() {
+	# Repair a PPA entry left by an older interrupted install before the
+	# initial update; otherwise a stale unsupported suite breaks the rerun.
+	local EXISTING_PPA_RC
+	if amneziaPpaSourceEntriesExist "${AMNEZIA_PPA_SOURCES_DIR}"; then
+		EXISTING_PPA_RC=0
+	else
+		EXISTING_PPA_RC=$?
+	fi
+	if [[ "${EXISTING_PPA_RC}" -eq 0 ]]; then
+		configureUbuntuAmneziaPpa "" "${AMNEZIA_PPA_SOURCES_DIR}" || exit 1
+	elif [[ "${EXISTING_PPA_RC}" -ne 1 ]]; then
+		exit 1
+	fi
+
+	apt-get update || { echo -e "${RED}ERROR: Failed to refresh APT package index.${NC}"; exit 1; }
+	apt install -y software-properties-common curl || { echo -e "${RED}ERROR: Failed to install software-properties-common and curl.${NC}"; exit 1; }
+	configureUbuntuAmneziaPpa "" "${AMNEZIA_PPA_SOURCES_DIR}" || exit 1
+	if ! apt-get -o APT::Update::Error-Mode=any update; then
+		local PPA_CLEANUP_RC
+		if cleanupNewlyCreatedUbuntuAmneziaPpa "${AMNEZIA_PPA_SOURCES_DIR}"; then
+			PPA_CLEANUP_RC=0
+		else
+			PPA_CLEANUP_RC=$?
+		fi
+		case "${PPA_CLEANUP_RC}" in
+			0)
+				echo -e "${RED}ERROR: Failed to update APT package indexes after configuring the Amnezia PPA. The newly created PPA source was removed so future APT operations remain usable.${NC}"
+				;;
+			1)
+				echo -e "${RED}ERROR: Failed to update APT package indexes after configuring the Amnezia PPA, and the newly created source could not be removed safely. Review ${AMNEZIA_PPA_SOURCES_DIR}.${NC}"
+				;;
+			2)
+				echo -e "${RED}ERROR: Failed to update APT package indexes after reconciling the pre-existing Amnezia PPA source. The administrator-owned source was left in place.${NC}"
+				;;
+		esac
+		exit 1
+	fi
+	checkAmneziaPpaToolsCandidate "${AMNEZIA_PPA_SELECTED_SUITE}" "${AMNEZIA_PPA_ARCHITECTURE}" || exit 1
+}
+
+# Add the Amnezia PPA source with its verified signing key for a fresh Debian
+# install. INCLUDE_DEB_SRC is 1 for the kernel backend, whose DKMS build needs
+# the source entry, and 0 for BoringTun.
+function configureDebianAmneziaAptSource() {
+	local INCLUDE_DEB_SRC="$1"
+	# Ensure required tools are available for key download/dearmor on minimal systems
+	if ! command -v gpg &>/dev/null; then
+		apt-get update
+		apt-get install -y gnupg || { echo -e "${RED}ERROR: Failed to install gnupg required for key import.${NC}"; exit 1; }
+	fi
+	if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+		apt-get update
+		apt-get install -y curl || { echo -e "${RED}ERROR: Failed to install curl required for key download.${NC}"; exit 1; }
+	fi
+	mkdir -p /etc/apt/keyrings
+	chmod 755 /etc/apt/keyrings
+	# Full 40-character fingerprint of the AmneziaWG APT signing key.
+	# Short key IDs (e.g., 0x57290828) are collision-prone; always fetch and
+	# verify by full fingerprint to prevent keyserver substitution attacks.
+	local AMNEZIAWG_APT_FPR="75C9DD72C799870E310542E24166F2C257290828"
+	local KEY_URL="https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${AMNEZIAWG_APT_FPR}"
+	local TMP_KEY_ASC
+	TMP_KEY_ASC=$(mktemp /tmp/amneziawg-apt-key.XXXXXX) || { echo -e "${RED}ERROR: Failed to create temporary file for APT signing key.${NC}"; exit 1; }
+	local KEY_FETCH_OK=0
+	# Use -4 to avoid IPv6 timeouts on VPS providers where AAAA records
+	# resolve but outbound IPv6 connectivity to keyservers is broken.
+	if command -v curl &>/dev/null; then
+		curl -4 -fsSL "${KEY_URL}" -o "${TMP_KEY_ASC}" && KEY_FETCH_OK=1
+	elif command -v wget &>/dev/null; then
+		wget -4 -qO "${TMP_KEY_ASC}" "${KEY_URL}" && KEY_FETCH_OK=1
+	fi
+	if [[ ${KEY_FETCH_OK} -ne 1 ]] || [[ ! -s "${TMP_KEY_ASC}" ]]; then
+		rm -f "${TMP_KEY_ASC}"
+		echo -e "${RED}ERROR: Failed to download the AmneziaWG APT signing key.${NC}"
+		echo -e "${ORANGE}Verify network connectivity and that curl/wget and gnupg are installed.${NC}"
+		exit 1
+	fi
+	# Verify the downloaded key's fingerprint matches before importing.
+	# This prevents importing a substituted key from a compromised keyserver.
+	local DOWNLOADED_FPR
+	DOWNLOADED_FPR=$(gpg --show-keys --with-colons "${TMP_KEY_ASC}" 2>/dev/null | awk -F: '/^fpr:/ { print $10; exit }')
+	if [[ -z "${DOWNLOADED_FPR}" ]]; then
+		rm -f "${TMP_KEY_ASC}"
+		echo -e "${RED}ERROR: Unable to read fingerprint from downloaded AmneziaWG APT signing key.${NC}"
+		exit 1
+	fi
+	if [[ "${DOWNLOADED_FPR^^}" != "${AMNEZIAWG_APT_FPR^^}" ]]; then
+		rm -f "${TMP_KEY_ASC}"
+		echo -e "${RED}ERROR: Downloaded key fingerprint (${DOWNLOADED_FPR}) does not match expected (${AMNEZIAWG_APT_FPR}).${NC}"
+		echo -e "${ORANGE}The key may have been tampered with. Aborting.${NC}"
+		exit 1
+	fi
+	# Fingerprint verified — import the key into the dedicated keyring
+	local TMP_KEYRING
+	TMP_KEYRING=$(mktemp /etc/apt/keyrings/amneziawg.gpg.tmp.XXXXXX) || {
+		rm -f "${TMP_KEY_ASC}"
+		echo -e "${RED}ERROR: Failed to create temporary file for AmneziaWG APT signing keyring.${NC}"
+		exit 1
+	}
+	if ! gpg --dearmor < "${TMP_KEY_ASC}" > "${TMP_KEYRING}" 2>/dev/null; then
+		rm -f "${TMP_KEY_ASC}" "${TMP_KEYRING}"
+		echo -e "${RED}ERROR: Failed to import the AmneziaWG APT signing key into keyring.${NC}"
+		exit 1
+	fi
+	rm -f "${TMP_KEY_ASC}"
+	if [[ ! -s "${TMP_KEYRING}" ]]; then
+		rm -f "${TMP_KEYRING}"
+		echo -e "${RED}ERROR: AmneziaWG APT keyring file is empty after import.${NC}"
+		exit 1
+	fi
+	chmod 644 "${TMP_KEYRING}"
+	mv "${TMP_KEYRING}" /etc/apt/keyrings/amneziawg.gpg
+	if [[ ! -s /etc/apt/keyrings/amneziawg.gpg ]]; then
+		echo -e "${RED}ERROR: AmneziaWG APT keyring file is empty after import.${NC}"
+		exit 1
+	fi
+	# Ensure the managed file exists with sentinel before appending PPA lines.
+	# When /etc/apt/sources.list already has deb-src, the copy block above is
+	# skipped and the file doesn't exist yet — without this guard the >> below
+	# would create it without the sentinel, causing uninstall to leave it behind.
+	if [[ ! -f /etc/apt/sources.list.d/amneziawg.sources.list ]]; then
+		echo "# Managed by amneziawg-install" > /etc/apt/sources.list.d/amneziawg.sources.list
+		chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
+	fi
+	# Append PPA repo lines only if not already present (idempotent on re-run)
+	if ! grep -q 'ppa.launchpadcontent.net/amnezia/ppa' /etc/apt/sources.list.d/amneziawg.sources.list; then
+		echo "deb [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
+		if [[ "${INCLUDE_DEB_SRC}" == 1 ]]; then
+			echo "deb-src [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
+		fi
+	fi
+}
+
+# Write the state of a fresh installation, which both backends share: server
+# keys, params, the server configuration with its firewall hooks, and the
+# forwarding sysctls.
+function writeAwgServerInstallState() {
+	# Ensure configuration directory exists
+	mkdir -p "${AMNEZIAWG_DIR}"
+	chmod 700 "${AMNEZIAWG_DIR}"
+
+	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+
+	SERVER_PRIV_KEY=$(awg genkey)
+	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | awg pubkey)
+
+	# Restrict umask for sensitive file creation (private keys, server config)
+	local OLD_UMASK
+	OLD_UMASK="$(umask)"
+	umask 077
+
+	# Save WireGuard settings atomically: write to temp file then move into place
+	PARAMS_TMP_FILE="$(mktemp "${AMNEZIAWG_DIR}/params.XXXXXX")" || { echo -e "${RED}ERROR: Failed to create temporary params file.${NC}"; exit 1; }
+	serializeParams "${PARAMS_TMP_FILE}" || { echo -e "${RED}ERROR: Failed to write params file.${NC}"; rm -f "${PARAMS_TMP_FILE}"; exit 1; }
+	if ! mv -f "${PARAMS_TMP_FILE}" "${AMNEZIAWG_DIR}/params"; then
+		echo -e "${RED}ERROR: Failed to move params file into place.${NC}"
+		rm -f "${PARAMS_TMP_FILE}"
+		exit 1
+	fi
+	chmod 600 "${AMNEZIAWG_DIR}/params"
+
+	# Add server interface. Include the IPv6 address only when IPv6 is enabled.
+	local SERVER_ADDRESS="${SERVER_AWG_IPV4}/24"
+	if [[ "${ENABLE_IPV6}" == "y" ]]; then
+		SERVER_ADDRESS="${SERVER_ADDRESS},${SERVER_AWG_IPV6}/64"
+	fi
+	local AWG_PROTOCOL_FIELDS=""
+	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || {
+		echo -e "${RED}ERROR: Failed to render protocol-specific server configuration.${NC}"
+		exit 1
+	}
+	echo "[Interface]
+Address = ${SERVER_ADDRESS}
+ListenPort = ${SERVER_PORT}
+PrivateKey = ${SERVER_PRIV_KEY}
+Jc = ${SERVER_AWG_JC}
+Jmin = ${SERVER_AWG_JMIN}
+Jmax = ${SERVER_AWG_JMAX}
+S1 = ${SERVER_AWG_S1}
+S2 = ${SERVER_AWG_S2}
+S3 = ${SERVER_AWG_S3}
+S4 = ${SERVER_AWG_S4}
+H1 = ${SERVER_AWG_H1}
+H2 = ${SERVER_AWG_H2}
+H3 = ${SERVER_AWG_H3}
+H4 = ${SERVER_AWG_H4}
+${AWG_PROTOCOL_FIELDS}" >"${SERVER_AWG_CONF}"
+	chmod 600 "${SERVER_AWG_CONF}"
+
+	# Restore default umask before creating system files and running services
+	umask "${OLD_UMASK}"
+
+	writeFirewallRules >>"${SERVER_AWG_CONF}"
+
+	# Enable routing on the server
+	mkdir -p /etc/sysctl.d
+	chmod 755 /etc/sysctl.d
+	echo "net.ipv4.ip_forward = 1" >/etc/sysctl.d/awg.conf
+	if [[ "${ENABLE_IPV6}" == "y" ]]; then
+		echo "net.ipv6.conf.all.forwarding = 1" >>/etc/sysctl.d/awg.conf
+	fi
+	chmod 644 /etc/sysctl.d/awg.conf
+
+	sysctl -p /etc/sysctl.d/awg.conf
+}
+
 function installAmneziaWG() {
 	ensureSupportedInstallDistro
+	selectFreshInstallBackend || exit 1
+	if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+		installBoringtunHost
+		return
+	fi
 
 	# Run setup questions first
 	installQuestions
@@ -7408,44 +8525,7 @@ function installAmneziaWG() {
 				chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 			fi
 		fi
-		# Repair a PPA entry left by an older interrupted install before the
-		# initial update; otherwise a stale unsupported suite breaks the rerun.
-		local EXISTING_PPA_RC
-		if amneziaPpaSourceEntriesExist "${AMNEZIA_PPA_SOURCES_DIR}"; then
-			EXISTING_PPA_RC=0
-		else
-			EXISTING_PPA_RC=$?
-		fi
-		if [[ "${EXISTING_PPA_RC}" -eq 0 ]]; then
-			configureUbuntuAmneziaPpa "" "${AMNEZIA_PPA_SOURCES_DIR}" || exit 1
-		elif [[ "${EXISTING_PPA_RC}" -ne 1 ]]; then
-			exit 1
-		fi
-
-		apt-get update || { echo -e "${RED}ERROR: Failed to refresh APT package index.${NC}"; exit 1; }
-		apt install -y software-properties-common curl || { echo -e "${RED}ERROR: Failed to install software-properties-common and curl.${NC}"; exit 1; }
-		configureUbuntuAmneziaPpa "" "${AMNEZIA_PPA_SOURCES_DIR}" || exit 1
-		if ! apt-get -o APT::Update::Error-Mode=any update; then
-			local PPA_CLEANUP_RC
-			if cleanupNewlyCreatedUbuntuAmneziaPpa "${AMNEZIA_PPA_SOURCES_DIR}"; then
-				PPA_CLEANUP_RC=0
-			else
-				PPA_CLEANUP_RC=$?
-			fi
-			case "${PPA_CLEANUP_RC}" in
-				0)
-					echo -e "${RED}ERROR: Failed to update APT package indexes after configuring the Amnezia PPA. The newly created PPA source was removed so future APT operations remain usable.${NC}"
-					;;
-				1)
-					echo -e "${RED}ERROR: Failed to update APT package indexes after configuring the Amnezia PPA, and the newly created source could not be removed safely. Review ${AMNEZIA_PPA_SOURCES_DIR}.${NC}"
-					;;
-				2)
-					echo -e "${RED}ERROR: Failed to update APT package indexes after reconciling the pre-existing Amnezia PPA source. The administrator-owned source was left in place.${NC}"
-					;;
-			esac
-			exit 1
-		fi
-		checkAmneziaPpaToolsCandidate "${AMNEZIA_PPA_SELECTED_SUITE}" "${AMNEZIA_PPA_ARCHITECTURE}" || exit 1
+		prepareUbuntuAmneziaPpaForInstall
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
 		apt install -y dkms iptables nftables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
@@ -7458,90 +8538,7 @@ function installAmneziaWG() {
 			sed -i -E '/^[[:space:]]*deb-src[[:space:]]/!s/^[[:space:]]*deb[[:space:]]+/deb-src /' /etc/apt/sources.list.d/amneziawg.sources.list
 			chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
 		fi
-		# Ensure required tools are available for key download/dearmor on minimal systems
-		if ! command -v gpg &>/dev/null; then
-			apt-get update
-			apt-get install -y gnupg || { echo -e "${RED}ERROR: Failed to install gnupg required for key import.${NC}"; exit 1; }
-		fi
-		if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
-			apt-get update
-			apt-get install -y curl || { echo -e "${RED}ERROR: Failed to install curl required for key download.${NC}"; exit 1; }
-		fi
-		mkdir -p /etc/apt/keyrings
-		chmod 755 /etc/apt/keyrings
-		# Full 40-character fingerprint of the AmneziaWG APT signing key.
-		# Short key IDs (e.g., 0x57290828) are collision-prone; always fetch and
-		# verify by full fingerprint to prevent keyserver substitution attacks.
-		local AMNEZIAWG_APT_FPR="75C9DD72C799870E310542E24166F2C257290828"
-		local KEY_URL="https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${AMNEZIAWG_APT_FPR}"
-		local TMP_KEY_ASC
-		TMP_KEY_ASC=$(mktemp /tmp/amneziawg-apt-key.XXXXXX) || { echo -e "${RED}ERROR: Failed to create temporary file for APT signing key.${NC}"; exit 1; }
-		local KEY_FETCH_OK=0
-		# Use -4 to avoid IPv6 timeouts on VPS providers where AAAA records
-		# resolve but outbound IPv6 connectivity to keyservers is broken.
-		if command -v curl &>/dev/null; then
-			curl -4 -fsSL "${KEY_URL}" -o "${TMP_KEY_ASC}" && KEY_FETCH_OK=1
-		elif command -v wget &>/dev/null; then
-			wget -4 -qO "${TMP_KEY_ASC}" "${KEY_URL}" && KEY_FETCH_OK=1
-		fi
-		if [[ ${KEY_FETCH_OK} -ne 1 ]] || [[ ! -s "${TMP_KEY_ASC}" ]]; then
-			rm -f "${TMP_KEY_ASC}"
-			echo -e "${RED}ERROR: Failed to download the AmneziaWG APT signing key.${NC}"
-			echo -e "${ORANGE}Verify network connectivity and that curl/wget and gnupg are installed.${NC}"
-			exit 1
-		fi
-		# Verify the downloaded key's fingerprint matches before importing.
-		# This prevents importing a substituted key from a compromised keyserver.
-		local DOWNLOADED_FPR
-		DOWNLOADED_FPR=$(gpg --show-keys --with-colons "${TMP_KEY_ASC}" 2>/dev/null | awk -F: '/^fpr:/ { print $10; exit }')
-		if [[ -z "${DOWNLOADED_FPR}" ]]; then
-			rm -f "${TMP_KEY_ASC}"
-			echo -e "${RED}ERROR: Unable to read fingerprint from downloaded AmneziaWG APT signing key.${NC}"
-			exit 1
-		fi
-		if [[ "${DOWNLOADED_FPR^^}" != "${AMNEZIAWG_APT_FPR^^}" ]]; then
-			rm -f "${TMP_KEY_ASC}"
-			echo -e "${RED}ERROR: Downloaded key fingerprint (${DOWNLOADED_FPR}) does not match expected (${AMNEZIAWG_APT_FPR}).${NC}"
-			echo -e "${ORANGE}The key may have been tampered with. Aborting.${NC}"
-			exit 1
-		fi
-		# Fingerprint verified — import the key into the dedicated keyring
-		local TMP_KEYRING
-		TMP_KEYRING=$(mktemp /etc/apt/keyrings/amneziawg.gpg.tmp.XXXXXX) || {
-			rm -f "${TMP_KEY_ASC}"
-			echo -e "${RED}ERROR: Failed to create temporary file for AmneziaWG APT signing keyring.${NC}"
-			exit 1
-		}
-		if ! gpg --dearmor < "${TMP_KEY_ASC}" > "${TMP_KEYRING}" 2>/dev/null; then
-			rm -f "${TMP_KEY_ASC}" "${TMP_KEYRING}"
-			echo -e "${RED}ERROR: Failed to import the AmneziaWG APT signing key into keyring.${NC}"
-			exit 1
-		fi
-		rm -f "${TMP_KEY_ASC}"
-		if [[ ! -s "${TMP_KEYRING}" ]]; then
-			rm -f "${TMP_KEYRING}"
-			echo -e "${RED}ERROR: AmneziaWG APT keyring file is empty after import.${NC}"
-			exit 1
-		fi
-		chmod 644 "${TMP_KEYRING}"
-		mv "${TMP_KEYRING}" /etc/apt/keyrings/amneziawg.gpg
-		if [[ ! -s /etc/apt/keyrings/amneziawg.gpg ]]; then
-			echo -e "${RED}ERROR: AmneziaWG APT keyring file is empty after import.${NC}"
-			exit 1
-		fi
-		# Ensure the managed file exists with sentinel before appending PPA lines.
-		# When /etc/apt/sources.list already has deb-src, the copy block above is
-		# skipped and the file doesn't exist yet — without this guard the >> below
-		# would create it without the sentinel, causing uninstall to leave it behind.
-		if [[ ! -f /etc/apt/sources.list.d/amneziawg.sources.list ]]; then
-			echo "# Managed by amneziawg-install" > /etc/apt/sources.list.d/amneziawg.sources.list
-			chmod 644 /etc/apt/sources.list.d/amneziawg.sources.list
-		fi
-		# Append PPA repo lines only if not already present (idempotent on re-run)
-		if ! grep -q 'ppa.launchpadcontent.net/amnezia/ppa' /etc/apt/sources.list.d/amneziawg.sources.list; then
-			echo "deb [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
-			echo "deb-src [signed-by=/etc/apt/keyrings/amneziawg.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" >>/etc/apt/sources.list.d/amneziawg.sources.list
-		fi
+		configureDebianAmneziaAptSource 1
 		apt-get update || { echo -e "${RED}ERROR: Failed to update package index.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
@@ -7611,73 +8608,7 @@ function installAmneziaWG() {
 	fi
 	chmod 644 /etc/modules-load.d/amneziawg.conf
 
-	# Ensure configuration directory exists
-	mkdir -p "${AMNEZIAWG_DIR}"
-	chmod 700 "${AMNEZIAWG_DIR}"
-
-	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
-
-	SERVER_PRIV_KEY=$(awg genkey)
-	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | awg pubkey)
-
-	# Restrict umask for sensitive file creation (private keys, server config)
-	local OLD_UMASK
-	OLD_UMASK="$(umask)"
-	umask 077
-
-	# Save WireGuard settings atomically: write to temp file then move into place
-	PARAMS_TMP_FILE="$(mktemp "${AMNEZIAWG_DIR}/params.XXXXXX")" || { echo -e "${RED}ERROR: Failed to create temporary params file.${NC}"; exit 1; }
-	serializeParams "${PARAMS_TMP_FILE}" || { echo -e "${RED}ERROR: Failed to write params file.${NC}"; rm -f "${PARAMS_TMP_FILE}"; exit 1; }
-	if ! mv -f "${PARAMS_TMP_FILE}" "${AMNEZIAWG_DIR}/params"; then
-		echo -e "${RED}ERROR: Failed to move params file into place.${NC}"
-		rm -f "${PARAMS_TMP_FILE}"
-		exit 1
-	fi
-	chmod 600 "${AMNEZIAWG_DIR}/params"
-
-	# Add server interface. Include the IPv6 address only when IPv6 is enabled.
-	local SERVER_ADDRESS="${SERVER_AWG_IPV4}/24"
-	if [[ "${ENABLE_IPV6}" == "y" ]]; then
-		SERVER_ADDRESS="${SERVER_ADDRESS},${SERVER_AWG_IPV6}/64"
-	fi
-	local AWG_PROTOCOL_FIELDS=""
-	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || {
-		echo -e "${RED}ERROR: Failed to render protocol-specific server configuration.${NC}"
-		exit 1
-	}
-	echo "[Interface]
-Address = ${SERVER_ADDRESS}
-ListenPort = ${SERVER_PORT}
-PrivateKey = ${SERVER_PRIV_KEY}
-Jc = ${SERVER_AWG_JC}
-Jmin = ${SERVER_AWG_JMIN}
-Jmax = ${SERVER_AWG_JMAX}
-S1 = ${SERVER_AWG_S1}
-S2 = ${SERVER_AWG_S2}
-S3 = ${SERVER_AWG_S3}
-S4 = ${SERVER_AWG_S4}
-H1 = ${SERVER_AWG_H1}
-H2 = ${SERVER_AWG_H2}
-H3 = ${SERVER_AWG_H3}
-H4 = ${SERVER_AWG_H4}
-${AWG_PROTOCOL_FIELDS}" >"${SERVER_AWG_CONF}"
-	chmod 600 "${SERVER_AWG_CONF}"
-
-	# Restore default umask before creating system files and running services
-	umask "${OLD_UMASK}"
-
-	writeFirewallRules >>"${SERVER_AWG_CONF}"
-
-	# Enable routing on the server
-	mkdir -p /etc/sysctl.d
-	chmod 755 /etc/sysctl.d
-	echo "net.ipv4.ip_forward = 1" >/etc/sysctl.d/awg.conf
-	if [[ "${ENABLE_IPV6}" == "y" ]]; then
-		echo "net.ipv6.conf.all.forwarding = 1" >>/etc/sysctl.d/awg.conf
-	fi
-	chmod 644 /etc/sysctl.d/awg.conf
-
-	sysctl -p /etc/sysctl.d/awg.conf
+	writeAwgServerInstallState
 
 	# Add a systemd drop-in override that:
 	#  - Ensures the amneziawg module is loaded before awg-quick starts (ExecStartPre)
@@ -8556,6 +9487,67 @@ function removeInstalledAptPackages() {
 	apt remove -y "${INSTALLED_PACKAGES[@]}"
 }
 
+# BoringTun: remove the PACKAGES that the package database lists as installed,
+# after one complete, successful read of it. Every row of the inventory must be
+# a package name and a dpkg status abbreviation, and dpkg itself must be listed
+# as installed, because dpkg-query reads a missing database as an empty one
+# without an error. A failed or malformed read is an error, never "not
+# installed"; so is a failed removal.
+function removeBoringtunAptPackages() { # <package>...
+	local INVENTORY LINE PACKAGE
+	local ROW=$'^([a-z0-9][a-z0-9+.-]+)\t([uihrp][ncHUFWti][ R]?)$'
+	local -A STATE=()
+	local -a INSTALLED_PACKAGES=()
+	# shellcheck disable=SC2016 # dpkg-query fields, not shell variables
+	if ! INVENTORY="$(dpkg-query -W -f='${Package}\t${db:Status-Abbrev}\n' 2>/dev/null)"; then
+		echo -e "${RED}ERROR: the package database cannot be read (dpkg-query failed).${NC}"
+		return 1
+	fi
+	while IFS= read -r LINE; do
+		[[ -n "${LINE}" ]] || continue
+		if [[ ! "${LINE}" =~ ${ROW} ]]; then
+			echo -e "${RED}ERROR: dpkg-query printed a line that is not a package status: ${LINE}${NC}"
+			return 1
+		fi
+		# A package listed for several architectures is installed when any is.
+		[[ "${STATE[${BASH_REMATCH[1]}]:-}" == i* ]] || STATE["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+	done <<<"${INVENTORY}"
+	if [[ "${STATE[dpkg]:-}" != ii* ]]; then
+		echo -e "${RED}ERROR: the package database read does not list dpkg as installed, so it is not the system's.${NC}"
+		return 1
+	fi
+	for PACKAGE in "$@"; do
+		[[ "${STATE[${PACKAGE}]:-}" == i* ]] && INSTALLED_PACKAGES+=("${PACKAGE}")
+	done
+	[[ "${#INSTALLED_PACKAGES[@]}" -gt 0 ]] || return 0
+	apt remove -y "${INSTALLED_PACKAGES[@]}" || return 1
+}
+
+# BoringTun: the unit is positively not running. systemd must answer its
+# ActiveState, which it does also once the unit file is gone, and the answer
+# must be inactive or failed. systemctl is-active is not used: its exit status
+# for an inactive unit differs between systemd versions (3 on 252, 4 on 255
+# for a removed unit), while a failed query exits 1. A failed query or any
+# other state is no proof.
+function boringtunServiceInactive() { # <interface>
+	local UNIT="awg-quick@$1.service" STATE
+	if ! STATE="$(systemctl show -p ActiveState --value "${UNIT}" 2>/dev/null)"; then
+		echo -e "${RED}ERROR: the state of ${UNIT} cannot be read.${NC}"
+		return 1
+	fi
+	case "${STATE}" in
+		inactive | failed) return 0 ;;
+		active | activating | deactivating | reloading | refreshing)
+			echo -e "${RED}ERROR: ${UNIT} is still ${STATE}.${NC}"
+			return 1
+			;;
+		*)
+			echo -e "${RED}ERROR: systemd reports an unexpected state for ${UNIT}: '${STATE}'.${NC}"
+			return 1
+			;;
+	esac
+}
+
 function uninstallAmneziaWG() {
 	echo ""
 	echo -e "\n${RED}WARNING: This will uninstall AmneziaWG and remove all the configuration files!${NC}"
@@ -8568,9 +9560,34 @@ function uninstallAmneziaWG() {
 
 		systemctl stop "awg-quick@${SERVER_AWG_NIC}"
 		systemctl disable "awg-quick@${SERVER_AWG_NIC}"
+		local DISABLE_RC=$?
+
+		# With BoringTun, the stop above ran the crash-safe teardown of the
+		# supervised daemon. Keep every file while a daemon of the interface
+		# still runs, so that a later uninstall can finish the job.
+		local BORINGTUN_DAEMONS=""
+		if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+			if ((DISABLE_RC != 0)); then
+				echo -e "${RED}ERROR: awg-quick@${SERVER_AWG_NIC} could not be disabled; nothing was removed. Fix the cause and rerun the uninstall.${NC}"
+				exit 1
+			fi
+			BORINGTUN_DAEMONS="$(boringtunDaemonsOf "${SERVER_AWG_NIC}")"
+			if [[ -n "${BORINGTUN_DAEMONS}" ]]; then
+				echo -e "${RED}ERROR: a BoringTun daemon of ${SERVER_AWG_NIC} is still running (PID ${BORINGTUN_DAEMONS//$'\n'/, }) after stopping awg-quick@${SERVER_AWG_NIC}.${NC}"
+				echo -e "${ORANGE}Nothing was removed. Check: journalctl -u awg-quick@${SERVER_AWG_NIC}, then rerun the uninstall.${NC}"
+				exit 1
+			fi
+			# Nothing is removed until the teardown is proven finished: a
+			# start attempt that poststop kept, such as a PostDown replay that
+			# may have run in part, stops the uninstall here.
+			if ! boringtunTeardownFinished "${SERVER_AWG_NIC}"; then
+				echo -e "${RED}ERROR: the BoringTun teardown of ${SERVER_AWG_NIC} is not proven finished; nothing was removed.${NC}"
+				exit 1
+			fi
+		fi
 
 		# Remove systemd drop-in override created during install
-		DROPIN_DIR="/etc/systemd/system/awg-quick@${SERVER_AWG_NIC:?}.service.d"
+		DROPIN_DIR="${AWG_SYSTEMD_UNIT_DIR}/awg-quick@${SERVER_AWG_NIC:?}.service.d"
 		OVERRIDE_FILE="${DROPIN_DIR}/override.conf"
 		if [[ -f "${OVERRIDE_FILE}" ]]; then
 			rm -f "${OVERRIDE_FILE}"
@@ -8580,21 +9597,62 @@ function uninstallAmneziaWG() {
 			rmdir "${DROPIN_DIR}"
 		fi
 		systemctl daemon-reload
+		local DAEMON_RELOAD_RC=$?
 
-		# Remove module auto-load entry
-		rm -f /etc/modules-load.d/amneziawg.conf
+		# Remove module auto-load entry. Only the kernel install writes it; a
+		# BoringTun install never does, so there it is someone else's.
+		if [[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]]; then
+			rm -f "${AWG_MODULES_LOAD_FILE}"
+		fi
 
 		# Disable routing
 		# Only remove our conf file; do NOT force ip_forward=0 at runtime because
 		# other services (Docker, libvirt, other VPNs) may depend on forwarding.
 		# The setting will revert to the system default on next reboot.
-		rm -f /etc/sysctl.d/awg.conf
+		rm -f "${AWG_SYSCTL_FILE}"
 
-		# Remove config files
-		rm -rf "${AMNEZIAWG_DIR:?}"
+		# BoringTun: every removal before the commit either worked or fails the
+		# uninstall, with the configuration kept for a rerun.
+		if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+			local LEFT_BEHIND="" LEFT_FILE
+			for LEFT_FILE in "${OVERRIDE_FILE}" "${AWG_SYSCTL_FILE}"; do
+				[[ ! -e "${LEFT_FILE}" && ! -L "${LEFT_FILE}" ]] || LEFT_BEHIND+=" ${LEFT_FILE}"
+			done
+			if [[ -n "${LEFT_BEHIND}" || ${DAEMON_RELOAD_RC} -ne 0 ]]; then
+				[[ -z "${LEFT_BEHIND}" ]] || echo -e "${RED}ERROR: could not remove${LEFT_BEHIND}.${NC}"
+				[[ ${DAEMON_RELOAD_RC} -eq 0 ]] || echo -e "${RED}ERROR: systemctl daemon-reload failed after the drop-in was removed.${NC}"
+				echo -e "${ORANGE}The configuration in ${AMNEZIAWG_DIR} was kept. Fix the cause and rerun the uninstall.${NC}"
+				exit 1
+			fi
+		fi
+
+		# BoringTun: the helpers, the binary store, the load override and runtime
+		# state. On failure params stay, so the uninstall can be run again.
+		if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]] && ! uninstallBoringtunRuntime "${SERVER_AWG_NIC}"; then
+			echo -e "${RED}ERROR: the BoringTun backend could not be removed completely; see the messages above.${NC}"
+			echo -e "${ORANGE}The configuration in ${AMNEZIAWG_DIR} was kept. Fix the cause and rerun the uninstall.${NC}"
+			exit 1
+		fi
+
+		# Remove config files. A BoringTun uninstall removes them last, only
+		# after its packages and repository entries are gone, so that until
+		# then a rerun finds params and uninstalls again.
+		if [[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]]; then
+			rm -rf "${AMNEZIAWG_DIR:?}"
+		fi
+
+		# A BoringTun host installed only amneziawg-tools. Kernel module packages
+		# found there were installed by someone else and are left alone.
+		local -a AWG_APT_PACKAGES=(amneziawg amneziawg-tools amneziawg-dkms)
+		[[ "${OS}" == 'debian' ]] && AWG_APT_PACKAGES=(amneziawg amneziawg-tools)
+		[[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]] && AWG_APT_PACKAGES=(amneziawg-tools)
+		# BoringTun removes them strictly: a failed package database read is an
+		# error, never "not installed".
+		local REMOVE_APT_PACKAGES=removeInstalledAptPackages
+		[[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]] && REMOVE_APT_PACKAGES=removeBoringtunAptPackages
 
 		if [[ ${OS} == 'ubuntu' ]]; then
-			if ! removeInstalledAptPackages amneziawg amneziawg-tools amneziawg-dkms; then
+			if ! "${REMOVE_APT_PACKAGES}" "${AWG_APT_PACKAGES[@]}"; then
 				echo -e "${RED}ERROR: Failed to remove one or more installed AmneziaWG packages.${NC}"
 				UNINSTALL_FAILED=1
 			fi
@@ -8606,10 +9664,12 @@ function uninstallAmneziaWG() {
 			# installer. Systems upgraded between formats can contain both.
 			local MANAGED_SOURCE
 			for MANAGED_SOURCE in \
-				/etc/apt/sources.list.d/amneziawg.sources \
-				/etc/apt/sources.list.d/amneziawg.sources.list; do
+				"${AMNEZIA_PPA_SOURCES_DIR}/amneziawg.sources" \
+				"${AMNEZIA_PPA_SOURCES_DIR}/amneziawg.sources.list"; do
 				if [[ -f "${MANAGED_SOURCE}" ]] && head -1 "${MANAGED_SOURCE}" | grep -q '# Managed by amneziawg-install'; then
 					rm -f "${MANAGED_SOURCE}"
+					# BoringTun: a managed repository file that stays blocks the commit.
+					[[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]] || [[ ! -e "${MANAGED_SOURCE}" ]] || UNINSTALL_FAILED=1
 				elif [[ -f "${MANAGED_SOURCE}" ]]; then
 					echo -e "${ORANGE}NOTE: ${MANAGED_SOURCE} was not created by this installer (missing sentinel). Leaving it in place.${NC}"
 				fi
@@ -8618,20 +9678,25 @@ function uninstallAmneziaWG() {
 			apt-get update || echo -e "${ORANGE}WARNING: Failed to refresh APT indexes after removing the Amnezia PPA.${NC}"
 			disable_apt_ipv4
 		elif [[ ${OS} == 'debian' ]]; then
-			if ! removeInstalledAptPackages amneziawg amneziawg-tools; then
+			if ! "${REMOVE_APT_PACKAGES}" "${AWG_APT_PACKAGES[@]}"; then
 				echo -e "${RED}ERROR: Failed to remove one or more installed AmneziaWG packages.${NC}"
 				UNINSTALL_FAILED=1
 			fi
 			# Only remove source file and keyring if the source file has our sentinel on line 1
-			if [[ -f /etc/apt/sources.list.d/amneziawg.sources.list ]] && head -1 /etc/apt/sources.list.d/amneziawg.sources.list | grep -q '# Managed by amneziawg-install'; then
-				rm -f /etc/apt/sources.list.d/amneziawg.sources.list
-				rm -f /etc/apt/keyrings/amneziawg.gpg
-			elif [[ -f /etc/apt/sources.list.d/amneziawg.sources.list ]]; then
-				echo -e "${ORANGE}NOTE: /etc/apt/sources.list.d/amneziawg.sources.list was not created by this installer (missing sentinel). Leaving it and keyring in place.${NC}"
-			elif [[ -f /etc/apt/keyrings/amneziawg.gpg ]]; then
+			local DEBIAN_SOURCE="${AMNEZIA_PPA_SOURCES_DIR}/amneziawg.sources.list"
+			if [[ -f "${DEBIAN_SOURCE}" ]] && head -1 "${DEBIAN_SOURCE}" | grep -q '# Managed by amneziawg-install'; then
+				rm -f "${DEBIAN_SOURCE}"
+				rm -f "${AWG_APT_KEYRING_FILE}"
+				# BoringTun: a managed repository file that stays blocks the commit.
+				[[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]] || [[ ! -e "${DEBIAN_SOURCE}" && ! -e "${AWG_APT_KEYRING_FILE}" ]] || UNINSTALL_FAILED=1
+			elif [[ -f "${DEBIAN_SOURCE}" ]]; then
+				echo -e "${ORANGE}NOTE: ${DEBIAN_SOURCE} was not created by this installer (missing sentinel). Leaving it and keyring in place.${NC}"
+			elif [[ -f "${AWG_APT_KEYRING_FILE}" ]]; then
 				# Source file is gone (manually deleted) but orphaned keyring remains
 				echo -e "${ORANGE}NOTE: Managed source file not found but orphaned keyring detected. Removing keyring.${NC}"
-				rm -f /etc/apt/keyrings/amneziawg.gpg
+				rm -f "${AWG_APT_KEYRING_FILE}"
+				# BoringTun: a managed repository file that stays blocks the commit.
+				[[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]] || [[ ! -e "${AWG_APT_KEYRING_FILE}" ]] || UNINSTALL_FAILED=1
 			fi
 			apt update
 		elif [[ ${OS} == 'fedora' ]]; then
@@ -8642,9 +9707,31 @@ function uninstallAmneziaWG() {
 			dnf copr disable -y amneziavpn/amneziawg
 		fi
 
-		# Check if AmneziaWG is running
-		systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"
-		AWG_RUNNING=$?
+		# Check if AmneziaWG is running. BoringTun needs positive proof that the
+		# unit is not running: a failed query is not "inactive".
+		if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+			AWG_RUNNING=0
+			boringtunServiceInactive "${SERVER_AWG_NIC}" && AWG_RUNNING=1
+		else
+			systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"
+			AWG_RUNNING=$?
+		fi
+
+		# BoringTun: the configuration goes last, as the commit of an
+		# uninstall whose every step succeeded. Until then it stays, so the
+		# next run of the installer offers the uninstall again instead of a
+		# fresh install.
+		if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+			if [[ ${AWG_RUNNING} -eq 0 || ${UNINSTALL_FAILED} -ne 0 ]]; then
+				echo -e "${ORANGE}The configuration in ${AMNEZIAWG_DIR} was kept, so the uninstall can be run again.${NC}"
+			else
+				rm -rf "${AMNEZIAWG_DIR:?}"
+				if [[ -e "${AMNEZIAWG_DIR}" ]]; then
+					echo -e "${RED}ERROR: ${AMNEZIAWG_DIR} could not be removed.${NC}"
+					UNINSTALL_FAILED=1
+				fi
+			fi
+		fi
 
 		if [[ ${AWG_RUNNING} -eq 0 || ${UNINSTALL_FAILED} -ne 0 ]]; then
 			echo "AmneziaWG failed to uninstall properly."
@@ -9726,6 +10813,7 @@ function applyAwgProtocolTransaction() (
 	# let each caller report the transaction directory retained for recovery.
 	function restorePreviousAwgRuntime() {
 		if (( SERVICE_WAS_ACTIVE )); then
+			awgBackendPrepareServiceStart
 			systemctl restart "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 && \
 				systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"
 		elif (( MANUAL_INTERFACE_ACTIVE )); then
@@ -9845,6 +10933,7 @@ function applyAwgProtocolTransaction() (
 	fi
 
 	if (( APPLY_FAILED == 0 && SERVICE_WAS_ACTIVE )); then
+		awgBackendPrepareServiceStart
 		systemctl restart "awg-quick@${SERVER_AWG_NIC}" || APPLY_FAILED=1
 	elif (( APPLY_FAILED == 0 && MANUAL_INTERFACE_ACTIVE )); then
 		awgBackendQuickUp "${SERVER_AWG_CONF}" || APPLY_FAILED=1

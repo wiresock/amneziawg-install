@@ -332,6 +332,51 @@ awg_protocol_is_proxy_compatible() {
     esac
 }
 
+# The proxy runs only in front of the kernel backend. A missing or empty
+# AWG_BACKEND is the installer's legacy default (kernel). BoringTun, and every
+# other or malformed value, fails closed.
+awg_backend_is_proxy_compatible() {
+    local backend="${1:-}"
+    backend="${backend#"${backend%%[![:space:]]*}"}"
+    backend="${backend%"${backend##*[![:space:]]}"}"
+    case "${backend}" in
+        ""|kernel) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Read a params file as data, never sourcing it: sourcing runs whatever the
+# file holds, and a later valid line would hide an earlier failed one. Every
+# non-empty line that is not a # comment must be an assignment in a form
+# amneziawg-install.sh writes: KEY='value' (a single quote inside the value
+# written as '"'"'), or, from installers before 7c2e7dd, KEY=value with a plain
+# value. Anything else (spaces around =, command words, substitutions, several
+# statements, a malformed quote), a duplicate key or an unreadable file fails.
+# Sets the associative array PARAMS_VALUES.
+parse_params_file() { # <file>
+    local f="$1" content line key value
+    local quoted_re="^([A-Z][A-Z0-9_]*)='(([^']|'\"'\"')*)'\$"
+    local plain_re='^([A-Z][A-Z0-9_]*)=([]A-Za-z0-9._:/,@+%=[-]*)$'
+    declare -gA PARAMS_VALUES=()
+    PARAMS_VALUES=()
+    content="$(cat -- "${f}" 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+        [[ -z "${line}" || "${line}" == \#* ]] && continue
+        if [[ "${line}" =~ ${quoted_re} ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]//\'\"\'\"\'/\'}"
+        elif [[ "${line}" =~ ${plain_re} ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+        else
+            return 1
+        fi
+        [[ -z "${PARAMS_VALUES[${key}]+set}" ]] || return 1
+        PARAMS_VALUES["${key}"]="${value}"
+    done <<<"${content}"
+    return 0
+}
+
 # Detect the active AmneziaWG interface and its config file.
 # Sets AWG_NIC, AWG_CONF_FILE, and LISTEN_PORT (if not already set).
 detect_awg_config() {
@@ -339,13 +384,46 @@ detect_awg_config() {
 
     local params_file="${AWG_DIR}/params"
 
-    # Try to read the params file saved by amneziawg-install.sh
-    if validate_params_file "${params_file}"; then
-        # Source params in a subshell to avoid polluting current environment.
-        local nic port proto
-        nic="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_AWG_NIC:-}"' _ "${params_file}")"
-        port="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${SERVER_PORT:-}"' _ "${params_file}")"
-        proto="$(bash -c '. "$1" 2>/dev/null && printf "%s" "${AWG_PROTOCOL_VERSION-}"' _ "${params_file}")"
+    # Only a params file that does not exist at all lets the legacy .conf
+    # discovery below stand in for it. One that exists but cannot be trusted
+    # or parsed (a symlink, another owner, a group- or world-accessible mode,
+    # an unreadable file, any line that is not a params assignment) leaves the
+    # backend unknown: the proxy may only run in front of the kernel backend,
+    # so that fails closed.
+    local params_loaded=0
+    if [[ -e "${params_file}" || -L "${params_file}" ]]; then
+        if ! validate_params_file "${params_file}" || ! parse_params_file "${params_file}"; then
+            die "${params_file} exists but cannot be trusted or read, so the
+AmneziaWG backend of this host cannot be established. amneziawg-proxy runs only
+in front of the kernel backend. Fix the params file (a regular file owned by
+root, mode 600 or 400, as amneziawg-install.sh writes it), then rerun this
+installer."
+        fi
+        params_loaded=1
+    fi
+
+    # The values amneziawg-install.sh saved, read as data. A missing
+    # AWG_BACKEND is a params file written before backends existed; the
+    # environment never stands in for it.
+    if ((params_loaded)); then
+        local nic port proto backend
+        nic="${PARAMS_VALUES[SERVER_AWG_NIC]:-}"
+        port="${PARAMS_VALUES[SERVER_PORT]:-}"
+        proto="${PARAMS_VALUES[AWG_PROTOCOL_VERSION]-}"
+        backend="${PARAMS_VALUES[AWG_BACKEND]-}"
+
+        if ! awg_backend_is_proxy_compatible "${backend}"; then
+            if [[ "${backend}" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
+                error "AmneziaWG backend '${backend}' detected in ${params_file}."
+            else
+                error "An unsupported AmneziaWG backend is configured in ${params_file}."
+            fi
+            die "amneziawg-proxy runs only in front of the AmneziaWG kernel backend.
+The BoringTun backend cannot be used behind the standalone proxy: BoringTun
+always listens on every address, so the backend port the proxy moves AWG to
+would stay public. Keep this host without the proxy, or reinstall AmneziaWG
+with the kernel backend."
+        fi
 
         if [[ -n "${nic}" ]]; then
             AWG_NIC="${nic}"

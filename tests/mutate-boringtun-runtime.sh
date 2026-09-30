@@ -15,31 +15,26 @@ set -uo pipefail
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
-JOBS=4
-if [[ "${1:-}" == -j ]]; then
-	JOBS="${2:?}"
-	shift 2
-fi
+# shellcheck source=helpers/mutation-engine.sh
+source "${SCRIPT_DIR}/helpers/mutation-engine.sh"
 
-declare -a NAMES=() EDITS=()
-SEP=$'\x1f'
+# How each suite reports: its final summary line (the last group is the number
+# of failed assertions) and its assertion-failure lines.
+mutation_suite test-boringtun-runtime '^BoringTun runtime tests: ([0-9]+) passed, ([0-9]+) failed$' '^  FAIL: '
+
 # mutant <name> <exact text, present exactly once> <replacement> [<text> <replacement>]...
 # Several edits make one mutant; each must apply exactly once.
 mutant() {
-	local EDIT=""
-	NAMES+=("$1")
+	local NAME="$1"
 	shift
-	while (($# >= 2)); do
-		EDIT+="$1${SEP}$2${SEP}"
-		shift 2
-	done
-	EDITS+=("${EDIT}")
+	mutation_add "${NAME}" test-boringtun-runtime amneziawg-install.sh "" "$@"
 }
 
 T=$'\t'
 
 # Activation boundary and store verification.
-mutant dispatch_without_internal_flag '[[ "${_AWG_BORINGTUN_RUNTIME_INTERNAL}" == 1 && "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]' 	'[[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]'
+mutant env_selects_backend $'_AWG_BACKEND_REQUESTED="${AWG_BACKEND-}"\nAWG_BACKEND="${AWG_BACKEND_KERNEL}"' \
+	$'_AWG_BACKEND_REQUESTED="${AWG_BACKEND-}"\nAWG_BACKEND="${AWG_BACKEND:-${AWG_BACKEND_KERNEL}}"'
 mutant no_sha_check 'if [[ "${ACTUAL_SHA}" != "${FIELDS[binary_sha256]}" ]]; then' 'if false; then'
 mutant no_mode_check '(((8#${MODE} & 8#022) == 0)) || return 1' ':'
 mutant no_ancestor_check $'function _awgBtTrustedAncestors() {\n' $'function _awgBtTrustedAncestors() {\n\treturn 0\n'
@@ -50,8 +45,9 @@ mutant no_foreground '"$1" --foreground --disable-drop-privileges' '"$1" --disab
 mutant descriptors_not_closed $'function _awgBtCloseInheritedFds() {\n' $'function _awgBtCloseInheritedFds() {\n\treturn 0\n'
 mutant launch_without_precheck '[[ "${_AWG_BT_STATE[PHASE]}" != prechecked ]]' 'false'
 # precheck.
-mutant no_module_loaded_check 'if [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then' 'if false; then'
-mutant no_autoload_check 'if modinfo -n amneziawg >/dev/null 2>&1; then' 'if false; then'
+mutant no_module_loaded_check $'if [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then\n\t\t_awgBtErr "the amneziawg kernel module is loaded' \
+	$'if false; then\n\t\t_awgBtErr "the amneziawg kernel module is loaded'
+mutant no_autoload_check 'if modinfo -n amneziawg >/dev/null 2>&1 && ! _awgBtKernelModuleBlocked; then' 'if false; then'
 mutant no_saveconfig_check '_awgBtSaveConfigEnabled "${CONFIG_FILE}" || RC=$?' 'RC=1'
 mutant b1_no_preexisting_refusal 'if [[ -n "${PRESENT}" ]]; then' 'if false; then'
 # poststart and the shared active-instance check.
@@ -99,7 +95,8 @@ mutant s9_missing_up_is_terminal $'elif ! _awgBtFlagIs "${INTERFACE_NAME}" up; t
 mutant s9_socket_unlink_failure_ignored \
 	$'cannot be removed; cleanup is incomplete"\n\t\tKEEP=1' $'cannot be removed; cleanup is incomplete"'
 # Socket ownership (S2).
-mutant s2_remove_replaced_node '[[ "${CURRENT}" == "$2" ]] || return 0' ':'
+mutant s2_remove_replaced_node $'\tCURRENT="$(_awgBtPathId "$1")" || return 0\n\t[[ "${CURRENT}" == "$2" ]] || return 0' \
+	$'\tCURRENT="$(_awgBtPathId "$1")" || return 0\n\t:'
 mutant s2_remove_while_owner_lives '_awgBtProcessIs "$3" "$4" && return 0' ':'
 mutant s2_record_without_fd_proof 'ss -xlHe 2>/dev/null | awk' 'true || ss -xlHe 2>/dev/null | awk'
 mutant s2_inode_only_identity "stat -c '%d:%i:%f:%.9Z'" "stat -c '%d:%i:%f:0.000000000'"
@@ -157,65 +154,4 @@ mutant filter_always_strips '((INDEX == PORT_INDEX)) && ((10#${CONFIGURED} == LI
 mutant filter_never_strips '((INDEX == PORT_INDEX)) && ((10#${CONFIGURED} == LIVE))' 'false'
 mutant parser_case_sensitive $'\tshopt -s nocasematch\n\twhile read -r LINE' $'\twhile read -r LINE'
 
-if [[ $# -gt 0 ]]; then
-	declare -a SELECTED=()
-	for NAME in "$@"; do
-		FOUND=0
-		for I in "${!NAMES[@]}"; do
-			[[ "${NAMES[I]}" == "${NAME}" ]] && SELECTED+=("${I}") && FOUND=1
-		done
-		((FOUND)) || { echo "unknown mutant ${NAME}" >&2; exit 2; }
-	done
-else
-	SELECTED=("${!NAMES[@]}")
-fi
-
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/boringtun-mutants.XXXXXX")"
-trap 'rm -rf -- "${WORK}"' EXIT
-
-run_one() { # <index>
-	local I="$1" DIR="${WORK}/m$1" OUT RC SUMMARY P
-	local -a PAIRS=()
-	mkdir -p "${DIR}/tests" "${DIR}/scripts"
-	cp "${PROJECT_ROOT}/tests/test-boringtun-runtime.sh" "${DIR}/tests/"
-	cp "${PROJECT_ROOT}/scripts/boringtun-artifact.sh" "${DIR}/scripts/"
-	cp "${PROJECT_ROOT}/amneziawg-install.sh" "${DIR}/amneziawg-install.sh"
-	mapfile -d "${SEP}" -t PAIRS < <(printf '%s' "${EDITS[I]}")
-	for ((P = 0; P + 1 < ${#PAIRS[@]}; P += 2)); do
-		if ! OLD="${PAIRS[P]}" NEW="${PAIRS[P + 1]}" perl -0777 -ne '
-			my $o = $ENV{OLD}; my $n = $ENV{NEW};
-			my $c = () = /\Q$o\E/g;
-			die "edit '"$((P / 2 + 1))"' matches $c times\n" unless $c == 1;
-			s/\Q$o\E/$n/; print;' "${DIR}/amneziawg-install.sh" >"${DIR}/mutated.sh" 2>"${DIR}/apply.err"; then
-			printf '%-38s DID NOT APPLY (%s)\n' "${NAMES[I]}" "$(cat "${DIR}/apply.err")"
-			return
-		fi
-		mv -- "${DIR}/mutated.sh" "${DIR}/amneziawg-install.sh"
-	done
-	OUT="$(cd "${DIR}" && timeout 900 bash tests/test-boringtun-runtime.sh 2>&1)"
-	RC=$?
-	SUMMARY="$(grep 'runtime tests:' <<<"${OUT}" | tail -n 1)"
-	if ((RC == 0)); then
-		printf '%-38s SURVIVED (%s)\n' "${NAMES[I]}" "${SUMMARY}"
-	else
-		printf '%-38s caught: %s | %s\n' "${NAMES[I]}" "${SUMMARY:-no summary, rc=${RC}}" \
-			"$(grep -m1 'FAIL:' <<<"${OUT}" | sed 's/^ *//' | cut -c1-100)"
-	fi
-}
-
-for I in "${SELECTED[@]}"; do
-	while (($(jobs -rp | wc -l) >= JOBS)); do
-		wait -n
-	done
-	run_one "${I}" >"${WORK}/result.${I}" &
-done
-wait
-
-BAD=0
-for I in "${SELECTED[@]}"; do
-	cat "${WORK}/result.${I}"
-	grep -qE 'SURVIVED|DID NOT APPLY' "${WORK}/result.${I}" && BAD=$((BAD + 1))
-done
-echo
-echo "BoringTun runtime mutants: $((${#SELECTED[@]} - BAD)) of ${#SELECTED[@]} caught"
-((BAD == 0))
+mutation_main "BoringTun runtime" "${PROJECT_ROOT}" "$@"

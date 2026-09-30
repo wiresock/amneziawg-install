@@ -140,6 +140,7 @@ AWG_BT_PATH="${MOCKBIN}:/usr/local/bin:/usr/bin:/bin"
 AWG_BT_READY_TIMEOUT=5
 AWG_BT_HOST_ARCH="x86_64"
 AWG_BT_TMP_DIR="${T}/tmp"
+AWG_BT_MODPROBE_OVERRIDE="${T}/etc/modprobe.d/amneziawg-install-boringtun.conf"
 NET="${AWG_BT_SYS_DIR}/class/net"
 mkdir -p "${T}/lib" "${T}/run" "${AWG_BT_CONFIG_DIR}" "${AWG_BT_SYSTEMD_DIR}" \
 	"${T}/usr/lib/systemd" "${AWG_BT_WG_SOCKET_DIR}" "${AWG_BT_AWG_SOCKET_DIR}" "${NET}" \
@@ -311,6 +312,16 @@ cat >"${MOCKBIN}/modinfo" <<EOF
 #!/bin/bash
 echo "modinfo \$*" >>'${S}/log'
 exit "\$(cat '${S}/modinfo-rc' 2>/dev/null || echo 1)"
+EOF
+
+# modprobe -n -v <name>: what modprobe would do. By default both the module and
+# its rtnl-link alias resolve to the installer's install command.
+cat >"${MOCKBIN}/modprobe" <<EOF
+#!/bin/bash
+echo "modprobe \$*" >>'${S}/log'
+NAME="\${!#}"
+if [[ -f "${S}/modprobe-\${NAME}" ]]; then cat "${S}/modprobe-\${NAME}"; else echo 'install /bin/false '; fi
+exit "\$(cat '${S}/modprobe-rc' 2>/dev/null || echo 0)"
 EOF
 
 cat >"${MOCKBIN}/ip" <<EOF
@@ -918,32 +929,26 @@ bind_socket() { # <path>
 	python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"
 }
 
-echo "=== The internal activation boundary ==="
-assert_eq "kernel 0" "${AWG_BACKEND} ${_AWG_BORINGTUN_RUNTIME_INTERNAL}" \
-	"a sourced installer starts on the kernel backend with the BoringTun runtime off"
-assert_eq "kernel 0" \
-	"$(env AWG_BACKEND=boringtun _AWG_BORINGTUN_RUNTIME_INTERNAL=1 bash -c 'source "$1"; echo "${AWG_BACKEND} ${_AWG_BORINGTUN_RUNTIME_INTERNAL}"' _ "${INSTALLER}")" \
-	"exported AWG_BACKEND and _AWG_BORINGTUN_RUNTIME_INTERNAL are discarded when the installer loads"
-assert_eq "0" "$(grep -v '^[[:space:]]*#' "${INSTALLER}" | grep -v '^function _awgInternalSelectBoringtunRuntimeForTesting()' |
-	grep -c '_awgInternalSelectBoringtunRuntimeForTesting')" "nothing in the installer calls the internal selection"
-run bash -c 'source "$1"; AWG_BACKEND=boringtun; normalizeAwgBackend' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "a persisted AWG_BACKEND=boringtun is still unsupported"
-run bash -c 'source "$1"; _awgInternalSelectBoringtunRuntimeForTesting; validatePersistedAwgBackendState' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "params validation rejects boringtun even after the internal selection"
-run bash -c 'source "$1"; AWG_BACKEND=boringtun; awgBackendCreateScratchInterface awgp1' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "without the internal selection a BoringTun scratch interface is refused"
-assert_contains "not supported by this installer version" "${ERR}" "and reported as an unsupported backend"
-run bash -c 'source "$1"; AWG_BACKEND=boringtun; ensureAwgBackendReady 0' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "without the internal selection ensureAwgBackendReady exits 1"
-run bash -c 'source "$1"; AWG_BACKEND=boringtun; awgSyncInterfaceConfig awg0' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "without the internal selection awgSyncInterfaceConfig refuses"
-run bash -c 'source "$1"; AWG_BACKEND=boringtun; awgBackendQuickUp /etc/amnezia/amneziawg/awg0.conf' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "without the internal selection awgBackendQuickUp refuses"
-run bash -c 'source "$1"; _awgInternalSelectBoringtunRuntimeForTesting; SERVER_PUB_IP=x; serializeParams "$2"' _ "${INSTALLER}" "${T}/params-out"
-assert_rc 1 "${RC}" "serializeParams refuses to persist the internal BoringTun selection"
-assert_true "and writes no params file" test ! -e "${T}/params-out"
-run bash -c 'source "$1"; _AWG_BORINGTUN_RUNTIME_INTERNAL=1; AWG_BACKEND=kernel; declare -f awgBackendCreateScratchInterface >/dev/null; _awgBtRuntimeSelected' _ "${INSTALLER}"
-assert_rc 1 "${RC}" "the internal flag alone does not select BoringTun while AWG_BACKEND is kernel"
+echo "=== The activation boundary ==="
+assert_eq "kernel" "${AWG_BACKEND}" "a sourced installer starts on the kernel backend"
+assert_eq "kernel" \
+	"$(env AWG_BACKEND=boringtun _AWG_BORINGTUN_RUNTIME_INTERNAL=1 bash -c 'source "$1"; echo "${AWG_BACKEND}"' _ "${INSTALLER}")" \
+	"an exported AWG_BACKEND is discarded when the installer loads"
+assert_eq "0" "$(grep -c '_AWG_BORINGTUN_RUNTIME_INTERNAL\|_awgInternalSelectBoringtunRuntimeForTesting\|_awgBtRuntimeSelected' "${INSTALLER}")" \
+	"the installer has no internal activation flag or selector any more"
+# Exported variables, including the removed internal flag, never reach the
+# BoringTun branches: the dispatchers still take the kernel path.
+run env AWG_BACKEND=boringtun _AWG_BORINGTUN_RUNTIME_INTERNAL=1 bash -c \
+	'source "$1"; ip() { echo "ip $*"; }; awgBackendCreateScratchInterface awgp1' _ "${INSTALLER}"
+assert_eq "ip link add dev awgp1 type amneziawg" "${OUT}" "exported AWG_BACKEND=boringtun and the old internal flag still dispatch to the kernel"
+run bash -c 'source "$1"; AWG_BACKEND=boringtun; normalizeAwgBackend && echo "${AWG_BACKEND}"' _ "${INSTALLER}"
+assert_rc 0 "${RC}" "a persisted AWG_BACKEND=boringtun is supported"
+assert_eq "boringtun" "${OUT}" "and normalizes to boringtun"
+run bash -c 'source "$1"; AWG_BACKEND=boringtun; SERVER_PUB_IP=x; serializeParams "$2"' _ "${INSTALLER}" "${T}/params-out"
+assert_rc 0 "${RC}" "serializeParams persists the BoringTun backend"
+assert_eq "AWG_BACKEND='boringtun'" "$(grep '^AWG_BACKEND=' "${T}/params-out")" "as AWG_BACKEND='boringtun'"
+run bash -c 'source "$1"; AWG_BACKEND=boringtun; ip() { echo "ip $*"; }; _awgBtScratchCreate() { echo "bt-scratch $*"; }; awgBackendCreateScratchInterface awgp1' _ "${INSTALLER}"
+assert_eq "bt-scratch awgp1" "${OUT}" "a validated AWG_BACKEND=boringtun dispatches to the BoringTun runtime, never to the kernel"
 
 echo "=== Kernel invariance of shared text and the kernel drop-in ==="
 assert_eq "could not create a temporary amneziawg interface (load the amneziawg kernel module for this kernel)
@@ -974,7 +979,7 @@ FIRST_LAUNCH="$(cat "${LAUNCH}")"
 _awgBtInstallHelpers
 assert_eq "0" "${_AWG_BT_FILE_CHANGED}" "regenerating unchanged helpers leaves them alone"
 assert_eq "${FIRST_LAUNCH}" "$(_awgBtRenderHelper launch)" "helper output is deterministic"
-assert_eq "${FIRST_LAUNCH}" "$(env SERVER_PRIV_KEY=secret WG_LOG_FILE=/x AWG_BT_STORE_DIR=/evil TMPD="${AWG_BT_TMP_DIR}" bash -c 'source "$1"; AWG_BT_TRUST_ANCHOR="$2"; AWG_BT_TRUSTED_UID="$3"; AWG_BT_STORE_DIR="$4"; AWG_BT_LIBEXEC_DIR="$5"; AWG_BT_RUN_DIR="$6"; AWG_BT_CONFIG_DIR="$7"; AWG_BT_SYSTEMD_DIR="$8"; AWG_BT_UNIT_DIRS="$9"; shift 9; AWG_BT_SYSTEMD_RUNTIME_DIR="$1"; AWG_BT_WG_SOCKET_DIR="$2"; AWG_BT_AWG_SOCKET_DIR="$3"; AWG_BT_SYS_DIR="$4"; AWG_BT_PROC_DIR="$5"; AWG_BT_TUN_DEVICE="$6"; AWG_BT_PATH="$7"; AWG_BT_READY_TIMEOUT="$8"; AWG_BT_HOST_ARCH="$9"; AWG_BT_TMP_DIR="${TMPD}"; _awgBtRenderHelper launch' _ \
+assert_eq "${FIRST_LAUNCH}" "$(env SERVER_PRIV_KEY=secret WG_LOG_FILE=/x AWG_BT_STORE_DIR=/evil AWG_BT_MODPROBE_OVERRIDE=/evil TMPD="${AWG_BT_TMP_DIR}" MPO="${AWG_BT_MODPROBE_OVERRIDE}" bash -c 'source "$1"; AWG_BT_TRUST_ANCHOR="$2"; AWG_BT_TRUSTED_UID="$3"; AWG_BT_STORE_DIR="$4"; AWG_BT_LIBEXEC_DIR="$5"; AWG_BT_RUN_DIR="$6"; AWG_BT_CONFIG_DIR="$7"; AWG_BT_SYSTEMD_DIR="$8"; AWG_BT_UNIT_DIRS="$9"; shift 9; AWG_BT_SYSTEMD_RUNTIME_DIR="$1"; AWG_BT_WG_SOCKET_DIR="$2"; AWG_BT_AWG_SOCKET_DIR="$3"; AWG_BT_SYS_DIR="$4"; AWG_BT_PROC_DIR="$5"; AWG_BT_TUN_DEVICE="$6"; AWG_BT_PATH="$7"; AWG_BT_READY_TIMEOUT="$8"; AWG_BT_HOST_ARCH="$9"; AWG_BT_TMP_DIR="${TMPD}"; AWG_BT_MODPROBE_OVERRIDE="${MPO}"; _awgBtRenderHelper launch' _ \
 	"${INSTALLER}" "${AWG_BT_TRUST_ANCHOR}" "${AWG_BT_TRUSTED_UID}" "${AWG_BT_STORE_DIR}" "${AWG_BT_LIBEXEC_DIR}" \
 	"${AWG_BT_RUN_DIR}" "${AWG_BT_CONFIG_DIR}" "${AWG_BT_SYSTEMD_DIR}" "${AWG_BT_UNIT_DIRS}" "${AWG_BT_SYSTEMD_RUNTIME_DIR}" \
 	"${AWG_BT_WG_SOCKET_DIR}" "${AWG_BT_AWG_SOCKET_DIR}" "${AWG_BT_SYS_DIR}" "${AWG_BT_PROC_DIR}" "${AWG_BT_TUN_DEVICE}" \
@@ -1355,6 +1360,124 @@ else
 	ok "precheck fails closed when modinfo is unavailable (skipped: a real modinfo is on the helper PATH)"
 fi
 mv "${T}/modinfo.saved" "${MOCKBIN}/modinfo"
+
+# An installed module is accepted only while the installer's load override is
+# in force: its exact, trusted file, and modprobe resolving both the module and
+# the rtnl-link alias to that install command.
+OVERRIDE="${AWG_BT_MODPROBE_OVERRIDE}"
+module_check() { # <expected rc> <label>
+	run _awgBtCheckKernelModule
+	assert_rc "$1" "${RC}" "$2"
+}
+mkdir -p "${OVERRIDE%/*}"
+chmod 0755 "${T}/etc" "${OVERRIDE%/*}"
+echo 0 >"${S}/modinfo-rc"
+_awgBtRenderModprobeOverride >"${OVERRIDE}"
+chmod 0644 "${OVERRIDE}"
+: >"${S}/log"
+module_check 0 "an installed module blocked by the installer's override passes the module check"
+assert_contains "modprobe -n -v amneziawg" "$(cat "${S}/log")" "the override is checked for the module name"
+assert_contains "modprobe -n -v rtnl-link-amneziawg" "$(cat "${S}/log")" "and for the rtnl-link alias that ip link add requests"
+assert_eq "install amneziawg /bin/false" "$(grep -v '^#' "${OVERRIDE}")" "the override's only directive is 'install amneziawg /bin/false'"
+precheck_ok_with_override() {
+	run ctl_precheck "${IF}"
+	if [[ "${ERR}" != *"kernel module"* && "${ERR}" != *"autoload"* ]]; then ok "$1"; else not_ok "$1 (rc=${RC}: ${ERR})"; fi
+}
+precheck_ok_with_override "precheck does not refuse a module that the override blocks"
+mkdir -p "${AWG_BT_SYS_DIR}/module/amneziawg"
+precheck_refused "a loaded module is refused even with the override in place" "kernel module is loaded"
+rmdir "${AWG_BT_SYS_DIR}/module/amneziawg"
+printf '%s\n# local edit\n' "$(_awgBtRenderModprobeOverride)" >"${OVERRIDE}"
+module_check 1 "a changed override file does not count"
+printf 'blacklist amneziawg\n' >"${OVERRIDE}"
+module_check 1 "a blacklist line instead of the install command does not count"
+_awgBtRenderModprobeOverride >"${OVERRIDE}"
+chmod 0664 "${OVERRIDE}"
+module_check 1 "a group-writable override file does not count"
+chmod 0644 "${OVERRIDE}"
+mv "${OVERRIDE}" "${T}/override.real"
+ln -s "${T}/override.real" "${OVERRIDE}"
+module_check 1 "an override that is a symlink does not count"
+rm -f "${OVERRIDE}"
+mv "${T}/override.real" "${OVERRIDE}"
+chmod 0777 "${OVERRIDE%/*}"
+module_check 1 "an override in a directory writable by others does not count"
+chmod 0755 "${OVERRIDE%/*}"
+echo "insmod /lib/modules/x/amneziawg.ko" >"${S}/modprobe-amneziawg"
+module_check 1 "an override that another modprobe configuration outranks does not count"
+rm -f "${S}/modprobe-amneziawg"
+echo "insmod /lib/modules/x/amneziawg.ko" >"${S}/modprobe-rtnl-link-amneziawg"
+module_check 1 "an override that does not cover the rtnl-link alias does not count"
+rm -f "${S}/modprobe-rtnl-link-amneziawg"
+
+# modprobe -n -v as the Ubuntu 26.04 coexistence job printed it: the
+# dependencies it would load first, then the block command, each line ending
+# in a space. The dependency lines disappear once those modules are loaded.
+REAL_DEPS=(
+	"insmod /lib/modules/7.0.0-1012-azure/kernel/net/ipv4/udp_tunnel.ko.zst"
+	"insmod /lib/modules/7.0.0-1012-azure/kernel/net/ipv6/ip6_udp_tunnel.ko.zst"
+	"insmod /lib/modules/7.0.0-1012-azure/kernel/lib/crypto/libcurve25519.ko.zst"
+)
+modprobe_output() { # <name> <line>..., each written with modprobe's trailing space
+	local NAME="$1"
+	shift
+	if (($#)); then printf '%s \n' "$@"; fi >"${S}/modprobe-${NAME}"
+}
+modprobe_reset() {
+	rm -f "${S}/modprobe-amneziawg" "${S}/modprobe-rtnl-link-amneziawg"
+}
+modprobe_output amneziawg "${REAL_DEPS[@]}" "install /bin/false"
+assert_eq "insmod /lib/modules/7.0.0-1012-azure/kernel/net/ipv4/udp_tunnel.ko.zst " "$(head -n 1 "${S}/modprobe-amneziawg")" "the fixture keeps modprobe's trailing space"
+module_check 0 "the real output with dependency insmods before 'install /bin/false' counts for the module"
+modprobe_reset
+modprobe_output rtnl-link-amneziawg "${REAL_DEPS[@]}" "install /bin/false"
+module_check 0 "and for the rtnl-link alias"
+modprobe_output amneziawg "${REAL_DEPS[@]}" "install /bin/false"
+module_check 0 "and for both at once"
+install_helpers
+precheck_ok_with_override "the generated precheck accepts the real output too"
+modprobe_output amneziawg "insmod /lib/modules/x/kernel/net/ipv4/udp_tunnel.ko.zst opt=1" "install /bin/false"
+module_check 0 "a dependency insmod with module options is still a dependency"
+refused_output() { # <label> <line>... of the output for amneziawg
+	local LABEL="$1"
+	shift
+	modprobe_reset
+	modprobe_output amneziawg "$@"
+	module_check 1 "${LABEL}"
+}
+refused_output "dependencies followed by a real insmod of amneziawg.ko do not count" \
+	"${REAL_DEPS[@]}" "insmod /lib/modules/7.0.0-1012-azure/updates/dkms/amneziawg.ko.zst"
+refused_output "an insmod of amneziawg before 'install /bin/false' does not count" \
+	"insmod /lib/modules/x/updates/dkms/amneziawg.ko.zst" "install /bin/false"
+refused_output "an uncompressed amneziawg.ko among the dependencies does not count" \
+	"${REAL_DEPS[0]}" "insmod /lib/modules/x/extra/amneziawg.ko" "install /bin/false"
+refused_output "'install /bin/true' does not count" "${REAL_DEPS[@]}" "install /bin/true"
+refused_output "'install /usr/bin/false' does not count" "install /usr/bin/false"
+refused_output "'install sh -c false' does not count" "install sh -c false"
+refused_output "'install /bin/false' followed by another action does not count" \
+	"install /bin/false" "insmod /lib/modules/x/kernel/net/ipv4/udp_tunnel.ko.zst"
+refused_output "'install /bin/false' twice does not count" "install /bin/false" "install /bin/false"
+refused_output "'install /bin/false' with more on its line does not count" "install /bin/false; insmod /x/amneziawg.ko"
+refused_output "a dependency action that is not an insmod does not count" "rmmod udp_tunnel" "install /bin/false"
+refused_output "a dependency's own install command, which can load anything, does not count" \
+	"install /sbin/modprobe --ignore-install amneziawg" "install /bin/false"
+refused_output "a relative insmod path does not count" "insmod udp_tunnel.ko" "install /bin/false"
+refused_output "empty output does not count"
+refused_output "output of blank lines only does not count" "" " "
+modprobe_reset
+echo 1 >"${S}/modprobe-rc"
+module_check 1 "a failing modprobe dry run does not count"
+rm -f "${S}/modprobe-rc"
+mv "${MOCKBIN}/modprobe" "${T}/modprobe.saved"
+if ! PATH="${AWG_BT_PATH}" command -v modprobe >/dev/null 2>&1; then
+	module_check 1 "without modprobe the override cannot be proven in force"
+else
+	ok "without modprobe the override cannot be proven in force (skipped: a real modprobe is on the helper PATH)"
+fi
+mv "${T}/modprobe.saved" "${MOCKBIN}/modprobe"
+module_check 0 "the restored override passes again"
+rm -f "${OVERRIDE}" "${S}/modinfo-rc"
+module_check 0 "without an installed module the override is irrelevant"
 
 AWG_BT_TUN_DEVICE="${T}/no-tun"
 install_helpers
@@ -2047,7 +2170,7 @@ mkdir -p "${T}/alt"
 chmod 0700 "${T}/alt"
 write_server_config "${IF}" "SaveConfig = true" "${T}/alt"
 write_server_config "${IF}"
-_awgInternalSelectBoringtunRuntimeForTesting
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 reset_state
 run awgBackendQuickUp "${T}/alt/${IF}.conf"
 assert_rc 1 "${RC}" "S5: quick-up checks SaveConfig in the exact config it is given"
@@ -2067,7 +2190,6 @@ assert_eq "$(grep -v SaveConfig "${T}/alt/${IF}.conf")" "$(cat "${S}/down-config
 "${CTL}" poststop "${IF}"
 write_server_config "${IF}"
 AWG_BACKEND=kernel
-_AWG_BORINGTUN_RUNTIME_INTERNAL=0
 
 if [[ -n "${AWG_QUICK_REFERENCE:-}" && -r "${AWG_QUICK_REFERENCE}" ]]; then
 	# awg-quick itself, unchanged except that it does not re-exec through sudo.
@@ -2196,7 +2318,7 @@ rm -f "${S}/strip-fail"
 
 echo 51821 >"${S}/port/${IF}"
 printf '[Interface]\nListenPort = 51821\n' >"${S}/strip/${IF}"
-_awgInternalSelectBoringtunRuntimeForTesting
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 run awgSyncInterfaceConfig "${IF}" --stderr-to-stdout
 assert_eq "syncconf-error-line" "${OUT}" "--stderr-to-stdout puts awg syncconf's stderr on stdout"
 run awgSyncInterfaceConfig "${IF}" "${T}/sync.err"
@@ -2210,7 +2332,6 @@ printf '[Interface]\nListenPort = 1\nListenPort = 2\n' >"${S}/strip/${IF}"
 run awgSyncInterfaceConfig "${IF}" "${T}/sync.err"
 assert_contains "more than once" "$(cat "${T}/sync.err")" "filter diagnostics go where awg syncconf's stderr goes"
 AWG_BACKEND=kernel
-_AWG_BORINGTUN_RUNTIME_INTERNAL=0
 : >"${S}/log"
 printf '[Interface]\nListenPort = 51821\n' >"${S}/strip/${IF}"
 run awgSyncInterfaceConfig "${IF}"
@@ -2219,7 +2340,7 @@ ListenPort = 51821" "$(cat "${S}/syncconf-input")" "the kernel sync still sends 
 assert_not_contains "listen-port" "$(cat "${S}/log")" "and never asks for the live port"
 
 echo "=== Scratch interfaces: collisions and the lifecycle ==="
-_awgInternalSelectBoringtunRuntimeForTesting
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 reset_state
 SYSTEMD_PRESENT="${T}/run/systemd-present"
 SYSTEMD_ABSENT="${T}/run/systemd-absent"
@@ -2265,13 +2386,13 @@ ORIGINAL_EXIT_TRAP="$(trap -p EXIT)"
 : >"${S}/log"
 awgBackendCreateScratchInterface awgp1 2>"${T}/err"
 assert_rc 0 "$?" "under systemd a scratch interface starts in a transient unit"
-TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp1]}"
+TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp1]:-}"
 UNIT="amneziawg-scratch-awgp1-${TOKEN}"
 assert_eq "systemd-run --quiet --collect --unit=${UNIT} -p Type=exec -p RuntimeMaxSec=900 -- $(command -v bash) -c [[ -e \"\$1\" && ! -e \"\$2\" ]] || exit 0; shift 2; exec \"\$@\" awg-scratch-unit ${SCRATCH_DIR}/${TOKEN}.owner ${SCRATCH_DIR}/${TOKEN}.reclaim $(command -v env) -i PATH=${AWG_BT_PATH} NO_COLOR=1 ${VERIFIED_BIN} --foreground --disable-drop-privileges --verbosity error awgp1" \
 	"$(grep '^systemd-run' "${S}/log")" "the unit is named after the attempt's token, has a hard lifetime and runs the production command line behind the attempt's gate"
 UNIT_PID="$(cat "${S}/units/${UNIT}")"
 assert_true "and the daemon is running" pid_alive "${UNIT_PID}"
-GUARD_PID="${_AWG_BT_SCRATCH_GUARDS[awgp1]}"
+GUARD_PID="${_AWG_BT_SCRATCH_GUARDS[awgp1]:-}"
 assert_true "and a guardian watches the shell that owns it" pid_alive "${GUARD_PID}"
 assert_eq "created ${UNIT_PID} ${GUARD_PID} ${BASHPID}" \
 	"$(record_get "${TOKEN}" guard PHASE) $(record_get "${TOKEN}" guard DAEMON_PID) $(record_get "${TOKEN}" guard GUARD_PID) $(record_get "${TOKEN}" owner OWNER_PID)" \
@@ -2291,13 +2412,13 @@ bash -c 'sleep 300 </dev/null >/dev/null 2>&1 & echo $!' | tee -a "${T}/decoys" 
 DECOY_PID="$(cat "${T}/decoy-pid")"
 awgBackendCreateScratchInterface awgv2 2>/dev/null
 assert_rc 0 "$?" "without systemd a scratch interface is a tracked process"
-TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgv2]}"
+TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgv2]:-}"
 CHILD_PID="$(record_get "${TOKEN}" guard DAEMON_PID)"
 assert_true "and it is running" pid_alive "${CHILD_PID}"
 assert_eq "${CHILD_PID} $(_awgBtProcessStartTime "${CHILD_PID}")" \
 	"$(record_get "${TOKEN}" child CHILD_PID) $(record_get "${TOKEN}" child CHILD_START)" \
 	"S3: the daemon recorded its own identity before readiness was declared"
-assert_eq "${_AWG_BT_SCRATCH_GUARDS[awgv2]}" "$(awk '{print $4}' "/proc/${CHILD_PID}/stat")" "whose parent is its guardian"
+assert_eq "${_AWG_BT_SCRATCH_GUARDS[awgv2]:-}" "$(awk '{print $4}' "/proc/${CHILD_PID}/stat")" "whose parent is its guardian"
 SIGIGN="$(tr -d '[:space:]' <"${TUNROOT}/${CHILD_PID}/sigign")"
 assert_true "and which does not inherit the guardian's ignored HUP, INT and TERM" test "$((16#${SIGIGN} & 16#4003))" -eq 0
 awgBackendDestroyScratchInterface awgv2
@@ -2321,7 +2442,7 @@ AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_PRESENT}"
 (
 	trap 'echo "previous handler ran" >"${T}/prev-exit"' EXIT
 	awgBackendCreateScratchInterface awgp5 2>/dev/null
-	echo "${_AWG_BT_SCRATCH_TOKENS[awgp5]}" >"${T}/token"
+	echo "${_AWG_BT_SCRATCH_TOKENS[awgp5]:-}" >"${T}/token"
 	exit 7
 )
 assert_rc 7 "$?" "a shell that exits with a scratch interface keeps its exit status"
@@ -2333,7 +2454,7 @@ for SIGNAL in TERM INT HUP KILL; do
 	rm -f "${T}/token"
 	(
 		awgBackendCreateScratchInterface awgp6 2>/dev/null
-		echo "${_AWG_BT_SCRATCH_TOKENS[awgp6]}" >"${T}/token"
+		echo "${_AWG_BT_SCRATCH_TOKENS[awgp6]:-}" >"${T}/token"
 		kill -s "${SIGNAL}" "${BASHPID}"
 		sleep 5
 		echo "not reached" >"${T}/not-reached"
@@ -2362,11 +2483,11 @@ source "$2"
 if [[ "$3" == unit ]]; then AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_PRESENT}"; else AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"; fi
 PATH="${MOCKBIN}:${PATH}"
 [[ -z "${CLIENT_WAIT:-}" ]] || _AWG_BT_SCRATCH_CLIENT_WAIT="${CLIENT_WAIT}"
-_awgInternalSelectBoringtunRuntimeForTesting
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 case "$4" in
 	create)
 		awgBackendCreateScratchInterface "$5" >/dev/null 2>&1 || exit 1
-		echo "${_AWG_BT_SCRATCH_TOKENS[$5]}" >"$6.tmp" && mv "$6.tmp" "$6"
+		echo "${_AWG_BT_SCRATCH_TOKENS[$5]:-}" >"$6.tmp" && mv "$6.tmp" "$6"
 		[[ "${7:-}" == hold ]] && exec sleep 120
 		exit 0
 		;;
@@ -2406,7 +2527,7 @@ reset_state
 touch "${S}/systemd-run-lost"
 awgBackendCreateScratchInterface awgp8 2>/dev/null
 assert_rc 0 "$?" "S3: a unit whose systemd-run answer was lost is still recognised by its token and used"
-TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp8]}"
+TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp8]:-}"
 rm -f "${S}/systemd-run-lost"
 awgBackendDestroyScratchInterface awgp8
 assert_true "S3: and it is torn down" scratch_gone awgp8 "${TOKEN}"
@@ -2762,7 +2883,7 @@ wait "${REAPER}" 2>/dev/null
 echo "=== The stale sweep touches only what records prove dead ==="
 reset_state
 awgBackendCreateScratchInterface awgp2 2>/dev/null
-TOKEN_A="${_AWG_BT_SCRATCH_TOKENS[awgp2]}"
+TOKEN_A="${_AWG_BT_SCRATCH_TOKENS[awgp2]:-}"
 owner unit sweep
 assert_true "a sweep in another process leaves an attempt with a live owner alone" test -e "${SCRATCH_DIR}/${TOKEN_A}.guard" -a -e "${NET}/awgp2"
 awgBackendCreateScratchInterface awgp3 2>/dev/null
@@ -2849,8 +2970,8 @@ rm -f "${SCRATCH_DIR}/${BOGUS}".*
 # A reused guardian PID in the owner's tracking.
 AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"
 awgBackendCreateScratchInterface awgv4 2>/dev/null
-TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgv4]}"
-REAL_GUARD="${_AWG_BT_SCRATCH_GUARDS[awgv4]}"
+TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgv4]:-}"
+REAL_GUARD="${_AWG_BT_SCRATCH_GUARDS[awgv4]:-}"
 _AWG_BT_SCRATCH_GUARDS[awgv4]="${DECOY_PID}"
 _AWG_BT_SCRATCH_GUARD_STARTS[awgv4]="$((DECOY_START + 1))"
 awgBackendDestroyScratchInterface awgv4 2>/dev/null
@@ -2894,7 +3015,6 @@ for PORT_LINE in "ListenPort =" "ListenPort = abc" "ListenPort = -1" "ListenPort
 	assert_true "S7: before anything is applied" test ! -e "${S}/setconf-input"
 done
 AWG_BACKEND=kernel
-_AWG_BORINGTUN_RUNTIME_INTERNAL=0
 reset_state
 staged "ListenPort = 51820"
 assert_rc 0 "${RC}" "kernel staged validation still passes"
@@ -2902,7 +3022,7 @@ assert_contains "ListenPort = 51820" "$(cat "${S}/setconf-input")" "and the kern
 assert_contains "type amneziawg" "$(cat "${S}/log")" "with a kernel scratch link"
 staged "ListenPort = abc"
 assert_contains "ListenPort = abc" "$(cat "${S}/setconf-input")" "the kernel path still leaves ListenPort to awg setconf, unchanged"
-_awgInternalSelectBoringtunRuntimeForTesting
+AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 
 echo "=== ensureAwgBackendReady (S6) and awgBackendQuickUp ==="
 reset_state
@@ -2988,7 +3108,6 @@ assert_not_contains "awg-quick up" "$(cat "${S}/log")" "and stops before awg-qui
 assert_true "and leaves no state" test -z "$(compgen -G "${AWG_BT_RUN_DIR}/${IF}@*")"
 rm -rf "${AWG_BT_SYS_DIR}/module/amneziawg"
 AWG_BACKEND=kernel
-_AWG_BORINGTUN_RUNTIME_INTERNAL=0
 
 echo
 echo "BoringTun runtime tests: ${PASS} passed, ${FAIL} failed"

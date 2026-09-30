@@ -76,6 +76,11 @@ case "$1" in
 		exit 0
 		;;
 	show)
+		if [[ "${3:-}" == "listen-port" ]]; then
+			# The live listen port, when a test provides one.
+			cat /tmp/awg-mock-listen-port 2>/dev/null || exit 1
+			exit 0
+		fi
 		if [[ "${2:-}" == "all" ]] && [[ "${3:-}" == "dump" ]]; then
 			# Tab-separated dump format used by the Rust poller.
 			# AmneziaWG emits extra obfuscation params on the interface line
@@ -2419,6 +2424,62 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 		echo "FAIL: Privileged helper rejected an approved AWG operation"
 		FAILED=$((FAILED + 1))
 	fi
+
+	# reconcile-interface leaves out the [Interface] ListenPort line only when
+	# it would not change the running interface: exactly one, a valid port,
+	# equal to the live listen port. Otherwise the stripped config is synced
+	# unchanged, as before. (A same-port set is a no-op for the kernel module;
+	# BoringTun rebinds its sockets on every ListenPort it is given.)
+	helper_reconcile_listen_port() { # <label> <strip output> <live port output, or - for none> <expect: omitted|kept>
+		local LABEL="$1" STRIP="$2" LIVE="$3" EXPECT="$4" SYNCED
+		printf '%b' "${STRIP}" > /tmp/awg-quick-strip-output
+		if [[ "${LIVE}" == "-" ]]; then
+			rm -f /tmp/awg-mock-listen-port
+		else
+			printf '%b' "${LIVE}" > /tmp/awg-mock-listen-port
+		fi
+		rm -f /tmp/awg-syncconf-stdin
+		if ! printf '' | "${PRIVILEGED_HELPER}" reconcile-interface awg0 >/dev/null 2>&1; then
+			echo "FAIL: ${LABEL} (reconcile-interface failed)"
+			FAILED=$((FAILED + 1))
+			return
+		fi
+		SYNCED="$(cat /tmp/awg-syncconf-stdin 2>/dev/null)"
+		if ! grep -Fq "PrivateKey = SYNC_PRIVATE_SECRET" <<<"${SYNCED}" || ! grep -Fq "PublicKey = ${SECOND_HELPER_KEY}" <<<"${SYNCED}"; then
+			echo "FAIL: ${LABEL} (the rest of the config was not synced)"
+			FAILED=$((FAILED + 1))
+		elif [[ "${EXPECT}" == omitted ]] && ! grep -qi 'listenport' <<<"${SYNCED}"; then
+			echo "OK: ${LABEL}"
+		elif [[ "${EXPECT}" == kept ]] && [[ "$(printf '%b' "${STRIP}" | grep -ci 'listenport')" == "$(grep -ci 'listenport' <<<"${SYNCED}")" ]]; then
+			echo "OK: ${LABEL}"
+		else
+			echo "FAIL: ${LABEL} (synced: ${SYNCED//$'\n'/ | })"
+			FAILED=$((FAILED + 1))
+		fi
+	}
+	HELPER_PEER="\n[Peer]\nPublicKey = ${SECOND_HELPER_KEY}\nAllowedIPs = 10.66.66.43/32\n"
+	helper_reconcile_listen_port "Helper leaves out a ListenPort equal to the live port" \
+		"[Interface]\nPrivateKey = SYNC_PRIVATE_SECRET\nListenPort = 51820\n${HELPER_PEER}" "51820\n" omitted
+	helper_reconcile_listen_port "Helper leaves out an unchanged ListenPort written with a comment and in any case" \
+		"[Interface]\nPrivateKey = SYNC_PRIVATE_SECRET\nlistenport=51820 # public\n${HELPER_PEER}" "51820\n" omitted
+	helper_reconcile_listen_port "Helper syncs a ListenPort that differs from the live port" \
+		"[Interface]\nPrivateKey = SYNC_PRIVATE_SECRET\nListenPort = 51820\n${HELPER_PEER}" "40000\n" kept
+	helper_reconcile_listen_port "Helper syncs the ListenPort when the live port cannot be read" \
+		"[Interface]\nPrivateKey = SYNC_PRIVATE_SECRET\nListenPort = 51820\n${HELPER_PEER}" - kept
+	helper_reconcile_listen_port "Helper syncs the ListenPort when the live port output is not a single number" \
+		"[Interface]\nPrivateKey = SYNC_PRIVATE_SECRET\nListenPort = 51820\n${HELPER_PEER}" "51820\n; touch /tmp/pwned\n" kept
+	helper_reconcile_listen_port "Helper syncs both ListenPort lines when there are two" \
+		"[Interface]\nPrivateKey = SYNC_PRIVATE_SECRET\nListenPort = 51820\nListenPort = 51820\n${HELPER_PEER}" "51820\n" kept
+	helper_reconcile_listen_port "Helper syncs an invalid ListenPort unchanged" \
+		"[Interface]\nPrivateKey = SYNC_PRIVATE_SECRET\nListenPort = 99999\n${HELPER_PEER}" "99999\n" kept
+	helper_reconcile_listen_port "Helper never drops a ListenPort-like line from a peer section" \
+		"[Interface]\nPrivateKey = SYNC_PRIVATE_SECRET\n\n[Peer]\nPublicKey = ${SECOND_HELPER_KEY}\nListenPort = 51820\nAllowedIPs = 10.66.66.43/32\n" "51820\n" kept
+	if [[ -e /tmp/pwned ]]; then
+		echo "FAIL: Helper executed content of the live listen-port output"
+		FAILED=$((FAILED + 1))
+		rm -f /tmp/pwned
+	fi
+	rm -f /tmp/awg-mock-listen-port /tmp/awg-quick-strip-output
 
 	HELPER_PARAMS_BACKUP="/tmp/amneziawg-helper-params-backup"
 	cp -p /etc/amnezia/amneziawg/params "${HELPER_PARAMS_BACKUP}"
