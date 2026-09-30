@@ -680,6 +680,8 @@ assert_eq "1" "$(_untrusted_rc 0 600 symlink "AWG_BACKEND='boringtun'")" \
     "detect_awg_config: params that are a symlink are refused"
 assert_eq "1" "$(_untrusted_rc 0 600 unloadable)" \
     "detect_awg_config: params that do not load are refused"
+assert_eq "1" "$(_detect_untrusted 0 600 unloadable | cut -d'|' -f2- | grep -c 'cannot be trusted or read')" \
+    "detect_awg_config: params that do not load are refused as unreadable, with the reason"
 assert_eq "0" "$(_untrusted_rc 0 600 - "AWG_BACKEND='kernel'")" \
     "detect_awg_config: valid root-owned 0600 kernel params are still accepted"
 _detect_absent() {

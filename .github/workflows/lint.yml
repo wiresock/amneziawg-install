@@ -44,6 +44,11 @@ jobs:
           bash -n .github/scripts/boringtun-host-diagnostics.sh
           bash -n tests/mutate-boringtun-runtime.sh
           bash -n tests/mutate-boringtun-host.sh
+          bash -n tests/helpers/mutation-engine.sh
+          bash -n tests/test-mutation-engine.sh
+          bash -n tests/equivalence/run-kernel-equivalence.sh
+          bash -n tests/equivalence/kernel-scenarios.sh
+          bash -n tests/equivalence/kernel-install-uninstall.sh
           bash -n tests/helpers/boringtun-foreground-launcher.sh
           bash -n tests/test-proxy-bootstrap.sh
           bash -n tests/test-ubuntu-ppa.sh
@@ -87,12 +92,17 @@ jobs:
           shellcheck --severity=warning tests/test-boringtun-install-mock.sh
           shellcheck --severity=warning tests/test-boringtun-host-live.sh
           shellcheck --severity=warning tests/test-boringtun-kernel-coexistence.sh
+          shellcheck --severity=warning tests/test-boringtun-host-root-safety.sh
           shellcheck --severity=warning .github/scripts/boringtun-host-diagnostics.sh
           shellcheck --severity=warning tests/mutate-boringtun-runtime.sh
           shellcheck --severity=warning tests/mutate-boringtun-host.sh
+          shellcheck --severity=warning tests/helpers/mutation-engine.sh
+          shellcheck --severity=warning tests/test-mutation-engine.sh
+          shellcheck --severity=warning tests/equivalence/run-kernel-equivalence.sh
+          shellcheck --severity=warning tests/equivalence/kernel-scenarios.sh
+          shellcheck --severity=warning tests/equivalence/kernel-install-uninstall.sh
           shellcheck --severity=warning tests/helpers/boringtun-foreground-launcher.sh
           shellcheck --severity=warning tests/test-proxy-bootstrap.sh
-          shellcheck --severity=warning tests/test-boringtun-host-root-safety.sh
           shellcheck --severity=warning tests/test-ubuntu-ppa.sh
           shellcheck --severity=warning tests/test-ubuntu-ppa-variants.sh
           shellcheck --severity=warning tests/test-ubuntu-resolute-live.sh

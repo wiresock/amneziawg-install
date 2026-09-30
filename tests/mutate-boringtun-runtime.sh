@@ -15,25 +15,15 @@ set -uo pipefail
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
-JOBS=4
-if [[ "${1:-}" == -j ]]; then
-	JOBS="${2:?}"
-	shift 2
-fi
+# shellcheck source=helpers/mutation-engine.sh
+source "${SCRIPT_DIR}/helpers/mutation-engine.sh"
 
-declare -a NAMES=() EDITS=()
-SEP=$'\x1f'
 # mutant <name> <exact text, present exactly once> <replacement> [<text> <replacement>]...
 # Several edits make one mutant; each must apply exactly once.
 mutant() {
-	local EDIT=""
-	NAMES+=("$1")
+	local NAME="$1"
 	shift
-	while (($# >= 2)); do
-		EDIT+="$1${SEP}$2${SEP}"
-		shift 2
-	done
-	EDITS+=("${EDIT}")
+	mutation_add "${NAME}" test-boringtun-runtime amneziawg-install.sh "" "$@"
 }
 
 T=$'\t'
@@ -159,65 +149,4 @@ mutant filter_always_strips '((INDEX == PORT_INDEX)) && ((10#${CONFIGURED} == LI
 mutant filter_never_strips '((INDEX == PORT_INDEX)) && ((10#${CONFIGURED} == LIVE))' 'false'
 mutant parser_case_sensitive $'\tshopt -s nocasematch\n\twhile read -r LINE' $'\twhile read -r LINE'
 
-if [[ $# -gt 0 ]]; then
-	declare -a SELECTED=()
-	for NAME in "$@"; do
-		FOUND=0
-		for I in "${!NAMES[@]}"; do
-			[[ "${NAMES[I]}" == "${NAME}" ]] && SELECTED+=("${I}") && FOUND=1
-		done
-		((FOUND)) || { echo "unknown mutant ${NAME}" >&2; exit 2; }
-	done
-else
-	SELECTED=("${!NAMES[@]}")
-fi
-
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/boringtun-mutants.XXXXXX")"
-trap 'rm -rf -- "${WORK}"' EXIT
-
-run_one() { # <index>
-	local I="$1" DIR="${WORK}/m$1" OUT RC SUMMARY P
-	local -a PAIRS=()
-	mkdir -p "${DIR}/tests" "${DIR}/scripts"
-	cp "${PROJECT_ROOT}/tests/test-boringtun-runtime.sh" "${DIR}/tests/"
-	cp "${PROJECT_ROOT}/scripts/boringtun-artifact.sh" "${DIR}/scripts/"
-	cp "${PROJECT_ROOT}/amneziawg-install.sh" "${DIR}/amneziawg-install.sh"
-	mapfile -d "${SEP}" -t PAIRS < <(printf '%s' "${EDITS[I]}")
-	for ((P = 0; P + 1 < ${#PAIRS[@]}; P += 2)); do
-		if ! OLD="${PAIRS[P]}" NEW="${PAIRS[P + 1]}" perl -0777 -ne '
-			my $o = $ENV{OLD}; my $n = $ENV{NEW};
-			my $c = () = /\Q$o\E/g;
-			die "edit '"$((P / 2 + 1))"' matches $c times\n" unless $c == 1;
-			s/\Q$o\E/$n/; print;' "${DIR}/amneziawg-install.sh" >"${DIR}/mutated.sh" 2>"${DIR}/apply.err"; then
-			printf '%-38s DID NOT APPLY (%s)\n' "${NAMES[I]}" "$(cat "${DIR}/apply.err")"
-			return
-		fi
-		mv -- "${DIR}/mutated.sh" "${DIR}/amneziawg-install.sh"
-	done
-	OUT="$(cd "${DIR}" && timeout 900 bash tests/test-boringtun-runtime.sh 2>&1)"
-	RC=$?
-	SUMMARY="$(grep 'runtime tests:' <<<"${OUT}" | tail -n 1)"
-	if ((RC == 0)); then
-		printf '%-38s SURVIVED (%s)\n' "${NAMES[I]}" "${SUMMARY}"
-	else
-		printf '%-38s caught: %s | %s\n' "${NAMES[I]}" "${SUMMARY:-no summary, rc=${RC}}" \
-			"$(grep -m1 'FAIL:' <<<"${OUT}" | sed 's/^ *//' | cut -c1-100)"
-	fi
-}
-
-for I in "${SELECTED[@]}"; do
-	while (($(jobs -rp | wc -l) >= JOBS)); do
-		wait -n
-	done
-	run_one "${I}" >"${WORK}/result.${I}" &
-done
-wait
-
-BAD=0
-for I in "${SELECTED[@]}"; do
-	cat "${WORK}/result.${I}"
-	grep -qE 'SURVIVED|DID NOT APPLY' "${WORK}/result.${I}" && BAD=$((BAD + 1))
-done
-echo
-echo "BoringTun runtime mutants: $((${#SELECTED[@]} - BAD)) of ${#SELECTED[@]} caught"
-((BAD == 0))
+mutation_main "BoringTun runtime" "${PROJECT_ROOT}" "$@"

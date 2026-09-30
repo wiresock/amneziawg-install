@@ -2386,13 +2386,13 @@ ORIGINAL_EXIT_TRAP="$(trap -p EXIT)"
 : >"${S}/log"
 awgBackendCreateScratchInterface awgp1 2>"${T}/err"
 assert_rc 0 "$?" "under systemd a scratch interface starts in a transient unit"
-TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp1]}"
+TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp1]:-}"
 UNIT="amneziawg-scratch-awgp1-${TOKEN}"
 assert_eq "systemd-run --quiet --collect --unit=${UNIT} -p Type=exec -p RuntimeMaxSec=900 -- $(command -v bash) -c [[ -e \"\$1\" && ! -e \"\$2\" ]] || exit 0; shift 2; exec \"\$@\" awg-scratch-unit ${SCRATCH_DIR}/${TOKEN}.owner ${SCRATCH_DIR}/${TOKEN}.reclaim $(command -v env) -i PATH=${AWG_BT_PATH} NO_COLOR=1 ${VERIFIED_BIN} --foreground --disable-drop-privileges --verbosity error awgp1" \
 	"$(grep '^systemd-run' "${S}/log")" "the unit is named after the attempt's token, has a hard lifetime and runs the production command line behind the attempt's gate"
 UNIT_PID="$(cat "${S}/units/${UNIT}")"
 assert_true "and the daemon is running" pid_alive "${UNIT_PID}"
-GUARD_PID="${_AWG_BT_SCRATCH_GUARDS[awgp1]}"
+GUARD_PID="${_AWG_BT_SCRATCH_GUARDS[awgp1]:-}"
 assert_true "and a guardian watches the shell that owns it" pid_alive "${GUARD_PID}"
 assert_eq "created ${UNIT_PID} ${GUARD_PID} ${BASHPID}" \
 	"$(record_get "${TOKEN}" guard PHASE) $(record_get "${TOKEN}" guard DAEMON_PID) $(record_get "${TOKEN}" guard GUARD_PID) $(record_get "${TOKEN}" owner OWNER_PID)" \
@@ -2412,13 +2412,13 @@ bash -c 'sleep 300 </dev/null >/dev/null 2>&1 & echo $!' | tee -a "${T}/decoys" 
 DECOY_PID="$(cat "${T}/decoy-pid")"
 awgBackendCreateScratchInterface awgv2 2>/dev/null
 assert_rc 0 "$?" "without systemd a scratch interface is a tracked process"
-TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgv2]}"
+TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgv2]:-}"
 CHILD_PID="$(record_get "${TOKEN}" guard DAEMON_PID)"
 assert_true "and it is running" pid_alive "${CHILD_PID}"
 assert_eq "${CHILD_PID} $(_awgBtProcessStartTime "${CHILD_PID}")" \
 	"$(record_get "${TOKEN}" child CHILD_PID) $(record_get "${TOKEN}" child CHILD_START)" \
 	"S3: the daemon recorded its own identity before readiness was declared"
-assert_eq "${_AWG_BT_SCRATCH_GUARDS[awgv2]}" "$(awk '{print $4}' "/proc/${CHILD_PID}/stat")" "whose parent is its guardian"
+assert_eq "${_AWG_BT_SCRATCH_GUARDS[awgv2]:-}" "$(awk '{print $4}' "/proc/${CHILD_PID}/stat")" "whose parent is its guardian"
 SIGIGN="$(tr -d '[:space:]' <"${TUNROOT}/${CHILD_PID}/sigign")"
 assert_true "and which does not inherit the guardian's ignored HUP, INT and TERM" test "$((16#${SIGIGN} & 16#4003))" -eq 0
 awgBackendDestroyScratchInterface awgv2
@@ -2442,7 +2442,7 @@ AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_PRESENT}"
 (
 	trap 'echo "previous handler ran" >"${T}/prev-exit"' EXIT
 	awgBackendCreateScratchInterface awgp5 2>/dev/null
-	echo "${_AWG_BT_SCRATCH_TOKENS[awgp5]}" >"${T}/token"
+	echo "${_AWG_BT_SCRATCH_TOKENS[awgp5]:-}" >"${T}/token"
 	exit 7
 )
 assert_rc 7 "$?" "a shell that exits with a scratch interface keeps its exit status"
@@ -2454,7 +2454,7 @@ for SIGNAL in TERM INT HUP KILL; do
 	rm -f "${T}/token"
 	(
 		awgBackendCreateScratchInterface awgp6 2>/dev/null
-		echo "${_AWG_BT_SCRATCH_TOKENS[awgp6]}" >"${T}/token"
+		echo "${_AWG_BT_SCRATCH_TOKENS[awgp6]:-}" >"${T}/token"
 		kill -s "${SIGNAL}" "${BASHPID}"
 		sleep 5
 		echo "not reached" >"${T}/not-reached"
@@ -2487,7 +2487,7 @@ AWG_BACKEND="${AWG_BACKEND_BORINGTUN}"
 case "$4" in
 	create)
 		awgBackendCreateScratchInterface "$5" >/dev/null 2>&1 || exit 1
-		echo "${_AWG_BT_SCRATCH_TOKENS[$5]}" >"$6.tmp" && mv "$6.tmp" "$6"
+		echo "${_AWG_BT_SCRATCH_TOKENS[$5]:-}" >"$6.tmp" && mv "$6.tmp" "$6"
 		[[ "${7:-}" == hold ]] && exec sleep 120
 		exit 0
 		;;
@@ -2527,7 +2527,7 @@ reset_state
 touch "${S}/systemd-run-lost"
 awgBackendCreateScratchInterface awgp8 2>/dev/null
 assert_rc 0 "$?" "S3: a unit whose systemd-run answer was lost is still recognised by its token and used"
-TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp8]}"
+TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp8]:-}"
 rm -f "${S}/systemd-run-lost"
 awgBackendDestroyScratchInterface awgp8
 assert_true "S3: and it is torn down" scratch_gone awgp8 "${TOKEN}"
@@ -2883,7 +2883,7 @@ wait "${REAPER}" 2>/dev/null
 echo "=== The stale sweep touches only what records prove dead ==="
 reset_state
 awgBackendCreateScratchInterface awgp2 2>/dev/null
-TOKEN_A="${_AWG_BT_SCRATCH_TOKENS[awgp2]}"
+TOKEN_A="${_AWG_BT_SCRATCH_TOKENS[awgp2]:-}"
 owner unit sweep
 assert_true "a sweep in another process leaves an attempt with a live owner alone" test -e "${SCRATCH_DIR}/${TOKEN_A}.guard" -a -e "${NET}/awgp2"
 awgBackendCreateScratchInterface awgp3 2>/dev/null
@@ -2970,8 +2970,8 @@ rm -f "${SCRATCH_DIR}/${BOGUS}".*
 # A reused guardian PID in the owner's tracking.
 AWG_BT_SYSTEMD_RUNTIME_DIR="${SYSTEMD_ABSENT}"
 awgBackendCreateScratchInterface awgv4 2>/dev/null
-TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgv4]}"
-REAL_GUARD="${_AWG_BT_SCRATCH_GUARDS[awgv4]}"
+TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgv4]:-}"
+REAL_GUARD="${_AWG_BT_SCRATCH_GUARDS[awgv4]:-}"
 _AWG_BT_SCRATCH_GUARDS[awgv4]="${DECOY_PID}"
 _AWG_BT_SCRATCH_GUARD_STARTS[awgv4]="$((DECOY_START + 1))"
 awgBackendDestroyScratchInterface awgv4 2>/dev/null
