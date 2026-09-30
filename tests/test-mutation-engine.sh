@@ -130,7 +130,7 @@ check "and fails the run" test "${RC}" -ne 0
 echo "=== The wrong failing assertion"
 run_toy wrong "mutation_add wrong_reason test-toy tool.sh 'an assertion that does not exist' '\$((\$1 * 2))' '\$((\$1 * 3))'"
 check "is INVALID when no failing assertion names the expected one" \
-	grep -q 'wrong_reason *INVALID (test-toy failed, but no failing assertion mentions "an assertion that does not exist")' <<<"${OUT}"
+	grep -q 'wrong_reason *INVALID (test-toy failed, but no failing assertion mentions "an assertion that does not exist"; first: FAIL: double 2 is 4)' <<<"${OUT}"
 check "and fails the run" test "${RC}" -ne 0
 
 echo "=== Harness failures"
