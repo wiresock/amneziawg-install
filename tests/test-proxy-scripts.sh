@@ -634,26 +634,43 @@ assert_eq "1" "$(_detect_rc - "AWG_BACKEND='kernel'" "AWG_PROTOCOL_VERSION='3'")
 # trusted leaves the backend unknown and fails closed; it never lets the
 # legacy .conf discovery decide. stat reports the given owner, since the test
 # cannot create root-owned files.
-_detect_untrusted() { # <owner uid> <mode> <symlink|unloadable|-> <params lines...>
+# Shapes: symlink, unloadable (a line that is no assignment), unreadable
+# (mode 000; stat reports the given mode), exact (only the given lines, in
+# order), - (the given lines after SERVER_AWG_NIC and SERVER_PORT).
+_detect_untrusted() { # <owner uid> <mode> <shape> <params lines...>
     local test_params_owner="$1" mode="$2" shape="$3"
     shift 3
     local tmpdir
     tmpdir="$(mktemp -d)"
-    printf '%s\n' "SERVER_AWG_NIC='awg0'" "SERVER_PORT='51820'" "$@" >"${tmpdir}/params.real"
+    if [[ "${shape}" == exact ]]; then
+        printf '%s\n' "$@" >"${tmpdir}/params.real"
+    else
+        printf '%s\n' "SERVER_AWG_NIC='awg0'" "SERVER_PORT='51820'" "$@" >"${tmpdir}/params.real"
+    fi
     printf '[Interface]\nListenPort = 51820\n' >"${tmpdir}/awg0.conf"
     case "${shape}" in
         symlink) ln -s "${tmpdir}/params.real" "${tmpdir}/params" ;;
         unloadable) printf 'SERVER_AWG_NIC=(\n' >"${tmpdir}/params" ;;
         *) mv "${tmpdir}/params.real" "${tmpdir}/params" ;;
     esac
-    chmod "${mode}" "${tmpdir}/params" "${tmpdir}/params.real" 2>/dev/null
+    if [[ "${shape}" == unreadable ]]; then
+        chmod 000 "${tmpdir}/params"
+    else
+        chmod "${mode}" "${tmpdir}/params" "${tmpdir}/params.real" 2>/dev/null
+    fi
     (
         set --
         source "${INSTALL_SCRIPT}"
         info()  { :; }
         warn()  { :; }
         step()  { :; }
-        stat() { if [[ "$2" == %u ]]; then echo "${test_params_owner}"; else command stat "$@"; fi; }
+        stat() {
+            case "$2" in
+                %u) echo "${test_params_owner}" ;;
+                %a) if [[ "${shape}" == unreadable ]]; then echo "${mode}"; else command stat "$@"; fi ;;
+                *) command stat "$@" ;;
+            esac
+        }
         AWG_DIR="${tmpdir}"
         LISTEN_PORT=""
         detect_awg_config >/dev/null
@@ -684,6 +701,31 @@ assert_eq "1" "$(_detect_untrusted 0 600 unloadable | cut -d'|' -f2- | grep -c '
     "detect_awg_config: params that do not load are refused as unreadable, with the reason"
 assert_eq "0" "$(_untrusted_rc 0 600 - "AWG_BACKEND='kernel'")" \
     "detect_awg_config: valid root-owned 0600 kernel params are still accepted"
+# Params are data: a malformed line is refused even when later lines are
+# valid, and nothing in the file ever runs.
+assert_eq "1" "$(_untrusted_rc 0 600 exact "AWG_BACKEND = boringtun" "SERVER_AWG_NIC='awg0'" "SERVER_PORT='51820'")" \
+    "detect_awg_config: 'AWG_BACKEND = boringtun' before valid lines is refused, never read as legacy"
+S4_MARKER="$(mktemp -u)"
+assert_eq "1" "$(_untrusted_rc 0 600 exact "touch ${S4_MARKER}" "AWG_BACKEND='kernel'" "SERVER_AWG_NIC='awg0'" "SERVER_PORT='51820'")" \
+    "detect_awg_config: a command before otherwise valid kernel assignments is refused"
+assert_eq "no" "$([[ -e "${S4_MARKER}" ]] && echo yes || echo no)" \
+    "detect_awg_config: and the command in the params file never runs"
+rm -f "${S4_MARKER}"
+for S4_LINE in "AWG_BACKEND=\$(id)" "AWG_BACKEND='kernel'; id" "AWG_BACKEND='kernel" "AWG_BACKEND=\"kernel\"" \
+    "AWG_BACKEND=\`id\`" "export AWG_BACKEND='kernel'" "AWG_BACKEND= kernel" "awg_backend='kernel'"; do
+    assert_eq "1" "$(_untrusted_rc 0 600 - "${S4_LINE}")" "detect_awg_config: the params line ${S4_LINE} is refused"
+done
+assert_eq "1" "$(_untrusted_rc 0 600 - "AWG_BACKEND='boringtun'" "AWG_BACKEND='kernel'")" \
+    "detect_awg_config: a duplicate key is refused, never read as its last value"
+if [[ "${EUID}" -ne 0 ]]; then
+    assert_eq "1" "$(_untrusted_rc 0 600 unreadable "AWG_BACKEND='kernel'")" \
+        "detect_awg_config: an unreadable params file is refused"
+fi
+assert_eq "0" "$(_untrusted_rc 0 600 - "AWG_BACKEND='kernel'" "SERVER_PUB_IP='it'\"'\"'s'" "# a comment" "")" \
+    "detect_awg_config: the installer's quoting of a single quote, a comment and a blank line are accepted"
+assert_eq "0" "$(_untrusted_rc 0 600 exact "SERVER_PUB_IP=203.0.113.7" "SERVER_AWG_NIC=awg0" "SERVER_PORT=51820" \
+    "SERVER_PRIV_KEY=YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=" "ALLOWED_IPS=0.0.0.0/0,::/0")" \
+    "detect_awg_config: legacy unquoted params (installers before 7c2e7dd) are accepted as kernel"
 _detect_absent() {
     local tmpdir
     tmpdir="$(mktemp -d)"
