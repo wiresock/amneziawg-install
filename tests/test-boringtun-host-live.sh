@@ -696,9 +696,17 @@ datapath "after the lifecycle"
 if [[ -n "${AWG_LIVE_BASE_INSTALLER:-}" ]]; then
 	echo "=== Binary lifecycle with the previous installer version's helpers"
 	LIBEXEC=/usr/local/libexec/amneziawg-install
+	# Each rendering is read in full before the comparison: cmp on a pipe stops
+	# at the first difference and leaves the renderer writing into a closed pipe.
+	# The trailing x keeps trailing newlines in both sides.
 	helpers_are_this_installers() {
-		cmp -s "${LIBEXEC}/awg-boringtun-launch" <(bash -c 'source "$1" && _awgBtRenderHelper launch' _ "${INSTALLER}") &&
-			cmp -s "${LIBEXEC}/awg-backend-ctl" <(bash -c 'source "$1" && _awgBtRenderHelper ctl' _ "${INSTALLER}")
+		local KIND FILE RENDERED
+		for KIND in launch ctl; do
+			FILE="${LIBEXEC}/awg-boringtun-launch"
+			[[ "${KIND}" == ctl ]] && FILE="${LIBEXEC}/awg-backend-ctl"
+			RENDERED="$(bash -c 'source "$1" && _awgBtRenderHelper "$2"' _ "${INSTALLER}" "${KIND}" && echo x)" || return 1
+			[[ "$(cat -- "${FILE}" && echo x)" == "${RENDERED}" ]] || return 1
+		done
 	}
 	bash -c 'source "$1" >/dev/null && _awgBtInstallHelpers' _ "${AWG_LIVE_BASE_INSTALLER}"
 	if helpers_are_this_installers; then
