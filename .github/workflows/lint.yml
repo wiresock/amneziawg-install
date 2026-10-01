@@ -37,6 +37,7 @@ jobs:
           bash -n tests/test-boringtun-runtime.sh
           bash -n tests/test-boringtun-runtime-live.sh
           bash -n tests/test-boringtun-host.sh
+          bash -n tests/test-boringtun-imitation.sh
           bash -n tests/test-boringtun-install-mock.sh
           bash -n tests/test-boringtun-host-live.sh
           bash -n tests/test-boringtun-kernel-coexistence.sh
@@ -44,6 +45,7 @@ jobs:
           bash -n .github/scripts/boringtun-host-diagnostics.sh
           bash -n tests/mutate-boringtun-runtime.sh
           bash -n tests/mutate-boringtun-host.sh
+          bash -n tests/mutate-boringtun-imitation.sh
           bash -n tests/helpers/mutation-engine.sh
           bash -n tests/test-mutation-engine.sh
           bash -n tests/helpers/boringtun-live-firewall.sh
@@ -91,6 +93,7 @@ jobs:
           shellcheck --severity=warning tests/test-boringtun-runtime.sh
           shellcheck --severity=warning tests/test-boringtun-runtime-live.sh
           shellcheck --severity=warning tests/test-boringtun-host.sh
+          shellcheck --severity=warning tests/test-boringtun-imitation.sh
           shellcheck --severity=warning tests/test-boringtun-install-mock.sh
           shellcheck --severity=warning tests/test-boringtun-host-live.sh
           shellcheck --severity=warning tests/test-boringtun-kernel-coexistence.sh
@@ -98,6 +101,7 @@ jobs:
           shellcheck --severity=warning .github/scripts/boringtun-host-diagnostics.sh
           shellcheck --severity=warning tests/mutate-boringtun-runtime.sh
           shellcheck --severity=warning tests/mutate-boringtun-host.sh
+          shellcheck --severity=warning tests/mutate-boringtun-imitation.sh
           shellcheck --severity=warning tests/helpers/mutation-engine.sh
           shellcheck --severity=warning tests/test-mutation-engine.sh
           shellcheck --severity=warning tests/helpers/boringtun-live-firewall.sh

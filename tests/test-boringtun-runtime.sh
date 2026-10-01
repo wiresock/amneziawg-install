@@ -1146,7 +1146,16 @@ rm -f "${AWG_BT_CONFIG_DIR}/${IF}.boringtun"
 launch_expect_refused "a missing runtime file is refused" "missing or not a regular file"
 runtime_case "a runtime file with mode 0644 is refused" "mode 0600" $'FORMAT=1\n' 0644
 runtime_case "a repeated runtime key is refused" "repeated key FORMAT" $'FORMAT=1\nFORMAT=1\n'
-runtime_case "an unknown runtime key is refused" "unknown key IMITATE_PROTOCOL" $'FORMAT=1\nIMITATE_PROTOCOL=dns\n'
+runtime_case "an unknown runtime key is refused" "unknown key PROBE_REPLY_RATE" $'FORMAT=1\nPROBE_REPLY_RATE=0\n'
+runtime_case "IMITATE_PROTOCOL=none is refused: the key's absence says none" "invalid IMITATE_PROTOCOL" $'FORMAT=1\nIMITATE_PROTOCOL=none\n'
+runtime_case "an unsupported IMITATE_PROTOCOL is refused" "invalid IMITATE_PROTOCOL" $'FORMAT=1\nIMITATE_PROTOCOL=http\n'
+runtime_case "an IMITATE_PROTOCOL in another case is refused" "invalid IMITATE_PROTOCOL" $'FORMAT=1\nIMITATE_PROTOCOL=DNS\n'
+runtime_case "a repeated IMITATE_PROTOCOL is refused" "repeated key IMITATE_PROTOCOL" $'FORMAT=1\nIMITATE_PROTOCOL=dns\nIMITATE_PROTOCOL=quic\n'
+runtime_case "an IMITATE_DOMAIN without IMITATE_PROTOCOL is refused" "invalid protocol imitation" $'FORMAT=1\nIMITATE_DOMAIN=example.com\n'
+runtime_case "an IMITATE_DOMAIN for stun is refused" "used only by dns, quic and sip" $'FORMAT=1\nIMITATE_PROTOCOL=stun\nIMITATE_DOMAIN=example.com\n'
+runtime_case "an empty IMITATE_DOMAIN is refused" "invalid protocol imitation" $'FORMAT=1\nIMITATE_PROTOCOL=dns\nIMITATE_DOMAIN=\n'
+runtime_case "an IMITATE_DOMAIN that is not an LDH host name is refused" "invalid imitation hostname" $'FORMAT=1\nIMITATE_PROTOCOL=quic\nIMITATE_DOMAIN=a b.example\n'
+runtime_case "an IMITATE_DOMAIN with a hyphen-edged label is refused" "invalid imitation hostname" $'FORMAT=1\nIMITATE_PROTOCOL=sip\nIMITATE_DOMAIN=-a.example\n'
 runtime_case "a malformed runtime line is refused" "malformed line" $'FORMAT=1\nexport X=1\n'
 runtime_case "a runtime file without FORMAT is refused" "has no FORMAT" $'# comment only\n'
 runtime_case "an unsupported runtime FORMAT is refused" "unsupported FORMAT 2" $'FORMAT=2\n'
@@ -1208,7 +1217,9 @@ assert_eq "--foreground
 --disable-drop-privileges
 --verbosity
 error
-${IF}" "$(cat "${S}/argv-${IF}")" "the daemon gets exactly the production arguments"
+--imitate-protocol
+none
+${IF}" "$(cat "${S}/argv-${IF}")" "the daemon gets exactly the production arguments, naming imitation none"
 assert_eq "${VERIFIED_BIN}" "$(tr '\0' '\n' <"/proc/${PID}/cmdline" | sed -n 1p)" \
 	"the daemon runs the verified store binary by its canonical path"
 ENV_NAMES="$(cut -d= -f1 "${S}/env-${IF}" | grep -vxE 'PWD|SHLVL|_' | tr '\n' ' ')"
@@ -1228,6 +1239,37 @@ bash -c 'sleep 60 </dev/null >/dev/null 2>&1 & echo $!' | tee -a "${T}/decoys" >
 assert_eq "" "$(_awgBtSocketHeldBy "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "$(cat "${T}/other-pid")" "$(_awgBtProcessStartTime "$(cat "${T}/other-pid")")")" \
 	"S2b: no other process is taken for its holder"
 kill -TERM "${PID}"
+wait_until 3 pid_gone "${PID}"
+
+# The imitation reaches the daemon only from the runtime file, never from WG_*
+# variables, and --probe-reply-rate is never passed.
+reset_state
+write_runtime_file "${IF}" $'FORMAT=1\nIMITATE_PROTOCOL=dns\nIMITATE_DOMAIN=example.com\n'
+ctl_precheck "${IF}"
+run env WG_IMITATE_PROTOCOL=sip WG_IMITATE_DOMAIN=evil.example WG_PROBE_REPLY_RATE=999999 "${LAUNCH}" "${IF}"
+assert_rc 0 "${RC}" "the launcher starts a daemon with a dns imitation"
+PID="$(cat "${AWG_BT_RUN_DIR}/boringtun-${IF}.pid" 2>/dev/null)"
+assert_eq "--foreground
+--disable-drop-privileges
+--verbosity
+error
+--imitate-protocol
+dns
+--imitate-domain
+example.com
+${IF}" "$(cat "${S}/argv-${IF}")" "the daemon gets the runtime file's protocol and hostname, the interface last"
+assert_eq "NO_COLOR PATH " "$(cut -d= -f1 "${S}/env-${IF}" | grep -vxE 'PWD|SHLVL|_' | tr '\n' ' ')" \
+	"and still no WG_* variable, whatever the caller exported"
+kill -TERM "${PID}" 2>/dev/null
+wait_until 3 pid_gone "${PID}"
+reset_state
+write_runtime_file "${IF}" $'FORMAT=1\nIMITATE_PROTOCOL=stun\n'
+ctl_precheck "${IF}"
+run "${LAUNCH}" "${IF}"
+PID="$(cat "${AWG_BT_RUN_DIR}/boringtun-${IF}.pid" 2>/dev/null)"
+assert_eq "--foreground --disable-drop-privileges --verbosity error --imitate-protocol stun ${IF}" \
+	"$(tr '\n' ' ' <"${S}/argv-${IF}" | sed 's/ $//')" "stun imitation carries no hostname"
+kill -TERM "${PID}" 2>/dev/null
 wait_until 3 pid_gone "${PID}"
 
 reset_state
@@ -2388,7 +2430,7 @@ awgBackendCreateScratchInterface awgp1 2>"${T}/err"
 assert_rc 0 "$?" "under systemd a scratch interface starts in a transient unit"
 TOKEN="${_AWG_BT_SCRATCH_TOKENS[awgp1]:-}"
 UNIT="amneziawg-scratch-awgp1-${TOKEN}"
-assert_eq "systemd-run --quiet --collect --unit=${UNIT} -p Type=exec -p RuntimeMaxSec=900 -- $(command -v bash) -c [[ -e \"\$1\" && ! -e \"\$2\" ]] || exit 0; shift 2; exec \"\$@\" awg-scratch-unit ${SCRATCH_DIR}/${TOKEN}.owner ${SCRATCH_DIR}/${TOKEN}.reclaim $(command -v env) -i PATH=${AWG_BT_PATH} NO_COLOR=1 ${VERIFIED_BIN} --foreground --disable-drop-privileges --verbosity error awgp1" \
+assert_eq "systemd-run --quiet --collect --unit=${UNIT} -p Type=exec -p RuntimeMaxSec=900 -- $(command -v bash) -c [[ -e \"\$1\" && ! -e \"\$2\" ]] || exit 0; shift 2; exec \"\$@\" awg-scratch-unit ${SCRATCH_DIR}/${TOKEN}.owner ${SCRATCH_DIR}/${TOKEN}.reclaim $(command -v env) -i PATH=${AWG_BT_PATH} NO_COLOR=1 ${VERIFIED_BIN} --foreground --disable-drop-privileges --verbosity error --imitate-protocol none awgp1" \
 	"$(grep '^systemd-run' "${S}/log")" "the unit is named after the attempt's token, has a hard lifetime and runs the production command line behind the attempt's gate"
 UNIT_PID="$(cat "${S}/units/${UNIT}")"
 assert_true "and the daemon is running" pid_alive "${UNIT_PID}"

@@ -828,6 +828,15 @@ is kept verbatim.
 - **Probe replies.** Replying to unauthenticated probes turns on by default when a protocol is
   set, subject to an aggregate byte budget. It can be disabled with
   `--probe-reply-rate 0` (FACT).
+- **At the pinned commit `71d8878`** (FACT, from its source, and VERIFIED by the PR 5 live
+  test): only a probe of the imitated protocol is answered. A DNS query gets `SERVFAIL`, a STUN
+  Binding Request a Binding Success, and a QUIC long-header packet of at least 1200 bytes gets
+  Version Negotiation only when its version is not one real servers accept (v1 and v2 get no
+  reply). SIP is never answered. The budget is 16 KiB/s by default. Sources that are loopback,
+  link-local, multicast, broadcast, `0.0.0.0/8` or `240.0.0.0/4`, or use port 0, are never
+  answered. DNS and SIP take a strict LDH hostname; QUIC accepts any printable SNI up to 253
+  bytes. A hostname with `none` or `stun`, or an invalid one, makes the binary exit before it
+  daemonizes, as does a `--probe-reply-rate` above 0 with `none`.
 
 ### 9.2 Persisted model and validation (PROPOSAL)
 
@@ -862,7 +871,11 @@ is kept verbatim.
    affected, because the Noise transport encryption is unchanged. BoringTun warns about this
    rather than refusing it (FACT). The installer should state that under imitation, AWG 3.x
    header protection adds little unmasking resistance. The datagrams present as the imitated
-   protocol instead.
+   protocol instead. **At `71d8878`** the effect depends on the protocol: `dns` leaves a
+   16-bit nonce, `stun` a 32-bit one, and `quic` and `none` a random one. SIP with any of S1–S4
+   at 31 bytes or more is **refused** (`HeaderProtectionNonce::Degenerate`): the request line
+   would leave the nonce a few fixed strings. The installer refuses that combination itself
+   (§21.3).
 2. **Upstream-collision avoidance is off under imitation.** With header protection on and no
    imitation, BoringTun re-frames a transport packet that an upstream receiver would misread
    as a control message. The kernel module (`4569c4c`) and amneziawg-go (`b5928ef`) drop such
@@ -872,7 +885,11 @@ is kept verbatim.
    go clients may therefore lose a fraction of server-to-client packets. **OPEN:** measure
    this with a live interop test before recommending that combination. Until then the
    installer warns, and recommends imitation with AWG 2.0, or AWG 3.x only with clients
-   known to handle it.
+   known to handle it. **Superseded at `71d8878`** (FACT): the per-protocol review landed.
+   `imitation_redraw_avoids_upstream_collisions` keeps the avoidance for `none`, `dns`, `quic`
+   and `stun`. It excludes only SIP with a request-line prefix, which header protection
+   refuses anyway. PR 5 measures kernel-client loss under AWG 3.0 with each imitation
+   (§18.6, R5).
 3. **Fidelity depends on the S sizes** (FACT, from `fill_dns`, `fill_stun` and `fill_sip` at
    `e4e4dc8`). A complete DNS framing with a root query needs at least 32 bytes of prefix,
    and a domain query needs `12 + len(domain) + 2 + 4 + 15`. STUN needs 20 bytes for a
@@ -884,7 +901,9 @@ is kept verbatim.
 4. **Probe responder.** DNS probes get SERVFAIL, STUN probes get Binding Success and QUIC
    probes get Version Negotiation. There is no SIP responder. Loopback sources are never
    answered. The STUN reply is larger than a bare request (about 2.6×), and only the
-   aggregate byte budget bounds that reflection (FACT).
+   aggregate byte budget bounds that reflection (FACT). At `71d8878`, Version Negotiation
+   answers only Initials of at least 1200 bytes whose version real servers do not accept;
+   QUIC v1 and v2 get no reply (§9.1).
 5. **Port choice.** Imitation is more plausible on the protocol's usual port, but the installer
    does not move ports: a port change needs new client configs. Port 53 on a host also conflicts
    with local resolvers such as `systemd-resolved`'s stub. This is documentation only.
@@ -1538,7 +1557,7 @@ artefacts can be staged, validated and swapped.
 | **2. Pinned BoringTun artefacts (CI only)** | A workflow builds the pinned commit for x86_64 and aarch64 (musl) on native runners, checks reproducibility, runs `cargo deny`, generates licenses and publishes `SHA256SUMS` and a provenance attestation. A smoke job runs the upstream interop harnesses and a descriptor-leak regression check against the artefact. The pin is recorded where the installer will read it. | No | — (parallel with 1) |
 | **3. BoringTun runtime layer** | `awg-backend-ctl` and launcher, generated from installer functions; the drop-in renderer; scratch interfaces (transient units); `ensureAwgBackendReady`, `awgSyncInterfaceConfig` filter and `awgBackendQuickUp` for BoringTun; probe and validation messages; supervision and crash-safe teardown. Mocked tests, plus a live CI job that provisions a host manually. | No (reachable only through an undocumented test hook) | 1, 2 |
 | **4. BoringTun host install and uninstall (experimental)** | `AWG_BACKEND=boringtun` for fresh Debian and Ubuntu installs (VM or bare metal); packages without recommends; binary acquisition and verification; uninstall; proxy and web-lifecycle guards; the web helper `ListenPort` filter; the proxy installer backend guard; the live CI jobs (§18.3–18.6 without their imitation steps); README section marked experimental. No imitation. Implemented as recorded in §21.2. | Yes | 3 |
-| **5. Built-in imitation** | Params keys, validation, install-time selection, `--set-boringtun-imitation` transaction, warnings and advisory, `--backend-status`, menu display. The imitation steps of §18.3 (step 8) and §18.6 ("with imitation" interop). | Yes | 4 |
+| **5. Built-in imitation** | Params keys, validation, install-time selection, `--set-boringtun-imitation` transaction, warnings and advisory, `--backend-status`, menu display. The imitation steps of §18.3 (step 8) and §18.6 ("with imitation" interop). Implemented as recorded in §21.3. | Yes | 4 |
 | **6. BoringTun binary lifecycle** | `--upgrade-boringtun` and `--rollback-boringtun` transactions. | Yes | 4 |
 | **7. Virtualization** | Backend-aware `checkVirt` with LXC and nspawn support for BoringTun after preflight; LXC hints; an LXC CI test if feasible (LXD on the runner). | Yes | 4 |
 | **8. Web panel and proxy UX, plus kernel-side guard** | Web wording, version display and read-only backend status (helper allowlist); proxy docs; refuse AWG 3.x with the proxy installed (a flagged behaviour change). | Yes | 4 |
@@ -2320,6 +2339,176 @@ assertion, and at least one assertion-failure line; text that merely contains
 `tests/equivalence/run-kernel-equivalence.sh <base>` compares the kernel path
 with a base revision.
 
+### 21.3 Built-in imitation as implemented (PR 5)
+
+PR 5 lets a BoringTun installation choose, change and inspect BoringTun's own
+protocol imitation. It adds no BoringTun source change, binary or pin change.
+The release stays `boringtun-cli-0.7.1-g71d88784ad29-b1`. This section records
+what it implements and where it differs from §9.
+
+**Persisted model.** A BoringTun installation's params carry
+`AWG_BORINGTUN_IMITATE_PROTOCOL` (`none`, `dns`, `quic`, `sip` or `stun`) and
+`AWG_BORINGTUN_IMITATE_DOMAIN` (empty, or a hostname for `dns`, `quic` or
+`sip`). `serializeParams` writes them only for BoringTun, so kernel params keep
+exactly their earlier keys. The environment boundary is the backend's:
+- `validateParamsFile` unsets both names before sourcing params.
+- A key that is absent means `none`, which is what PR 4 params mean.
+- A present key must be valid.
+- Kernel params that carry anything other than `none` and no hostname are
+  damaged.
+- Only a fresh install reads the caller's values, from copies taken when the
+  installer loads (`selectFreshInstallImitation`).
+- A kernel install that asks for an imitation fails before any change.
+
+The hostname rule is the binary's strict LDH rule (`is_valid_imitation_host`),
+applied by the installer to all three protocols. That is narrower than the
+binary for QUIC, which accepts any printable SNI. The characters are spelled out,
+so no locale widens the rule.
+
+**Runtime file and command line.** `<if>.boringtun` stays `FORMAT=1`. It gains
+two optional allowlisted keys, `IMITATE_PROTOCOL` and `IMITATE_DOMAIN`, rendered
+only when the imitation is not `none`. A file without them, such as PR 4's, means
+`none`, and `none` renders PR 4's file byte for byte. The launcher's parser
+refuses:
+- `IMITATE_PROTOCOL=none`;
+- an unknown protocol;
+- a repeated key;
+- a hostname without a protocol, an empty one, one with `stun`, or an invalid
+  one.
+
+`_awgBtDaemonArgv` always names the protocol and appends the interface last:
+`… --verbosity error --imitate-protocol <p> [--imitate-domain <d>] <if>`.
+`--probe-reply-rate` is never passed, so the binary's default applies (16 KiB/s
+with a protocol, off with `none`). The daemon still gets an `env -i`
+environment of `PATH` and `NO_COLOR`, so no `WG_*` variable reaches it. Scratch
+instances run the persisted imitation, so staged validation (§8.4) checks what
+the service will run, including the SIP refusal.
+
+**Fresh install.**
+- `AUTO_INSTALL` takes the environment's values, or `none`, and never asks.
+- An interactive BoringTun install asks "Protocol imitation: 1) none (default)
+  2) dns 3) quic 4) sip 5) stun", and for `dns`, `quic` and `sip` an optional
+  hostname.
+- The kernel install asks nothing new.
+- The warnings below are printed before the final confirmation.
+
+**Warnings (§9.4).** `printBoringtunImitationWarnings` covers:
+- that shaping is server-side only, and client configs do not change;
+- the probe replies of the chosen protocol, the budget and the refused sources;
+- that the port never changes;
+- under AWG 3.x, the header-protection nonce each protocol leaves;
+- an advisory, never a refusal, for S1–S4 below the pinned fillers' sizes:
+  `dns` 32 (or the hostname's length + 33), `stun` 20, `sip` 31, `quic` 1.
+
+`checkBoringtunImitationProtocolCompat` refuses `sip` under AWG 3.0 or 3.1 while
+any S size is 31 or more. It applies both when `sip` is chosen and when
+`--enable-awg3` or `--enable-awg31` runs under `sip`. It runs before anything
+changes. With the installer's S range of 15–150, that is almost every
+installation. A protocol change keeps the imitation and prints the AWG 3.x
+warning first. From the menu, enabling an imitation under AWG 3.x asks
+`[y/N]`.
+
+**`--set-boringtun-imitation <protocol> [hostname]`** is a transaction in a
+subshell:
+1. It validates the arguments, takes the lifecycle lock and reloads params
+   (`loadParams 0 1`).
+2. It requires BoringTun. Identical values are a no-op.
+3. It applies the SIP check, then reads `ActiveState`:
+   - `active`: apply and restart;
+   - `inactive` or `failed`: persist without starting;
+   - anything else: abort before any change.
+4. It regenerates the helpers (`_awgBtEnsureReady 0`) while the runtime file is
+   still the old one, so a PR 4 launcher never meets the new keys. For an active
+   unit it proves the running instance (`_awgBtCheckServedByBoringtun`).
+5. In a private `.awg-imitation.*` directory it backs up params and the runtime
+   file byte for byte, and records their modes (params may be 0400).
+6. It renders both new files there and checks them:
+   - `serializeParams` must report success; it fails on any write failure,
+     including one part-way through or in the imitation append, and still
+     restores the umask;
+   - the runtime file through the launcher's own parser;
+   - params as a complete canonical file: exactly the keys `serializeParams`
+     writes for BoringTun (`AWG_PARAMS_KEYS` and `AWG_PARAMS_BORINGTUN_KEYS`,
+     which a test keeps equal to its output), each once and in order;
+   - params read back in isolation (`readStagedParamsInIsolation`): every
+     canonical variable is unset first, so nothing in the installer's shell
+     can fill in a missing line, and every key must be set. Then
+     `validateParamsFile`, which validates the backend, the imitation and the
+     AWG protocol state, must accept the file as the params of a private
+     directory;
+   - the state read back must be the current state with only the imitation
+     changed: a digest of every other key's value is compared, never printed;
+   - the server config on a scratch instance that runs the new imitation.
+
+   Every check runs before anything is applied, so a failed one changes no live
+   file and needs no rollback.
+7. It replaces the runtime file, then params, atomically, keeping their modes.
+8. For an active unit it runs `awgBackendPrepareServiceStart`, restarts, and
+   verifies:
+   - the unit is active;
+   - MainPID is the recorded, verified daemon;
+   - the TUN link and UAPI answer;
+   - the listen port is the persisted one;
+   - no amneziawg module is loaded;
+   - the daemon's command line carries the new imitation.
+9. Any failure, or HUP, INT or TERM once files change, restores both files
+   exactly. If the unit was active, it is restarted on the previous imitation
+   and verified. If the files cannot be restored, the unit is not restarted.
+   Every failing step is reported, and on an incomplete rollback the recovery
+   files are kept.
+
+Client configs never change.
+
+**`--backend-status`** prints `key=value` lines and changes nothing: params
+whose mode is not 600 or 400 are refused, never repaired. Keys:
+- every backend: `backend=`, `awg_protocol=`, `service_state=`;
+- BoringTun: `imitation_protocol=`, `imitation_domain=`,
+  `imitation_domain_mode=configured|random|none`, `installed_release=`,
+  `pinned_release=`, `daemon_state=running|stopped|unverified`, `daemon_pid=`;
+- BoringTun, beyond §9: `daemon_imitation_protocol=` and
+  `daemon_imitation_domain=`, read from the running daemon's command line. A PR 4
+  daemon, started without the flag, reads as `none`.
+- kernel: `module_state=loaded|not-loaded`.
+
+It prints no key. It exits 0 for a valid installation, and 1 for params that
+cannot be used or a BoringTun store that does not verify
+(`installed_release=invalid`).
+
+**Menu.** A BoringTun host's menu shows a line with the backend and the
+imitation, and has 8 options: the kernel menu's options with their numbers
+(6 still uninstalls), **7) Change BoringTun protocol imitation**, and 8) Exit.
+The kernel menu keeps its 7 options unchanged.
+
+**Tests.**
+- `tests/test-boringtun-imitation.sh` covers validators, the params boundary,
+  fresh-install selection, the runtime file and command line, warnings and
+  advisory, the SIP refusal, the transaction's states, failure injection,
+  rollback and signal paths, the PR 4 → PR 5 upgrade order, `--backend-status`,
+  and the menus. It also runs a real partial write: the kernel stops the params
+  write after 25 lines (RLIMIT_FSIZE through `prlimit`). The test checks that
+  this makes `serializeParams` and the transaction fail before anything is
+  applied, and checks the isolated read-back of staged files that lack a key
+  the shell still has. `tests/mutate-boringtun-imitation.sh` has 48 mutants,
+  each caught by a named assertion.
+- `tests/test-boringtun-runtime.sh` covers the launcher's refusals of bad
+  runtime files, and the exact command lines of launcher and scratch instances
+  with and without imitation.
+- The install-mock matrix covers a kernel `AUTO_INSTALL` with an imitation,
+  refused before any change. On the installed host it runs the real
+  transaction, active and inactive, plus `--backend-status` and a fresh
+  `AUTO_INSTALL` with `sip`.
+- The live test (§18.3) cycles `dns` → `quic` → `sip` → `stun` → `none`. It
+  records the prefixes of the server's datagrams on the client's side, where
+  `dns`, `quic` and `stun` must shape every one and `sip` must carry request
+  lines. It sends DNS, STUN, QUIC (reserved and v1) and SIP probes from the
+  client's network and from loopback. It also adds and removes a client under
+  imitation and moves to AWG 3.0 and back. The x86_64 job installs with the last
+  installer before imitation (`9f5a1af`) and manages the host with this one.
+- The coexistence job (§18.6) measures an AmneziaWG kernel client's echo loss
+  under AWG 3.0 with `none`, `dns`, `quic` and `stun`.
+- amneziawg-go is not measured: it would need a pinned, verified third-party
+  build in CI. It is left for later.
+
 ## 22. Current functions and files that will need modification
 
 ### `amneziawg-install.sh` (line numbers at `67fd5ce`)
@@ -2379,7 +2568,7 @@ with a base revision.
 | R2 | Hosts booted with `ipv6.disable=1` cannot run BoringTun. | INFERRED limitation | The preflight refuses with a clear message; verify on a VM in PR 4. |
 | R3 | Kernel module on BoringTun hosts, especially containers whose host can autoload it. | Design risk | Precheck, poststart check and PID contract, fail-closed (§7.11); test in PR 4. |
 | R4 | The daemon runs as root. | Security | Accept initially; evaluate `setpriv` with ambient capabilities later. |
-| R5 | AWG 3.x plus imitation: header-protection masking is weakened, and upstream-collision avoidance is off, so kernel and go clients may drop packets. | Operational (FACT; loss rate unmeasured) | Warn; measure in the §18.6 interop job before recommending. |
+| R5 | AWG 3.x plus imitation: header-protection masking is weakened, and upstream-collision avoidance is off, so kernel and go clients may drop packets. | Operational; PARTLY SUPERSEDED at `71d8878` | The nonce weakening stands (`dns` 16-bit, `stun` 32-bit, `quic` random), and the installer warns. The collision avoidance now applies to `none`, `dns`, `quic` and `stun`, and SIP with a request-line prefix is refused under header protection (§9.4, §21.3). Kernel-client loss is measured by the coexistence job (§21.3); amneziawg-go is not measured in PR 5. |
 | R6 | Throughput and CPU compared with the kernel module. | OPEN | Benchmark on VMs (x86_64 and aarch64). |
 | R7 | Maturity and security-audit status of the fork; who owns pin bumps and how fast security fixes ship. | Governance | Maintainers decide an owner and a response-time target. |
 | R8 | Publishing binaries from this repository is a new release process. | Governance | Decide in PR 2; alternatively publish from the WireSock organisation. |

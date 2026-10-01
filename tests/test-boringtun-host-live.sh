@@ -10,10 +10,24 @@
 # 3.1 and back to 2.0, manages clients, restarts, stops, kills the daemon, and
 # finally uninstalls through the menu and audits what is left.
 #
+# It then cycles the built-in protocol imitation through dns, quic, sip, stun
+# and none with --set-boringtun-imitation: each time it checks params, the
+# runtime file, the daemon's command line and --backend-status, moves data
+# through the tunnel while it records the prefixes of the server's datagrams
+# on the client's side (which must have the imitated protocol's shape), and
+# sends DNS, STUN, QUIC and SIP probes from the client's network (only the
+# imitated service may answer, and never SIP) and from loopback (never
+# answered). Under dns it also adds and removes a client and moves to AWG 3.0
+# and back, which keeps the imitation.
+#
+# With AWG_LIVE_PREVIOUS_INSTALLER=<path>, the fresh install runs that earlier
+# installer version instead, and everything after it runs this one: the
+# upgrade path from an installation without imitation (params without its
+# keys, a FORMAT=1 runtime file, the earlier helpers and a running daemon
+# started without --imitate-protocol).
+#
 # Requirements: root, systemd as PID 1, network access to the Amnezia PPA and
 # GitHub, no AmneziaWG kernel module, python3, and AWG_DISPOSABLE_HOST_TEST=1.
-# Nothing here is imitation: built-in protocol imitation is not part of this
-# installer version.
 #
 # Usage: AWG_DISPOSABLE_HOST_TEST=1 bash tests/test-boringtun-host-live.sh
 
@@ -222,8 +236,9 @@ echo "=== Fresh install: AWG_BACKEND=boringtun AUTO_INSTALL=y"
 # config or QR code; the client is added below, its output kept private.
 env AWG_BACKEND=boringtun AUTO_INSTALL=y SERVER_PUB_IP="${HOST_ADDR}" SERVER_PUB_NIC="${PUBLIC_NIC}" \
 	SERVER_AWG_NIC="${IF}" SERVER_PORT="${PORT}" ENABLE_IPV6=n CREATE_INITIAL_CLIENT=n \
-	bash "${INSTALLER}" >"${WORK}/install.log" 2>&1 </dev/null
+	bash "${AWG_LIVE_PREVIOUS_INSTALLER:-${INSTALLER}}" >"${WORK}/install.log" 2>&1 </dev/null
 INSTALL_RC=$?
+[[ -z "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]] || echo "    (installed by the earlier installer ${AWG_LIVE_PREVIOUS_INSTALLER}; everything below runs this one)"
 tail -n 25 "${WORK}/install.log" | sed 's/^/    | /'
 check "the installer completes" test "${INSTALL_RC}" -eq 0
 ((INSTALL_RC == 0)) || die "the install failed; nothing more to test"
@@ -264,6 +279,20 @@ check_served() { # <label>
 	check "$1: no AmneziaWG kernel module is loaded" no_kernel_module
 }
 check_served "after the install"
+DAEMON_ARGS="$(tr '\0' ' ' <"/proc/$(main_pid)/cmdline")"
+if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
+	check "upgrade: the earlier installer's params have no imitation keys" bash -c '! grep -q "^AWG_BORINGTUN_" /etc/amnezia/amneziawg/params'
+	check "upgrade: its runtime file is FORMAT=1 alone" test "$(grep -v '^#' "/etc/amnezia/amneziawg/${IF}.boringtun")" = "FORMAT=1"
+	check "upgrade: its daemon was started without --imitate-protocol" bash -c '[[ "$1" != *--imitate-protocol* ]]' _ "${DAEMON_ARGS}"
+else
+	check "a fresh install imitates none" grep -qx "AWG_BORINGTUN_IMITATE_PROTOCOL='none'" /etc/amnezia/amneziawg/params
+	check "and names it on the daemon's command line" bash -c '[[ "$1" == *" --imitate-protocol none ${2} " ]]' _ "${DAEMON_ARGS}" "${IF}"
+fi
+bash "${INSTALLER}" --backend-status >"${WORK}/status" 2>&1
+check "--backend-status reports the BoringTun backend with imitation none and the running daemon" \
+	test "$(grep -E '^(backend|imitation_protocol|daemon_state|daemon_imitation_protocol)=' "${WORK}/status" | tr '\n' ' ')" = \
+	"backend=boringtun imitation_protocol=none daemon_state=running daemon_imitation_protocol=none "
+check "  and the installed release is the pinned one" test "$(grep -c "^\(installed\|pinned\)_release=${RELEASE_ID}\$" "${WORK}/status")" -eq 2
 check "awg show works" bash -c "awg show '${IF}' >/dev/null"
 check "awg show all dump lists the interface" bash -c "awg show all dump | grep -q '^${IF}[[:space:]]'"
 
@@ -435,6 +464,149 @@ protocol_mode() { # <flag> <label> <expected version>
 protocol_mode --enable-awg3 "AWG 3.0" 3
 protocol_mode --enable-awg31 "AWG 3.1" 3.1
 protocol_mode --disable-awg3 "back to AWG 2.0" 2
+
+# ── Protocol imitation ──────────────────────────────────────────────────────
+WIRE="${PROJECT_ROOT}/tests/helpers/boringtun-imitation-wire.py"
+client_config_hashes() {
+	sha256sum /etc/amnezia/amneziawg/clients/*.conf "${CLIENT_CONF}" 2>/dev/null
+}
+status_line() { # <key>: its line of --backend-status
+	bash "${INSTALLER}" --backend-status 2>/dev/null | grep "^$1="
+}
+params_s() { # <S1|S2|S3|S4>
+	sed -n "s/^SERVER_AWG_$1='\\([0-9]*\\)'\$/\\1/p" /etc/amnezia/amneziawg/params
+}
+# Probes from the client's network: only the imitated service answers, never
+# SIP, and QUIC only for a version real servers do not offer. From loopback
+# nothing is answered.
+expect_probes() { # <imitation>
+	local KIND EXPECTED GOT LOOPBACK_KIND
+	for KIND in dns stun quic quic-v1 sip; do
+		EXPECTED=silent
+		case "$1:${KIND}" in
+			dns:dns) EXPECTED=servfail ;;
+			stun:stun) EXPECTED=binding-success ;;
+			quic:quic) EXPECTED=version-negotiation ;;
+		esac
+		GOT="$(ip netns exec "${NS}" python3 "${WIRE}" probe "${KIND}" "${HOST_ADDR}" "${PORT}" 2>&1)"
+		check "$1: a ${KIND} probe from ${CLIENT_ADDR} gets ${EXPECTED} (${GOT})" test "${GOT}" = "${EXPECTED}"
+	done
+	LOOPBACK_KIND="$1"
+	[[ "$1" != none ]] || LOOPBACK_KIND=dns
+	GOT="$(python3 "${WIRE}" probe "${LOOPBACK_KIND}" 127.0.0.1 "${PORT}" 2>&1)"
+	check "$1: a ${LOOPBACK_KIND} probe from loopback is never answered (${GOT})" test "${GOT}" = silent
+}
+# Data through the tunnel while the client's side records the prefixes of the
+# server's datagrams, which must have the imitation's shape.
+wire_prefixes() { # <imitation>
+	local CAPTURE="${WORK}/prefixes" PID COUNTS TOTAL MATCHING LARGEST=0 NAME SIZE
+	rm -f "${CAPTURE}"
+	ip netns exec "${NS}" python3 "${WIRE}" capture "${VETH_CLIENT}" "${HOST_ADDR}" "${PORT}" 45 "${CAPTURE}" &
+	PID=$!
+	sleep 1
+	datapath "$1 imitation"
+	kill "${PID}" 2>/dev/null
+	wait "${PID}" 2>/dev/null
+	COUNTS="$(python3 "${WIRE}" classify "$1" "${CAPTURE}")"
+	read -r TOTAL MATCHING <<<"${COUNTS}"
+	echo "    ($1: ${MATCHING} of ${TOTAL} server datagrams have the imitation's prefix shape)"
+	case "$1" in
+		dns | stun | quic)
+			check "$1: every datagram the server sent has a $1-shaped S prefix (${MATCHING}/${TOTAL})" \
+				test "${TOTAL:-0}" -ge 10 -a "${MATCHING:-0}" -eq "${TOTAL:-0}"
+			;;
+		sip)
+			# A request line needs a prefix of 31 bytes; shorter ones stay random.
+			for NAME in S2 S3 S4; do
+				SIZE="$(params_s "${NAME}")"
+				((SIZE > LARGEST)) && LARGEST="${SIZE}"
+			done
+			if ((LARGEST >= 31)); then
+				check "sip: the server's datagrams carry SIP request lines (${MATCHING}/${TOTAL})" test "${MATCHING:-0}" -ge 1
+			else
+				echo "    (sip: S2-S4 are all below 31 bytes, so no request line fits)"
+			fi
+			;;
+		none)
+			check "none: the server sent datagrams (${TOTAL})" test "${TOTAL:-0}" -ge 10
+			;;
+	esac
+}
+imitation_step() { # <protocol> [hostname]
+	local PROTOCOL="$1" DOMAIN="${2:-}" HASHES RC EXPECTED_RUNTIME="FORMAT=1" ARGS
+	HASHES="$(client_config_hashes)"
+	echo "--- imitation ${PROTOCOL}${DOMAIN:+ (${DOMAIN})}"
+	bash "${INSTALLER}" --set-boringtun-imitation "${PROTOCOL}" ${DOMAIN:+"${DOMAIN}"} >"${WORK}/imitation.log" 2>&1 </dev/null
+	RC=$?
+	tail -n 14 "${WORK}/imitation.log" | sed 's/^/    | /'
+	check "${PROTOCOL}: --set-boringtun-imitation succeeds" test "${RC}" -eq 0
+	check "${PROTOCOL}: no client config was rewritten" test "$(client_config_hashes)" = "${HASHES}"
+	check "${PROTOCOL}: params persist it" \
+		test "$(grep '^AWG_BORINGTUN_' /etc/amnezia/amneziawg/params | tr '\n' ' ')" = "AWG_BORINGTUN_IMITATE_PROTOCOL='${PROTOCOL}' AWG_BORINGTUN_IMITATE_DOMAIN='${DOMAIN}' "
+	if [[ "${PROTOCOL}" != none ]]; then
+		EXPECTED_RUNTIME+=" IMITATE_PROTOCOL=${PROTOCOL}${DOMAIN:+ IMITATE_DOMAIN=${DOMAIN}}"
+	fi
+	check "${PROTOCOL}: the runtime file says '${EXPECTED_RUNTIME}'" \
+		test "$(grep -v '^#' "/etc/amnezia/amneziawg/${IF}.boringtun" | tr '\n' ' ' | sed 's/ $//')" = "${EXPECTED_RUNTIME}"
+	check_served "${PROTOCOL}"
+	ARGS="$(tr '\0' ' ' <"/proc/$(main_pid)/cmdline")"
+	check "${PROTOCOL}: the daemon runs --imitate-protocol ${PROTOCOL}${DOMAIN:+ --imitate-domain ${DOMAIN}}, the interface last" \
+		bash -c '[[ "$1" == *" --imitate-protocol $2 ${3:+--imitate-domain $3 }$4 " ]]' _ "${ARGS}" "${PROTOCOL}" "${DOMAIN}" "${IF}"
+	check "${PROTOCOL}: --probe-reply-rate is never passed" bash -c '[[ "$1" != *--probe-reply-rate* ]]' _ "${ARGS}"
+	check "${PROTOCOL}: the daemon's environment is only NO_COLOR and PATH" \
+		test "$(tr '\0' '\n' <"/proc/$(main_pid)/environ" | cut -d= -f1 | sort | tr '\n' ' ')" = "NO_COLOR PATH "
+	check "${PROTOCOL}: --backend-status reports it, and the daemon running it" \
+		test "$(bash "${INSTALLER}" --backend-status 2>/dev/null | grep -E '^(imitation_protocol|imitation_domain|daemon_state|daemon_imitation_protocol|daemon_imitation_domain)=' | tr '\n' ' ')" = \
+		"imitation_protocol=${PROTOCOL} imitation_domain=${DOMAIN} daemon_state=running daemon_imitation_protocol=${PROTOCOL} daemon_imitation_domain=${DOMAIN} "
+	check "${PROTOCOL}: the listen port is still ${PORT}" test "$(awg show "${IF}" listen-port 2>/dev/null)" = "${PORT}"
+	check "${PROTOCOL}: no transaction directory is left" bash -c '! compgen -G "/etc/amnezia/amneziawg/.awg-imitation.*" >/dev/null'
+	check "${PROTOCOL}: no scratch interface, unit or record is left" scratch_clean
+	wire_prefixes "${PROTOCOL}"
+	expect_probes "${PROTOCOL}"
+}
+
+imitation_step dns example.com
+check "dns: the warnings name the DNS probe reply" grep -q "SERVFAIL" "${WORK}/imitation.log"
+bash "${INSTALLER}" --set-boringtun-imitation dns example.com >"${WORK}/imitation.log" 2>&1 </dev/null
+check "dns: setting the same imitation again changes nothing" grep -q "already dns" "${WORK}/imitation.log"
+PEERS_BEFORE="$(peer_count)"
+bash "${INSTALLER}" --add-client imitated >/dev/null 2>&1
+check "dns: --add-client adds a peer under imitation" test "$(peer_count)" -eq $((PEERS_BEFORE + 1))
+bash "${INSTALLER}" --remove-client imitated >/dev/null 2>&1
+check "dns: --remove-client removes it" test "$(peer_count)" -eq "${PEERS_BEFORE}"
+check "dns: the daemon still runs dns" bash -c '[[ "$(tr "\0" " " <"/proc/$1/cmdline")" == *"--imitate-protocol dns "* ]]' _ "$(main_pid)"
+
+echo "--- AWG 3.0 keeps the imitation"
+bash "${INSTALLER}" --enable-awg3 >"${WORK}/protocol.log" 2>&1 </dev/null
+RC=$?
+tail -n 8 "${WORK}/protocol.log" | sed 's/^/    | /'
+check "dns: --enable-awg3 succeeds" test "${RC}" -eq 0
+check "  and first states what header protection loses under dns" grep -q "16 random bits" "${WORK}/protocol.log"
+check "  params keep the imitation" grep -qx "AWG_BORINGTUN_IMITATE_PROTOCOL='dns'" /etc/amnezia/amneziawg/params
+check "  and the daemon runs it" test "$(status_line daemon_imitation_protocol)" = "daemon_imitation_protocol=dns"
+check_served "AWG 3.0 with dns imitation"
+datapath "AWG 3.0 with dns imitation"
+expect_probes dns
+LARGEST=0
+for NAME in S1 S2 S3 S4; do
+	SIZE="$(params_s "${NAME}")"
+	((SIZE > LARGEST)) && LARGEST="${SIZE}"
+done
+if ((LARGEST >= 31)); then
+	bash "${INSTALLER}" --set-boringtun-imitation sip >"${WORK}/imitation.log" 2>&1 </dev/null
+	RC=$?
+	check "AWG 3.0: sip is refused with S sizes up to ${LARGEST}" test "${RC}" -ne 0
+	check "  before anything changed" test "$(status_line daemon_imitation_protocol)" = "daemon_imitation_protocol=dns"
+fi
+bash "${INSTALLER}" --disable-awg3 >"${WORK}/protocol.log" 2>&1 </dev/null
+check "back to AWG 2.0 under dns imitation" test "$?" -eq 0
+check "  keeps the imitation" test "$(status_line daemon_imitation_protocol)" = "daemon_imitation_protocol=dns"
+
+imitation_step quic cdn.example.org
+imitation_step sip pbx.example
+imitation_step stun
+imitation_step none
+datapath "after the imitation cycle"
 
 # ── Uninstall ───────────────────────────────────────────────────────────────
 stop_client

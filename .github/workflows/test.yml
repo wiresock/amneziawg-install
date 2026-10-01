@@ -29,6 +29,7 @@ jobs:
           bash tests/test-boringtun-foreground-launcher.sh
           bash tests/test-boringtun-runtime.sh
           bash tests/test-boringtun-host.sh
+          bash tests/test-boringtun-imitation.sh
           bash tests/test-mutation-engine.sh
           bash tests/test-boringtun-live-firewall.sh
           bash tests/test-cargo-build-common.sh

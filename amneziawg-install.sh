@@ -56,6 +56,18 @@ AWG_BACKEND_BORINGTUN="boringtun"
 _AWG_BACKEND_REQUESTED="${AWG_BACKEND-}"
 AWG_BACKEND="${AWG_BACKEND_KERNEL}"
 
+# BoringTun protocol imitation, a BoringTun-only server setting persisted in
+# params as AWG_BORINGTUN_IMITATE_PROTOCOL (none, dns, quic, sip or stun) and
+# AWG_BORINGTUN_IMITATE_DOMAIN (an optional hostname for dns, quic and sip).
+# Like the backend, params are authoritative: validateParamsFile discards both
+# names before sourcing params, and only a fresh install reads the caller's
+# request, from the copies taken here (selectFreshInstallImitation).
+AWG_BT_IMITATE_NONE="none"
+_AWG_BT_IMITATE_PROTOCOL_REQUESTED="${AWG_BORINGTUN_IMITATE_PROTOCOL-}"
+_AWG_BT_IMITATE_DOMAIN_REQUESTED="${AWG_BORINGTUN_IMITATE_DOMAIN-}"
+AWG_BORINGTUN_IMITATE_PROTOCOL="${AWG_BT_IMITATE_NONE}"
+AWG_BORINGTUN_IMITATE_DOMAIN=""
+
 # Capability marker. The web panel runs its own copy of this script for client
 # lifecycle operations. A fresh BoringTun install requires that copy to carry
 # this exact line, read as data (webPanelLifecycleScriptSupportsBoringtun),
@@ -1967,10 +1979,160 @@ function selectFreshInstallBackend() {
 	fi
 }
 
-# Validate the persisted backend after params are sourced. Backends with their
-# own persisted settings will validate them here too.
+# Validate the persisted backend after params are sourced, and the settings
+# that belong to it.
 function validatePersistedAwgBackendState() {
-	normalizeAwgBackend
+	normalizeAwgBackend || return 1
+	validatePersistedBoringtunImitationState
+}
+
+# The protocol imitation must suit the backend: a kernel installation has none
+# and no hostname, and a BoringTun one a supported protocol and a hostname only
+# where that protocol uses one.
+function checkBoringtunImitationForBackend() {
+	if [[ "${AWG_BACKEND:-}" != "${AWG_BACKEND_BORINGTUN}" ]]; then
+		if [[ "${AWG_BORINGTUN_IMITATE_PROTOCOL:-${AWG_BT_IMITATE_NONE}}" != "${AWG_BT_IMITATE_NONE}" || -n "${AWG_BORINGTUN_IMITATE_DOMAIN:-}" ]]; then
+			echo "ERROR: protocol imitation is available only with the BoringTun backend (AWG_BACKEND=${AWG_BACKEND_BORINGTUN})." >&2
+			return 1
+		fi
+		return 0
+	fi
+	_awgBtImitationCheck "${AWG_BORINGTUN_IMITATE_PROTOCOL:-}" "${AWG_BORINGTUN_IMITATE_DOMAIN:-}"
+}
+
+# Normalize the persisted imitation. Params written before imitation existed
+# have neither key, which means none; a key that is present must hold a valid
+# value, and a kernel installation must not carry one other than none.
+function validatePersistedBoringtunImitationState() {
+	[[ -n "${AWG_BORINGTUN_IMITATE_PROTOCOL+set}" ]] || AWG_BORINGTUN_IMITATE_PROTOCOL="${AWG_BT_IMITATE_NONE}"
+	AWG_BORINGTUN_IMITATE_DOMAIN="${AWG_BORINGTUN_IMITATE_DOMAIN:-}"
+	checkBoringtunImitationForBackend
+}
+
+# Choose the imitation of a fresh installation from the caller's
+# AWG_BORINGTUN_IMITATE_PROTOCOL and AWG_BORINGTUN_IMITATE_DOMAIN, as they were
+# when the installer was loaded: unset or empty means none. A kernel install
+# refuses any other request here, before it changes anything.
+function selectFreshInstallImitation() {
+	AWG_BORINGTUN_IMITATE_PROTOCOL="${_AWG_BT_IMITATE_PROTOCOL_REQUESTED:-${AWG_BT_IMITATE_NONE}}"
+	AWG_BORINGTUN_IMITATE_DOMAIN="${_AWG_BT_IMITATE_DOMAIN_REQUESTED}"
+	if ! checkBoringtunImitationForBackend; then
+		echo "ERROR: set AWG_BORINGTUN_IMITATE_PROTOCOL to none (the default), dns, quic, sip or stun, and AWG_BORINGTUN_IMITATE_DOMAIN only for dns, quic or sip, on a fresh installation with AWG_BACKEND=${AWG_BACKEND_BORINGTUN}." >&2
+		return 1
+	fi
+}
+
+# How the imitation is shown: the protocol, and for dns, quic and sip whether
+# the hostname is configured or left to BoringTun.
+function boringtunImitationDomainMode() { # <protocol> <domain>
+	if ! _awgBtImitationUsesDomain "$1"; then
+		printf 'none\n'
+	elif [[ -n "$2" ]]; then
+		printf 'configured\n'
+	else
+		printf 'random\n'
+	fi
+}
+
+function boringtunImitationDisplay() { # <protocol> <domain>
+	case "$(boringtunImitationDomainMode "$1" "$2")" in
+		configured) printf '%s (hostname %s)\n' "$1" "$2" ;;
+		random) printf '%s (hostname chosen by BoringTun)\n' "$1" ;;
+		*) printf '%s\n' "$1" ;;
+	esac
+}
+
+# The largest of S1-S4, the S prefixes that imitation shapes.
+function boringtunLargestSPrefix() {
+	local LARGEST=0 SIZE
+	for SIZE in "${SERVER_AWG_S1:-0}" "${SERVER_AWG_S2:-0}" "${SERVER_AWG_S3:-0}" "${SERVER_AWG_S4:-0}"; do
+		[[ "${SIZE}" =~ ^[0-9]{1,5}$ ]] || SIZE=0
+		((10#${SIZE} > LARGEST)) && LARGEST=$((10#${SIZE}))
+	done
+	printf '%s\n' "${LARGEST}"
+}
+
+# The pinned BoringTun refuses SIP imitation together with header protection
+# (AWG 3.0 and 3.1) once any S prefix is 31 bytes or more: the SIP request line
+# it writes there would leave the header-protection nonce a few fixed strings.
+# Checked before anything changes, so the refusal never surfaces as a failed
+# restart.
+function checkBoringtunImitationProtocolCompat() { # <protocol> <AWG protocol version>
+	[[ "$1" == sip ]] || return 0
+	[[ "$2" == "${AWG_PROTOCOL_VERSION_3}" || "$2" == "${AWG_PROTOCOL_VERSION_31}" ]] || return 0
+	(($(boringtunLargestSPrefix) >= 31)) || return 0
+	echo "ERROR: SIP imitation cannot be combined with AmneziaWG $(awgProtocolDisplayName "$2") on this server." >&2
+	echo "BoringTun refuses SIP imitation with header protection while any of S1-S4 is 31 bytes or more (S1=${SERVER_AWG_S1:-} S2=${SERVER_AWG_S2:-} S3=${SERVER_AWG_S3:-} S4=${SERVER_AWG_S4:-}): the SIP request line it writes there leaves the header-protection nonce only a few fixed values." >&2
+	echo "Choose dns, quic or stun, or keep SIP with AmneziaWG 2.0. Changing S1-S4 would need new client configs." >&2
+	return 1
+}
+
+# The trade-offs of a protocol imitation, printed wherever one is chosen or
+# kept across a protocol change (design §9.4). They describe the persisted
+# S1-S4 and listen port and the given imitation and AWG protocol version; they
+# never refuse anything.
+function printBoringtunImitationWarnings() { # <protocol> <domain> <AWG protocol version>
+	local PROTOCOL="$1" DOMAIN="$2" VERSION="$3"
+	[[ "${PROTOCOL}" != "${AWG_BT_IMITATE_NONE}" ]] || return 0
+	echo -e "${ORANGE}Protocol imitation: $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}")${NC}"
+	echo "- Server side only: BoringTun shapes the S1-S4 prefixes of the packets this server sends. Standard AmneziaWG clients keep sending plain AmneziaWG; client configs do not change."
+	case "${PROTOCOL}" in
+		dns) echo "- Probes: the listen port answers DNS queries from other hosts with SERVFAIL." ;;
+		stun) echo "- Probes: the listen port answers STUN Binding Requests with a Binding Success about 2.6 times the request's size, so it can reflect traffic toward a spoofed source." ;;
+		quic) echo "- Probes: the listen port answers QUIC Initials of 1200 bytes or more with Version Negotiation when they offer a version that real servers do not (QUIC v1 and v2 get no reply)." ;;
+		sip) echo "- Probes: SIP requests get no reply; BoringTun has no SIP responder." ;;
+	esac
+	echo "  All probe replies share a budget of 16 KiB/s (BoringTun's default); loopback, link-local, multicast and broadcast sources are never answered."
+	echo "- The listen port stays ${SERVER_PORT:-unchanged}: the installer never moves it, because a new port needs new client configs. Imitation is most plausible on the protocol's usual port."
+	if [[ "${VERSION}" == "${AWG_PROTOCOL_VERSION_3}" || "${VERSION}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
+		echo -e "${ORANGE}- AmneziaWG $(awgProtocolDisplayName "${VERSION}"): header protection takes its nonce from the first 12 bytes of each S prefix, and imitation shapes those bytes.${NC}"
+		case "${PROTOCOL}" in
+			dns) echo "  dns leaves 16 random bits: nonces repeat within a few hundred datagrams, and each repeat repeats the header mask, so header masking is much weaker." ;;
+			stun) echo "  stun leaves 32 random bits: nonces start to repeat after about 77,000 datagrams, which weakens header masking on long-lived keys." ;;
+			quic) echo "  quic leaves the nonce random, so header protection keeps its strength." ;;
+			sip) echo "  sip is accepted only while every S prefix is 30 bytes or less, where it stays random." ;;
+		esac
+		echo "  Payload encryption is unaffected. Under imitation the packets present as ${PROTOCOL} rather than relying on header masking."
+	fi
+	printBoringtunImitationFillAdvisory "${PROTOCOL}" "${DOMAIN}"
+}
+
+# Warn, without refusing, about S prefixes too short for the imitation to shape
+# completely. The sizes are those of BoringTun's fillers at the pinned release:
+# a DNS query needs 32 bytes (a root query) or the hostname's length plus 33
+# (a query for it), a STUN header 20, a SIP request line 31 and a QUIC short
+# header 1. They describe that release, not limits the installer enforces.
+function printBoringtunImitationFillAdvisory() { # <protocol> <domain>
+	local PROTOCOL="$1" DOMAIN="$2" NEED=0 NAMED=0 NAME SIZE SHORT="" UNNAMED="" SHORT_N=0 UNNAMED_N=0
+	case "${PROTOCOL}" in
+		dns)
+			NEED=32
+			[[ -z "${DOMAIN}" ]] || NAMED=$((${#DOMAIN} + 33))
+			;;
+		stun) NEED=20 ;;
+		sip) NEED=31 ;;
+		quic) NEED=1 ;;
+		*) return 0 ;;
+	esac
+	for NAME in S1 S2 S3 S4; do
+		SIZE="SERVER_AWG_${NAME}"
+		SIZE="${!SIZE:-}"
+		[[ "${SIZE}" =~ ^[0-9]{1,5}$ ]] || continue
+		if ((10#${SIZE} < NEED)); then
+			SHORT+="${SHORT:+, }${NAME}=${SIZE}"
+			((SHORT_N += 1))
+		elif ((10#${SIZE} < NAMED)); then
+			UNNAMED+="${UNNAMED:+, }${NAME}=${SIZE}"
+			((UNNAMED_N += 1))
+		fi
+	done
+	if [[ -n "${SHORT}" ]]; then
+		echo "- Note: ${SHORT} $( ((SHORT_N == 1)) && echo is || echo are) below the ${NEED} bytes ${PROTOCOL} imitation needs for a complete ${PROTOCOL^^} header; those prefixes are only partly shaped. This is advisory: the S sizes stay as they are."
+	fi
+	if [[ -n "${UNNAMED}" ]]; then
+		echo "- Note: ${UNNAMED} $( ((UNNAMED_N == 1)) && echo is || echo are) below the ${NAMED} bytes a DNS query for ${DOMAIN} needs; those prefixes carry a root query instead. This is advisory: the S sizes stay as they are."
+	fi
+	return 0
 }
 
 # Emit only the protocol-specific [Interface] lines. Callers must redirect
@@ -2771,12 +2933,16 @@ function serializeParams() {
 			return 1
 			;;
 	esac
+	checkBoringtunImitationForBackend || return 1
 	# Apply a restrictive umask only while writing the params file to disk,
 	# so that subprocesses (apt/dnf, dkms, etc.) are not affected.
-	local OLD_UMASK
+	# Every write's status is kept: a write that fails part-way, or a file
+	# that cannot be opened, makes the function fail even though the umask is
+	# restored after it.
+	local OLD_UMASK RC=0
 	OLD_UMASK="$(umask)"
 	umask 077
-	cat >"${OUTPUT_FILE}" <<EOF
+	cat >"${OUTPUT_FILE}" <<EOF || RC=1
 SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
 SERVER_PUB_NIC=$(safeQuoteParam "${SERVER_PUB_NIC}")
 SERVER_AWG_NIC=$(safeQuoteParam "${SERVER_AWG_NIC}")
@@ -2811,8 +2977,88 @@ AWG_KEEPALIVE_TIMEOUT=$(safeQuoteParam "${AWG_KEEPALIVE_TIMEOUT:-}")
 AWG_RANDOM_TRAILERS=$(safeQuoteParam "${AWG_RANDOM_TRAILERS:-}")
 AWG_DISABLE_COOKIES=$(safeQuoteParam "${AWG_DISABLE_COOKIES:-}")
 EOF
+	# Only BoringTun installations persist the protocol imitation, so kernel
+	# params keep exactly the keys they had before imitation existed.
+	if ((RC == 0)) && [[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+		cat >>"${OUTPUT_FILE}" <<EOF || RC=1
+AWG_BORINGTUN_IMITATE_PROTOCOL=$(safeQuoteParam "${AWG_BORINGTUN_IMITATE_PROTOCOL:-${AWG_BT_IMITATE_NONE}}")
+AWG_BORINGTUN_IMITATE_DOMAIN=$(safeQuoteParam "${AWG_BORINGTUN_IMITATE_DOMAIN:-}")
+EOF
+	fi
 	umask "${OLD_UMASK}"
+	return "${RC}"
 }
+
+# The keys serializeParams writes, in its order: AWG_PARAMS_KEYS for every
+# backend, then AWG_PARAMS_BORINGTUN_KEYS for BoringTun. A test keeps this list
+# equal to what serializeParams writes.
+AWG_PARAMS_KEYS="SERVER_PUB_IP SERVER_PUB_NIC SERVER_AWG_NIC SERVER_AWG_IPV4 SERVER_AWG_IPV6 SERVER_PORT SERVER_PRIV_KEY SERVER_PUB_KEY CLIENT_DNS_1 CLIENT_DNS_2 ALLOWED_IPS ENABLE_IPV6 SERVER_AWG_JC SERVER_AWG_JMIN SERVER_AWG_JMAX SERVER_AWG_S1 SERVER_AWG_S2 SERVER_AWG_S3 SERVER_AWG_S4 SERVER_AWG_H1 SERVER_AWG_H2 SERVER_AWG_H3 SERVER_AWG_H4 AWG_BACKEND AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY AWG_CONTENT_PADDING_ADDITION AWG_REKEY_AFTER_TIME AWG_REKEY_TIMEOUT AWG_REJECT_AFTER_TIME AWG_KEEPALIVE_TIMEOUT AWG_RANDOM_TRAILERS AWG_DISABLE_COOKIES"
+AWG_PARAMS_BORINGTUN_KEYS="AWG_BORINGTUN_IMITATE_PROTOCOL AWG_BORINGTUN_IMITATE_DOMAIN"
+
+function awgParamsCanonicalKeys() { # <backend>
+	local KEYS="${AWG_PARAMS_KEYS}"
+	[[ "${1:-}" != "${AWG_BACKEND_BORINGTUN}" ]] || KEYS+=" ${AWG_PARAMS_BORINGTUN_KEYS}"
+	# shellcheck disable=SC2086 # the key lists are fixed words
+	printf '%s\n' ${KEYS}
+}
+
+# Whether FILE, as serializeParams writes it, has exactly BACKEND's canonical
+# key lines, each once and in order, and no other line: a truncated file, a
+# missing or repeated key, an unexpected assignment and a value broken across
+# lines all fail.
+function awgParamsFileHasCanonicalKeys() { # <file> <backend>
+	local LINE KEYS=""
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		[[ "${LINE}" =~ ^([A-Z][A-Z0-9_]*)= ]] || return 1
+		KEYS+="${BASH_REMATCH[1]} "
+	done <"$1" || return 1
+	[[ "${KEYS}" == "$(awgParamsCanonicalKeys "$2" | tr '\n' ' ')" ]]
+}
+
+# A digest of the persisted state in this shell: every key of AWG_PARAMS_KEYS
+# with its value, or as unset. It compares two states without printing a value.
+function awgParamsStateDigest() {
+	local KEY
+	for KEY in ${AWG_PARAMS_KEYS}; do
+		printf '%s:%s=%s\n' "${KEY}" "${!KEY+set}" "${!KEY-}"
+	done | sha256sum | cut -d' ' -f1
+}
+
+# Read a staged params file in isolation, as the next loadParams will. Every
+# canonical variable is unset first, so a line the file lacks can never be
+# filled in from this shell. The file must set every canonical key of its
+# backend, and must then pass validateParamsFile (with it as the params of a
+# private directory next to the live server config), which validates the
+# backend, its imitation and the AWG protocol state. Prints
+# "<state digest>|<imitation protocol>|<imitation hostname>". The file is
+# installer-generated and private.
+function readStagedParamsInIsolation() ( # <staged file> <private check directory>
+	local STAGED="$1" CHECK_DIR="$2" KEY CONFIG="${SERVER_AWG_CONF}" INTERFACE="${SERVER_AWG_NIC}"
+	# shellcheck disable=SC2086 # the key lists are fixed words
+	unset ${AWG_PARAMS_KEYS} ${AWG_PARAMS_BORINGTUN_KEYS}
+	# shellcheck source=/dev/null
+	if ! source "${STAGED}"; then
+		echo "ERROR: the staged params cannot be read." >&2
+		return 1
+	fi
+	for KEY in $(awgParamsCanonicalKeys "${AWG_BACKEND:-}"); do
+		if [[ -z "${!KEY+set}" ]]; then
+			echo "ERROR: the staged params do not set ${KEY}." >&2
+			return 1
+		fi
+	done
+	if ! mkdir -m 0700 -- "${CHECK_DIR}" || ! cp -p -- "${STAGED}" "${CHECK_DIR}/params" ||
+		! ln -s -- "${CONFIG}" "${CHECK_DIR}/${INTERFACE}.conf"; then
+		echo "ERROR: cannot prepare the check of the staged params." >&2
+		return 1
+	fi
+	AMNEZIAWG_DIR="${CHECK_DIR}"
+	if ! validateParamsFile 0 >/dev/null || ! normalizeAwgProtocolVersion >/dev/null; then
+		echo "ERROR: the staged params would not load." >&2
+		return 1
+	fi
+	printf '%s|%s|%s\n' "$(awgParamsStateDigest)" "${AWG_BORINGTUN_IMITATE_PROTOCOL:-}" "${AWG_BORINGTUN_IMITATE_DOMAIN:-}"
+)
 
 # Validate an IPv6 address string
 # Handles full form (8 hextets), compressed form (with ::), and mixed forms
@@ -4151,6 +4397,54 @@ function _awgBtValidInterfaceName() {
 	[[ "${1:-}" =~ ^[a-zA-Z0-9_=+.-]{1,15}$ ]]
 }
 
+# BoringTun protocol imitation values: the pinned binary's --imitate-protocol
+# names, and the protocols that carry a hostname.
+function _awgBtImitationProtocolValid() {
+	case "${1-}" in
+		none | dns | quic | sip | stun) return 0 ;;
+	esac
+	return 1
+}
+
+function _awgBtImitationUsesDomain() {
+	case "${1-}" in
+		dns | quic | sip) return 0 ;;
+	esac
+	return 1
+}
+
+# An imitation hostname is a strict LDH host name, the binary's rule for DNS
+# query names and SIP URIs (is_valid_imitation_host): at most 253 bytes of
+# dot-separated labels, each 1-63 ASCII letters, digits and hyphens that neither
+# starts nor ends with a hyphen. The binary accepts any printable SNI for quic;
+# the installer applies the strict rule to all three protocols. The characters
+# are spelled out so that no locale widens the ranges.
+function _awgBtImitationDomainValid() {
+	local DOMAIN="${1-}"
+	local ALNUM='[0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]'
+	local INNER='[-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]'
+	local LABEL="${ALNUM}(${INNER}{0,61}${ALNUM})?"
+	[[ "${DOMAIN}" =~ ^${LABEL}(\.${LABEL})*$ ]] && ((${#DOMAIN} <= 253))
+}
+
+# Check a protocol and hostname pair, naming what is wrong.
+function _awgBtImitationCheck() { # <protocol> <domain>
+	local PROTOCOL="${1-}" DOMAIN="${2-}"
+	if ! _awgBtImitationProtocolValid "${PROTOCOL}"; then
+		_awgBtErr "unsupported BoringTun imitation protocol $(printf '%q' "${PROTOCOL}") (supported: none, dns, quic, sip, stun)"
+		return 1
+	fi
+	[[ -z "${DOMAIN}" ]] && return 0
+	if ! _awgBtImitationUsesDomain "${PROTOCOL}"; then
+		_awgBtErr "an imitation hostname is used only by dns, quic and sip, not by ${PROTOCOL}"
+		return 1
+	fi
+	if ! _awgBtImitationDomainValid "${DOMAIN}"; then
+		_awgBtErr "invalid imitation hostname $(printf '%q' "${DOMAIN}"): use at most 253 characters of dot-separated labels of 1-63 ASCII letters, digits and hyphens, none starting or ending with a hyphen"
+		return 1
+	fi
+}
+
 # "<uid> <octal mode>" of a path, without following a final symlink.
 function _awgBtStatOwnerMode() {
 	stat -c '%u %a' -- "$1" 2>/dev/null
@@ -4325,21 +4619,31 @@ function _awgBtVerifyRelease() { # <release id>
 	_AWG_BT_VERIFIED_BIN="${CANONICAL_BINARY}"
 }
 
-# The runtime file carries launcher settings rendered from params. Format 1 has
-# none yet: later settings are added to its allowlist, never read from the
-# environment.
+# The runtime file carries launcher settings rendered from params, never read
+# from the environment. Format 1 has an allowlist of optional keys:
+# IMITATE_PROTOCOL and IMITATE_DOMAIN, the protocol imitation, rendered only
+# when it is not none. A file without them, such as the one an earlier
+# installer version wrote, means no imitation.
 function _awgBtRuntimeFilePath() {
 	printf '%s/%s.boringtun\n' "${AWG_BT_CONFIG_DIR}" "$1"
 }
 
 function _awgBtRenderRuntimeFile() {
+	local PROTOCOL="${AWG_BORINGTUN_IMITATE_PROTOCOL:-none}" DOMAIN="${AWG_BORINGTUN_IMITATE_DOMAIN:-}"
+	_awgBtImitationCheck "${PROTOCOL}" "${DOMAIN}" || return 1
 	printf '# Managed by amneziawg-install (backend: boringtun). Regenerated from params.\n'
 	printf 'FORMAT=1\n'
+	if [[ "${PROTOCOL}" != none ]]; then
+		printf 'IMITATE_PROTOCOL=%s\n' "${PROTOCOL}"
+		[[ -z "${DOMAIN}" ]] || printf 'IMITATE_DOMAIN=%s\n' "${DOMAIN}"
+	fi
 }
 
 function _awgBtReadRuntimeFile() {
 	local FILE LINE KEY VALUE OWNER="" MODE=""
 	local -A SEEN=()
+	_AWG_BT_IMITATE_PROTOCOL=none
+	_AWG_BT_IMITATE_DOMAIN=""
 	FILE="$(_awgBtRuntimeFilePath "$1")"
 	if [[ -L "${FILE}" || ! -f "${FILE}" ]]; then
 		_awgBtErr "the BoringTun runtime file ${FILE} is missing or not a regular file"
@@ -4370,6 +4674,17 @@ function _awgBtReadRuntimeFile() {
 					return 1
 				fi
 				;;
+			IMITATE_PROTOCOL)
+				# none is never rendered: the key's absence says it.
+				if [[ "${VALUE}" == none ]] || ! _awgBtImitationProtocolValid "${VALUE}"; then
+					_awgBtErr "invalid IMITATE_PROTOCOL in ${FILE}"
+					return 1
+				fi
+				_AWG_BT_IMITATE_PROTOCOL="${VALUE}"
+				;;
+			IMITATE_DOMAIN)
+				_AWG_BT_IMITATE_DOMAIN="${VALUE}"
+				;;
 			*)
 				_awgBtErr "unknown key ${KEY} in ${FILE}"
 				return 1
@@ -4378,6 +4693,11 @@ function _awgBtReadRuntimeFile() {
 	done <"${FILE}"
 	if [[ -z "${SEEN[FORMAT]+set}" ]]; then
 		_awgBtErr "${FILE} has no FORMAT"
+		return 1
+	fi
+	if [[ -n "${SEEN[IMITATE_DOMAIN]+set}" && -z "${_AWG_BT_IMITATE_DOMAIN}" ]] ||
+		! _awgBtImitationCheck "${_AWG_BT_IMITATE_PROTOCOL}" "${_AWG_BT_IMITATE_DOMAIN}"; then
+		_awgBtErr "invalid protocol imitation in ${FILE}"
 		return 1
 	fi
 }
@@ -4749,11 +5069,18 @@ function _awgBtStateLoad() { # <interface>
 # The one BoringTun command line, shared by the launcher and scratch
 # interfaces: an empty environment apart from PATH and NO_COLOR, so no WG_*
 # variable reaches the daemon, the foreground daemon, root privileges kept
-# (its getlogin() based drop fails under systemd) and the quietest log level.
-function _awgBtDaemonArgv() {
-	local ENV_BIN
+# (its getlogin() based drop fails under systemd), the quietest log level and
+# the protocol imitation, always named. --probe-reply-rate is never passed, so
+# the binary's own default applies. The imitation is checked again here, since
+# the binary would reject a bad pair only after the launcher started it.
+function _awgBtDaemonArgv() { # <binary> <interface> [<protocol> [<domain>]]
+	local ENV_BIN PROTOCOL="${3:-none}" DOMAIN="${4:-}"
+	_awgBtImitationCheck "${PROTOCOL}" "${DOMAIN}" || return 1
 	ENV_BIN="$(command -v env)" || return 1
-	_AWG_BT_ARGV=("${ENV_BIN}" -i "PATH=${AWG_BT_PATH}" NO_COLOR=1 "$1" --foreground --disable-drop-privileges --verbosity error "$2")
+	_AWG_BT_ARGV=("${ENV_BIN}" -i "PATH=${AWG_BT_PATH}" NO_COLOR=1 "$1" --foreground --disable-drop-privileges --verbosity error
+		--imitate-protocol "${PROTOCOL}")
+	[[ -z "${DOMAIN}" ]] || _AWG_BT_ARGV+=(--imitate-domain "${DOMAIN}")
+	_AWG_BT_ARGV+=("$2")
 }
 
 # Close every descriptor above stderr. The daemon and the scratch guardian
@@ -4805,7 +5132,7 @@ function awgBoringtunLaunchMain() {
 	fi
 	PID_FILE="$(_awgBtPidFile "${INTERFACE_NAME}")"
 	rm -f -- "${PID_FILE}"
-	if ! _awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${INTERFACE_NAME}"; then
+	if ! _awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${INTERFACE_NAME}" "${_AWG_BT_IMITATE_PROTOCOL}" "${_AWG_BT_IMITATE_DOMAIN}"; then
 		_awgBtLaunchRefused "${INTERFACE_NAME}"
 		return 1
 	fi
@@ -5690,7 +6017,7 @@ function awgBackendCtlMain() {
 }
 
 # Functions the generated helpers carry. Keep in step with their callers.
-_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtVerifyRelease _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtRemoveOwnedPath _awgBtSocketHeldBy _awgBtSymlinkToNode _awgBtProveUapiNodes _awgBtNewToken _awgBtCurrentAttempt _awgBtAttemptBase _awgBtStateFile _awgBtFlagsArm _awgBtFlagRaise _awgBtFlagIs _awgBtAttemptRemove _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
+_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtValidInterfaceName _awgBtImitationProtocolValid _awgBtImitationUsesDomain _awgBtImitationDomainValid _awgBtImitationCheck _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtVerifyRelease _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtRemoveOwnedPath _awgBtSocketHeldBy _awgBtSymlinkToNode _awgBtProveUapiNodes _awgBtNewToken _awgBtCurrentAttempt _awgBtAttemptBase _awgBtStateFile _awgBtFlagsArm _awgBtFlagRaise _awgBtFlagIs _awgBtAttemptRemove _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
 _AWG_BT_LAUNCH_FUNCTIONS="awgBoringtunLaunchMain _awgBtRecordSocketNodes _awgBtLaunchRefused _awgBtLaunchFailed"
 _AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtWithoutSaveConfig _awgBtTryDownCopy _awgBtDownCopy _awgBtLinkIsOwned _awgBtGuardedDown _awgBtRecordFailedDown _awgBtReplayPostDown _awgBtReportUnfinishedDown _awgBtFilteredStrip _awgBtSync _awgBtRenderModprobeOverride _awgBtModprobeActionBlocked _awgBtKernelModuleBlocked _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtVerifyActiveInstance _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
 
@@ -5722,6 +6049,8 @@ function _awgBtRenderHelper() {
 	printf '_AWG_BT_PROG=%q\n' "${NAME}"
 	printf '_AWG_BT_VERIFIED_BIN=""\n'
 	printf '_AWG_BT_ARGV=()\n'
+	printf '_AWG_BT_IMITATE_PROTOCOL=none\n'
+	printf '_AWG_BT_IMITATE_DOMAIN=""\n'
 	printf '_AWG_BT_ATTEMPT=""\n'
 	printf 'declare -A _AWG_BT_STATE=()\n'
 	printf '_AWG_BT_WG_ID=""\n'
@@ -6432,7 +6761,7 @@ function _awgBtScratchCreate() {
 	fi
 	_awgBtScratchSweep
 	_awgBtVerifyStore || return 1
-	_awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${NAME}" || return 1
+	_awgBtDaemonArgv "${_AWG_BT_VERIFIED_BIN}" "${NAME}" "${AWG_BORINGTUN_IMITATE_PROTOCOL:-none}" "${AWG_BORINGTUN_IMITATE_DOMAIN:-}" || return 1
 	if ! TOKEN="$(_awgBtNewToken)"; then
 		_awgBtErr "cannot draw a token for scratch interface ${NAME}"
 		return 1
@@ -7761,6 +8090,40 @@ function serverConfigHasIPv6Address() {
 	return 1
 }
 
+# Ask for the protocol imitation of a fresh interactive BoringTun install. The
+# caller's AWG_BORINGTUN_IMITATE_* request, already validated, is the default.
+function askBoringtunImitation() {
+	local -a PROTOCOLS=(none dns quic sip stun)
+	local CHOICE="" DEFAULT=1 I DOMAIN
+	for I in "${!PROTOCOLS[@]}"; do
+		[[ "${PROTOCOLS[I]}" == "${AWG_BORINGTUN_IMITATE_PROTOCOL}" ]] && DEFAULT=$((I + 1))
+	done
+	echo ""
+	echo -e "${GREEN}BoringTun protocol imitation (shapes the S1-S4 prefixes this server sends):${NC}"
+	echo "Protocol imitation:"
+	echo "   1) none (default)"
+	echo "   2) dns"
+	echo "   3) quic"
+	echo "   4) sip"
+	echo "   5) stun"
+	until [[ "${CHOICE}" =~ ^[1-5]$ ]]; do
+		read -rp "Select an option [1-5]: " -e -i "${DEFAULT}" CHOICE
+	done
+	AWG_BORINGTUN_IMITATE_PROTOCOL="${PROTOCOLS[CHOICE - 1]}"
+	DOMAIN=""
+	if _awgBtImitationUsesDomain "${AWG_BORINGTUN_IMITATE_PROTOCOL}"; then
+		DOMAIN="${AWG_BORINGTUN_IMITATE_DOMAIN}"
+		while true; do
+			read -rp "Imitation hostname (optional; empty lets BoringTun choose): " -e -i "${DOMAIN}" DOMAIN
+			if [[ -z "${DOMAIN}" ]] || _awgBtImitationDomainValid "${DOMAIN}"; then
+				break
+			fi
+			echo "Use at most 253 characters of dot-separated labels of 1-63 ASCII letters, digits and hyphens, none starting or ending with a hyphen."
+		done
+	fi
+	AWG_BORINGTUN_IMITATE_DOMAIN="${DOMAIN}"
+}
+
 function installQuestions() {
 	# Fresh installs remain on AWG 2.0 regardless of caller environment. AWG 3.0
 	# and AWG 3.1 can be enabled only after installation through the explicit
@@ -7771,6 +8134,9 @@ function installQuestions() {
 	# was loaded (kernel unless AWG_BACKEND=boringtun was exported), never from
 	# a later assignment.
 	selectFreshInstallBackend || exit 1
+	# The protocol imitation likewise, and a kernel install refuses one here,
+	# before anything is changed.
+	selectFreshInstallImitation || exit 1
 
 	# Non-interactive mode: use environment variable overrides or sensible defaults
 	# Set AUTO_INSTALL=y to skip all prompts
@@ -7902,6 +8268,7 @@ function installQuestions() {
 		SERVER_AWG_H3="${RANDOM_AWG_H3_MIN}-${RANDOM_AWG_H3_MAX}"
 		SERVER_AWG_H4="${RANDOM_AWG_H4_MIN}-${RANDOM_AWG_H4_MAX}"
 
+		printBoringtunImitationWarnings "${AWG_BORINGTUN_IMITATE_PROTOCOL}" "${AWG_BORINGTUN_IMITATE_DOMAIN}" "${AWG_PROTOCOL_VERSION}"
 		return
 	fi
 
@@ -8057,6 +8424,11 @@ function installQuestions() {
 	echo -e "\n${GREEN}H1-H4 Ranged Headers (ranges must not overlap):${NC}"
 	generateH1AndH2AndH3AndH4Ranges
 	readH1AndH2AndH3AndH4Ranges
+
+	if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+		askBoringtunImitation
+		printBoringtunImitationWarnings "${AWG_BORINGTUN_IMITATE_PROTOCOL}" "${AWG_BORINGTUN_IMITATE_DOMAIN}" "${AWG_PROTOCOL_VERSION}"
+	fi
 
 	echo ""
 	echo "Okay, that was all I needed. We are ready to setup your AmneziaWG server now."
@@ -8484,6 +8856,7 @@ ${AWG_PROTOCOL_FIELDS}" >"${SERVER_AWG_CONF}"
 function installAmneziaWG() {
 	ensureSupportedInstallDistro
 	selectFreshInstallBackend || exit 1
+	selectFreshInstallImitation || exit 1
 	if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
 		installBoringtunHost
 		return
@@ -9829,12 +10202,13 @@ function validateParamsFile() {
 	fi
 
 	# Params must be authoritative; do not let exported shell variables fill in
-	# keys that older params files legitimately lack, select an AWG backend, or
-	# enable AWG 3.0 features.
+	# keys that older params files legitimately lack, select an AWG backend or a
+	# BoringTun protocol imitation, or enable AWG 3.0 features.
 	unset ENABLE_IPV6 AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY \
 		AWG_CONTENT_PADDING_ADDITION AWG_REKEY_AFTER_TIME AWG_REKEY_TIMEOUT \
 		AWG_REJECT_AFTER_TIME AWG_KEEPALIVE_TIMEOUT AWG_RANDOM_TRAILERS \
-		AWG_DISABLE_COOKIES AWG_BACKEND
+		AWG_DISABLE_COOKIES AWG_BACKEND AWG_BORINGTUN_IMITATE_PROTOCOL \
+		AWG_BORINGTUN_IMITATE_DOMAIN
 	# shellcheck source=/etc/amnezia/amneziawg/params
 	if ! source "${AMNEZIAWG_DIR}/params"; then
 		echo -e "${RED}ERROR: Failed to load params from ${AMNEZIAWG_DIR}/params.${NC}" >&2
@@ -10989,6 +11363,15 @@ function setAwgProtocolMode() (
 		loadParams 0 1
 	fi
 	normalizeAwgProtocolVersion || return 1
+	# BoringTun keeps its protocol imitation across protocol changes. AWG 3.x
+	# refuses SIP imitation with long S prefixes and weakens header masking
+	# under the others, so say so before anything changes.
+	if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" && "${TARGET_MODE}" != "${AWG_PROTOCOL_VERSION_2}" ]]; then
+		checkBoringtunImitationProtocolCompat "${AWG_BORINGTUN_IMITATE_PROTOCOL}" "${TARGET_MODE}" || return 1
+		if [[ -z "${_AWG_BT_IMITATION_WARNED:-}" ]]; then
+			printBoringtunImitationWarnings "${AWG_BORINGTUN_IMITATE_PROTOCOL}" "${AWG_BORINGTUN_IMITATE_DOMAIN}" "${TARGET_MODE}"
+		fi
+	fi
 	if [[ "${AWG_PROTOCOL_VERSION}" == "${TARGET_MODE}" ]]; then
 		# A persisted AWG 3.x mode is not enough to prove that the currently
 		# installed userspace and running kernel still support it. Kernel/package
@@ -11117,6 +11500,411 @@ function setAwgProtocolMode() (
 	echo "All client configuration files were updated; redistribute them before reconnecting clients."
 )
 
+# The imitation a running BoringTun daemon was started with, from its command
+# line: sets _AWG_BT_DAEMON_PROTOCOL and _AWG_BT_DAEMON_DOMAIN. A daemon started
+# without --imitate-protocol, as earlier installer versions did, imitates none.
+function _awgBtDaemonImitation() { # <pid>
+	local -a ARGS=()
+	local I
+	_AWG_BT_DAEMON_PROTOCOL=""
+	_AWG_BT_DAEMON_DOMAIN=""
+	[[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+	mapfile -d '' -t ARGS <"${AWG_BT_PROC_DIR}/$1/cmdline" 2>/dev/null || return 1
+	((${#ARGS[@]})) || return 1
+	_AWG_BT_DAEMON_PROTOCOL=none
+	for ((I = 0; I + 1 < ${#ARGS[@]}; I++)); do
+		case "${ARGS[I]}" in
+			--imitate-protocol) _AWG_BT_DAEMON_PROTOCOL="${ARGS[I + 1]}" ;;
+			--imitate-domain) _AWG_BT_DAEMON_DOMAIN="${ARGS[I + 1]}" ;;
+		esac
+	done
+	return 0
+}
+
+# The active awg-quick@<if> is served by the verified BoringTun instance its
+# start recorded (unit active, MainPID, TUN link, UAPI), listens on the
+# persisted port, no amneziawg kernel module is loaded, and the daemon runs the
+# given imitation.
+function verifyBoringtunImitationServed() { # <protocol> <domain>
+	local UNIT="awg-quick@${SERVER_AWG_NIC}.service" PORT=""
+	if ! systemctl is-active --quiet "${UNIT}"; then
+		echo "ERROR: ${UNIT} is not active." >&2
+		return 1
+	fi
+	_awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}" || return 1
+	PORT="$(_awgBtListenPort "${SERVER_AWG_NIC}")" || PORT=""
+	if [[ "${PORT}" != "${SERVER_PORT}" ]]; then
+		echo "ERROR: ${SERVER_AWG_NIC} listens on port ${PORT:-none}, not on ${SERVER_PORT}." >&2
+		return 1
+	fi
+	if [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then
+		echo "ERROR: the amneziawg kernel module is loaded." >&2
+		return 1
+	fi
+	if ! _awgBtDaemonImitation "${_AWG_BT_STATE[PID]:-}" ||
+		[[ "${_AWG_BT_DAEMON_PROTOCOL}" != "$1" || "${_AWG_BT_DAEMON_DOMAIN}" != "$2" ]]; then
+		echo "ERROR: the BoringTun daemon of ${SERVER_AWG_NIC} does not run protocol imitation $(boringtunImitationDisplay "$1" "$2")." >&2
+		return 1
+	fi
+	return 0
+}
+
+# Replace DEST with a copy of SOURCE: the same bytes, SOURCE's owner and the
+# given mode, renamed into place so that DEST is never partly written.
+function replaceFileExactly() { # <source> <dest> <mode>
+	local TEMP_FILE
+	TEMP_FILE="$(mktemp "$(dirname -- "$2")/.$(basename -- "$2").imitation.XXXXXX")" || return 1
+	if ! cp -p -- "$1" "${TEMP_FILE}" || ! chmod "$3" -- "${TEMP_FILE}" || ! mv -f -- "${TEMP_FILE}" "$2"; then
+		rm -f -- "${TEMP_FILE}"
+		return 1
+	fi
+}
+
+function cleanupBoringtunImitationTransactionDir() {
+	local RESOLVED_DIR RESOLVED_ROOT
+	RESOLVED_DIR="$(readlink -f -- "$1" 2>/dev/null || true)"
+	RESOLVED_ROOT="$(readlink -f -- "${AMNEZIAWG_DIR}" 2>/dev/null || true)"
+	if [[ -n "${RESOLVED_DIR}" && -n "${RESOLVED_ROOT}" && ! -L "$1" &&
+		"${RESOLVED_DIR}" == "${RESOLVED_ROOT}/.awg-imitation."* ]]; then
+		rm -rf -- "${RESOLVED_DIR}"
+	fi
+}
+
+# Change the BoringTun protocol imitation (design §9.3). Under the lifecycle
+# lock, with params reloaded: identical values change nothing. The unit's state
+# decides the rest before any file changes: active applies the change with a
+# restart and verifies it, inactive or failed only persists it for the next
+# start, and any other state (activating, deactivating, reloading, unknown)
+# aborts. The helpers are regenerated before the runtime file gains keys that
+# an older launcher would refuse. Params and the runtime file are rendered into
+# a private transaction directory and checked: the runtime file with the
+# launcher's own parser, params by reading them back, and the server config on
+# a scratch BoringTun instance that runs the new imitation. Both files are
+# backed up byte for byte with their modes and then replaced atomically. A
+# failure, or HUP, INT or TERM, after that restores both files exactly and, if
+# the unit was active, restarts it on the previous imitation; every step that
+# fails is reported. Client configs never change.
+function setBoringtunImitation() ( # <protocol> [<domain> [warned]]
+	local PROTOCOL="${1-}" DOMAIN="${2-}" WARNED="${3:-0}"
+	local UNIT STATE ACTIVE=0 OLD_PROTOCOL OLD_DOMAIN TRANSACTION_DIR=""
+	local PARAMS_FILE RUNTIME_FILE PARAMS_STAGE RUNTIME_STAGE PARAMS_BACKUP RUNTIME_BACKUP
+	local PARAMS_MODE RUNTIME_MODE="" RUNTIME_EXISTED=0 APPLY_STARTED=0 CURRENT_STATE STAGED_STATE
+
+	if ! _awgBtImitationCheck "${PROTOCOL}" "${DOMAIN}"; then
+		echo "Usage: amneziawg-install.sh --set-boringtun-imitation <none|dns|quic|sip|stun> [hostname]" >&2
+		return 1
+	fi
+	acquireClientLifecycleLock || return 1
+	loadParams 0 1
+	if [[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]]; then
+		echo "ERROR: protocol imitation is available only with the BoringTun backend; this installation uses the ${AWG_BACKEND} backend. Nothing was changed." >&2
+		return 1
+	fi
+	normalizeAwgProtocolVersion || return 1
+	OLD_PROTOCOL="${AWG_BORINGTUN_IMITATE_PROTOCOL}"
+	OLD_DOMAIN="${AWG_BORINGTUN_IMITATE_DOMAIN}"
+	if [[ "${PROTOCOL}" == "${OLD_PROTOCOL}" && "${DOMAIN}" == "${OLD_DOMAIN}" ]]; then
+		echo "BoringTun protocol imitation is already $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}"); nothing was changed."
+		return 0
+	fi
+	checkBoringtunImitationProtocolCompat "${PROTOCOL}" "${AWG_PROTOCOL_VERSION}" || return 1
+
+	UNIT="awg-quick@${SERVER_AWG_NIC}.service"
+	STATE="$(systemctl show -p ActiveState --value "${UNIT}" 2>/dev/null)" || STATE=""
+	case "${STATE}" in
+		active) ACTIVE=1 ;;
+		inactive | failed) ;;
+		*)
+			echo "ERROR: ${UNIT} is ${STATE:-in an unknown state}; nothing was changed. Retry once it is active, inactive or failed." >&2
+			return 1
+			;;
+	esac
+	((WARNED)) || printBoringtunImitationWarnings "${PROTOCOL}" "${DOMAIN}" "${AWG_PROTOCOL_VERSION}"
+
+	# The store, the platform and the helpers. This exits the subshell on
+	# failure, before anything is changed.
+	_awgBtEnsureReady 0
+	if ((ACTIVE)) && ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}"; then
+		echo "ERROR: ${UNIT} is active but not served by the verified BoringTun instance recorded for it; nothing was changed." >&2
+		return 1
+	fi
+
+	PARAMS_FILE="${AMNEZIAWG_DIR}/params"
+	RUNTIME_FILE="$(_awgBtRuntimeFilePath "${SERVER_AWG_NIC}")"
+	PARAMS_MODE="$(stat -c '%a' -- "${PARAMS_FILE}" 2>/dev/null)" || PARAMS_MODE=""
+	if [[ -L "${RUNTIME_FILE}" ]] || { [[ -e "${RUNTIME_FILE}" ]] && [[ ! -f "${RUNTIME_FILE}" ]]; }; then
+		echo "ERROR: ${RUNTIME_FILE} is not a regular file; nothing was changed." >&2
+		return 1
+	fi
+	if [[ -f "${RUNTIME_FILE}" ]]; then
+		RUNTIME_EXISTED=1
+		RUNTIME_MODE="$(stat -c '%a' -- "${RUNTIME_FILE}" 2>/dev/null)" || RUNTIME_MODE=""
+	fi
+	if [[ -z "${PARAMS_MODE}" ]] || { ((RUNTIME_EXISTED)) && [[ -z "${RUNTIME_MODE}" ]]; }; then
+		echo "ERROR: cannot read the modes of ${PARAMS_FILE} and ${RUNTIME_FILE}; nothing was changed." >&2
+		return 1
+	fi
+
+	function restoreBoringtunImitationFiles() {
+		local FAILED=0
+		if ((RUNTIME_EXISTED)); then
+			replaceFileExactly "${RUNTIME_BACKUP}" "${RUNTIME_FILE}" "${RUNTIME_MODE}" || FAILED=1
+		else
+			rm -f -- "${RUNTIME_FILE}" || FAILED=1
+		fi
+		replaceFileExactly "${PARAMS_BACKUP}" "${PARAMS_FILE}" "${PARAMS_MODE}" || FAILED=1
+		AWG_BORINGTUN_IMITATE_PROTOCOL="${OLD_PROTOCOL}"
+		AWG_BORINGTUN_IMITATE_DOMAIN="${OLD_DOMAIN}"
+		if ((FAILED)); then
+			echo "ERROR: ${PARAMS_FILE} and ${RUNTIME_FILE} could not both be restored." >&2
+		fi
+		return "${FAILED}"
+	}
+
+	function restoreBoringtunImitationRuntime() {
+		((ACTIVE)) || return 0
+		awgBackendPrepareServiceStart
+		if ! systemctl restart "${UNIT}" || ! verifyBoringtunImitationServed "${OLD_PROTOCOL}" "${OLD_DOMAIN}"; then
+			echo "ERROR: ${UNIT} could not be restarted on the previous protocol imitation $(boringtunImitationDisplay "${OLD_PROTOCOL}" "${OLD_DOMAIN}"). Check: journalctl -u ${UNIT}" >&2
+			return 1
+		fi
+	}
+
+	function rollbackBoringtunImitation() {
+		local FAILED=0
+		restoreBoringtunImitationFiles || FAILED=1
+		# A restart on files that could not be restored would run neither
+		# configuration, so the unit is left to the operator then.
+		if ((FAILED == 0)) && ! restoreBoringtunImitationRuntime; then
+			FAILED=1
+		fi
+		if ((FAILED == 0)); then
+			echo "The previous protocol imitation $(boringtunImitationDisplay "${OLD_PROTOCOL}" "${OLD_DOMAIN}") was restored." >&2
+			cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		else
+			echo "ERROR: the rollback is incomplete; recovery files remain in ${TRANSACTION_DIR}" >&2
+		fi
+		return "${FAILED}"
+	}
+
+	function rollbackBoringtunImitationOnSignal() {
+		trap '' HUP INT TERM
+		echo "ERROR: the protocol imitation change was interrupted." >&2
+		if ((APPLY_STARTED)); then
+			rollbackBoringtunImitation
+		elif [[ -n "${TRANSACTION_DIR}" ]]; then
+			cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		fi
+		exit "$1"
+	}
+
+	trap 'rollbackBoringtunImitationOnSignal 129' HUP
+	trap 'rollbackBoringtunImitationOnSignal 130' INT
+	trap 'rollbackBoringtunImitationOnSignal 143' TERM
+
+	TRANSACTION_DIR="$(mktemp -d "${AMNEZIAWG_DIR}/.awg-imitation.XXXXXX")" || {
+		TRANSACTION_DIR=""
+		echo "ERROR: could not create the protocol imitation transaction directory; nothing was changed." >&2
+		return 1
+	}
+	chmod 700 -- "${TRANSACTION_DIR}"
+	PARAMS_STAGE="${TRANSACTION_DIR}/params.new"
+	PARAMS_BACKUP="${TRANSACTION_DIR}/params.backup"
+	RUNTIME_STAGE="${TRANSACTION_DIR}/${SERVER_AWG_NIC}.boringtun"
+	RUNTIME_BACKUP="${TRANSACTION_DIR}/runtime.backup"
+
+	# The loaded state, without the imitation: the staged params must read
+	# back as exactly this plus the requested imitation.
+	CURRENT_STATE="$(awgParamsStateDigest)"
+	AWG_BORINGTUN_IMITATE_PROTOCOL="${PROTOCOL}"
+	AWG_BORINGTUN_IMITATE_DOMAIN="${DOMAIN}"
+	if ! cp -p -- "${PARAMS_FILE}" "${PARAMS_BACKUP}" ||
+		{ ((RUNTIME_EXISTED)) && ! cp -p -- "${RUNTIME_FILE}" "${RUNTIME_BACKUP}"; } ||
+		! serializeParams "${PARAMS_STAGE}" ||
+		! (umask 077 && _awgBtRenderRuntimeFile >"${RUNTIME_STAGE}") ||
+		! chmod 600 -- "${RUNTIME_STAGE}"; then
+		echo "ERROR: could not stage the protocol imitation change; nothing was changed." >&2
+		cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+	# The staged runtime file must read back, through the launcher's parser, as
+	# exactly the requested imitation.
+	if ! (
+		AWG_BT_CONFIG_DIR="${TRANSACTION_DIR}"
+		_awgBtReadRuntimeFile "${SERVER_AWG_NIC}" &&
+			[[ "${_AWG_BT_IMITATE_PROTOCOL}" == "${PROTOCOL}" && "${_AWG_BT_IMITATE_DOMAIN}" == "${DOMAIN}" ]]
+	); then
+		echo "ERROR: the staged runtime file does not read back as $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}"); nothing was changed." >&2
+		cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+	# The staged params must be a complete canonical BoringTun params file
+	# that loads on its own, and must read back as the current state with only
+	# the imitation changed.
+	if ! awgParamsFileHasCanonicalKeys "${PARAMS_STAGE}" "${AWG_BACKEND_BORINGTUN}"; then
+		echo "ERROR: the staged params are not a complete params file; nothing was changed." >&2
+		cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+	if ! STAGED_STATE="$(readStagedParamsInIsolation "${PARAMS_STAGE}" "${TRANSACTION_DIR}/check")"; then
+		echo "ERROR: the staged params do not load on their own; nothing was changed." >&2
+		cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+	if [[ "${STAGED_STATE}" != "${CURRENT_STATE}|${PROTOCOL}|${DOMAIN}" ]]; then
+		echo "ERROR: the staged params differ from the current ones in more than the protocol imitation; nothing was changed." >&2
+		cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+	if ! validateStagedAwgConfigs "${TRANSACTION_DIR}" "${SERVER_AWG_CONF}"; then
+		echo "ERROR: BoringTun does not accept the server configuration with protocol imitation $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}"); nothing was changed." >&2
+		cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+
+	APPLY_STARTED=1
+	if ! _awgBtWriteManagedFile "${RUNTIME_FILE}" 0600 <"${RUNTIME_STAGE}" ||
+		! replaceFileExactly "${PARAMS_STAGE}" "${PARAMS_FILE}" "${PARAMS_MODE}"; then
+		echo "ERROR: could not write the new protocol imitation; restoring the previous files." >&2
+		rollbackBoringtunImitation
+		return 1
+	fi
+	if ((ACTIVE)); then
+		awgBackendPrepareServiceStart
+		if ! systemctl restart "${UNIT}" || ! verifyBoringtunImitationServed "${PROTOCOL}" "${DOMAIN}"; then
+			echo "ERROR: ${UNIT} did not come back on protocol imitation $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}"); restoring the previous one." >&2
+			rollbackBoringtunImitation
+			return 1
+		fi
+	fi
+	trap - HUP INT TERM
+	cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+	if ((ACTIVE)); then
+		echo "BoringTun protocol imitation is now $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}"); ${UNIT} was restarted with it."
+	else
+		echo "BoringTun protocol imitation is now $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}"). ${UNIT} is ${STATE} and was not started; the imitation applies at its next start."
+	fi
+	echo "Client configs are unchanged."
+	return 0
+)
+
+# Menu option: ask for the imitation, show its trade-offs, confirm enabling one
+# under AWG 3.x, then run the transaction, which reloads params under the lock.
+function changeBoringtunImitationInteractively() {
+	local -a PROTOCOLS=(none dns quic sip stun)
+	local CHOICE="" DEFAULT=1 I PROTOCOL DOMAIN="" RESPONSE
+	normalizeAwgProtocolVersion || return 1
+	echo "Current BoringTun protocol imitation: $(boringtunImitationDisplay "${AWG_BORINGTUN_IMITATE_PROTOCOL}" "${AWG_BORINGTUN_IMITATE_DOMAIN}")"
+	echo ""
+	for I in "${!PROTOCOLS[@]}"; do
+		[[ "${PROTOCOLS[I]}" == "${AWG_BORINGTUN_IMITATE_PROTOCOL}" ]] && DEFAULT=$((I + 1))
+	done
+	echo "Protocol imitation:"
+	echo "   1) none"
+	echo "   2) dns"
+	echo "   3) quic"
+	echo "   4) sip"
+	echo "   5) stun"
+	until [[ "${CHOICE}" =~ ^[1-5]$ ]]; do
+		read -rp "Select an option [1-5]: " -e -i "${DEFAULT}" CHOICE
+	done
+	PROTOCOL="${PROTOCOLS[CHOICE - 1]}"
+	if _awgBtImitationUsesDomain "${PROTOCOL}"; then
+		[[ "${PROTOCOL}" != "${AWG_BORINGTUN_IMITATE_PROTOCOL}" ]] || DOMAIN="${AWG_BORINGTUN_IMITATE_DOMAIN}"
+		while true; do
+			read -rp "Imitation hostname (optional; empty lets BoringTun choose): " -e -i "${DOMAIN}" DOMAIN
+			if [[ -z "${DOMAIN}" ]] || _awgBtImitationDomainValid "${DOMAIN}"; then
+				break
+			fi
+			echo "Use at most 253 characters of dot-separated labels of 1-63 ASCII letters, digits and hyphens, none starting or ending with a hyphen."
+		done
+	fi
+	if [[ "${PROTOCOL}" == "${AWG_BORINGTUN_IMITATE_PROTOCOL}" && "${DOMAIN}" == "${AWG_BORINGTUN_IMITATE_DOMAIN}" ]]; then
+		echo "Protocol imitation unchanged."
+		return 0
+	fi
+	checkBoringtunImitationProtocolCompat "${PROTOCOL}" "${AWG_PROTOCOL_VERSION}" || return 1
+	printBoringtunImitationWarnings "${PROTOCOL}" "${DOMAIN}" "${AWG_PROTOCOL_VERSION}"
+	if [[ "${PROTOCOL}" != "${AWG_BT_IMITATE_NONE}" ]] && awgProtocolUsesHeaderProtection; then
+		read -rp "Enable ${PROTOCOL} imitation under AWG $(awgProtocolDisplayName "${AWG_PROTOCOL_VERSION}")? [y/N]: " RESPONSE
+		[[ "${RESPONSE}" == [Yy] ]] || {
+			echo "Protocol imitation change cancelled."
+			return 0
+		}
+	fi
+	setBoringtunImitation "${PROTOCOL}" "${DOMAIN}" 1
+}
+
+# --backend-status: a read-only key=value report of the installation's backend.
+# Every backend prints backend, awg_protocol and service_state; BoringTun adds
+# its imitation, the installed and pinned releases and its daemon; the kernel
+# backend adds module_state. No keys or other secrets are printed. It exits 0
+# for a valid installation and 1 when params or the BoringTun store cannot be
+# used. It changes nothing: params with an insecure mode are refused here, not
+# repaired as the management commands repair them.
+function printBackendStatus() {
+	local PARAMS_FILE="${AMNEZIAWG_DIR}/params" OWNER MODE UNIT STATE RC=0
+	local INSTALLED=none PINNED="" DAEMON_STATE=stopped DAEMON_PID=""
+	if [[ -L "${PARAMS_FILE}" || ! -f "${PARAMS_FILE}" ]]; then
+		echo "ERROR: ${PARAMS_FILE} is missing or not a regular file." >&2
+		return 1
+	fi
+	OWNER="$(stat -c '%u' -- "${PARAMS_FILE}" 2>/dev/null)" || OWNER=""
+	MODE="$(stat -c '%a' -- "${PARAMS_FILE}" 2>/dev/null)" || MODE=""
+	if [[ "${OWNER}" != 0 ]] || [[ "${MODE}" != 600 && "${MODE}" != 400 ]]; then
+		echo "ERROR: ${PARAMS_FILE} must be owned by root with mode 600 or 400; --backend-status does not repair it." >&2
+		return 1
+	fi
+	if ! validateParamsFile 0 >/dev/null || ! normalizeAwgProtocolVersion >/dev/null; then
+		echo "ERROR: ${PARAMS_FILE} does not describe a valid installation." >&2
+		return 1
+	fi
+	UNIT="awg-quick@${SERVER_AWG_NIC}.service"
+	STATE="$(systemctl show -p ActiveState --value "${UNIT}" 2>/dev/null)" || STATE=""
+	[[ "${STATE}" =~ ^[a-z-]+$ ]] || STATE=unknown
+	printf 'backend=%s\n' "${AWG_BACKEND}"
+	printf 'awg_protocol=%s\n' "$(awgProtocolDisplayName "${AWG_PROTOCOL_VERSION}")"
+	printf 'service_state=%s\n' "${STATE}"
+	if [[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]]; then
+		if [[ -e "${AWG_BT_SYS_DIR}/module/amneziawg" ]]; then
+			printf 'module_state=loaded\n'
+		else
+			printf 'module_state=not-loaded\n'
+		fi
+		return 0
+	fi
+	printf 'imitation_protocol=%s\n' "${AWG_BORINGTUN_IMITATE_PROTOCOL}"
+	printf 'imitation_domain=%s\n' "${AWG_BORINGTUN_IMITATE_DOMAIN}"
+	printf 'imitation_domain_mode=%s\n' "$(boringtunImitationDomainMode "${AWG_BORINGTUN_IMITATE_PROTOCOL}" "${AWG_BORINGTUN_IMITATE_DOMAIN}")"
+	if _awgBtSelectRelease "$(_awgBtHostArch 2>/dev/null)"; then
+		PINNED="${_AWG_BT_REL_ID}"
+	fi
+	if _awgBtVerifyStore 2>/dev/null; then
+		INSTALLED="$(readlink -- "${AWG_BT_STORE_DIR}/current")"
+	else
+		[[ ! -e "${AWG_BT_STORE_DIR}" && ! -L "${AWG_BT_STORE_DIR}" ]] || INSTALLED=invalid
+		RC=1
+	fi
+	_AWG_BT_DAEMON_PROTOCOL=""
+	_AWG_BT_DAEMON_DOMAIN=""
+	if [[ "${STATE}" == active ]]; then
+		if ((RC == 0)) && _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}" 2>/dev/null; then
+			DAEMON_STATE=running
+			DAEMON_PID="${_AWG_BT_STATE[PID]:-}"
+			_awgBtDaemonImitation "${DAEMON_PID}" || true
+		else
+			DAEMON_STATE=unverified
+		fi
+	fi
+	printf 'installed_release=%s\n' "${INSTALLED}"
+	printf 'pinned_release=%s\n' "${PINNED}"
+	printf 'daemon_state=%s\n' "${DAEMON_STATE}"
+	printf 'daemon_pid=%s\n' "${DAEMON_PID}"
+	printf 'daemon_imitation_protocol=%s\n' "${_AWG_BT_DAEMON_PROTOCOL}"
+	printf 'daemon_imitation_domain=%s\n' "${_AWG_BT_DAEMON_DOMAIN}"
+	return "${RC}"
+}
+
 function changeAwgProtocolInteractively() {
 	local TARGET_MODE RESPONSE CHOICE=""
 	normalizeAwgProtocolVersion || return 1
@@ -11175,6 +11963,11 @@ function changeAwgProtocolInteractively() {
 			echo -e "${ORANGE}Current S1-S4 values differ. Upstream recommends identical S1-S4 when RandomTrailers is on; existing values will be kept.${NC}"
 		fi
 	fi
+	if [[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" && "${TARGET_MODE}" != "${AWG_PROTOCOL_VERSION_2}" ]]; then
+		checkBoringtunImitationProtocolCompat "${AWG_BORINGTUN_IMITATE_PROTOCOL}" "${TARGET_MODE}" || return 1
+		printBoringtunImitationWarnings "${AWG_BORINGTUN_IMITATE_PROTOCOL}" "${AWG_BORINGTUN_IMITATE_DOMAIN}" "${TARGET_MODE}"
+		_AWG_BT_IMITATION_WARNED=1
+	fi
 	read -rp "Switch this interface to AWG $(awgProtocolDisplayName "${TARGET_MODE}")? [y/N]: " RESPONSE
 	[[ "${RESPONSE}" == [Yy] ]] || {
 		echo "Protocol change cancelled."
@@ -11200,6 +11993,10 @@ function manageMenu() {
 	echo ""
 	echo "It looks like AmneziaWG is already installed."
 	echo ""
+	if [[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+		manageBoringtunMenu
+		return
+	fi
 	echo "What do you want to do?"
 	echo "   1) Add a new user"
 	echo "   2) List all users"
@@ -11231,6 +12028,53 @@ function manageMenu() {
 		runLockedManagementOperation uninstallAmneziaWG
 		;;
 	7)
+		exit 0
+		;;
+	esac
+}
+
+# The management menu of a BoringTun installation: the kernel menu's options,
+# numbered as there, plus a change of the protocol imitation before Exit,
+# under a line that shows the imitation.
+function manageBoringtunMenu() {
+	local MENU_OPTION=""
+	echo "Backend: BoringTun (experimental); protocol imitation: $(boringtunImitationDisplay "${AWG_BORINGTUN_IMITATE_PROTOCOL:-${AWG_BT_IMITATE_NONE}}" "${AWG_BORINGTUN_IMITATE_DOMAIN:-}")"
+	echo ""
+	echo "What do you want to do?"
+	echo "   1) Add a new user"
+	echo "   2) List all users"
+	echo "   3) Revoke existing user"
+	echo "   4) Regenerate all client configs (using current server parameters)"
+	echo "   5) Change AWG protocol mode (current: $(awgProtocolDisplayName "${AWG_PROTOCOL_VERSION:-${AWG_PROTOCOL_VERSION_2}}"))"
+	echo "   6) Uninstall AmneziaWG"
+	echo "   7) Change BoringTun protocol imitation (current: ${AWG_BORINGTUN_IMITATE_PROTOCOL:-${AWG_BT_IMITATE_NONE}})"
+	echo "   8) Exit"
+	until [[ ${MENU_OPTION} =~ ^[1-8]$ ]]; do
+		read -rp "Select an option [1-8]: " MENU_OPTION
+	done
+	case "${MENU_OPTION}" in
+	1)
+		runLockedManagementOperation newClient
+		;;
+	2)
+		listClients
+		;;
+	3)
+		runLockedManagementOperation revokeClient
+		;;
+	4)
+		runLockedManagementOperation regenerateClients
+		;;
+	5)
+		changeAwgProtocolInteractively
+		;;
+	6)
+		runLockedManagementOperation uninstallAmneziaWG
+		;;
+	7)
+		changeBoringtunImitationInteractively
+		;;
+	8)
 		exit 0
 		;;
 	esac
@@ -11584,9 +12428,30 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	#   amneziawg-install.sh --enable-awg3
 	#   amneziawg-install.sh --enable-awg31
 	#   amneziawg-install.sh --disable-awg3
+	#   amneziawg-install.sh --set-boringtun-imitation <none|dns|quic|sip|stun> [hostname]
+	#   amneziawg-install.sh --backend-status
 	#
 	# Requires AmneziaWG to be already installed (params file must exist).
 	case "${1:-}" in
+		--set-boringtun-imitation|--backend-status)
+			if [[ "$1" == --backend-status && $# -ne 1 ]] ||
+				[[ "$1" == --set-boringtun-imitation && ($# -lt 2 || $# -gt 3) ]]; then
+				echo "Usage: amneziawg-install.sh --set-boringtun-imitation <none|dns|quic|sip|stun> [hostname]" >&2
+				echo "       amneziawg-install.sh --backend-status" >&2
+				exit 1
+			fi
+			initialCheck
+			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
+				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
+				exit 1
+			fi
+			if [[ "$1" == --backend-status ]]; then
+				printBackendStatus
+			else
+				setBoringtunImitation "$2" "${3-}"
+			fi
+			exit $?
+			;;
 		--protocol-status|--enable-awg3|--enable-awg31|--disable-awg3)
 			initialCheck
 			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
