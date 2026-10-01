@@ -52,3 +52,27 @@ bt_unit_release() { # <unit> <store>
 	EXE="${EXE#"${STORE}"/}"
 	printf '%s\n' "${EXE%/boringtun-cli}"
 }
+
+# bt_fixture_build2 <store> <pinned release id>: a TEST FIXTURE build 2 of the
+# pinned source commit (the same files and MANIFEST under the -b2 store name
+# that a later build of that commit would get), and print its store name. Its
+# name is one the helpers of installer versions before PR 6 refuse.
+bt_fixture_build2() {
+	local STORE="$1" PINNED="$2" FIXTURE FILE
+	FIXTURE="$(sed -E 's/(-g[0-9a-f]{12})-linux-/\1-b2-linux-/' <<<"${PINNED}")"
+	[[ "${FIXTURE}" != "${PINNED}" && ! -e "${STORE}/${FIXTURE}" ]] || return 1
+	mkdir -m 0755 -- "${STORE}/${FIXTURE}" || return 1
+	for FILE in LICENSE MANIFEST THIRD-PARTY-LICENSES boringtun-cli; do
+		cp -- "${STORE}/${PINNED}/${FILE}" "${STORE}/${FIXTURE}/${FILE}" || return 1
+	done
+	chmod 0644 -- "${STORE}/${FIXTURE}/LICENSE" "${STORE}/${FIXTURE}/THIRD-PARTY-LICENSES" "${STORE}/${FIXTURE}/MANIFEST"
+	chmod 0755 -- "${STORE}/${FIXTURE}/boringtun-cli"
+	chown -R 0:0 -- "${STORE}/${FIXTURE}"
+	printf '%s\n' "${FIXTURE}"
+}
+
+# bt_fixture_make_previous <store> <release id>: point previous at a TEST
+# FIXTURE atomically, as a test only.
+bt_fixture_make_previous() {
+	ln -s -- "$2" "$1/.previous.fixture" && mv -T -f -- "$1/.previous.fixture" "$1/previous"
+}

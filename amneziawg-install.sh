@@ -12099,12 +12099,30 @@ function _awgBtPruneRelease() { # <release id>
 
 # The SHA-256 of every file a binary switch must leave as it is: params, the
 # server config, the runtime file and every active client config. Compared,
-# never printed.
+# never printed. Fails when the client set cannot be read or any of the files
+# cannot be hashed, so a missing or unreadable file never shortens both
+# snapshots alike.
 function _awgBtLifecycleConfigHashes() {
-	local -a CLIENTS=()
+	local -a CLIENTS=() FILES=()
 	collectActiveAwgClientConfigs CLIENTS >/dev/null 2>&1 || return 1
-	sha256sum -- "${AMNEZIAWG_DIR}/params" "${SERVER_AWG_CONF}" "$(_awgBtRuntimeFilePath "${SERVER_AWG_NIC}")" "${CLIENTS[@]}" 2>/dev/null
-	return 0
+	FILES=("${AMNEZIAWG_DIR}/params" "${SERVER_AWG_CONF}" "$(_awgBtRuntimeFilePath "${SERVER_AWG_NIC}")" "${CLIENTS[@]}")
+	if ! sha256sum -- "${FILES[@]}" 2>/dev/null; then
+		return 1
+	fi
+}
+
+# The generated helpers that start and stop the service must accept every
+# release name this installer may select: builds from 2 on are named
+# -b<build>, which the helpers of earlier installer versions refuse. So an
+# explicit lifecycle operation regenerates them from this installer
+# (_awgBtInstallHelpers) before current can change or the service restarts.
+# They are derived files and are not put back when an activation fails: they
+# accept the earlier release names as well.
+function _awgBtReconcileLifecycleHelpers() {
+	if ! _awgBtInstallHelpers; then
+		echo "ERROR: could not update the BoringTun helpers in ${AWG_BT_LIBEXEC_DIR}; nothing was changed." >&2
+		return 1
+	fi
 }
 
 # Prove, before a release may become current, that its binary accepts this
@@ -12186,7 +12204,7 @@ function _awgBtVerifyLifecycleActivation() {
 #     step is reported on its own.
 function boringtunBinaryLifecycle() ( # <upgrade|rollback>
 	local MODE="$1" ARCH UNIT STATE ACTIVE=0 CURRENT_ID PREVIOUS_ID="" PREVIOUS_EXISTED=0 LINK_RC
-	local TARGET CREATED=0 WORK="" SWITCHED=0 RESTARTED=0 HASHES_BEFORE="" HASHES_AFTER="" UNMANAGED
+	local TARGET CREATED=0 WORK="" SWITCHED=0 RESTARTED=0 REPAIRED=0 HASHES_BEFORE="" HASHES_AFTER="" UNMANAGED
 	case "${MODE}" in
 		upgrade | rollback) ;;
 		*) return 1 ;;
@@ -12238,10 +12256,25 @@ function boringtunBinaryLifecycle() ( # <upgrade|rollback>
 				echo "ERROR: ${AWG_BT_STORE_DIR}/${TARGET} is not the release this installer pins (its binary has another SHA-256); nothing was changed." >&2
 				return 1
 			fi
+			if ((PREVIOUS_EXISTED)) && [[ "${PREVIOUS_ID}" == "${CURRENT_ID}" ]]; then
+				# A switch interrupted between its two link renames left
+				# previous naming current. Which release previous named
+				# before cannot be known: only the duplicate link is
+				# dropped, and every release directory stays as it is,
+				# unmanaged, never adopted as the rollback target.
+				if ! rm -f -- "${AWG_BT_STORE_DIR}/previous" ||
+					[[ -e "${AWG_BT_STORE_DIR}/previous" || -L "${AWG_BT_STORE_DIR}/previous" ]]; then
+					echo "ERROR: ${AWG_BT_STORE_DIR}/previous names current and could not be removed; the store is not consistent." >&2
+					return 1
+				fi
+				echo "${AWG_BT_STORE_DIR}/previous named current, which an interrupted switch leaves; that link was removed. No release directory was changed or chosen as the rollback target."
+				REPAIRED=1
+			fi
 			if ((ACTIVE)) && ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
 				# current was switched, but the service was not restarted
 				# onto it (an interrupted transaction): finish that now.
 				echo "current already selects ${TARGET}, but ${UNIT} is not served by it; restarting it on ${TARGET}."
+				_awgBtReconcileLifecycleHelpers || return 1
 				awgBackendPrepareServiceStart
 				if ! systemctl restart "${UNIT}" || ! _awgBtVerifyLifecycleActivation; then
 					echo "ERROR: ${UNIT} is still not verifiably served by ${TARGET}. Check: journalctl -u ${UNIT}" >&2
@@ -12250,7 +12283,13 @@ function boringtunBinaryLifecycle() ( # <upgrade|rollback>
 				echo "${UNIT} now runs the BoringTun release ${TARGET}."
 				return 0
 			fi
-			echo "The BoringTun release ${TARGET} that this installer pins is already current; nothing was changed."
+			if ((REPAIRED)); then
+				echo "The BoringTun release ${TARGET} that this installer pins is already current."
+			else
+				echo "The BoringTun release ${TARGET} that this installer pins is already current; nothing was changed."
+			fi
+			UNMANAGED="$(_awgBtUnmanagedReleases)"
+			[[ -z "${UNMANAGED}" ]] || echo "NOTE: ${AWG_BT_STORE_DIR} also holds release directories that neither current nor previous names, which were left alone: $(tr '\n' ' ' <<<"${UNMANAGED}")"
 			return 0
 		fi
 	else
@@ -12260,6 +12299,7 @@ function boringtunBinaryLifecycle() ( # <upgrade|rollback>
 		fi
 		TARGET="${PREVIOUS_ID}"
 	fi
+	_awgBtReconcileLifecycleHelpers || return 1
 
 	function abandonBoringtunLifecycle() {
 		[[ -z "${WORK}" ]] || rm -rf -- "${WORK}"
@@ -12359,7 +12399,11 @@ function boringtunBinaryLifecycle() ( # <upgrade|rollback>
 		abandonBoringtunLifecycle
 		return 1
 	fi
-	HASHES_AFTER="$(_awgBtLifecycleConfigHashes)" || HASHES_AFTER=""
+	if ! HASHES_AFTER="$(_awgBtLifecycleConfigHashes)"; then
+		echo "ERROR: cannot read the configuration of this installation after the validation; nothing was changed." >&2
+		abandonBoringtunLifecycle
+		return 1
+	fi
 	if [[ "${HASHES_AFTER}" != "${HASHES_BEFORE}" ]]; then
 		echo "ERROR: the configuration changed during the validation; nothing was changed." >&2
 		abandonBoringtunLifecycle
@@ -12386,7 +12430,11 @@ function boringtunBinaryLifecycle() ( # <upgrade|rollback>
 			return 1
 		fi
 	fi
-	HASHES_AFTER="$(_awgBtLifecycleConfigHashes)" || HASHES_AFTER=""
+	if ! HASHES_AFTER="$(_awgBtLifecycleConfigHashes)"; then
+		echo "ERROR: cannot read the configuration of this installation after the switch; restoring ${CURRENT_ID}." >&2
+		restoreBoringtunLifecycle
+		return 1
+	fi
 	if [[ "${HASHES_AFTER}" != "${HASHES_BEFORE}" ]]; then
 		echo "ERROR: the configuration changed during the switch; restoring ${CURRENT_ID}." >&2
 		restoreBoringtunLifecycle

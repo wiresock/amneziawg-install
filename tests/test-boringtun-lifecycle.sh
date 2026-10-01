@@ -176,6 +176,19 @@ case "\$1" in
 			RC="\$(head -n 1 '${S}/restart-rc')"
 			[[ "\$(wc -l <'${S}/restart-rc')" -gt 1 ]] && sed -i 1d '${S}/restart-rc'
 		fi
+		# A start runs the installed helpers, which verify the store
+		# themselves: with <state>/restart-uses-helper, both installed
+		# helpers must accept the release current selects.
+		if [[ -f '${S}/restart-uses-helper' ]]; then
+			for HELPER in '${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl' '${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch'; do
+				if VERIFIED="\$(bash -c 'source <(head -n -2 "\$1") >/dev/null 2>&1 || exit 2; _awgBtVerifyStore 2>/dev/null && printf "%s" "\${_AWG_BT_VERIFIED_BIN}"' _ "\${HELPER}")"; then
+					echo "helper \${HELPER##*/} verified \$(basename "\$(dirname "\${VERIFIED}")")" >>'${S}/log'
+				else
+					echo "helper \${HELPER##*/} refused current" >>'${S}/log'
+					RC=1
+				fi
+			done
+		fi
 		exit "\${RC}"
 		;;
 esac
@@ -219,7 +232,36 @@ TAG="\${URL%/*}"
 TAG="\${TAG##*/}"
 cp -- "${FIXTURE}/serve/\${TAG}/\${URL##*/}" "\${OUTPUT}" || exit 22
 EOF
+# sha256sum: the real one. With <state>/hash-fail holding
+# "<path> <n> <missing|status>", the n-th run that hashes <path> fails for
+# real: "missing" hashes a path that does not exist in its place (that file's
+# hash is absent and the run fails), "status" hashes everything and then fails.
+REAL_SHA256SUM="$(PATH=/usr/bin:/bin command -v sha256sum)"
+cat >"${MOCKBIN}/sha256sum" <<EOF
+#!/bin/bash
+if [[ -s '${S}/hash-fail' ]]; then
+	read -r FAIL_PATH FAIL_CALL FAIL_MODE <'${S}/hash-fail'
+	for ARG in "\$@"; do
+		[[ "\${ARG}" == "\${FAIL_PATH}" ]] || continue
+		CALL=\$((\$(cat '${S}/hash-calls' 2>/dev/null || echo 0) + 1))
+		echo "\${CALL}" >'${S}/hash-calls'
+		[[ "\${CALL}" == "\${FAIL_CALL}" ]] || break
+		if [[ "\${FAIL_MODE}" == status ]]; then
+			'${REAL_SHA256SUM}' "\$@"
+			exit 1
+		fi
+		ARGS=()
+		for ARG in "\$@"; do
+			[[ "\${ARG}" == "\${FAIL_PATH}" ]] && ARG="\${FAIL_PATH}.injected-missing"
+			ARGS+=("\${ARG}")
+		done
+		exec '${REAL_SHA256SUM}' "\${ARGS[@]}"
+	done
+fi
+exec '${REAL_SHA256SUM}' "\$@"
+EOF
 chmod 0755 "${MOCKBIN}"/*
+hash -r
 
 # ── Function stubs ───────────────────────────────────────────────────────────
 acquireClientLifecycleLock() {
@@ -234,6 +276,7 @@ _awgBtCheckServedByBoringtun() {
 verifyBoringtunImitationServed() {
 	local RC=0
 	echo "verify current=$(readlink "${STORE}/current") imitation=$1|$2" >>"${S}/log"
+	[[ -f "${S}/verify-touch" ]] && echo "# changed during the switch" >>"${AMNEZIAWG_DIR}/clients/awg0-client-bob.conf"
 	if [[ -s "${S}/verify-rc" ]]; then
 		RC="$(head -n 1 "${S}/verify-rc")"
 		[[ "$(wc -l <"${S}/verify-rc")" -gt 1 ]] && sed -i 1d "${S}/verify-rc"
@@ -257,11 +300,13 @@ validateStagedAwgConfigs() {
 	done
 	echo "validate candidate=${_AWG_BT_CANDIDATE_RELEASE} current=$(readlink "${STORE}/current") imitation=${AWG_BORINGTUN_IMITATE_PROTOCOL}|${AWG_BORINGTUN_IMITATE_DOMAIN} files=${NAMES% }" >>"${S}/log"
 	[[ -f "${S}/validate-term" ]] && { rm -f "${S}/validate-term"; kill -TERM "${BASHPID}"; }
+	[[ -f "${S}/validate-touch" ]] && echo "# changed during the validation" >>"${AMNEZIAWG_DIR}/clients/awg0-client-bob.conf"
 	! grep -qxF -- "${_AWG_BT_CANDIDATE_RELEASE}" "${S}/reject-validate" 2>/dev/null
 }
 collectActiveAwgClientConfigs() {
 	local -n OUTPUT_REF="$1"
 	OUTPUT_REF=("${AMNEZIAWG_DIR}/clients/awg0-client-alice.conf" "${AMNEZIAWG_DIR}/clients/awg0-client-bob.conf")
+	[[ ! -f "${S}/collect-fails" ]]
 }
 
 # ── Fixture releases (TEST FIXTURES, never published) ───────────────────────
@@ -1092,6 +1137,219 @@ assert_contains "argv $(readlink -f "${STORE}/${STORE_ID_[old]}/boringtun-cli") 
 	"a scratch instance of a candidate runs the candidate's verified binary, not current's"
 run env _AWG_BT_CANDIDATE_RELEASE=evil bash -c 'source "$1" >/dev/null 2>&1; printf "[%s]" "${_AWG_BT_CANDIDATE_RELEASE}"' _ "${INSTALLER}"
 assert_eq "[]" "${OUT}" "the environment never selects a candidate"
+
+echo "=== Helpers of the previous installer version ==="
+# The helpers an installation of the PR 6 base (78b780b) left installed,
+# rendered by that installer's own _awgBtRenderHelper with this suite's
+# settings: CI passes the base installer in AWG_TEST_BASE_INSTALLER, and a
+# checkout with history provides it with git.
+BASE_COMMIT=78b780bc8df73b86fa1c2722e7af2bd4e11e2a6a
+BASE_INSTALLER="${T}/base-installer.sh"
+if [[ -n "${AWG_TEST_BASE_INSTALLER:-}" ]]; then
+	cp -- "${AWG_TEST_BASE_INSTALLER}" "${BASE_INSTALLER}"
+else
+	git -C "${PROJECT_ROOT}" show "${BASE_COMMIT}:amneziawg-install.sh" >"${BASE_INSTALLER}" 2>/dev/null || rm -f "${BASE_INSTALLER}"
+fi
+assert_true "the installer of the PR 6 base is available for the legacy-helper tests" test -s "${BASE_INSTALLER}"
+HELPER_SETTINGS="$(for V in ${_AWG_BT_HELPER_VARIABLES}; do printf '%s=%q\n' "${V}" "${!V}"; done)"
+install_base_helpers() {
+	local KIND NAME
+	mkdir -p "${AWG_BT_LIBEXEC_DIR}"
+	chmod 0755 "${AWG_BT_LIBEXEC_DIR}"
+	for KIND in launch ctl; do
+		NAME=awg-boringtun-launch
+		[[ "${KIND}" == launch ]] || NAME=awg-backend-ctl
+		env -i PATH="${PATH}" bash -c 'source "$1" >/dev/null 2>&1; eval "$2"; _awgBtRenderHelper "$3"' _ "${BASE_INSTALLER}" "${HELPER_SETTINGS}" "${KIND}" \
+			>"${AWG_BT_LIBEXEC_DIR}/${NAME}"
+		chmod 0755 "${AWG_BT_LIBEXEC_DIR}/${NAME}"
+	done
+}
+# helper_verifies <helper>: the installed helper's own check of the release
+# current selects; prints the release it verified.
+helper_verifies() {
+	local VERIFIED
+	VERIFIED="$(bash -c 'source <(head -n -2 "$1") >/dev/null 2>&1 || exit 2; _awgBtVerifyStore 2>/dev/null && printf "%s" "${_AWG_BT_VERIFIED_BIN}"' _ "$1")" || return 1
+	basename "$(dirname "${VERIFIED}")"
+}
+helpers_are_this_installers() {
+	cmp -s "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" <(_awgBtRenderHelper launch) &&
+		cmp -s "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" <(_awgBtRenderHelper ctl)
+}
+legacy_helper_host() { # <unit state>
+	make_install dns example.com 3
+	rm -rf -- "${STORE:?}"/*
+	store_release b1
+	links b1
+	pin_to b2
+	install_base_helpers
+	echo "$1" >"${S}/active-state"
+	touch "${S}/restart-uses-helper"
+}
+legacy_helper_host inactive
+assert_eq "${STORE_ID_[b1]}" "$(helper_verifies "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch")" "the base's launcher accepts the legacy build 1"
+links b2
+run helper_verifies "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch"
+assert_rc 1 "${RC}" "but refuses a -b2 release as current: the hazard an unreconciled switch would leave"
+links b1
+BEFORE_HASHES="$(config_hashes)"
+run upgrade
+assert_rc 0 "${RC}" "stopped host with the base's helpers: b1 -> b2 succeeds"
+assert_true "  the helpers are now this installer's" helpers_are_this_installers
+assert_eq "${STORE_ID_[b2]} ${STORE_ID_[b1]}" "$(link_of current) $(link_of previous)" "  current is b2 and previous b1"
+assert_eq "0" "$(restarts)" "  the service stays stopped"
+assert_eq "${STORE_ID_[b2]}" "$(helper_verifies "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch")" "  the installed launcher accepts the new current, so the next start can run b2"
+assert_eq "${STORE_ID_[b2]}" "$(helper_verifies "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl")" "  and so does the installed awg-backend-ctl"
+assert_eq "${BEFORE_HASHES}" "$(config_hashes)" "  params, configs and the runtime file are unchanged"
+legacy_helper_host active
+BEFORE_HASHES="$(config_hashes)"
+run upgrade
+assert_rc 0 "${RC}" "active host with the base's helpers: b1 -> b2 succeeds"
+assert_eq "restart current=${STORE_ID_[b2]}
+helper awg-backend-ctl verified ${STORE_ID_[b2]}
+helper awg-boringtun-launch verified ${STORE_ID_[b2]}" "$(grep -E '^(restart|helper) ' "${S}/log")" \
+	"  the restart ran the reconciled installed helpers, which accept b2"
+assert_contains "verify current=${STORE_ID_[b2]} imitation=dns|example.com" "$(cat "${S}/log")" "  and the activation was verified"
+assert_eq "${BEFORE_HASHES}" "$(config_hashes)" "  configs unchanged"
+: >"${S}/log"
+run rollback
+assert_rc 0 "${RC}" "  a rollback to b1 runs through the same helpers"
+assert_contains "helper awg-boringtun-launch verified ${STORE_ID_[b1]}" "$(cat "${S}/log")" "  which accept the legacy b1 again"
+legacy_helper_host active
+chmod 0777 "${AWG_BT_LIBEXEC_DIR}"
+STATE_BEFORE="$(lifecycle_state)"
+run upgrade
+chmod 0755 "${AWG_BT_LIBEXEC_DIR}"
+assert_rc 1 "${RC}" "a helper that cannot be updated stops the change before anything changes"
+assert_contains "could not update the BoringTun helpers" "${ERR}" "helper update fails: it says so"
+assert_eq "${STATE_BEFORE}" "$(lifecycle_state)" "helper update fails: current and previous are unchanged"
+assert_eq "0" "$(restarts)" "helper update fails: no restart"
+assert_true "helper update fails: no download" test ! -s "${S}/curl-log"
+legacy_helper_host active
+printf '1\n0\n' >"${S}/restart-rc"
+run upgrade
+assert_rc 1 "${RC}" "a failed activation after the helpers were updated"
+assert_eq "${STORE_ID_[b1]} none" "$(link_of current) $(link_of previous)" "  restores current b1 and the absent previous"
+assert_contains "helper awg-boringtun-launch verified ${STORE_ID_[b1]}" "$(cat "${S}/log")" "  the recovery restart ran through the updated helpers, which accept b1"
+assert_contains "runs ${STORE_ID_[b1]} again" "${ERR}" "  and the original release runs again"
+assert_true "  the updated helpers stay: nothing depends on the old ones" helpers_are_this_installers
+
+echo "=== Previous naming current after an interrupted switch ==="
+# A rollback killed between its two link renames, for real.
+interrupted_rollback() {
+	eval "$(declare -f _awgBtSetStoreLink | sed '1s/_awgBtSetStoreLink/realSetStoreLink/')"
+	_awgBtSetStoreLink() {
+		[[ "$1" == current ]] && kill -KILL "${BASHPID}"
+		realSetStoreLink "$@"
+	}
+	rollback
+}
+duplicate_host() { # <unit state> [served rc]
+	make_install
+	rm -rf -- "${STORE:?}"/*
+	store_release old
+	store_release new
+	links new old
+	pin_to new
+	echo "$1" >"${S}/active-state"
+	echo "${2:-0}" >"${S}/served-rc"
+	run interrupted_rollback
+	: >"${S}/log"
+	: >"${S}/curl-log"
+}
+duplicate_host active
+assert_eq "137" "${RC}" "(the rollback was killed between previous and current)"
+assert_eq "current=${STORE_ID_[new]} previous=${STORE_ID_[new]} store=[$(sorted "${STORE_ID_[new]}" "${STORE_ID_[old]}" current previous)]" \
+	"$(lifecycle_state)" "(that leaves previous naming current, and the old release unreferenced)"
+run printBackendStatus
+assert_rc 1 "${RC}" "(the status reports that state as invalid)"
+run upgrade
+assert_rc 0 "${RC}" "pinned current, previous naming it, healthy daemon: the upgrade repairs and succeeds"
+assert_contains "previous named current" "${OUT}" "  it says what it repaired"
+assert_eq "current=${STORE_ID_[new]} previous=none store=[$(sorted "${STORE_ID_[new]}" "${STORE_ID_[old]}" current)]" \
+	"$(lifecycle_state)" "  the duplicate previous link is removed, current is unchanged and the old release is kept"
+assert_contains "left alone: ${STORE_ID_[old]}" "${OUT}" "  the old release is reported as unmanaged, not adopted"
+assert_eq "0" "$(restarts)" "  no restart"
+assert_true "  no download" test ! -s "${S}/curl-log"
+run printBackendStatus
+assert_rc 0 "${RC}" "  the status is valid again"
+assert_contains $'previous_release=none\nrollback_available=no' "${OUT}" "  with no rollback target"
+assert_contains "unmanaged_releases=1" "${OUT}" "  and one unmanaged release"
+duplicate_host active 1
+run upgrade
+assert_rc 0 "${RC}" "with the daemon still on the old release: the upgrade repairs and restarts onto current"
+assert_eq "1" "$(restarts)" "  one restart"
+assert_contains "verify current=${STORE_ID_[new]}" "$(cat "${S}/log")" "  that is verified"
+assert_eq "current=${STORE_ID_[new]} previous=none store=[$(sorted "${STORE_ID_[new]}" "${STORE_ID_[old]}" current)]" \
+	"$(lifecycle_state)" "  current unchanged, previous removed, the old release kept"
+duplicate_host inactive
+run upgrade
+assert_rc 0 "${RC}" "with the service stopped: the upgrade repairs"
+assert_eq "0" "$(restarts)" "  and does not start it"
+assert_eq "none" "$(link_of previous)" "  the duplicate previous link is removed"
+duplicate_host active
+chmod 0555 "${STORE}"
+run upgrade
+chmod 0755 "${STORE}"
+assert_rc 1 "${RC}" "a duplicate previous that cannot be removed fails the upgrade"
+assert_not_contains "already current" "${OUT}" "  without reporting a healthy no-op"
+assert_eq "${STORE_ID_[new]}" "$(link_of previous)" "  the link is still there"
+make_install
+rm -rf -- "${STORE:?}"/*
+store_release old
+links old old
+pin_to new
+run upgrade
+assert_rc 0 "${RC}" "previous naming an older current: the upgrade still proceeds"
+assert_eq "${STORE_ID_[new]} ${STORE_ID_[old]}" "$(link_of current) $(link_of previous)" "  to current new and previous old"
+
+echo "=== Incomplete configuration snapshots ==="
+snapshot_case() { # <label> <command breaking the snapshot...>
+	make_install
+	rm -rf -- "${STORE:?}"/*
+	store_release old5
+	store_release old
+	links old old5
+	pin_to new
+	"${@:2}"
+	STATE_BEFORE="$(lifecycle_state)"
+	run upgrade
+	assert_rc 1 "${RC}" "$1: the upgrade fails before anything changes"
+	assert_contains "cannot read the configuration of this installation; nothing was changed" "${ERR}" "$1:   because the snapshot is incomplete"
+	assert_eq "${STATE_BEFORE}" "$(lifecycle_state)" "$1:   current, previous and the store are unchanged"
+	assert_eq "0" "$(restarts)" "$1:   no restart"
+	assert_not_contains "validate candidate" "$(cat "${S}/log")" "$1:   and the target was never validated"
+	chmod -R u+rw "${AMNEZIAWG_DIR}"
+}
+snapshot_case "params fail to hash" eval 'echo "${AMNEZIAWG_DIR}/params 1 missing" >"${S}/hash-fail"'
+snapshot_case "the server config fails to hash" eval 'echo "${SERVER_AWG_CONF} 1 missing" >"${S}/hash-fail"'
+snapshot_case "the runtime file is missing" rm -f "${RUNTIME_FILE}"
+snapshot_case "the runtime file is unreadable" chmod 000 "${RUNTIME_FILE}"
+snapshot_case "a client config is missing" rm -f "${AMNEZIAWG_DIR}/clients/awg0-client-alice.conf"
+snapshot_case "a client config is unreadable" chmod 000 "${AMNEZIAWG_DIR}/clients/awg0-client-bob.conf"
+snapshot_case "the client set cannot be read" touch "${S}/collect-fails"
+snapshot_case "sha256sum fails after hashing everything" eval 'echo "${AMNEZIAWG_DIR}/params 1 status" >"${S}/hash-fail"'
+after_case() { # <label> <expected error> <expected rc> <hash-fail line> [validate-touch|verify-touch]
+	make_install
+	rm -rf -- "${STORE:?}"/*
+	store_release old5
+	store_release old
+	links old old5
+	pin_to new
+	[[ -z "$4" ]] || echo "$4" >"${S}/hash-fail"
+	[[ -z "${5:-}" ]] || touch "${S}/$5"
+	run upgrade
+	assert_rc "$3" "${RC}" "$1: the change fails"
+	assert_contains "$2" "${ERR}" "$1:   as it should"
+	assert_eq "${STORE_ID_[old]} ${STORE_ID_[old5]}" "$(link_of current) $(link_of previous)" "$1:   current and previous are as before"
+}
+after_case "a hash failure after the validation" "after the validation; nothing was changed" 1 "${AMNEZIAWG_DIR}/params 2 missing"
+assert_eq "0" "$(restarts)" "  no restart"
+after_case "a hash failure status after the validation" "after the validation; nothing was changed" 1 "${AMNEZIAWG_DIR}/params 2 status"
+after_case "a configuration that changes during the validation" "changed during the validation" 1 "" validate-touch
+after_case "a hash failure after the switch" "after the switch; restoring" 1 "${AMNEZIAWG_DIR}/params 3 missing"
+assert_eq "2" "$(restarts)" "  the original release is restarted"
+after_case "a hash failure status after the switch" "after the switch; restoring" 1 "${AMNEZIAWG_DIR}/params 3 status"
+after_case "a configuration that changes during the switch" "changed during the switch" 1 "" verify-touch
 
 echo "=== Command line ==="
 run bash "${INSTALLER}" --upgrade-boringtun "${STORE_ID_[old]}"

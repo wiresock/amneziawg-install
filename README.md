@@ -531,13 +531,21 @@ leave the installed release alone.
 
 **What each command targets.**
 - **Upgrade:** only the release pinned in the installer itself, never a "latest" lookup.
-  Moving to a newer BoringTun means a newer installer with a reviewed pin. When the pin is
-  already installed, the upgrade changes nothing.
+  Moving to a newer BoringTun means a newer installer with a reviewed pin.
+  - When the pin is already installed and its links are consistent, the upgrade changes
+    nothing.
+  - If an interrupted switch left `previous` naming the same release, the upgrade removes only
+    that link. Any older release directory stays, unmanaged, and is never guessed back as the
+    rollback target.
 - **Rollback:** only the release that was current before the last upgrade or rollback. It
   takes no release argument.
 
-The store keeps at most two releases, `current` and `previous`, so two rollbacks in a row
-toggle back and forth.
+The store manages at most two releases, `current` and `previous`, so two rollbacks in a row
+toggle back and forth. Other release directories can remain, for example after an
+interrupted switch. They are unmanaged: reported, never used, never removed automatically.
+
+Both commands first refresh the installer's two generated helper scripts, because helpers
+from earlier versions don't accept the names of later builds.
 
 **What a switch does.**
 1. The upgrade downloads and verifies the pinned release exactly as a fresh install does,
@@ -559,7 +567,9 @@ toggle back and forth.
 Params, client configs, the imitation and the listen port never change.
 
 **Status.** `--backend-status` adds:
-- `previous_release`, `rollback_available` and `upgrade_available`;
+- `previous_release`, `rollback_available` and `upgrade_available`. `rollback_available=yes`
+  means a previous release is there and passes the store check; the rollback itself still
+  validates it against today's settings and can refuse;
 - `daemon_release`, the release the running daemon executes, which shows a service that still
   runs an old binary;
 - `unmanaged_releases`: release directories neither link names, which are reported but never

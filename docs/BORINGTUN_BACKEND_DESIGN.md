@@ -2543,8 +2543,10 @@ which is stated rather than pretended: the build in a name is the one the instal
 when it stored a release whose binary had the embedded SHA-256. The store is root's alone,
 and a rollback only ever follows `previous`, which only the installer writes.
 
-**Store.** At most two managed releases: `current` and `previous`, each a root-owned
+**Store.** At most two *managed* releases: `current` and `previous`, each a root-owned
 relative link to a release directory. A PR 4/PR 5 store has only `current`, which is valid.
+The store can hold more release directories than that: one a prune could not remove, one an
+interrupted transaction left, or one put there by hand. Those are unmanaged.
 - Links are written atomically: a new link renamed over the old (`_awgBtSetStoreLink`).
 - A link is read only if it is a root-owned symlink whose target is a single valid release
   name (`_awgBtReadStoreLink`).
@@ -2554,15 +2556,30 @@ relative link to a release directory. A PR 4/PR 5 store has only `current`, whic
 **Commands.** `--upgrade-boringtun` and `--rollback-boringtun` take no argument; an extra one
 is a usage error.
 - **Upgrade:** moves `current` to the release this installer pins, and only that one. There is
-  no "latest", channel or API lookup. When `current` already is the pin it is a no-op: no
-  download, no link rewrite, no restart. The exception is an active service that runs another
-  binary (an interrupted switch), which is restarted onto `current` and verified, never
-  reported as a clean no-op.
+  no "latest", channel or API lookup.
+  - When `current` already is the pin and the links are consistent, it is a no-op: no
+    download, no link rewrite, no restart.
+  - If `previous` also names `current` (a switch interrupted between its two renames), it
+    removes only that duplicate `previous` link and reports it. Every release directory stays
+    as it is. The release that used to be `previous` cannot be known: it stays unmanaged and
+    is never guessed or adopted as rollback history.
+  - If removing that link fails, the command fails instead of reporting a healthy no-op.
+  - An active service that runs another binary (an interrupted switch) is restarted onto
+    `current` and verified, never reported as a clean no-op.
 - **Rollback:** moves `current` to the release `previous` names, and to no other. It fails
   without changing anything when `previous` is absent or names `current`.
 - **No implicit switch:** nothing else changes `current`. Client management, protocol changes,
   imitation changes, the runtime layer and the menu only verify the selected release. A test
   pins the call sites.
+- **Helpers:** both commands regenerate the generated helpers (`awg-boringtun-launch`,
+  `awg-backend-ctl`) through `_awgBtInstallHelpers` before `current` can change or the service
+  restarts. Helpers of earlier installer versions refuse `-b<build>` release names, so a switch
+  to a later build would otherwise leave `current` naming a release the installed helpers
+  reject at the next start. The no-op path regenerates them before its restart onto `current`.
+  If they cannot be written, the command fails before any link or service change.
+  - Helpers are derived files and accept the legacy build 1 names as well. So when an
+    activation fails they are not put back: the restored release starts through them.
+  - Params, configs and the runtime file are never rewritten for this.
 
 **Transaction** (`boringtunBinaryLifecycle`, a subshell):
 1. It takes the lifecycle lock and reads params without migrations. BoringTun only: a kernel
@@ -2595,7 +2612,11 @@ is a usage error.
    - It runs the staged validation of the server config and of every active client config
      (private copies).
    - Params, the server config, the runtime file and every active client config must hash as
-     before; they are never rewritten.
+     before; they are never rewritten. A snapshot is complete or it fails:
+     - if the client set cannot be read, or any of those files cannot be hashed, the
+       snapshot fails;
+     - before the switch, a failed snapshot stops the command before anything changes;
+     - after the switch, it is a failure and the links are restored.
    - A rollback target that rejects today's settings (for example a protocol mode enabled
      after the upgrade) is refused before `current` changes.
 5. `previous` := `current`, then `current` := target.
@@ -2616,14 +2637,20 @@ is a usage error.
    - Reports each failing step on its own: activation, link restoration, recovery restart,
      recovery verification. When links cannot be restored, the unit is not restarted and the
      operator gets the exact link targets.
-   - Always removes the private copies of the client configs.
+   - Removes the private copies of the client configs on these paths. A signal that arrives
+     after the traps are removed but before that removal can leave the private 0700 work
+     directory behind (a known follow-up).
    - A failure before step 5 only removes what the attempt created.
 
 **Crash model.** Writing `previous` before `current` means `current` never names a release
 that has not passed step 4. After a hard interruption (SIGKILL, power loss):
-- **Between the two renames:** `previous` and `current` name the same release. The status
-  marks that `previous` invalid and fails; a rollback refuses; an upgrade proceeds. The old
-  `previous` (an upgrade) or the rollback target (a rollback) is left as an unmanaged release.
+- **Between the two renames:** `previous` and `current` name the same release.
+  - The status marks that `previous` invalid and fails, and a rollback refuses.
+  - An upgrade to a different pin proceeds and writes the links afresh.
+  - An upgrade to the pin `current` already names drops only the duplicate `previous`.
+  - The old `previous` (an upgrade) or the rollback target (a rollback) is left as an
+    unmanaged release. That lost rollback history is not recovered: no command guesses it
+    from the unmanaged directories.
 - **After `current` but before the restart:** the store is consistent (`current` the verified
   target, `previous` the old release). The running daemon still executes the old binary,
   which `--backend-status` shows as `daemon_state=unverified` and
@@ -2642,6 +2669,12 @@ No journal file is needed.
 A damaged `current` or `previous` (including `previous` naming `current`) makes it exit 1.
 It stays read-only: no repair, download, restart or helper write.
 
+`rollback_available=yes` means that `previous` names another release that passes the
+runtime's store check. It does not promise a rollback succeeds. The rollback itself also
+checks the release's exact members and single links, runs the binary's `--version`, and
+validates it against today's configuration; it can still refuse. Aligning the status with
+the stricter structural check is a known follow-up.
+
 **Tests.**
 - `tests/test-boringtun-lifecycle.sh` uses TEST FIXTURE releases served by a mocked curl. It
   covers:
@@ -2652,14 +2685,27 @@ It stays read-only: no repair, download, restart or helper write.
   - rejection by the target binary;
   - activation, link and recovery failures, signals and retention;
   - damaged links and releases, the interrupted switch and the status;
-  - the call sites and the candidate's scratch selection.
-- `tests/mutate-boringtun-lifecycle.sh` holds its mutants.
+  - the call sites and the candidate's scratch selection;
+  - the helpers that the PR 6 base installer (`78b780b`) renders itself: a stopped and an
+    active b1 → b2 switch, which must leave helpers that accept b2; a helper update that
+    fails; and a failed activation that restarts b1 through the updated helpers. CI fetches
+    that installer by its SHA as `AWG_TEST_BASE_INSTALLER`;
+  - a rollback really killed (SIGKILL) between its two link renames, and the upgrade that
+    repairs the duplicate `previous`;
+  - snapshots that cannot be completed, each before and after the switch: params, the server
+    config, the runtime file, a client config, the client set, and a `sha256sum` failure.
+- `tests/mutate-boringtun-lifecycle.sh` holds its mutants, including the helper update, the
+  duplicate repair, every snapshot input, both failure checks and both comparisons.
 - The host live test makes a TEST FIXTURE older release current (the verified binary under the
   synthetic commit `feedface…`) and removes the pin from the store. It then upgrades
   (downloading the real release), rolls back, upgrades again without a download, and runs a
   no-op. Each step checks the datapath (ping and a 4 MiB checksummed TCP transfer), the
   daemon's release, the imitation and unchanged configuration hashes.
 - The coexistence job runs the same upgrade before its kernel-client interop.
+- The x86_64 host job (`AWG_LIVE_BASE_INSTALLER`) then installs the helpers the PR 6 base
+  installer renders. It rolls back to a TEST FIXTURE build 2 of the pinned commit (a `-b2`
+  name those helpers refuse) through systemd's real restart, and upgrades back, with the
+  datapath checked each time.
 
 ## 22. Current functions and files that will need modification
 

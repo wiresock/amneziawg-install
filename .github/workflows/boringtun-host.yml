@@ -122,8 +122,17 @@ jobs:
           git show FETCH_HEAD:amneziawg-install.sh >"$RUNNER_TEMP/previous-installer.sh"
           echo "AWG_LIVE_PREVIOUS_INSTALLER=$RUNNER_TEMP/previous-installer.sh" >>"$GITHUB_ENV"
 
+      # The helper-compatibility step runs the binary lifecycle with the
+      # helpers that the PR 6 base installer renders, fetched by its fixed SHA.
+      - name: Fetch the installer before the binary lifecycle
+        if: matrix.upgrade
+        run: |
+          git fetch --no-tags --depth=1 origin 78b780bc8df73b86fa1c2722e7af2bd4e11e2a6a
+          git show FETCH_HEAD:amneziawg-install.sh >"$RUNNER_TEMP/base-installer.sh"
+          echo "AWG_LIVE_BASE_INSTALLER=$RUNNER_TEMP/base-installer.sh" >>"$GITHUB_ENV"
+
       - name: Install, use and uninstall BoringTun through the installer (as root)
-        run: sudo env AWG_DISPOSABLE_HOST_TEST=1 AWG_LIVE_PREVIOUS_INSTALLER="${AWG_LIVE_PREVIOUS_INSTALLER:-}" bash tests/test-boringtun-host-live.sh
+        run: sudo env AWG_DISPOSABLE_HOST_TEST=1 AWG_LIVE_PREVIOUS_INSTALLER="${AWG_LIVE_PREVIOUS_INSTALLER:-}" AWG_LIVE_BASE_INSTALLER="${AWG_LIVE_BASE_INSTALLER:-}" bash tests/test-boringtun-host-live.sh
 
       - name: Collect diagnostics
         if: failure()

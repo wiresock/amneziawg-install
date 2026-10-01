@@ -94,6 +94,51 @@ mutant no_term_trap "after restoring both links and removing the downloaded rele
 mutant downloaded_target_kept "current unchanged, and the release this attempt downloaded is removed" \
 	'if ((CREATED)) || { [[ "${MODE}" == upgrade ]] && [[ "${_AWG_BT_REL_CREATED:-0}" == 1 ]]; }; then' 'if false; then'
 
+# Helpers of an earlier installer version (review S1).
+mutant helpers_not_reconciled "the installed launcher accepts the new current, so the next start can run b2" \
+	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
+	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n'
+mutant helper_failure_ignored "helper update fails: no restart" \
+	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
+	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || :\n'
+
+# previous naming current after an interrupted switch (review S2).
+mutant duplicate_previous_kept "the duplicate previous link is removed, current is unchanged and the old release is kept" \
+	$'\t\t\tif ((PREVIOUS_EXISTED)) && [[ "${PREVIOUS_ID}" == "${CURRENT_ID}" ]]; then\n\t\t\t\t# A switch interrupted' \
+	$'\t\t\tif false; then\n\t\t\t\t# A switch interrupted'
+mutant duplicate_removal_failure_ignored "a duplicate previous that cannot be removed fails the upgrade" \
+	$'\t\t\t\tif ! rm -f -- "${AWG_BT_STORE_DIR}/previous" ||\n\t\t\t\t\t[[ -e "${AWG_BT_STORE_DIR}/previous" || -L "${AWG_BT_STORE_DIR}/previous" ]]; then' \
+	$'\t\t\t\trm -f -- "${AWG_BT_STORE_DIR}/previous"\n\t\t\t\tif false; then'
+
+# The configuration snapshots (review S3).
+mutant hash_failure_masked "the runtime file is missing: the upgrade fails before anything changes" \
+	$'\tif ! sha256sum -- "${FILES[@]}" 2>/dev/null; then\n\t\treturn 1\n\tfi' \
+	$'\tsha256sum -- "${FILES[@]}" 2>/dev/null\n\treturn 0'
+mutant client_set_failure_ignored "the client set cannot be read:   because the snapshot is incomplete" \
+	$'\tcollectActiveAwgClientConfigs CLIENTS >/dev/null 2>&1 || return 1\n\tFILES=' \
+	$'\tcollectActiveAwgClientConfigs CLIENTS >/dev/null 2>&1 || :\n\tFILES='
+mutant runtime_file_not_hashed "the runtime file is missing: the upgrade fails before anything changes" \
+	'FILES=("${AMNEZIAWG_DIR}/params" "${SERVER_AWG_CONF}" "$(_awgBtRuntimeFilePath "${SERVER_AWG_NIC}")" "${CLIENTS[@]}")' \
+	'FILES=("${AMNEZIAWG_DIR}/params" "${SERVER_AWG_CONF}" "${CLIENTS[@]}")'
+mutant client_config_not_hashed "a client config is missing:   because the snapshot is incomplete" \
+	'FILES=("${AMNEZIAWG_DIR}/params" "${SERVER_AWG_CONF}" "$(_awgBtRuntimeFilePath "${SERVER_AWG_NIC}")" "${CLIENTS[@]}")' \
+	'FILES=("${AMNEZIAWG_DIR}/params" "${SERVER_AWG_CONF}" "$(_awgBtRuntimeFilePath "${SERVER_AWG_NIC}")" "${CLIENTS[@]:1}")'
+mutant before_failure_ignored "the target was never validated" \
+	'if ! HASHES_BEFORE="$(_awgBtLifecycleConfigHashes)" || [[ -z "${HASHES_BEFORE}" ]]; then' \
+	'HASHES_BEFORE="$(_awgBtLifecycleConfigHashes)"; if [[ -z "${HASHES_BEFORE}" ]]; then'
+mutant after_validation_failure_ignored "a hash failure status after the validation: the change fails" \
+	$'\tif ! HASHES_AFTER="$(_awgBtLifecycleConfigHashes)"; then\n\t\techo "ERROR: cannot read the configuration of this installation after the validation' \
+	$'\tHASHES_AFTER="$(_awgBtLifecycleConfigHashes)"\n\tif false; then\n\t\techo "ERROR: cannot read the configuration of this installation after the validation'
+mutant after_switch_failure_ignored "a hash failure status after the switch: the change fails" \
+	$'\tif ! HASHES_AFTER="$(_awgBtLifecycleConfigHashes)"; then\n\t\techo "ERROR: cannot read the configuration of this installation after the switch' \
+	$'\tHASHES_AFTER="$(_awgBtLifecycleConfigHashes)"\n\tif false; then\n\t\techo "ERROR: cannot read the configuration of this installation after the switch'
+mutant validation_comparison_bypassed "a configuration that changes during the validation:   as it should" \
+	$'\tif [[ "${HASHES_AFTER}" != "${HASHES_BEFORE}" ]]; then\n\t\techo "ERROR: the configuration changed during the validation' \
+	$'\tif false; then\n\t\techo "ERROR: the configuration changed during the validation'
+mutant switch_comparison_bypassed "a configuration that changes during the switch: the change fails" \
+	$'\tif [[ "${HASHES_AFTER}" != "${HASHES_BEFORE}" ]]; then\n\t\techo "ERROR: the configuration changed during the switch' \
+	$'\tif false; then\n\t\techo "ERROR: the configuration changed during the switch'
+
 # Retention.
 mutant old_previous_kept "the old previous is removed once the new state is final" \
 	'if ((PREVIOUS_EXISTED)) && [[ "${PREVIOUS_ID}" != "${TARGET}" && "${PREVIOUS_ID}" != "${CURRENT_ID}" ]]; then' 'if false; then'
