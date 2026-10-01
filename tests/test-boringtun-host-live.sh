@@ -20,6 +20,11 @@
 # answered). Under dns it also adds and removes a client and moves to AWG 3.0
 # and back, which keeps the imitation.
 #
+# Then the binary lifecycle: a TEST FIXTURE older release made current, the
+# real pinned release removed and fetched again by --upgrade-boringtun, a
+# --rollback-boringtun to the fixture, an upgrade back and a no-op upgrade,
+# each with the tunnel's datapath and an unchanged configuration.
+#
 # With AWG_LIVE_PREVIOUS_INSTALLER=<path>, the fresh install runs that earlier
 # installer version instead, and everything after it runs this one: the
 # upgrade path from an installation without imitation (params without its
@@ -607,6 +612,80 @@ imitation_step sip pbx.example
 imitation_step stun
 imitation_step none
 datapath "after the imitation cycle"
+
+# ── Binary lifecycle ────────────────────────────────────────────────────────
+# A TEST FIXTURE older release (tests/helpers/boringtun-lifecycle-fixture.sh:
+# the verified binary under a synthetic source commit) is made current, as an
+# earlier installer would have left it, and the real pinned release, removed
+# from the store, is the upgrade target: --upgrade-boringtun downloads and
+# verifies it through the public release path, validates it, switches and
+# restarts; --rollback-boringtun returns to the fixture; a second upgrade
+# toggles back without a download, and a third is a no-op.
+echo "=== Binary lifecycle"
+# shellcheck source=helpers/boringtun-lifecycle-fixture.sh
+source "${SCRIPT_DIR}/helpers/boringtun-lifecycle-fixture.sh"
+installation_hashes() {
+	sha256sum /etc/amnezia/amneziawg/params "/etc/amnezia/amneziawg/${IF}.conf" "/etc/amnezia/amneziawg/${IF}.boringtun" \
+		/etc/amnezia/amneziawg/clients/*.conf "${CLIENT_CONF}" 2>/dev/null | cut -d' ' -f1 | tr '\n' ' '
+}
+store_links() {
+	printf '%s %s' "$(readlink "${STORE}/current" 2>/dev/null || echo none)" "$(readlink "${STORE}/previous" 2>/dev/null || echo none)"
+}
+lifecycle() { # <flag> <log>
+	bash "${INSTALLER}" "$1" >"${WORK}/$2" 2>&1 </dev/null
+}
+bash "${INSTALLER}" --set-boringtun-imitation dns example.com >/dev/null 2>&1 </dev/null
+check "the lifecycle runs under dns imitation" test "$(status_line daemon_imitation_protocol)" = "daemon_imitation_protocol=dns"
+FIXTURE_ID="$(bt_fixture_release "${STORE}" "${RELEASE_ID}")"
+check "a TEST FIXTURE older release is built in the store (${FIXTURE_ID})" test -n "${FIXTURE_ID}" -a -d "${STORE}/${FIXTURE_ID}"
+check "  and verifies as a store release" bash -c 'source "$1" && _awgBtVerifyRelease "$2"' _ "${INSTALLER}" "${FIXTURE_ID}"
+bt_fixture_make_current "${STORE}" "${FIXTURE_ID}"
+rm -rf -- "${STORE:?}/${RELEASE_ID}"
+systemctl restart "${UNIT}"
+check "the service runs the fixture release" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${FIXTURE_ID}"
+datapath "on the fixture release"
+HASHES="$(installation_hashes)"
+bash "${INSTALLER}" --backend-status >"${WORK}/status" 2>&1
+check "status: installed is the fixture, the pin is offered as an upgrade, no previous" \
+	test "$(grep -E '^(installed_release|pinned_release|previous_release|rollback_available|upgrade_available|daemon_release)=' "${WORK}/status" | tr '\n' ' ')" = \
+	"installed_release=${FIXTURE_ID} pinned_release=${RELEASE_ID} previous_release=none rollback_available=no upgrade_available=yes daemon_release=${FIXTURE_ID} "
+PID="$(main_pid)"
+lifecycle --upgrade-boringtun upgrade.log
+RC=$?
+tail -n 6 "${WORK}/upgrade.log" | sed 's/^/    | /'
+check "--upgrade-boringtun succeeds" test "${RC}" -eq 0
+check "  it downloaded the pinned release from its public URL" \
+	grep -qF "Downloading https://github.com/wiresock/amneziawg-install/releases/download/${RELEASE_TAG}/${ASSET}" "${WORK}/upgrade.log"
+check "  current is the pinned release and previous the fixture" test "$(store_links)" = "${RELEASE_ID} ${FIXTURE_ID}"
+check "  the pinned binary has the embedded SHA-256" test "$(sha256sum "${STORE}/${RELEASE_ID}/boringtun-cli" | cut -d' ' -f1)" = "${BINARY_SHA256}"
+check "  the daemon was restarted onto it" test "$(main_pid)" != "${PID}" -a "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
+check_served "after the upgrade"
+check "  the imitation is kept" bash -c '[[ "$(tr "\0" " " <"/proc/$1/cmdline")" == *"--imitate-protocol dns --imitate-domain example.com "* ]]' _ "$(main_pid)"
+check "  params, the runtime file and every config are byte for byte the same" test "$(installation_hashes)" = "${HASHES}"
+check "  no scratch interface, unit or record is left" scratch_clean
+datapath "after the upgrade"
+bash "${INSTALLER}" --backend-status >"${WORK}/status" 2>&1
+check "status after the upgrade" \
+	test "$(grep -E '^(installed_release|previous_release|rollback_available|upgrade_available|daemon_release)=' "${WORK}/status" | tr '\n' ' ')" = \
+	"installed_release=${RELEASE_ID} previous_release=${FIXTURE_ID} rollback_available=yes upgrade_available=no daemon_release=${RELEASE_ID} "
+lifecycle --rollback-boringtun rollback.log
+RC=$?
+tail -n 4 "${WORK}/rollback.log" | sed 's/^/    | /'
+check "--rollback-boringtun succeeds" test "${RC}" -eq 0
+check "  current is the fixture again and previous the pinned release" test "$(store_links)" = "${FIXTURE_ID} ${RELEASE_ID}"
+check "  the daemon runs the fixture's binary" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${FIXTURE_ID}"
+check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
+datapath "after the rollback"
+lifecycle --upgrade-boringtun upgrade2.log
+check "a second --upgrade-boringtun toggles back" test "$?" -eq 0 -a "$(store_links)" = "${RELEASE_ID} ${FIXTURE_ID}"
+check "  without downloading again" bash -c '! grep -q "Downloading" "$1"' _ "${WORK}/upgrade2.log"
+check "  on the pinned binary" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
+PID="$(main_pid)"
+lifecycle --upgrade-boringtun upgrade3.log
+check "a third --upgrade-boringtun is a no-op" grep -q "already current; nothing was changed" "${WORK}/upgrade3.log"
+check "  that restarted nothing" test "$(main_pid)" = "${PID}"
+check "  and left the configuration as it was" test "$(installation_hashes)" = "${HASHES}"
+datapath "after the lifecycle"
 
 # ── Uninstall ───────────────────────────────────────────────────────────────
 stop_client

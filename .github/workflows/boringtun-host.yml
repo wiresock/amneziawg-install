@@ -4,7 +4,9 @@ name: BoringTun Host
 # amneziawg-install.sh: the installer itself installs amneziawg-tools and the
 # immutable public BoringTun release on disposable runners, moves traffic
 # through the tunnel, switches protocol modes, cycles the built-in protocol
-# imitation (checking the server's datagrams and the probe replies on the wire)
+# imitation (checking the server's datagrams and the probe replies on the wire),
+# moves the binary through --upgrade-boringtun and --rollback-boringtun (a TEST
+# FIXTURE older release against the real pinned one)
 # and uninstalls. The x86_64 job installs with the last installer version
 # without protocol imitation and manages the host with this one, the upgrade
 # path; the aarch64 and Debian jobs install with this one. A separate job
@@ -21,6 +23,7 @@ on:
       - tests/test-boringtun-kernel-coexistence.sh
       - tests/helpers/boringtun-live-firewall.sh
       - tests/helpers/boringtun-imitation-wire.py
+      - tests/helpers/boringtun-lifecycle-fixture.sh
       - .github/workflows/boringtun-host.yml
   pull_request:
     branches: [main]
@@ -31,6 +34,7 @@ on:
       - tests/test-boringtun-kernel-coexistence.sh
       - tests/helpers/boringtun-live-firewall.sh
       - tests/helpers/boringtun-imitation-wire.py
+      - tests/helpers/boringtun-lifecycle-fixture.sh
       - .github/workflows/boringtun-host.yml
   workflow_dispatch:
 

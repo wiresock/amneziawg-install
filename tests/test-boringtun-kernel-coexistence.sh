@@ -228,6 +228,26 @@ systemctl reset-failed "${UNIT}" >/dev/null 2>&1
 systemctl start "${UNIT}"
 check "once the module is unloaded, BoringTun starts again" test -e "/sys/class/net/${IF}/tun_flags"
 
+echo "=== Binary lifecycle before the interop (TEST FIXTURE older release) ==="
+# The interop below runs on a binary that --upgrade-boringtun installed: a TEST
+# FIXTURE older release (tests/helpers/boringtun-lifecycle-fixture.sh) is made
+# current, the pinned release is removed, and the upgrade fetches it again.
+# shellcheck source=helpers/boringtun-lifecycle-fixture.sh
+source "${SCRIPT_DIR}/helpers/boringtun-lifecycle-fixture.sh"
+STORE=/usr/local/lib/amneziawg-install/boringtun
+PINNED_ID="$(readlink "${STORE}/current")"
+FIXTURE_ID="$(bt_fixture_release "${STORE}" "${PINNED_ID}")"
+bt_fixture_make_current "${STORE}" "${FIXTURE_ID}"
+rm -rf -- "${STORE:?}/${PINNED_ID}"
+systemctl restart "${UNIT}"
+check "(the service runs the TEST FIXTURE ${FIXTURE_ID})" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${FIXTURE_ID}"
+check "--upgrade-boringtun succeeds with the module installed" run_managed lifecycle-upgrade.log --upgrade-boringtun
+check "  current is the pinned release again and previous the fixture" \
+	test "$(readlink "${STORE}/current") $(readlink "${STORE}/previous")" = "${PINNED_ID} ${FIXTURE_ID}"
+check "  the service runs it" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${PINNED_ID}"
+check "  on a TUN device" test -e "/sys/class/net/${IF}/tun_flags"
+check "  and the module was never loaded" bash -c '! [[ -e /sys/module/amneziawg ]]'
+
 echo "=== Interop: an AmneziaWG kernel client with BoringTun's protocol imitation ==="
 KNS="awgk"
 KIF="awgk0"
