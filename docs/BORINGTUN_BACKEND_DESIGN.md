@@ -1120,6 +1120,8 @@ untested.
   5. On failure, switch back, restart and report.
 - `--rollback-boringtun` switches to `previous` using the same transaction. At most two
   versions are kept.
+- Implemented in PR 6 (§21.4), which also adds a build component to the store identity of
+  later builds.
 
 ### 12.6 Supply-chain considerations
 
@@ -1558,7 +1560,7 @@ artefacts can be staged, validated and swapped.
 | **3. BoringTun runtime layer** | `awg-backend-ctl` and launcher, generated from installer functions; the drop-in renderer; scratch interfaces (transient units); `ensureAwgBackendReady`, `awgSyncInterfaceConfig` filter and `awgBackendQuickUp` for BoringTun; probe and validation messages; supervision and crash-safe teardown. Mocked tests, plus a live CI job that provisions a host manually. | No (reachable only through an undocumented test hook) | 1, 2 |
 | **4. BoringTun host install and uninstall (experimental)** | `AWG_BACKEND=boringtun` for fresh Debian and Ubuntu installs (VM or bare metal); packages without recommends; binary acquisition and verification; uninstall; proxy and web-lifecycle guards; the web helper `ListenPort` filter; the proxy installer backend guard; the live CI jobs (§18.3–18.6 without their imitation steps); README section marked experimental. No imitation. Implemented as recorded in §21.2. | Yes | 3 |
 | **5. Built-in imitation** | Params keys, validation, install-time selection, `--set-boringtun-imitation` transaction, warnings and advisory, `--backend-status`, menu display. The imitation steps of §18.3 (step 8) and §18.6 ("with imitation" interop). Implemented as recorded in §21.3. | Yes | 4 |
-| **6. BoringTun binary lifecycle** | `--upgrade-boringtun` and `--rollback-boringtun` transactions. | Yes | 4 |
+| **6. BoringTun binary lifecycle** | `--upgrade-boringtun` and `--rollback-boringtun` transactions. Implemented as recorded in §21.4. | Yes | 4 |
 | **7. Virtualization** | Backend-aware `checkVirt` with LXC and nspawn support for BoringTun after preflight; LXC hints; an LXC CI test if feasible (LXD on the runner). | Yes | 4 |
 | **8. Web panel and proxy UX, plus kernel-side guard** | Web wording, version display and read-only backend status (helper allowlist); proxy docs; refuse AWG 3.x with the proxy installed (a flagged behaviour change). | Yes | 4 |
 | **9. Container deliverable** | Dockerfile and entrypoint, `awgService*` abstraction, container mode, Docker integration test. | Yes | 4, 5 |
@@ -2508,6 +2510,156 @@ The kernel menu keeps its 7 options unchanged.
   under AWG 3.0 with `none`, `dns`, `quic` and `stun`.
 - amneziawg-go is not measured: it would need a pinned, verified third-party
   build in CI. It is left for later.
+
+### 21.4 Binary lifecycle as implemented (PR 6)
+
+PR 6 lets an installed BoringTun host move its binary to the release this installer pins,
+and back. It publishes nothing, changes neither the pin nor any hash, and the release stays
+`boringtun-cli-0.7.1-g71d88784ad29-b1`. The kernel path is unchanged.
+
+**Release identity and builds.** Published asset names, and with them each archive's
+top-level directory, carry no build number. PR 4 named the store directory after that archive
+directory, `boringtun-cli-<version>-g<commit12>-linux-<arch>-musl`. So a rebuild of the same
+source commit (`-b2`, with a different toolchain or flags and different bytes) would have
+collided with build 1. MANIFEST format 1 has no build field either.
+
+PR 6 makes the store identity the installer's (`_awgBtReleaseStoreId`):
+- Build 1 keeps exactly the PR 4 name.
+- Every later build adds `-b<build>`:
+  `boringtun-cli-<version>-g<commit12>-b<build>-linux-<arch>-musl`.
+- `-b1` is never written, and `-b0` and leading zeros are invalid (`_awgBtReleaseIdValid`).
+
+Consequences:
+- **Existing hosts are untouched:** every PR 4/PR 5 store already names the current pin
+  correctly, and no store is renamed or migrated.
+- **Builds coexist:** builds 1 and 2 of one commit sit side by side.
+- **The archive is unchanged:** a build ≥ 2 is unpacked from its archive directory and stored
+  under its build name.
+
+The installer embeds `AWG_BT_RELEASE_BUILD` (`release.env`'s `BORINGTUN_RELEASE_BUILD`, the
+tag's `-b<build>`). The runtime checks (`_awgBtVerifyRelease`, in the helpers) bind a
+directory's version, commit and architecture to its MANIFEST. Format 1 cannot bind the build,
+which is stated rather than pretended: the build in a name is the one the installer gave
+when it stored a release whose binary had the embedded SHA-256. The store is root's alone,
+and a rollback only ever follows `previous`, which only the installer writes.
+
+**Store.** At most two managed releases: `current` and `previous`, each a root-owned
+relative link to a release directory. A PR 4/PR 5 store has only `current`, which is valid.
+- Links are written atomically: a new link renamed over the old (`_awgBtSetStoreLink`).
+- A link is read only if it is a root-owned symlink whose target is a single valid release
+  name (`_awgBtReadStoreLink`).
+- Other release directories are *unmanaged*. They are reported by both commands and counted
+  by the status, but never used or removed automatically.
+
+**Commands.** `--upgrade-boringtun` and `--rollback-boringtun` take no argument; an extra one
+is a usage error.
+- **Upgrade:** moves `current` to the release this installer pins, and only that one. There is
+  no "latest", channel or API lookup. When `current` already is the pin it is a no-op: no
+  download, no link rewrite, no restart. The exception is an active service that runs another
+  binary (an interrupted switch), which is restarted onto `current` and verified, never
+  reported as a clean no-op.
+- **Rollback:** moves `current` to the release `previous` names, and to no other. It fails
+  without changing anything when `previous` is absent or names `current`.
+- **No implicit switch:** nothing else changes `current`. Client management, protocol changes,
+  imitation changes, the runtime layer and the menu only verify the selected release. A test
+  pins the call sites.
+
+**Transaction** (`boringtunBinaryLifecycle`, a subshell):
+1. It takes the lifecycle lock and reads params without migrations. BoringTun only: a kernel
+   installation fails before any download or change.
+2. `current` must verify, and `previous`, if present, must be a valid link. The unit's
+   `ActiveState` decides what happens:
+   - `active` is switched and restarted;
+   - `inactive` and `failed` are switched and left stopped;
+   - anything else, or a state that cannot be read, aborts first.
+3. The target:
+   - **Upgrade:** the pin is downloaded and verified by PR 4's hardened path
+     (`_awgBtEnsurePinnedRelease`, shared with the fresh install) and stored beside `current`.
+     A pinned directory already in the store is reused only after it verifies against the
+     embedded contract.
+   - **Rollback:** the target is `previous`, verified as a store release
+     (`_awgBtVerifyCandidate` with a release id):
+     - trust of every directory;
+     - exactly the four single-link root-owned members;
+     - the MANIFEST read as data and bound to the name;
+     - the binary's SHA-256 against its MANIFEST;
+     - the embedded source repository;
+     - the binary unchanged since it was hashed;
+     - only then `--version`, against the MANIFEST version.
+4. **Validation before switching** (`_awgBtValidateReleaseCandidate`):
+   - The target binary runs on scratch instances, selected through `_AWG_BT_CANDIDATE_RELEASE`.
+     That variable is set only by this function and reset when the installer loads, so the
+     environment cannot set it; the scratch verifies the release itself.
+   - It runs the persisted imitation, and the AWG 3.0 or 3.1 capability probe with the
+     persisted key.
+   - It runs the staged validation of the server config and of every active client config
+     (private copies).
+   - Params, the server config, the runtime file and every active client config must hash as
+     before; they are never rewritten.
+   - A rollback target that rejects today's settings (for example a protocol mode enabled
+     after the upgrade) is refused before `current` changes.
+5. `previous` := `current`, then `current` := target.
+6. An active unit gets `awgBackendPrepareServiceStart`, a restart and
+   `_awgBtVerifyLifecycleActivation`:
+   - unit active;
+   - MainPID the recorded instance, executing the binary `current` now selects;
+   - TUN link, UAPI and listen port;
+   - no kernel module;
+   - the persisted imitation on its command line;
+   - the interface carries the server config's peers.
+7. On success the old `previous`, if no link names it, is removed only if it is a real
+   directory directly in the trusted store. Failure to remove it is a warning.
+8. **Failure recovery.** A failure, or HUP/INT/TERM, after step 5 began does the following:
+   - Restores both links exactly, including a `previous` that did not exist.
+   - Restarts and verifies the original release, but only if this attempt restarted the unit.
+   - Removes a release this attempt downloaded.
+   - Reports each failing step on its own: activation, link restoration, recovery restart,
+     recovery verification. When links cannot be restored, the unit is not restarted and the
+     operator gets the exact link targets.
+   - Always removes the private copies of the client configs.
+   - A failure before step 5 only removes what the attempt created.
+
+**Crash model.** Writing `previous` before `current` means `current` never names a release
+that has not passed step 4. After a hard interruption (SIGKILL, power loss):
+- **Between the two renames:** `previous` and `current` name the same release. The status
+  marks that `previous` invalid and fails; a rollback refuses; an upgrade proceeds. The old
+  `previous` (an upgrade) or the rollback target (a rollback) is left as an unmanaged release.
+- **After `current` but before the restart:** the store is consistent (`current` the verified
+  target, `previous` the old release). The running daemon still executes the old binary,
+  which `--backend-status` shows as `daemon_state=unverified` and
+  `daemon_release=<old>`. The next `--upgrade-boringtun` to that pin restarts onto it instead
+  of reporting a no-op.
+
+No journal file is needed.
+
+**Status.** `--backend-status` keeps every PR 5 key and appends:
+- `previous_release` (a release, `none` or `invalid`);
+- `rollback_available` and `upgrade_available` (`yes`/`no`);
+- `daemon_release`: the store release the main process executes, from its executable path;
+  `none` when stopped, `unknown` otherwise;
+- `unmanaged_releases` (a count).
+
+A damaged `current` or `previous` (including `previous` naming `current`) makes it exit 1.
+It stays read-only: no repair, download, restart or helper write.
+
+**Tests.**
+- `tests/test-boringtun-lifecycle.sh` uses TEST FIXTURE releases served by a mocked curl. It
+  covers:
+  - identity, and the b1/b2 coexistence and switching;
+  - PR 4/PR 5 stores, fresh installs and the no-op;
+  - service states, gates and candidate validation at AWG 2.0/3.0/3.1 with
+    none/dns/quic/stun;
+  - rejection by the target binary;
+  - activation, link and recovery failures, signals and retention;
+  - damaged links and releases, the interrupted switch and the status;
+  - the call sites and the candidate's scratch selection.
+- `tests/mutate-boringtun-lifecycle.sh` holds its mutants.
+- The host live test makes a TEST FIXTURE older release current (the verified binary under the
+  synthetic commit `feedface…`) and removes the pin from the store. It then upgrades
+  (downloading the real release), rolls back, upgrades again without a download, and runs a
+  no-op. Each step checks the datapath (ping and a 4 MiB checksummed TCP transfer), the
+  daemon's release, the imitation and unchanged configuration hashes.
+- The coexistence job runs the same upgrade before its kernel-client interop.
 
 ## 22. Current functions and files that will need modification
 
