@@ -11947,6 +11947,7 @@ function changeBoringtunImitationInteractively() {
 function printBackendStatus() {
 	local PARAMS_FILE="${AMNEZIAWG_DIR}/params" OWNER MODE UNIT STATE RC=0
 	local INSTALLED=none PINNED="" DAEMON_STATE=stopped DAEMON_PID=""
+	local PREVIOUS=none ROLLBACK=no UPGRADE=no DAEMON_RELEASE=none
 	if [[ -L "${PARAMS_FILE}" || ! -f "${PARAMS_FILE}" ]]; then
 		echo "ERROR: ${PARAMS_FILE} is missing or not a regular file." >&2
 		return 1
@@ -12004,8 +12005,410 @@ function printBackendStatus() {
 	printf 'daemon_pid=%s\n' "${DAEMON_PID}"
 	printf 'daemon_imitation_protocol=%s\n' "${_AWG_BT_DAEMON_PROTOCOL}"
 	printf 'daemon_imitation_domain=%s\n' "${_AWG_BT_DAEMON_DOMAIN}"
+	# The binary lifecycle (PR 6): the rollback target, whether a rollback or
+	# an upgrade to this installer's pin is possible, the release the running
+	# daemon executes, and store releases that neither link names.
+	_awgBtReadStoreLink previous 2>/dev/null
+	case $? in
+		0)
+			PREVIOUS="${_AWG_BT_LINK_TARGET}"
+			if [[ "${PREVIOUS}" == "${INSTALLED}" ]] || ! _awgBtVerifyRelease "${PREVIOUS}" 2>/dev/null; then
+				PREVIOUS=invalid
+				RC=1
+			fi
+			;;
+		2) PREVIOUS=none ;;
+		*)
+			PREVIOUS=invalid
+			RC=1
+			;;
+	esac
+	[[ "${PREVIOUS}" != none && "${PREVIOUS}" != invalid && "${INSTALLED}" != invalid && "${INSTALLED}" != none ]] && ROLLBACK=yes
+	[[ "${INSTALLED}" != invalid && "${INSTALLED}" != none && -n "${PINNED}" && "${INSTALLED}" != "${PINNED}" ]] && UPGRADE=yes
+	if [[ "${STATE}" == active ]]; then
+		[[ -n "${DAEMON_PID}" ]] || DAEMON_PID="$(systemctl show -p MainPID --value "${UNIT}" 2>/dev/null)" || DAEMON_PID=""
+		DAEMON_RELEASE=unknown
+		[[ ! "${DAEMON_PID}" =~ ^[1-9][0-9]*$ ]] || DAEMON_RELEASE="$(_awgBtDaemonRelease "${DAEMON_PID}")"
+	fi
+	printf 'previous_release=%s\n' "${PREVIOUS}"
+	printf 'rollback_available=%s\n' "${ROLLBACK}"
+	printf 'upgrade_available=%s\n' "${UPGRADE}"
+	printf 'daemon_release=%s\n' "${DAEMON_RELEASE}"
+	printf 'unmanaged_releases=%s\n' "$(_awgBtUnmanagedReleases | grep -c .)"
 	return "${RC}"
 }
+
+# ── BoringTun binary lifecycle ───────────────────────────────────────────────
+# The store keeps at most two managed releases, each named by a root-owned
+# relative link: current, which the service runs, and previous, the rollback
+# target. Nothing switches the binary implicitly: only --upgrade-boringtun
+# moves current to the release pinned by this installer, and only
+# --rollback-boringtun moves it to previous. Both validate the target binary
+# against this installation's settings on scratch instances before current
+# changes, write previous first and current second, and restore both links
+# exactly (and the service, if it was active) when activation fails.
+
+# The release a running BoringTun process executes: its store directory, from
+# its verified executable path, or "unknown".
+function _awgBtDaemonRelease() { # <pid>
+	local EXE="" CANONICAL_STORE="" ID=""
+	EXE="$(readlink -- "${AWG_BT_PROC_DIR}/$1/exe" 2>/dev/null)" || EXE=""
+	CANONICAL_STORE="$(readlink -f -- "${AWG_BT_STORE_DIR}" 2>/dev/null)" || CANONICAL_STORE=""
+	ID="${EXE#"${CANONICAL_STORE}"/}"
+	ID="${ID%/boringtun-cli}"
+	if [[ -n "${CANONICAL_STORE}" && "${EXE}" == "${CANONICAL_STORE}/${ID}/boringtun-cli" ]] && _awgBtReleaseIdValid "${ID}"; then
+		printf '%s\n' "${ID}"
+	else
+		printf 'unknown\n'
+	fi
+}
+
+# Release directories in the store that neither current nor previous names:
+# left by an interrupted transaction or by hand. They are reported, never used
+# and never removed automatically.
+function _awgBtUnmanagedReleases() {
+	local ENTRY NAME CURRENT_ID="" PREVIOUS_ID=""
+	_awgBtReadStoreLink current 2>/dev/null && CURRENT_ID="${_AWG_BT_LINK_TARGET}"
+	_awgBtReadStoreLink previous 2>/dev/null && PREVIOUS_ID="${_AWG_BT_LINK_TARGET}"
+	for ENTRY in "${AWG_BT_STORE_DIR}"/*; do
+		NAME="${ENTRY##*/}"
+		_awgBtReleaseIdValid "${NAME}" || continue
+		[[ "${NAME}" != "${CURRENT_ID}" && "${NAME}" != "${PREVIOUS_ID}" ]] && printf '%s\n' "${NAME}"
+	done
+	return 0
+}
+
+# Remove a release directory of the store that neither link names: only a
+# valid release name, a real directory directly in the trusted store, never a
+# symlink and never the target of current or previous (re-read here).
+function _awgBtPruneRelease() { # <release id>
+	local ID="$1" DIR="${AWG_BT_STORE_DIR}/$1" LINK RC CANONICAL_STORE CANONICAL_DIR
+	_awgBtReleaseIdValid "${ID}" || return 1
+	for LINK in current previous; do
+		_awgBtReadStoreLink "${LINK}" 2>/dev/null
+		RC=$?
+		((RC == 2)) && continue
+		((RC == 0)) && [[ "${_AWG_BT_LINK_TARGET}" != "${ID}" ]] || return 1
+	done
+	CANONICAL_STORE="$(readlink -f -- "${AWG_BT_STORE_DIR}" 2>/dev/null)" || return 1
+	CANONICAL_DIR="$(readlink -f -- "${DIR}" 2>/dev/null)" || return 1
+	[[ -d "${DIR}" && ! -L "${DIR}" && "${CANONICAL_DIR}" == "${CANONICAL_STORE}/${ID}" ]] &&
+		_awgBtTrustedAncestors "${DIR}" && _awgBtTrustedNode "${DIR}" dir || return 1
+	rm -rf -- "${DIR}"
+}
+
+# The SHA-256 of every file a binary switch must leave as it is: params, the
+# server config, the runtime file and every active client config. Compared,
+# never printed.
+function _awgBtLifecycleConfigHashes() {
+	local -a CLIENTS=()
+	collectActiveAwgClientConfigs CLIENTS >/dev/null 2>&1 || return 1
+	sha256sum -- "${AMNEZIAWG_DIR}/params" "${SERVER_AWG_CONF}" "$(_awgBtRuntimeFilePath "${SERVER_AWG_NIC}")" "${CLIENTS[@]}" 2>/dev/null
+	return 0
+}
+
+# Prove, before a release may become current, that its binary accepts this
+# installation as it is: scratch instances of that release (never the one
+# current selects) with the persisted imitation run the capability probe of
+# the persisted AWG protocol (3.0 or 3.1) and the staged validation of the
+# server config and of every active client config (private copies, so that
+# awg-quick strip accepts their names). Nothing is rewritten.
+function _awgBtValidateReleaseCandidate() { # <release id> <private work dir>
+	local RELEASE="$1" WORK="$2" RC=0 INDEX=0 CLIENT
+	local -a CLIENTS=() FILES=("${SERVER_AWG_CONF}")
+	_AWG_BT_CANDIDATE_RELEASE="${RELEASE}"
+	case "${AWG_PROTOCOL_VERSION}" in
+		"${AWG_PROTOCOL_VERSION_3}") probeAwg3Capability "${AWG_HEADER_PROTECTION_KEY}" || RC=1 ;;
+		"${AWG_PROTOCOL_VERSION_31}") probeAwg31Capability "${AWG_HEADER_PROTECTION_KEY}" || RC=1 ;;
+	esac
+	if ((RC == 0)) && ! collectActiveAwgClientConfigs CLIENTS; then
+		RC=1
+	fi
+	if ((RC == 0)); then
+		for CLIENT in "${CLIENTS[@]}"; do
+			INDEX=$((INDEX + 1))
+			if ! (umask 077 && cp -- "${CLIENT}" "${WORK}/client-${INDEX}.conf"); then
+				RC=1
+				break
+			fi
+			FILES+=("${WORK}/client-${INDEX}.conf")
+		done
+	fi
+	if ((RC == 0)) && ! validateStagedAwgConfigs "${WORK}" "${FILES[@]}"; then
+		RC=1
+	fi
+	_AWG_BT_CANDIDATE_RELEASE=""
+	return "${RC}"
+}
+
+# The interface's peers are the server config's peers.
+function _awgBtInterfaceCarriesServerPeers() {
+	local LIVE CONFIGURED
+	LIVE="$(awg show "${SERVER_AWG_NIC}" peers 2>/dev/null)" || return 1
+	CONFIGURED="$(sed -n 's/^[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p' "${SERVER_AWG_CONF}")"
+	[[ "$(LC_ALL=C sort <<<"${LIVE}")" == "$(LC_ALL=C sort <<<"${CONFIGURED}")" ]]
+}
+
+# The restarted service runs the release current selects, verified as PR 5's
+# imitation change verifies it (unit active, MainPID the recorded verified
+# binary of current, TUN link, UAPI, listen port, no kernel module, the
+# persisted imitation on its command line), and carries the server's peers.
+function _awgBtVerifyLifecycleActivation() {
+	verifyBoringtunImitationServed "${AWG_BORINGTUN_IMITATE_PROTOCOL}" "${AWG_BORINGTUN_IMITATE_DOMAIN}" || return 1
+	if ! _awgBtInterfaceCarriesServerPeers; then
+		echo "ERROR: ${SERVER_AWG_NIC} does not carry the peers of ${SERVER_AWG_CONF}." >&2
+		return 1
+	fi
+}
+
+# --upgrade-boringtun and --rollback-boringtun, one transaction in a subshell:
+#  1. under the lifecycle lock, params read without migrations; BoringTun only;
+#  2. current must verify, and previous, when present, must be a valid link;
+#     the unit's ActiveState decides: active is switched and restarted,
+#     inactive and failed are switched and left stopped, anything else (or a
+#     state that cannot be read) aborts before any change;
+#  3. the target: for an upgrade the release this installer pins (a no-op when
+#     current already is it, except that an active service still running
+#     another binary is restarted onto it), downloaded and stored beside
+#     current if absent; for a rollback the release previous names;
+#  4. the target is verified as a store release, then validated against this
+#     installation on scratch instances (_awgBtValidateReleaseCandidate), and
+#     params, the server config, the runtime file and every active client
+#     config must hash as before;
+#  5. previous := current, then current := target, each atomically, so current
+#     never names a release that has not passed step 4;
+#  6. an active unit is restarted and verified (_awgBtVerifyLifecycleActivation);
+#  7. on success the old previous release is removed unless a link names it,
+#     so at most two managed releases remain;
+#  8. a failure or HUP, INT or TERM after step 5 began restores both links
+#     exactly and, if the unit was active, restarts and verifies the original
+#     release; a release this transaction stored is removed. Every failing
+#     step is reported on its own.
+function boringtunBinaryLifecycle() ( # <upgrade|rollback>
+	local MODE="$1" ARCH UNIT STATE ACTIVE=0 CURRENT_ID PREVIOUS_ID="" PREVIOUS_EXISTED=0 LINK_RC
+	local TARGET CREATED=0 WORK="" SWITCHED=0 RESTARTED=0 HASHES_BEFORE="" HASHES_AFTER="" UNMANAGED
+	case "${MODE}" in
+		upgrade | rollback) ;;
+		*) return 1 ;;
+	esac
+	acquireClientLifecycleLock || return 1
+	loadParams 0 1
+	if [[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]]; then
+		echo "ERROR: --${MODE}-boringtun applies only to the BoringTun backend; this installation uses the ${AWG_BACKEND} backend. Nothing was changed." >&2
+		return 1
+	fi
+	normalizeAwgProtocolVersion || return 1
+	if ! ARCH="$(_awgBtHostArch)" || ! _awgBtSelectRelease "${ARCH}"; then
+		echo "ERROR: BoringTun releases exist only for x86_64 and aarch64 hosts." >&2
+		return 1
+	fi
+	if ! _awgBtReadStoreLink current || ! _awgBtVerifyStore; then
+		echo "ERROR: the release ${AWG_BT_STORE_DIR}/current selects does not verify; nothing was changed." >&2
+		return 1
+	fi
+	CURRENT_ID="${_AWG_BT_LINK_TARGET}"
+	_awgBtReadStoreLink previous
+	LINK_RC=$?
+	case "${LINK_RC}" in
+		0)
+			PREVIOUS_ID="${_AWG_BT_LINK_TARGET}"
+			PREVIOUS_EXISTED=1
+			;;
+		2) ;;
+		*)
+			echo "ERROR: ${AWG_BT_STORE_DIR}/previous is damaged; nothing was changed." >&2
+			return 1
+			;;
+	esac
+	UNIT="awg-quick@${SERVER_AWG_NIC}.service"
+	STATE="$(systemctl show -p ActiveState --value "${UNIT}" 2>/dev/null)" || STATE=""
+	case "${STATE}" in
+		active) ACTIVE=1 ;;
+		inactive | failed) ;;
+		*)
+			echo "ERROR: ${UNIT} is ${STATE:-in an unknown state}; nothing was changed. Retry once it is active, inactive or failed." >&2
+			return 1
+			;;
+	esac
+
+	if [[ "${MODE}" == upgrade ]]; then
+		TARGET="${_AWG_BT_REL_ID}"
+		if [[ "${CURRENT_ID}" == "${TARGET}" ]]; then
+			if [[ "$(sha256sum -- "${AWG_BT_STORE_DIR}/${TARGET}/boringtun-cli" 2>/dev/null | cut -d' ' -f1)" != "${_AWG_BT_REL_BINARY_SHA256}" ]]; then
+				echo "ERROR: ${AWG_BT_STORE_DIR}/${TARGET} is not the release this installer pins (its binary has another SHA-256); nothing was changed." >&2
+				return 1
+			fi
+			if ((ACTIVE)) && ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
+				# current was switched, but the service was not restarted
+				# onto it (an interrupted transaction): finish that now.
+				echo "current already selects ${TARGET}, but ${UNIT} is not served by it; restarting it on ${TARGET}."
+				awgBackendPrepareServiceStart
+				if ! systemctl restart "${UNIT}" || ! _awgBtVerifyLifecycleActivation; then
+					echo "ERROR: ${UNIT} is still not verifiably served by ${TARGET}. Check: journalctl -u ${UNIT}" >&2
+					return 1
+				fi
+				echo "${UNIT} now runs the BoringTun release ${TARGET}."
+				return 0
+			fi
+			echo "The BoringTun release ${TARGET} that this installer pins is already current; nothing was changed."
+			return 0
+		fi
+	else
+		if ((PREVIOUS_EXISTED == 0)) || [[ "${PREVIOUS_ID}" == "${CURRENT_ID}" ]]; then
+			echo "ERROR: there is no BoringTun release to roll back to (${AWG_BT_STORE_DIR}/previous is absent or names current); nothing was changed." >&2
+			return 1
+		fi
+		TARGET="${PREVIOUS_ID}"
+	fi
+
+	function abandonBoringtunLifecycle() {
+		[[ -z "${WORK}" ]] || rm -rf -- "${WORK}"
+		# A release this attempt stored (also when a signal arrived before it
+		# could record that) is removed; one that was there before stays.
+		if ((CREATED)) || { [[ "${MODE}" == upgrade ]] && [[ "${_AWG_BT_REL_CREATED:-0}" == 1 ]]; }; then
+			_awgBtPruneRelease "${TARGET}" || echo "WARNING: could not remove ${AWG_BT_STORE_DIR}/${TARGET}, which this attempt stored." >&2
+		fi
+	}
+
+	function restoreBoringtunLifecycle() {
+		local FAILED=0
+		if ! _awgBtSetStoreLink current "${CURRENT_ID}"; then
+			echo "ERROR: could not restore ${AWG_BT_STORE_DIR}/current to ${CURRENT_ID}." >&2
+			FAILED=1
+		fi
+		if ((PREVIOUS_EXISTED)); then
+			if ! _awgBtSetStoreLink previous "${PREVIOUS_ID}"; then
+				echo "ERROR: could not restore ${AWG_BT_STORE_DIR}/previous to ${PREVIOUS_ID}." >&2
+				FAILED=1
+			fi
+		elif ! rm -f -- "${AWG_BT_STORE_DIR}/previous" || [[ -e "${AWG_BT_STORE_DIR}/previous" || -L "${AWG_BT_STORE_DIR}/previous" ]]; then
+			echo "ERROR: could not remove ${AWG_BT_STORE_DIR}/previous, which did not exist before." >&2
+			FAILED=1
+		fi
+		# The private copies of the client configs are never needed for a
+		# recovery; the store keeps every release this attempt touched.
+		[[ -z "${WORK}" ]] || rm -rf -- "${WORK}"
+		if ((FAILED)); then
+			echo "ERROR: the store links are not restored; ${UNIT} is left as it is. Point current back at ${CURRENT_ID} and previous at ${PREVIOUS_ID:-nothing}, then restart ${UNIT}." >&2
+			return 1
+		fi
+		echo "Restored ${AWG_BT_STORE_DIR}/current to ${CURRENT_ID} and previous to ${PREVIOUS_ID:-none}." >&2
+		# Only a service this attempt restarted runs anything else; one that was
+		# not restarted still runs the original release.
+		if ((ACTIVE && RESTARTED)); then
+			awgBackendPrepareServiceStart
+			if ! systemctl restart "${UNIT}"; then
+				echo "ERROR: the recovery restart of ${UNIT} on ${CURRENT_ID} failed. Check: journalctl -u ${UNIT}" >&2
+				return 1
+			fi
+			if ! _awgBtVerifyLifecycleActivation; then
+				echo "ERROR: after the recovery restart, ${UNIT} is not verifiably served by ${CURRENT_ID}. Check: journalctl -u ${UNIT}" >&2
+				return 1
+			fi
+			echo "${UNIT} runs ${CURRENT_ID} again." >&2
+		fi
+		abandonBoringtunLifecycle
+		return 0
+	}
+
+	function interruptBoringtunLifecycle() {
+		trap '' HUP INT TERM
+		echo "ERROR: the BoringTun ${MODE} was interrupted." >&2
+		if ((SWITCHED)); then
+			restoreBoringtunLifecycle
+		else
+			abandonBoringtunLifecycle
+		fi
+		exit "$1"
+	}
+
+	trap 'interruptBoringtunLifecycle 129' HUP
+	trap 'interruptBoringtunLifecycle 130' INT
+	trap 'interruptBoringtunLifecycle 143' TERM
+
+	if [[ "${MODE}" == upgrade ]]; then
+		echo "Upgrading BoringTun from ${CURRENT_ID} to ${TARGET}, the release this installer pins (${AWG_BT_RELEASE_TAG})."
+		if ! _awgBtEnsurePinnedRelease "${ARCH}"; then
+			echo "ERROR: the pinned release could not be made available; nothing was changed." >&2
+			return 1
+		fi
+		CREATED="${_AWG_BT_REL_CREATED}"
+	else
+		echo "Rolling BoringTun back from ${CURRENT_ID} to ${TARGET}."
+	fi
+	if ! _awgBtVerifyCandidate "${AWG_BT_STORE_DIR}/${TARGET}" "${ARCH}" "${TARGET}"; then
+		echo "ERROR: ${TARGET} does not verify as a release of the BoringTun store; nothing was changed." >&2
+		abandonBoringtunLifecycle
+		return 1
+	fi
+	if ! WORK="$(mktemp -d "${TMPDIR:-/tmp}/amneziawg-boringtun-lifecycle.XXXXXX")"; then
+		WORK=""
+		echo "ERROR: cannot create a private directory for the validation; nothing was changed." >&2
+		abandonBoringtunLifecycle
+		return 1
+	fi
+	chmod 0700 -- "${WORK}"
+	if ! HASHES_BEFORE="$(_awgBtLifecycleConfigHashes)" || [[ -z "${HASHES_BEFORE}" ]]; then
+		echo "ERROR: cannot read the configuration of this installation; nothing was changed." >&2
+		abandonBoringtunLifecycle
+		return 1
+	fi
+	echo "Validating ${TARGET} against this installation's current settings before it becomes current..."
+	if ! _awgBtValidateReleaseCandidate "${TARGET}" "${WORK}"; then
+		echo "ERROR: ${TARGET} does not accept this installation's current settings (AWG $(awgProtocolDisplayName "${AWG_PROTOCOL_VERSION}"), imitation $(boringtunImitationDisplay "${AWG_BORINGTUN_IMITATE_PROTOCOL}" "${AWG_BORINGTUN_IMITATE_DOMAIN}"), the server and client configs); current is still ${CURRENT_ID}." >&2
+		abandonBoringtunLifecycle
+		return 1
+	fi
+	HASHES_AFTER="$(_awgBtLifecycleConfigHashes)" || HASHES_AFTER=""
+	if [[ "${HASHES_AFTER}" != "${HASHES_BEFORE}" ]]; then
+		echo "ERROR: the configuration changed during the validation; nothing was changed." >&2
+		abandonBoringtunLifecycle
+		return 1
+	fi
+
+	SWITCHED=1
+	if ! _awgBtSetStoreLink previous "${CURRENT_ID}"; then
+		echo "ERROR: could not point ${AWG_BT_STORE_DIR}/previous at ${CURRENT_ID}." >&2
+		restoreBoringtunLifecycle
+		return 1
+	fi
+	if ! _awgBtSetStoreLink current "${TARGET}"; then
+		echo "ERROR: could not point ${AWG_BT_STORE_DIR}/current at ${TARGET}." >&2
+		restoreBoringtunLifecycle
+		return 1
+	fi
+	if ((ACTIVE)); then
+		awgBackendPrepareServiceStart
+		RESTARTED=1
+		if ! systemctl restart "${UNIT}" || ! _awgBtVerifyLifecycleActivation; then
+			echo "ERROR: ${UNIT} did not come up verifiably on ${TARGET}; restoring ${CURRENT_ID}." >&2
+			restoreBoringtunLifecycle
+			return 1
+		fi
+	fi
+	HASHES_AFTER="$(_awgBtLifecycleConfigHashes)" || HASHES_AFTER=""
+	if [[ "${HASHES_AFTER}" != "${HASHES_BEFORE}" ]]; then
+		echo "ERROR: the configuration changed during the switch; restoring ${CURRENT_ID}." >&2
+		restoreBoringtunLifecycle
+		return 1
+	fi
+	trap - HUP INT TERM
+	SWITCHED=0
+	rm -rf -- "${WORK}"
+	if ((PREVIOUS_EXISTED)) && [[ "${PREVIOUS_ID}" != "${TARGET}" && "${PREVIOUS_ID}" != "${CURRENT_ID}" ]]; then
+		_awgBtPruneRelease "${PREVIOUS_ID}" ||
+			echo "WARNING: could not remove ${AWG_BT_STORE_DIR}/${PREVIOUS_ID}, the earlier rollback target." >&2
+	fi
+	if ((ACTIVE)); then
+		echo "BoringTun now runs ${TARGET}; ${UNIT} was restarted on it. previous is ${CURRENT_ID}."
+	else
+		echo "current is now ${TARGET} and previous ${CURRENT_ID}. ${UNIT} is ${STATE} and was not started; it runs ${TARGET} at its next start."
+	fi
+	UNMANAGED="$(_awgBtUnmanagedReleases)"
+	[[ -z "${UNMANAGED}" ]] || echo "NOTE: ${AWG_BT_STORE_DIR} also holds release directories that neither current nor previous names, which were left alone: $(tr '\n' ' ' <<<"${UNMANAGED}")"
+	echo "Params, the server and client configs and the protocol imitation are unchanged."
+	return 0
+)
 
 function changeAwgProtocolInteractively() {
 	local TARGET_MODE RESPONSE CHOICE=""
@@ -12532,9 +12935,29 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	#   amneziawg-install.sh --disable-awg3
 	#   amneziawg-install.sh --set-boringtun-imitation <none|dns|quic|sip|stun> [hostname]
 	#   amneziawg-install.sh --backend-status
+	#   amneziawg-install.sh --upgrade-boringtun
+	#   amneziawg-install.sh --rollback-boringtun
 	#
 	# Requires AmneziaWG to be already installed (params file must exist).
 	case "${1:-}" in
+		--upgrade-boringtun|--rollback-boringtun)
+			if [[ $# -ne 1 ]]; then
+				echo "Usage: amneziawg-install.sh --upgrade-boringtun" >&2
+				echo "       amneziawg-install.sh --rollback-boringtun" >&2
+				exit 1
+			fi
+			initialCheck
+			if [[ ! -e "${AMNEZIAWG_DIR}/params" ]]; then
+				echo "ERROR: AmneziaWG is not installed (params file missing)" >&2
+				exit 1
+			fi
+			if [[ "$1" == --upgrade-boringtun ]]; then
+				boringtunBinaryLifecycle upgrade
+			else
+				boringtunBinaryLifecycle rollback
+			fi
+			exit $?
+			;;
 		--set-boringtun-imitation|--backend-status)
 			if [[ "$1" == --backend-status && $# -ne 1 ]] ||
 				[[ "$1" == --set-boringtun-imitation && ($# -lt 2 || $# -gt 3) ]]; then
