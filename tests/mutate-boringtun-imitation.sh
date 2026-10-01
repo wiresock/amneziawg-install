@@ -90,9 +90,9 @@ mutant no_noop test-boringtun-imitation "without touching the runtime" \
 	$'\t\techo "BoringTun protocol imitation is already $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}"); nothing was changed."\n\t\treturn 0' \
 	$'\t\techo "BoringTun protocol imitation is already $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}"); nothing was changed."'
 mutant transitional_state_accepted test-boringtun-imitation "a unit that is 'activating' aborts the change" \
-	$'\t\tactive) ACTIVE=1 ;;\n\t\tinactive | failed) ;;' $'\t\tactive) ACTIVE=1 ;;\n\t\tinactive | failed | activating) ;;'
+	$'\t\tactive) ACTIVE=1 ;;\n\t\tinactive | failed) ;;\n\t\t*)\n\t\t\techo "ERROR: ${UNIT} is ${STATE:-in an unknown state}; nothing was changed. Retry once it is active, inactive or failed." >&2\n\t\t\treturn 1\n\t\t\t;;\n\tesac\n\t((WARNED))' $'\t\tactive) ACTIVE=1 ;;\n\t\tinactive | failed | activating) ;;\n\t\t*)\n\t\t\techo "ERROR: ${UNIT} is ${STATE:-in an unknown state}; nothing was changed. Retry once it is active, inactive or failed." >&2\n\t\t\treturn 1\n\t\t\t;;\n\tesac\n\t((WARNED))'
 mutant failed_unit_restarted test-boringtun-imitation "failed: the unit is not started" \
-	$'\t\tactive) ACTIVE=1 ;;\n\t\tinactive | failed) ;;' $'\t\tactive | failed) ACTIVE=1 ;;\n\t\tinactive) ;;'
+	$'\t\tactive) ACTIVE=1 ;;\n\t\tinactive | failed) ;;\n\t\t*)\n\t\t\techo "ERROR: ${UNIT} is ${STATE:-in an unknown state}; nothing was changed. Retry once it is active, inactive or failed." >&2\n\t\t\treturn 1\n\t\t\t;;\n\tesac\n\t((WARNED))' $'\t\tactive | failed) ACTIVE=1 ;;\n\t\tinactive) ;;\n\t\t*)\n\t\t\techo "ERROR: ${UNIT} is ${STATE:-in an unknown state}; nothing was changed. Retry once it is active, inactive or failed." >&2\n\t\t\treturn 1\n\t\t\t;;\n\tesac\n\t((WARNED))'
 mutant helpers_not_reconciled test-boringtun-imitation "the helpers are regenerated while the runtime file is still the previous one" \
 	$'\t_awgBtEnsureReady 0\n\tif ((ACTIVE)) && ! _awgBtCheckServedByBoringtun' $'\tif ((ACTIVE)) && ! _awgBtCheckServedByBoringtun'
 mutant running_instance_unproven test-boringtun-imitation "an active unit that is not the recorded BoringTun instance is left alone" \

@@ -38,6 +38,7 @@ jobs:
           bash -n tests/test-boringtun-runtime-live.sh
           bash -n tests/test-boringtun-host.sh
           bash -n tests/test-boringtun-imitation.sh
+          bash -n tests/test-boringtun-lifecycle.sh
           bash -n tests/test-boringtun-install-mock.sh
           bash -n tests/test-boringtun-host-live.sh
           bash -n tests/test-boringtun-kernel-coexistence.sh
@@ -46,9 +47,11 @@ jobs:
           bash -n tests/mutate-boringtun-runtime.sh
           bash -n tests/mutate-boringtun-host.sh
           bash -n tests/mutate-boringtun-imitation.sh
+          bash -n tests/mutate-boringtun-lifecycle.sh
           bash -n tests/helpers/mutation-engine.sh
           bash -n tests/test-mutation-engine.sh
           bash -n tests/helpers/boringtun-live-firewall.sh
+          bash -n tests/helpers/boringtun-lifecycle-fixture.sh
           bash -n tests/test-boringtun-live-firewall.sh
           bash -n tests/equivalence/run-kernel-equivalence.sh
           bash -n tests/equivalence/kernel-scenarios.sh
@@ -94,6 +97,7 @@ jobs:
           shellcheck --severity=warning tests/test-boringtun-runtime-live.sh
           shellcheck --severity=warning tests/test-boringtun-host.sh
           shellcheck --severity=warning tests/test-boringtun-imitation.sh
+          shellcheck --severity=warning tests/test-boringtun-lifecycle.sh
           shellcheck --severity=warning tests/test-boringtun-install-mock.sh
           shellcheck --severity=warning tests/test-boringtun-host-live.sh
           shellcheck --severity=warning tests/test-boringtun-kernel-coexistence.sh
@@ -102,9 +106,11 @@ jobs:
           shellcheck --severity=warning tests/mutate-boringtun-runtime.sh
           shellcheck --severity=warning tests/mutate-boringtun-host.sh
           shellcheck --severity=warning tests/mutate-boringtun-imitation.sh
+          shellcheck --severity=warning tests/mutate-boringtun-lifecycle.sh
           shellcheck --severity=warning tests/helpers/mutation-engine.sh
           shellcheck --severity=warning tests/test-mutation-engine.sh
           shellcheck --severity=warning tests/helpers/boringtun-live-firewall.sh
+          shellcheck --severity=warning tests/helpers/boringtun-lifecycle-fixture.sh
           shellcheck --severity=warning tests/test-boringtun-live-firewall.sh
           shellcheck --severity=warning tests/equivalence/run-kernel-equivalence.sh
           shellcheck --severity=warning tests/equivalence/kernel-scenarios.sh

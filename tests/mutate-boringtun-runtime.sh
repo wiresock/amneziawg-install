@@ -148,7 +148,7 @@ mutant s3_unit_without_gate \
 	"'[[ -e \"\$1\" && ! -e \"\$2\" ]] || exit 0; shift 2; exec \"\$@\"'" "'shift 2; exec \"\$@\"'"
 mutant s3_reclaim_leaves_unit $'\t\tsystemctl stop "${UNIT}.service" >/dev/null 2>&1\n' ''
 mutant s3_sweep_ignores_liveness '((ALIVE)) && continue' ':'
-mutant s3_no_sweep $'\t_awgBtScratchSweep\n\t_awgBtVerifyStore || return 1' $'\t_awgBtVerifyStore || return 1'
+mutant s3_no_sweep $'\t_awgBtScratchSweep\n\t# The release current selects, or the candidate a lifecycle transaction' $'\t# The release current selects, or the candidate a lifecycle transaction'
 # The ListenPort filter and the awg-quick parser.
 mutant filter_always_strips '((INDEX == PORT_INDEX)) && ((10#${CONFIGURED} == LIVE))' '((INDEX == PORT_INDEX))'
 mutant filter_never_strips '((INDEX == PORT_INDEX)) && ((10#${CONFIGURED} == LIVE))' 'false'

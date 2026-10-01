@@ -1071,7 +1071,12 @@ pinned_release=${AWG_BT_RELEASE_ASSET_X86_64%.tar.gz}
 daemon_state=stopped
 daemon_pid=
 daemon_imitation_protocol=
-daemon_imitation_domain=" "${OUT}" "the BoringTun report, key by key"
+daemon_imitation_domain=
+previous_release=none
+rollback_available=no
+upgrade_available=no
+daemon_release=none
+unmanaged_releases=0" "${OUT}" "the BoringTun report, key by key"
 assert_not_contains "${MOCK_KEY}" "${OUT}${ERR}" "  no key is printed"
 
 make_install boringtun quic "" 3
