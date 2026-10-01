@@ -38,8 +38,7 @@ mutant request_read_late test-boringtun-imitation "the request is the one the in
 mutant kernel_accepts_imitation test-boringtun-imitation "kernel params that carry a dns imitation are damaged" \
 	'echo "ERROR: protocol imitation is available only with the BoringTun backend (AWG_BACKEND=${AWG_BACKEND_BORINGTUN})." >&2'$'\n'"${T}${T}${T}return 1" ':'
 mutant kernel_params_get_keys test-boringtun-imitation "kernel params carry no imitation keys" \
-	$'if [[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]; then\n\t\tcat >>"${OUTPUT_FILE}" <<EOF' \
-	$'if true; then\n\t\tcat >>"${OUTPUT_FILE}" <<EOF'
+	'if ((RC == 0)) && [[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]; then' 'if ((RC == 0)); then'
 mutant empty_protocol_is_none test-boringtun-imitation "an empty persisted protocol is refused" \
 	'[[ -n "${AWG_BORINGTUN_IMITATE_PROTOCOL+set}" ]] || AWG_BORINGTUN_IMITATE_PROTOCOL="${AWG_BT_IMITATE_NONE}"' \
 	'AWG_BORINGTUN_IMITATE_PROTOCOL="${AWG_BORINGTUN_IMITATE_PROTOCOL:-${AWG_BT_IMITATE_NONE}}"'
@@ -115,6 +114,26 @@ mutant no_term_trap test-boringtun-imitation "after restoring both files exactly
 mutant rollback_dir_removed_on_failure test-boringtun-imitation "which are kept" \
 	$'\t\telse\n\t\t\techo "ERROR: the rollback is incomplete; recovery files remain in ${TRANSACTION_DIR}" >&2' \
 	$'\t\telse\n\t\t\tcleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"\n\t\t\techo "ERROR: the rollback is incomplete; recovery files remain in ${TRANSACTION_DIR}" >&2'
+
+# Complete staged params (review item 23): a params write that fails
+# part-way, or staged params that are incomplete, do not load on their own or
+# change more than the imitation, never get committed.
+mutant serializer_ignores_body_failure test-boringtun-imitation "serializeParams fails when the params write stops part-way" \
+	'cat >"${OUTPUT_FILE}" <<EOF || RC=1' 'cat >"${OUTPUT_FILE}" <<EOF'
+mutant serializer_ignores_append_failure test-boringtun-imitation "serializeParams fails when the imitation append fails" \
+	'cat >>"${OUTPUT_FILE}" <<EOF || RC=1' 'cat >>"${OUTPUT_FILE}" <<EOF'
+mutant staged_check_omits_server_port test-boringtun-imitation "because SERVER_PORT is missing" \
+	' SERVER_AWG_IPV6 SERVER_PORT SERVER_PRIV_KEY ' ' SERVER_AWG_IPV6 SERVER_PRIV_KEY '
+mutant staged_check_inherits_parent test-boringtun-imitation "because SERVER_PRIV_KEY is missing" \
+	$'\tunset ${AWG_PARAMS_KEYS} ${AWG_PARAMS_BORINGTUN_KEYS}\n\t# shellcheck source=/dev/null\n\tif ! source "${STAGED}"; then' \
+	$'\t# shellcheck source=/dev/null\n\tif ! source "${STAGED}"; then'
+mutant staged_check_skips_protocol_state test-boringtun-imitation "a staged file with an invalid header-protection key does not load" \
+	$'if ! validateParamsFile 0 >/dev/null || ! normalizeAwgProtocolVersion >/dev/null; then\n\t\techo "ERROR: the staged params would not load." >&2' \
+	$'if false; then\n\t\techo "ERROR: the staged params would not load." >&2'
+mutant staged_schema_unchecked test-boringtun-imitation "staged params with a repeated key are refused" \
+	'if ! awgParamsFileHasCanonicalKeys "${PARAMS_STAGE}" "${AWG_BACKEND_BORINGTUN}"; then' 'if false; then'
+mutant staged_state_not_compared test-boringtun-imitation "staged params that change S4 are refused" \
+	'if [[ "${STAGED_STATE}" != "${CURRENT_STATE}|${PROTOCOL}|${DOMAIN}" ]]; then' 'if false; then'
 
 # --backend-status and the menus.
 mutant status_mode_unchecked test-boringtun-imitation "by the status itself, before params are read" \

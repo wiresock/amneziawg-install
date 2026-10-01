@@ -264,6 +264,10 @@ make_install() {
 		AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
 		AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
 		AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+		if [[ "${AWG_PROTOCOL_VERSION}" == 3.1 ]]; then
+			AWG_RANDOM_TRAILERS="${AWG31_DEFAULT_RANDOM_TRAILERS}"
+			AWG_DISABLE_COOKIES="${AWG31_DEFAULT_DISABLE_COOKIES}"
+		fi
 	fi
 	cat >"${SERVER_AWG_CONF}" <<EOF
 [Interface]
@@ -847,6 +851,175 @@ assert_eq "${BEFORE}" "$(snapshot)" "  after restoring both files exactly"
 assert_eq "verify dns|example.com" "$(grep '^verify' "${S}/log")" "  and the previous imitation is running again"
 assert_contains "interrupted" "${ERR}" "  and the interruption is reported"
 assert_eq "0" "$(transaction_dirs)" "  no transaction directory is left"
+
+echo "=== Complete staged params ==="
+# A real partial write: cat becomes a wrapper that, once armed with
+# "<input prefix> <byte limit>" in <state>/partial-write, runs the real cat on
+# the first input that starts with that prefix under RLIMIT_FSIZE (prlimit),
+# with SIGXFSZ ignored. The kernel stops the write at the limit and cat fails
+# with EFBIG ("File too large"). "keep" limits the file to its current size,
+# for an append. Every other run is the real cat.
+REAL_CAT="$(PATH=/usr/bin:/bin command -v cat)"
+cat >"${MOCKBIN}/cat" <<EOF
+#!/bin/bash
+if [[ \$# -eq 0 && -s '${S}/partial-write' ]]; then
+	read -r PREFIX LIMIT <'${S}/partial-write'
+	IN="\$(mktemp '${T}/cat-in.XXXXXX')"
+	'${REAL_CAT}' >"\${IN}"
+	if [[ "\$(head -c "\${#PREFIX}" "\${IN}")" == "\${PREFIX}" ]]; then
+		rm -f '${S}/partial-write'
+		[[ "\${LIMIT}" == keep ]] && LIMIT="\$(stat -L -c %s /proc/\$\$/fd/1)"
+		trap '' XFSZ
+		exec prlimit --fsize="\${LIMIT}" '${REAL_CAT}' "\${IN}"
+	fi
+	exec '${REAL_CAT}' "\${IN}"
+fi
+exec '${REAL_CAT}' "\$@"
+EOF
+chmod 0755 "${MOCKBIN}/cat"
+hash -r
+partial_write() { # <input prefix> <byte limit|keep>
+	printf '%s %s\n' "$1" "$2" >"${S}/partial-write"
+}
+# The bytes of the first 25 canonical lines: up to AWG_PROTOCOL_VERSION, so
+# AWG_HEADER_PROTECTION_KEY and every later key are cut off.
+prefix_bytes() {
+	head -n 25 "${AMNEZIAWG_DIR}/params" | wc -c
+}
+# serializeParams of the state make_install left in this shell; prints
+# "<rc> umask-restored|umask-changed".
+serialize() { # <output file>
+	local BEFORE_UMASK RC
+	BEFORE_UMASK="$(umask)"
+	serializeParams "$1"
+	RC=$?
+	printf '%s %s' "${RC}" "$([[ "$(umask)" == "${BEFORE_UMASK}" ]] && echo umask-restored || echo umask-changed)"
+}
+keys_of() { # <file>
+	sed -n 's/^\([A-Z][A-Z0-9_]*\)=.*/\1/p' "$1" | tr '\n' ' '
+}
+
+make_install boringtun dns example.com 3
+CANONICAL="${T}/canonical.params"
+cp -- "${AMNEZIAWG_DIR}/params" "${CANONICAL}"
+run serialize "${T}/ser.ok"
+assert_eq "0 umask-restored" "${OUT}" "serializeParams succeeds and restores the umask"
+assert_true "  and writes the canonical params byte for byte" cmp -s "${T}/ser.ok" "${CANONICAL}"
+assert_eq "$(awgParamsCanonicalKeys boringtun | tr '\n' ' ')" "$(keys_of "${T}/ser.ok")" \
+	"the canonical key list is exactly the keys serializeParams writes for BoringTun"
+run serialize "${T}/no-such-directory/params"
+assert_eq "1 umask-restored" "${OUT}" "serializeParams fails when its output cannot be opened, and restores the umask"
+partial_write SERVER_PUB_IP= 0
+run serialize "${T}/ser.empty"
+assert_eq "1 umask-restored" "${OUT}" "serializeParams fails when the params write fails before any byte"
+assert_true "  (the injected kernel write limit was applied)" test ! -e "${S}/partial-write"
+assert_eq "0" "$(wc -c <"${T}/ser.empty")" "  and nothing was written"
+partial_write SERVER_PUB_IP= "$(prefix_bytes)"
+run serialize "${T}/ser.partial"
+assert_eq "1 umask-restored" "${OUT}" "serializeParams fails when the params write stops part-way"
+assert_eq "25" "$(wc -l <"${T}/ser.partial")" "  (the kernel stopped it after 25 lines)"
+assert_eq "0" "$(grep -c '^AWG_BORINGTUN_' "${T}/ser.partial")" "  and the imitation is not appended after a failed write"
+partial_write AWG_BORINGTUN_IMITATE_PROTOCOL= keep
+run serialize "${T}/ser.append"
+assert_eq "1 umask-restored" "${OUT}" "serializeParams fails when the imitation append fails"
+assert_true "  (the injected kernel write limit was applied)" test ! -e "${S}/partial-write"
+make_install kernel
+run serialize "${T}/ser.kernel"
+assert_eq "0" "${OUT%% *}" "kernel: serializeParams succeeds"
+assert_eq "$(awgParamsCanonicalKeys kernel | tr '\n' ' ')" "$(keys_of "${T}/ser.kernel")" \
+	"the canonical key list is exactly the keys serializeParams writes for the kernel backend"
+partial_write SERVER_PUB_IP= "$(prefix_bytes)"
+run serialize "${T}/ser.kernel-partial"
+assert_eq "1" "${OUT%% *}" "kernel: a params write that stops part-way fails too"
+
+make_install boringtun dns example.com 3
+schema() { # <label> <expected rc> <command editing the copy...>
+	cp -- "${CANONICAL}" "${T}/schema.params"
+	"${@:3}"
+	run awgParamsFileHasCanonicalKeys "${T}/schema.params" boringtun
+	assert_rc "$2" "${RC}" "$1"
+}
+schema "a complete BoringTun params file has the canonical keys" 0 true
+schema "a truncated one does not" 1 sed -i '26,$d' "${T}/schema.params"
+schema "nor one without SERVER_PORT" 1 sed -i '/^SERVER_PORT=/d' "${T}/schema.params"
+schema "nor one with a repeated key" 1 sed -i '$a SERVER_PORT='"'"'51820'"'" "${T}/schema.params"
+schema "nor one with an unexpected key" 1 sed -i '$a EXTRA_SETTING='"'"'x'"'" "${T}/schema.params"
+schema "nor one with a stray line" 1 sed -i '$a # comment' "${T}/schema.params"
+schema "nor one without the imitation keys" 1 sed -i '/^AWG_BORINGTUN_/d' "${T}/schema.params"
+run awgParamsFileHasCanonicalKeys "${T}/ser.kernel" boringtun
+assert_rc 1 "${RC}" "kernel params are not BoringTun params"
+
+# The isolated read-back: no variable of this shell fills in a missing line.
+isolated() { # <staged file>
+	loadParams 0 1 >/dev/null
+	readStagedParamsInIsolation "$1" "${T}/check.$$.${RANDOM}"
+}
+staged_without() { # <key>: the canonical file without that key's line
+	grep -v "^$1=" "${CANONICAL}" >"${T}/staged.params"
+	chmod 600 "${T}/staged.params"
+}
+cp -- "${CANONICAL}" "${T}/staged.params"
+run isolated "${T}/staged.params"
+assert_rc 0 "${RC}" "a complete staged file reads back in isolation"
+assert_eq "dns|example.com" "${OUT#*|}" "  with its imitation"
+for KEY in SERVER_PRIV_KEY SERVER_PORT SERVER_AWG_S4 AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY; do
+	staged_without "${KEY}"
+	run isolated "${T}/staged.params"
+	assert_rc 1 "${RC}" "a staged file without ${KEY} is refused although this shell has ${KEY}"
+	assert_contains "do not set ${KEY}" "${ERR}" "  because ${KEY} is missing"
+done
+sed "s/^AWG_HEADER_PROTECTION_KEY=.*/AWG_HEADER_PROTECTION_KEY='not-a-key'/" "${CANONICAL}" >"${T}/staged.params"
+chmod 600 "${T}/staged.params"
+run isolated "${T}/staged.params"
+assert_rc 1 "${RC}" "a staged file with an invalid header-protection key does not load"
+assert_contains "would not load" "${ERR}" "  because its AWG protocol state is validated"
+
+# The transaction: a partial write of the staged params under AWG 3.x changes
+# nothing, before anything is applied.
+for VERSION in 3 3.1; do
+	make_install boringtun dns example.com "${VERSION}"
+	chmod 400 "${AMNEZIAWG_DIR}/params"
+	BEFORE="$(snapshot)"
+	partial_write SERVER_PUB_IP= "$(prefix_bytes)"
+	run setBoringtunImitation stun
+	assert_rc 1 "${RC}" "AWG ${VERSION}: a staged params write that stops part-way fails the change"
+	assert_true "AWG ${VERSION}:   (the injected kernel write limit was applied)" test ! -e "${S}/partial-write"
+	assert_not_contains "systemctl restart" "$(cat "${S}/log")" "AWG ${VERSION}:   no restart"
+	assert_not_contains "is now stun" "${OUT}" "AWG ${VERSION}:   no success message"
+	assert_not_contains "was restored" "${ERR}" "AWG ${VERSION}:   no rollback was needed: it failed before anything was applied"
+	assert_eq "${BEFORE}" "$(snapshot)" "AWG ${VERSION}:   params and the runtime file are byte for byte and mode for mode as they were"
+	assert_eq "0" "$(transaction_dirs)" "AWG ${VERSION}:   the staging directory is removed"
+	run load_params
+	assert_eq "0 boringtun|dns|example.com" "${RC} ${OUT}" "AWG ${VERSION}:   and params still load"
+done
+make_install boringtun dns example.com 3
+BEFORE="$(snapshot)"
+partial_write AWG_BORINGTUN_IMITATE_PROTOCOL= keep
+run setBoringtunImitation stun
+assert_rc 1 "${RC}" "a failed imitation append fails the change"
+assert_eq "${BEFORE}" "$(snapshot)" "  and nothing changed"
+assert_not_contains "systemctl restart" "$(cat "${S}/log")" "  no restart"
+
+# Staged params that are complete and load, but are not the current state
+# plus the imitation, are refused too.
+eval "$(declare -f serializeParams | sed '1s/serializeParams/realSerializeParams/')"
+stage_altered() { # <sed expression applied to the staged params>
+	serializeParams() {
+		realSerializeParams "$@" || return
+		sed -i "${STAGE_EDIT}" "$1"
+	}
+	setBoringtunImitation stun
+}
+make_install boringtun dns example.com 3
+BEFORE="$(snapshot)"
+STAGE_EDIT="s/^SERVER_AWG_S4=.*/SERVER_AWG_S4='51'/" run stage_altered
+assert_rc 1 "${RC}" "staged params that change S4 are refused"
+assert_contains "differ from the current ones in more than the protocol imitation" "${ERR}" "  as more than the imitation"
+assert_eq "${BEFORE}" "$(snapshot)" "  and nothing changed"
+STAGE_EDIT='$a SERVER_PORT='"'"'51820'"'" run stage_altered
+assert_rc 1 "${RC}" "staged params with a repeated key are refused"
+assert_contains "not a complete params file" "${ERR}" "  as incomplete"
+assert_eq "${BEFORE}" "$(snapshot)" "  and nothing changed"
 
 echo "=== Upgrade from the previous installer ==="
 # Params without the imitation keys, a FORMAT=1 runtime file and helpers that

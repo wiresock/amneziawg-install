@@ -2423,9 +2423,25 @@ subshell:
 5. In a private `.awg-imitation.*` directory it backs up params and the runtime
    file byte for byte, and records their modes (params may be 0400).
 6. It renders both new files there and checks them:
+   - `serializeParams` must report success; it fails on any write failure,
+     including one part-way through or in the imitation append, and still
+     restores the umask;
    - the runtime file through the launcher's own parser;
-   - params by reading them back;
+   - params as a complete canonical file: exactly the keys `serializeParams`
+     writes for BoringTun (`AWG_PARAMS_KEYS` and `AWG_PARAMS_BORINGTUN_KEYS`,
+     which a test keeps equal to its output), each once and in order;
+   - params read back in isolation (`readStagedParamsInIsolation`): every
+     canonical variable is unset first, so nothing in the installer's shell
+     can fill in a missing line, and every key must be set. Then
+     `validateParamsFile`, which validates the backend, the imitation and the
+     AWG protocol state, must accept the file as the params of a private
+     directory;
+   - the state read back must be the current state with only the imitation
+     changed: a digest of every other key's value is compared, never printed;
    - the server config on a scratch instance that runs the new imitation.
+
+   Every check runs before anything is applied, so a failed one changes no live
+   file and needs no rollback.
 7. It replaces the runtime file, then params, atomically, keeping their modes.
 8. For an active unit it runs `awgBackendPrepareServiceStart`, restarts, and
    verifies:
@@ -2468,8 +2484,12 @@ The kernel menu keeps its 7 options unchanged.
   fresh-install selection, the runtime file and command line, warnings and
   advisory, the SIP refusal, the transaction's states, failure injection,
   rollback and signal paths, the PR 4 → PR 5 upgrade order, `--backend-status`,
-  and the menus. `tests/mutate-boringtun-imitation.sh` has 41 mutants, each
-  caught by a named assertion.
+  and the menus. It also runs a real partial write: the kernel stops the params
+  write after 25 lines (RLIMIT_FSIZE through `prlimit`). The test checks that
+  this makes `serializeParams` and the transaction fail before anything is
+  applied, and checks the isolated read-back of staged files that lack a key
+  the shell still has. `tests/mutate-boringtun-imitation.sh` has 48 mutants,
+  each caught by a named assertion.
 - `tests/test-boringtun-runtime.sh` covers the launcher's refusals of bad
   runtime files, and the exact command lines of launcher and scratch instances
   with and without imitation.

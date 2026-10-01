@@ -2936,10 +2936,13 @@ function serializeParams() {
 	checkBoringtunImitationForBackend || return 1
 	# Apply a restrictive umask only while writing the params file to disk,
 	# so that subprocesses (apt/dnf, dkms, etc.) are not affected.
-	local OLD_UMASK
+	# Every write's status is kept: a write that fails part-way, or a file
+	# that cannot be opened, makes the function fail even though the umask is
+	# restored after it.
+	local OLD_UMASK RC=0
 	OLD_UMASK="$(umask)"
 	umask 077
-	cat >"${OUTPUT_FILE}" <<EOF
+	cat >"${OUTPUT_FILE}" <<EOF || RC=1
 SERVER_PUB_IP=$(safeQuoteParam "${SERVER_PUB_IP}")
 SERVER_PUB_NIC=$(safeQuoteParam "${SERVER_PUB_NIC}")
 SERVER_AWG_NIC=$(safeQuoteParam "${SERVER_AWG_NIC}")
@@ -2976,14 +2979,86 @@ AWG_DISABLE_COOKIES=$(safeQuoteParam "${AWG_DISABLE_COOKIES:-}")
 EOF
 	# Only BoringTun installations persist the protocol imitation, so kernel
 	# params keep exactly the keys they had before imitation existed.
-	if [[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
-		cat >>"${OUTPUT_FILE}" <<EOF
+	if ((RC == 0)) && [[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]; then
+		cat >>"${OUTPUT_FILE}" <<EOF || RC=1
 AWG_BORINGTUN_IMITATE_PROTOCOL=$(safeQuoteParam "${AWG_BORINGTUN_IMITATE_PROTOCOL:-${AWG_BT_IMITATE_NONE}}")
 AWG_BORINGTUN_IMITATE_DOMAIN=$(safeQuoteParam "${AWG_BORINGTUN_IMITATE_DOMAIN:-}")
 EOF
 	fi
 	umask "${OLD_UMASK}"
+	return "${RC}"
 }
+
+# The keys serializeParams writes, in its order: AWG_PARAMS_KEYS for every
+# backend, then AWG_PARAMS_BORINGTUN_KEYS for BoringTun. A test keeps this list
+# equal to what serializeParams writes.
+AWG_PARAMS_KEYS="SERVER_PUB_IP SERVER_PUB_NIC SERVER_AWG_NIC SERVER_AWG_IPV4 SERVER_AWG_IPV6 SERVER_PORT SERVER_PRIV_KEY SERVER_PUB_KEY CLIENT_DNS_1 CLIENT_DNS_2 ALLOWED_IPS ENABLE_IPV6 SERVER_AWG_JC SERVER_AWG_JMIN SERVER_AWG_JMAX SERVER_AWG_S1 SERVER_AWG_S2 SERVER_AWG_S3 SERVER_AWG_S4 SERVER_AWG_H1 SERVER_AWG_H2 SERVER_AWG_H3 SERVER_AWG_H4 AWG_BACKEND AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY AWG_CONTENT_PADDING_ADDITION AWG_REKEY_AFTER_TIME AWG_REKEY_TIMEOUT AWG_REJECT_AFTER_TIME AWG_KEEPALIVE_TIMEOUT AWG_RANDOM_TRAILERS AWG_DISABLE_COOKIES"
+AWG_PARAMS_BORINGTUN_KEYS="AWG_BORINGTUN_IMITATE_PROTOCOL AWG_BORINGTUN_IMITATE_DOMAIN"
+
+function awgParamsCanonicalKeys() { # <backend>
+	local KEYS="${AWG_PARAMS_KEYS}"
+	[[ "${1:-}" != "${AWG_BACKEND_BORINGTUN}" ]] || KEYS+=" ${AWG_PARAMS_BORINGTUN_KEYS}"
+	# shellcheck disable=SC2086 # the key lists are fixed words
+	printf '%s\n' ${KEYS}
+}
+
+# Whether FILE, as serializeParams writes it, has exactly BACKEND's canonical
+# key lines, each once and in order, and no other line: a truncated file, a
+# missing or repeated key, an unexpected assignment and a value broken across
+# lines all fail.
+function awgParamsFileHasCanonicalKeys() { # <file> <backend>
+	local LINE KEYS=""
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		[[ "${LINE}" =~ ^([A-Z][A-Z0-9_]*)= ]] || return 1
+		KEYS+="${BASH_REMATCH[1]} "
+	done <"$1" || return 1
+	[[ "${KEYS}" == "$(awgParamsCanonicalKeys "$2" | tr '\n' ' ')" ]]
+}
+
+# A digest of the persisted state in this shell: every key of AWG_PARAMS_KEYS
+# with its value, or as unset. It compares two states without printing a value.
+function awgParamsStateDigest() {
+	local KEY
+	for KEY in ${AWG_PARAMS_KEYS}; do
+		printf '%s:%s=%s\n' "${KEY}" "${!KEY+set}" "${!KEY-}"
+	done | sha256sum | cut -d' ' -f1
+}
+
+# Read a staged params file in isolation, as the next loadParams will. Every
+# canonical variable is unset first, so a line the file lacks can never be
+# filled in from this shell. The file must set every canonical key of its
+# backend, and must then pass validateParamsFile (with it as the params of a
+# private directory next to the live server config), which validates the
+# backend, its imitation and the AWG protocol state. Prints
+# "<state digest>|<imitation protocol>|<imitation hostname>". The file is
+# installer-generated and private.
+function readStagedParamsInIsolation() ( # <staged file> <private check directory>
+	local STAGED="$1" CHECK_DIR="$2" KEY CONFIG="${SERVER_AWG_CONF}" INTERFACE="${SERVER_AWG_NIC}"
+	# shellcheck disable=SC2086 # the key lists are fixed words
+	unset ${AWG_PARAMS_KEYS} ${AWG_PARAMS_BORINGTUN_KEYS}
+	# shellcheck source=/dev/null
+	if ! source "${STAGED}"; then
+		echo "ERROR: the staged params cannot be read." >&2
+		return 1
+	fi
+	for KEY in $(awgParamsCanonicalKeys "${AWG_BACKEND:-}"); do
+		if [[ -z "${!KEY+set}" ]]; then
+			echo "ERROR: the staged params do not set ${KEY}." >&2
+			return 1
+		fi
+	done
+	if ! mkdir -m 0700 -- "${CHECK_DIR}" || ! cp -p -- "${STAGED}" "${CHECK_DIR}/params" ||
+		! ln -s -- "${CONFIG}" "${CHECK_DIR}/${INTERFACE}.conf"; then
+		echo "ERROR: cannot prepare the check of the staged params." >&2
+		return 1
+	fi
+	AMNEZIAWG_DIR="${CHECK_DIR}"
+	if ! validateParamsFile 0 >/dev/null || ! normalizeAwgProtocolVersion >/dev/null; then
+		echo "ERROR: the staged params would not load." >&2
+		return 1
+	fi
+	printf '%s|%s|%s\n' "$(awgParamsStateDigest)" "${AWG_BORINGTUN_IMITATE_PROTOCOL:-}" "${AWG_BORINGTUN_IMITATE_DOMAIN:-}"
+)
 
 # Validate an IPv6 address string
 # Handles full form (8 hextets), compressed form (with ::), and mixed forms
@@ -11513,7 +11588,7 @@ function setBoringtunImitation() ( # <protocol> [<domain> [warned]]
 	local PROTOCOL="${1-}" DOMAIN="${2-}" WARNED="${3:-0}"
 	local UNIT STATE ACTIVE=0 OLD_PROTOCOL OLD_DOMAIN TRANSACTION_DIR=""
 	local PARAMS_FILE RUNTIME_FILE PARAMS_STAGE RUNTIME_STAGE PARAMS_BACKUP RUNTIME_BACKUP
-	local PARAMS_MODE RUNTIME_MODE="" RUNTIME_EXISTED=0 APPLY_STARTED=0
+	local PARAMS_MODE RUNTIME_MODE="" RUNTIME_EXISTED=0 APPLY_STARTED=0 CURRENT_STATE STAGED_STATE
 
 	if ! _awgBtImitationCheck "${PROTOCOL}" "${DOMAIN}"; then
 		echo "Usage: amneziawg-install.sh --set-boringtun-imitation <none|dns|quic|sip|stun> [hostname]" >&2
@@ -11638,6 +11713,9 @@ function setBoringtunImitation() ( # <protocol> [<domain> [warned]]
 	RUNTIME_STAGE="${TRANSACTION_DIR}/${SERVER_AWG_NIC}.boringtun"
 	RUNTIME_BACKUP="${TRANSACTION_DIR}/runtime.backup"
 
+	# The loaded state, without the imitation: the staged params must read
+	# back as exactly this plus the requested imitation.
+	CURRENT_STATE="$(awgParamsStateDigest)"
 	AWG_BORINGTUN_IMITATE_PROTOCOL="${PROTOCOL}"
 	AWG_BORINGTUN_IMITATE_DOMAIN="${DOMAIN}"
 	if ! cp -p -- "${PARAMS_FILE}" "${PARAMS_BACKUP}" ||
@@ -11650,19 +11728,31 @@ function setBoringtunImitation() ( # <protocol> [<domain> [warned]]
 		return 1
 	fi
 	# The staged runtime file must read back, through the launcher's parser, as
-	# exactly the requested imitation, and the staged params likewise.
+	# exactly the requested imitation.
 	if ! (
 		AWG_BT_CONFIG_DIR="${TRANSACTION_DIR}"
 		_awgBtReadRuntimeFile "${SERVER_AWG_NIC}" &&
 			[[ "${_AWG_BT_IMITATE_PROTOCOL}" == "${PROTOCOL}" && "${_AWG_BT_IMITATE_DOMAIN}" == "${DOMAIN}" ]]
-	) || ! (
-		unset AWG_BACKEND AWG_BORINGTUN_IMITATE_PROTOCOL AWG_BORINGTUN_IMITATE_DOMAIN
-		# shellcheck source=/dev/null
-		source "${PARAMS_STAGE}" && validatePersistedAwgBackendState &&
-			[[ "${AWG_BACKEND}" == "${AWG_BACKEND_BORINGTUN}" &&
-				"${AWG_BORINGTUN_IMITATE_PROTOCOL}" == "${PROTOCOL}" && "${AWG_BORINGTUN_IMITATE_DOMAIN}" == "${DOMAIN}" ]]
 	); then
-		echo "ERROR: the staged protocol imitation does not read back as $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}"); nothing was changed." >&2
+		echo "ERROR: the staged runtime file does not read back as $(boringtunImitationDisplay "${PROTOCOL}" "${DOMAIN}"); nothing was changed." >&2
+		cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+	# The staged params must be a complete canonical BoringTun params file
+	# that loads on its own, and must read back as the current state with only
+	# the imitation changed.
+	if ! awgParamsFileHasCanonicalKeys "${PARAMS_STAGE}" "${AWG_BACKEND_BORINGTUN}"; then
+		echo "ERROR: the staged params are not a complete params file; nothing was changed." >&2
+		cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+	if ! STAGED_STATE="$(readStagedParamsInIsolation "${PARAMS_STAGE}" "${TRANSACTION_DIR}/check")"; then
+		echo "ERROR: the staged params do not load on their own; nothing was changed." >&2
+		cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
+		return 1
+	fi
+	if [[ "${STAGED_STATE}" != "${CURRENT_STATE}|${PROTOCOL}|${DOMAIN}" ]]; then
+		echo "ERROR: the staged params differ from the current ones in more than the protocol imitation; nothing was changed." >&2
 		cleanupBoringtunImitationTransactionDir "${TRANSACTION_DIR}"
 		return 1
 	fi
