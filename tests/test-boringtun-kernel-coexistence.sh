@@ -20,11 +20,17 @@
 # while the module is unloaded, the module is then loaded behind the
 # override's back (the running daemon is unaffected), and a kernel client in a
 # network namespace, configured with an installer-generated client config,
-# sends a sweep of UDP datagram sizes to an echo service on the server's
-# tunnel address, once per imitation (none, dns, quic, stun). The loss is
-# reported for each. SIP is refused under AWG 3.0 while any S size is 31 or
-# more; a kernel module that rejects AWG 3.0 is reported, and the sweep then
-# runs under AWG 2.0.
+# is exercised once per imitation (none, dns, quic, stun):
+#   - a sweep of UDP datagram sizes to an echo service on the server's tunnel
+#     address; the loss is measured and reported as evidence, never held to a
+#     threshold;
+#   - a 4 MiB TCP transfer from the server to the kernel client, the direction
+#     whose S prefixes BoringTun shapes, which must arrive complete with the
+#     sender's SHA-256.
+# A handshake that never completes, an echo service that answers nothing, or
+# a transfer that does not arrive intact fails the test. SIP is refused under
+# AWG 3.0 while any S size is 31 or more; a kernel module that rejects AWG 3.0
+# is reported, and the interop then runs under AWG 2.0.
 #
 # Requirements: root, systemd, Ubuntu with the running kernel's headers
 # available, network access, AWG_DISPOSABLE_HOST_TEST=1.
@@ -289,6 +295,47 @@ lost = [i for i in range(seq) if i not in got]
 print(seq, len(lost), *sorted(set(sizes[i % len(sizes)] for i in lost))[:20])
 PY
 }
+# A 4 MiB transfer from the server's side of the tunnel to a listener on the
+# kernel client's tunnel address: the payload travels server -> client
+# through BoringTun's shaped datagrams. The sender hashes what it sends and the
+# receiver what it receives, independently; prints "<sent bytes> <sent
+# SHA-256> <received bytes> <received SHA-256>", with "-" for a side that
+# failed. Every step is bounded.
+kernel_tcp_transfer() {
+	local PORT_TCP=$((41000 + RANDOM % 1000)) RECEIVER SENDER_OUT RECEIVED
+	rm -f "${WORK}/kreceived"
+	ip netns exec "${KNS}" timeout 120 python3 - "${KCLIENT_ADDR}" "${PORT_TCP}" "${WORK}/kreceived" <<'PY' &
+import hashlib, socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], int(sys.argv[2]))); s.listen(1); s.settimeout(60)
+c, _ = s.accept(); c.settimeout(60)
+h = hashlib.sha256(); n = 0
+while True:
+    b = c.recv(65536)
+    if not b:
+        break
+    h.update(b); n += len(b)
+open(sys.argv[3], "w").write("%d %s\n" % (n, h.hexdigest()))
+PY
+	RECEIVER=$!
+	for _ in $(seq 1 50); do
+		ip netns exec "${KNS}" ss -Hltn "sport = :${PORT_TCP}" 2>/dev/null | grep -q . && break
+		sleep 0.1
+	done
+	SENDER_OUT="$(timeout 120 python3 - "${KCLIENT_ADDR}" "${PORT_TCP}" <<'PY'
+import hashlib, os, socket, sys
+payload = os.urandom(4 * 1024 * 1024)
+c = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=30)
+c.settimeout(60); c.sendall(payload); c.shutdown(socket.SHUT_WR)
+c.recv(1)
+c.close()
+print(len(payload), hashlib.sha256(payload).hexdigest())
+PY
+)" || SENDER_OUT="- -"
+	wait "${RECEIVER}" 2>/dev/null
+	RECEIVED="$(cat "${WORK}/kreceived" 2>/dev/null)"
+	printf '%s %s\n' "${SENDER_OUT:-- -}" "${RECEIVED:-- -}"
+}
 set_imitation_managed() { # <log> <protocol>
 	timeout --kill-after=30 "${INSTALLER_TIMEOUT}" bash "${INSTALLER}" --set-boringtun-imitation "$2" >"${WORK}/$1" 2>&1 </dev/null
 }
@@ -336,10 +383,25 @@ for PROTOCOL in none dns quic stun; do
 		bash -c '[[ "$(tr "\0" " " <"/proc/$(systemctl show -p MainPID --value "$1")/cmdline")" == *"--imitate-protocol $2 "* ]]' _ "${UNIT}" "${PROTOCOL}"
 	if kernel_reachable; then
 		ok "${INTEROP_PROTOCOL} + ${PROTOCOL}: the kernel client completes a handshake and reaches the server"
+		SENT="" LOST="" LOST_SIZES=""
 		read -r SENT LOST LOST_SIZES <<<"$(loss_sweep)"
-		note "${INTEROP_PROTOCOL} + ${PROTOCOL} imitation, kernel client: ${LOST:-?} of ${SENT:-?} echoed datagrams lost${LOST_SIZES:+ (payload sizes ${LOST_SIZES})}"
-		check "${INTEROP_PROTOCOL} + ${PROTOCOL}: loss stays below 1% (${LOST:-?}/${SENT:-?})" \
-			test -n "${SENT}" -a "$((${LOST:-${SENT}} * 100))" -lt "${SENT:-0}"
+		# Measurement, not a policy: any loss is reported, and only an echo
+		# service that answers nothing fails.
+		check "${INTEROP_PROTOCOL} + ${PROTOCOL}: the UDP sweep ran and echoes came back through the tunnel" \
+			test -n "${SENT}" -a -n "${LOST}" -a "${LOST:-0}" -lt "${SENT:-0}"
+		SENT_BYTES="" SENT_SHA="" GOT_BYTES="" GOT_SHA=""
+		read -r SENT_BYTES SENT_SHA GOT_BYTES GOT_SHA <<<"$(kernel_tcp_transfer)"
+		check "${INTEROP_PROTOCOL} + ${PROTOCOL}: a 4 MiB TCP transfer from the server to the kernel client completes" \
+			test "${SENT_BYTES}" = 4194304 -a -n "${GOT_BYTES}" -a "${GOT_BYTES}" != -
+		check "  with the same byte count at both ends (${GOT_BYTES:-?}/${SENT_BYTES:-?})" test "${GOT_BYTES}" = "${SENT_BYTES}"
+		check "  and the same SHA-256 at both ends (${GOT_SHA:0:16}…)" test -n "${SENT_SHA}" -a "${SENT_SHA}" != - -a "${GOT_SHA}" = "${SENT_SHA}"
+		note "${INTEROP_PROTOCOL} + ${PROTOCOL} imitation, kernel client:"
+		echo "    UDP echo: ${LOST:-?} / ${SENT:-?} lost${LOST_SIZES:+ (payload sizes ${LOST_SIZES})}"
+		if [[ -n "${SENT_SHA}" && "${SENT_SHA}" != - && "${GOT_SHA}" == "${SENT_SHA}" && "${GOT_BYTES}" == "${SENT_BYTES}" ]]; then
+			echo "    TCP server -> client: ${GOT_BYTES} bytes, SHA-256 match"
+		else
+			echo "    TCP server -> client: sent ${SENT_BYTES:-?} bytes, received ${GOT_BYTES:-?} bytes, SHA-256 mismatch or incomplete"
+		fi
 	else
 		bad "${INTEROP_PROTOCOL} + ${PROTOCOL}: the kernel client completes a handshake and reaches the server"
 	fi
