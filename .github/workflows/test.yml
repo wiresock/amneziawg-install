@@ -19,6 +19,14 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # The lifecycle suite installs the helpers that the PR 6 base installer
+      # renders, so it needs that installer, fetched by its fixed SHA.
+      - name: Fetch the installer before the binary lifecycle
+        run: |
+          git fetch --no-tags --depth=1 origin 78b780bc8df73b86fa1c2722e7af2bd4e11e2a6a
+          git show FETCH_HEAD:amneziawg-install.sh >"$RUNNER_TEMP/base-installer.sh"
+          echo "AWG_TEST_BASE_INSTALLER=$RUNNER_TEMP/base-installer.sh" >>"$GITHUB_ENV"
+
       - name: Run unit tests
         run: |
           bash tests/test-functions.sh
@@ -30,6 +38,7 @@ jobs:
           bash tests/test-boringtun-runtime.sh
           bash tests/test-boringtun-host.sh
           bash tests/test-boringtun-imitation.sh
+          bash tests/test-boringtun-lifecycle.sh
           bash tests/test-mutation-engine.sh
           bash tests/test-boringtun-live-firewall.sh
           bash tests/test-cargo-build-common.sh

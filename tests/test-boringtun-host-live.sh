@@ -20,6 +20,11 @@
 # answered). Under dns it also adds and removes a client and moves to AWG 3.0
 # and back, which keeps the imitation.
 #
+# Then the binary lifecycle: a TEST FIXTURE older release made current, the
+# real pinned release removed and fetched again by --upgrade-boringtun, a
+# --rollback-boringtun to the fixture, an upgrade back and a no-op upgrade,
+# each with the tunnel's datapath and an unchanged configuration.
+#
 # With AWG_LIVE_PREVIOUS_INSTALLER=<path>, the fresh install runs that earlier
 # installer version instead, and everything after it runs this one: the
 # upgrade path from an installation without imitation (params without its
@@ -607,6 +612,176 @@ imitation_step sip pbx.example
 imitation_step stun
 imitation_step none
 datapath "after the imitation cycle"
+
+# ── Binary lifecycle ────────────────────────────────────────────────────────
+# A TEST FIXTURE older release (tests/helpers/boringtun-lifecycle-fixture.sh:
+# the verified binary under a synthetic source commit) is made current, as an
+# earlier installer would have left it, and the real pinned release, removed
+# from the store, is the upgrade target: --upgrade-boringtun downloads and
+# verifies it through the public release path, validates it, switches and
+# restarts; --rollback-boringtun returns to the fixture; a second upgrade
+# toggles back without a download, and a third is a no-op.
+echo "=== Binary lifecycle"
+# shellcheck source=helpers/boringtun-lifecycle-fixture.sh
+source "${SCRIPT_DIR}/helpers/boringtun-lifecycle-fixture.sh"
+installation_hashes() {
+	sha256sum /etc/amnezia/amneziawg/params "/etc/amnezia/amneziawg/${IF}.conf" "/etc/amnezia/amneziawg/${IF}.boringtun" \
+		/etc/amnezia/amneziawg/clients/*.conf "${CLIENT_CONF}" 2>/dev/null | cut -d' ' -f1 | tr '\n' ' '
+}
+store_links() {
+	printf '%s %s' "$(readlink "${STORE}/current" 2>/dev/null || echo none)" "$(readlink "${STORE}/previous" 2>/dev/null || echo none)"
+}
+lifecycle() { # <flag> <log>
+	bash "${INSTALLER}" "$1" >"${WORK}/$2" 2>&1 </dev/null
+}
+bash "${INSTALLER}" --set-boringtun-imitation dns example.com >/dev/null 2>&1 </dev/null
+check "the lifecycle runs under dns imitation" test "$(status_line daemon_imitation_protocol)" = "daemon_imitation_protocol=dns"
+FIXTURE_ID="$(bt_fixture_release "${STORE}" "${RELEASE_ID}")"
+check "a TEST FIXTURE older release is built in the store (${FIXTURE_ID})" test -n "${FIXTURE_ID}" -a -d "${STORE}/${FIXTURE_ID}"
+check "  and verifies as a store release" bash -c 'source "$1" && _awgBtVerifyRelease "$2"' _ "${INSTALLER}" "${FIXTURE_ID}"
+bt_fixture_make_current "${STORE}" "${FIXTURE_ID}"
+rm -rf -- "${STORE:?}/${RELEASE_ID}"
+systemctl restart "${UNIT}"
+check "the service runs the fixture release" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${FIXTURE_ID}"
+datapath "on the fixture release"
+HASHES="$(installation_hashes)"
+bash "${INSTALLER}" --backend-status >"${WORK}/status" 2>&1
+check "status: installed is the fixture, the pin is offered as an upgrade, no previous" \
+	test "$(grep -E '^(installed_release|pinned_release|previous_release|rollback_available|upgrade_available|daemon_release)=' "${WORK}/status" | tr '\n' ' ')" = \
+	"installed_release=${FIXTURE_ID} pinned_release=${RELEASE_ID} previous_release=none rollback_available=no upgrade_available=yes daemon_release=${FIXTURE_ID} "
+PID="$(main_pid)"
+lifecycle --upgrade-boringtun upgrade.log
+RC=$?
+tail -n 6 "${WORK}/upgrade.log" | sed 's/^/    | /'
+check "--upgrade-boringtun succeeds" test "${RC}" -eq 0
+check "  it downloaded the pinned release from its public URL" \
+	grep -qF "Downloading https://github.com/wiresock/amneziawg-install/releases/download/${RELEASE_TAG}/${ASSET}" "${WORK}/upgrade.log"
+check "  current is the pinned release and previous the fixture" test "$(store_links)" = "${RELEASE_ID} ${FIXTURE_ID}"
+check "  the pinned binary has the embedded SHA-256" test "$(sha256sum "${STORE}/${RELEASE_ID}/boringtun-cli" | cut -d' ' -f1)" = "${BINARY_SHA256}"
+check "  the daemon was restarted onto it" test "$(main_pid)" != "${PID}" -a "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
+check_served "after the upgrade"
+check "  the imitation is kept" bash -c '[[ "$(tr "\0" " " <"/proc/$1/cmdline")" == *"--imitate-protocol dns --imitate-domain example.com "* ]]' _ "$(main_pid)"
+check "  params, the runtime file and every config are byte for byte the same" test "$(installation_hashes)" = "${HASHES}"
+check "  no scratch interface, unit or record is left" scratch_clean
+datapath "after the upgrade"
+bash "${INSTALLER}" --backend-status >"${WORK}/status" 2>&1
+check "status after the upgrade" \
+	test "$(grep -E '^(installed_release|previous_release|rollback_available|upgrade_available|daemon_release)=' "${WORK}/status" | tr '\n' ' ')" = \
+	"installed_release=${RELEASE_ID} previous_release=${FIXTURE_ID} rollback_available=yes upgrade_available=no daemon_release=${RELEASE_ID} "
+lifecycle --rollback-boringtun rollback.log
+RC=$?
+tail -n 4 "${WORK}/rollback.log" | sed 's/^/    | /'
+check "--rollback-boringtun succeeds" test "${RC}" -eq 0
+check "  current is the fixture again and previous the pinned release" test "$(store_links)" = "${FIXTURE_ID} ${RELEASE_ID}"
+check "  the daemon runs the fixture's binary" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${FIXTURE_ID}"
+check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
+datapath "after the rollback"
+lifecycle --upgrade-boringtun upgrade2.log
+check "a second --upgrade-boringtun toggles back" test "$?" -eq 0 -a "$(store_links)" = "${RELEASE_ID} ${FIXTURE_ID}"
+check "  without downloading again" bash -c '! grep -q "Downloading" "$1"' _ "${WORK}/upgrade2.log"
+check "  on the pinned binary" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
+PID="$(main_pid)"
+lifecycle --upgrade-boringtun upgrade3.log
+check "a third --upgrade-boringtun is a no-op" grep -q "already current; nothing was changed" "${WORK}/upgrade3.log"
+check "  that restarted nothing" test "$(main_pid)" = "${PID}"
+check "  and left the configuration as it was" test "$(installation_hashes)" = "${HASHES}"
+datapath "after the lifecycle"
+
+# ── Binary lifecycle with the previous installer version's helpers ──────────
+# With AWG_LIVE_BASE_INSTALLER=<PR 6 base installer>: the helpers that version
+# renders replace this one's, and a TEST FIXTURE build 2 of the pinned source
+# commit, whose -b2 name those helpers refuse, becomes previous. The rollback
+# to it must first bring the helpers up to this installer's, so that systemd's
+# restart, which runs them, accepts it; the upgrade then returns to the pin.
+if [[ -n "${AWG_LIVE_BASE_INSTALLER:-}" ]]; then
+	echo "=== Binary lifecycle with the previous installer version's helpers"
+	LIBEXEC=/usr/local/libexec/amneziawg-install
+	# Each rendering is read in full before the comparison: cmp on a pipe stops
+	# at the first difference and leaves the renderer writing into a closed pipe.
+	# The trailing x keeps trailing newlines in both sides.
+	helpers_are_this_installers() {
+		local KIND FILE RENDERED
+		for KIND in launch ctl; do
+			FILE="${LIBEXEC}/awg-boringtun-launch"
+			[[ "${KIND}" == ctl ]] && FILE="${LIBEXEC}/awg-backend-ctl"
+			RENDERED="$(bash -c 'source "$1" && _awgBtRenderHelper "$2"' _ "${INSTALLER}" "${KIND}" && echo x)" || return 1
+			[[ "$(cat -- "${FILE}" && echo x)" == "${RENDERED}" ]] || return 1
+		done
+	}
+	bash -c 'source "$1" >/dev/null && _awgBtInstallHelpers' _ "${AWG_LIVE_BASE_INSTALLER}"
+	if helpers_are_this_installers; then
+		bad "the previous installer version's helpers are installed"
+	else
+		ok "the previous installer version's helpers are installed"
+	fi
+	B2_ID="$(bt_fixture_build2 "${STORE}" "${RELEASE_ID}")"
+	check "a TEST FIXTURE build 2 of the pinned commit is built (${B2_ID})" test -n "${B2_ID}" -a -d "${STORE}/${B2_ID}"
+	bt_fixture_make_previous "${STORE}" "${B2_ID}"
+	HASHES="$(installation_hashes)"
+	lifecycle --rollback-boringtun rollback-b2.log
+	RC=$?
+	tail -n 4 "${WORK}/rollback-b2.log" | sed 's/^/    | /'
+	check "--rollback-boringtun to the -b2 release succeeds" test "${RC}" -eq 0
+	check "  the helpers are now this installer's" helpers_are_this_installers
+	check "  current is the -b2 release and previous the pin" test "$(store_links)" = "${B2_ID} ${RELEASE_ID}"
+	check "  systemd restarted the service through the reconciled helpers onto it" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${B2_ID}"
+	check "  the active instance is the one its start recorded" \
+		bash -c 'source "$1" && _awgBtCheckServedByBoringtun "$2"' _ "${INSTALLER}" "${IF}"
+	check "  ${IF} is a TUN device with its UAPI answering" test -e "/sys/class/net/${IF}/tun_flags" -a "$(awg show "${IF}" listen-port 2>/dev/null)" = "${PORT}"
+	check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
+	datapath "on the -b2 release"
+	lifecycle --upgrade-boringtun upgrade-b2.log
+	check "--upgrade-boringtun returns to the pin" test "$?" -eq 0 -a "$(store_links)" = "${RELEASE_ID} ${B2_ID}"
+	check "  the service runs the pinned binary" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
+	check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
+	datapath "back on the pinned release"
+
+	# The pin already current while the service is stopped and the previous
+	# installer version's helpers are installed, which refuse it: the upgrade
+	# must reconcile them without starting the service, and the next ordinary
+	# start must then run it. A TEST FIXTURE copy of this installer pins the
+	# -b2 build (the same commit and binary as build 1); nothing is published.
+	echo "=== The pin already current and stopped, with the previous installer version's helpers"
+	B2_INSTALLER="${WORK}/installer-pinning-test-fixture-b2.sh"
+	sed 's/^AWG_BT_RELEASE_BUILD="1"$/AWG_BT_RELEASE_BUILD="2"/' "${INSTALLER}" >"${B2_INSTALLER}"
+	check "a TEST FIXTURE copy of this installer pins the -b2 build" test "$(grep -c '^AWG_BT_RELEASE_BUILD="2"$' "${B2_INSTALLER}")" = 1
+	lifecycle --rollback-boringtun rollback-b2-again.log
+	check "  --rollback-boringtun makes the -b2 release current again" test "$?" -eq 0 -a "$(store_links)" = "${B2_ID} ${RELEASE_ID}"
+	systemctl stop "${UNIT}"
+	check "  the service is stopped" bash -c "! systemctl is-active --quiet '${UNIT}'"
+	bash -c 'source "$1" >/dev/null && _awgBtInstallHelpers' _ "${AWG_LIVE_BASE_INSTALLER}"
+	if helpers_are_this_installers; then
+		bad "  the previous installer version's helpers are installed again"
+	else
+		ok "  the previous installer version's helpers are installed again"
+	fi
+	check "  (which refuse current -b2: the next start would fail)" \
+		bash -c '! bash -c '\''source <(head -n -2 "$1") >/dev/null 2>&1 && _awgBtVerifyStore'\'' _ "$1" 2>/dev/null' _ "${LIBEXEC}/awg-boringtun-launch"
+	STARTS_BEFORE="$(systemctl show -p InvocationID -p ActiveEnterTimestampMonotonic --value "${UNIT}" | tr '\n' ' ')"
+	HASHES="$(installation_hashes)"
+	bash "${B2_INSTALLER}" --upgrade-boringtun >"${WORK}/upgrade-pinned-b2.log" 2>&1 </dev/null
+	RC=$?
+	sed 's/^/    | /' "${WORK}/upgrade-pinned-b2.log"
+	check "--upgrade-boringtun with the -b2 pin already current succeeds" test "${RC}" -eq 0
+	check "  it downloads nothing" bash -c '! grep -q "Downloading" "$1"' _ "${WORK}/upgrade-pinned-b2.log"
+	check "  current and previous are unchanged" test "$(store_links)" = "${B2_ID} ${RELEASE_ID}"
+	check "  the service was neither started nor restarted" \
+		test "$(systemctl show -p InvocationID -p ActiveEnterTimestampMonotonic --value "${UNIT}" | tr '\n' ' ')" = "${STARTS_BEFORE}"
+	check "  and is still stopped" bash -c "! systemctl is-active --quiet '${UNIT}'"
+	check "  both helpers are reconciled" helpers_are_this_installers
+	check "  it says so, and that the service was left stopped" \
+		bash -c 'grep -q "helpers in .* were updated" "$1" && grep -q "was left inactive" "$1" && ! grep -q "nothing was changed" "$1"' _ "${WORK}/upgrade-pinned-b2.log"
+	check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
+	check "a plain systemctl start then succeeds" systemctl start "${UNIT}"
+	check "  the service runs the -b2 binary current selects" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${B2_ID}"
+	check "  the active instance is the one its start recorded" \
+		bash -c 'source "$1" && _awgBtCheckServedByBoringtun "$2"' _ "${INSTALLER}" "${IF}"
+	check "  ${IF} is a TUN device with its UAPI answering" test -e "/sys/class/net/${IF}/tun_flags" -a "$(awg show "${IF}" listen-port 2>/dev/null)" = "${PORT}"
+	datapath "started on the already current -b2 release"
+	lifecycle --upgrade-boringtun upgrade-b2-again.log
+	check "--upgrade-boringtun returns to the pin again" test "$?" -eq 0 -a "$(store_links)" = "${RELEASE_ID} ${B2_ID}"
+	check "  the service runs the pinned binary" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
+fi
 
 # ── Uninstall ───────────────────────────────────────────────────────────────
 stop_client

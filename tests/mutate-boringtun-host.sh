@@ -51,9 +51,9 @@ mutant member_types_ignored test-boringtun-host "${INSTALLER}" \
 mutant manifest_commit_ignored test-boringtun-host "${INSTALLER}" \
 	'"${FIELDS[source_commit]}" != "${AWG_BT_RELEASE_SOURCE_COMMIT}" ||' ''
 mutant version_ignored test-boringtun-host "${INSTALLER}" \
-	'if [[ "${VERSION}" != "boringtun ${AWG_BT_RELEASE_VERSION}" ]]; then' 'if false; then'
+	'if [[ "${VERSION}" != "boringtun ${EXPECTED_VERSION}" ]]; then' 'if false; then'
 mutant_expect version_run_outside_store test-boringtun-host "${INSTALLER}" "ran only from the store" \
-	'_awgBtCheckReleaseDir "${WORK}/unpacked/${_AWG_BT_REL_ID}" "${ARCH}"' '_awgBtVerifyCandidate "${WORK}/unpacked/${_AWG_BT_REL_ID}" "${ARCH}"'
+	'_awgBtCheckReleaseDir "${WORK}/unpacked/${_AWG_BT_REL_ARCHIVE_ID}" "${ARCH}"' '_awgBtVerifyCandidate "${WORK}/unpacked/${_AWG_BT_REL_ARCHIVE_ID}" "${ARCH}"'
 # B1: a release directory in the store is trusted before it runs, and fully
 # verified before current points at it.
 mutant_expect candidate_runs_before_trust test-boringtun-host "${INSTALLER}" "its binary never runs" \
