@@ -5,18 +5,21 @@ This repository builds static `boringtun-cli` binaries from a pinned commit of
 for a future userspace AmneziaWG backend (see
 [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
 
-**Status: built and attested; not published yet.** Four separate stages handle
-the artifacts, and only the first two run on their own:
+**Status: one release published.** `boringtun-cli-0.7.1-g71d88784ad29-b1`,
+built from the previous pin `71d88784ad29`, is public and is what the installer
+downloads. The current pin `ae2ab44e9a68` has a candidate release contract and
+no release yet. Four separate stages handle the artifacts, and only the first
+two run on their own:
 
 | Stage | What happens | Where |
 |---|---|---|
 | Artifact build | The pinned source is built, packaged, verified and interop-tested; the archives are uploaded as workflow artifacts | BoringTun Artifacts workflow: pushes that change the recipe, manual dispatch |
 | Attestation | Each archive gets a signed SLSA build provenance attestation; never for a pull request | the same workflow's `attest` job |
 | Publication | For one reviewed, attested run, every check against the release contract, then a GitHub Release | BoringTun Release workflow: manual dispatch only ([Publishing a release](#publishing-a-release)) |
-| Installer consumption | `amneziawg-install` downloads the archive for the host's architecture from the exact release URL and checks it against SHA-256 values embedded in the installer | not implemented yet (PR 4) |
+| Installer consumption | `amneziawg-install` downloads the archive for the host's architecture from the exact release URL and checks it against SHA-256 values embedded in the installer | `amneziawg-install.sh`, with the constants of the published release; a new release reaches the installer only through a separate change of those constants |
 
-No release has been published. Workflow artifacts expire after 90 days and are
-not a distribution channel; the installer will only ever use release assets.
+Workflow artifacts expire after 90 days and are not a distribution channel;
+the installer only ever uses release assets.
 
 ## Source pin
 
@@ -340,9 +343,12 @@ strict grammar as `pin.env` and refuses any disagreement with the pin:
 `<ARCH>` is `X86_64` and `AARCH64`. The release title is derived:
 `BoringTun CLI <version> (WireSock <commit12>), build <build> (experimental)`.
 A published tag is never reused or moved, so once a build is public, any other
-bytes need a new build number. The contract holds a `candidate` of build 1 of
-the frozen integration baseline. Nothing built from the earlier pin
-`e4e4dc85ec03` is ever to be published: its archives lacked the
+bytes need a new build number. The build number is scoped to one source commit:
+a new pin starts again at build 1. The contract holds a `candidate` of build 1
+of the current pin, `boringtun-cli-0.7.1-gae2ab44e9a68-b1`; the published
+release of the previous pin, `boringtun-cli-0.7.1-g71d88784ad29-b1`, stays
+side by side and is never moved, edited or replaced. Nothing built from the
+earlier pin `e4e4dc85ec03` is ever to be published: its archives lacked the
 curve25519-dalek notices, and it is no longer the pin.
 
 ### The BoringTun Release workflow
@@ -411,15 +417,14 @@ setting that no workflow changes.
 8. Embed the release constants (tag, asset names, archive and binary SHA-256)
    in `amneziawg-install.sh` (PR 4).
 
-## Not yet done
+## Installer side
 
-The installer's internal BoringTun runtime layer can already run an unpacked
-archive: the archive's top-level directory becomes a release in
+The installer's BoringTun runtime layer runs an unpacked archive: the archive's
+top-level directory becomes a release in
 `/usr/local/lib/amneziawg-install/boringtun/`, and every start checks it against
 its `MANIFEST` (see §21.1 of [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
-Only CI populates that store today.
-
-No release is published, and the installer does not download anything yet.
-PR 4 embeds the constants of the first published release in
-`amneziawg-install.sh`, downloads and verifies the archive on the target, and
-makes the BoringTun backend selectable.
+`amneziawg-install.sh` embeds the tag, asset names and SHA-256 values of the
+release it installs, currently `boringtun-cli-0.7.1-g71d88784ad29-b1`. Moving
+the installer to a newer release is a separate change of those constants, with
+its own upgrade and rollback evidence; a candidate or even a published release
+of a newer pin does not change what the installer downloads.
