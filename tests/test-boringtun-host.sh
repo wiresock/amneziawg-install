@@ -1585,6 +1585,36 @@ REAL_BT_RUNTIME=1 REAL_TEARDOWN_CHECK=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPU
 assert_rc 0 "${RC}" "N1: with identity inspection restored, the rerun proves the node and finishes"
 assert_true "  the node, then its record, then the configuration are gone" \
 	test ! -e "${WG_SOCK}" -a "$(attempt_files)" -eq 0 -a ! -e "${AMNEZIAWG_DIR}"
+
+echo "--- #133: poststop keeps an UNKNOWN node's record for the uninstall"
+# The generated poststop cannot read the identity of the recorded socket of a
+# dead daemon, nor prove it absent: it keeps the node and the finished
+# attempt's record. The uninstall, with inspection restored, proves the node
+# from that same record, removes it, then the record, then the configuration.
+install_runtime
+dead_socket "${WG_SOCK}"
+ln -s "${WG_SOCK}" "${AWG_SOCK}"
+record_attempt launched up "done"
+cp -- "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT}.state" "${T}/133-state.before"
+cat >"${MOCKBIN}/stat" <<EOF
+#!/bin/bash
+if [[ "\${2:-}" == "%d:%i:%f:%.9Z" && "\${*: -1}" == '${WG_SOCK}' ]]; then
+	echo failed >>'${T}/133-stat-failed'
+	exit 1
+fi
+exec '$(command -v stat)' "\$@"
+EOF
+chmod 0755 "${MOCKBIN}/stat"
+INVOCATION_ID="${ATTEMPT}" run "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" poststop "${IF}"
+rm -f "${MOCKBIN}/stat"
+assert_true "#133: (the generated poststop's identity query of the node failed)" test -s "${T}/133-stat-failed"
+assert_contains "cleanup is incomplete" "${ERR}" "#133: poststop reports the cleanup of an UNKNOWN node incomplete"
+assert_true "  the node stays" test -S "${WG_SOCK}"
+assert_true "  and the finished attempt's record, unchanged" cmp -s "${T}/133-state.before" "${AWG_BT_RUN_DIR}/${IF}@${ATTEMPT}.state"
+REAL_BT_RUNTIME=1 REAL_TEARDOWN_CHECK=1 OS=ubuntu AWG_BACKEND=boringtun RUN_INPUT=y run uninstall_flow
+assert_rc 0 "${RC}" "#133: the uninstall, with inspection restored, proves the node from the retained record and finishes"
+assert_true "  the node, then its record, then the configuration are gone" \
+	test ! -e "${WG_SOCK}" -a ! -L "${AWG_SOCK}" -a "$(attempt_files)" -eq 0 -a ! -e "${AMNEZIAWG_DIR}"
 # The record resolves when its node is already absent.
 install_runtime
 dead_socket "${WG_SOCK}"
