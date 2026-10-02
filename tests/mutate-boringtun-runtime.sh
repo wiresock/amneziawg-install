@@ -93,10 +93,30 @@ mutant s9_remove_incomplete_state 'if ((TERMINAL && ! KEEP)); then' 'if ((! KEEP
 mutant s9_missing_up_is_terminal $'elif ! _awgBtFlagIs "${INTERFACE_NAME}" up; then\n\t\t\t_awgBtErr "awg-quick up of' \
 	$'elif ! _awgBtFlagIs "${INTERFACE_NAME}" up; then\n\t\t\tTERMINAL=1\n\t\t\t_awgBtErr "awg-quick up of'
 mutant s9_socket_unlink_failure_ignored \
-	$'cannot be removed; cleanup is incomplete"\n\t\tKEEP=1' $'cannot be removed; cleanup is incomplete"'
+	$'cannot be removed or proven gone; cleanup is incomplete"\n\t\tKEEP=1' $'cannot be removed or proven gone; cleanup is incomplete"'
 # Socket ownership (S2).
-mutant s2_remove_replaced_node $'\tCURRENT="$(_awgBtPathId "$1")" || return 0\n\t[[ "${CURRENT}" == "$2" ]] || return 0' \
-	$'\tCURRENT="$(_awgBtPathId "$1")" || return 0\n\t:'
+mutant s2_remove_replaced_node $'\t\t[[ "${CURRENT}" != "$2" ]]\n\t\treturn\n' $'\t\tfalse\n\t\treturn\n'
+# #133: a recorded node whose identity cannot be read and whose absence cannot
+# be proven is UNKNOWN, never gone. Each mutant restores one way of taking a
+# failed identity query for a node that is gone; each is caught only by its
+# own named assertion.
+mutation_add owned_path_unknown_resolved test-boringtun-runtime amneziawg-install.sh \
+	"#133: and keeps the attempt's state, its proof of ownership" \
+	$'\t\t*) return 1 ;;\n\tesac\n\trm -f -- "$1" 2>/dev/null\n' $'\t\t*) return 0 ;;\n\tesac\n\trm -f -- "$1" 2>/dev/null\n'
+mutation_add owned_path_post_removal_unknown_resolved test-boringtun-runtime amneziawg-install.sh \
+	"#133 post-removal: an unreadable identity after the removal keeps the attempt's state" \
+	$'\trm -f -- "$1" 2>/dev/null\n\t_awgBtRecordedNodeGone "$1" "$2" || return 1\n}' \
+	$'\trm -f -- "$1" 2>/dev/null\n\t[[ "$(_awgBtPathId "$1")" != "$2" ]]\n}'
+mutation_add failed_identity_query_is_gone test-boringtun-runtime amneziawg-install.sh \
+	"#133: a node whose identity cannot be read and whose absence cannot be proven is UNKNOWN" \
+	$'\t_awgBtPathAbsent "$1" && return 0\n\treturn 2\n}' $'\treturn 0\n}'
+mutation_add scratch_unknown_node_ignored test-boringtun-runtime amneziawg-install.sh \
+	"#133 scratch: and so does the record that proves it the instance's" \
+	$'"${GUARD_RECORD[WG_SOCK]}" "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}" || LEFT=1\n' \
+	$'"${GUARD_RECORD[WG_SOCK]}" "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}"\n'
+mutation_add helper_lacks_path_absent test-boringtun-runtime amneziawg-install.sh \
+	"#133: the generated awg-backend-ctl defines _awgBtPathAbsent" \
+	' _awgBtPathId _awgBtPathAbsent _awgBtRecordedNodeGone ' ' _awgBtPathId _awgBtRecordedNodeGone '
 mutant s2_remove_while_owner_lives '_awgBtProcessIs "$3" "$4" && return 0' ':'
 mutant s2_record_without_fd_proof 'ss -xlHe 2>/dev/null | awk' 'true || ss -xlHe 2>/dev/null | awk'
 mutant s2_inode_only_identity "stat -c '%d:%i:%f:%.9Z'" "stat -c '%d:%i:%f:0.000000000'"

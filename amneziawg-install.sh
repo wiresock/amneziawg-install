@@ -4864,20 +4864,45 @@ function _awgBtPathId() {
 	stat -c '%d:%i:%f:%.9Z' -- "$1" 2>/dev/null
 }
 
-# Remove the node at PATH only if it is still the node recorded as ID and the
-# process PID/START that created it is gone. A node that no longer exists, a
-# replacement, an unrecorded node and one whose daemon may still serve it are
-# all left alone, and none of that is a failure. It fails (1) only when the
-# exact recorded node of a dead owner is still there after the removal: that
-# cleanup is incomplete. A failed awg query is never evidence either way.
-function _awgBtRemoveOwnedPath() { # <path> <id> <pid> <start time>
+# Whether the node recorded as ID is provably gone from PATH. What is at PATH
+# is one of:
+#   ABSENT     proven absent (_awgBtPathAbsent): gone, returns 0;
+#   DIFFERENT  its identity was read and is not ID: a replacement, gone,
+#              returns 0;
+#   MATCH      its identity was read and is ID: still there, returns 1;
+#   UNKNOWN    its identity cannot be read and its absence cannot be proven:
+#              it may still be there, returns 2.
+# A failed identity query is never taken for a different or an absent node.
+function _awgBtRecordedNodeGone() { # <path> <recorded id>
 	local CURRENT
+	if CURRENT="$(_awgBtPathId "$1")" && [[ "${CURRENT}" =~ ^[0-9]+:[0-9]+:[0-9a-f]+:[0-9]+\.[0-9]{9}$ ]]; then
+		[[ "${CURRENT}" != "$2" ]]
+		return
+	fi
+	_awgBtPathAbsent "$1" && return 0
+	return 2
+}
+
+# Remove the node at PATH only if it is still the node recorded as ID and the
+# process PID/START that created it is gone. An unrecorded node and one whose
+# daemon may still serve it are left alone, and that is no failure; neither is
+# a recorded node that is provably gone (_awgBtRecordedNodeGone). It fails (1)
+# while the exact recorded node of a dead owner may still be there: it is
+# still there after the removal, or its identity cannot be read and its
+# absence cannot be proven, before or after the removal. That cleanup is
+# incomplete, and the record that proves the node BoringTun's must be kept. A
+# failed awg query is never evidence either way.
+function _awgBtRemoveOwnedPath() { # <path> <id> <pid> <start time>
 	[[ -n "$2" && -n "$3" && -n "$4" ]] || return 0
 	_awgBtProcessIs "$3" "$4" && return 0
-	CURRENT="$(_awgBtPathId "$1")" || return 0
-	[[ "${CURRENT}" == "$2" ]] || return 0
+	_awgBtRecordedNodeGone "$1" "$2"
+	case $? in
+		0) return 0 ;;
+		1) ;;
+		*) return 1 ;;
+	esac
 	rm -f -- "$1" 2>/dev/null
-	[[ "$(_awgBtPathId "$1")" != "$2" ]]
+	_awgBtRecordedNodeGone "$1" "$2" || return 1
 }
 
 # The node at PATH is a UNIX socket that the live process PID/START holds open:
@@ -5912,7 +5937,9 @@ function _awgBtCtlStop() { # <interface>
 #  - a different link that took the name is left alone, and PostDown, which
 #    may address the interface by name, is not replayed while it exists;
 #  - socket nodes are removed only if they are the recorded, proven nodes of a
-#    daemon that is gone; if such a node cannot be removed, the state is kept.
+#    daemon that is gone; if such a node cannot be removed or proven gone
+#    (its identity cannot be read and its absence cannot be proven), the
+#    state is kept.
 function _awgBtCtlPoststop() { # <interface>
 	local INTERFACE_NAME="$1" INDEX="" PID START KEEP=0 TERMINAL=0 REPLAY=0 RC
 	if ! _awgBtCurrentAttempt || ! _awgBtPrepareRunDir || ! _awgBtStateLoad "${INTERFACE_NAME}"; then
@@ -5992,7 +6019,7 @@ function _awgBtCtlPoststop() { # <interface>
 	fi
 	if ! _awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[WG_SOCK]}" "${PID}" "${START}" ||
 		! _awgBtRemoveOwnedPath "${AWG_BT_AWG_SOCKET_DIR}/${INTERFACE_NAME}.sock" "${_AWG_BT_STATE[AWG_SOCK]}" "${PID}" "${START}"; then
-		_awgBtErr "a UAPI socket node of the dead BoringTun daemon of ${INTERFACE_NAME} cannot be removed; cleanup is incomplete"
+		_awgBtErr "a UAPI socket node of the dead BoringTun daemon of ${INTERFACE_NAME} cannot be removed or proven gone; cleanup is incomplete"
 		KEEP=1
 	fi
 	rm -f -- "$(_awgBtPidFile "${INTERFACE_NAME}")"
@@ -6042,7 +6069,7 @@ function awgBackendCtlMain() {
 }
 
 # Functions the generated helpers carry. Keep in step with their callers.
-_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtReleaseIdValid _awgBtValidInterfaceName _awgBtImitationProtocolValid _awgBtImitationUsesDomain _awgBtImitationDomainValid _awgBtImitationCheck _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtVerifyRelease _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtRemoveOwnedPath _awgBtSocketHeldBy _awgBtSymlinkToNode _awgBtProveUapiNodes _awgBtNewToken _awgBtCurrentAttempt _awgBtAttemptBase _awgBtStateFile _awgBtFlagsArm _awgBtFlagRaise _awgBtFlagIs _awgBtAttemptRemove _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
+_AWG_BT_HELPER_FUNCTIONS="_awgBtErr _awgBtReleaseIdValid _awgBtValidInterfaceName _awgBtImitationProtocolValid _awgBtImitationUsesDomain _awgBtImitationDomainValid _awgBtImitationCheck _awgBtStatOwnerMode _awgBtTrustedNode _awgBtTrustedAncestors _awgBtHostArch _awgBtVerifyStore _awgBtVerifyRelease _awgBtRuntimeFilePath _awgBtReadRuntimeFile _awgBtPidFile _awgBtPrepareRunDir _awgBtWriteState _awgBtListenPort _awgBtUapiReady _awgBtLinkExists _awgBtLinkIsTun _awgBtLinkIndex _awgBtListedByAwg _awgBtProcStat _awgBtProcessStartTime _awgBtProcessAlive _awgBtProcessIs _awgBtSignalProcess _awgBtStopProcess _awgBtPathId _awgBtPathAbsent _awgBtRecordedNodeGone _awgBtRemoveOwnedPath _awgBtSocketHeldBy _awgBtSymlinkToNode _awgBtProveUapiNodes _awgBtNewToken _awgBtCurrentAttempt _awgBtAttemptBase _awgBtStateFile _awgBtFlagsArm _awgBtFlagRaise _awgBtFlagIs _awgBtAttemptRemove _awgBtStateValueValid _awgBtStateNew _awgBtStateSave _awgBtStateLoad _awgBtDaemonArgv _awgBtCloseInheritedFds"
 _AWG_BT_LAUNCH_FUNCTIONS="awgBoringtunLaunchMain _awgBtRecordSocketNodes _awgBtLaunchRefused _awgBtLaunchFailed"
 _AWG_BT_CTL_FUNCTIONS="awgBackendCtlMain _awgBtInterfaceValues _awgBtSaveConfigEnabled _awgBtWithoutSaveConfig _awgBtTryDownCopy _awgBtDownCopy _awgBtLinkIsOwned _awgBtGuardedDown _awgBtRecordFailedDown _awgBtReplayPostDown _awgBtReportUnfinishedDown _awgBtFilteredStrip _awgBtSync _awgBtRenderModprobeOverride _awgBtModprobeActionBlocked _awgBtKernelModuleBlocked _awgBtCheckKernelModule _awgBtCheckPlatform _awgBtCheckHelpers _awgBtCheckBaseUnit _awgBtVerifyActiveInstance _awgBtCtlPrecheck _awgBtCtlPoststart _awgBtCtlStop _awgBtCtlPoststop"
 
@@ -6711,8 +6738,10 @@ function _awgBtScratchReclaim() { # <token>
 	if [[ -n "${GUARD_RECORD[DAEMON_PID]}" ]] && ! _awgBtStopProcess "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}"; then
 		LEFT=1
 	fi
-	_awgBtRemoveOwnedPath "${WG_NODE}" "${GUARD_RECORD[WG_SOCK]}" "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}"
-	_awgBtRemoveOwnedPath "${AWG_NODE}" "${GUARD_RECORD[AWG_SOCK]}" "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}"
+	# A recorded node that may still be there keeps the records, also when its
+	# identity cannot be read.
+	_awgBtRemoveOwnedPath "${WG_NODE}" "${GUARD_RECORD[WG_SOCK]}" "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}" || LEFT=1
+	_awgBtRemoveOwnedPath "${AWG_NODE}" "${GUARD_RECORD[AWG_SOCK]}" "${GUARD_RECORD[DAEMON_PID]}" "${GUARD_RECORD[DAEMON_START]}" || LEFT=1
 	if [[ -n "${GUARD_RECORD[IFINDEX]}" && "$(_awgBtLinkIndex "${NAME}")" == "${GUARD_RECORD[IFINDEX]}" ]]; then
 		LEFT=1
 	fi

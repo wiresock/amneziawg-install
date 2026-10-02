@@ -1698,7 +1698,8 @@ stops the child through its identity and removes only nodes proven to be that
 child's. Only when all of that succeeded, or when it refused before starting
 anything, does it record `PHASE=launch-failed`: `awg-quick up` then stops at
 its first step, before any PostUp hook, so nothing of the attempt is left and no
-PostDown is owed. A proven node it cannot remove keeps the earlier phase.
+PostDown is owed. A proven node it cannot remove, or cannot prove gone, keeps
+the earlier phase.
 
 **poststart.** `awg-quick up` returned successfully, so this attempt created the
 link (`awg-quick` refuses an existing one) and its PostUp hooks ran. The `up`
@@ -1772,7 +1773,7 @@ neither is a cleanup step that left an owned resource behind:
 | `up`, no down, the owned TUN link still there | leave it | kept |
 | `up`, no down, another link has the name, or the link was never recorded | leave it; PostDown, which may address the name, is not replayed | kept |
 | the recorded daemon does not stop | report | kept |
-| the exact recorded node of the dead daemon cannot be removed | report incomplete cleanup | kept; a later `poststop` removes the node and, with `done` raised, finishes without a hook |
+| the exact recorded node of the dead daemon cannot be removed, or cannot be proven gone (UNKNOWN: its identity cannot be read and its absence cannot be proven) | report incomplete cleanup; the node stays | kept as the proof of ownership; a later `poststop` or uninstall with the same record removes the node and, with `done` raised, finishes without a hook |
 
 A replay raises `replay` before its first hook; if that fails, no hook runs and
 the state is kept. Replayed hooks are parsed like `awg-quick`'s `parse_options`
@@ -1970,7 +1971,7 @@ recommends, so no kernel module is present, and runs
 | Replay fails before its hooks (the config cannot be read) | owned attempt | none | not run; never run again automatically | kept; no `done`; incomplete cleanup reported | operator |
 | Replay done, state cannot be removed | owned attempt | none | never run again | kept | none needed |
 | Foreign socket at the UAPI path | fd and diagnostics proof fails | none; the node is never recorded | not applicable (the start fails) | terminal (`started` when precheck sees the node, `launch-failed` when it appears later) | the name stays refused until the operator removes the node |
-| Launcher fails before readiness | child by PID and start time, nodes by proof | child stopped, its proven nodes removed | none (no PostUp ran) | terminal (`launch-failed`); kept if a node cannot be removed | none needed |
+| Launcher fails before readiness | child by PID and start time, nodes by proof | child stopped, its proven nodes removed | none (no PostUp ran) | terminal (`launch-failed`); kept if a node cannot be removed or proven gone | none needed |
 | A PostUp hook fails inside `awg-quick up` | owned daemon | awg-quick's own link delete; `poststop` stops the daemon if it still runs | none, as with awg-quick; named as owed | kept (no `up`) | operator |
 | `up` cannot be recorded in poststart | owned link at poststart | emergency guarded down (copy in `/tmp` if needed) | by `awg-quick down`, once | terminal (`done`) | none needed |
 | Link cannot be recorded, `/tmp` usable | link captured at poststart | emergency guarded down from `/tmp` | once | terminal (`done`) | none needed |

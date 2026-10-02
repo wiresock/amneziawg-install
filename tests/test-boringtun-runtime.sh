@@ -929,6 +929,38 @@ bind_socket() { # <path>
 	python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"
 }
 
+# identity_query_fails <path> [<passes>]: until identity_query_restored, the
+# identity query of PATH (_awgBtPathId's stat) fails in every process that
+# finds stat through MOCKBIN, the generated helpers included, after PASSES
+# queries of it that succeed. Each failed query is logged in $S/stat-failed.
+REAL_STAT="$(command -v stat)"
+identity_query_fails() {
+	printf '%s\n' "$1" >"${S}/stat-fail"
+	printf '%s\n' "${2:-0}" >"${S}/stat-fail-passes"
+	rm -f "${S}/stat-failed"
+	cat >"${MOCKBIN}/stat" <<EOF
+#!/bin/bash
+S='${S}'
+REAL='${REAL_STAT}'
+EOF
+	cat >>"${MOCKBIN}/stat" <<'EOF'
+if [[ "${2:-}" == "%d:%i:%f:%.9Z" && "${*: -1}" == "$(cat "${S}/stat-fail" 2>/dev/null)" ]]; then
+	PASSES="$(cat "${S}/stat-fail-passes" 2>/dev/null)"
+	if [[ "${PASSES}" =~ ^[1-9][0-9]*$ ]]; then
+		echo "$((PASSES - 1))" >"${S}/stat-fail-passes"
+	else
+		echo "${*: -1}" >>"${S}/stat-failed"
+		exit 1
+	fi
+fi
+exec "${REAL}" "$@"
+EOF
+	chmod 0755 "${MOCKBIN}/stat"
+}
+identity_query_restored() {
+	rm -f "${MOCKBIN}/stat" "${S}/stat-fail" "${S}/stat-fail-passes"
+}
+
 echo "=== The activation boundary ==="
 assert_eq "kernel" "${AWG_BACKEND}" "a sourced installer starts on the kernel backend"
 assert_eq "kernel" \
@@ -993,6 +1025,12 @@ assert_contains "export PATH=" "${FIRST_LAUNCH}" "helpers set their own PATH"
 assert_contains "declare -A _AWG_BT_STATE=()" "${FIRST_LAUNCH}" "helpers declare the ownership state they parse"
 assert_true "the generated launcher is valid bash" bash -n "${LAUNCH}"
 assert_true "the generated awg-backend-ctl is valid bash" bash -n "${CTL}"
+# #133: the socket cleanup of poststop and of a failed launch proves a node
+# gone or unknown with these, so both helpers must carry them.
+for FUNCTION in _awgBtPathId _awgBtPathAbsent _awgBtRecordedNodeGone _awgBtRemoveOwnedPath; do
+	assert_true "#133: the generated awg-backend-ctl defines ${FUNCTION}" grep -qx "${FUNCTION} () " "${CTL}"
+	assert_true "#133: the generated launcher defines ${FUNCTION}" grep -qx "${FUNCTION} () " "${LAUNCH}"
+done
 for FUNCTION in $(grep -oE '\b_awgBt[A-Za-z]+\b' <(declare -f ${_AWG_BT_HELPER_FUNCTIONS} ${_AWG_BT_CTL_FUNCTIONS} ${_AWG_BT_LAUNCH_FUNCTIONS}) | sort -u); do
 	if declare -F "${FUNCTION}" >/dev/null && [[ " ${_AWG_BT_HELPER_FUNCTIONS} ${_AWG_BT_CTL_FUNCTIONS} ${_AWG_BT_LAUNCH_FUNCTIONS} " != *" ${FUNCTION} "* ]]; then
 		not_ok "a helper calls ${FUNCTION}, which the helpers do not carry"
@@ -1897,6 +1935,89 @@ assert_true "S9g: a later poststop removes the socket" test ! -e "${AWG_BT_WG_SO
 assert_eq "up
 down" "$(cat "${HOOK_LOG}")" "S9g: without running PostDown again"
 assert_true "S9g: and finishes the attempt" nothing_left "${IF}"
+# #133: the identity of the dead daemon's recorded socket cannot be read and
+# its absence cannot be proven (UNKNOWN). The node may still be the recorded
+# one, so poststop keeps it and the attempt's record, the only proof that the
+# node is BoringTun's; a later poststop, with inspection restored, proves the
+# same node from the same record and finishes without running a hook again.
+WG_NODE="${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+reset_state
+: >"${HOOK_LOG}"
+service_start "${IF}"
+PID="$(state_get "${IF}" PID)"
+RECORDED_WG="$(state_get "${IF}" WG_SOCK)"
+kill -KILL "${PID}"
+wait_until 3 pid_gone "${PID}"
+"${CTL}" stop "${IF}" 2>/dev/null
+assert_eq "${RECORDED_WG}" "$(_awgBtPathId "${WG_NODE}")" "#133: (the dead daemon's recorded socket node is still there)"
+cp -- "$(state_file "${IF}")" "${T}/133-state.before"
+identity_query_fails "${WG_NODE}"
+run "${CTL}" poststop "${IF}"
+identity_query_restored
+assert_eq "${WG_NODE}" "$(sort -u "${S}/stat-failed" 2>/dev/null)" "#133: (the generated poststop's identity query of the node failed)"
+assert_true "#133: poststop leaves a recorded node whose identity cannot be read in place" test -S "${WG_NODE}"
+assert_eq "${RECORDED_WG}" "$(_awgBtPathId "${WG_NODE}")" "#133: (the very node the attempt recorded)"
+assert_true "#133: and keeps the attempt's state, its proof of ownership" test -f "$(state_file "${IF}")"
+assert_true "#133: the same record, unchanged" cmp -s "${T}/133-state.before" "$(state_file "${IF}")"
+assert_true "#133: (the attempt is terminal: its PostDown replay completed)" flag_is "${IF}" "done"
+assert_contains "cannot be removed or proven gone; cleanup is incomplete" "${ERR}" "#133: the cleanup is reported incomplete"
+assert_contains "the state of this attempt of ${IF} is kept" "${ERR}" "#133: and the state reported kept"
+assert_eq "up
+down" "$(cat "${HOOK_LOG}")" "#133: (PostDown was replayed once)"
+run "${CTL}" poststop "${IF}"
+assert_true "#133: with inspection restored, a later poststop removes the node its retained record proves" test ! -e "${WG_NODE}"
+assert_eq "up
+down" "$(cat "${HOOK_LOG}")" "#133: without running PostDown again"
+assert_true "#133: and finishes the attempt" nothing_left "${IF}"
+# #133: after the removal attempt the node's identity cannot be read and its
+# absence cannot be proven: an empty, failed identity query is no proof that
+# the recorded node is gone.
+reset_state
+: >"${HOOK_LOG}"
+service_start "${IF}"
+PID="$(state_get "${IF}" PID)"
+RECORDED_WG="$(state_get "${IF}" WG_SOCK)"
+kill -KILL "${PID}"
+wait_until 3 pid_gone "${PID}"
+"${CTL}" stop "${IF}" 2>/dev/null
+identity_query_fails "${WG_NODE}" 1
+echo "${WG_NODE}" >"${S}/rm-fail"
+run "${CTL}" poststop "${IF}"
+rm -f "${S}/rm-fail"
+assert_eq "0" "$(cat "${S}/stat-fail-passes")" "#133 post-removal: (the identity query before the removal succeeded: MATCH)"
+identity_query_restored
+assert_eq "${WG_NODE}" "$(sort -u "${S}/stat-failed" 2>/dev/null)" "#133 post-removal: (the identity query after the removal attempt failed)"
+assert_eq "${RECORDED_WG}" "$(_awgBtPathId "${WG_NODE}")" "#133 post-removal: (the recorded node is still there)"
+assert_true "#133 post-removal: an unreadable identity after the removal keeps the attempt's state" test -f "$(state_file "${IF}")"
+assert_contains "cleanup is incomplete" "${ERR}" "#133 post-removal: and the cleanup is reported incomplete"
+run "${CTL}" poststop "${IF}"
+assert_true "#133 post-removal: a later poststop removes the node" test ! -e "${WG_NODE}"
+assert_eq "up
+down" "$(cat "${HOOK_LOG}")" "#133 post-removal: (PostDown was replayed once in all)"
+assert_true "#133 post-removal: and finishes the attempt" nothing_left "${IF}"
+# #133: a replacement appears at the path right after the recorded node is
+# unlinked. Its identity is read and differs: it is left alone, and the
+# recorded node's obligation is resolved.
+reset_state
+: >"${HOOK_LOG}"
+service_start "${IF}"
+PID="$(state_get "${IF}" PID)"
+kill -KILL "${PID}"
+wait_until 3 pid_gone "${PID}"
+"${CTL}" stop "${IF}" 2>/dev/null
+echo "${WG_NODE}" >"${S}/rm-hold-after"
+"${CTL}" poststop "${IF}" 2>/dev/null &
+POSTSTOP_PID=$!
+wait_until 5 test -e "${S}/rm-waiting-after"
+assert_true "#133 race: (the recorded node was unlinked)" test ! -e "${WG_NODE}"
+bind_socket "${WG_NODE}"
+REPLACEMENT_ID="$(_awgBtPathId "${WG_NODE}")"
+touch "${S}/rm-release-after"
+wait "${POSTSTOP_PID}"
+rm -f "${S}"/rm-*
+assert_eq "${REPLACEMENT_ID}" "$(_awgBtPathId "${WG_NODE}")" "#133 race: the replacement that appeared during the removal is left alone"
+assert_true "#133 race: and the attempt finishes: the recorded node is gone" test ! -e "$(state_file "${IF}")"
+rm -f "${WG_NODE}"
 # S9h: the PostDown replay cannot read the config. The replay was recorded as
 # started, so its hooks are never run again, and no done flag and no removal
 # follow a replay that did not complete.
@@ -2167,6 +2288,72 @@ _awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "${NODE_ID}" "${LISTE
 assert_true "S2: a node changed since it was recorded (same inode and mode, new change time) is never removed" 	test -S "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
 _awgBtRemoveOwnedPath "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock" "$(_awgBtPathId "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock")" "${LISTENER}" "${LISTENER_START}"
 assert_true "S2: the recorded node of a dead owner is removed" test ! -e "${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+# #133: what is at a recorded path is ABSENT, DIFFERENT, MATCH or UNKNOWN, and
+# only ABSENT and DIFFERENT, each positively established, resolve the record.
+WG_NODE="${AWG_BT_WG_SOCKET_DIR}/${IF}.sock"
+# shellcheck disable=SC2034 # read by the stat stubs below
+FAIL_NODE="${WG_NODE}"
+# The identity query of FAIL_NODE fails; the stubs run in the subshell of the
+# query, so a count of queries is kept in a file.
+IDENTITY_FAILS='stat() { [[ "$2" == "%d:%i:%f:%.9Z" && "${*: -1}" == "${FAIL_NODE}" ]] && return 1; command stat "$@"; }'
+IDENTITY_GARBLED='stat() { [[ "$2" == "%d:%i:%f:%.9Z" && "${*: -1}" == "${FAIL_NODE}" ]] && { echo "not-an-identity"; return 0; }; command stat "$@"; }'
+IDENTITY_FAILS_AFTER_ONE='stat() { if [[ "$2" == "%d:%i:%f:%.9Z" && "${*: -1}" == "${FAIL_NODE}" ]]; then echo x >>"${T}/identity-queries"; [[ "$(wc -l <"${T}/identity-queries")" -le 1 ]] || return 1; fi; command stat "$@"; }'
+assert_eq "2" "$(bind_socket "${WG_NODE}"; ID="$(_awgBtPathId "${WG_NODE}")"; eval "${IDENTITY_FAILS}"; _awgBtRecordedNodeGone "${WG_NODE}" "${ID}"; echo $?)" \
+	"#133: a node whose identity cannot be read and whose absence cannot be proven is UNKNOWN"
+NODE_ID="$(_awgBtPathId "${WG_NODE}")"
+(eval "${IDENTITY_FAILS}"; _awgBtRemoveOwnedPath "${WG_NODE}" "${NODE_ID}" "${LISTENER}" "${LISTENER_START}")
+assert_rc 1 "$?" "#133 UNKNOWN: a recorded node of a dead owner whose identity cannot be read is unresolved"
+assert_eq "${NODE_ID}" "$(_awgBtPathId "${WG_NODE}")" "#133 UNKNOWN: and stays"
+(eval "${IDENTITY_GARBLED}"; _awgBtRemoveOwnedPath "${WG_NODE}" "${NODE_ID}" "${LISTENER}" "${LISTENER_START}")
+assert_rc 1 "$?" "#133 UNKNOWN: an identity that is no identity is unresolved too"
+assert_eq "${NODE_ID}" "$(_awgBtPathId "${WG_NODE}")" "#133 UNKNOWN: and the node stays"
+(eval "${IDENTITY_FAILS}"; _awgBtRemoveOwnedPath "${WG_NODE}" "${NODE_ID}" "$$" "$(_awgBtProcessStartTime "$$")")
+assert_rc 0 "$?" "#133: a node whose owner still runs is left alone without a verdict, as before"
+assert_eq "${NODE_ID}" "$(_awgBtPathId "${WG_NODE}")" "#133: (and stays)"
+: >"${T}/identity-queries"
+(eval "${IDENTITY_FAILS_AFTER_ONE}"; rm() { return 1; }; _awgBtRemoveOwnedPath "${WG_NODE}" "${NODE_ID}" "${LISTENER}" "${LISTENER_START}")
+assert_rc 1 "$?" "#133 post-removal UNKNOWN: a MATCH whose identity cannot be read after the removal is unresolved"
+assert_eq "2" "$(wc -l <"${T}/identity-queries")" "#133 post-removal UNKNOWN: (MATCH before the removal, unreadable after it)"
+assert_eq "${NODE_ID}" "$(_awgBtPathId "${WG_NODE}")" "#133 post-removal UNKNOWN: (the node is still there)"
+rm -f "${WG_NODE}"
+bind_socket "${WG_NODE}"
+REPLACEMENT_ID="$(_awgBtPathId "${WG_NODE}")"
+_awgBtRemoveOwnedPath "${WG_NODE}" "${NODE_ID}" "${LISTENER}" "${LISTENER_START}"
+assert_rc 0 "$?" "#133 DIFFERENT: a readable, different identity resolves the record"
+assert_eq "${REPLACEMENT_ID}" "$(_awgBtPathId "${WG_NODE}")" "#133 DIFFERENT: and the replacement stays"
+_awgBtRemoveOwnedPath "${WG_NODE}" "${REPLACEMENT_ID}" "${LISTENER}" "${LISTENER_START}"
+assert_rc 0 "$?" "#133 MATCH: the exact recorded node of a dead owner is removed and resolved"
+assert_true "#133 MATCH: (it is gone)" test ! -e "${WG_NODE}"
+(eval "${IDENTITY_FAILS}"; _awgBtRemoveOwnedPath "${WG_NODE}" "${REPLACEMENT_ID}" "${LISTENER}" "${LISTENER_START}")
+assert_rc 0 "$?" "#133 ABSENT: a listing that proves the node absent resolves the record, whatever the identity query says"
+# The replacement race: a new node takes the path right after the unlink.
+bind_socket "${WG_NODE}"
+NODE_ID="$(_awgBtPathId "${WG_NODE}")"
+(rm() { command rm "$@" && bind_socket "${WG_NODE}"; }; _awgBtRemoveOwnedPath "${WG_NODE}" "${NODE_ID}" "${LISTENER}" "${LISTENER_START}")
+assert_rc 0 "$?" "#133 race: a node that replaced the removed one resolves the record"
+assert_true "#133 race: and stays, a different node" test -S "${WG_NODE}" -a "$(_awgBtPathId "${WG_NODE}")" != "${NODE_ID}"
+rm -f "${WG_NODE}"
+# #133: the launcher's cleanup of a failed launch counts a recorded node whose
+# identity cannot be read as not removed: the attempt keeps its phase, not
+# launch-failed, and its record of the node.
+reset_state
+bind_socket "${WG_NODE}"
+(
+	_awgBtCurrentAttempt && _awgBtPrepareRunDir && _awgBtStateNew "${AWG_BT_CONFIG_DIR}/${IF}.conf" || exit 1
+	_AWG_BT_STATE[PHASE]=launching
+	_AWG_BT_STATE[PID]="${LISTENER}"
+	_AWG_BT_STATE[PID_START]="${LISTENER_START}"
+	_AWG_BT_STATE[WG_SOCK]="$(_awgBtPathId "${WG_NODE}")"
+	_awgBtStateSave "${IF}" || exit 1
+	eval "${IDENTITY_FAILS}"
+	_awgBtLaunchFailed "${IF}" "${LISTENER}"
+) 2>"${T}/err"
+assert_contains "not completely removed; its state is kept" "$(cat "${T}/err")" "#133 launch: a failed launch with an unreadable recorded node reports its cleanup incomplete"
+assert_eq "launching" "$(state_get "${IF}" PHASE)" "#133 launch: and is never recorded as launch-failed"
+assert_eq "$(_awgBtPathId "${WG_NODE}")" "$(state_get "${IF}" WG_SOCK)" "#133 launch: its record still names the node, which stays"
+run "${CTL}" poststop "${IF}"
+assert_true "#133 launch: a later poststop removes the node from that record" test ! -e "${WG_NODE}"
+assert_true "#133 launch: and keeps the nonterminal attempt, as for any incomplete launch cleanup" test -f "$(state_file "${IF}")"
 # Through poststop: a crash, then a foreign replacement of the socket.
 write_server_config "${IF}"
 reset_state
@@ -2631,6 +2818,31 @@ for MODE in direct unit; do
 	assert_true "S3 (${MODE}): a later run's sweep reclaims the instance" scratch_gone awgv6 "${TOKEN}"
 	assert_true "S3 (${MODE}): its daemon is gone" pid_gone "${DAEMON}"
 done
+# #133: the sweep cannot read the identity of a recorded scratch socket of a
+# dead daemon, nor prove it absent: the node and the records stay for a later
+# sweep, which, with inspection restored, reclaims the instance.
+reset_state
+rm -f "${T}/token"
+"${OWNER_CMD[@]}" direct create awgq3 "${T}/token" hold &
+OWNER_PID=$!
+wait_until 10 test -s "${T}/token"
+TOKEN="$(cat "${T}/token")"
+DAEMON="$(record_get "${TOKEN}" guard DAEMON_PID)"
+SCRATCH_WG_ID="$(record_get "${TOKEN}" guard WG_SOCK)"
+kill -KILL "$(record_get "${TOKEN}" guard GUARD_PID)"
+wait_until 3 pid_gone "${DAEMON}"
+kill -KILL "${OWNER_PID}"
+wait "${OWNER_PID}" 2>/dev/null
+assert_true "#133 scratch: (the guardian recorded the daemon's socket)" test -n "${SCRATCH_WG_ID}"
+assert_eq "${SCRATCH_WG_ID}" "$(_awgBtPathId "${AWG_BT_WG_SOCKET_DIR}/awgq3.sock")" "#133 scratch: (the dead daemon's recorded socket is still there)"
+identity_query_fails "${AWG_BT_WG_SOCKET_DIR}/awgq3.sock"
+owner direct sweep 2>/dev/null
+identity_query_restored
+assert_true "#133 scratch: (the sweep's identity query of the node failed)" test -s "${S}/stat-failed"
+assert_true "#133 scratch: a recorded node whose identity cannot be read stays" test -S "${AWG_BT_WG_SOCKET_DIR}/awgq3.sock"
+assert_eq "${SCRATCH_WG_ID}" "$(record_get "${TOKEN}" guard WG_SOCK)" "#133 scratch: and so does the record that proves it the instance's"
+owner direct sweep
+assert_true "#133 scratch: a later sweep, with inspection restored, reclaims the instance" scratch_gone awgq3 "${TOKEN}"
 
 # destroy interrupted: the stop request is made, then the owner dies.
 reset_state
