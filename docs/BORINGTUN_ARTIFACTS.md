@@ -36,18 +36,28 @@ The file is data: `scripts/boringtun-artifact.sh` parses it with a strict
 through that script, and a unit test fails if the commit appears in any other
 script, workflow or configuration file.
 
-The current pin is `71d88784ad29dc95871c105e26cc62f6acdd565b` (boringtun-cli
-0.7.1, tree `6f0f0a32a197fe71fb66c074cb1e56caf7024dd8`), the frozen baseline
-for the first `amneziawg-install` integration. Upstream also tags it
-`awg3.1-integration-2026-09-28` (tag object
-`eb30d9694381f3da97f569cbde7b09aad256cd4b`); the tag is informational only, and
-builds and installer trust anchors use the commit. It descends from
-`e4e4dc85ec039d40bbc92b3667b7fc92966b1b0a`, the commit the backend design was
-validated against, by upstream pull requests #58 to #66: noise and device fixes,
-including transactional listen-port rebinding (#65) and releasing a device's
-write intent when a mutation unwinds (#66), and JNI bindings. Its shipped
-dependency graph is unchanged: the one lockfile change is a test-only
-dependency.
+The current pin is `ae2ab44e9a68ca1a3232d2e8b13f9db30a9b9dcf` (boringtun-cli
+0.7.1, tree `3bea8cdeefd5f55a1129db7d31481b9b3a8edde8`), the source checkpoint
+that upstream tags `awg3.1-integration-2026-10-02` (tag object
+`39c91795414246e241a3346a0adcc6273364a377`); the tag is informational only, and
+builds and installer trust anchors use the commit. The previous pin,
+`71d88784ad29dc95871c105e26cc62f6acdd565b` (tree
+`6f0f0a32a197fe71fb66c074cb1e56caf7024dd8`, upstream tag
+`awg3.1-integration-2026-09-28`), is the source of the published release
+`boringtun-cli-0.7.1-g71d88784ad29-b1` that the installer uses today.
+
+Upstream rewrote its history after that release. In the current history the
+old pin's tree is commit `8ba4d792dd071783d4864ef022258ff9d7c52bbd`, with
+exactly the same tree `6f0f0a32a197fe71fb66c074cb1e56caf7024dd8`, and the new
+pin descends from it by 15 commits with none behind: upstream pull requests
+#67 to #75 (fwmark and listener-rebind fixes, UAPI errno reporting, TUN read
+and Darwin MTU descriptor fixes, retry-safe no-session write admission and
+bounded UDP socket diagnostics; #67 and #71 change only the integration-test
+harness) and the dependency updates #34, #45, #48, #49, #62 and #63. A GitHub
+compare of `71d88784ad29` with `ae2ab44e9a68` therefore reports `diverged`;
+that is the rewrite, not dropped source. The shipped dependency graph changes
+only by three lockfile bumps: clap 4.6.6 to 4.6.7, portable-atomic 1.14.0 to
+1.15.0 and thiserror 2.0.20 to 2.0.21; no `Cargo.toml` changes.
 
 A pin bump is a reviewed change to `pin.env`, together with any policy change in
 `packaging/boringtun/`. The artifact workflow runs automatically for it.
