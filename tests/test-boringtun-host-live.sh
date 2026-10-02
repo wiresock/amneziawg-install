@@ -735,6 +735,52 @@ if [[ -n "${AWG_LIVE_BASE_INSTALLER:-}" ]]; then
 	check "  the service runs the pinned binary" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
 	check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
 	datapath "back on the pinned release"
+
+	# The pin already current while the service is stopped and the previous
+	# installer version's helpers are installed, which refuse it: the upgrade
+	# must reconcile them without starting the service, and the next ordinary
+	# start must then run it. A TEST FIXTURE copy of this installer pins the
+	# -b2 build (the same commit and binary as build 1); nothing is published.
+	echo "=== The pin already current and stopped, with the previous installer version's helpers"
+	B2_INSTALLER="${WORK}/installer-pinning-test-fixture-b2.sh"
+	sed 's/^AWG_BT_RELEASE_BUILD="1"$/AWG_BT_RELEASE_BUILD="2"/' "${INSTALLER}" >"${B2_INSTALLER}"
+	check "a TEST FIXTURE copy of this installer pins the -b2 build" test "$(grep -c '^AWG_BT_RELEASE_BUILD="2"$' "${B2_INSTALLER}")" = 1
+	lifecycle --rollback-boringtun rollback-b2-again.log
+	check "  --rollback-boringtun makes the -b2 release current again" test "$?" -eq 0 -a "$(store_links)" = "${B2_ID} ${RELEASE_ID}"
+	systemctl stop "${UNIT}"
+	check "  the service is stopped" bash -c "! systemctl is-active --quiet '${UNIT}'"
+	bash -c 'source "$1" >/dev/null && _awgBtInstallHelpers' _ "${AWG_LIVE_BASE_INSTALLER}"
+	if helpers_are_this_installers; then
+		bad "  the previous installer version's helpers are installed again"
+	else
+		ok "  the previous installer version's helpers are installed again"
+	fi
+	check "  (which refuse current -b2: the next start would fail)" \
+		bash -c '! bash -c '\''source <(head -n -2 "$1") >/dev/null 2>&1 && _awgBtVerifyStore'\'' _ "$1" 2>/dev/null' _ "${LIBEXEC}/awg-boringtun-launch"
+	STARTS_BEFORE="$(systemctl show -p InvocationID -p ActiveEnterTimestampMonotonic --value "${UNIT}" | tr '\n' ' ')"
+	HASHES="$(installation_hashes)"
+	bash "${B2_INSTALLER}" --upgrade-boringtun >"${WORK}/upgrade-pinned-b2.log" 2>&1 </dev/null
+	RC=$?
+	sed 's/^/    | /' "${WORK}/upgrade-pinned-b2.log"
+	check "--upgrade-boringtun with the -b2 pin already current succeeds" test "${RC}" -eq 0
+	check "  it downloads nothing" bash -c '! grep -q "Downloading" "$1"' _ "${WORK}/upgrade-pinned-b2.log"
+	check "  current and previous are unchanged" test "$(store_links)" = "${B2_ID} ${RELEASE_ID}"
+	check "  the service was neither started nor restarted" \
+		test "$(systemctl show -p InvocationID -p ActiveEnterTimestampMonotonic --value "${UNIT}" | tr '\n' ' ')" = "${STARTS_BEFORE}"
+	check "  and is still stopped" bash -c "! systemctl is-active --quiet '${UNIT}'"
+	check "  both helpers are reconciled" helpers_are_this_installers
+	check "  it says so, and that the service was left stopped" \
+		bash -c 'grep -q "helpers in .* were updated" "$1" && grep -q "was left inactive" "$1" && ! grep -q "nothing was changed" "$1"' _ "${WORK}/upgrade-pinned-b2.log"
+	check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
+	check "a plain systemctl start then succeeds" systemctl start "${UNIT}"
+	check "  the service runs the -b2 binary current selects" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${B2_ID}"
+	check "  the active instance is the one its start recorded" \
+		bash -c 'source "$1" && _awgBtCheckServedByBoringtun "$2"' _ "${INSTALLER}" "${IF}"
+	check "  ${IF} is a TUN device with its UAPI answering" test -e "/sys/class/net/${IF}/tun_flags" -a "$(awg show "${IF}" listen-port 2>/dev/null)" = "${PORT}"
+	datapath "started on the already current -b2 release"
+	lifecycle --upgrade-boringtun upgrade-b2-again.log
+	check "--upgrade-boringtun returns to the pin again" test "$?" -eq 0 -a "$(store_links)" = "${RELEASE_ID} ${B2_ID}"
+	check "  the service runs the pinned binary" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
 fi
 
 # ── Uninstall ───────────────────────────────────────────────────────────────

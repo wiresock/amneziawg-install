@@ -101,6 +101,28 @@ mutant helpers_not_reconciled "the installed launcher accepts the new current, s
 mutant helper_failure_ignored "helper update fails: no restart" \
 	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
 	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || :\n'
+# ... also when current already is the pin (residual S1).
+PINNED_RECONCILE=$'\t\t\t# before anything else changes; a stopped service stays stopped.\n\t\t\t_awgBtReconcileLifecycleHelpers || return 1\n'
+PINNED_SERVED=$'\t\t\tif ((ACTIVE)) && ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}" >/dev/null 2>&1; then'
+mutant pinned_noop_skips_helper_reconcile "pinned b2 + inactive + legacy helpers: the helpers are reconciled" \
+	"${PINNED_RECONCILE}" $'\t\t\t# before anything else changes; a stopped service stays stopped.\n'
+mutant pinned_inactive_skips_helper_reconcile "pinned b2 + inactive + legacy helpers: the helpers are reconciled" \
+	"${PINNED_RECONCILE}" $'\t\t\t# before anything else changes; a stopped service stays stopped.\n\t\t\t[[ "${STATE}" == inactive ]] || _awgBtReconcileLifecycleHelpers || return 1\n'
+mutant pinned_failed_skips_helper_reconcile "pinned b2 + failed + legacy helpers: the helpers are reconciled" \
+	"${PINNED_RECONCILE}" $'\t\t\t# before anything else changes; a stopped service stays stopped.\n\t\t\t[[ "${STATE}" == failed ]] || _awgBtReconcileLifecycleHelpers || return 1\n'
+mutant pinned_helper_failure_ignored "pinned b2 + inactive + helpers that cannot be updated: the upgrade fails" \
+	"${PINNED_RECONCILE}" $'\t\t\t# before anything else changes; a stopped service stays stopped.\n\t\t\t_awgBtReconcileLifecycleHelpers || :\n'
+mutant pinned_helper_update_unreported "pinned b2 + inactive + legacy helpers: it does not claim that nothing changed" \
+	$'\t\t\tif ((REPAIRED || _AWG_BT_HELPERS_CHANGED)); then' $'\t\t\tif ((REPAIRED)); then'
+mutant pinned_helpers_always_changed "pinned b2 + current helpers: and reports a true no-op" \
+	$'\t_AWG_BT_HELPERS_CHANGED=0\n\t_awgBtEnsureDirectory' $'\t_AWG_BT_HELPERS_CHANGED=1\n\t_awgBtEnsureDirectory'
+mutant pinned_stopped_service_started "pinned b2 + inactive + legacy helpers: the service is neither started nor restarted" \
+	"${PINNED_SERVED}" $'\t\t\tif ! ((ACTIVE)) || ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}" >/dev/null 2>&1; then'
+mutant pinned_restart_for_helper_update "pinned b2 + active healthy daemon + legacy helpers: no restart merely for the helper update" \
+	"${PINNED_SERVED}" $'\t\t\tif ((ACTIVE)) && { ((_AWG_BT_HELPERS_CHANGED)) || ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}" >/dev/null 2>&1; }; then'
+mutant pinned_mismatch_reconciles_twice "pinned b2 + active daemon on another binary + legacy helpers: the helpers are reconciled once, then one restart runs through them onto b2" \
+	$'restarting it on ${TARGET}."\n\t\t\t\tawgBackendPrepareServiceStart' \
+	$'restarting it on ${TARGET}."\n\t\t\t\t_awgBtReconcileLifecycleHelpers || return 1\n\t\t\t\tawgBackendPrepareServiceStart'
 
 # previous naming current after an interrupted switch (review S2).
 mutant duplicate_previous_kept "the duplicate previous link is removed, current is unchanged and the old release is kept" \

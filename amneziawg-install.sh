@@ -4382,6 +4382,7 @@ _AWG_BT_VERIFIED_VERSION=""
 # reset here, so the environment can never select it.
 _AWG_BT_CANDIDATE_RELEASE=""
 _AWG_BT_FILE_CHANGED=0
+_AWG_BT_HELPERS_CHANGED=0
 _AWG_BT_ARGV=()
 # The command line of a transient scratch unit (_awgBtScratchUnitArgv).
 _AWG_BT_UNIT_ARGV=()
@@ -6167,13 +6168,17 @@ function _awgBtWriteManagedFile() {
 	_AWG_BT_FILE_CHANGED=1
 }
 
+# _AWG_BT_HELPERS_CHANGED says whether either helper was rewritten.
 function _awgBtInstallHelpers() {
 	local CONTENT
+	_AWG_BT_HELPERS_CHANGED=0
 	_awgBtEnsureDirectory "${AWG_BT_LIBEXEC_DIR}" 0755 || return 1
 	CONTENT="$(_awgBtRenderHelper launch)" || return 1
 	_awgBtWriteManagedFile "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" 0755 <<<"${CONTENT}" || return 1
+	((_AWG_BT_FILE_CHANGED == 0)) || _AWG_BT_HELPERS_CHANGED=1
 	CONTENT="$(_awgBtRenderHelper ctl)" || return 1
 	_awgBtWriteManagedFile "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" 0755 <<<"${CONTENT}" || return 1
+	((_AWG_BT_FILE_CHANGED == 0)) || _AWG_BT_HELPERS_CHANGED=1
 }
 
 # Write the runtime file and the drop-in for INTERFACE, then reload systemd.
@@ -12115,12 +12120,14 @@ function _awgBtLifecycleConfigHashes() {
 # release name this installer may select: builds from 2 on are named
 # -b<build>, which the helpers of earlier installer versions refuse. So an
 # explicit lifecycle operation regenerates them from this installer
-# (_awgBtInstallHelpers) before current can change or the service restarts.
-# They are derived files and are not put back when an activation fails: they
-# accept the earlier release names as well.
+# (_awgBtInstallHelpers) before current can change or the service restarts,
+# and also when current already is the pinned release, whatever the service's
+# state, so that its next start can run what current selects. They are
+# derived files and are not put back when an activation fails: they accept
+# the earlier release names as well.
 function _awgBtReconcileLifecycleHelpers() {
 	if ! _awgBtInstallHelpers; then
-		echo "ERROR: could not update the BoringTun helpers in ${AWG_BT_LIBEXEC_DIR}; nothing was changed." >&2
+		echo "ERROR: could not update the BoringTun helpers in ${AWG_BT_LIBEXEC_DIR}; current, previous and the service were not changed." >&2
 		return 1
 	fi
 }
@@ -12185,10 +12192,12 @@ function _awgBtVerifyLifecycleActivation() {
 #     the unit's ActiveState decides: active is switched and restarted,
 #     inactive and failed are switched and left stopped, anything else (or a
 #     state that cannot be read) aborts before any change;
-#  3. the target: for an upgrade the release this installer pins (a no-op when
-#     current already is it, except that an active service still running
-#     another binary is restarted onto it), downloaded and stored beside
-#     current if absent; for a rollback the release previous names;
+#  3. the target: for an upgrade the release this installer pins (when
+#     current already is it, only the helpers are reconciled and a previous
+#     that names current is dropped, the service keeps its state, and an
+#     active service still running another binary is restarted onto it),
+#     downloaded and stored beside current if absent; for a rollback the
+#     release previous names;
 #  4. the target is verified as a store release, then validated against this
 #     installation on scratch instances (_awgBtValidateReleaseCandidate), and
 #     params, the server config, the runtime file and every active client
@@ -12256,6 +12265,13 @@ function boringtunBinaryLifecycle() ( # <upgrade|rollback>
 				echo "ERROR: ${AWG_BT_STORE_DIR}/${TARGET} is not the release this installer pins (its binary has another SHA-256); nothing was changed." >&2
 				return 1
 			fi
+			# The helpers of an earlier installer version may refuse the
+			# release current selects, so they are reconciled here too,
+			# before anything else changes; a stopped service stays stopped.
+			_awgBtReconcileLifecycleHelpers || return 1
+			if ((_AWG_BT_HELPERS_CHANGED)); then
+				echo "The BoringTun helpers in ${AWG_BT_LIBEXEC_DIR} were updated to this installer's, which accept ${TARGET}."
+			fi
 			if ((PREVIOUS_EXISTED)) && [[ "${PREVIOUS_ID}" == "${CURRENT_ID}" ]]; then
 				# A switch interrupted between its two link renames left
 				# previous naming current. Which release previous named
@@ -12274,7 +12290,6 @@ function boringtunBinaryLifecycle() ( # <upgrade|rollback>
 				# current was switched, but the service was not restarted
 				# onto it (an interrupted transaction): finish that now.
 				echo "current already selects ${TARGET}, but ${UNIT} is not served by it; restarting it on ${TARGET}."
-				_awgBtReconcileLifecycleHelpers || return 1
 				awgBackendPrepareServiceStart
 				if ! systemctl restart "${UNIT}" || ! _awgBtVerifyLifecycleActivation; then
 					echo "ERROR: ${UNIT} is still not verifiably served by ${TARGET}. Check: journalctl -u ${UNIT}" >&2
@@ -12283,8 +12298,11 @@ function boringtunBinaryLifecycle() ( # <upgrade|rollback>
 				echo "${UNIT} now runs the BoringTun release ${TARGET}."
 				return 0
 			fi
-			if ((REPAIRED)); then
+			if ((REPAIRED || _AWG_BT_HELPERS_CHANGED)); then
 				echo "The BoringTun release ${TARGET} that this installer pins is already current."
+				if ((_AWG_BT_HELPERS_CHANGED && !ACTIVE)); then
+					echo "${UNIT} was left ${STATE}; its next start uses the updated helpers."
+				fi
 			else
 				echo "The BoringTun release ${TARGET} that this installer pins is already current; nothing was changed."
 			fi

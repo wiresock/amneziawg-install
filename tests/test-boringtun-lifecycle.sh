@@ -1302,6 +1302,165 @@ run upgrade
 assert_rc 0 "${RC}" "previous naming an older current: the upgrade still proceeds"
 assert_eq "${STORE_ID_[new]} ${STORE_ID_[old]}" "$(link_of current) $(link_of previous)" "  to current new and previous old"
 
+echo "=== The pin already current, with the previous installer version's helpers ==="
+# A host whose current already is the pinned -b2 release while the helpers
+# the PR 6 base rendered are still installed: those refuse current, so the
+# next start would fail. The explicit upgrade, which changes no release here,
+# must still leave helpers that accept what current selects, and must not
+# start a stopped service to do so.
+pinned_legacy_host() { # <unit state> <previous fixture|none> [served rc]
+	make_install dns example.com 3
+	rm -rf -- "${STORE:?}"/*
+	store_release b2
+	[[ "$2" == none ]] || store_release "$2"
+	links b2 "$2"
+	pin_to b2
+	install_base_helpers
+	echo "$1" >"${S}/active-state"
+	echo "${3:-0}" >"${S}/served-rc"
+	touch "${S}/restart-uses-helper"
+	: >"${S}/log"
+	: >"${S}/curl-log"
+}
+# The upgrade, logging each regeneration of the helpers.
+counted_upgrade() {
+	eval "$(declare -f _awgBtInstallHelpers | sed '1s/_awgBtInstallHelpers/realInstallHelpers/')"
+	_awgBtInstallHelpers() {
+		echo "install-helpers" >>"${S}/log"
+		realInstallHelpers
+	}
+	upgrade
+}
+# Every systemctl call that would start, stop or restart the unit.
+service_changes() { grep -cE '^systemctl (start|restart|stop|reload|reload-or-restart|try-restart|kill)( |$)' "${S}/log"; }
+pinned_stopped_case() { # <inactive|failed> <previous fixture|none>
+	local LABEL="pinned b2 + $1 + legacy helpers" STATE_BEFORE HASHES_BEFORE
+	pinned_legacy_host "$1" "$2"
+	assert_eq "" "$(helper_verifies "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch")" "${LABEL}: (the base's launcher refuses current b2 before)"
+	STATE_BEFORE="$(lifecycle_state)"
+	HASHES_BEFORE="$(config_hashes)"
+	run counted_upgrade
+	assert_rc 0 "${RC}" "${LABEL}: the upgrade succeeds"
+	assert_true "${LABEL}: the helpers are reconciled" helpers_are_this_installers
+	assert_eq "1" "$(grep -c '^install-helpers$' "${S}/log")" "${LABEL}:   once"
+	assert_eq "${STORE_ID_[b2]}" "$(helper_verifies "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch")" "${LABEL}: the installed launcher accepts current b2"
+	assert_eq "${STORE_ID_[b2]}" "$(helper_verifies "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl")" "${LABEL}: the installed awg-backend-ctl, whose precheck runs that check, accepts it"
+	assert_eq "${STATE_BEFORE}" "$(lifecycle_state)" "${LABEL}: current, previous and the store are unchanged"
+	assert_true "${LABEL}: no download" test ! -s "${S}/curl-log"
+	assert_eq "0" "$(service_changes)" "${LABEL}: the service is neither started nor restarted"
+	assert_eq "${HASHES_BEFORE}" "$(config_hashes)" "${LABEL}: params, configs and the runtime file are unchanged"
+	assert_contains "helpers in ${AWG_BT_LIBEXEC_DIR} were updated" "${OUT}" "${LABEL}: it says the helpers were updated"
+	assert_contains "was left $1; its next start uses the updated helpers" "${OUT}" "${LABEL}:   and that the service was left $1"
+	assert_not_contains "nothing was changed" "${OUT}" "${LABEL}: it does not claim that nothing changed"
+	: >"${S}/log"
+	systemctl restart awg-quick@awg0.service
+	assert_eq "restart current=${STORE_ID_[b2]}
+helper awg-backend-ctl verified ${STORE_ID_[b2]}
+helper awg-boringtun-launch verified ${STORE_ID_[b2]}" "$(grep -E '^(restart|helper) ' "${S}/log")" \
+		"${LABEL}: the next start runs through the installed helpers, which accept b2"
+}
+pinned_stopped_case inactive b1
+pinned_stopped_case failed none
+
+LABEL="pinned b2 + active healthy daemon + legacy helpers"
+pinned_legacy_host active b1 0
+STATE_BEFORE="$(lifecycle_state)"
+run counted_upgrade
+assert_rc 0 "${RC}" "${LABEL}: the upgrade succeeds"
+assert_true "${LABEL}: the helpers are reconciled" helpers_are_this_installers
+assert_contains "served current=${STORE_ID_[b2]}" "$(cat "${S}/log")" "${LABEL}: the daemon is checked"
+assert_eq "0" "$(service_changes)" "${LABEL}: no restart merely for the helper update"
+assert_eq "${STATE_BEFORE}" "$(lifecycle_state)" "${LABEL}: current and previous are unchanged"
+assert_true "${LABEL}: no download" test ! -s "${S}/curl-log"
+assert_not_contains "nothing was changed" "${OUT}" "${LABEL}: it does not claim that nothing changed"
+
+LABEL="pinned b2 + active daemon on another binary + legacy helpers"
+pinned_legacy_host active b1 1
+STATE_BEFORE="$(lifecycle_state)"
+run counted_upgrade
+assert_rc 0 "${RC}" "${LABEL}: the upgrade restarts onto current"
+assert_eq "install-helpers
+restart current=${STORE_ID_[b2]}
+helper awg-backend-ctl verified ${STORE_ID_[b2]}
+helper awg-boringtun-launch verified ${STORE_ID_[b2]}" "$(grep -E '^(install-helpers$|restart |helper )' "${S}/log")" \
+	"${LABEL}: the helpers are reconciled once, then one restart runs through them onto b2"
+assert_contains "verify current=${STORE_ID_[b2]} imitation=dns|example.com" "$(cat "${S}/log")" "${LABEL}: the activation is verified"
+assert_eq "${STATE_BEFORE}" "$(lifecycle_state)" "${LABEL}: no link is rewritten"
+assert_true "${LABEL}: no download" test ! -s "${S}/curl-log"
+
+pinned_failure_case() { # <inactive|failed>
+	local LABEL="pinned b2 + $1 + helpers that cannot be updated" STATE_BEFORE
+	pinned_legacy_host "$1" b1
+	chmod 0777 "${AWG_BT_LIBEXEC_DIR}"
+	STATE_BEFORE="$(lifecycle_state)"
+	run upgrade
+	chmod 0755 "${AWG_BT_LIBEXEC_DIR}"
+	assert_rc 1 "${RC}" "${LABEL}: the upgrade fails"
+	assert_contains "could not update the BoringTun helpers" "${ERR}" "${LABEL}: it says so"
+	assert_not_contains "already current" "${OUT}" "${LABEL}: without reporting the pin as current"
+	assert_eq "${STATE_BEFORE}" "$(lifecycle_state)" "${LABEL}: current and previous are unchanged"
+	assert_eq "0" "$(service_changes)" "${LABEL}: the service is neither started nor restarted"
+	assert_true "${LABEL}: no download" test ! -s "${S}/curl-log"
+}
+pinned_failure_case inactive
+pinned_failure_case failed
+
+# Helpers that already are this installer's: a true no-op, which rewrites
+# nothing.
+LABEL="pinned b2 + current helpers"
+pinned_legacy_host active b1 0
+_awgBtInstallHelpers
+HELPER_NODES="$(stat -c '%i %Y' "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl")"
+STATE_BEFORE="$(lifecycle_state)"
+run upgrade
+assert_rc 0 "${RC}" "${LABEL}: the upgrade succeeds"
+assert_contains "is already current; nothing was changed." "${OUT}" "${LABEL}: and reports a true no-op"
+assert_not_contains "helpers in" "${OUT}" "${LABEL}:   without mentioning the helpers"
+assert_eq "${HELPER_NODES}" "$(stat -c '%i %Y' "${AWG_BT_LIBEXEC_DIR}/awg-boringtun-launch" "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl")" "${LABEL}: the helpers are not rewritten"
+assert_eq "${STATE_BEFORE}" "$(lifecycle_state)" "${LABEL}: no link is rewritten"
+assert_eq "0" "$(service_changes)" "${LABEL}: no restart"
+assert_true "${LABEL}: no download" test ! -s "${S}/curl-log"
+
+# Both at once: a rollback killed between its renames left previous naming
+# the pinned b2, the old release unreferenced, and the base's helpers are
+# installed; the service is stopped.
+duplicate_legacy_host() {
+	make_install dns example.com 3
+	rm -rf -- "${STORE:?}"/*
+	store_release old
+	store_release b2
+	links b2 old
+	pin_to b2
+	echo inactive >"${S}/active-state"
+	run interrupted_rollback
+	install_base_helpers
+	touch "${S}/restart-uses-helper"
+	: >"${S}/log"
+	: >"${S}/curl-log"
+}
+LABEL="previous naming the pinned b2 + legacy helpers + inactive"
+duplicate_legacy_host
+assert_eq "current=${STORE_ID_[b2]} previous=${STORE_ID_[b2]} store=[$(sorted "${STORE_ID_[b2]}" "${STORE_ID_[old]}" current previous)]" \
+	"$(lifecycle_state)" "${LABEL}: (the interrupted rollback left that state)"
+run upgrade
+assert_rc 0 "${RC}" "${LABEL}: the upgrade succeeds"
+assert_eq "current=${STORE_ID_[b2]} previous=none store=[$(sorted "${STORE_ID_[b2]}" "${STORE_ID_[old]}" current)]" \
+	"$(lifecycle_state)" "${LABEL}: current stays b2, previous is removed and the old release is kept"
+assert_contains "left alone: ${STORE_ID_[old]}" "${OUT}" "${LABEL}: the old release stays unmanaged, not adopted"
+assert_true "${LABEL}: the helpers are reconciled" helpers_are_this_installers
+assert_eq "0" "$(service_changes)" "${LABEL}: the service stays inactive"
+run printBackendStatus
+assert_rc 0 "${RC}" "${LABEL}: the status is valid"
+assert_contains $'previous_release=none\nrollback_available=no' "${OUT}" "${LABEL}:   with no rollback target"
+duplicate_legacy_host
+chmod 0777 "${AWG_BT_LIBEXEC_DIR}"
+STATE_BEFORE="$(lifecycle_state)"
+run upgrade
+chmod 0755 "${AWG_BT_LIBEXEC_DIR}"
+assert_rc 1 "${RC}" "${LABEL}, helpers that cannot be updated: the upgrade fails"
+assert_eq "${STATE_BEFORE}" "$(lifecycle_state)" "${LABEL}, helpers that cannot be updated: the store is left as it was, previous included"
+assert_eq "0" "$(service_changes)" "${LABEL}, helpers that cannot be updated: no restart"
+
 echo "=== Incomplete configuration snapshots ==="
 snapshot_case() { # <label> <command breaking the snapshot...>
 	make_install

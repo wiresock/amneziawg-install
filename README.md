@@ -532,8 +532,11 @@ leave the installed release alone.
 **What each command targets.**
 - **Upgrade:** only the release pinned in the installer itself, never a "latest" lookup.
   Moving to a newer BoringTun means a newer installer with a reviewed pin.
-  - When the pin is already installed and its links are consistent, the upgrade changes
-    nothing.
+  - When the pin is already installed, its links are consistent and the helper scripts are
+    up to date, the upgrade changes nothing.
+  - When the pin is already installed but the helper scripts are older, the upgrade only
+    refreshes them and says so. A stopped service stays stopped, and a running one is not
+    restarted for it.
   - If an interrupted switch left `previous` naming the same release, the upgrade removes only
     that link. Any older release directory stays, unmanaged, and is never guessed back as the
     rollback target.
@@ -545,7 +548,8 @@ toggle back and forth. Other release directories can remain, for example after a
 interrupted switch. They are unmanaged: reported, never used, never removed automatically.
 
 Both commands first refresh the installer's two generated helper scripts, because helpers
-from earlier versions don't accept the names of later builds.
+from earlier versions don't accept the names of later builds. That includes an upgrade that
+finds the pin already installed.
 
 **What a switch does.**
 1. The upgrade downloads and verifies the pinned release exactly as a fresh install does,

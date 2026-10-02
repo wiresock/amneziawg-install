@@ -2557,8 +2557,13 @@ interrupted transaction left, or one put there by hand. Those are unmanaged.
 is a usage error.
 - **Upgrade:** moves `current` to the release this installer pins, and only that one. There is
   no "latest", channel or API lookup.
-  - When `current` already is the pin and the links are consistent, it is a no-op: no
-    download, no link rewrite, no restart.
+  - When `current` already is the pin, the links are consistent and the helpers already are
+    this installer's, it is a true no-op: no download, no link rewrite, no helper rewrite, no
+    restart.
+  - When `current` already is the pin but the installed helpers are stale (for example those
+    of an earlier installer version, which refuse a `-b<build>` pin), only the helpers are
+    rewritten and the command says so. There is no download and no link rewrite. An
+    `inactive` or `failed` service stays stopped, and a healthy active one is not restarted.
   - If `previous` also names `current` (a switch interrupted between its two renames), it
     removes only that duplicate `previous` link and reports it. Every release directory stays
     as it is. The release that used to be `previous` cannot be known: it stays unmanaged and
@@ -2575,8 +2580,10 @@ is a usage error.
   `awg-backend-ctl`) through `_awgBtInstallHelpers` before `current` can change or the service
   restarts. Helpers of earlier installer versions refuse `-b<build>` release names, so a switch
   to a later build would otherwise leave `current` naming a release the installed helpers
-  reject at the next start. The no-op path regenerates them before its restart onto `current`.
-  If they cannot be written, the command fails before any link or service change.
+  reject at the next start. An upgrade whose pin already is `current` regenerates them too,
+  first of all, whatever the service's state, so that the next start of a stopped service runs
+  the release `current` selects. If they cannot be written, the command fails before any link
+  or service change, a duplicate `previous` included.
   - Helpers are derived files and accept the legacy build 1 names as well. So when an
     activation fails they are not put back: the restored release starts through them.
   - Params, configs and the runtime file are never rewritten for this.
@@ -2690,12 +2697,19 @@ the stricter structural check is a known follow-up.
     active b1 → b2 switch, which must leave helpers that accept b2; a helper update that
     fails; and a failed activation that restarts b1 through the updated helpers. CI fetches
     that installer by its SHA as `AWG_TEST_BASE_INSTALLER`;
+  - the same helpers with `current` already the pinned b2: `inactive` and `failed` (helpers
+    reconciled, no start, no download, no link change, and a next start that runs through
+    them), a healthy active daemon (no restart), an active daemon on another binary (one
+    reconciliation, then one restart), a helper update that fails in either stopped state,
+    helpers that already are this installer's (a true no-op), and the duplicate `previous`
+    left by a killed rollback together with stale helpers;
   - a rollback really killed (SIGKILL) between its two link renames, and the upgrade that
     repairs the duplicate `previous`;
   - snapshots that cannot be completed, each before and after the switch: params, the server
     config, the runtime file, a client config, the client set, and a `sha256sum` failure.
 - `tests/mutate-boringtun-lifecycle.sh` holds its mutants, including the helper update, the
-  duplicate repair, every snapshot input, both failure checks and both comparisons.
+  duplicate repair, the helper update when the pin already is `current`, every snapshot input,
+  both failure checks and both comparisons.
 - The host live test makes a TEST FIXTURE older release current (the verified binary under the
   synthetic commit `feedface…`) and removes the pin from the store. It then upgrades
   (downloading the real release), rolls back, upgrades again without a download, and runs a
