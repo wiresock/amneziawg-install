@@ -22,6 +22,7 @@ on:
     paths:
       - amneziawg-install.sh
       - tests/test-boringtun-host-live.sh
+      - tests/test-boringtun-sip-wire-live.sh
       - tests/test-boringtun-public-release.sh
       - tests/test-boringtun-kernel-coexistence.sh
       - tests/helpers/boringtun-contracts.sh
@@ -34,6 +35,7 @@ on:
     paths:
       - amneziawg-install.sh
       - tests/test-boringtun-host-live.sh
+      - tests/test-boringtun-sip-wire-live.sh
       - tests/test-boringtun-public-release.sh
       - tests/test-boringtun-kernel-coexistence.sh
       - tests/helpers/boringtun-contracts.sh

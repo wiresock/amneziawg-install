@@ -10,6 +10,11 @@
 # 3.1 and back to 2.0, manages clients, restarts, stops, kills the daemon, and
 # finally uninstalls through the menu and audits what is left.
 #
+# Under sip, each server packet kind is held to its own S size (a request line
+# fits a prefix of 31 bytes or more), and tests/test-boringtun-sip-wire-live.sh
+# then checks fixed S sizes, the 30/31 boundary and cookie replies with the
+# same verified binary.
+#
 # It then cycles the built-in protocol imitation through dns, quic, sip, stun
 # and none with --set-boringtun-imitation: each time it checks params, the
 # runtime file, the daemon's command line and --backend-status, moves data
@@ -496,6 +501,18 @@ status_line() { # <key>: its line of --backend-status
 params_s() { # <S1|S2|S3|S4>
 	sed -n "s/^SERVER_AWG_$1='\\([0-9]*\\)'\$/\\1/p" /etc/amnezia/amneziawg/params
 }
+params_h() { # <H1|H2|H3|H4>: a number or MIN-MAX
+	sed -n "s/^SERVER_AWG_$1='\\([0-9-]*\\)'\$/\\1/p" /etc/amnezia/amneziawg/params
+}
+# The S that prefixes a packet kind.
+sip_kind_s() { # <init|response|cookie|transport>
+	case "$1" in init) echo S1 ;; response) echo S2 ;; cookie) echo S3 ;; transport) echo S4 ;; esac
+}
+# The server's packet layout for the wire helper: S1-S4, then H1-H4.
+params_layout() {
+	printf '%s,%s,%s,%s,%s,%s,%s,%s' "$(params_s S1)" "$(params_s S2)" "$(params_s S3)" "$(params_s S4)" \
+		"$(params_h H1)" "$(params_h H2)" "$(params_h H3)" "$(params_h H4)"
+}
 # Probes from the client's network: only the imitated service answers, never
 # SIP, and QUIC only for a version real servers do not offer. From loopback
 # nothing is answered.
@@ -519,9 +536,12 @@ expect_probes() { # <imitation>
 # Data through the tunnel while the client's side records the prefixes of the
 # server's datagrams, which must have the imitation's shape.
 wire_prefixes() { # <imitation>
-	local CAPTURE="${WORK}/prefixes" PID COUNTS TOTAL MATCHING LARGEST=0 NAME SIZE
+	local CAPTURE="${WORK}/prefixes" PID COUNTS TOTAL MATCHING LAYOUT=() KINDS KIND SEEN SHAPED EXPECTED VERDICT
 	rm -f "${CAPTURE}"
-	ip netns exec "${NS}" python3 "${WIRE}" capture "${VETH_CLIENT}" "${HOST_ADDR}" "${PORT}" 45 "${CAPTURE}" &
+	# SIP shapes each packet kind by its own S, so its capture records the
+	# kind of every datagram, decided from its length and type tag.
+	[[ "$1" != sip ]] || LAYOUT=("$(params_layout)")
+	ip netns exec "${NS}" python3 "${WIRE}" capture "${VETH_CLIENT}" "${HOST_ADDR}" "${PORT}" 45 "${CAPTURE}" "${LAYOUT[@]}" &
 	PID=$!
 	sleep 1
 	datapath "$1 imitation"
@@ -536,16 +556,34 @@ wire_prefixes() { # <imitation>
 				test "${TOTAL:-0}" -ge 10 -a "${MATCHING:-0}" -eq "${TOTAL:-0}"
 			;;
 		sip)
-			# A request line needs a prefix of 31 bytes; shorter ones stay random.
-			for NAME in S2 S3 S4; do
-				SIZE="$(params_s "${NAME}")"
-				((SIZE > LARGEST)) && LARGEST="${SIZE}"
-			done
-			if ((LARGEST >= 31)); then
-				check "sip: the server's datagrams carry SIP request lines (${MATCHING}/${TOTAL})" test "${MATCHING:-0}" -ge 1
-			else
-				echo "    (sip: S2-S4 are all below 31 bytes, so no request line fits)"
+			# Each kind on its own S: a request line needs a prefix of 31
+			# bytes, so a kind whose S is 31 or more must carry one in every
+			# datagram and a shorter one in none. The S sizes here are the
+			# installer's random ones; tests/test-boringtun-sip-wire-live.sh
+			# covers fixed sizes, the 30/31 boundary and cookie replies.
+			if ! KINDS="$(python3 "${WIRE}" kinds sip "${CAPTURE}" "$(params_s S1),$(params_s S2),$(params_s S3),$(params_s S4)")"; then
+				bad "sip: the server's datagrams could not be classified by packet kind"
+				return
 			fi
+			while read -r KIND SEEN SHAPED EXPECTED VERDICT; do
+				case "${KIND}" in
+					response | transport)
+						check "sip: ${KIND}s are ${EXPECTED} for S=$(params_s "$(sip_kind_s "${KIND}")") (${SHAPED}/${SEEN} shaped)" \
+							test "${VERDICT}" = ok
+						;;
+					init | cookie)
+						# The responder sends neither in ordinary traffic; if it
+						# did, they are held to the same rule.
+						if [[ "${VERDICT}" == unobserved ]]; then
+							echo "    (sip: no ${KIND} datagram from the server)"
+						else
+							check "sip: ${KIND}s are ${EXPECTED} for S=$(params_s "$(sip_kind_s "${KIND}")") (${SHAPED}/${SEEN} shaped)" \
+								test "${VERDICT}" = ok
+						fi
+						;;
+					unknown) echo "    (sip: ${SEEN} server datagrams of no packet kind)" ;;
+				esac
+			done <<<"${KINDS}"
 			;;
 		none)
 			check "none: the server sent datagrams (${TOTAL})" test "${TOTAL:-0}" -ge 10
@@ -627,6 +665,20 @@ imitation_step sip pbx.example
 imitation_step stun
 imitation_step none
 datapath "after the imitation cycle"
+
+# ── SIP imitation per packet kind, fixed sizes ──────────────────────────────
+# The installer draws S1-S4 at random, so the cycle above checks whichever
+# rule those sizes give each kind. tests/test-boringtun-sip-wire-live.sh fixes
+# them: the recorded follow-up C sizes with and without cookie replies, every
+# server S at 31 and at 30, and a mixed layout, plus negative controls. It runs
+# the embedded release's verified binary (the client's copy) as two peers in
+# namespaces of its own, apart from the installed host.
+echo "=== SIP imitation per packet kind (fixed S sizes)"
+check "the fixed-size SIP wire test runs the embedded release's binary" \
+	test "$(sha256sum "${CLIENT_BIN}" | cut -d' ' -f1)" = "${BINARY_SHA256}"
+bash "${SCRIPT_DIR}/test-boringtun-sip-wire-live.sh" "${CLIENT_BIN}" 2>&1 | sed 's/^/    | /'
+SIP_WIRE_RC="${PIPESTATUS[0]}"
+check "the fixed-size SIP wire test passes" test "${SIP_WIRE_RC}" -eq 0
 
 # ── Binary lifecycle ────────────────────────────────────────────────────────
 # A TEST FIXTURE older release (tests/helpers/boringtun-lifecycle-fixture.sh:
