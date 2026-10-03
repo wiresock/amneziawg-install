@@ -73,8 +73,14 @@ btc_embedded_release_problems() { # <installer>
 # configuration repeats it (documentation, *.md, may quote it). The installer
 # never needs it: it may hold it only as its AWG_BT_RELEASE_SOURCE_COMMIT, when
 # the release it embeds is a build of the same pin.
+#
+# The check fails closed: when the repository cannot be read completely, it
+# prints the scan's diagnostic and returns 1, also when the part it could read
+# matched as expected. grep exits 0 with matches, 1 without any and 2 after an
+# error, whether or not it matched elsewhere; only 0 and 1 without a
+# diagnostic are a complete scan.
 btc_pin_commit_problems() { # <repository root> <pin commit>
-	local ROOT="$1" COMMIT="$2" FILE
+	local ROOT="$1" COMMIT="$2" FILE LINE LINES RC SCAN ERRORS
 	if [[ ! "${COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
 		echo "the pin's commit '${COMMIT}' is not a full commit SHA"
 		return 0
@@ -83,17 +89,40 @@ btc_pin_commit_problems() { # <repository root> <pin commit>
 		echo "packaging/boringtun/pin.env does not define BORINGTUN_COMMIT=${COMMIT}"
 	grep -qx "BORINGTUN_RELEASE_SOURCE_COMMIT=${COMMIT}" "${ROOT}/packaging/boringtun/release.env" ||
 		echo "packaging/boringtun/release.env does not restate the pinned commit"
-	while IFS= read -r FILE; do
+	SCAN="$(mktemp)" || { echo "cannot create a temporary file for the scan of ${ROOT}"; return 1; }
+	ERRORS="$(mktemp)" || { rm -f -- "${SCAN}"; echo "cannot create a temporary file for the scan of ${ROOT}"; return 1; }
+	# NUL-terminated names, in a file: the scan's own exit status is kept, and
+	# no name is split or evaluated.
+	(cd -- "${ROOT}" || exit 2; grep -rlZF --exclude-dir=.git --exclude-dir=target --exclude='*.md' -e "${COMMIT}" .) \
+		>"${SCAN}" 2>"${ERRORS}"
+	RC=$?
+	if ((RC > 1)) || [[ -s "${ERRORS}" ]] || ! LC_ALL=C sort -z -o "${SCAN}" -- "${SCAN}" 2>>"${ERRORS}"; then
+		echo "the scan of ${ROOT} for the pinned commit did not complete (exit ${RC}): $(tr '\n' ' ' <"${ERRORS}")"
+		rm -f -- "${SCAN}" "${ERRORS}"
+		return 1
+	fi
+	while IFS= read -r -d '' FILE; do
+		FILE="${FILE#./}"
 		case "${FILE}" in
 			packaging/boringtun/pin.env | packaging/boringtun/release.env) ;;
 			amneziawg-install.sh)
-				# No -q: an early exit would fail the pipe under pipefail.
-				if grep -F -e "${COMMIT}" "${ROOT}/${FILE}" | grep -vx "AWG_BT_RELEASE_SOURCE_COMMIT=\"${COMMIT}\"" >/dev/null; then
-					echo "amneziawg-install.sh repeats the pinned commit outside AWG_BT_RELEASE_SOURCE_COMMIT"
+				# Its lines with the commit, read with grep's status kept: a
+				# read error must not look like "no other line".
+				LINES="$(grep -F -e "${COMMIT}" -- "${ROOT}/${FILE}")"
+				RC=$?
+				if ((RC > 1)); then
+					echo "amneziawg-install.sh could not be read for the pinned commit (exit ${RC})"
+					rm -f -- "${SCAN}" "${ERRORS}"
+					return 1
 				fi
+				((RC == 0)) && while IFS= read -r LINE; do
+					[[ "${LINE}" == "AWG_BT_RELEASE_SOURCE_COMMIT=\"${COMMIT}\"" ]] && continue
+					echo "amneziawg-install.sh repeats the pinned commit outside AWG_BT_RELEASE_SOURCE_COMMIT"
+					break
+				done <<<"${LINES}"
 				;;
 			*) echo "${FILE} repeats the pinned commit" ;;
 		esac
-	done < <(cd "${ROOT}" && grep -rlF --exclude-dir=.git --exclude-dir=target --exclude='*.md' -e "${COMMIT}" . |
-		sed 's#^\./##' | LC_ALL=C sort)
+	done <"${SCAN}"
+	rm -f -- "${SCAN}" "${ERRORS}"
 }

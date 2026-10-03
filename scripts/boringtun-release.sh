@@ -186,10 +186,12 @@ Static \`boringtun-cli\` binaries built by this repository from
 (\`boringtun-cli\` ${BTA_VERSION}), build ${BTR[BORINGTUN_RELEASE_BUILD]}, for the experimental userspace
 AmneziaWG backend of \`amneziawg-install\`.
 
-These archives are meant for \`amneziawg-install\`, which checks them against
-SHA-256 values embedded in the installer. They are not published or endorsed
-by the upstream BoringTun or WireSock BoringTun projects. At the time of this
-release, \`amneziawg-install\` does not yet install BoringTun.
+These archives are meant for \`amneziawg-install\`, which installs a BoringTun
+release only from the exact URLs and SHA-256 values embedded in an installer
+version. Publishing this release does not change the BoringTun release pinned
+by existing \`amneziawg-install\` versions; adopting it is a separate, reviewed
+installer update. The archives are not published or endorsed by the upstream
+BoringTun or WireSock BoringTun projects.
 
 | Architecture | Target | Linkage |
 |---|---|---|
