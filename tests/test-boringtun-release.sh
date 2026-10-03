@@ -57,6 +57,24 @@ assert_true() {
 	if "$@"; then ok "${NAME}"; else not_ok "${NAME}"; fi
 }
 
+assert_contains() { # <expected part> <actual> <name>
+	if [[ "$2" == *"$1"* ]]; then
+		ok "$3"
+	else
+		not_ok "$3"
+		printf '    expected to contain: %s\n    actual: %s\n' "$1" "$2" >&2
+	fi
+}
+
+assert_not_contains() { # <unexpected part> <actual> <name>
+	if [[ "$2" != *"$1"* ]]; then
+		ok "$3"
+	else
+		not_ok "$3"
+		printf '    expected not to contain: %s\n' "$1" >&2
+	fi
+}
+
 REPO="wiresock/amneziawg-install"
 PIN_COMMIT="0123456789abcdef0123456789abcdef01234567"
 C12="${PIN_COMMIT:0:12}"
@@ -503,12 +521,43 @@ asset=SHA256SUMS sha256=$(sha_of "${GOOD}/SHA256SUMS")" "${RUN_OUT}" \
 run_release notes "${ARTIFACTS_COMMIT}"
 assert_succeeds "notes for a full artifacts commit are printed"
 if [[ "${RUN_OUT}" == *"$(cat "${GOOD}/SHA256SUMS")"* && "${RUN_OUT}" == *RUSTSEC-2025-0069* && \
-	"${RUN_OUT}" == *"not position-independent"* && "${RUN_OUT}" == *"does not yet install BoringTun"* && \
-	"${RUN_OUT}" == *"not published or endorsed"* ]]; then
+	"${RUN_OUT}" == *"not position-independent"* && "${RUN_OUT}" == *"not published or endorsed"* ]]; then
 	ok "the notes carry the checksums, the advisory, the aarch64 non-PIE status and the scope"
 else
 	not_ok "the notes carry the checksums, the advisory, the aarch64 non-PIE status and the scope"
 fi
+# What the notes say about the installer, sentence by sentence, independent of
+# line breaks: publishing a release and an installer adopting it are separate
+# steps, so the notes must say that publication changes no existing installer
+# and that adoption is a separate reviewed update, and never that the
+# installer cannot install BoringTun, already uses this release or follows
+# new releases on its own.
+notes_sentences() { # <notes>
+	tr '\n' ' ' <<<"$1" | tr -s ' ' | sed 's/\([.;:]\) /\1\n/g'
+}
+notes_scope_problems() { # <notes>
+	local SENTENCES
+	SENTENCES="$(notes_sentences "$1")"
+	grep -qE 'Publishing this release does not change .*existing `amneziawg-install` versions' <<<"${SENTENCES}" ||
+		echo "no sentence says that publishing changes no existing installer version"
+	grep -qE 'adopting it is a separate, reviewed installer update' <<<"${SENTENCES}" ||
+		echo "no sentence says that adoption is a separate reviewed installer update"
+	grep -iE 'does not (yet )?install BoringTun|not yet install|does not support BoringTun|automatically|has adopted|adopted by|now installs|will install|updates? existing' \
+		<<<"${SENTENCES}" | sed 's/^/claims: /'
+}
+assert_eq "" "$(notes_scope_problems "${RUN_OUT}")" \
+	"the notes separate publication from installer adoption and claim neither adoption nor missing support"
+assert_not_contains "does not yet install BoringTun" "${RUN_OUT}" "  the pre-PR4 claim that the installer does not install BoringTun is gone"
+assert_contains "commit \`${PIN_COMMIT}\` (\`boringtun-cli\` 0.7.1), build 2," "$(tr '\n' ' ' <<<"${RUN_OUT}")" \
+	"the notes name the contract's source commit, version and build"
+assert_eq "no sentence says that publishing changes no existing installer version
+no sentence says that adoption is a separate reviewed installer update
+claims: At the time of this release, \`amneziawg-install\` does not yet install BoringTun." \
+	"$(notes_scope_problems "Static binaries for \`amneziawg-install\`. At the time of this release, \`amneziawg-install\` does not yet install BoringTun.")" \
+	"  (the check rejects the old wording)"
+SCOPE="$(notes_scope_problems "$(printf '%s\n\n%s\n' "${RUN_OUT}" "The installer now installs this release automatically.")")"
+assert_eq "1 claims: 1" "$(grep -c . <<<"${SCOPE}") ${SCOPE:0:8}$(grep -c 'now installs this release automatically' <<<"${SCOPE}")" \
+	"  (and an adoption claim)"
 
 # The provenance command of the notes: every "gh attestation verify" line with
 # its continuation lines.
@@ -650,6 +699,86 @@ mkdir -p "${STAGE_ROOT}/.github/workflows"
 printf 'env:\n  COMMIT: %s\n' "${PIN_COMMIT}" >"${STAGE_ROOT}/.github/workflows/build.yml"
 assert_true "  nor may a workflow" grep -qxF ".github/workflows/build.yml repeats the pinned commit" \
 	<<<"$(btc_pin_commit_problems "${STAGE_ROOT}" "${PIN_COMMIT}")"
+
+echo "=== The pinned-commit scan fails closed ==="
+# The scan is a release-policy check: a repository it cannot read completely
+# is a failure, never an empty result. A grep that does the real search and
+# then fails like a scan that met an unreadable subtree makes that
+# deterministic for every user, root included: SCAN_FAIL_RC is its exit
+# status, SCAN_FAIL_MESSAGE its diagnostic.
+REAL_GREP="$(command -v grep)"
+FAILING_GREP="${TEST_ROOT}/failing-grep"
+mkdir -p "${FAILING_GREP}"
+cat >"${FAILING_GREP}/grep" <<'EOF'
+#!/bin/bash
+RECURSIVE=""
+for ARG; do [[ "${ARG}" == -r* ]] && RECURSIVE=1; done
+"${REAL_GREP}" "$@"
+RC=$?
+[[ -n "${RECURSIVE}" ]] || exit "${RC}"
+[[ -z "${SCAN_FAIL_MESSAGE:-}" ]] || printf '%s\n' "${SCAN_FAIL_MESSAGE}" >&2
+exit "${SCAN_FAIL_RC}"
+EOF
+chmod 0755 "${FAILING_GREP}/grep"
+# The scan of the current stage: SCAN_OUT (its problems) and SCAN_RC.
+scan_stage() { # [failing grep exit status] [its diagnostic]
+	if (($#)); then
+		SCAN_OUT="$(PATH="${FAILING_GREP}:${PATH}" REAL_GREP="${REAL_GREP}" SCAN_FAIL_RC="$1" SCAN_FAIL_MESSAGE="${2:-}" \
+			btc_pin_commit_problems "${STAGE_ROOT}" "${PIN_COMMIT}" 2>/dev/null)"
+	else
+		SCAN_OUT="$(btc_pin_commit_problems "${STAGE_ROOT}" "${PIN_COMMIT}" 2>/dev/null)"
+	fi
+	SCAN_RC=$?
+}
+make_stage scan "${PIN_FILE}" "${FIXTURE_INSTALLER}"
+scan_stage
+assert_eq "0 " "${SCAN_RC} ${SCAN_OUT}" "a complete scan that finds the commit only in pin.env and release.env passes"
+ABSENT_COMMIT="abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+SCAN_OUT="$(btc_pin_commit_problems "${STAGE_ROOT}" "${ABSENT_COMMIT}" 2>&1)"
+SCAN_RC=$?
+assert_eq "0 packaging/boringtun/pin.env does not define BORINGTUN_COMMIT=${ABSENT_COMMIT}
+packaging/boringtun/release.env does not restate the pinned commit" "${SCAN_RC} ${SCAN_OUT}" \
+	"a complete scan without any match (grep's exit 1) is no scan error; the missing pin is the problem"
+mkdir -p "${STAGE_ROOT}/scripts" "${STAGE_ROOT}/docs"
+printf '#!/bin/bash\nbash scripts/boringtun-artifact.sh pin\n' >"${STAGE_ROOT}/scripts/build.sh"
+printf 'The pin is %s.\n' "${PIN_COMMIT}" >"${STAGE_ROOT}/docs/notes.md"
+scan_stage
+assert_eq "0 " "${SCAN_RC} ${SCAN_OUT}" "  files that do not repeat it, and documentation that quotes it, pass"
+printf 'COMMIT=%s\n' "${PIN_COMMIT}" >"${STAGE_ROOT}/scripts/odd name.sh"
+printf 'commit: %s\n' "${PIN_COMMIT}" >"${STAGE_ROOT}/scripts/config.yml"
+scan_stage
+assert_eq "0 scripts/config.yml repeats the pinned commit
+scripts/odd name.sh repeats the pinned commit" "${SCAN_RC} ${SCAN_OUT}" \
+	"a complete scan reports every readable repetition, in order, whatever the file name"
+rm -f -- "${STAGE_ROOT}/scripts/odd name.sh" "${STAGE_ROOT}/scripts/config.yml"
+assert_true "  (the stage's pin.env and release.env are matches of the real scan)" \
+	eval '[[ "$(cd "${STAGE_ROOT}" && "${REAL_GREP}" -rlF -e "${PIN_COMMIT}" packaging | LC_ALL=C sort | tr "\n" " ")" == "packaging/boringtun/pin.env packaging/boringtun/release.env " ]]'
+scan_stage 2 "grep: ./private: Permission denied"
+assert_eq "1" "${SCAN_RC}" "a scan that could not read a subtree fails, although its other matches were all expected"
+assert_contains "did not complete (exit 2): grep: ./private: Permission denied" "${SCAN_OUT}" "  and names the scan's error"
+scan_stage 2
+assert_eq "1" "${SCAN_RC}" "a scan that exits 2 without a diagnostic fails"
+scan_stage 0 "grep: warning: ./loop: recursive directory loop"
+assert_eq "1" "${SCAN_RC}" "a scan that reports a diagnostic fails, whatever its exit status"
+scan_stage 1 "grep: ./private: Input/output error"
+assert_eq "1" "${SCAN_RC}" "  also when it found nothing"
+scan_stage 1
+assert_eq "0 " "${SCAN_RC} ${SCAN_OUT}" "  while a silent scan that exits 1 (no match) is complete"
+# A real unreadable directory, for a user whom a mode of 0 stops; root reads
+# it anyway, and the failing grep above stands in for it.
+mkdir -p "${STAGE_ROOT}/private"
+printf 'COMMIT=%s\n' "${PIN_COMMIT}" >"${STAGE_ROOT}/private/config.sh"
+chmod 000 "${STAGE_ROOT}/private"
+if ! ls "${STAGE_ROOT}/private" >/dev/null 2>&1; then
+	scan_stage
+	assert_eq "1" "${SCAN_RC}" "a real unreadable directory fails the scan"
+	assert_contains "Permission denied" "${SCAN_OUT}" "  with the scan's diagnostic"
+else
+	echo "  (a mode-0 directory is readable to uid ${EUID}; the failing grep covers that case)"
+fi
+chmod 755 "${STAGE_ROOT}/private"
+scan_stage
+assert_eq "0 private/config.sh repeats the pinned commit" "${SCAN_RC} ${SCAN_OUT}" "  and once readable, the repetition in it is reported"
 
 # The repository's own pin and contract, approved, beside the repository's own
 # installer: the step from this repository's candidate to its approval.
@@ -804,6 +933,8 @@ assert_eq "2" "$(grep -c -- "--repo ${REPO} --cert-identity ${IDENTITY} --source
 # run verified: not BoringTun's source commit, this checkout's HEAD or any other.
 assert_eq "$(expected_command "${ARTIFACTS_COMMIT}")" "$(notes_command "$(cat "${TEST_ROOT}/dry-ok/notes.md")")" \
 	"the dry run's notes give the provenance command for the verified artifacts commit"
+assert_eq "" "$(notes_scope_problems "$(cat "${TEST_ROOT}/dry-ok/notes.md")")" \
+	"  and separate publication from installer adoption"
 OTHER_COMMIT="fedcba9876543210fedcba9876543210fedcba98"
 reset_mock "${GOOD}"; edit_run ".head_sha = \"${OTHER_COMMIT}\""; edit_attestation ".digest = \"${OTHER_COMMIT}\""
 run_release dry-run "${RUN_ID}" "${OTHER_COMMIT}" main "${TEST_ROOT}/dry-other"
