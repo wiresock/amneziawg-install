@@ -41,6 +41,8 @@ jobs:
           bash -n tests/test-boringtun-lifecycle.sh
           bash -n tests/test-boringtun-install-mock.sh
           bash -n tests/test-boringtun-host-live.sh
+          bash -n tests/test-boringtun-public-release.sh
+          bash -n tests/helpers/boringtun-contracts.sh
           bash -n tests/test-boringtun-kernel-coexistence.sh
           bash -n tests/test-boringtun-host-root-safety.sh
           bash -n .github/scripts/boringtun-host-diagnostics.sh
@@ -100,6 +102,8 @@ jobs:
           shellcheck --severity=warning tests/test-boringtun-lifecycle.sh
           shellcheck --severity=warning tests/test-boringtun-install-mock.sh
           shellcheck --severity=warning tests/test-boringtun-host-live.sh
+          shellcheck --severity=warning -x tests/test-boringtun-public-release.sh
+          shellcheck --severity=warning tests/helpers/boringtun-contracts.sh
           shellcheck --severity=warning tests/test-boringtun-kernel-coexistence.sh
           shellcheck --severity=warning tests/test-boringtun-host-root-safety.sh
           shellcheck --severity=warning .github/scripts/boringtun-host-diagnostics.sh

@@ -143,7 +143,9 @@ for TOOL in python3 curl ip sha256sum; do
 	command -v "${TOOL}" >/dev/null 2>&1 || die "${TOOL} is required"
 done
 
-# The embedded release, read from the installer as data.
+# The embedded release, read from the installer as data. It is the published
+# release this installer installs, which can be older than the release that
+# packaging/boringtun/release.env prepares: nothing here reads that file.
 installer_value() {
 	sed -n "s/^$1=\"\\(.*\\)\"\$/\\1/p" "${INSTALLER}"
 }
@@ -153,7 +155,10 @@ case "$(uname -m)" in
 	*) die "no BoringTun release for $(uname -m)" ;;
 esac
 RELEASE_TAG="$(installer_value AWG_BT_RELEASE_TAG)"
+RELEASE_BASE_URL="$(installer_value AWG_BT_RELEASE_BASE_URL)"
+SOURCE_COMMIT="$(installer_value AWG_BT_RELEASE_SOURCE_COMMIT)"
 ASSET="$(installer_value "AWG_BT_RELEASE_ASSET_${ARCH_KEY}")"
+ARCHIVE_SHA256="$(installer_value "AWG_BT_RELEASE_ARCHIVE_SHA256_${ARCH_KEY}")"
 BINARY_SHA256="$(installer_value "AWG_BT_RELEASE_BINARY_SHA256_${ARCH_KEY}")"
 RELEASE_ID="${ASSET%.tar.gz}"
 STORE="/usr/local/lib/amneziawg-install/boringtun"
@@ -262,8 +267,16 @@ done
 check "no amneziawg.ko was built" test -z "$(find /lib/modules -name 'amneziawg.ko*' -print -quit 2>/dev/null)"
 check "the store selects ${RELEASE_ID}" test "$(readlink "${STORE}/current")" = "${RELEASE_ID}"
 check "the installed binary has the embedded SHA-256" test "$(sha256sum "${STORE}/${RELEASE_ID}/boringtun-cli" | cut -d' ' -f1)" = "${BINARY_SHA256}"
-check "the embedded SHA-256 is the release contract's" \
-	grep -qx "BORINGTUN_RELEASE_BINARY_SHA256_${ARCH_KEY}=${BINARY_SHA256}" "${PROJECT_ROOT}/packaging/boringtun/release.env"
+check "the installed MANIFEST names the embedded source commit and binary SHA-256" \
+	bash -c 'grep -qx "source_commit=$2" "$1" && grep -qx "binary_sha256=$3" "$1"' _ \
+	"${STORE}/${RELEASE_ID}/MANIFEST" "${SOURCE_COMMIT}" "${BINARY_SHA256}"
+# The same immutable asset again, to show which bytes the installer accepted.
+curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 -o "${WORK}/${ASSET}" "${RELEASE_BASE_URL}/${ASSET}"
+check "the embedded URL the installer downloaded serves the embedded archive SHA-256" \
+	test "$(sha256sum "${WORK}/${ASSET}" 2>/dev/null | cut -d' ' -f1)" = "${ARCHIVE_SHA256}"
+check "  and the installed release is that archive's content" \
+	bash -c 'for F in LICENSE MANIFEST THIRD-PARTY-LICENSES boringtun-cli; do tar -xzOf "$1" "$2/$F" | cmp -s - "$3/$F" || exit 1; done' _ \
+	"${WORK}/${ASSET}" "${ASSET%.tar.gz}" "${STORE}/${RELEASE_ID}"
 check "the store verifies" bash -c 'source "$1" && _awgBtVerifyStore' _ "${INSTALLER}"
 check "the helpers are root-owned, mode 0755" \
 	test "$(stat -c '%u %a' /usr/local/libexec/amneziawg-install/awg-boringtun-launch /usr/local/libexec/amneziawg-install/awg-backend-ctl | tr '\n' ' ')" = "0 755 0 755 "
@@ -284,6 +297,8 @@ check_served() { # <label>
 	check "$1: no AmneziaWG kernel module is loaded" no_kernel_module
 }
 check_served "after the install"
+check "the daemon executes the embedded release's binary" \
+	test "$(sha256sum "/proc/$(main_pid)/exe" 2>/dev/null | cut -d' ' -f1)" = "${BINARY_SHA256}"
 DAEMON_ARGS="$(tr '\0' ' ' <"/proc/$(main_pid)/cmdline")"
 if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 	check "upgrade: the earlier installer's params have no imitation keys" bash -c '! grep -q "^AWG_BORINGTUN_" /etc/amnezia/amneziawg/params'

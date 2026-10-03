@@ -10,17 +10,21 @@ name: BoringTun Host
 # and uninstalls. The x86_64 job installs with the last installer version
 # without protocol imitation and manages the host with this one, the upgrade
 # path; the aarch64 and Debian jobs install with this one. A separate job
-# downloads the public release anonymously, and one proves coexistence with an
-# installed AmneziaWG kernel module. See docs/BORINGTUN_BACKEND_DESIGN.md.
+# downloads the public release that the installer embeds anonymously, and one
+# proves coexistence with an installed AmneziaWG kernel module. Every job uses
+# the release named by the installer's AWG_BT_RELEASE_* constants, never
+# packaging/boringtun/release.env, which may prepare a newer release before an
+# installer adopts it. See docs/BORINGTUN_BACKEND_DESIGN.md.
 
 on:
   push:
     branches: [main]
     paths:
       - amneziawg-install.sh
-      - packaging/boringtun/release.env
       - tests/test-boringtun-host-live.sh
+      - tests/test-boringtun-public-release.sh
       - tests/test-boringtun-kernel-coexistence.sh
+      - tests/helpers/boringtun-contracts.sh
       - tests/helpers/boringtun-live-firewall.sh
       - tests/helpers/boringtun-imitation-wire.py
       - tests/helpers/boringtun-lifecycle-fixture.sh
@@ -29,9 +33,10 @@ on:
     branches: [main]
     paths:
       - amneziawg-install.sh
-      - packaging/boringtun/release.env
       - tests/test-boringtun-host-live.sh
+      - tests/test-boringtun-public-release.sh
       - tests/test-boringtun-kernel-coexistence.sh
+      - tests/helpers/boringtun-contracts.sh
       - tests/helpers/boringtun-live-firewall.sh
       - tests/helpers/boringtun-imitation-wire.py
       - tests/helpers/boringtun-lifecycle-fixture.sh
@@ -56,35 +61,12 @@ jobs:
           persist-credentials: false
 
       # The exact URLs the installer uses, without credentials: a renamed
-      # asset, a wrong tag or an unpublished release fails here.
+      # asset, a wrong tag, an unpublished release or other bytes fail here.
+      # The source of truth is the installer's AWG_BT_RELEASE_* constants
+      # alone, the published release this installer consumes; release.env may
+      # already prepare a newer one that no installer has adopted yet.
       - name: Download the embedded release anonymously and verify it
-        run: |
-          # Absolute paths: the downloads happen in another directory.
-          REPO_ROOT="$GITHUB_WORKSPACE"
-          value() { sed -n "s/^$1=\"\\(.*\\)\"\$/\\1/p" "$REPO_ROOT/amneziawg-install.sh"; }
-          contract() { sed -n "s/^$1=//p" "$REPO_ROOT/packaging/boringtun/release.env"; }
-          BASE="$(value AWG_BT_RELEASE_BASE_URL)"
-          test -n "$BASE"
-          mkdir -p "$RUNNER_TEMP/release"
-          cd "$RUNNER_TEMP/release"
-          for KEY in X86_64 AARCH64; do
-            ASSET="$(value "AWG_BT_RELEASE_ASSET_${KEY}")"
-            curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 -o "$ASSET" "$BASE/$ASSET"
-            test "$(sha256sum "$ASSET" | cut -d' ' -f1)" = "$(value "AWG_BT_RELEASE_ARCHIVE_SHA256_${KEY}")"
-            test "$(value "AWG_BT_RELEASE_ARCHIVE_SHA256_${KEY}")" = "$(contract "BORINGTUN_RELEASE_ARCHIVE_SHA256_${KEY}")"
-            STEM="${ASSET%.tar.gz}"
-            test "$(tar -xzOf "$ASSET" "$STEM/boringtun-cli" | sha256sum | cut -d' ' -f1)" = "$(value "AWG_BT_RELEASE_BINARY_SHA256_${KEY}")"
-            test "$(value "AWG_BT_RELEASE_BINARY_SHA256_${KEY}")" = "$(contract "BORINGTUN_RELEASE_BINARY_SHA256_${KEY}")"
-            test "$(tar -xzOf "$ASSET" "$STEM/MANIFEST" | sed -n 's/^source_commit=//p')" = "$(value AWG_BT_RELEASE_SOURCE_COMMIT)"
-            echo "verified $ASSET"
-          done
-          curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 -o SHA256SUMS "$BASE/SHA256SUMS"
-          printf '%s  %s\n%s  %s\n' \
-            "$(value AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64)" "$(value AWG_BT_RELEASE_ASSET_AARCH64)" \
-            "$(value AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64)" "$(value AWG_BT_RELEASE_ASSET_X86_64)" >expected-sums
-          cmp SHA256SUMS expected-sums
-          sha256sum -c SHA256SUMS
-          echo "verified SHA256SUMS $(sha256sum SHA256SUMS | cut -d' ' -f1)"
+        run: bash tests/test-boringtun-public-release.sh
 
   live:
     name: Fresh host install (${{ matrix.arch }})

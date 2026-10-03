@@ -10,6 +10,8 @@ set -uo pipefail
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 ARTIFACT_SCRIPT="${PROJECT_ROOT}/scripts/boringtun-artifact.sh"
+# shellcheck source=helpers/boringtun-contracts.sh
+source "${SCRIPT_DIR}/helpers/boringtun-contracts.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/boringtun-artifact-tests.XXXXXX")"
 TEST_ROOT="$(CDPATH='' cd -- "${TEST_ROOT}" && pwd -P)"
 BIN_DIR="${TEST_ROOT}/bin"
@@ -248,26 +250,32 @@ BORINGTUN_VERSION=0.7.1
 BORINGTUN_RUST_TOOLCHAIN=1.98.1
 BORINGTUN_ARTIFACT_FORMAT=1" "${RUN_OUT}" "a valid pin with comments and blank lines is printed as KEY=VALUE"
 
-REPO_PIN_COMMIT="$(env BORINGTUN_PIN_FILE="${PROJECT_ROOT}/packaging/boringtun/pin.env" \
-	bash "${ARTIFACT_SCRIPT}" pin 2>/dev/null | sed -n 's/^BORINGTUN_COMMIT=//p')"
+REPO_PIN="$(env BORINGTUN_PIN_FILE="${PROJECT_ROOT}/packaging/boringtun/pin.env" bash "${ARTIFACT_SCRIPT}" pin 2>/dev/null)"
+REPO_PIN_COMMIT="$(sed -n 's/^BORINGTUN_COMMIT=//p' <<<"${REPO_PIN}")"
 if [[ "${REPO_PIN_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
 	ok "the repository's own pin file is valid"
 else
 	not_ok "the repository's own pin file is valid"
 fi
+# The pin builds exactly WireSock BoringTun, at an exact version with an exact
+# Rust release and artifact format, and nothing else.
+PIN_SHAPE="^BORINGTUN_REPOSITORY=${BTC_SOURCE_REPOSITORY//./\\.}"$'\n'"BORINGTUN_COMMIT=[0-9a-f]{40}"$'\n'
+PIN_SHAPE+="BORINGTUN_VERSION=[0-9]+\.[0-9]+\.[0-9]+"$'\n'"BORINGTUN_RUST_TOOLCHAIN=[0-9]+\.[0-9]+\.[0-9]+"$'\n'
+PIN_SHAPE+="BORINGTUN_ARTIFACT_FORMAT=1\$"
+if [[ "${REPO_PIN}" =~ ${PIN_SHAPE} ]]; then
+	ok "the repository's pin names WireSock BoringTun, an exact version, Rust release and artifact format"
+else
+	not_ok "the repository's pin names WireSock BoringTun, an exact version, Rust release and artifact format"
+fi
 # Scripts, workflows and configuration must read the commit from pin.env rather
-# than repeat it; documentation may quote it. The exceptions are the release
-# contract, a reviewed statement of what a release contains, which the release
-# script refuses when it disagrees with the pin, and amneziawg-install.sh,
-# which embeds the published release as its trust anchor because it is used as
-# a single downloaded file; tests/test-boringtun-host.sh keeps those embedded
-# values equal to pin.env and the release contract.
-assert_eq "amneziawg-install.sh
-packaging/boringtun/pin.env
-packaging/boringtun/release.env" \
-	"$(cd "${PROJECT_ROOT}" && grep -rlF --exclude-dir=.git --exclude-dir=target --exclude='*.md' \
-		-e "${REPO_PIN_COMMIT:-unset}" . | sed 's#^\./##' | LC_ALL=C sort)" \
-	"the pinned commit is defined only in pin.env and restated only in the release contract"
+# than repeat it; documentation may quote it. The release contract restates it
+# as the provenance of the release it describes, and the release script refuses
+# a contract that disagrees with the pin. The installer does not need it: its
+# AWG_BT_RELEASE_* constants name the published release it uses, which can be a
+# build of an earlier pin, because an installer adopts a release only in a later
+# change (see tests/helpers/boringtun-contracts.sh).
+assert_eq "" "$(btc_pin_commit_problems "${PROJECT_ROOT}" "${REPO_PIN_COMMIT:-unset}")" \
+	"the pinned commit is defined in pin.env, restated in the release contract and repeated in no script, workflow or configuration"
 
 # Each case: a label, then the complete pin file content.
 check_bad_pin() {

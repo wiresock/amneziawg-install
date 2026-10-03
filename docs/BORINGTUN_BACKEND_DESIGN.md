@@ -2070,9 +2070,14 @@ uninstall removes exactly the packages it removed before.
 
 **Release.** The installer embeds the release tag, base URL, version, source
 repository and commit, and per architecture the asset name, archive SHA-256 and
-binary SHA-256 (`AWG_BT_RELEASE_*`). `tests/test-boringtun-host.sh` keeps them
-equal to `packaging/boringtun/release.env` and `pin.env`, and a CI job downloads
-the real assets anonymously and checks them. The transaction, in order:
+binary SHA-256 (`AWG_BT_RELEASE_*`) of an already published release.
+`tests/test-boringtun-host.sh` checks that they are internally consistent, and a
+CI job (`tests/test-boringtun-public-release.sh`) downloads the real assets
+anonymously and checks them against these constants alone. They are not tied to
+`packaging/boringtun/pin.env` or `release.env`, which may already prepare or
+publish a newer release that the installer adopts only in a later change (see
+"Three contracts" in [BORINGTUN_ARTIFACTS.md](BORINGTUN_ARTIFACTS.md)). The
+transaction, in order:
 
 1. `uname -m` maps to x86_64 (`x86_64`, `amd64`) or aarch64 (`aarch64`,
    `arm64`); anything else is refused before any change.
@@ -2537,7 +2542,7 @@ Consequences:
 - **The archive is unchanged:** a build ≥ 2 is unpacked from its archive directory and stored
   under its build name.
 
-The installer embeds `AWG_BT_RELEASE_BUILD` (`release.env`'s `BORINGTUN_RELEASE_BUILD`, the
+The installer embeds `AWG_BT_RELEASE_BUILD` (the embedded release's build number, its
 tag's `-b<build>`). The runtime checks (`_awgBtVerifyRelease`, in the helpers) bind a
 directory's version, commit and architecture to its MANIFEST. Format 1 cannot bind the build,
 which is stated rather than pretended: the build in a name is the one the installer gave

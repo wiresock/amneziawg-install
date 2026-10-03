@@ -5,18 +5,46 @@ This repository builds static `boringtun-cli` binaries from a pinned commit of
 for a future userspace AmneziaWG backend (see
 [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
 
-**Status: built and attested; not published yet.** Four separate stages handle
-the artifacts, and only the first two run on their own:
+**Status: one release published.** `boringtun-cli-0.7.1-g71d88784ad29-b1`,
+built from the previous pin `71d88784ad29`, is public and is what the installer
+downloads. The current pin `ae2ab44e9a68` has a candidate release contract and
+no release yet. Four separate stages handle the artifacts, and only the first
+two run on their own:
 
 | Stage | What happens | Where |
 |---|---|---|
 | Artifact build | The pinned source is built, packaged, verified and interop-tested; the archives are uploaded as workflow artifacts | BoringTun Artifacts workflow: pushes that change the recipe, manual dispatch |
 | Attestation | Each archive gets a signed SLSA build provenance attestation; never for a pull request | the same workflow's `attest` job |
 | Publication | For one reviewed, attested run, every check against the release contract, then a GitHub Release | BoringTun Release workflow: manual dispatch only ([Publishing a release](#publishing-a-release)) |
-| Installer consumption | `amneziawg-install` downloads the archive for the host's architecture from the exact release URL and checks it against SHA-256 values embedded in the installer | not implemented yet (PR 4) |
+| Installer consumption | `amneziawg-install` downloads the archive for the host's architecture from the exact release URL and checks it against SHA-256 values embedded in the installer | `amneziawg-install.sh`, with the constants of the published release; a new release reaches the installer only through a separate change of those constants |
 
-No release has been published. Workflow artifacts expire after 90 days and are
-not a distribution channel; the installer will only ever use release assets.
+Workflow artifacts expire after 90 days and are not a distribution channel;
+the installer only ever uses release assets.
+
+## Three contracts
+
+Three separate statements describe a BoringTun build, at three stages of its
+life:
+
+| Contract | Answers | Checked by |
+|---|---|---|
+| [`packaging/boringtun/pin.env`](../packaging/boringtun/pin.env), the artifact source pin | Which exact WireSock BoringTun commit the artifact pipeline builds | `boringtun-artifact.sh pin`; `tests/test-boringtun-artifact.sh` also requires that no script, workflow or configuration repeats the commit |
+| [`packaging/boringtun/release.env`](../packaging/boringtun/release.env), the release contract | Which exact build of that pin is being prepared, reviewed or published: `candidate` or `approved` | `boringtun-release.sh contract` and every release workflow job: it must always match `pin.env` |
+| `AWG_BT_RELEASE_*` in `amneziawg-install.sh`, the installer's release | Which already published, immutable release this installer installs and trusts | `tests/test-boringtun-host.sh` (internally consistent: tag, URL, asset names and hashes follow from its version, commit and build); `tests/test-boringtun-public-release.sh` in the BoringTun Host workflow (public, with exactly the embedded bytes) |
+
+A release is prepared and published before any installer uses it: the pin
+moves, its build becomes a candidate contract, the contract is approved and
+published, and only then, in a separate later change, does the installer adopt
+the published release by changing its `AWG_BT_RELEASE_*` constants. Until that
+change the installer still names an earlier published release, so the
+installer's release may differ from the pin and the contract, while the
+contract is a candidate and also after it is approved and published.
+`release.env` always matches `pin.env`. No test compares the installer's
+constants with `pin.env` or `release.env`; each contract is checked on its own
+terms, and the host tests and the public-release download use only the
+installer's constants. Today the pin is `ae2ab44e9a68`, the contract a
+candidate of its build 1, and the installer installs the published
+`boringtun-cli-0.7.1-g71d88784ad29-b1`.
 
 ## Source pin
 
@@ -34,20 +62,32 @@ the source is defined:
 The file is data: `scripts/boringtun-artifact.sh` parses it with a strict
 `KEY=VALUE` grammar and never sources it. Every workflow job reads the pin
 through that script, and a unit test fails if the commit appears in any other
-script, workflow or configuration file.
+script, workflow or configuration file. The release contract restates it, as
+the provenance of the release it describes; the installer does not need it
+(see [Three contracts](#three-contracts)).
 
-The current pin is `71d88784ad29dc95871c105e26cc62f6acdd565b` (boringtun-cli
-0.7.1, tree `6f0f0a32a197fe71fb66c074cb1e56caf7024dd8`), the frozen baseline
-for the first `amneziawg-install` integration. Upstream also tags it
-`awg3.1-integration-2026-09-28` (tag object
-`eb30d9694381f3da97f569cbde7b09aad256cd4b`); the tag is informational only, and
-builds and installer trust anchors use the commit. It descends from
-`e4e4dc85ec039d40bbc92b3667b7fc92966b1b0a`, the commit the backend design was
-validated against, by upstream pull requests #58 to #66: noise and device fixes,
-including transactional listen-port rebinding (#65) and releasing a device's
-write intent when a mutation unwinds (#66), and JNI bindings. Its shipped
-dependency graph is unchanged: the one lockfile change is a test-only
-dependency.
+The current pin is `ae2ab44e9a68ca1a3232d2e8b13f9db30a9b9dcf` (boringtun-cli
+0.7.1, tree `3bea8cdeefd5f55a1129db7d31481b9b3a8edde8`), the source checkpoint
+that upstream tags `awg3.1-integration-2026-10-02` (tag object
+`39c91795414246e241a3346a0adcc6273364a377`); the tag is informational only, and
+builds and installer trust anchors use the commit. The previous pin,
+`71d88784ad29dc95871c105e26cc62f6acdd565b` (tree
+`6f0f0a32a197fe71fb66c074cb1e56caf7024dd8`, upstream tag
+`awg3.1-integration-2026-09-28`), is the source of the published release
+`boringtun-cli-0.7.1-g71d88784ad29-b1` that the installer uses today.
+
+Upstream rewrote its history after that release. In the current history the
+old pin's tree is commit `8ba4d792dd071783d4864ef022258ff9d7c52bbd`, with
+exactly the same tree `6f0f0a32a197fe71fb66c074cb1e56caf7024dd8`, and the new
+pin descends from it by 15 commits with none behind: upstream pull requests
+#67 to #75 (fwmark and listener-rebind fixes, UAPI errno reporting, TUN read
+and Darwin MTU descriptor fixes, retry-safe no-session write admission and
+bounded UDP socket diagnostics; #67 and #71 change only the integration-test
+harness) and the dependency updates #34, #45, #48, #49, #62 and #63. A GitHub
+compare of `71d88784ad29` with `ae2ab44e9a68` therefore reports `diverged`;
+that is the rewrite, not dropped source. The shipped dependency graph changes
+only by three lockfile bumps: clap 4.6.6 to 4.6.7, portable-atomic 1.14.0 to
+1.15.0 and thiserror 2.0.20 to 2.0.21; no `Cargo.toml` changes.
 
 A pin bump is a reviewed change to `pin.env`, together with any policy change in
 `packaging/boringtun/`. The artifact workflow runs automatically for it.
@@ -330,9 +370,12 @@ strict grammar as `pin.env` and refuses any disagreement with the pin:
 `<ARCH>` is `X86_64` and `AARCH64`. The release title is derived:
 `BoringTun CLI <version> (WireSock <commit12>), build <build> (experimental)`.
 A published tag is never reused or moved, so once a build is public, any other
-bytes need a new build number. The contract holds a `candidate` of build 1 of
-the frozen integration baseline. Nothing built from the earlier pin
-`e4e4dc85ec03` is ever to be published: its archives lacked the
+bytes need a new build number. The build number is scoped to one source commit:
+a new pin starts again at build 1. The contract holds a `candidate` of build 1
+of the current pin, `boringtun-cli-0.7.1-gae2ab44e9a68-b1`; the published
+release of the previous pin, `boringtun-cli-0.7.1-g71d88784ad29-b1`, stays
+side by side and is never moved, edited or replaced. Nothing built from the
+earlier pin `e4e4dc85ec03` is ever to be published: its archives lacked the
 curve25519-dalek notices, and it is no longer the pin.
 
 ### The BoringTun Release workflow
@@ -398,18 +441,23 @@ setting that no workflow changes.
 6. The maintainers approve: `BORINGTUN_RELEASE_STATE=approved` in a reviewed
    change.
 7. Dispatch BoringTun Release with `mode=publish`.
-8. Embed the release constants (tag, asset names, archive and binary SHA-256)
-   in `amneziawg-install.sh` (PR 4).
+8. Later, in a separate change, adopt the published release in the installer:
+   its `AWG_BT_RELEASE_*` constants (tag, URL, source, build, asset names,
+   archive and binary SHA-256). Until then the installer keeps its earlier
+   release, and every step above is valid beside it. From that change on, the
+   host tests and the public-release download check the adopted release.
 
-## Not yet done
+## Installer side
 
-The installer's internal BoringTun runtime layer can already run an unpacked
-archive: the archive's top-level directory becomes a release in
+The installer's BoringTun runtime layer runs an unpacked archive: the archive's
+top-level directory becomes a release in
 `/usr/local/lib/amneziawg-install/boringtun/`, and every start checks it against
 its `MANIFEST` (see §21.1 of [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
-Only CI populates that store today.
-
-No release is published, and the installer does not download anything yet.
-PR 4 embeds the constants of the first published release in
-`amneziawg-install.sh`, downloads and verifies the archive on the target, and
-makes the BoringTun backend selectable.
+`amneziawg-install.sh` embeds the tag, asset names and SHA-256 values of the
+release it installs, currently `boringtun-cli-0.7.1-g71d88784ad29-b1`. Moving
+the installer to a newer release is a separate change of those constants, with
+its own upgrade and rollback evidence; a candidate or even a published release
+of a newer pin does not change what the installer downloads. The tests check
+those constants only against themselves and against the public release they
+name, never against `pin.env` or `release.env` (see
+[Three contracts](#three-contracts)).
