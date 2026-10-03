@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Unit tests for the BoringTun host installation of amneziawg-install.sh: the
-# embedded public release and its agreement with the release contract, the
+# internal consistency of the embedded public release, the
 # download-and-verify transaction, the atomic store install, the proxy,
 # web-panel and kernel-module guards, package selection, the preflight, the
 # order of a fresh install, and the BoringTun part of uninstall. Nothing here
@@ -16,8 +16,6 @@ set -uo pipefail
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 INSTALLER="${PROJECT_ROOT}/amneziawg-install.sh"
-RELEASE_CONTRACT="${PROJECT_ROOT}/packaging/boringtun/release.env"
-PIN_FILE="${PROJECT_ROOT}/packaging/boringtun/pin.env"
 
 # Every path the suite touches is redirected below its private test root, and
 # still it refuses root outside a disposable host, before anything is sourced:
@@ -36,6 +34,8 @@ done
 
 # shellcheck source=../amneziawg-install.sh
 source "${INSTALLER}"
+# shellcheck source=helpers/boringtun-contracts.sh
+source "${SCRIPT_DIR}/helpers/boringtun-contracts.sh"
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/boringtun-host-tests.XXXXXX")"
 T="$(CDPATH='' cd -- "${T}" && pwd -P)"
@@ -120,44 +120,87 @@ run() {
 	ERR="$(cat "${T}/err")"
 }
 
-# A value from a KEY=VALUE contract file, read as data.
-contract_value() { # <file> <key>
-	sed -n "s/^$2=//p" "$1"
-}
-
-echo "=== The embedded release matches the release contract ==="
-for PAIR in \
-	TAG:BORINGTUN_RELEASE_TAG \
-	VERSION:BORINGTUN_RELEASE_VERSION \
-	SOURCE_COMMIT:BORINGTUN_RELEASE_SOURCE_COMMIT \
-	ASSET_X86_64:BORINGTUN_RELEASE_ASSET_X86_64 \
-	ARCHIVE_SHA256_X86_64:BORINGTUN_RELEASE_ARCHIVE_SHA256_X86_64 \
-	BINARY_SHA256_X86_64:BORINGTUN_RELEASE_BINARY_SHA256_X86_64 \
-	ASSET_AARCH64:BORINGTUN_RELEASE_ASSET_AARCH64 \
-	ARCHIVE_SHA256_AARCH64:BORINGTUN_RELEASE_ARCHIVE_SHA256_AARCH64 \
-	BINARY_SHA256_AARCH64:BORINGTUN_RELEASE_BINARY_SHA256_AARCH64; do
-	EMBEDDED_NAME="AWG_BT_RELEASE_${PAIR%%:*}"
-	CONTRACT_VALUE="$(contract_value "${RELEASE_CONTRACT}" "${PAIR#*:}")"
-	if [[ -n "${CONTRACT_VALUE}" && "${!EMBEDDED_NAME}" == "${CONTRACT_VALUE}" ]]; then
-		ok "${EMBEDDED_NAME} equals ${PAIR#*:} in release.env (${CONTRACT_VALUE})"
-	else
-		not_ok "${EMBEDDED_NAME} (${!EMBEDDED_NAME}) equals ${PAIR#*:} in release.env (${CONTRACT_VALUE})"
-	fi
+echo "=== The embedded installer release is internally consistent ==="
+# AWG_BT_RELEASE_* name the published release this installer downloads and
+# trusts. They are checked on their own terms and never against
+# packaging/boringtun/pin.env or release.env: those describe the release being
+# built, prepared or published, which an installer adopts only in a later,
+# separate change, so they may name a newer release (candidate or approved)
+# than the one embedded here. tests/test-boringtun-public-release.sh proves in
+# CI that the embedded release is public with exactly these bytes.
+assert_eq "" "$(btc_embedded_release_problems "${INSTALLER}")" \
+	"the embedded tag, URL, asset names and hashes all follow from the embedded version, commit and build"
+for NAME in ${BTC_EMBEDDED_NAMES}; do
+	VAR="AWG_BT_RELEASE_${NAME}"
+	assert_eq "$(btc_embedded_value "${INSTALLER}" "${NAME}")" "${!VAR}" "the sourced ${VAR} is the embedded value"
 done
-assert_eq "approved" "$(contract_value "${RELEASE_CONTRACT}" BORINGTUN_RELEASE_STATE)" \
-	"the embedded release is the approved (published) one"
-assert_eq "$(contract_value "${PIN_FILE}" BORINGTUN_REPOSITORY)" "${AWG_BT_RELEASE_SOURCE_REPOSITORY}" \
-	"the embedded source repository is the pinned one"
-assert_eq "$(contract_value "${PIN_FILE}" BORINGTUN_COMMIT)" "${AWG_BT_RELEASE_SOURCE_COMMIT}" \
-	"the embedded source commit is the pinned one"
-assert_eq "$(contract_value "${PIN_FILE}" BORINGTUN_VERSION)" "${AWG_BT_RELEASE_VERSION}" \
-	"the embedded version is the pinned one"
+assert_true "the embedded version is a release version" \
+	eval '[[ "${AWG_BT_RELEASE_VERSION}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]'
+assert_eq "https://github.com/Wiresock-Foundation/wiresock-boringtun" "${AWG_BT_RELEASE_SOURCE_REPOSITORY}" \
+	"the embedded release was built from WireSock BoringTun"
+assert_true "the embedded source commit is a full commit SHA" eval '[[ "${AWG_BT_RELEASE_SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]'
+assert_true "the embedded build is a positive integer" eval '[[ "${AWG_BT_RELEASE_BUILD}" =~ ^[1-9][0-9]*$ ]]'
+assert_eq "boringtun-cli-${AWG_BT_RELEASE_VERSION}-g${AWG_BT_RELEASE_SOURCE_COMMIT:0:12}-b${AWG_BT_RELEASE_BUILD}" "${AWG_BT_RELEASE_TAG}" \
+	"the embedded tag follows from the embedded version, commit and build"
 assert_eq "https://github.com/wiresock/amneziawg-install/releases/download/${AWG_BT_RELEASE_TAG}" "${AWG_BT_RELEASE_BASE_URL}" \
 	"downloads come from exactly this repository's release of that tag, over HTTPS"
 assert_eq "boringtun-cli-${AWG_BT_RELEASE_VERSION}-g${AWG_BT_RELEASE_SOURCE_COMMIT:0:12}-linux-x86_64-musl.tar.gz" \
 	"${AWG_BT_RELEASE_ASSET_X86_64}" "the x86_64 asset name follows from the version and commit"
 assert_eq "boringtun-cli-${AWG_BT_RELEASE_VERSION}-g${AWG_BT_RELEASE_SOURCE_COMMIT:0:12}-linux-aarch64-musl.tar.gz" \
 	"${AWG_BT_RELEASE_ASSET_AARCH64}" "the aarch64 asset name follows from the version and commit"
+for NAME in ARCHIVE_SHA256_X86_64 BINARY_SHA256_X86_64 ARCHIVE_SHA256_AARCH64 BINARY_SHA256_AARCH64; do
+	VAR="AWG_BT_RELEASE_${NAME}"
+	assert_true "${VAR} is a lowercase SHA-256" eval '[[ "${!VAR}" =~ ^[0-9a-f]{64}$ ]]'
+done
+assert_eq "4" "$(printf '%s\n' "${AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64}" "${AWG_BT_RELEASE_BINARY_SHA256_X86_64}" \
+	"${AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64}" "${AWG_BT_RELEASE_BINARY_SHA256_AARCH64}" | sort -u | wc -l)" \
+	"the two archives and the two binaries have four different embedded hashes"
+
+# An installer whose embedded release is not internally consistent fails the
+# check above: one AWG_BT_RELEASE_* value changed in a copy of this installer.
+inconsistent_installer() { # <label> <expected problem> <NAME> <value>
+	sed "s|^AWG_BT_RELEASE_$3=.*\$|AWG_BT_RELEASE_$3=\"$4\"|" "${INSTALLER}" >"${T}/inconsistent-installer.sh"
+	assert_contains "$2" "$(btc_embedded_release_problems "${T}/inconsistent-installer.sh")" "$1"
+}
+C12="${AWG_BT_RELEASE_SOURCE_COMMIT:0:12}"
+inconsistent_installer "a tag of another build is inconsistent" "AWG_BT_RELEASE_TAG" \
+	TAG "boringtun-cli-${AWG_BT_RELEASE_VERSION}-g${C12}-b$((AWG_BT_RELEASE_BUILD + 1))"
+inconsistent_installer "a tag of another commit is inconsistent" "AWG_BT_RELEASE_TAG" \
+	TAG "boringtun-cli-${AWG_BT_RELEASE_VERSION}-gfedcba987654-b${AWG_BT_RELEASE_BUILD}"
+inconsistent_installer "a download URL of another tag is inconsistent" "AWG_BT_RELEASE_BASE_URL" \
+	BASE_URL "https://github.com/wiresock/amneziawg-install/releases/download/boringtun-cli-0.0.1-gfedcba987654-b1"
+inconsistent_installer "a latest-release URL is inconsistent" "AWG_BT_RELEASE_BASE_URL" \
+	BASE_URL "https://github.com/wiresock/amneziawg-install/releases/latest/download"
+inconsistent_installer "a download URL of another repository is inconsistent" "AWG_BT_RELEASE_BASE_URL" \
+	BASE_URL "https://github.com/example/amneziawg-install/releases/download/${AWG_BT_RELEASE_TAG}"
+inconsistent_installer "a plain-HTTP download URL is inconsistent" "AWG_BT_RELEASE_BASE_URL" \
+	BASE_URL "http://github.com/wiresock/amneziawg-install/releases/download/${AWG_BT_RELEASE_TAG}"
+inconsistent_installer "the aarch64 asset as the x86_64 asset is inconsistent" "AWG_BT_RELEASE_ASSET_X86_64" \
+	ASSET_X86_64 "${AWG_BT_RELEASE_ASSET_AARCH64}"
+inconsistent_installer "an asset of another commit is inconsistent" "AWG_BT_RELEASE_ASSET_AARCH64" \
+	ASSET_AARCH64 "boringtun-cli-${AWG_BT_RELEASE_VERSION}-gfedcba987654-linux-aarch64-musl.tar.gz"
+inconsistent_installer "an asset of another version is inconsistent" "AWG_BT_RELEASE_ASSET_X86_64" \
+	ASSET_X86_64 "boringtun-cli-9.9.9-g${C12}-linux-x86_64-musl.tar.gz"
+inconsistent_installer "a short source commit is inconsistent" "AWG_BT_RELEASE_SOURCE_COMMIT" SOURCE_COMMIT "${C12}"
+inconsistent_installer "an uppercase source commit is inconsistent" "AWG_BT_RELEASE_SOURCE_COMMIT" \
+	SOURCE_COMMIT "${AWG_BT_RELEASE_SOURCE_COMMIT^^}"
+inconsistent_installer "another source repository is inconsistent" "AWG_BT_RELEASE_SOURCE_REPOSITORY" \
+	SOURCE_REPOSITORY "https://github.com/cloudflare/boringtun"
+inconsistent_installer "build 0 is inconsistent" "AWG_BT_RELEASE_BUILD" BUILD 0
+inconsistent_installer "a non-release version is inconsistent" "AWG_BT_RELEASE_VERSION" VERSION "0.7"
+inconsistent_installer "an uppercase archive hash is inconsistent" "AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64" \
+	ARCHIVE_SHA256_X86_64 "${AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64^^}"
+inconsistent_installer "a short binary hash is inconsistent" "AWG_BT_RELEASE_BINARY_SHA256_AARCH64" \
+	BINARY_SHA256_AARCH64 "${AWG_BT_RELEASE_BINARY_SHA256_AARCH64:1}"
+inconsistent_installer "the x86_64 binary hash for aarch64 is inconsistent" "not four different values" \
+	BINARY_SHA256_AARCH64 "${AWG_BT_RELEASE_BINARY_SHA256_X86_64}"
+inconsistent_installer "the archive hash as the binary hash is inconsistent" "not four different values" \
+	BINARY_SHA256_X86_64 "${AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64}"
+sed "/^AWG_BT_RELEASE_TAG=/p" "${INSTALLER}" >"${T}/inconsistent-installer.sh"
+assert_contains "AWG_BT_RELEASE_TAG is assigned 2 times, not once" "$(btc_embedded_release_problems "${T}/inconsistent-installer.sh")" \
+	"a repeated assignment is inconsistent"
+rm -f -- "${T}/inconsistent-installer.sh"
+
 assert_eq "0" "$(grep -cE 'releases/latest|api\.github\.com|actions/artifacts' "${INSTALLER}")" \
 	"the installer never looks up a latest release, the GitHub API or Actions artifacts"
 assert_eq "1" "$(grep -c "^AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST=\"boringtun-host-v1\"$" "${INSTALLER}")" \
@@ -188,10 +231,20 @@ run _awgBtSelectRelease x86_64
 _awgBtSelectRelease x86_64
 assert_eq "${AWG_BT_RELEASE_ASSET_X86_64} ${AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64} ${AWG_BT_RELEASE_BINARY_SHA256_X86_64}" \
 	"${_AWG_BT_REL_ASSET} ${_AWG_BT_REL_ARCHIVE_SHA256} ${_AWG_BT_REL_BINARY_SHA256}" "x86_64 selects the x86_64 asset and hashes"
-assert_eq "${AWG_BT_RELEASE_ASSET_X86_64%.tar.gz}" "${_AWG_BT_REL_ID}" "the release id is the archive's top-level directory"
+assert_eq "${AWG_BT_RELEASE_ASSET_X86_64%.tar.gz}" "${_AWG_BT_REL_ARCHIVE_ID}" "the archive id is the x86_64 archive's top-level directory"
+# The store id of the embedded release: build 1 keeps the archive's name that
+# every earlier installer gave it, a later build adds -b<build>.
+embedded_store_id() { # <arch>
+	local BUILD_PART=""
+	[[ "${AWG_BT_RELEASE_BUILD}" == 1 ]] || BUILD_PART="-b${AWG_BT_RELEASE_BUILD}"
+	printf 'boringtun-cli-%s-g%s%s-linux-%s-musl' "${AWG_BT_RELEASE_VERSION}" "${AWG_BT_RELEASE_SOURCE_COMMIT:0:12}" "${BUILD_PART}" "$1"
+}
+assert_eq "$(embedded_store_id x86_64)" "${_AWG_BT_REL_ID}" "the x86_64 store id follows from the embedded version, commit and build"
 _awgBtSelectRelease aarch64
 assert_eq "${AWG_BT_RELEASE_ASSET_AARCH64} ${AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64} ${AWG_BT_RELEASE_BINARY_SHA256_AARCH64}" \
 	"${_AWG_BT_REL_ASSET} ${_AWG_BT_REL_ARCHIVE_SHA256} ${_AWG_BT_REL_BINARY_SHA256}" "aarch64 selects the aarch64 asset and hashes"
+assert_eq "${AWG_BT_RELEASE_ASSET_AARCH64%.tar.gz}" "${_AWG_BT_REL_ARCHIVE_ID}" "the archive id is the aarch64 archive's top-level directory"
+assert_eq "$(embedded_store_id aarch64)" "${_AWG_BT_REL_ID}" "the aarch64 store id follows from the embedded version, commit and build"
 run _awgBtSelectRelease armv7l
 assert_rc 1 "${RC}" "no release is selected for another architecture"
 

@@ -78,8 +78,14 @@ AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"
 # The immutable public BoringTun release that fresh BoringTun installs download.
 # These values are the installer's only trust anchor for the binary: they are
 # embedded here, never read from the network, the environment or a file.
-# tests/test-boringtun-host.sh keeps them equal to the release contract,
-# packaging/boringtun/release.env, and to packaging/boringtun/pin.env.
+# They name an already published release and are deliberately independent of
+# packaging/boringtun/pin.env (the source the artifact pipeline builds) and
+# packaging/boringtun/release.env (the release being prepared or published):
+# a new release is built, approved and published first, and this installer
+# adopts it only in a later, separate change of these values, so until then
+# they name an earlier release. tests/test-boringtun-host.sh checks that they
+# are internally consistent, and tests/test-boringtun-public-release.sh that
+# the release is public with exactly these bytes.
 AWG_BT_RELEASE_TAG="boringtun-cli-0.7.1-g71d88784ad29-b1"
 AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/amneziawg-install/releases/download/boringtun-cli-0.7.1-g71d88784ad29-b1"
 AWG_BT_RELEASE_VERSION="0.7.1"

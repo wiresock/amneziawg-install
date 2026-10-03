@@ -21,7 +21,6 @@ set -uo pipefail
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 INSTALLER="${PROJECT_ROOT}/amneziawg-install.sh"
-RELEASE_CONTRACT="${PROJECT_ROOT}/packaging/boringtun/release.env"
 
 if [[ "${EUID}" -eq 0 && "${AWG_DISPOSABLE_HOST_TEST:-}" != 1 ]]; then
 	echo "ERROR: run the BoringTun lifecycle tests as an unprivileged user; as root they run only on a disposable host with AWG_DISPOSABLE_HOST_TEST=1" >&2
@@ -33,6 +32,8 @@ source "${INSTALLER}"
 
 # The real embedded release, before the fixtures replace it.
 REAL_TAG="${AWG_BT_RELEASE_TAG}"
+REAL_VERSION="${AWG_BT_RELEASE_VERSION}"
+REAL_COMMIT="${AWG_BT_RELEASE_SOURCE_COMMIT}"
 REAL_BUILD="${AWG_BT_RELEASE_BUILD}"
 REAL_ASSET_X86_64="${AWG_BT_RELEASE_ASSET_X86_64}"
 REAL_ASSET_AARCH64="${AWG_BT_RELEASE_ASSET_AARCH64}"
@@ -500,12 +501,13 @@ restarts() { grep -c '^restart current=' "${S}/log"; }
 work_dirs() { find "${T}/tmp" -maxdepth 1 -name 'amneziawg-boringtun-lifecycle.*' | wc -l; }
 
 echo "=== Release identity ==="
-assert_eq "$(sed -n 's/^BORINGTUN_RELEASE_BUILD=//p' "${RELEASE_CONTRACT}")" "${REAL_BUILD}" \
-	"the embedded build number is release.env's BORINGTUN_RELEASE_BUILD"
+# The installer's embedded release, on its own terms: release.env describes the
+# release being prepared, which this installer may not have adopted yet.
+assert_true "the embedded build number is a positive integer" eval '[[ "${REAL_BUILD}" =~ ^[1-9][0-9]*$ ]]'
 assert_eq "b${REAL_BUILD}" "${REAL_TAG##*-g*-}" "the embedded tag ends with that build"
-assert_eq "${REAL_ASSET_X86_64%.tar.gz}" "$(_awgBtReleaseStoreId "$(sed -n 's/^BORINGTUN_RELEASE_VERSION=//p' "${RELEASE_CONTRACT}")" "$(sed -n 's/^BORINGTUN_RELEASE_SOURCE_COMMIT=//p' "${RELEASE_CONTRACT}")" "${REAL_BUILD}" x86_64)" \
+assert_eq "${REAL_ASSET_X86_64%.tar.gz}" "$(_awgBtReleaseStoreId "${REAL_VERSION}" "${REAL_COMMIT}" "${REAL_BUILD}" x86_64)" \
 	"the published build 1 keeps the store name PR 4 and PR 5 installs gave it (x86_64)"
-assert_eq "${REAL_ASSET_AARCH64%.tar.gz}" "$(_awgBtReleaseStoreId "$(sed -n 's/^BORINGTUN_RELEASE_VERSION=//p' "${RELEASE_CONTRACT}")" "$(sed -n 's/^BORINGTUN_RELEASE_SOURCE_COMMIT=//p' "${RELEASE_CONTRACT}")" "${REAL_BUILD}" aarch64)" \
+assert_eq "${REAL_ASSET_AARCH64%.tar.gz}" "$(_awgBtReleaseStoreId "${REAL_VERSION}" "${REAL_COMMIT}" "${REAL_BUILD}" aarch64)" \
 	"  (aarch64)"
 assert_eq "boringtun-cli-0.7.1-g111111111111-linux-x86_64-musl" "$(_awgBtReleaseStoreId 0.7.1 "${COMMIT_X}" 1 x86_64)" "build 1 has no build component"
 assert_eq "boringtun-cli-0.7.1-g111111111111-b2-linux-x86_64-musl" "$(_awgBtReleaseStoreId 0.7.1 "${COMMIT_X}" 2 x86_64)" "build 2 names its build"

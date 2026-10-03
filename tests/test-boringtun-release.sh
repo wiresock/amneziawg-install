@@ -2,7 +2,9 @@
 
 # Unit tests for scripts/boringtun-release.sh, the required-notices check of
 # scripts/boringtun-artifact.sh and the static shape of the BoringTun Artifacts
-# and BoringTun Release workflows. Nothing here talks to GitHub: fixture archives
+# and BoringTun Release workflows, and that a candidate or approved release
+# contract is valid beside an installer that still embeds an earlier
+# release. Nothing here talks to GitHub: fixture archives
 # stand in for the build (with minimal ELF headers for the binaries), and mocks
 # for gh and curl record every call, so a dry run can be shown to change nothing.
 
@@ -14,6 +16,8 @@ RELEASE_SCRIPT="${PROJECT_ROOT}/scripts/boringtun-release.sh"
 ARTIFACT_SCRIPT="${PROJECT_ROOT}/scripts/boringtun-artifact.sh"
 RELEASE_WORKFLOW="${PROJECT_ROOT}/.github/workflows/boringtun-release.yml"
 ARTIFACTS_WORKFLOW="${PROJECT_ROOT}/.github/workflows/boringtun-artifacts.yml"
+# shellcheck source=helpers/boringtun-contracts.sh
+source "${SCRIPT_DIR}/helpers/boringtun-contracts.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/boringtun-release-tests.XXXXXX")"
 TEST_ROOT="$(CDPATH='' cd -- "${TEST_ROOT}" && pwd -P)"
 BIN_DIR="${TEST_ROOT}/bin"
@@ -568,6 +572,112 @@ if grep -qE '^BORINGTUN_RELEASE_STATE=(candidate|approved)$' "${PROJECT_ROOT}/pa
 else
 	not_ok "the repository's release contract is valid against the repository's pin"
 fi
+
+echo "=== Release preparation is independent of the installer's release ==="
+# A release is prepared (candidate), approved and published before any
+# installer uses it; an installer adopts it later, in a separate change of its
+# AWG_BT_RELEASE_* constants. In between, pin.env and release.env describe the
+# new build while amneziawg-install.sh still embeds an earlier published one,
+# and every stage must be valid as it is: the contract against the pin, the
+# pin's commit only in pin.env and release.env, and the installer's embedded
+# release on its own terms (tests/helpers/boringtun-contracts.sh).
+OTHER_COMMIT="fedcba9876543210fedcba9876543210fedcba98"
+# An installer that embeds one release: build <build> of <commit> with the
+# archive and binary hashes for x86_64, then for aarch64.
+write_embedded_installer() { # <file> <commit> <build> <x86_64 archive> <x86_64 binary> <aarch64 archive> <aarch64 binary>
+	local STEM="boringtun-cli-0.7.1-g${2:0:12}"
+	{
+		printf '#!/usr/bin/env bash\n# fixture installer: only the embedded release\n'
+		printf 'AWG_BT_RELEASE_TAG="%s-b%s"\n' "${STEM}" "$3"
+		printf 'AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/amneziawg-install/releases/download/%s-b%s"\n' "${STEM}" "$3"
+		printf 'AWG_BT_RELEASE_VERSION="0.7.1"\n'
+		printf 'AWG_BT_RELEASE_SOURCE_REPOSITORY="https://github.com/Wiresock-Foundation/wiresock-boringtun"\n'
+		printf 'AWG_BT_RELEASE_SOURCE_COMMIT="%s"\n' "$2"
+		printf 'AWG_BT_RELEASE_BUILD="%s"\n' "$3"
+		printf 'AWG_BT_RELEASE_ASSET_X86_64="%s-linux-x86_64-musl.tar.gz"\n' "${STEM}"
+		printf 'AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64="%s"\n' "$4"
+		printf 'AWG_BT_RELEASE_BINARY_SHA256_X86_64="%s"\n' "$5"
+		printf 'AWG_BT_RELEASE_ASSET_AARCH64="%s-linux-aarch64-musl.tar.gz"\n' "${STEM}"
+		printf 'AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64="%s"\n' "$6"
+		printf 'AWG_BT_RELEASE_BINARY_SHA256_AARCH64="%s"\n' "$7"
+	} >"$1"
+}
+# A repository tree for one stage: the pin, the current contract and an
+# installer, as the checks of the three contracts see them.
+make_stage() { # <name> <pin file> <installer>
+	STAGE_ROOT="${TEST_ROOT}/stages/$1"
+	mkdir -p "${STAGE_ROOT}/packaging/boringtun"
+	cp -- "$2" "${STAGE_ROOT}/packaging/boringtun/pin.env"
+	cp -- "${CONTRACT}" "${STAGE_ROOT}/packaging/boringtun/release.env"
+	cp -- "$3" "${STAGE_ROOT}/amneziawg-install.sh"
+}
+# Every check of every contract for a stage tree, against its own pin.
+check_stage() { # <label> <pin commit>
+	local PIN="${STAGE_ROOT}/packaging/boringtun/pin.env"
+	env BORINGTUN_PIN_FILE="${PIN}" BORINGTUN_RELEASE_FILE="${STAGE_ROOT}/packaging/boringtun/release.env" \
+		bash "${RELEASE_SCRIPT}" contract >"${TEST_ROOT}/run.out" 2>"${TEST_ROOT}/run.err"
+	RUN_RC=$?
+	RUN_ERR="$(cat "${TEST_ROOT}/run.err")"
+	assert_succeeds "$1: the release contract is valid against the pin"
+	assert_eq "" "$(btc_pin_commit_problems "${STAGE_ROOT}" "$2")" "$1: the pinned commit is only in pin.env and release.env"
+	assert_eq "" "$(btc_embedded_release_problems "${STAGE_ROOT}/amneziawg-install.sh")" \
+		"$1: the installer's embedded release is internally consistent"
+}
+FIXTURE_INSTALLER="${TEST_ROOT}/fixture-installer.sh"
+write_embedded_installer "${FIXTURE_INSTALLER}" "${OTHER_COMMIT}" 1 \
+	"$(printf '%064d' 1)" "$(printf '%064d' 2)" "$(printf '%064d' 3)" "$(printf '%064d' 4)"
+for STATE in candidate approved; do
+	write_contract "${GOOD}" "BORINGTUN_RELEASE_STATE=${STATE}"
+	make_stage "${STATE}" "${PIN_FILE}" "${FIXTURE_INSTALLER}"
+	check_stage "a ${STATE} contract beside an installer that embeds another release" "${PIN_COMMIT}"
+	assert_true "  (the contract's tag is not the installer's)" test \
+		"$(sed -n 's/^BORINGTUN_RELEASE_TAG=//p' "${CONTRACT}")" != "$(btc_embedded_value "${FIXTURE_INSTALLER}" TAG)"
+done
+# The same stage once the installer has adopted the approved release, in its
+# own later change: the commit may then also be the installer's
+# AWG_BT_RELEASE_SOURCE_COMMIT, and only there.
+write_embedded_installer "${TEST_ROOT}/adopted-installer.sh" "${PIN_COMMIT}" 2 \
+	"$(sha_of "${GOOD}/${X_NAME}")" "$(binary_sha_of "${GOOD}/${X_NAME}")" \
+	"$(sha_of "${GOOD}/${A_NAME}")" "$(binary_sha_of "${GOOD}/${A_NAME}")"
+make_stage adopted "${PIN_FILE}" "${TEST_ROOT}/adopted-installer.sh"
+assert_eq "$(sed -n 's/^BORINGTUN_RELEASE_TAG=//p' "${CONTRACT}")" "$(btc_embedded_value "${TEST_ROOT}/adopted-installer.sh" TAG)" \
+	"  (the adopting installer embeds the contract's release)"
+check_stage "an approved contract that the installer has adopted" "${PIN_COMMIT}"
+printf '# %s\n' "${PIN_COMMIT}" >>"${STAGE_ROOT}/amneziawg-install.sh"
+assert_eq "amneziawg-install.sh repeats the pinned commit outside AWG_BT_RELEASE_SOURCE_COMMIT" \
+	"$(btc_pin_commit_problems "${STAGE_ROOT}" "${PIN_COMMIT}")" "  the installer may not repeat the pinned commit anywhere else"
+mkdir -p "${STAGE_ROOT}/.github/workflows"
+printf 'env:\n  COMMIT: %s\n' "${PIN_COMMIT}" >"${STAGE_ROOT}/.github/workflows/build.yml"
+assert_true "  nor may a workflow" grep -qxF ".github/workflows/build.yml repeats the pinned commit" \
+	<<<"$(btc_pin_commit_problems "${STAGE_ROOT}" "${PIN_COMMIT}")"
+
+# The repository's own pin and contract, approved, beside the repository's own
+# installer: the step from this repository's candidate to its approval.
+sed 's/^BORINGTUN_RELEASE_STATE=candidate$/BORINGTUN_RELEASE_STATE=approved/' \
+	"${PROJECT_ROOT}/packaging/boringtun/release.env" >"${CONTRACT}"
+make_stage repository-approved "${PROJECT_ROOT}/packaging/boringtun/pin.env" "${PROJECT_ROOT}/amneziawg-install.sh"
+assert_eq "BORINGTUN_RELEASE_STATE=approved" "$(grep '^BORINGTUN_RELEASE_STATE=' "${CONTRACT}")" \
+	"the repository's contract approved"
+check_stage "the repository's contract approved beside the repository's installer" \
+	"$(sed -n 's/^BORINGTUN_COMMIT=//p' "${PROJECT_ROOT}/packaging/boringtun/pin.env")"
+
+# Approval never loosens the contract's tie to the pin: an approved contract
+# that names the installer's release instead of the pin's is refused.
+write_contract "${GOOD}" BORINGTUN_RELEASE_STATE=approved "BORINGTUN_RELEASE_SOURCE_COMMIT=${OTHER_COMMIT}" \
+	"BORINGTUN_RELEASE_TAG=$(btc_embedded_value "${FIXTURE_INSTALLER}" TAG)" \
+	"BORINGTUN_RELEASE_ASSET_X86_64=$(btc_embedded_value "${FIXTURE_INSTALLER}" ASSET_X86_64)" \
+	"BORINGTUN_RELEASE_ASSET_AARCH64=$(btc_embedded_value "${FIXTURE_INSTALLER}" ASSET_AARCH64)"
+run_release contract
+assert_fails_with "but the pin is ${PIN_COMMIT}" "an approved contract for the installer's release instead of the pin's is refused"
+for STATE in candidate approved; do
+	write_contract "${GOOD}" "BORINGTUN_RELEASE_STATE=${STATE}" "BORINGTUN_RELEASE_VERSION=0.7.2"
+	run_release contract
+	assert_fails_with "but the pin is 0.7.1" "a ${STATE} contract for another version than the pin's is refused"
+	write_contract "${GOOD}" "BORINGTUN_RELEASE_STATE=${STATE}" "BORINGTUN_RELEASE_ARTIFACT_FORMAT=2"
+	run_release contract
+	assert_fails_with "is for artifact format 2, but the pin is 1" "a ${STATE} contract for another artifact format than the pin's is refused"
+done
+write_contract "${GOOD}"
 
 echo "=== Artifact set ==="
 
