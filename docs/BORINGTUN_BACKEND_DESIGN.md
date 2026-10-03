@@ -2507,8 +2507,22 @@ The kernel menu keeps its 7 options unchanged.
   `AUTO_INSTALL` with `sip`.
 - The live test (§18.3) cycles `dns` → `quic` → `sip` → `stun` → `none`. It
   records the prefixes of the server's datagrams on the client's side, where
-  `dns`, `quic` and `stun` must shape every one and `sip` must carry request
-  lines. It sends DNS, STUN, QUIC (reserved and v1) and SIP probes from the
+  `dns`, `quic` and `stun` must shape every one. For `sip` each datagram's
+  kind comes from its length and type tag, not from the prefix: handshake
+  responses and transport must carry a request line in every datagram when
+  their S (S2, S4) is 31 bytes or more and in none below it, as must cookie
+  replies (S3) when the server sent any. The checks fail closed
+  (`tests/helpers/boringtun-wire-checks.sh`): a datagram of no kind, of two
+  kinds or from a malformed IPv4/UDP frame fails, a malformed capture record
+  or incomplete helper output fails, and a capture or replay counts only if it
+  exits 0 with its completion marker; the host's capture must still be
+  running when it is stopped after the traffic. `tests/test-boringtun-sip-wire-live.sh`
+  then runs the verified binary as two peers with fixed sizes: the S2=26 S3=81
+  S4=22 layout of an earlier false failure, every S at 31 and at 30, and a
+  mixed layout, with cookie replies forced by a replayed initiation past the
+  handshake rate limit, and with controls on the real captures: appended
+  records of no kind or malformed evidence fail, and stripping or adding
+  request lines in one kind fails only that kind. It sends DNS, STUN, QUIC (reserved and v1) and SIP probes from the
   client's network and from loopback. It also adds and removes a client under
   imitation and moves to AWG 3.0 and back. The x86_64 job installs with the last
   installer before imitation (`9f5a1af`) and manages the host with this one.
