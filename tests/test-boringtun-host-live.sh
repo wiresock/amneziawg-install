@@ -182,6 +182,8 @@ peer_count() {
 # helpers/boringtun-live-firewall.sh: a failed query is never a result.
 # shellcheck source=helpers/boringtun-live-firewall.sh
 source "${SCRIPT_DIR}/helpers/boringtun-live-firewall.sh"
+# shellcheck source=helpers/boringtun-wire-checks.sh
+source "${SCRIPT_DIR}/helpers/boringtun-wire-checks.sh"
 fw_args() {
 	FW_ARGS=("/etc/amnezia/amneziawg/${IF}.conf" "${IF}" "${PORT}" "${PUBLIC_NIC}")
 }
@@ -212,6 +214,7 @@ cleanup() {
 	trap - EXIT
 	((FAILED == 0)) || dump_diagnostics
 	[[ -n "${CLIENT_PID}" ]] && kill "${CLIENT_PID}" 2>/dev/null
+	bt_wire_cleanup
 	local PID
 	for PID in "${LISTENER_PIDS[@]}"; do
 		kill "${PID}" 2>/dev/null
@@ -504,10 +507,6 @@ params_s() { # <S1|S2|S3|S4>
 params_h() { # <H1|H2|H3|H4>: a number or MIN-MAX
 	sed -n "s/^SERVER_AWG_$1='\\([0-9-]*\\)'\$/\\1/p" /etc/amnezia/amneziawg/params
 }
-# The S that prefixes a packet kind.
-sip_kind_s() { # <init|response|cookie|transport>
-	case "$1" in init) echo S1 ;; response) echo S2 ;; cookie) echo S3 ;; transport) echo S4 ;; esac
-}
 # The server's packet layout for the wire helper: S1-S4, then H1-H4.
 params_layout() {
 	printf '%s,%s,%s,%s,%s,%s,%s,%s' "$(params_s S1)" "$(params_s S2)" "$(params_s S3)" "$(params_s S4)" \
@@ -536,57 +535,51 @@ expect_probes() { # <imitation>
 # Data through the tunnel while the client's side records the prefixes of the
 # server's datagrams, which must have the imitation's shape.
 wire_prefixes() { # <imitation>
-	local CAPTURE="${WORK}/prefixes" PID COUNTS TOTAL MATCHING LAYOUT=() KINDS KIND SEEN SHAPED EXPECTED VERDICT
-	rm -f "${CAPTURE}"
+	local CAPTURE="${WORK}/prefixes" COUNTS TOTAL MATCHING LAYOUT=()
 	# SIP shapes each packet kind by its own S, so its capture records the
 	# kind of every datagram, decided from its length and type tag.
 	[[ "$1" != sip ]] || LAYOUT=("$(params_layout)")
-	ip netns exec "${NS}" python3 "${WIRE}" capture "${VETH_CLIENT}" "${HOST_ADDR}" "${PORT}" 45 "${CAPTURE}" "${LAYOUT[@]}" &
-	PID=$!
-	sleep 1
+	# The capture outlives the traffic and is stopped once the traffic has
+	# passed: one that ended on its own, failed, or did not stop cleanly did
+	# not observe the whole interval (tests/helpers/boringtun-wire-checks.sh).
+	if ! bt_wire_capture_start "${NS}" "${VETH_CLIENT}" "${HOST_ADDR}" "${PORT}" 300 "${CAPTURE}" "${LAYOUT[@]}"; then
+		bad "$1: the client-side capture started"
+		return
+	fi
 	datapath "$1 imitation"
-	kill "${PID}" 2>/dev/null
-	wait "${PID}" 2>/dev/null
-	COUNTS="$(python3 "${WIRE}" classify "$1" "${CAPTURE}")"
+	if bt_wire_capture_finish "${CAPTURE}" stop 10; then
+		ok "$1: the client-side capture recorded the whole traffic interval and stopped cleanly ($(wc -l <"${CAPTURE}") datagrams)"
+	else
+		bad "$1: the client-side capture recorded the whole traffic interval and stopped cleanly"
+		return
+	fi
+	if [[ "$1" == sip ]]; then
+		# Each kind on its own S: a request line needs a prefix of 31 bytes,
+		# so a kind whose S is 31 or more must carry one in every datagram
+		# and a shorter one in none. Responses and transport must be seen;
+		# the responder sends initiations and cookie replies only in
+		# exceptional cases, held to the same rule when they occur. The S
+		# sizes here are the installer's random ones;
+		# tests/test-boringtun-sip-wire-live.sh covers fixed sizes, the 30/31
+		# boundary and cookie replies.
+		bt_wire_assert_sip sip "${CAPTURE}" "$(params_s S1),$(params_s S2),$(params_s S3),$(params_s S4)" \
+			init:optional response:required cookie:optional transport:required &&
+			echo "    (sip: $(bt_wire_pooled_shaped) server datagrams carry a request line)"
+		return
+	fi
+	if ! COUNTS="$(python3 "${WIRE}" classify "$1" "${CAPTURE}")" || [[ ! "${COUNTS}" =~ ^(0|[1-9][0-9]*)\ (0|[1-9][0-9]*)$ ]]; then
+		bad "$1: the capture has a valid prefix count ('${COUNTS:-}')"
+		return
+	fi
 	read -r TOTAL MATCHING <<<"${COUNTS}"
 	echo "    ($1: ${MATCHING} of ${TOTAL} server datagrams have the imitation's prefix shape)"
 	case "$1" in
 		dns | stun | quic)
 			check "$1: every datagram the server sent has a $1-shaped S prefix (${MATCHING}/${TOTAL})" \
-				test "${TOTAL:-0}" -ge 10 -a "${MATCHING:-0}" -eq "${TOTAL:-0}"
-			;;
-		sip)
-			# Each kind on its own S: a request line needs a prefix of 31
-			# bytes, so a kind whose S is 31 or more must carry one in every
-			# datagram and a shorter one in none. The S sizes here are the
-			# installer's random ones; tests/test-boringtun-sip-wire-live.sh
-			# covers fixed sizes, the 30/31 boundary and cookie replies.
-			if ! KINDS="$(python3 "${WIRE}" kinds sip "${CAPTURE}" "$(params_s S1),$(params_s S2),$(params_s S3),$(params_s S4)")"; then
-				bad "sip: the server's datagrams could not be classified by packet kind"
-				return
-			fi
-			while read -r KIND SEEN SHAPED EXPECTED VERDICT; do
-				case "${KIND}" in
-					response | transport)
-						check "sip: ${KIND}s are ${EXPECTED} for S=$(params_s "$(sip_kind_s "${KIND}")") (${SHAPED}/${SEEN} shaped)" \
-							test "${VERDICT}" = ok
-						;;
-					init | cookie)
-						# The responder sends neither in ordinary traffic; if it
-						# did, they are held to the same rule.
-						if [[ "${VERDICT}" == unobserved ]]; then
-							echo "    (sip: no ${KIND} datagram from the server)"
-						else
-							check "sip: ${KIND}s are ${EXPECTED} for S=$(params_s "$(sip_kind_s "${KIND}")") (${SHAPED}/${SEEN} shaped)" \
-								test "${VERDICT}" = ok
-						fi
-						;;
-					unknown) echo "    (sip: ${SEEN} server datagrams of no packet kind)" ;;
-				esac
-			done <<<"${KINDS}"
+				test "${TOTAL}" -ge 10 -a "${MATCHING}" -eq "${TOTAL}"
 			;;
 		none)
-			check "none: the server sent datagrams (${TOTAL})" test "${TOTAL:-0}" -ge 10
+			check "none: the server sent datagrams (${TOTAL})" test "${TOTAL}" -ge 10
 			;;
 	esac
 }

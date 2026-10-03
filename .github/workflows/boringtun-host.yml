@@ -26,6 +26,7 @@ on:
       - tests/test-boringtun-public-release.sh
       - tests/test-boringtun-kernel-coexistence.sh
       - tests/helpers/boringtun-contracts.sh
+      - tests/helpers/boringtun-wire-checks.sh
       - tests/helpers/boringtun-live-firewall.sh
       - tests/helpers/boringtun-imitation-wire.py
       - tests/helpers/boringtun-lifecycle-fixture.sh
@@ -39,6 +40,7 @@ on:
       - tests/test-boringtun-public-release.sh
       - tests/test-boringtun-kernel-coexistence.sh
       - tests/helpers/boringtun-contracts.sh
+      - tests/helpers/boringtun-wire-checks.sh
       - tests/helpers/boringtun-live-firewall.sh
       - tests/helpers/boringtun-imitation-wire.py
       - tests/helpers/boringtun-lifecycle-fixture.sh
