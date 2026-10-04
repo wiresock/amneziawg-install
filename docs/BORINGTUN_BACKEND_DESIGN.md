@@ -2517,14 +2517,22 @@ The kernel menu keeps its 7 options unchanged.
   first fragment leaves unresolved, or one from a malformed IPv4/UDP frame
   fails, as does a malformed capture record or incomplete helper output. A
   later fragment counts only inside the datagram whose first fragment it
-  continues (same source, destination and IP ID, within 30 s). A capture
-  counts only if it exits 0 with its exact transcript: ready (naming itself)
-  before the traffic, still running after it, then stopped by the caller's
-  authorized SIGTERM or completed after its whole interval by the caller's
-  clock. That establishes an internally consistent record of what the packet
-  socket delivered, not that every datagram was received. Children are
-  tracked by PID and start time and signalled through a pidfd, so a reused
-  PID is never signalled or waited for. `tests/test-boringtun-sip-wire-live.sh`
+  continues (same source, destination and IP ID, within 30 s); one that says
+  more fragments follow must end before the declared payload does. A capture
+  counts only if it exits 0 with its exact transcript: ready (naming itself,
+  with its CLOCK_BOOTTIME reading) before the traffic, still running after
+  it, then stopped by the caller's authorized SIGTERM, or completed with an
+  end reading at least its interval after its ready reading, both readings
+  within the caller's own clock readings around them. The interval is the
+  capture's own: a slow start or a slow status collection is outside it. That
+  establishes an internally consistent record of what the packet socket
+  delivered, not that every datagram was received. Children are tracked by
+  PID and start time before they may run their command, and signalled
+  through a pidfd, so a reused PID is never signalled or waited for and an
+  interruption finds every running child tracked. The harness freezes each
+  child before ending it and removes the UAPI nodes that child is proven
+  (by `ss`) to hold, so a peer interrupted during its startup leaves no
+  socket behind. `tests/test-boringtun-sip-wire-live.sh`
   then runs the verified binary as two peers with fixed sizes: the S2=26 S3=81
   S4=22 layout of an earlier false failure, every S at 31 and at 30, and a
   mixed layout, with cookie replies forced by a replayed initiation past the
@@ -2533,7 +2541,8 @@ The kernel menu keeps its 7 options unchanged.
   request lines in one kind fails only that kind (accounting after
   classification, not capture completeness). Further controls use real
   processes: an unauthorized SIGTERM to the real capture, a PID reused in a
-  private PID namespace, and UAPI sockets the run does not own. The live
+  private PID namespace, UAPI sockets the run does not own, and one a child
+  of the run holds that the run had not yet recorded. The live
   test sends DNS, STUN, QUIC (reserved and v1) and SIP probes from the
   client's network and from loopback. It also adds and removes a client under
   imitation and moves to AWG 3.0 and back. The x86_64 job installs with the last

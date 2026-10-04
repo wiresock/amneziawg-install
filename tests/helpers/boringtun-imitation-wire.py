@@ -23,11 +23,13 @@
       the first 16 bytes of that S prefix are kept; "unknown", "ambiguous",
       "unresolved" and "malformed" keep none ("-"). The rest of each datagram
       is ciphertext and is never recorded. FILE.state is the transcript:
-      "ready <pid> <start time>" once the socket listens, then exactly one
-      end -- "complete <records>" at the deadline, "stopped <records> <token>"
-      after a SIGTERM that FILE.stop authorized (both exit 0), or
-      "interrupted <records>" after one it did not (exit 3). Any other end
-      leaves no end line and exits nonzero.
+      "ready <pid> <start time> <ready clock>" once the socket listens, then
+      exactly one end -- "complete <records> <end clock>" once SECONDS have
+      passed since the ready clock, "stopped <records> <token>" after a
+      SIGTERM that FILE.stop authorized (both exit 0), or "interrupted
+      <records>" after one it did not (exit 3). The clocks are CLOCK_BOOTTIME
+      in centiseconds, the clock of /proc/uptime. Any other end leaves no end
+      line and exits nonzero.
 
   classify <protocol> <file>
       For a capture without layout, print "<datagrams> <matching>": how many
@@ -59,10 +61,11 @@
       limit each copy without a cookie MAC draws a cookie reply. The datagram
       is held in memory only.
 
-  owned <pid> <start time> <check|TERM|KILL>
+  owned <pid> <start time> <check|TERM|KILL|STOP>
       Probe or signal the process with that PID only if it is still the one
       that recorded that start time, through a pidfd (owned): never a process
-      that was given the PID later.
+      that was given the PID later. STOP returns once every thread of it is
+      stopped.
 
 The probe formats are those the pinned BoringTun classifies
 (boringtun/src/noise/imitation/detect.rs at the pinned commit).
@@ -270,15 +273,18 @@ class Fragments:
 
     An entry is keyed by the IPv4 source, destination and identification --
     the IP ID alone names no datagram -- and keeps the datagram's IP payload
-    length (its UDP length) and the byte ranges seen. A later fragment is a
-    continuation only if it lies inside that payload, overlaps nothing seen,
-    carries a multiple of 8 bytes unless it is the last, and, if it is the
-    last, ends the payload exactly. An entry expires TIMEOUT seconds after its
-    first fragment (the Linux default ipfrag_time) and is dropped once every
-    byte is accounted for; after that the same key names no datagram. This is
-    bookkeeping, not reassembly: the bytes of later fragments are never
-    inspected, and a datagram whose later fragments never arrive is not
-    reported."""
+    length (its declared UDP length) and the byte ranges seen. A later
+    fragment is a continuation only if it lies inside that payload and
+    overlaps nothing seen; the last fragment (More Fragments clear) must end
+    the payload exactly, and any other must carry a multiple of 8 bytes and
+    end before the payload does, since the fragments it says will follow need
+    room. So only the last fragment can account for the payload's final
+    byte, in whatever order the fragments come, and an entry is retired once
+    every byte is accounted for, the last fragment included; after that the
+    same key names no datagram. An entry also expires TIMEOUT seconds after
+    its first fragment (the Linux default ipfrag_time). This is bookkeeping,
+    not reassembly: the bytes of later fragments are never inspected, and a
+    datagram whose later fragments never arrive is not reported."""
 
     TIMEOUT = 30.0
 
@@ -310,7 +316,9 @@ class Fragments:
             return False
         total, seen, _ = entry
         end = offset + length
-        if length == 0 or end > total or (last and end != total) or (not last and length % 8):
+        if length == 0:
+            return False
+        if (end != total) if last else (length % 8 or end >= total):
             return False
         if any(start < end and offset < stop for start, stop in seen):
             return False
@@ -416,21 +424,31 @@ def stop_token(path):
     return token if STOP_TOKEN.fullmatch(token) else None
 
 
+def boot_centiseconds(nanoseconds):
+    """A CLOCK_BOOTTIME reading in whole centiseconds, as /proc/uptime gives
+    the same clock to the shell."""
+    return nanoseconds // 10 ** 7
+
+
 def capture(interface, source, source_port, seconds, path, layout=None):
     """Record the relevant datagrams; return the exit status.
 
-    PATH.state is the transcript: "ready <pid> <start time>" once the socket
-    is bound, then exactly one end. At the deadline, "complete <records>"
-    (status 0). On SIGTERM, "stopped <records> <token>" (status 0) when
-    PATH.stop holds the caller's stop authorization, else "interrupted
-    <records>" (status 3): a TERM nobody authorized is not a controlled stop.
-    A PATH.stop that exists before the start is refused. Anything else -- an
-    exception, another signal -- leaves no end line and a nonzero status. A
-    record is always written whole: a stop is only acted on between records."""
+    PATH.state is the transcript: "ready <pid> <start time> <ready clock>"
+    once the socket is bound, then exactly one end. The clock is CLOCK_BOOTTIME
+    in centiseconds, the clock of /proc/uptime, read when the capture is ready;
+    its deadline is SECONDS after that reading. At the deadline, "complete
+    <records> <end clock>" (status 0), the end clock read once the deadline
+    has passed: the end clock is at least SECONDS later than the ready clock.
+    On SIGTERM, "stopped <records> <token>" (status 0) when PATH.stop holds
+    the caller's stop authorization, else "interrupted <records>" (status 3):
+    a TERM nobody authorized is not a controlled stop. A PATH.stop that exists
+    before the start is refused. Anything else -- an exception, another
+    signal -- leaves no end line and a nonzero status. A record is always
+    written whole: a stop is only acted on between records."""
     sizes, ranges = parse_layout(layout) if layout else (None, None)
     wanted_source = socket.inet_aton(source)
     wanted_port = parse_number(source_port, "port", 65535)
-    duration = float(parse_number(seconds, "capture seconds", 86400))
+    duration = parse_number(seconds, "capture seconds", 86400) * 10 ** 9
     state_path, stop_path = path + ".state", path + ".stop"
     if os.path.lexists(stop_path):
         raise InputError("%s exists before the capture started" % stop_path)
@@ -444,13 +462,14 @@ def capture(interface, source, source_port, seconds, path, layout=None):
     fragments = Fragments()
     records = 0
     with open(path, "w") as out:
-        write_state(state_path, "ready %d %d" % own_identity())
-        deadline = time.monotonic() + duration
+        ready = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        write_state(state_path, "ready %d %d %d" % (own_identity() + (boot_centiseconds(ready),)))
+        deadline = ready + duration
         while not stop:
-            left = deadline - time.monotonic()
+            left = deadline - time.clock_gettime_ns(time.CLOCK_BOOTTIME)
             if left <= 0:
                 break
-            readable = select.select([sock, wake_read], [], [], left)[0]
+            readable = select.select([sock, wake_read], [], [], left / 10 ** 9)[0]
             if wake_read in readable:
                 os.read(wake_read, 64)
             if sock not in readable:
@@ -465,7 +484,8 @@ def capture(interface, source, source_port, seconds, path, layout=None):
                 out.flush()
                 records += 1
     if not stop:
-        write_state(state_path, "complete %d" % records)
+        end = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME))
+        write_state(state_path, "complete %d %d" % (records, end))
         return 0
     token = stop_token(stop_path)
     if token is None:
@@ -517,7 +537,22 @@ def replay(interface, client, server, server_port, layout, count, seconds):
     return 0
 
 
-OWNED_ACTIONS = {"check": None, "TERM": signal.SIGTERM, "KILL": signal.SIGKILL}
+OWNED_ACTIONS = {"check": None, "TERM": signal.SIGTERM, "KILL": signal.SIGKILL, "STOP": signal.SIGSTOP}
+
+
+def all_stopped(fd, pid, start):
+    """Whether every thread of the process behind the pidfd FD is stopped;
+    None once it has exited (the pidfd turns readable) or its PID names
+    another process."""
+    if select.select([fd], [], [], 0)[0]:
+        return None
+    try:
+        states = [stat_fields("/proc/%d/task/%s/stat" % (pid, task))[0] for task in os.listdir("/proc/%d/task" % pid)]
+        if int(stat_fields("/proc/%d/stat" % pid)[19]) != start:
+            return None
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return bool(states) and all(state in ("T", "t") for state in states)
 
 
 def owned(pid_text, start_text, action):
@@ -526,12 +561,14 @@ def owned(pid_text, start_text, action):
     process that was given the same PID later. A pidfd is opened first and the
     identity checked through /proc afterwards: an open pidfd refers to one
     process, so a signal sent through it reaches that process or nothing.
-    Prints "running" or "signalled" (exit 0), or "gone", "replaced" or
-    "exited" (exit 1)."""
+    STOP also waits, up to 2 s, until every thread of it is stopped: it can
+    then change nothing until it is continued or killed. Prints "running",
+    "signalled" or "stopped" (exit 0), or "gone", "replaced", "exited" or,
+    for a STOP not seen to take hold, "running" (exit 1)."""
     pid = parse_number(pid_text, "PID", 4194304)
     start = parse_number(start_text, "start time", 2 ** 62, WIDE_NUMBER)
     if action not in OWNED_ACTIONS:
-        raise InputError("the action is check, TERM or KILL, not %r" % action)
+        raise InputError("the action is check, TERM, KILL or STOP, not %r" % action)
     try:
         fd = os.pidfd_open(pid)
     except ProcessLookupError:
@@ -557,8 +594,22 @@ def owned(pid_text, start_text, action):
         except ProcessLookupError:
             print("exited")
             return 1
-        print("signalled")
-        return 0
+        if action != "STOP":
+            print("signalled")
+            return 0
+        deadline = time.monotonic() + 2
+        while True:
+            stopped = all_stopped(fd, pid, start)
+            if stopped is None:
+                print("exited")
+                return 1
+            if stopped:
+                print("stopped")
+                return 0
+            if time.monotonic() > deadline:
+                print("running")
+                return 1
+            time.sleep(0.005)
     finally:
         os.close(fd)
 

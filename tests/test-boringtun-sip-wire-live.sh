@@ -26,9 +26,10 @@
 # The scenarios: the S sizes of the recorded follow-up C failure (S1=29 S2=26
 # S3=81 S4=22) without and with cookie replies, every server S at 31, every
 # server S at 30, and a mixed layout with an ordinary S4 of 45. Each capture
-# must be ready before its traffic, outlive it, run its whole interval and
-# complete, and each replay must finish; both must exit 0 with their exact
-# transcripts (tests/helpers/boringtun-wire-checks.sh). Every recorded
+# must be ready before its traffic, outlive it, run its whole interval (by
+# its own boot-time clock, from ready to complete) and complete, and each
+# replay must finish; both must exit 0 with their exact transcripts
+# (tests/helpers/boringtun-wire-checks.sh). Every recorded
 # relevant datagram must then be classified and follow its kind's rule; that
 # holds what the packet socket delivered, which is not proof that nothing
 # escaped it. Controls on the real captures then show that an unknown,
@@ -38,14 +39,17 @@
 # change records that are already classified: they prove the per-kind
 # accounting, not that a capture is complete. Further controls use real
 # processes: a SIGTERM that reaches the real capture before its authorized
-# stop fails the capture check; in a PID namespace of its own (unshare), a
-# tracked child's PID, reaped by the shell and given to another process,
-# leads the tracker neither to signal nor to wait for that process; and a
-# UAPI socket this run did not create, or one replaced since, is left alone.
+# stop fails the capture check; a SIGTERM while a namespace is being made
+# ends the run only once that namespace is recorded; in a PID namespace of
+# its own (unshare), a tracked child's PID, reaped by the shell and given to
+# another process, leads the tracker neither to signal nor to wait for that
+# process; a UAPI socket this run did not create, or one replaced since, is
+# left alone; and one that a child of this run holds but this run had not
+# yet recorded is removed with that child.
 #
-# Requirements: root, ip (iproute2) with network namespaces, /dev/net/tun,
-# awg (amneziawg-tools), ping, python3, unshare (util-linux), and
-# AWG_DISPOSABLE_HOST_TEST=1. With
+# Requirements: root, ip and ss (iproute2) with network namespaces,
+# /dev/net/tun, awg (amneziawg-tools), ping, python3, unshare and nsenter
+# (util-linux), and AWG_DISPOSABLE_HOST_TEST=1. With
 # AWG_LIVE_SECRET_SCAN set (tests/test-boringtun-host-live.sh does), the two
 # private keys generated here are added to that output scan's secret list.
 #
@@ -121,7 +125,7 @@ source "${SCRIPT_DIR}/helpers/boringtun-wire-checks.sh"
 [[ "${AWG_DISPOSABLE_HOST_TEST:-}" == 1 ]] || die "this test creates network namespaces and interfaces; set AWG_DISPOSABLE_HOST_TEST=1 on a disposable host"
 [[ "${EUID}" -eq 0 ]] || die "must run as root"
 [[ -n "${BIN}" && -x "${BIN}" ]] || die "usage: $0 <boringtun-cli>"
-for TOOL in ip awg ping python3 unshare; do
+for TOOL in ip ss awg ping python3 unshare nsenter; do
 	command -v "${TOOL}" >/dev/null 2>&1 || die "${TOOL} is required"
 done
 [[ -c /dev/net/tun ]] || die "/dev/net/tun is required"
@@ -130,13 +134,79 @@ done
 socket_identity() { # <path>
 	stat -c '%d %i %.9Z' -- "$1" 2>/dev/null
 }
-# Stop every child this run started (peers, capture, replay), each within a
-# bounded time, then remove the namespaces it created (their veth and TUN
-# links go with them) and the UAPI sockets its peers created -- each only
-# while it is still that socket. Nothing this run did not create is removed,
-# also when it runs before anything was created.
+# The identity of the UNIX socket node at PATH when the live process
+# PID/START holds it: one of the socket inodes among its fds is, by ss's
+# socket diagnostics in its network namespace, bound to exactly this file
+# (its inode and device), the proof the installer uses for its daemon's
+# sockets. A node that another process bound, or one that changed during
+# the check, is not that process's: nothing is printed.
+socket_held_by() { # <path> <pid> <start time>
+	local NODE="$1" PID="$2" START="$3" ID DEV INO MAJOR MINOR FD LINK HELD=" "
+	[[ -S "${NODE}" && ! -L "${NODE}" ]] || return 1
+	ID="$(socket_identity "${NODE}")" || return 1
+	read -r DEV INO _ <<<"${ID}"
+	MAJOR=$(((DEV >> 8) & 0xfff))
+	MINOR=$(((DEV & 0xff) | ((DEV >> 12) & 0xfff00)))
+	for FD in "/proc/${PID}/fd/"*; do
+		LINK="$(readlink -- "${FD}" 2>/dev/null)" || continue
+		[[ "${LINK}" =~ ^socket:\[([0-9]+)\]$ ]] && HELD+="${BASH_REMATCH[1]} "
+	done
+	[[ "${HELD}" != " " ]] || return 1
+	nsenter --net="/proc/${PID}/ns/net" ss -xlHe 2>/dev/null | awk -v ino="${INO}" -v dev="${DEV}" \
+		-v major="${MAJOR}" -v minor="${MINOR}" -v held="${HELD}" '
+		{
+			vino = ""; vmaj = ""; vmin = ""
+			for (i = 1; i <= NF; i++) {
+				if ($i ~ /^ino:[0-9]+$/) vino = substr($i, 5)
+				if ($i ~ /^dev:[0-9]+\/[0-9]+$/) { split(substr($i, 5), d, "/"); vmaj = d[1]; vmin = d[2] }
+			}
+			if (vino == ino && ((vmaj == 0 && vmin == dev) || (vmaj == major && vmin == minor)) && index(held, " " $6 " ")) found = 1
+		}
+		END { exit !found }' || return 1
+	# Still that process, so the fds read were its own; still that node.
+	python3 "${WIRE}" owned "${PID}" "${START}" check >/dev/null 2>&1 || return 1
+	[[ "$(socket_identity "${NODE}")" == "${ID}" ]] || return 1
+	printf '%s\n' "${ID}"
+}
+# BoringTun's AmneziaWG UAPI path is a symlink to its WireGuard socket: it
+# counts as the peer's while it resolves to that very node. Prints the
+# symlink's own identity.
+symlink_to_node() { # <link> <node path> <node identity>
+	local ID
+	[[ -L "$1" ]] || return 1
+	ID="$(socket_identity "$1")" || return 1
+	[[ "$(readlink -f -- "$1" 2>/dev/null)" == "$(readlink -f -- "$2" 2>/dev/null)" ]] || return 1
+	[[ "$(socket_identity "$2")" == "$3" && "$(socket_identity "$1")" == "${ID}" ]] || return 1
+	printf '%s\n' "${ID}"
+}
+# Record as this run's the UAPI nodes of interface IF that the owned child
+# HANDLE holds: its WireGuard socket, and the AmneziaWG symlink once that
+# points at it. 1 if the child holds no socket at that path.
+own_held_sockets() { # <handle> <interface>
+	local PID START NODE="/var/run/wireguard/$2.sock" LINK="/var/run/amneziawg/$2.sock" ID
+	read -r PID START _ <<<"$1"
+	ID="$(socket_held_by "${NODE}" "${PID}" "${START}")" || return 1
+	OWNED_SOCKETS[${NODE}]="${ID}"
+	ID="$(symlink_to_node "${LINK}" "${NODE}" "${ID}")" && OWNED_SOCKETS[${LINK}]="${ID}"
+	return 0
+}
+# Stop every child this run started (peers, capture, replay), then remove
+# the namespaces it created (their veth and TUN links go with them) and the
+# UAPI nodes its peers created -- each only while it is still that node.
+# Each child is first frozen (SIGSTOP through its pidfd, every thread
+# stopped) and the nodes it holds are recorded before it is killed: a frozen
+# child creates nothing more, so a node that a peer made at its start, before
+# this run recorded it, cannot be left behind. Nothing this run did not
+# create is removed, also when it runs before anything was created.
 teardown() {
-	local NETNS SOCKET
+	local NETNS SOCKET HANDLE IF
+	for HANDLE in "${BT_WIRE_CHILDREN[@]}"; do
+		bt_wire_signal "${HANDLE}" STOP
+		for IF in "${IF_S}" "${IF_C}"; do
+			own_held_sockets "${HANDLE}" "${IF}"
+		done
+		bt_wire_signal "${HANDLE}" KILL
+	done
 	bt_wire_cleanup
 	SERVER_PID=""
 	CLIENT_PID=""
@@ -157,10 +227,30 @@ cleanup() {
 	exit "${RC}"
 }
 trap cleanup EXIT
-# An interrupted run still cleans up: these exits run the EXIT trap.
-trap 'exit 143' TERM
-trap 'exit 130' INT
-trap 'exit 129' HUP
+# An interrupted run still cleans up: its exit runs the EXIT trap. While
+# something is being made and recorded (recording), the interruption waits
+# until the record is written, so nothing made is ever left unrecorded.
+INTERRUPTED=""
+RECORDING=0
+interrupted() { # <exit status>
+	if ((RECORDING)); then
+		INTERRUPTED="$1"
+	else
+		exit "$1"
+	fi
+}
+recording() { # <command...>
+	local RC
+	RECORDING=1
+	"$@"
+	RC=$?
+	RECORDING=0
+	[[ -z "${INTERRUPTED}" ]] || exit "${INTERRUPTED}"
+	return "${RC}"
+}
+trap 'interrupted 143' TERM
+trap 'interrupted 130' INT
+trap 'interrupted 129' HUP
 WORK="$(mktemp -d /var/tmp/awg-sip-wire.XXXXXX)"
 chmod 0700 "${WORK}"
 SERVER_KEY="$(awg genkey)"
@@ -182,9 +272,10 @@ shared_lines() { # <S1> <S2> <S3> <S4>
 		"${JUNK}" "$1" "$2" "$3" "$4" "${H1}" "${H2}" "${H3}" "${H4}"
 }
 # Start one peer in its namespace as an owned child (PEER_HANDLE, its PID in
-# STARTED_PID), record the UAPI socket it creates as this run's, and
-# configure it through that socket. A socket path that already exists is not
-# this run's: the peer is not started and the path is left alone.
+# STARTED_PID), record the UAPI socket it creates as this run's once it is
+# proven to hold it, and configure it through that socket. A socket path
+# that already exists is not this run's: the peer is not started and the
+# path is left alone.
 start_peer() { # <namespace> <interface> <log> <config file> <tunnel address> <peer tunnel address> [imitation args...]
 	local NETNS="$1" IF="$2" LOG="$3" CONF="$4" ADDR="$5" PEER_ADDR="$6" SOCKET
 	shift 6
@@ -198,24 +289,26 @@ start_peer() { # <namespace> <interface> <log> <config file> <tunnel address> <p
 	bt_wire_spawn PEER_HANDLE "${LOG}" - ip netns exec "${NETNS}" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "${BIN}" \
 		--foreground --disable-drop-privileges --verbosity error "$@" "${IF}" || return 1
 	STARTED_PID="${PEER_HANDLE%% *}"
-	if ! wait_for 10 test -S "/var/run/wireguard/${IF}.sock"; then
+	if ! wait_for 10 own_held_sockets "${PEER_HANDLE}" "${IF}"; then
 		sed 's/^/    | /' "${LOG}"
+		echo "    no UAPI socket that peer ${STARTED_PID} holds appeared at /var/run/wireguard/${IF}.sock"
 		return 1
 	fi
-	for SOCKET in "/var/run/wireguard/${IF}.sock" "/var/run/amneziawg/${IF}.sock"; do
-		[[ -S "${SOCKET}" ]] && OWNED_SOCKETS[${SOCKET}]="$(socket_identity "${SOCKET}")"
-	done
 	awg setconf "${IF}" "${CONF}" &&
 		ip -n "${NETNS}" addr add "${ADDR}/32" dev "${IF}" &&
 		ip -n "${NETNS}" link set "${IF}" up &&
 		ip -n "${NETNS}" route add "${PEER_ADDR}/32" dev "${IF}"
 }
-# A namespace of this run: refused if the name is taken, recorded once made.
+# A namespace of this run: refused if the name is taken, recorded as it is
+# made (an interruption meanwhile waits for the record).
 create_netns() { # <name>
 	if ip netns list 2>/dev/null | grep -qE "^$1( |$)"; then
 		echo "    namespace $1 already exists; it is not this run's and is left alone"
 		return 1
 	fi
+	recording add_netns "$1"
+}
+add_netns() { # <name>
 	ip netns add "$1" || return 1
 	CREATED_NETNS+=("$1")
 }
@@ -429,6 +522,30 @@ else
 fi
 teardown
 
+echo "--- an interruption while a namespace is made"
+# This run's create_netns, with ip wrapped so that this shell gets SIGTERM
+# just after "ip netns add" has made the namespace: the run must end (143)
+# only once the namespace is recorded, so that its cleanup finds it.
+PROBE_NS="awgsip-p-${RUN_ID}"
+PROBE_FILE="${WORK}/netns-probe"
+(
+	CREATED_NETNS=()
+	trap 'interrupted 143' TERM
+	trap 'printf "%s\n" "${CREATED_NETNS[@]}" >"${PROBE_FILE}"' EXIT
+	ip() {
+		command ip "$@"
+		local RC=$?
+		[[ "$1 $2" == "netns add" ]] && kill -TERM "${BASHPID}"
+		return "${RC}"
+	}
+	create_netns "${PROBE_NS}"
+	echo reached >"${PROBE_FILE}.after"
+)
+PROBE_RC=$?
+check "a SIGTERM while a namespace is being made ends the run (${PROBE_RC}) only once that namespace is recorded" \
+	test "${PROBE_RC}" = 143 -a "$(cat "${PROBE_FILE}" 2>/dev/null)" = "${PROBE_NS}" -a ! -e "${PROBE_FILE}.after"
+[[ "$(cat "${PROBE_FILE}" 2>/dev/null)" == "${PROBE_NS}" ]] && ip netns delete "${PROBE_NS}"
+
 echo "--- the owned-child tracker, in a PID namespace of its own (unshare)"
 # Bash reaps a background child by itself, and the kernel may then give its
 # PID to another process. That is forced here, and only inside a fresh PID
@@ -506,6 +623,58 @@ python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])'
 OWNED_SOCKETS[${REPLACED}]="$(socket_identity "${REPLACED}")"
 teardown
 check "while one this run recorded and still the same is removed" test ! -e "${REPLACED}"
+# A peer interrupted after it made its UAPI nodes and before this run
+# recorded them: a tracked stand-in binds and holds the WireGuard socket and
+# makes the AmneziaWG symlink, as BoringTun does, and nothing records them.
+mkdir -p /var/run/amneziawg
+HOLDER='import os, socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.listen()
+if len(sys.argv) > 2:
+    os.symlink(sys.argv[1], sys.argv[2])
+time.sleep(600)'
+NODE="/var/run/wireguard/${IF_S}.sock"
+NODE_LINK="/var/run/amneziawg/${IF_S}.sock"
+HOLDER_HANDLE=""
+if bt_wire_spawn HOLDER_HANDLE /dev/null - python3 -c "${HOLDER}" "${NODE}" "${NODE_LINK}" &&
+	wait_for 10 test -S "${NODE}" -a -L "${NODE_LINK}"; then
+	read -r HOLDER_PID HOLDER_START _ <<<"${HOLDER_HANDLE}"
+	teardown
+	check "a node that a tracked child holds, not yet recorded by this run, is removed with that child" \
+		test ! -e "${NODE}" -a ! -L "${NODE_LINK}"
+	check "  and the child was ended" \
+		bash -c '! python3 "$1" owned "$2" "$3" check >/dev/null' _ "${WIRE}" "${HOLDER_PID}" "${HOLDER_START}"
+else
+	bad "a tracked stand-in holds the node of ${IF_S}"
+fi
+# The same node held by a process this run does not track, and a tracked
+# child's socket whose node another process replaced at the same path.
+if bt_wire_spawn HOLDER_HANDLE /dev/null - python3 -c "${HOLDER}" "${NODE}" && wait_for 10 test -S "${NODE}"; then
+	read -r HOLDER_PID HOLDER_START _ <<<"${HOLDER_HANDLE}"
+	bt_wire_untrack "${HOLDER_HANDLE}"
+	FOREIGN_ID="$(socket_identity "${NODE}")"
+	teardown
+	check "a node that a process this run does not track holds is left alone" \
+		test "$(socket_identity "${NODE}")" = "${FOREIGN_ID}"
+	check "  as is that process" \
+		bash -c 'python3 "$1" owned "$2" "$3" check >/dev/null' _ "${WIRE}" "${HOLDER_PID}" "${HOLDER_START}"
+	bt_wire_stop "${HOLDER_HANDLE}" 5
+	rm -f -- "${NODE}"
+else
+	bad "an untracked stand-in holds the node of ${IF_S}"
+fi
+if bt_wire_spawn HOLDER_HANDLE /dev/null - python3 -c "${HOLDER}" "${NODE}" && wait_for 10 test -S "${NODE}"; then
+	rm -f -- "${NODE}"
+	python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "${NODE}"
+	REPLACED_ID="$(socket_identity "${NODE}")"
+	teardown
+	check "a node that replaced a tracked child's socket at its path is left alone" \
+		test "$(socket_identity "${NODE}")" = "${REPLACED_ID}"
+	rm -f -- "${NODE}"
+else
+	bad "a tracked stand-in holds the node of ${IF_S} for the replacement control"
+fi
 
 echo "BoringTun SIP wire test: ${PASSED} passed, ${FAILED} failed"
 ((FAILED == 0))

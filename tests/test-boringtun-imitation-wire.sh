@@ -192,6 +192,27 @@ elif cmd == "fragments":
     big = struct.pack(">HHHH", 51820, 40000, 1008, 0) + bytes(payload[:16]) + bytes(39) + struct.pack("<I", 400000050) + bytes(941)
     status, length, data, _ = fp(raw(big[:80], ident=11, fragment=0x2000))
     print("first-fragment-tags-seen", wire.record_line(sizes, ranges, status, length, data).split(" ")[0])
+    # The second review's boundary: a 104-byte UDP datagram (96 payload bytes,
+    # a shaped transport for S4=45) whose first fragment carries 64 bytes.
+    # Each case is "offset:length:more" pieces of it, one status per piece.
+    sizes45, ranges45 = wire.parse_layout("64,31,31,45," + sys.argv[3])
+    body = bytearray((b"OPTIONS sip:u@x SIP/2.0\r\n" + b" " * 96)[:96])
+    body[45:49] = struct.pack("<I", 400000050)
+    udp = struct.pack(">HHHH", 51820, 40000, 104, 0) + bytes(body)
+    def piece(ident, offset, length, more):
+        return fp(raw(udp[offset:offset + length], ident=ident, fragment=(0x2000 if more else 0) | offset // 8))
+    def pieces(ident, *specs):
+        return ",".join(piece(ident, *spec)[0] for spec in specs)
+    print("boundary-nonfinal-at-end", pieces(20, (0, 64, 1), (64, 40, 1)))
+    print("boundary-then-last", pieces(20, (64, 40, 0)))
+    print("boundary-exact-end", pieces(21, (0, 64, 1), (64, 40, 0)))
+    print("boundary-exact-end-again", pieces(21, (64, 40, 0)))
+    print("boundary-shorter-nonfinal", pieces(22, (0, 64, 1), (64, 32, 1), (96, 8, 0)))
+    print("boundary-out-of-order", pieces(23, (0, 64, 1), (96, 8, 0), (64, 32, 1)))
+    print("boundary-out-of-order-again", pieces(23, (64, 32, 1)))
+    print("boundary-empty", pieces(25, (0, 64, 1), (64, 0, 1)))
+    lines = [wire.record_line(sizes45, ranges45, *piece(24, *spec)[:3]) for spec in ((0, 64, 1), (64, 40, 1))]
+    print("boundary-records", "|".join(line.replace(" ", "_") for line in lines if line is not None))
 elif cmd == "layout":
     try:
         wire.parse_layout(sys.argv[3])
@@ -271,6 +292,24 @@ assert_eq "continuation" "$(fragment_case within-30s)" "a later fragment 29 s af
 assert_eq "malformed" "$(fragment_case stale-after-30s)" "one 30.5 s after its first fragment finds that state expired and is malformed"
 assert_eq "transport" "$(fragment_case first-fragment-tags-seen)" "a first fragment that carries every eligible tag is classified as usual"
 printf '%s\n' "$(fragment_case first-fragment-record | tr '_' ' ')" >"${T}/fragment-record"
+# A fragment that says more follow must leave room for them: under the
+# declared length, one that reaches the end with More Fragments set
+# contradicts itself. Only the last fragment can end the payload, so an entry
+# is retired with it, in whatever order the fragments come.
+assert_eq "datagram,malformed" "$(fragment_case boundary-nonfinal-at-end)" \
+	"a non-final fragment that reaches the declared end (64 of 104 bytes, then 40 with More Fragments) is malformed"
+assert_eq "continuation" "$(fragment_case boundary-then-last)" "  while the right last fragment still ends that datagram"
+assert_eq "datagram,continuation" "$(fragment_case boundary-exact-end)" "a last fragment that ends the declared payload exactly continues it"
+assert_eq "malformed" "$(fragment_case boundary-exact-end-again)" "  and completes it: the same IP ID then names nothing"
+assert_eq "datagram,continuation,continuation" "$(fragment_case boundary-shorter-nonfinal)" \
+	"a shorter non-final fragment, then the last one, continue it"
+assert_eq "datagram,continuation,continuation" "$(fragment_case boundary-out-of-order)" \
+	"the last fragment before the middle one continues it as well"
+assert_eq "malformed" "$(fragment_case boundary-out-of-order-again)" "  and the middle one completes it out of order"
+assert_eq "datagram,malformed" "$(fragment_case boundary-empty)" "a later fragment that carries nothing is malformed"
+fragment_case boundary-records | tr '|_' '\n ' >"${T}/boundary-records"
+assert_eq "transport 96 malformed 60" "$(cut -d' ' -f1,2 "${T}/boundary-records" | tr '\n' ' ' | sed 's/ $//')" \
+	"the real helper records that contradictory observation: the transport's first fragment, and a malformed frame"
 
 echo "=== The recorded follow-up C failure ==="
 # S2=26 S3=81 S4=22: handshake responses and transport, no cookie reply, 0/2054 shaped.
@@ -424,7 +463,12 @@ finally:
 bt_wire_spawn RUNNING /dev/null - sleep 30
 read -r RUN_PID RUN_START _ <<<"${RUNNING}"
 assert_eq "${RUN_PID} $(start_of "${RUN_PID}") ${BASHPID}" "${RUNNING}" "a spawned child's handle is its own PID, start time and parent"
-assert_eq "sleep" "$(tr '\0' ' ' <"/proc/${RUN_PID}/cmdline" | cut -d' ' -f1)" "  and the PID runs the command itself"
+# Released once tracked, the child becomes its command within its 10 ms poll.
+for ((I = 0; I < 100; I++)); do
+	[[ "$(tr '\0' ' ' <"/proc/${RUN_PID}/cmdline" | cut -d' ' -f1)" == sleep ]] && break
+	sleep 0.01
+done
+assert_eq "sleep" "$(tr '\0' ' ' <"/proc/${RUN_PID}/cmdline" | cut -d' ' -f1)" "  and once released, the PID runs the command itself"
 # Processes that have a tracked number but not its start time, as a PID given
 # to another process after the tracked child was reaped. Each check has one of
 # its own, so no check's outcome rests on what another did to its process.
@@ -478,18 +522,96 @@ bt_wire_stop "${IGNORING}" 1
 assert_eq "137" "${BT_WIRE_STATUS}" "a child that ignores SIGTERM is killed after the limit and collected (137)"
 assert_eq "0" "${#BT_WIRE_CHILDREN[@]}" "collected children are no longer tracked"
 
+echo "=== Owned children: tracked before they run ==="
+# A child records its identity and waits; the parent tracks the handle and
+# only then releases it. Each phase is interrupted on purpose, in a shell
+# whose SIGTERM trap is the callers' (end and collect what is tracked, then
+# exit 143). The child's command would create RAN; afterwards the child must
+# be gone, and with the trap run, the identity records too.
+handoff() { # <phase>: "<status> <ran|not-run> <child running|gone> <identity records left|cleaned>"
+	local PHASE="$1" RAN="${T}/handoff-$1" CHILD="" START="" DIR STATUS
+	rm -f -- "${RAN}" "${RAN}.handle" "${RAN}.dir"
+	(
+		trap 'bt_wire_cleanup; exit 143' TERM
+		eval "original_$(declare -f bt_wire_track)"
+		note() { echo "$1" >"${RAN}.handle"; echo "${BT_WIRE_DIR}" >"${RAN}.dir"; }
+		case "${PHASE}" in
+			before-tracking) bt_wire_track() { note "$1"; kill -TERM "${BASHPID}"; original_bt_wire_track "$1"; } ;;
+			before-release) bt_wire_track() { note "$1"; original_bt_wire_track "$1"; kill -TERM "${BASHPID}"; } ;;
+			parent-killed) bt_wire_track() { note "$1"; original_bt_wire_track "$1"; kill -KILL "${BASHPID}"; } ;;
+			released) bt_wire_track() { note "$1"; original_bt_wire_track "$1"; } ;;
+		esac
+		bt_wire_spawn HANDLE /dev/null - bash -c ': >"$1"; exec sleep 30' _ "${RAN}"
+		for ((I = 0; I < 100; I++)); do
+			[[ -e "${RAN}" ]] && break
+			sleep 0.05
+		done
+		kill -TERM "${BASHPID}"
+		exit 0
+	)
+	STATUS=$?
+	# A withdrawn child notices within 10 ms that its parent let go.
+	sleep 0.3
+	read -r CHILD START _ 2>/dev/null <"${RAN}.handle"
+	DIR="$(cat "${RAN}.dir" 2>/dev/null)"
+	echo "${STATUS} $([[ -e "${RAN}" ]] && echo ran || echo not-run)" \
+		"$(runs_as "${CHILD}" "${START}" && echo running || echo gone)" "$([[ -n "${DIR}" && -e "${DIR}" ]] && echo left || echo cleaned)"
+	end_as "${CHILD}" "${START}" 2>/dev/null
+	[[ -n "${DIR}" ]] && rm -rf -- "${DIR}"
+}
+assert_eq "143 not-run gone cleaned" "$(handoff before-tracking)" \
+	"interrupted before its child is tracked, the caller exits 143 and the child never runs its command"
+assert_eq "143 not-run gone cleaned" "$(handoff before-release)" \
+	"interrupted after tracking and before the release, the waiting child is ended and never runs its command"
+assert_eq "143 ran gone cleaned" "$(handoff released)" "interrupted once its command runs, the tracked child is ended"
+assert_eq "137 not-run gone left" "$(handoff parent-killed)" \
+	"a caller killed outright before the release leaves no child running its command (no trap could clean up)"
+# A failed registration releases nothing.
+registration() { # <case>: "<spawn status> '<handle>' <ran|not-run> <tracked>"
+	local RAN="${T}/registration-$1"
+	rm -f -- "${RAN}"
+	(
+		case "$1" in
+			unwritable) bt_wire_self_identity() { return 1; } ;;
+			foreign)
+				bt_wire_self_identity() {
+					local LINE FIELDS=()
+					read -r LINE </proc/self/stat
+					read -r -a FIELDS <<<"${LINE##*) }"
+					printf '1 1 %s\n' "${FIELDS[1]}"
+				}
+				;;
+		esac
+		HANDLE=""
+		bt_wire_spawn HANDLE /dev/null - bash -c ': >"$1"; exec sleep 30' _ "${RAN}" >/dev/null
+		RC=$?
+		sleep 0.5
+		echo "${RC} '${HANDLE}' $([[ -e "${RAN}" ]] && echo ran || echo not-run) ${#BT_WIRE_CHILDREN[@]}"
+		bt_wire_cleanup
+	)
+}
+assert_eq "1 '' not-run 0" "$(registration unwritable)" \
+	"a child that cannot record its identity is never released: spawn fails, nothing is tracked, its command never runs"
+assert_eq "1 '' not-run 0" "$(registration foreign)" \
+	"a child whose recorded identity is not its own is withdrawn: spawn fails, nothing is tracked, its command never runs"
+
 # ── The consumers, with a fake capture/replay child ─────────────────────────
 # The fake follows the helper's protocol unless a mode breaks it: it copies a
-# given capture, puts its SIGTERM handler in place, and only then writes
-# "ready <pid> <start time>" (its own). On SIGTERM it ends "stopped <n>
-# <token>" when the stop file holds a token, else "interrupted <n>" (status
-# 3); with FAKE_END=complete it sleeps the capture interval and ends
-# "complete <n>". FAKE_CAPTURE_RC replaces status 0. Modes: noready, crash
-# (status 42 after ready), premature (complete at once), stale (a stale
-# transcript, then exit), stale-running (a stale transcript, still running),
-# selfterm (a SIGTERM to itself before the caller's stop), wrongready (a ready
-# line of another process), wrongcount (an end with one record too many),
-# extra (an extra line after its end). The replay prints its ready line and
+# given capture, puts its SIGTERM handler in place, waits FAKE_START_DELAY
+# seconds (a slow start), and only then writes "ready <pid> <start time>
+# <ready clock>" (its own, the clock from /proc/uptime). On SIGTERM it ends
+# "stopped <n> <token>" when the stop file holds a token, else "interrupted
+# <n>" (status 3); with FAKE_END=complete it sleeps FAKE_RUN seconds (the
+# capture interval by default) and ends "complete <n> <end clock>".
+# FAKE_CAPTURE_RC replaces status 0. Modes: noready, crash (status 42 after
+# ready), premature (complete at once), stale (a stale transcript, then
+# exit), stale-running (a stale transcript, still running), selfterm (a
+# SIGTERM to itself before the caller's stop), wrongready (a ready line of
+# another process), wrongcount (an end with one record too many), extra (an
+# extra line after its end), noclock and endnoclock (a ready or complete
+# line without its clock), readyearly (a ready clock before its start),
+# readylate (a ready clock after the caller saw it), endlate (an end clock
+# after the caller saw it end). The replay prints its ready line and
 # "replayed <n>" and exits FAKE_REPLAY_RC; modes noready and noinit.
 # `kinds` runs the real helper unless FAKE_KINDS asks for empty or garbage
 # output with exit 0; "owned" always runs the real helper.
@@ -499,6 +621,13 @@ cat >"${FAKEWIRE}" <<'EOF'
 read -r LINE </proc/self/stat
 read -r -a FIELDS <<<"${LINE##*) }"
 ME="$$ ${FIELDS[19]}"
+# The capture's clock: CLOCK_BOOTTIME in centiseconds, as /proc/uptime has it.
+clock() {
+	local UPTIME REST
+	read -r UPTIME REST </proc/uptime
+	UPTIME="${UPTIME/./}"
+	CLOCK=$((10#${UPTIME}))
+}
 case "$1" in
 	capture)
 		OUT="$6"
@@ -519,15 +648,20 @@ case "$1" in
 			exit 3
 		}
 		trap on_term TERM
-		if [[ "${FAKE_CAPTURE_MODE:-}" == wrongready ]]; then
-			echo "ready 1 1" >>"${STATE}"
-		else
-			echo "ready ${ME}" >>"${STATE}"
-		fi
+		# Its readiness delayed, as a slow start would.
+		sleep "${FAKE_START_DELAY:-0}"
+		clock
+		READY="${CLOCK}"
+		case "${FAKE_CAPTURE_MODE:-}" in
+			wrongready) echo "ready 1 1 ${READY}" >>"${STATE}" ;;
+			noclock) echo "ready ${ME}" >>"${STATE}" ;;
+			readyearly) echo "ready ${ME} 0" >>"${STATE}" ;;
+			readylate) echo "ready ${ME} $((READY + 100000))" >>"${STATE}" ;;
+			*) echo "ready ${ME} ${READY}" >>"${STATE}" ;;
+		esac
 		case "${FAKE_CAPTURE_MODE:-}" in
 			crash) exit 42 ;;
-			premature) echo "complete ${N}" >>"${STATE}"; exit 0 ;;
-			early) sleep 1; echo "complete ${N}" >>"${STATE}"; exit 0 ;;
+			premature) clock; echo "complete ${N} ${CLOCK}" >>"${STATE}"; exit 0 ;;
 			stale) printf 'stopped %s\njunk\nstopped %s\n' "${N}" "${N}" >>"${STATE}"; exit 0 ;;
 			stale-running) printf 'stopped %s\njunk\n' "${N}" >>"${STATE}" ;;
 			selfterm) kill -TERM "$$" ;;
@@ -535,9 +669,15 @@ case "$1" in
 		if [[ "${FAKE_END}" == stop ]]; then
 			while :; do sleep 0.05; done
 		fi
-		sleep "$5"
+		# It completes after FAKE_RUN seconds, its interval by default.
+		sleep "${FAKE_RUN:-$5}"
 		[[ "${FAKE_CAPTURE_MODE:-}" == wrongcount ]] && N=$((N + 1))
-		echo "complete ${N}" >>"${STATE}"
+		clock
+		case "${FAKE_CAPTURE_MODE:-}" in
+			endlate) echo "complete ${N} $((READY + 100000))" >>"${STATE}" ;;
+			endnoclock) echo "complete ${N}" >>"${STATE}" ;;
+			*) echo "complete ${N} ${CLOCK}" >>"${STATE}" ;;
+		esac
 		[[ "${FAKE_CAPTURE_MODE:-}" == extra ]] && echo "junk" >>"${STATE}"
 		exit "${FAKE_CAPTURE_RC:-0}"
 		;;
@@ -587,6 +727,10 @@ py record "64,149,31,55,${H}" "${T}/fragment-valid-host" response:1:sip transpor
 cat "${T}/fragment-valid-host" "${T}/fragment-record" >"${T}/host-fragment"
 py record "64,149,31,55,${H}" "${T}/fragment-valid-live" response:1:sip cookie:2:sip transport:2:sip
 cat "${T}/fragment-valid-live" "${T}/fragment-record" >"${T}/live-fragment"
+# The real helper's records of the contradictory continuation, mixed with
+# valid records (the transport's 96 bytes fit S4=45 and S4=31 alike).
+cat "${T}/host-valid" "${T}/boundary-records" >"${T}/host-boundary"
+cat "${T}/live-valid" "${T}/boundary-records" >"${T}/live-boundary"
 
 # The host consumer: wire_prefixes sip, its capture stopped after the traffic.
 # Prints the consumer's assertions and a last line "complete assertions=<n>
@@ -641,7 +785,23 @@ live_case() { # <capture> [VAR=value...]
 		LEVEL="${BASH_SUBSHELL}"
 		ok() { echo "  OK: $1"; PASSED=$((PASSED + 1)); }
 		bad() { echo "  FAIL: $1"; FAILED=$((FAILED + 1)); }
-		check() { local M="$1"; shift; if "$@"; then ok "${M}"; else bad "${M}"; fi; }
+		# With FIXTURE_COLLECT_DELAY, the first poll inside the capture's
+		# finish sleeps that long, as a caller slow to collect a status would.
+		DELAY_POLL=no
+		check() {
+			local M="$1"
+			shift
+			[[ "${M}" == *"capture outlived the traffic"* && "${FIXTURE_COLLECT_DELAY:-0}" != 0 ]] && DELAY_POLL=yes
+			if "$@"; then ok "${M}"; else bad "${M}"; fi
+		}
+		sleep() {
+			if [[ "${DELAY_POLL}" == yes ]]; then
+				DELAY_POLL=no
+				command sleep "${FIXTURE_COLLECT_DELAY}"
+			else
+				command sleep "$@"
+			fi
+		}
 		# Stand-in peers whose /proc cmdlines carry what peer_modes reads.
 		bash -c 'while :; do sleep 0.2; done' server --imitate-protocol sip --imitate-domain pbx.example fixture0 &
 		SERVER_PID=$!
@@ -699,8 +859,9 @@ expect_fixture() { # <label> <pass|reject> <text|-> <fixture command...>
 }
 
 echo "=== The capture contract, directly ==="
-# A capture that is still running when the caller asks for completion, but
-# completes before its interval has passed, by the caller's own clock.
+# The interval is the capture's own, from its ready clock to its end clock:
+# neither a slow start nor a slow collection of its status may stand in for
+# it. DIRECT_COLLECT_DELAY delays the caller's first poll inside the finish.
 capture_direct() { # <seconds> [VAR=value...]: the finish's status and message
 	local SECONDS_ARG="$1"
 	shift
@@ -710,9 +871,24 @@ capture_direct() { # <seconds> [VAR=value...]: the finish's status and message
 		LEVEL="${BASH_SUBSHELL}"
 		python3() { if ((BASH_SUBSHELL > LEVEL)); then exec "${FAKEWIRE}" "${@:2}"; else "${FAKEWIRE}" "${@:2}"; fi; }
 		ip() { if [[ "$1 $2" == "netns exec" ]]; then shift 3; "$@"; else return 97; fi; }
+		DELAY_POLL=no
+		sleep() {
+			if [[ "${DELAY_POLL}" == yes ]]; then
+				DELAY_POLL=no
+				command sleep "${DIRECT_COLLECT_DELAY}"
+			else
+				command sleep "$@"
+			fi
+		}
 		# shellcheck disable=SC2034 # read by the sourced boringtun-wire-checks.sh
 		WIRE=fake
-		bt_wire_capture_start fixture fixture 192.0.2.1 51820 "${SECONDS_ARG}" "${T}/direct.capture" "64,31,31,45,${H}" >/dev/null || exit 9
+		if ! bt_wire_capture_start fixture fixture 192.0.2.1 51820 "${SECONDS_ARG}" "${T}/direct.capture" "64,31,31,45,${H}" \
+			>"${T}/direct.message"; then
+			bt_wire_cleanup
+			echo "1 $(cat "${T}/direct.message")"
+			exit 0
+		fi
+		[[ -n "${DIRECT_COLLECT_DELAY:-}" ]] && DELAY_POLL=yes
 		# In this shell, the capture's parent, as the real callers do.
 		bt_wire_capture_finish "${T}/direct.capture" complete 10 >"${T}/direct.message"
 		RC=$?
@@ -721,9 +897,24 @@ capture_direct() { # <seconds> [VAR=value...]: the finish's status and message
 	)
 }
 assert_eq "0 " "$(capture_direct 1)" "a capture that runs its whole 1 s interval and completes passes"
-RESULT="$(capture_direct 3 FAKE_CAPTURE_MODE=early)"
-assert_true "a capture still running when asked, that completes after 1 s of a 3 s interval, is rejected (${RESULT%%$'\n'*})" \
-	bash -c '[[ "$1" == "1     the capture completed after 1."*", before its 3 s interval"* ]]' _ "${RESULT}"
+direct_rejects() { # <label> <message start> <seconds> [VAR=value...]
+	local LABEL="$1" WANT="$2" RESULT
+	shift 2
+	RESULT="$(capture_direct "$@")"
+	assert_true "${LABEL} (${RESULT%%$'\n'*})" bash -c '[[ "$1" == "1     $2"* ]]' _ "${RESULT}" "${WANT}"
+}
+direct_rejects "a capture still running when asked, that completes after 1 s of a 3 s interval, is rejected" \
+	"the capture was ready at " 3 FAKE_RUN=1
+direct_rejects "  as is one that became ready 2.4 s late and then ran 1 s" "the capture was ready at " 3 FAKE_START_DELAY=2.4 FAKE_RUN=1
+direct_rejects "  and one that ran 1 s while the caller was 3.5 s late to collect its status" \
+	"the capture was ready at " 3 FAKE_RUN=1 DIRECT_COLLECT_DELAY=3.5
+assert_eq "0 " "$(capture_direct 3 FAKE_START_DELAY=2.4)" "one that became ready 2.4 s late and then ran its whole 3 s passes"
+assert_eq "0 " "$(capture_direct 3 DIRECT_COLLECT_DELAY=3.5)" "  as does one that ran its whole 3 s while the caller was 3.5 s late to collect it"
+direct_rejects "a ready line without its clock is refused" "the capture did not become ready" 1 FAKE_CAPTURE_MODE=noclock
+direct_rejects "a ready clock before the capture was started is refused" "the capture's ready clock " 1 FAKE_CAPTURE_MODE=readyearly
+direct_rejects "a ready clock after the caller saw the ready line is refused" "the capture's ready clock " 1 FAKE_CAPTURE_MODE=readylate
+direct_rejects "a complete line without its clock is refused" "the capture's transcript is not exactly" 1 FAKE_CAPTURE_MODE=endnoclock
+direct_rejects "an end clock after the caller saw the capture end is refused" "the capture's end clock " 1 FAKE_CAPTURE_MODE=endlate
 
 echo "=== The host consumer (wire_prefixes) ==="
 CAPTURE_TEXT="the client-side capture ran from before the traffic until its authorized stop"
@@ -734,6 +925,8 @@ for SUMMARY in unknown ambiguous unresolved malformed; do
 done
 expect_fixture "the real helper's record of a fragment that hides a tag is rejected among valid records" reject \
 	"no recorded server datagram is unresolved" host_case "${T}/host-fragment" FIXTURE_SIZES=64,149,31,55
+expect_fixture "the real helper's records of a non-final fragment that reaches the declared end are rejected" reject \
+	"no recorded server datagram is malformed" host_case "${T}/host-boundary"
 for CASE in truncated badlength; do
 	expect_fixture "valid records plus a ${CASE} record are rejected" reject "the capture has a complete, valid per-kind result" \
 		host_case "${T}/host-${CASE}"
@@ -747,23 +940,40 @@ for MODE in FAKE_CAPTURE_RC=42 FAKE_CAPTURE_MODE=crash FAKE_CAPTURE_MODE=prematu
 	expect_fixture "a capture with ${MODE} after valid records is rejected" reject "${CAPTURE_TEXT}" \
 		host_case "${T}/host-valid" "${MODE}"
 done
-for MODE in FAKE_CAPTURE_MODE=noready FAKE_CAPTURE_MODE=wrongready; do
+for MODE in FAKE_CAPTURE_MODE=noready FAKE_CAPTURE_MODE=wrongready FAKE_CAPTURE_MODE=noclock FAKE_CAPTURE_MODE=readyearly \
+	FAKE_CAPTURE_MODE=readylate; do
 	expect_fixture "a capture with ${MODE} is rejected" reject "the client-side capture started" host_case "${T}/host-valid" "${MODE}"
 done
 
 echo "=== The harness consumer (run_scenario, expect_scenario) ==="
 LIVE_CAPTURE_TEXT="the capture outlived the traffic, ran its whole 3 s and completed with all its records"
 expect_fixture "a valid scenario passes" pass - live_case "${T}/live-valid"
+# The interval is the capture's own: a late start, or a caller late to
+# collect the status, neither shortens a whole interval nor lengthens a
+# short one.
+expect_fixture "a scenario whose capture ran only 1 s of its 3 s is rejected" reject "${LIVE_CAPTURE_TEXT}" \
+	live_case "${T}/live-valid" FAKE_RUN=1
+expect_fixture "a scenario whose capture became ready 2.4 s late and ran its whole 3 s passes" pass - \
+	live_case "${T}/live-valid" FAKE_START_DELAY=2.4
+expect_fixture "a scenario whose capture became ready 2.4 s late and ran only 1 s is rejected" reject "${LIVE_CAPTURE_TEXT}" \
+	live_case "${T}/live-valid" FAKE_START_DELAY=2.4 FAKE_RUN=1
+expect_fixture "a scenario whose capture ran its whole 3 s while the caller was 3.5 s late to collect it passes" pass - \
+	live_case "${T}/live-valid" FIXTURE_COLLECT_DELAY=3.5
+expect_fixture "a scenario whose capture ran only 1 s while the caller was 3.5 s late to collect it is rejected" reject \
+	"${LIVE_CAPTURE_TEXT}" live_case "${T}/live-valid" FAKE_RUN=1 FIXTURE_COLLECT_DELAY=3.5
 for SUMMARY in unknown ambiguous unresolved malformed; do
 	expect_fixture "valid records plus a ${SUMMARY} record are rejected" reject "no recorded server datagram is ${SUMMARY}" \
 		live_case "${T}/live-${SUMMARY}"
 done
 expect_fixture "the real helper's record of a fragment that hides a tag is rejected among valid records" reject \
 	"no recorded server datagram is unresolved" live_case "${T}/live-fragment" FIXTURE_SIZES=64,149,31,55
+expect_fixture "the real helper's records of a non-final fragment that reaches the declared end are rejected" reject \
+	"no recorded server datagram is malformed" live_case "${T}/live-boundary"
 expect_fixture "valid records plus a truncated record are rejected" reject "the capture has a complete, valid per-kind result" \
 	live_case "${T}/live-truncated"
 for MODE in FAKE_CAPTURE_RC=42 FAKE_CAPTURE_MODE=crash FAKE_CAPTURE_MODE=premature FAKE_CAPTURE_MODE=stale \
-	FAKE_CAPTURE_MODE=selfterm FAKE_CAPTURE_MODE=wrongcount FAKE_CAPTURE_MODE=extra; do
+	FAKE_CAPTURE_MODE=selfterm FAKE_CAPTURE_MODE=wrongcount FAKE_CAPTURE_MODE=extra FAKE_CAPTURE_MODE=endnoclock \
+	FAKE_CAPTURE_MODE=endlate; do
 	expect_fixture "a scenario whose capture has ${MODE} is rejected" reject "${LIVE_CAPTURE_TEXT}" live_case "${T}/live-valid" "${MODE}"
 done
 expect_fixture "a scenario whose capture never gets ready is rejected" reject "the capture started" \
