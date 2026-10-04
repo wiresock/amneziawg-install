@@ -13,18 +13,21 @@
       SIGTERM asks it to stop. Needs root (a packet socket). Relevance is
       decided by addresses, protocol and ports only, and every IPv4 and UDP
       length is validated before any byte is payload (frame_payload); a
-      relevant frame that is not valid IPv4/UDP is recorded as malformed.
+      relevant frame that is not valid IPv4/UDP, and a later fragment that
+      fits no recorded first fragment (Fragments), is recorded as malformed.
       Without LAYOUT a line is the payload's first 16 bytes (hex). With
       LAYOUT ("S1,S2,S3,S4,H1,H2,H3,H4", each H a number or MIN-MAX, the H
       ranges disjoint) a line is "<kind> <length> <prefix>": the packet kind
       is decided in memory from the length and the AmneziaWG type tag that
       follows the kind's S prefix, never from the prefix's content, and only
-      the first 16 bytes of that S prefix are kept; "unknown", "ambiguous"
-      and "malformed" keep none ("-"). The rest of each datagram is
-      ciphertext and is never recorded. FILE.state gets "ready" once the
-      socket listens, then "complete <records>" at the deadline or "stopped
-      <records>" after a SIGTERM; both exit 0. Any other end leaves no final
-      line and exits nonzero.
+      the first 16 bytes of that S prefix are kept; "unknown", "ambiguous",
+      "unresolved" and "malformed" keep none ("-"). The rest of each datagram
+      is ciphertext and is never recorded. FILE.state is the transcript:
+      "ready <pid> <start time>" once the socket listens, then exactly one
+      end -- "complete <records>" at the deadline, "stopped <records> <token>"
+      after a SIGTERM that FILE.stop authorized (both exit 0), or
+      "interrupted <records>" after one it did not (exit 3). Any other end
+      leaves no end line and exits nonzero.
 
   classify <protocol> <file>
       For a capture without layout, print "<datagrams> <matching>": how many
@@ -36,10 +39,10 @@
 
   kinds sip <file> <S1,S2,S3,S4>
       For a LAYOUT capture, after validating every record against the sizes
-      (kind_records), print seven rows in this order:
+      (kind_records), print eight rows in this order:
       "<kind> <datagrams> <shaped> <expected> <verdict>" for init,
-      response, cookie and transport, then "unknown <n>", "ambiguous <n>"
-      and "malformed <n>". A SIP request line fits an S prefix of 31 bytes or
+      response, cookie and transport, then "unknown <n>", "ambiguous <n>",
+      "unresolved <n>" and "malformed <n>". A SIP request line fits an S prefix of 31 bytes or
       more (SIP_REQUEST_LINE_MIN in the pinned BoringTun), so a kind whose S
       is at least 31 is expected "shaped" (every datagram), a shorter one
       "random" (none); the verdict is "ok", "FAIL", or "unobserved" when no
@@ -47,14 +50,19 @@
       malformed record or argument prints nothing and exits 1.
 
   replay <interface> <client address> <server address> <server port> <layout> <count> <seconds>
-      Print "ready" once listening, then wait up to SECONDS for one
-      complete, unfragmented handshake initiation (kind "init") from CLIENT
-      ADDRESS to SERVER ADDRESS:SERVER PORT on INTERFACE, send that datagram
-      COUNT times to the server from a new UDP socket and print "replayed
-      <count>"; any other end exits nonzero. A genuine initiation carries a
-      valid mac1, so past the server's handshake rate limit each copy
-      without a cookie MAC draws a cookie reply. The datagram is held in
-      memory only.
+      Print "ready <pid> <start time>" once listening, then wait up to
+      SECONDS for one complete, unfragmented handshake initiation (kind
+      "init") from CLIENT ADDRESS to SERVER ADDRESS:SERVER PORT on INTERFACE,
+      send that datagram COUNT times to the server from a new UDP socket and
+      print "replayed <count>"; any other end exits nonzero. A genuine
+      initiation carries a valid mac1, so past the server's handshake rate
+      limit each copy without a cookie MAC draws a cookie reply. The datagram
+      is held in memory only.
+
+  owned <pid> <start time> <check|TERM|KILL>
+      Probe or signal the process with that PID only if it is still the one
+      that recorded that start time, through a pidfd (owned): never a process
+      that was given the PID later.
 
 The probe formats are those the pinned BoringTun classifies
 (boringtun/src/noise/imitation/detect.rs at the pinned commit).
@@ -158,22 +166,27 @@ def probe(kind, host, port):
 KINDS = (("init", 0, 148), ("response", 1, 92), ("cookie", 2, 64), ("transport", 3, 32))
 KIND_NAMES = tuple(name for name, _, _ in KINDS)
 # Datagrams that are counted but have no packet kind: no kind's length and tag
-# fit ("unknown"), more than one does ("ambiguous"), or the frame carrying a
-# relevant datagram is not valid IPv4/UDP ("malformed").
-SUMMARY_NAMES = ("unknown", "ambiguous", "malformed")
+# fit ("unknown"); more than one does ("ambiguous"); a kind whose length rule
+# fits has its type tag beyond the bytes observed, as in a short first IPv4
+# fragment, so no unique kind can be claimed ("unresolved"); or the frame
+# carrying a relevant datagram is not valid IPv4/UDP ("malformed").
+SUMMARY_NAMES = ("unknown", "ambiguous", "unresolved", "malformed")
 SIP_REQUEST_LINE_MIN = 31
 # The S prefix bytes a record keeps, at most.
 PREFIX_KEPT = 16
 NUMBER = re.compile(r"0|[1-9][0-9]{0,9}")
+WIDE_NUMBER = re.compile(r"0|[1-9][0-9]{0,18}")
 STRICT_HEX = re.compile(r"(?:[0-9a-f]{2})*")
+# A stop authorization: one line of 32 lowercase hex digits.
+STOP_TOKEN = re.compile(r"[0-9a-f]{32}")
 
 
 class InputError(ValueError):
     """A layout, capture or argument that is not what it must be."""
 
 
-def parse_number(text, what, maximum):
-    if not NUMBER.fullmatch(text) or int(text) > maximum:
+def parse_number(text, what, maximum, pattern=NUMBER):
+    if not pattern.fullmatch(text) or int(text) > maximum:
         raise InputError("%s %r is not a number from 0 to %d" % (what, text, maximum))
     return int(text)
 
@@ -214,14 +227,18 @@ def classify_datagram(length, head, sizes, ranges):
     HEAD (all of it, or the part a first IPv4 fragment carries): the kind
     whose length rule LENGTH meets and whose type tag, read little-endian
     after the kind's S prefix as the pinned BoringTun reads it, is in the
-    kind's H range. "ambiguous" when more than one kind fits, "unknown" when
-    none does. The prefix's content is never consulted."""
+    kind's H range. "ambiguous" when more than one kind fits; "unresolved"
+    when a kind whose length rule LENGTH meets has its tag beyond HEAD, so
+    that a unique kind cannot be claimed; "unknown" when no kind fits. The
+    prefix's content is never consulted."""
     found = []
+    unseen = False
     for name, index, size in KINDS:
         offset = sizes[index]
         if (length < offset + size) if name == "transport" else (length != offset + size):
             continue
         if len(head) < offset + 4:
+            unseen = True
             continue
         tag = struct.unpack("<I", head[offset:offset + 4])[0]
         low, high = ranges[index]
@@ -229,6 +246,8 @@ def classify_datagram(length, head, sizes, ranges):
             found.append(name)
     if len(found) > 1:
         return "ambiguous"
+    if unseen:
+        return "unresolved"
     return found[0] if found else "unknown"
 
 
@@ -240,11 +259,68 @@ def kind_of(payload, sizes, ranges):
 # What the IPv4/UDP framing of one captured frame yields.
 IGNORE = "ignore"            # not from the wanted source address and port
 MALFORMED = "malformed"      # from the wanted source, but not valid IPv4/UDP
-CONTINUATION = "continuation"  # a later fragment of a datagram already counted
+CONTINUATION = "continuation"  # a later fragment that fits a recorded first fragment
 DATAGRAM = "datagram"
 
 
-def frame_payload(frame, source, source_port, destination=None, destination_port=None, first_fragments=None):
+class Fragments:
+    """The first fragments of relevant datagrams whose later fragments are
+    still due, so that a later fragment counts as the continuation only of a
+    datagram whose first fragment was recorded, and only where it fits.
+
+    An entry is keyed by the IPv4 source, destination and identification --
+    the IP ID alone names no datagram -- and keeps the datagram's IP payload
+    length (its UDP length) and the byte ranges seen. A later fragment is a
+    continuation only if it lies inside that payload, overlaps nothing seen,
+    carries a multiple of 8 bytes unless it is the last, and, if it is the
+    last, ends the payload exactly. An entry expires TIMEOUT seconds after its
+    first fragment (the Linux default ipfrag_time) and is dropped once every
+    byte is accounted for; after that the same key names no datagram. This is
+    bookkeeping, not reassembly: the bytes of later fragments are never
+    inspected, and a datagram whose later fragments never arrive is not
+    reported."""
+
+    TIMEOUT = 30.0
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.entries = {}
+
+    def _expire(self):
+        now = self.clock()
+        for key in [key for key, entry in self.entries.items() if now - entry[2] > self.TIMEOUT]:
+            del self.entries[key]
+        return now
+
+    def first(self, key, total, carried):
+        """A first fragment carrying CARRIED of the datagram's TOTAL IP payload
+        bytes. False if a datagram with this key is already in progress."""
+        now = self._expire()
+        if key in self.entries:
+            return False
+        self.entries[key] = [total, [(0, carried)], now]
+        return True
+
+    def later(self, key, offset, length, last):
+        """A later fragment carrying LENGTH bytes at byte OFFSET; LAST when its
+        More Fragments flag is clear. False unless it fits as described."""
+        self._expire()
+        entry = self.entries.get(key)
+        if entry is None:
+            return False
+        total, seen, _ = entry
+        end = offset + length
+        if length == 0 or end > total or (last and end != total) or (not last and length % 8):
+            return False
+        if any(start < end and offset < stop for start, stop in seen):
+            return False
+        seen.append((offset, end))
+        if sum(stop - start for start, stop in seen) == total:
+            del self.entries[key]
+        return True
+
+
+def frame_payload(frame, source, source_port, destination=None, destination_port=None, fragments=None):
     """(status, datagram length, datagram bytes, fragmented) for one IPv4 frame.
 
     Relevance is decided by addressing alone: the IPv4 source address (and
@@ -252,11 +328,11 @@ def frame_payload(frame, source, source_port, destination=None, destination_port
     length is validated before any byte counts as payload: the IPv4 header
     length and total length within the frame, the UDP header within the IPv4
     payload, and the UDP length equal to the IPv4 payload -- or, for a first
-    fragment, larger than it. A first fragment yields the datagram's declared
-    length and only the bytes it carries, and its IP ID is remembered in
-    FIRST_FRAGMENTS; a later fragment is a continuation of such a datagram, or
-    malformed. Frames that cannot be validated from a relevant source are
-    malformed, never skipped."""
+    fragment, larger than it and a multiple of 8 bytes carried. A first
+    fragment yields the datagram's declared length and only the bytes it
+    carries; with FRAGMENTS (a Fragments) it is recorded there, and a later
+    fragment is a continuation only if FRAGMENTS accepts it. Frames that cannot
+    be validated from a relevant source are malformed, never skipped."""
     if len(frame) < 20:
         relevant = len(frame) >= 16 and frame[12:16] == source
         return (MALFORMED if relevant else IGNORE), len(frame), b"", False
@@ -271,9 +347,9 @@ def frame_payload(frame, source, source_port, destination=None, destination_port
     fragment = struct.unpack(">H", frame[6:8])[0]
     offset, more = fragment & 0x1FFF, bool(fragment & 0x2000)
     body = frame[header:total]
-    ident = bytes(frame[4:6])
+    key = (bytes(frame[12:16]), bytes(frame[16:20]), bytes(frame[4:6]))
     if offset:
-        if first_fragments is not None and ident in first_fragments:
+        if fragments is not None and fragments.later(key, offset * 8, len(body), not more):
             return CONTINUATION, len(frame), b"", True
         return MALFORMED, len(frame), b"", True
     if len(body) < 8:
@@ -284,10 +360,10 @@ def frame_payload(frame, source, source_port, destination=None, destination_port
     if udp_length < 8:
         return MALFORMED, len(frame), b"", more
     if more:
-        if udp_length <= len(body):
+        if udp_length <= len(body) or len(body) % 8:
             return MALFORMED, len(frame), b"", True
-        if first_fragments is not None:
-            first_fragments.add(ident)
+        if fragments is not None and not fragments.first(key, udp_length, len(body)):
+            return MALFORMED, len(frame), b"", True
         return DATAGRAM, udp_length - 8, body[8:], True
     if udp_length != len(body):
         return MALFORMED, len(frame), b"", False
@@ -316,18 +392,48 @@ def write_state(path, line):
         os.fsync(state.fileno())
 
 
+def stat_fields(path):
+    """The fields of a /proc/<pid>/stat file after the command name: [0] is
+    the state (field 3), [1] the parent PID (field 4), [19] the start time in
+    clock ticks after boot (field 22)."""
+    with open(path) as stat:
+        return stat.read().rsplit(")", 1)[1].split()
+
+
+def own_identity():
+    """This process's PID and start time, as the shell tracker records them."""
+    return os.getpid(), int(stat_fields("/proc/self/stat")[19])
+
+
+def stop_token(path):
+    """The stop authorization in PATH, or None."""
+    try:
+        with open(path) as authorization:
+            text = authorization.read(100)
+    except FileNotFoundError:
+        return None
+    token = text[:-1] if text.endswith("\n") else text
+    return token if STOP_TOKEN.fullmatch(token) else None
+
+
 def capture(interface, source, source_port, seconds, path, layout=None):
-    """Record the relevant datagrams, then write "complete <records>" to
-    PATH.state at the deadline, or "stopped <records>" after a SIGTERM, the
-    caller's controlled stop. "ready" is written once the socket is bound.
-    Anything else -- an exception, another signal -- leaves no final line and
-    a nonzero exit status. A record is always written whole: the stop request
-    is only acted on between records."""
+    """Record the relevant datagrams; return the exit status.
+
+    PATH.state is the transcript: "ready <pid> <start time>" once the socket
+    is bound, then exactly one end. At the deadline, "complete <records>"
+    (status 0). On SIGTERM, "stopped <records> <token>" (status 0) when
+    PATH.stop holds the caller's stop authorization, else "interrupted
+    <records>" (status 3): a TERM nobody authorized is not a controlled stop.
+    A PATH.stop that exists before the start is refused. Anything else -- an
+    exception, another signal -- leaves no end line and a nonzero status. A
+    record is always written whole: a stop is only acted on between records."""
     sizes, ranges = parse_layout(layout) if layout else (None, None)
     wanted_source = socket.inet_aton(source)
     wanted_port = parse_number(source_port, "port", 65535)
-    duration = float(seconds)
-    state_path = path + ".state"
+    duration = float(parse_number(seconds, "capture seconds", 86400))
+    state_path, stop_path = path + ".state", path + ".stop"
+    if os.path.lexists(stop_path):
+        raise InputError("%s exists before the capture started" % stop_path)
     stop = []
     wake_read, wake_write = os.pipe()
     os.set_blocking(wake_write, False)
@@ -335,10 +441,10 @@ def capture(interface, source, source_port, seconds, path, layout=None):
     signal.signal(signal.SIGTERM, lambda signum, frame: stop.append(signum))
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
     sock.bind((interface, 0))
-    first_fragments = set()
+    fragments = Fragments()
     records = 0
     with open(path, "w") as out:
-        write_state(state_path, "ready")
+        write_state(state_path, "ready %d %d" % own_identity())
         deadline = time.monotonic() + duration
         while not stop:
             left = deadline - time.monotonic()
@@ -350,7 +456,7 @@ def capture(interface, source, source_port, seconds, path, layout=None):
             if sock not in readable:
                 continue
             status, length, data, _ = frame_payload(sock.recv(65535), wanted_source, wanted_port,
-                                                    first_fragments=first_fragments)
+                                                    fragments=fragments)
             if status == IGNORE:
                 continue
             line = record_line(sizes, ranges, status, length, data)
@@ -358,13 +464,22 @@ def capture(interface, source, source_port, seconds, path, layout=None):
                 out.write(line + "\n")
                 out.flush()
                 records += 1
-    write_state(state_path, ("stopped %d" if stop else "complete %d") % records)
+    if not stop:
+        write_state(state_path, "complete %d" % records)
+        return 0
+    token = stop_token(stop_path)
+    if token is None:
+        write_state(state_path, "interrupted %d" % records)
+        return 3
+    write_state(state_path, "stopped %d %s" % (records, token))
+    return 0
 
 
 def replay(interface, client, server, server_port, layout, count, seconds):
-    """Print "ready" once listening, then wait up to SECONDS for one complete,
-    unfragmented handshake initiation from CLIENT to SERVER:SERVER_PORT, send
-    it COUNT times and print "replayed <count>"; anything else exits nonzero."""
+    """Print "ready <pid> <start time>" once listening, then wait up to
+    SECONDS for one complete, unfragmented handshake initiation from CLIENT to
+    SERVER:SERVER_PORT, send it COUNT times and print "replayed <count>";
+    anything else exits nonzero."""
     sizes, ranges = parse_layout(layout)
     port = parse_number(server_port, "port", 65535)
     copies = parse_number(count, "count", 100000)
@@ -373,7 +488,7 @@ def replay(interface, client, server, server_port, layout, count, seconds):
     sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0003))
     sniffer.bind((interface, 0))
     wanted_client, wanted_server = socket.inet_aton(client), socket.inet_aton(server)
-    print("ready", flush=True)
+    print("ready %d %d" % own_identity(), flush=True)
     deadline = time.monotonic() + float(seconds)
     initiation = None
     while initiation is None:
@@ -400,6 +515,52 @@ def replay(interface, client, server, server_port, layout, count, seconds):
             sock.send(initiation)
     print("replayed %d" % copies, flush=True)
     return 0
+
+
+OWNED_ACTIONS = {"check": None, "TERM": signal.SIGTERM, "KILL": signal.SIGKILL}
+
+
+def owned(pid_text, start_text, action):
+    """Probe or signal one process the caller started, named by its PID and
+    the start time it recorded itself (field 22 of /proc/PID/stat), never a
+    process that was given the same PID later. A pidfd is opened first and the
+    identity checked through /proc afterwards: an open pidfd refers to one
+    process, so a signal sent through it reaches that process or nothing.
+    Prints "running" or "signalled" (exit 0), or "gone", "replaced" or
+    "exited" (exit 1)."""
+    pid = parse_number(pid_text, "PID", 4194304)
+    start = parse_number(start_text, "start time", 2 ** 62, WIDE_NUMBER)
+    if action not in OWNED_ACTIONS:
+        raise InputError("the action is check, TERM or KILL, not %r" % action)
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        print("gone")
+        return 1
+    try:
+        try:
+            fields = stat_fields("/proc/%d/stat" % pid)
+        except FileNotFoundError:
+            print("gone")
+            return 1
+        if int(fields[19]) != start:
+            print("replaced")
+            return 1
+        if fields[0] in ("Z", "X"):
+            print("exited")
+            return 1
+        if OWNED_ACTIONS[action] is None:
+            print("running")
+            return 0
+        try:
+            signal.pidfd_send_signal(fd, OWNED_ACTIONS[action])
+        except ProcessLookupError:
+            print("exited")
+            return 1
+        print("signalled")
+        return 0
+    finally:
+        os.close(fd)
 
 
 def shaped(protocol, prefix):
@@ -487,7 +648,7 @@ def classify(protocol, path):
 
 def kinds(protocol, path, sizes_text):
     """Every row at once, after the whole capture is validated: four packet
-    kinds, then the three summaries, in this order."""
+    kinds, then the four summaries, in this order."""
     if protocol != "sip":
         raise InputError("per-kind expectations are defined for sip only")
     sizes = parse_sizes(sizes_text)
@@ -519,13 +680,15 @@ def main(argv):
         if len(argv) == 4 and argv[0] == "probe" and argv[1] in PROBES:
             print(probe(argv[1], argv[2], argv[3]))
         elif len(argv) in (6, 7) and argv[0] == "capture":
-            capture(*argv[1:])
+            return capture(*argv[1:])
         elif len(argv) == 3 and argv[0] == "classify":
             classify(argv[1], argv[2])
         elif len(argv) == 4 and argv[0] == "kinds":
             kinds(argv[1], argv[2], argv[3])
         elif len(argv) == 8 and argv[0] == "replay":
             return replay(*argv[1:])
+        elif len(argv) == 4 and argv[0] == "owned":
+            return owned(*argv[1:])
         else:
             print(__doc__, file=sys.stderr)
             return 2

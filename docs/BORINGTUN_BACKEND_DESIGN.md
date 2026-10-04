@@ -2512,17 +2512,29 @@ The kernel menu keeps its 7 options unchanged.
   responses and transport must carry a request line in every datagram when
   their S (S2, S4) is 31 bytes or more and in none below it, as must cookie
   replies (S3) when the server sent any. The checks fail closed
-  (`tests/helpers/boringtun-wire-checks.sh`): a datagram of no kind, of two
-  kinds or from a malformed IPv4/UDP frame fails, a malformed capture record
-  or incomplete helper output fails, and a capture or replay counts only if it
-  exits 0 with its completion marker; the host's capture must still be
-  running when it is stopped after the traffic. `tests/test-boringtun-sip-wire-live.sh`
+  (`tests/helpers/boringtun-wire-checks.sh`) and cover every recorded relevant
+  observation: a datagram of no kind, of two kinds, one whose kind a short
+  first fragment leaves unresolved, or one from a malformed IPv4/UDP frame
+  fails, as does a malformed capture record or incomplete helper output. A
+  later fragment counts only inside the datagram whose first fragment it
+  continues (same source, destination and IP ID, within 30 s). A capture
+  counts only if it exits 0 with its exact transcript: ready (naming itself)
+  before the traffic, still running after it, then stopped by the caller's
+  authorized SIGTERM or completed after its whole interval by the caller's
+  clock. That establishes an internally consistent record of what the packet
+  socket delivered, not that every datagram was received. Children are
+  tracked by PID and start time and signalled through a pidfd, so a reused
+  PID is never signalled or waited for. `tests/test-boringtun-sip-wire-live.sh`
   then runs the verified binary as two peers with fixed sizes: the S2=26 S3=81
   S4=22 layout of an earlier false failure, every S at 31 and at 30, and a
   mixed layout, with cookie replies forced by a replayed initiation past the
   handshake rate limit, and with controls on the real captures: appended
   records of no kind or malformed evidence fail, and stripping or adding
-  request lines in one kind fails only that kind. It sends DNS, STUN, QUIC (reserved and v1) and SIP probes from the
+  request lines in one kind fails only that kind (accounting after
+  classification, not capture completeness). Further controls use real
+  processes: an unauthorized SIGTERM to the real capture, a PID reused in a
+  private PID namespace, and UAPI sockets the run does not own. The live
+  test sends DNS, STUN, QUIC (reserved and v1) and SIP probes from the
   client's network and from loopback. It also adds and removes a client under
   imitation and moves to AWG 3.0 and back. The x86_64 job installs with the last
   installer before imitation (`9f5a1af`) and manages the host with this one.

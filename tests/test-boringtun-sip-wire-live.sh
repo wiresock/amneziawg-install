@@ -26,17 +26,26 @@
 # The scenarios: the S sizes of the recorded follow-up C failure (S1=29 S2=26
 # S3=81 S4=22) without and with cookie replies, every server S at 31, every
 # server S at 30, and a mixed layout with an ordinary S4 of 45. Each capture
-# and replay child must exit 0 with its completion marker
-# (tests/helpers/boringtun-wire-checks.sh), and each capture must hold only
-# classified datagrams. Controls on the real captures then show that an
-# unknown, ambiguous or malformed record fails the check, and that removing
-# the request lines of one kind, or giving a random kind request lines, fails
-# that kind's verdict and only that one. The signature controls change records
-# that are already classified: they prove the per-kind accounting, not that a
-# capture is complete.
+# must be ready before its traffic, outlive it, run its whole interval and
+# complete, and each replay must finish; both must exit 0 with their exact
+# transcripts (tests/helpers/boringtun-wire-checks.sh). Every recorded
+# relevant datagram must then be classified and follow its kind's rule; that
+# holds what the packet socket delivered, which is not proof that nothing
+# escaped it. Controls on the real captures then show that an unknown,
+# ambiguous, unresolved or malformed record fails the check, and that
+# removing the request lines of one kind, or giving a random kind request
+# lines, fails that kind's verdict and only that one. The signature controls
+# change records that are already classified: they prove the per-kind
+# accounting, not that a capture is complete. Further controls use real
+# processes: a SIGTERM that reaches the real capture before its authorized
+# stop fails the capture check; in a PID namespace of its own (unshare), a
+# tracked child's PID, reaped by the shell and given to another process,
+# leads the tracker neither to signal nor to wait for that process; and a
+# UAPI socket this run did not create, or one replaced since, is left alone.
 #
 # Requirements: root, ip (iproute2) with network namespaces, /dev/net/tun,
-# awg (amneziawg-tools), ping, python3, and AWG_DISPOSABLE_HOST_TEST=1. With
+# awg (amneziawg-tools), ping, python3, unshare (util-linux), and
+# AWG_DISPOSABLE_HOST_TEST=1. With
 # AWG_LIVE_SECRET_SCAN set (tests/test-boringtun-host-live.sh does), the two
 # private keys generated here are added to that output scan's secret list.
 #
@@ -73,7 +82,10 @@ WORK=""
 SERVER_PID=""
 CLIENT_PID=""
 STARTED_PID=""
+PEER_HANDLE=""
 CREATED_NETNS=()
+# The UAPI sockets this run's peers created: path -> "device inode ctime".
+declare -A OWNED_SOCKETS=()
 PASSED=0
 FAILED=0
 
@@ -109,16 +121,22 @@ source "${SCRIPT_DIR}/helpers/boringtun-wire-checks.sh"
 [[ "${AWG_DISPOSABLE_HOST_TEST:-}" == 1 ]] || die "this test creates network namespaces and interfaces; set AWG_DISPOSABLE_HOST_TEST=1 on a disposable host"
 [[ "${EUID}" -eq 0 ]] || die "must run as root"
 [[ -n "${BIN}" && -x "${BIN}" ]] || die "usage: $0 <boringtun-cli>"
-for TOOL in ip awg ping python3; do
+for TOOL in ip awg ping python3 unshare; do
 	command -v "${TOOL}" >/dev/null 2>&1 || die "${TOOL} is required"
 done
 [[ -c /dev/net/tun ]] || die "/dev/net/tun is required"
 
+# The identity of a filesystem object: device, inode and ctime in ns.
+socket_identity() { # <path>
+	stat -c '%d %i %.9Z' -- "$1" 2>/dev/null
+}
 # Stop every child this run started (peers, capture, replay), each within a
 # bounded time, then remove the namespaces it created (their veth and TUN
-# links go with them) and the peers' UAPI sockets.
+# links go with them) and the UAPI sockets its peers created -- each only
+# while it is still that socket. Nothing this run did not create is removed,
+# also when it runs before anything was created.
 teardown() {
-	local NETNS
+	local NETNS SOCKET
 	bt_wire_cleanup
 	SERVER_PID=""
 	CLIENT_PID=""
@@ -126,8 +144,10 @@ teardown() {
 		ip netns delete "${NETNS}" 2>/dev/null
 	done
 	CREATED_NETNS=()
-	rm -f "/var/run/wireguard/${IF_S}.sock" "/var/run/wireguard/${IF_C}.sock" \
-		"/var/run/amneziawg/${IF_S}.sock" "/var/run/amneziawg/${IF_C}.sock"
+	for SOCKET in "${!OWNED_SOCKETS[@]}"; do
+		[[ "$(socket_identity "${SOCKET}")" == "${OWNED_SOCKETS[${SOCKET}]}" ]] && rm -f -- "${SOCKET}"
+	done
+	OWNED_SOCKETS=()
 }
 cleanup() {
 	local RC=$?
@@ -137,6 +157,10 @@ cleanup() {
 	exit "${RC}"
 }
 trap cleanup EXIT
+# An interrupted run still cleans up: these exits run the EXIT trap.
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
 WORK="$(mktemp -d /var/tmp/awg-sip-wire.XXXXXX)"
 chmod 0700 "${WORK}"
 SERVER_KEY="$(awg genkey)"
@@ -157,19 +181,30 @@ shared_lines() { # <S1> <S2> <S3> <S4>
 	printf '%s\nS1 = %s\nS2 = %s\nS3 = %s\nS4 = %s\nH1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\n' \
 		"${JUNK}" "$1" "$2" "$3" "$4" "${H1}" "${H2}" "${H3}" "${H4}"
 }
-# Start one peer in its namespace, as a tracked child of this shell
-# (STARTED_PID), and configure it through its UAPI socket.
+# Start one peer in its namespace as an owned child (PEER_HANDLE, its PID in
+# STARTED_PID), record the UAPI socket it creates as this run's, and
+# configure it through that socket. A socket path that already exists is not
+# this run's: the peer is not started and the path is left alone.
 start_peer() { # <namespace> <interface> <log> <config file> <tunnel address> <peer tunnel address> [imitation args...]
-	local NETNS="$1" IF="$2" LOG="$3" CONF="$4" ADDR="$5" PEER_ADDR="$6"
+	local NETNS="$1" IF="$2" LOG="$3" CONF="$4" ADDR="$5" PEER_ADDR="$6" SOCKET
 	shift 6
-	ip netns exec "${NETNS}" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "${BIN}" --foreground --disable-drop-privileges \
-		--verbosity error "$@" "${IF}" >"${LOG}" 2>&1 </dev/null &
-	STARTED_PID=$!
-	bt_wire_track "${STARTED_PID}"
+	STARTED_PID=""
+	for SOCKET in "/var/run/wireguard/${IF}.sock" "/var/run/amneziawg/${IF}.sock"; do
+		if [[ -e "${SOCKET}" || -L "${SOCKET}" ]]; then
+			echo "    ${SOCKET} already exists; it is not this run's and is left alone"
+			return 1
+		fi
+	done
+	bt_wire_spawn PEER_HANDLE "${LOG}" - ip netns exec "${NETNS}" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "${BIN}" \
+		--foreground --disable-drop-privileges --verbosity error "$@" "${IF}" || return 1
+	STARTED_PID="${PEER_HANDLE%% *}"
 	if ! wait_for 10 test -S "/var/run/wireguard/${IF}.sock"; then
 		sed 's/^/    | /' "${LOG}"
 		return 1
 	fi
+	for SOCKET in "/var/run/wireguard/${IF}.sock" "/var/run/amneziawg/${IF}.sock"; do
+		[[ -S "${SOCKET}" ]] && OWNED_SOCKETS[${SOCKET}]="$(socket_identity "${SOCKET}")"
+	done
 	awg setconf "${IF}" "${CONF}" &&
 		ip -n "${NETNS}" addr add "${ADDR}/32" dev "${IF}" &&
 		ip -n "${NETNS}" link set "${IF}" up &&
@@ -228,8 +263,10 @@ declare -A SIZES_OF=()
 # One scenario: fresh peers, the client's side recording the server's
 # datagrams for CAPTURE_SECONDS while the client pings through the tunnel
 # (handshake response and transport), and, with "cookies", a replayed
-# initiation (cookie replies). The capture must run to its deadline and the
-# replay must finish, both with status 0 and their completion markers.
+# initiation (cookie replies). The capture must be ready before the traffic,
+# still running after it, and run its whole interval to completion; the
+# replay must finish. Both must exit 0 with their exact transcripts
+# (tests/helpers/boringtun-wire-checks.sh).
 run_scenario() { # <name> <S1> <S2> <S3> <S4> <cookies|no-cookies>
 	local NAME="$1" S1="$2" S2="$3" S3="$4" S4="$5" COOKIES="$6" LAYOUT CAPTURE="${WORK}/$1.capture"
 	LAYOUT="${S1},${S2},${S3},${S4},${H_RANGES}"
@@ -254,7 +291,7 @@ run_scenario() { # <name> <S1> <S2> <S3> <S4> <cookies|no-cookies>
 		check "${NAME}: one genuine initiation was replayed ${REPLAYS} times, and the replay exited 0" \
 			bt_wire_replay_finish "${WORK}/${NAME}.replay" "${REPLAYS}" 15
 	fi
-	check "${NAME}: the capture ran its ${CAPTURE_SECONDS} s to completion and exited 0 with all its records" \
+	check "${NAME}: the capture outlived the traffic, ran its whole ${CAPTURE_SECONDS} s and completed with all its records" \
 		bt_wire_capture_finish "${CAPTURE}" complete "$((CAPTURE_SECONDS + 10))"
 }
 # The per-kind check of a scenario's capture.
@@ -317,7 +354,7 @@ echo "--- controls on the real captures"
 # Evidence that is not a complete, classified capture fails the check: a
 # record of no kind, of two kinds, from a malformed frame, a truncated or
 # non-numeric record, or one in the legacy prefix format.
-for CONTROL in "unknown 77 -" "ambiguous 95 -" "malformed 41 -" "transport 77" \
+for CONTROL in "unknown 77 -" "ambiguous 95 -" "unresolved 95 -" "malformed 41 -" "transport 77" \
 	"transport NOT_A_LENGTH 4f5054494f4e53207369703a75407820" "4f5054494f4e53207369703a75407820"; do
 	{ cat "${WORK}/at-31.capture"; printf '%s\n' "${CONTROL}"; } >"${WORK}/control.capture"
 	check "at-31 with the record '${CONTROL}' appended fails the per-kind check" \
@@ -361,6 +398,114 @@ check "mixed without request lines in transports: transport fails while the shap
 tamper "${WORK}/mixed.capture" cookie strip "${WORK}/neg.capture"
 check "mixed without request lines in cookie replies: cookie fails while the shaped transports pass" \
 	test "$(verdicts "${WORK}/neg.capture" 64,30,31,45)" = "response=ok cookie=FAIL transport=ok"
+
+echo "--- controls on the capture contract (the real capture helper)"
+fails() { # <command...>
+	! "$@"
+}
+# The authorized stop of a real capture passes. A SIGTERM that reaches it
+# before that -- from anyone -- fails the same check, and the capture itself
+# ends as interrupted, with status 3.
+CONTROL_LAYOUT="64,31,31,31,${H_RANGES}"
+if setup_pair 64 31 31 31; then
+	if bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" 60 "${WORK}/authorized.capture" "${CONTROL_LAYOUT}"; then
+		check "the authorized stop of a running real capture passes the capture check (the controls' baseline)" \
+			bt_wire_capture_finish "${WORK}/authorized.capture" stop 10
+	else
+		bad "the real capture started for the authorized-stop baseline"
+	fi
+	if bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" 60 "${WORK}/oob.capture" "${CONTROL_LAYOUT}"; then
+		bt_wire_signal "${BT_WIRE_CAPTURE}" TERM
+		bt_wire_await "${BT_WIRE_CAPTURE}" 10
+		check "a SIGTERM before the authorized stop fails the capture check" \
+			fails bt_wire_capture_finish "${WORK}/oob.capture" stop 10
+		check "  and the capture ended as interrupted, with status 3 ($(tail -n 1 "${WORK}/oob.capture.state"), ${BT_WIRE_STATUS})" \
+			bash -c '[[ "$1" =~ ^interrupted\ (0|[1-9][0-9]*)$ && "$2" == 3 ]]' _ "$(tail -n 1 "${WORK}/oob.capture.state")" "${BT_WIRE_STATUS}"
+	else
+		bad "the real capture started for the out-of-band stop control"
+	fi
+else
+	bad "the peers could not be set up for the capture controls"
+fi
+teardown
+
+echo "--- the owned-child tracker, in a PID namespace of its own (unshare)"
+# Bash reaps a background child by itself, and the kernel may then give its
+# PID to another process. That is forced here, and only inside a fresh PID
+# namespace: bt_wire_cleanup must neither signal nor wait for the process
+# that was given the tracked child's number, and must still end a tracked
+# child that runs.
+cat >"${WORK}/pid-reuse.sh" <<'EOF'
+set -uo pipefail
+WIRE="$1/helpers/boringtun-imitation-wire.py"
+source "$1/helpers/boringtun-wire-checks.sh"
+echo "namespace-shell-pid $$"
+bt_wire_spawn RUNNING /dev/null - sleep 30 || exit 3
+bt_wire_spawn EXITED /dev/null - bash -c 'exit 42' || exit 3
+OLD="${EXITED%% *}"
+for ((I = 0; I < 50; I++)); do
+	[[ -e "/proc/${OLD}" ]] || break
+	sleep 0.1
+done
+if [[ -e "/proc/${OLD}" ]]; then
+	echo "inconclusive: ${OLD} was not reaped by the shell"
+	exit 4
+fi
+echo "reaped-without-wait ${OLD}"
+printf '%s' "$((OLD - 1))" >/proc/sys/kernel/ns_last_pid || exit 5
+sleep 30 &
+STRANGER=$!
+if [[ "${STRANGER}" != "${OLD}" ]]; then
+	kill "${STRANGER}"
+	echo "inconclusive: the new process got PID ${STRANGER}, not ${OLD}"
+	exit 4
+fi
+echo "reused ${OLD}"
+bt_wire_cleanup
+if kill -0 "${STRANGER}" 2>/dev/null; then echo "replacement-alive"; else echo "replacement-gone"; fi
+if [[ -e "/proc/${RUNNING%% *}" ]]; then echo "tracked-running-survived"; else echo "tracked-running-ended"; fi
+kill -TERM "${STRANGER}" 2>/dev/null
+wait "${STRANGER}"
+echo "replacement-status $?"
+EOF
+if command -v unshare >/dev/null 2>&1; then
+	REUSE="$(unshare --pid --fork --mount-proc bash "${WORK}/pid-reuse.sh" "${SCRIPT_DIR}" 2>&1)"
+	sed 's/^/    | /' <<<"${REUSE}"
+	check "a tracked child that the shell reaped by itself had its PID given to an untracked process (forced, private PID namespace)" \
+		grep -q '^reused ' <<<"${REUSE}"
+	check "  bt_wire_cleanup neither signalled nor reaped that process" \
+		bash -c 'grep -qx replacement-alive <<<"$1" && grep -qx "replacement-status 143" <<<"$1"' _ "${REUSE}"
+	check "  and still ended the tracked child that ran" grep -qx tracked-running-ended <<<"${REUSE}"
+else
+	bad "unshare is available for the PID-reuse control"
+fi
+
+echo "--- UAPI sockets: only this run's are removed"
+mkdir -p /var/run/wireguard
+FOREIGN="/var/run/wireguard/${IF_S}.sock"
+python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "${FOREIGN}"
+FOREIGN_ID="$(socket_identity "${FOREIGN}")"
+teardown
+check "a teardown while this run owns no socket leaves an existing one alone" \
+	test -n "${FOREIGN_ID}" -a "$(socket_identity "${FOREIGN}")" = "${FOREIGN_ID}"
+check "a peer is not started on a socket path that already exists" fails setup_pair 64 31 31 31
+teardown
+check "  and the teardown after it leaves that socket alone" test "$(socket_identity "${FOREIGN}")" = "${FOREIGN_ID}"
+rm -f -- "${FOREIGN}"
+REPLACED="/var/run/wireguard/${IF_C}.sock"
+python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "${REPLACED}"
+OWNED_SOCKETS[${REPLACED}]="$(socket_identity "${REPLACED}")"
+rm -f -- "${REPLACED}"
+python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "${REPLACED}"
+REPLACED_ID="$(socket_identity "${REPLACED}")"
+teardown
+check "a socket this run recorded, then replaced at the same path by another, is left alone" \
+	test "$(socket_identity "${REPLACED}")" = "${REPLACED_ID}"
+rm -f -- "${REPLACED}"
+python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "${REPLACED}"
+OWNED_SOCKETS[${REPLACED}]="$(socket_identity "${REPLACED}")"
+teardown
+check "while one this run recorded and still the same is removed" test ! -e "${REPLACED}"
 
 echo "BoringTun SIP wire test: ${PASSED} passed, ${FAILED} failed"
 ((FAILED == 0))

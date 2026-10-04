@@ -539,18 +539,22 @@ wire_prefixes() { # <imitation>
 	# SIP shapes each packet kind by its own S, so its capture records the
 	# kind of every datagram, decided from its length and type tag.
 	[[ "$1" != sip ]] || LAYOUT=("$(params_layout)")
-	# The capture outlives the traffic and is stopped once the traffic has
-	# passed: one that ended on its own, failed, or did not stop cleanly did
-	# not observe the whole interval (tests/helpers/boringtun-wire-checks.sh).
+	# The capture is ready before the traffic starts, must still be running
+	# when the traffic has passed, and is then stopped by an authorized SIGTERM
+	# (tests/helpers/boringtun-wire-checks.sh). A capture that ended before
+	# that, failed, or was stopped by anything else does not count. What it
+	# recorded is what its packet socket delivered; the checks below hold
+	# every recorded relevant datagram to its rule, which is not proof that
+	# no datagram escaped the socket.
 	if ! bt_wire_capture_start "${NS}" "${VETH_CLIENT}" "${HOST_ADDR}" "${PORT}" 300 "${CAPTURE}" "${LAYOUT[@]}"; then
 		bad "$1: the client-side capture started"
 		return
 	fi
 	datapath "$1 imitation"
 	if bt_wire_capture_finish "${CAPTURE}" stop 10; then
-		ok "$1: the client-side capture recorded the whole traffic interval and stopped cleanly ($(wc -l <"${CAPTURE}") datagrams)"
+		ok "$1: the client-side capture ran from before the traffic until its authorized stop ($(wc -l <"${CAPTURE}") records)"
 	else
-		bad "$1: the client-side capture recorded the whole traffic interval and stopped cleanly"
+		bad "$1: the client-side capture ran from before the traffic until its authorized stop"
 		return
 	fi
 	if [[ "$1" == sip ]]; then
