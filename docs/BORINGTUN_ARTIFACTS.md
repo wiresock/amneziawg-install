@@ -7,7 +7,7 @@ for a future userspace AmneziaWG backend (see
 
 **Status: one release published.** `boringtun-cli-0.7.1-g71d88784ad29-b1`,
 built from the previous pin `71d88784ad29`, is public and is what the installer
-downloads. The current pin `ae2ab44e9a68` has a candidate release contract and
+downloads. The current pin `ae2ab44e9a68` has an approved release contract and
 no release yet. Four separate stages handle the artifacts, and only the first
 two run on their own:
 
@@ -42,8 +42,8 @@ contract is a candidate and also after it is approved and published.
 `release.env` always matches `pin.env`. No test compares the installer's
 constants with `pin.env` or `release.env`; each contract is checked on its own
 terms, and the host tests and the public-release download use only the
-installer's constants. Today the pin is `ae2ab44e9a68`, the contract a
-candidate of its build 1, and the installer installs the published
+installer's constants. Today the pin is `ae2ab44e9a68`, the contract an
+approved, not yet published build 1, and the installer installs the published
 `boringtun-cli-0.7.1-g71d88784ad29-b1`.
 
 ## Source pin
@@ -371,8 +371,8 @@ strict grammar as `pin.env` and refuses any disagreement with the pin:
 `BoringTun CLI <version> (WireSock <commit12>), build <build> (experimental)`.
 A published tag is never reused or moved, so once a build is public, any other
 bytes need a new build number. The build number is scoped to one source commit:
-a new pin starts again at build 1. The contract holds a `candidate` of build 1
-of the current pin, `boringtun-cli-0.7.1-gae2ab44e9a68-b1`; the published
+a new pin starts again at build 1. The contract holds an `approved`, not yet
+published build 1 of the current pin, `boringtun-cli-0.7.1-gae2ab44e9a68-b1`; the published
 release of the previous pin, `boringtun-cli-0.7.1-g71d88784ad29-b1`, stays
 side by side and is never moved, edited or replaced. Nothing built from the
 earlier pin `e4e4dc85ec03` is ever to be published: its archives lacked the
