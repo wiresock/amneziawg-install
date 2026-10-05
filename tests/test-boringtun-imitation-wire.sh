@@ -20,6 +20,12 @@
 # server datagram whenever any of S2-S4 was 31 bytes or more. That check failed
 # on a correct server with S2=26 S3=81 S4=22 (0/2054 shaped): S3 prefixes only
 # cookie replies, and none was sent.
+#
+# A datagram that fits more than one kind is decided by what the receiving
+# client can verify of each reading. Without that, the host check failed on a
+# correct server whose one handshake response, at S2=54, also fit the
+# transport rule at S4=52 (follow-up D). Genuine datagrams of the pinned
+# binary at those sizes anchor the mac1 check to the real wire.
 
 set -uo pipefail
 
@@ -59,17 +65,66 @@ assert_true() {
 }
 
 H="100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100"
+# The receiving client's public key the consumers pass to the capture.
+FIXTURE_KEY="QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2g="
 # Python against the real helper, imported from its file: datagrams, frames
 # and capture files built exactly.
 py() {
 	"${REAL_PYTHON}" - "${WIRE_REAL}" "$@" <<'PY'
-import importlib.util, os, struct, sys
+import base64, hashlib, importlib.util, os, struct, sys
 spec = importlib.util.spec_from_file_location("wire", sys.argv[1])
 wire = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wire)
 SIZES = {"init": 148, "response": 92, "cookie": 64, "transport": 32}
 TAGS = {"init": 100000050, "response": 200000050, "cookie": 300000050, "transport": 400000050}
 SERVER = bytes([192, 0, 2, 1])
+# Genuine datagrams of the pinned BoringTun (71d88784) SIP server at follow-up
+# D's sizes, S1=99 S2=54 S3=92 S4=52, with REPORTED's H ranges, recorded on the
+# client's side: the handshake response, which also fits the transport rule
+# (its four bytes at 52 are 0x6f602020, inside H4), and the first ping reply of
+# the session it opened. Public bytes only: SIP text, a handshake response,
+# ciphertext. GENUINE_KEY is the receiving client's static public key.
+REPORTED = "99,54,92,52,123456789-223456788,708538112-708538367,1234567890-1334567889,1862270976-1962270975"
+GENUINE_KEY = "QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2g="
+GENUINE_RESPONSE = bytes.fromhex(
+    "4f5054494f4e53207369703a6d40766f69702e7062782e6578616d706c65205349502f322e300d0a0d0a2020202020202020"
+    "20202020606f3b2a011c8b2e0101e34c374fba8079d1bacc51b0947e24d74c92a465e5d603f523753b4165f1ced5722cc62e"
+    "b4f555167df1634f163785c19ba131fa9b44e3a99d34a93a4795ce0337f300000000000000000000000000000000")
+GENUINE_TRANSPORT = bytes.fromhex(
+    "4d455353414745207369703a6e6f63406c616e2e7062782e6578616d706c65205349502f322e300d0a0d0a20202020202020"
+    "2020056408710101e34c0000000000000000258805a040114b24f95603e3ef7b44be86423f6a7bad454aafa50a3c4f0d1a2e"
+    "9b8b427519d770af0000ba323ed92213d4c960d30a817e8039c994c0ceca793e31e48a3654594bce6fed4c3f62f78a41431c"
+    "f8193ae14f59c5bb1617e9fc108e918246619f8594636a8e167f04b09dd7")
+# Constructed datagrams fitting more than one kind: S1=64 S2=81 S3=109 S4=45
+# with wide H2 and H3 (a transport of 96 plaintext bytes is 173 bytes, the
+# length of a response and of a cookie reply), and a receiving key of this
+# test's own. mac1 is computed here as the WireGuard protocol defines it,
+# independently of the helper; the genuine response above holds it too.
+CROSSED = "64,81,109,45,5-104,65536-1073741823,1073741824-2130706431,2130706432-2147483647"
+TEST_KEY = bytes(range(32))
+
+def with_mac1(body, public, valid=True):
+    """BODY (a handshake message up to mac1) with its mac1 and a zero mac2."""
+    mac = hashlib.blake2s(body, digest_size=16, key=hashlib.blake2s(b"mac1----" + public).digest()).digest()
+    return body + (mac if valid else bytes(b ^ 0xFF for b in mac)) + bytes(16)
+
+def response_message(receiver, valid=True, at28=0, public=TEST_KEY, tag=500000000):
+    """A response to RECEIVER whose ephemeral key holds AT28 at offset 28."""
+    body = bytearray(struct.pack("<III", tag, 0x11223344, receiver) + os.urandom(48))
+    body[28:32] = struct.pack("<I", at28)
+    return with_mac1(bytes(body), public, valid)
+
+def init_message(valid=True, at56=0, public=TEST_KEY, tag=50):
+    """An initiation whose encrypted static key holds AT56 at offset 56."""
+    body = bytearray(struct.pack("<II", tag, 0x55667788) + os.urandom(108))
+    body[56:60] = struct.pack("<I", at56)
+    return with_mac1(bytes(body), public, valid)
+
+def transport(receiver, s4=45, plaintext=96, tag=2140000000):
+    return os.urandom(s4) + struct.pack("<IIQ", tag, receiver, 7) + os.urandom(plaintext + 16)
+
+def put(datagram, offset, value):
+    return datagram[:offset] + struct.pack("<I", value) + datagram[offset + 4:]
 
 def datagram(kind, s, prefix="random", tag=None, extra=0):
     if prefix == "sip":
@@ -109,6 +164,88 @@ elif cmd == "ambiguous":
     d[10:14] = struct.pack("<I", 200000050)
     d[70:74] = struct.pack("<I", 400000050)
     print(wire.kind_of(bytes(d), sizes, ranges))
+elif cmd == "evidence":
+    # One "<case> <result>" per line: datagrams that fit more than one kind,
+    # with and without what the receiver can verify (wire.Evidence).
+    key = wire.parse_public_key(GENUINE_KEY)
+    sizes, ranges = wire.parse_layout(REPORTED)
+    print("genuine-response-without-evidence", wire.kind_of(GENUINE_RESPONSE, sizes, ranges))
+    ev = wire.Evidence(key)
+    print("genuine-response", wire.kind_of(GENUINE_RESPONSE, sizes, ranges, ev))
+    print("genuine-ping-reply", wire.kind_of(GENUINE_TRANSPORT, sizes, ranges, ev))
+    print("genuine-response-other-key", wire.kind_of(GENUINE_RESPONSE, sizes, ranges, wire.Evidence(TEST_KEY)))
+    status, length, data, _ = wire.frame_payload(ipv4(GENUINE_RESPONSE), SERVER, 51820, fragments=wire.Fragments())
+    print("genuine-record", wire.record_line(sizes, ranges, status, length, data, wire.Evidence(key)).replace(" ", "_"))
+    # Its first 136 bytes as a first fragment: both tags and mac1 are inside
+    # it, but a fragment is never decided.
+    udp = struct.pack(">HHHH", 51820, 40000, 8 + len(GENUINE_RESPONSE), 0) + GENUINE_RESPONSE
+    status, length, data, _ = wire.frame_payload(raw(udp[:144], fragment=0x2000), SERVER, 51820, fragments=wire.Fragments())
+    print("genuine-first-fragment", wire.record_line(sizes, ranges, status, length, data, wire.Evidence(key)).split(" ")[0])
+
+    sizes, ranges = wire.parse_layout(CROSSED)
+    def kind(datagram, evidence):
+        return wire.kind_of(datagram, sizes, ranges, evidence)
+    def response(receiver, valid=True, at109=0):
+        """A 173-byte response at S2=81 whose bytes at 45 (the transport
+        reading) fit no range and at 109 (the cookie reading) are AT109."""
+        return put(os.urandom(81) + response_message(receiver, valid, at28=at109), 45, 0)
+    def ping_reply(receiver, at81=0, at109=0):
+        """A 173-byte transport whose bytes at 81 and 109 are AT81, AT109."""
+        return put(put(transport(receiver), 81, at81), 109, at109)
+    # A transport that also fits the response rule: the response reading's
+    # mac1 fails, so it is a transport, with or without a session.
+    mirror = ping_reply(0xA1A1A1A1, at81=300000000)
+    print("transport-also-response-without-evidence", kind(mirror, None))
+    print("transport-also-response", kind(mirror, wire.Evidence(TEST_KEY)))
+    # A transport that also fits the cookie rule: decided only by its session.
+    tie = ping_reply(0xB2B2B2B2, at109=1500000000)
+    ev = wire.Evidence(TEST_KEY)
+    print("session-response", kind(response(0xB2B2B2B2), ev))
+    print("transport-also-cookie-in-session", kind(tie, ev))
+    print("transport-also-cookie-other-session", kind(ping_reply(0xC3C3C3C3, at109=1500000000), ev))
+    print("transport-also-cookie-no-session", kind(tie, wire.Evidence(TEST_KEY)))
+    forged = wire.Evidence(TEST_KEY)
+    print("forged-response", kind(response(0xB2B2B2B2, valid=False), forged))
+    print("transport-also-cookie-after-forged-response", kind(tie, forged))
+    print("transport-also-response-and-cookie-in-session", kind(ping_reply(0xB2B2B2B2, 300000000, 1500000000), ev))
+    print("transport-also-response-and-cookie-no-session",
+          kind(ping_reply(0xB2B2B2B2, 300000000, 1500000000), wire.Evidence(TEST_KEY)))
+    # A response that also fits the cookie rule (its ephemeral key at 109).
+    print("response-also-cookie", kind(response(0xD4D4D4D4, at109=1500000000), wire.Evidence(TEST_KEY)))
+    print("forged-response-also-cookie", kind(response(0xD4D4D4D4, valid=False, at109=1500000000), wire.Evidence(TEST_KEY)))
+    # A server initiation (212 bytes) that also fits the transport rule.
+    init = put(os.urandom(64) + init_message(), 45, 2140000000)
+    print("init-also-transport", kind(init, wire.Evidence(TEST_KEY)))
+    print("forged-init-also-transport", kind(put(os.urandom(64) + init_message(valid=False), 45, 2140000000),
+                                              wire.Evidence(TEST_KEY)))
+    # An initiation and a response in one datagram (S2 = S1 + 56, which the
+    # installer never draws): one mac1 field serves both readings.
+    sizes, ranges = wire.parse_layout("10,66,31,130,5-104,65536-1073741823,1073741824-2130706431,2130706432-2147483647")
+    both = os.urandom(10) + init_message(at56=300000000)
+    print("init-also-response", wire.kind_of(both, sizes, ranges, wire.Evidence(TEST_KEY)))
+    neither = os.urandom(10) + init_message(valid=False, at56=300000000)
+    print("forged-init-also-response", wire.kind_of(neither, sizes, ranges, wire.Evidence(TEST_KEY)))
+    class Credulous(wire.Evidence):
+        def authentic(self, message):
+            return True
+    print("two-authentic-readings", wire.kind_of(both, sizes, ranges, Credulous(TEST_KEY)))
+elif cmd == "key":
+    try:
+        print("accepted %d" % len(wire.parse_public_key(sys.argv[3])))
+    except wire.InputError:
+        print("refused")
+elif cmd == "record-genuine":
+    # record-genuine <out> <with-evidence|without-evidence> <cookies>: the
+    # genuine response and three copies of the genuine ping reply, then
+    # COOKIES shaped cookie replies, recorded as capture() records them.
+    sizes, ranges = wire.parse_layout(REPORTED)
+    ev = wire.Evidence(wire.parse_public_key(GENUINE_KEY)) if sys.argv[4] == "with-evidence" else None
+    datagrams = [GENUINE_RESPONSE] + [GENUINE_TRANSPORT] * 3
+    datagrams += [datagram("cookie", 92, "sip", tag=1300000000) for _ in range(int(sys.argv[5]))]
+    with open(sys.argv[3], "w") as out:
+        for d in datagrams:
+            status, length, data, _ = wire.frame_payload(ipv4(d), SERVER, 51820, fragments=wire.Fragments())
+            out.write(wire.record_line(sizes, ranges, status, length, data, ev) + "\n")
 elif cmd == "record":
     # record <layout> <out> (<kind>:<count>:<sip|random>)...: a capture file
     # written exactly as capture() writes it, through frame_payload.
@@ -257,6 +394,56 @@ for LAYOUT in "29,26,81,22" "29,26,81,22,${H},5" "x,26,81,22,${H}" "29,26,81,655
 	assert_eq "refused" "$(py layout "${LAYOUT}")" "the layout '${LAYOUT}' is refused"
 done
 assert_eq "accepted" "$(py layout "29,26,81,22,${H}")" "a valid layout is accepted"
+
+echo "=== More than one kind: what the receiver can verify decides ==="
+# Follow-up D: main 2ff94d0's host SIP check failed on a correct server
+# (BoringTun Host run 37276248795, Debian 12, S1=99 S2=54 S3=92 S4=52). Its
+# one handshake response also fit the transport rule at S4=52, two filler
+# bytes and half its tag, and was recorded ambiguous. A reading wins only by
+# what the receiving client can verify: mac1 under its key, or a transport's
+# session as an authenticated response named it.
+EVIDENCE="$(py evidence)"
+evidence_is() { # <case> <expected> <message>
+	assert_eq "$2" "$(awk -v c="$1" '$1 == c { print $2 }' <<<"${EVIDENCE}")" "$3"
+}
+evidence_is genuine-response-without-evidence ambiguous \
+	"follow-up D's genuine response fits the response and the transport rule: alone, ambiguous"
+evidence_is genuine-response response "  its mac1 holds under the client's key: a response"
+evidence_is genuine-ping-reply transport "  and the ping reply of the session it opened is a transport"
+evidence_is genuine-response-other-key transport \
+	"  under another key its mac1 fails and only its transport reading remains: no response is claimed"
+evidence_is genuine-record response_146_4f5054494f4e53207369703a6d40766f \
+	"  the capture's record path records it as a response, with its prefix"
+evidence_is genuine-first-fragment ambiguous "  a first fragment of it is not decided, though its tags and mac1 are inside"
+evidence_is transport-also-response-without-evidence ambiguous "a transport that also fits the response rule: alone, ambiguous"
+evidence_is transport-also-response transport "  the response reading's mac1 fails: a transport, with or without its session"
+evidence_is session-response response "an authenticated response opens the session it names"
+evidence_is transport-also-cookie-in-session transport "a transport of that session that also fits the cookie rule is a transport"
+evidence_is transport-also-cookie-other-session ambiguous "  one naming another session stays ambiguous: a cookie reading is never refuted"
+evidence_is transport-also-cookie-no-session ambiguous "  as does one before any response"
+evidence_is forged-response response "a response whose mac1 fails is still a response where it fits no other kind"
+evidence_is transport-also-cookie-after-forged-response ambiguous "  but it opens no session: a transport naming it stays ambiguous"
+evidence_is transport-also-response-and-cookie-in-session transport \
+	"a transport of a session that also fits the response and the cookie rule is a transport"
+evidence_is transport-also-response-and-cookie-no-session ambiguous "  without its session it stays ambiguous"
+evidence_is response-also-cookie response "a response that also fits the cookie rule is decided by its mac1"
+evidence_is forged-response-also-cookie cookie "  if that fails, the cookie reading is all that remains"
+evidence_is init-also-transport init "a server initiation that also fits the transport rule is decided by its mac1"
+evidence_is forged-init-also-transport transport "  if that fails, the transport reading is all that remains"
+evidence_is init-also-response init "an initiation that also fits the response rule: only the initiation's mac1 holds"
+evidence_is forged-init-also-response unknown "  when neither mac1 holds it is no kind"
+evidence_is two-authentic-readings ambiguous "two readings that both authenticate stay ambiguous: no kind wins by its order"
+for KEY in "QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2g" "QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2g==" "" "not-a-key" \
+	"QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2g=x" "QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2-="; do
+	assert_eq refused "$(py key "${KEY}")" "the receiver key '${KEY}' is refused"
+done
+assert_eq "accepted 32" "$(py key "${FIXTURE_KEY}")" "a base64 public key of 32 bytes is accepted"
+CAPTURE_ARGS=(capture lo 127.0.0.1 51820 1 "${T}/args.capture" "29,26,81,22,${H}")
+"${REAL_PYTHON}" "${WIRE_REAL}" "${CAPTURE_ARGS[@]}" >/dev/null 2>&1
+assert_eq 2 "$?" "a capture given a layout without the receiver key is refused (usage)"
+"${REAL_PYTHON}" "${WIRE_REAL}" "${CAPTURE_ARGS[@]}" not-a-key >/dev/null 2>&1
+assert_eq "1 absent" "$? $(test -e "${T}/args.capture.state" && echo present || echo absent)" \
+	"  as is one given a key that is not 32 base64 bytes, before it writes anything"
 
 echo "=== IPv4/UDP framing before payload ==="
 assert_eq "datagram 77 77 whole" "$(py frame valid)" "a valid frame yields its UDP payload"
@@ -611,10 +798,12 @@ assert_eq "1 '' not-run 0" "$(registration foreign)" \
 # extra line after its end), noclock and endnoclock (a ready or complete
 # line without its clock), readyearly (a ready clock before its start),
 # readylate (a ready clock after the caller saw it), endlate (an end clock
-# after the caller saw it end). The replay prints its ready line and
-# "replayed <n>" and exits FAKE_REPLAY_RC; modes noready and noinit.
-# `kinds` runs the real helper unless FAKE_KINDS asks for empty or garbage
-# output with exit 0; "owned" always runs the real helper.
+# after the caller saw it end). With FAKE_EXPECT_KEY it starts only when given
+# a layout and that receiver key, as the consumer fixtures require. The
+# replay prints its ready line and "replayed <n>" and exits FAKE_REPLAY_RC;
+# modes noready and noinit. `kinds` runs the real helper unless FAKE_KINDS
+# asks for empty or garbage output with exit 0; "owned" always runs the real
+# helper.
 FAKEWIRE="${T}/fakewire"
 cat >"${FAKEWIRE}" <<'EOF'
 #!/bin/bash
@@ -630,6 +819,12 @@ clock() {
 }
 case "$1" in
 	capture)
+		# With FAKE_EXPECT_KEY, only a layout capture given that receiver key
+		# starts, as the real helper needs both.
+		if [[ -n "${FAKE_EXPECT_KEY:-}" ]] && [[ $# -ne 8 || -z "$7" || "$8" != "${FAKE_EXPECT_KEY}" ]]; then
+			echo "fake capture: no layout with the receiver key ${FAKE_EXPECT_KEY}: $*" >&2
+			exit 1
+		fi
 		OUT="$6"
 		STATE="${OUT}.state"
 		cp -- "${FAKE_CAPTURE}" "${OUT}"
@@ -731,6 +926,12 @@ cat "${T}/fragment-valid-live" "${T}/fragment-record" >"${T}/live-fragment"
 # valid records (the transport's 96 bytes fit S4=45 and S4=31 alike).
 cat "${T}/host-valid" "${T}/boundary-records" >"${T}/host-boundary"
 cat "${T}/live-valid" "${T}/boundary-records" >"${T}/live-boundary"
+# Follow-up D's genuine response and ping replies, plus shaped cookie replies
+# for the harness consumer's rules, as the real helper records them with the
+# client's key and without it.
+py record-genuine "${T}/genuine-with" with-evidence 2
+py record-genuine "${T}/genuine-without" without-evidence 2
+OTHER_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 # The host consumer: wire_prefixes sip, its capture stopped after the traffic.
 # Prints the consumer's assertions and a last line "complete assertions=<n>
@@ -741,7 +942,7 @@ host_case() { # <capture> [VAR=value...]
 	# shellcheck disable=SC2034 # the fixture settings are read by the extracted wire_prefixes
 	(
 		# shellcheck disable=SC2163 # the arguments are VAR=value assignments
-		export FAKE_CAPTURE="${CAPTURE}" FAKE_END=stop "$@"
+		export FAKE_CAPTURE="${CAPTURE}" FAKE_END=stop FAKE_EXPECT_KEY="${FIXTURE_KEY}" "$@"
 		WORK="${T}/host-work"
 		rm -rf "${WORK}" && mkdir -p "${WORK}"
 		WIRE=fake NS=fixture VETH_CLIENT=fixture HOST_ADDR=192.0.2.1 PORT=51820
@@ -755,6 +956,7 @@ host_case() { # <capture> [VAR=value...]
 		check() { local M="$1"; shift; if "$@"; then ok "${M}"; else bad "${M}"; fi; }
 		params_s() { cut -d, -f"${1#S}" <<<"${SIZES}"; }
 		params_layout() { echo "${SIZES},${H}"; }
+		client_public_key() { echo "${FIXTURE_CONSUMER_KEY:-${FIXTURE_KEY}}"; }
 		datapath() { :; }
 		python3() { if ((BASH_SUBSHELL > LEVEL)); then exec "${FAKEWIRE}" "${@:2}"; else "${FAKEWIRE}" "${@:2}"; fi; }
 		ip() { if [[ "$1 $2" == "netns exec" ]]; then shift 3; "$@"; else return 97; fi; }
@@ -772,11 +974,12 @@ live_case() { # <capture> [VAR=value...]
 	# shellcheck disable=SC2034 # the fixture settings are read by the extracted run_scenario
 	(
 		# shellcheck disable=SC2163 # the arguments are VAR=value assignments
-		export FAKE_CAPTURE="${CAPTURE}" FAKE_END=complete "$@"
+		export FAKE_CAPTURE="${CAPTURE}" FAKE_END=complete FAKE_EXPECT_KEY="${FIXTURE_KEY}" "$@"
 		WORK="${T}/live-work"
 		rm -rf "${WORK}" && mkdir -p "${WORK}"
 		WIRE=fake NS_C=fixture VETH_C=fixture ADDR_C=192.0.2.2 ADDR_S=192.0.2.1 PORT=51999 DOMAIN=pbx.example
 		REPLAYS=400 TUN_S=10.77.0.1 H_RANGES="${H}" CAPTURE_SECONDS=3
+		CLIENT_PUB="${FIXTURE_CONSUMER_KEY:-${FIXTURE_KEY}}"
 		IFS=, read -r S1 S2 S3 S4 <<<"${FIXTURE_SIZES:-64,31,31,31}"
 		declare -A SIZES_OF=()
 		PASSED=0 FAILED=0
@@ -919,6 +1122,14 @@ direct_rejects "an end clock after the caller saw the capture end is refused" "t
 echo "=== The host consumer (wire_prefixes) ==="
 CAPTURE_TEXT="the client-side capture ran from before the traffic until its authorized stop"
 expect_fixture "valid response and transport records pass" pass - host_case "${T}/host-valid"
+expect_fixture "follow-up D's genuine datagrams, recorded with the client's key, pass" pass - \
+	host_case "${T}/genuine-with" FIXTURE_SIZES=99,54,92,52
+expect_fixture "  recorded without it, the ambiguous response is rejected" reject "no recorded server datagram is ambiguous (1)" \
+	host_case "${T}/genuine-without" FIXTURE_SIZES=99,54,92,52
+expect_fixture "  as is the missing response" reject "response datagrams were recorded (0)" \
+	host_case "${T}/genuine-without" FIXTURE_SIZES=99,54,92,52
+expect_fixture "a capture given another receiver key is not used" reject "the client-side capture started" \
+	host_case "${T}/host-valid" FIXTURE_CONSUMER_KEY="${OTHER_KEY}"
 for SUMMARY in unknown ambiguous unresolved malformed; do
 	expect_fixture "valid records plus a ${SUMMARY} record are rejected" reject "no recorded server datagram is ${SUMMARY}" \
 		host_case "${T}/host-${SUMMARY}"
@@ -948,6 +1159,14 @@ done
 echo "=== The harness consumer (run_scenario, expect_scenario) ==="
 LIVE_CAPTURE_TEXT="the capture outlived the traffic, ran its whole 3 s and completed with all its records"
 expect_fixture "a valid scenario passes" pass - live_case "${T}/live-valid"
+expect_fixture "follow-up D's genuine datagrams, recorded with the client's key, pass" pass - \
+	live_case "${T}/genuine-with" FIXTURE_SIZES=99,54,92,52
+expect_fixture "  recorded without it, the ambiguous response is rejected" reject "no recorded server datagram is ambiguous (1)" \
+	live_case "${T}/genuine-without" FIXTURE_SIZES=99,54,92,52
+expect_fixture "  as is the missing response" reject "response datagrams were recorded (0)" \
+	live_case "${T}/genuine-without" FIXTURE_SIZES=99,54,92,52
+expect_fixture "a scenario whose capture is given another receiver key is rejected" reject "the capture started" \
+	live_case "${T}/live-valid" FIXTURE_CONSUMER_KEY="${OTHER_KEY}"
 # The interval is the capture's own: a late start, or a caller late to
 # collect the status, neither shortens a whole interval nor lengthens a
 # short one.

@@ -2511,7 +2511,13 @@ The kernel menu keeps its 7 options unchanged.
   kind comes from its length and type tag, not from the prefix: handshake
   responses and transport must carry a request line in every datagram when
   their S (S2, S4) is 31 bytes or more and in none below it, as must cookie
-  replies (S3) when the server sent any. The checks fail closed
+  replies (S3) when the server sent any. A datagram that fits two kinds is
+  decided only by what the receiving client can verify of each reading: a
+  handshake message's mac1 under the client's static public key, and a
+  transport's receiver index against the session an authenticated response
+  opened. No reading wins by its kind. A cookie reading can never be
+  verified here, so a datagram this leaves undecided stays ambiguous. The
+  checks fail closed
   (`tests/helpers/boringtun-wire-checks.sh`) and cover every recorded relevant
   observation: a datagram of no kind, of two kinds, one whose kind a short
   first fragment leaves unresolved, or one from a malformed IPv4/UDP frame
@@ -2536,7 +2542,12 @@ The kernel menu keeps its 7 options unchanged.
   then runs the verified binary as two peers with fixed sizes: the S2=26 S3=81
   S4=22 layout of an earlier false failure, every S at 31 and at 30, and a
   mixed layout, with cookie replies forced by a replayed initiation past the
-  handshake rate limit, and with controls on the real captures: appended
+  handshake rate limit. It adds the S1=99 S2=54 S3=92 S4=52 layout of a later
+  false failure, with H ranges that make every handshake response fit the
+  transport rule too, and a crossed layout whose ping replies also fit the
+  response and cookie rules. The crossed layout with its handshake before
+  the capture must stay ambiguous. It also has controls on the real
+  captures: appended
   records of no kind or malformed evidence fail, and stripping or adding
   request lines in one kind fails only that kind (accounting after
   classification, not capture completeness). Further controls use real

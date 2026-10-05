@@ -6,7 +6,12 @@
 # records the server's datagrams; each one's kind (handshake response, cookie
 # reply, transport) is decided from its length and the AmneziaWG type tag after
 # that kind's S prefix, never from the SIP text under test
-# (tests/helpers/boringtun-imitation-wire.py).
+# (tests/helpers/boringtun-imitation-wire.py). A datagram that fits more than
+# one kind is decided by what the client can verify of each reading: a
+# handshake message's mac1 under the client's public key, a transport's
+# receiver index against the session an authenticated response opened.
+# Nothing decides a cookie reading, so a transport that also fits the cookie
+# rule outside a seen session stays ambiguous.
 #
 # The pinned BoringTun writes a SIP request line into every S prefix of 31
 # bytes or more (SIP_REQUEST_LINE_MIN) and leaves a shorter one random, for
@@ -25,7 +30,11 @@
 #
 # The scenarios: the S sizes of the recorded follow-up C failure (S1=29 S2=26
 # S3=81 S4=22) without and with cookie replies, every server S at 31, every
-# server S at 30, and a mixed layout with an ordinary S4 of 45. Each capture
+# server S at 30, a mixed layout with an ordinary S4 of 45, the S sizes of
+# the recorded follow-up D failure (S1=99 S2=54 S3=92 S4=52) with H ranges
+# that make every response fit the transport rule too, and a crossed layout
+# whose ping replies also fit the response and cookie rules; that crossed
+# layout with its handshake before the capture must stay ambiguous. Each capture
 # must be ready before its traffic, outlive it, run its whole interval (by
 # its own boot-time clock, from ready to complete) and complete, and each
 # replay must finish; both must exit 0 with their exact transcripts
@@ -264,10 +273,11 @@ fi
 SERVER_PUB="$(awg pubkey <<<"${SERVER_KEY}")"
 CLIENT_PUB="$(awg pubkey <<<"${CLIENT_KEY}")"
 
-# The [Interface] lines both peers share: the junk settings, S1-S4, H1-H4.
-shared_lines() { # <S1> <S2> <S3> <S4>
+# The [Interface] lines both peers share: the junk settings, S1-S4, H1-H4
+# (H_RANGES unless given).
+shared_lines() { # <S1> <S2> <S3> <S4> [<H1,H2,H3,H4>]
 	local H1 H2 H3 H4
-	IFS=, read -r H1 H2 H3 H4 <<<"${H_RANGES}"
+	IFS=, read -r H1 H2 H3 H4 <<<"${5:-${H_RANGES}}"
 	printf '%s\nS1 = %s\nS2 = %s\nS3 = %s\nS4 = %s\nH1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\n' \
 		"${JUNK}" "$1" "$2" "$3" "$4" "${H1}" "${H2}" "${H3}" "${H4}"
 }
@@ -312,8 +322,9 @@ add_netns() { # <name>
 	ip netns add "$1" || return 1
 	CREATED_NETNS+=("$1")
 }
-# A fresh pair of peers with the given S sizes.
-setup_pair() { # <S1> <S2> <S3> <S4>
+# A fresh pair of peers with the given S sizes (and H ranges, H_RANGES unless
+# given).
+setup_pair() { # <S1> <S2> <S3> <S4> [<H1,H2,H3,H4>]
 	teardown
 	if ip link show "${VETH_S}" >/dev/null 2>&1 || ip link show "${VETH_C}" >/dev/null 2>&1; then
 		echo "    a link named ${VETH_S} or ${VETH_C} already exists; it is not this run's and is left alone"
@@ -359,18 +370,20 @@ declare -A SIZES_OF=()
 # initiation (cookie replies). The capture must be ready before the traffic,
 # still running after it, and run its whole interval to completion; the
 # replay must finish. Both must exit 0 with their exact transcripts
-# (tests/helpers/boringtun-wire-checks.sh).
-run_scenario() { # <name> <S1> <S2> <S3> <S4> <cookies|no-cookies>
-	local NAME="$1" S1="$2" S2="$3" S3="$4" S4="$5" COOKIES="$6" LAYOUT CAPTURE="${WORK}/$1.capture"
-	LAYOUT="${S1},${S2},${S3},${S4},${H_RANGES}"
+# (tests/helpers/boringtun-wire-checks.sh). The capture is given the client's
+# public key: a datagram that fits more than one kind is decided by what the
+# client can verify of each reading.
+run_scenario() { # <name> <S1> <S2> <S3> <S4> <cookies|no-cookies> [<H1,H2,H3,H4>]
+	local NAME="$1" S1="$2" S2="$3" S3="$4" S4="$5" COOKIES="$6" H="${7:-${H_RANGES}}" LAYOUT CAPTURE="${WORK}/$1.capture"
+	LAYOUT="${S1},${S2},${S3},${S4},${H}"
 	SIZES_OF[${NAME}]="${S1},${S2},${S3},${S4}"
-	echo "--- ${NAME}: S1=${S1} S2=${S2} S3=${S3} S4=${S4}, ${COOKIES}"
-	if ! setup_pair "${S1}" "${S2}" "${S3}" "${S4}"; then
+	echo "--- ${NAME}: S1=${S1} S2=${S2} S3=${S3} S4=${S4}, ${COOKIES}${7:+, H=${H}}"
+	if ! setup_pair "${S1}" "${S2}" "${S3}" "${S4}" "${H}"; then
 		bad "${NAME}: the peers could not be set up"
 		return 1
 	fi
 	check "${NAME}: the server runs --imitate-protocol sip, the client no imitation" peer_modes
-	if ! bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" "${CAPTURE_SECONDS}" "${CAPTURE}" "${LAYOUT}"; then
+	if ! bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" "${CAPTURE_SECONDS}" "${CAPTURE}" "${LAYOUT}" "${CLIENT_PUB}"; then
 		bad "${NAME}: the capture started"
 		return 1
 	fi
@@ -441,6 +454,48 @@ expect_scenario at-30 init:absent response:required:random cookie:required:rando
 # 5. Mixed, with an ordinary S4: each kind follows its own S.
 run_scenario mixed 64 30 31 45 cookies
 expect_scenario mixed init:absent response:required:random cookie:required:shaped transport:required:shaped
+
+# 6. Follow-up D's layout (S1=99 S2=54 S3=92 S4=52, an installer draw), with
+# H ranges in the installer's segments that make every response fit two
+# kinds: a response's S2 prefix ends in two filler spaces before its tag, so
+# the four bytes at S4=52 read 0x2020 | (tag & 0xffff) << 16, and with H2 =
+# 0x2a3b6f00-0x2a3b6fff that is 0x6fXX2020, inside H4. Its mac1, under the
+# client's key, decides it a response.
+REPORTED_H="123456789-223456788,708538112-708538367,1234567890-1334567889,1862270976-1962270975"
+run_scenario reported 99 54 92 52 no-cookies "${REPORTED_H}"
+expect_scenario reported init:absent response:required:shaped cookie:absent transport:required:shaped
+
+# 7. Crossed: a ping reply (96 bytes of plaintext) is S4 + 32 + 96 = 173 bytes,
+# the length of a response at S2=81 and of a cookie reply at S3=109, and its
+# ciphertext at 81 and 109 falls in the wide H2 and H3 about one time in four
+# each; so does the response's ephemeral key at 109. H4's top byte 0x7f is
+# never SIP text. A reading whose mac1 fails is not the client's; a
+# transport whose receiver index is the session an authenticated response
+# opened is decided against an unconfirmable cookie reading.
+CROSSED_H="5-104,65536-1073741823,1073741824-2130706431,2130706432-2147483647"
+run_scenario crossed 64 81 109 45 no-cookies "${CROSSED_H}"
+expect_scenario crossed init:absent response:required:shaped cookie:absent transport:required:shaped
+# The same layout with the handshake made before the capture: no response
+# names the session, so a ping reply that also fits the cookie rule cannot
+# be decided and stays ambiguous, which fails the check.
+echo "--- crossed, handshake before the capture"
+if setup_pair 64 81 109 45 "${CROSSED_H}" &&
+	ip netns exec "${NS_C}" ping -c 1 -W 2 -q "${TUN_S}" >/dev/null &&
+	bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" 60 "${WORK}/unseen.capture" "64,81,109,45,${CROSSED_H}" "${CLIENT_PUB}"; then
+	ip netns exec "${NS_C}" ping -c 60 -i 0.05 -W 2 -q "${TUN_S}" >/dev/null
+	check "crossed, handshake before the capture: the capture ran until its authorized stop" \
+		bt_wire_capture_finish "${WORK}/unseen.capture" stop 10
+	if bt_wire_kinds "${WORK}/unseen.capture" 64,81,109,45; then
+		check "  ping replies that also fit the cookie rule stay ambiguous without their session's response (${BT_WIRE_SUMMARY[ambiguous]} ambiguous, ${BT_WIRE_SEEN[transport]} transport, ${BT_WIRE_SEEN[response]} response)" \
+			test "${BT_WIRE_SUMMARY[ambiguous]}" -ge 1 -a "${BT_WIRE_SEEN[response]}" = 0
+	else
+		bad "crossed, handshake before the capture: the capture has a valid per-kind result (${BT_WIRE_REASON})"
+	fi
+	check "  and the per-kind check fails" \
+		check_fails "${WORK}/unseen.capture" 64,81,109,45 init:absent response:optional cookie:absent transport:required
+else
+	bad "crossed, handshake before the capture: the peers, the handshake and the capture started"
+fi
 teardown
 
 echo "--- controls on the real captures"
@@ -501,13 +556,13 @@ fails() { # <command...>
 # ends as interrupted, with status 3.
 CONTROL_LAYOUT="64,31,31,31,${H_RANGES}"
 if setup_pair 64 31 31 31; then
-	if bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" 60 "${WORK}/authorized.capture" "${CONTROL_LAYOUT}"; then
+	if bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" 60 "${WORK}/authorized.capture" "${CONTROL_LAYOUT}" "${CLIENT_PUB}"; then
 		check "the authorized stop of a running real capture passes the capture check (the controls' baseline)" \
 			bt_wire_capture_finish "${WORK}/authorized.capture" stop 10
 	else
 		bad "the real capture started for the authorized-stop baseline"
 	fi
-	if bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" 60 "${WORK}/oob.capture" "${CONTROL_LAYOUT}"; then
+	if bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" 60 "${WORK}/oob.capture" "${CONTROL_LAYOUT}" "${CLIENT_PUB}"; then
 		bt_wire_signal "${BT_WIRE_CAPTURE}" TERM
 		bt_wire_await "${BT_WIRE_CAPTURE}" 10
 		check "a SIGTERM before the authorized stop fails the capture check" \

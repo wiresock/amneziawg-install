@@ -7,7 +7,7 @@
       version-negotiation, silent, or unexpected:<length>. Each reply is
       matched to its own probe (transaction ID, connection IDs).
 
-  capture <interface> <source address> <source port> <seconds> <file> [<layout>]
+  capture <interface> <source address> <source port> <seconds> <file> [<layout> <receiver key>]
       Record every UDP datagram that arrives on INTERFACE from SOURCE
       ADDRESS:SOURCE PORT, one line each, until SECONDS have passed or a
       SIGTERM asks it to stop. Needs root (a packet socket). Relevance is
@@ -21,8 +21,12 @@
       is decided in memory from the length and the AmneziaWG type tag that
       follows the kind's S prefix, never from the prefix's content, and only
       the first 16 bytes of that S prefix are kept; "unknown", "ambiguous",
-      "unresolved" and "malformed" keep none ("-"). The rest of each datagram
-      is ciphertext and is never recorded. FILE.state is the transcript:
+      "unresolved" and "malformed" keep none ("-"). RECEIVER KEY is the
+      static public key (base64) of the peer the datagrams are sent to: a
+      datagram that fits more than one kind is decided only by what that
+      receiver could verify of each reading (Evidence), and is ambiguous
+      when that does not decide it. The rest of each datagram is ciphertext
+      and is never recorded. FILE.state is the transcript:
       "ready <pid> <start time> <ready clock>" once the socket listens, then
       exactly one end -- "complete <records> <end clock>" once SECONDS have
       passed since the ready clock, "stopped <records> <token>" after a
@@ -71,6 +75,9 @@ The probe formats are those the pinned BoringTun classifies
 (boringtun/src/noise/imitation/detect.rs at the pinned commit).
 """
 
+import base64
+import hashlib
+import hmac
 import os
 import re
 import select
@@ -182,6 +189,12 @@ WIDE_NUMBER = re.compile(r"0|[1-9][0-9]{0,18}")
 STRICT_HEX = re.compile(r"(?:[0-9a-f]{2})*")
 # A stop authorization: one line of 32 lowercase hex digits.
 STOP_TOKEN = re.compile(r"[0-9a-f]{32}")
+# A WireGuard public key: 32 bytes in base64, 44 characters.
+PUBLIC_KEY = re.compile(r"[A-Za-z0-9+/]{43}=")
+# The handshake kinds, whose messages end in mac1 and mac2 (16 bytes each),
+# and the label of mac1's key (boringtun/src/noise/handshake.rs: LABEL_MAC1).
+HANDSHAKES = ("init", "response")
+MAC1_LABEL = b"mac1----"
 
 
 class InputError(ValueError):
@@ -225,7 +238,86 @@ def parse_layout(text):
     return sizes, ranges
 
 
-def classify_datagram(length, head, sizes, ranges):
+def parse_public_key(text):
+    """A base64 WireGuard public key -> its 32 bytes."""
+    if not PUBLIC_KEY.fullmatch(text):
+        raise InputError("%r is not a base64 public key of 32 bytes" % text[:60])
+    return base64.b64decode(text)
+
+
+def message_of(datagram, sizes, kind):
+    """The WireGuard message that reading DATAGRAM as KIND finds after the
+    kind's S prefix: its fixed size, or for transport its 16-byte header."""
+    index = KIND_NAMES.index(kind)
+    size = 16 if kind == "transport" else KINDS[index][2]
+    return datagram[sizes[index]:sizes[index] + size]
+
+
+class Evidence:
+    """What the receiver of the recorded datagrams can verify of a reading,
+    for a datagram that fits more than one kind. The pinned BoringTun's
+    receiver decides such a datagram the same way: each reading must
+    authenticate, and one that fails does not end the search
+    (boringtun/src/noise/inbound.rs: receive). No reading wins by its kind.
+
+    A handshake reading (init, response) is authentic when its mac1 holds:
+    keyed BLAKE2s-128 over the message from its type tag up to mac1, keyed by
+    BLAKE2s-256("mac1----" || the receiver's static public key). BoringTun
+    writes the tag first and computes mac1 over it (handshake.rs:
+    append_mac1_and_mac2), and every receiver checks mac1 first. It covers
+    neither the S prefix nor the bytes after the message, so the SIP text
+    under test plays no part. Any bytes but a genuine message pass with
+    probability 2**-128.
+
+    A transport reading names its session by its receiver index. It is
+    confirmed when that index is the receiver of a response this capture saw
+    and authenticated (learn): for a session the client initiated, the
+    server's transport carries the index the client named in its
+    initiation, which the response returns. A session whose response the
+    capture did not see confirms nothing.
+
+    A cookie reading cannot be checked: its AEAD is keyed by the server's
+    static key and bound to the mac1 of the client's handshake that drew it,
+    which this capture does not record."""
+
+    def __init__(self, public_key):
+        self.mac1_key = hashlib.blake2s(MAC1_LABEL + public_key).digest()
+        self.sessions = set()
+
+    def authentic(self, message):
+        """Whether the mac1 of a complete handshake MESSAGE holds."""
+        mac1 = hashlib.blake2s(message[:-32], digest_size=16, key=self.mac1_key).digest()
+        return hmac.compare_digest(mac1, message[-32:-16])
+
+    def decide(self, datagram, sizes, readings):
+        """The READINGS of a complete DATAGRAM that its receiver could still
+        take: the authentic handshake readings, if any; otherwise all but the
+        refuted handshake readings, and of those only the transport reading
+        when its session is confirmed, the rest being cookie readings."""
+        authentic = [kind for kind in readings
+                     if kind in HANDSHAKES and self.authentic(message_of(datagram, sizes, kind))]
+        if authentic:
+            return authentic
+        rest = [kind for kind in readings if kind not in HANDSHAKES]
+        if "transport" in rest and self.confirmed(datagram, sizes):
+            return ["transport"]
+        return rest
+
+    def confirmed(self, datagram, sizes):
+        """Whether reading DATAGRAM as transport names a session this capture
+        saw a response authenticate."""
+        receiver = struct.unpack("<I", message_of(datagram, sizes, "transport")[4:8])[0]
+        return receiver in self.sessions
+
+    def learn(self, datagram, sizes):
+        """Remember the session of a complete DATAGRAM classified a
+        response, if its mac1 holds."""
+        response = message_of(datagram, sizes, "response")
+        if self.authentic(response):
+            self.sessions.add(struct.unpack("<I", response[8:12])[0])
+
+
+def classify_datagram(length, head, sizes, ranges, evidence=None):
     """The packet kind of a datagram of LENGTH bytes whose first bytes are
     HEAD (all of it, or the part a first IPv4 fragment carries): the kind
     whose length rule LENGTH meets and whose type tag, read little-endian
@@ -233,7 +325,11 @@ def classify_datagram(length, head, sizes, ranges):
     kind's H range. "ambiguous" when more than one kind fits; "unresolved"
     when a kind whose length rule LENGTH meets has its tag beyond HEAD, so
     that a unique kind cannot be claimed; "unknown" when no kind fits. The
-    prefix's content is never consulted."""
+    prefix's content is never consulted. With EVIDENCE (an Evidence) and
+    the whole datagram in HEAD, more than one fitting kind is first decided
+    by what the receiver can verify (Evidence.decide), and is ambiguous only
+    if that leaves more than one; a fragment is never decided that way. A
+    complete datagram classified a response teaches EVIDENCE its session."""
     found = []
     unseen = False
     for name, index, size in KINDS:
@@ -247,16 +343,23 @@ def classify_datagram(length, head, sizes, ranges):
         low, high = ranges[index]
         if low <= tag <= high:
             found.append(name)
+    complete = evidence is not None and len(head) == length
+    if complete and len(found) > 1:
+        found = evidence.decide(head, sizes, found)
     if len(found) > 1:
         return "ambiguous"
     if unseen:
         return "unresolved"
-    return found[0] if found else "unknown"
+    if not found:
+        return "unknown"
+    if complete and found[0] == "response":
+        evidence.learn(head, sizes)
+    return found[0]
 
 
-def kind_of(payload, sizes, ranges):
+def kind_of(payload, sizes, ranges, evidence=None):
     """The packet kind of a complete datagram."""
-    return classify_datagram(len(payload), payload, sizes, ranges)
+    return classify_datagram(len(payload), payload, sizes, ranges, evidence)
 
 
 # What the IPv4/UDP framing of one captured frame yields.
@@ -378,7 +481,7 @@ def frame_payload(frame, source, source_port, destination=None, destination_port
     return DATAGRAM, udp_length - 8, body[8:], False
 
 
-def record_line(sizes, ranges, status, length, data):
+def record_line(sizes, ranges, status, length, data, evidence=None):
     """The capture record of one relevant frame, or None for a continuation."""
     if status == CONTINUATION:
         return None
@@ -386,7 +489,7 @@ def record_line(sizes, ranges, status, length, data):
         return "malformed %d -" % length
     if sizes is None:
         return data[:PREFIX_KEPT].hex()
-    kind = classify_datagram(length, data, sizes, ranges)
+    kind = classify_datagram(length, data, sizes, ranges, evidence)
     if kind in SUMMARY_NAMES:
         return "%s %d -" % (kind, length)
     prefix = data[:min(PREFIX_KEPT, sizes[KIND_NAMES.index(kind)])]
@@ -430,8 +533,11 @@ def boot_centiseconds(nanoseconds):
     return nanoseconds // 10 ** 7
 
 
-def capture(interface, source, source_port, seconds, path, layout=None):
-    """Record the relevant datagrams; return the exit status.
+def capture(interface, source, source_port, seconds, path, layout=None, receiver=None):
+    """Record the relevant datagrams; return the exit status. With LAYOUT,
+    RECEIVER is the base64 static public key of the peer they are sent to:
+    the evidence that decides a datagram fitting more than one kind
+    (Evidence), learned in the order the datagrams arrive.
 
     PATH.state is the transcript: "ready <pid> <start time> <ready clock>"
     once the socket is bound, then exactly one end. The clock is CLOCK_BOOTTIME
@@ -446,6 +552,7 @@ def capture(interface, source, source_port, seconds, path, layout=None):
     signal -- leaves no end line and a nonzero status. A record is always
     written whole: a stop is only acted on between records."""
     sizes, ranges = parse_layout(layout) if layout else (None, None)
+    evidence = Evidence(parse_public_key(receiver)) if layout else None
     wanted_source = socket.inet_aton(source)
     wanted_port = parse_number(source_port, "port", 65535)
     duration = parse_number(seconds, "capture seconds", 86400) * 10 ** 9
@@ -478,7 +585,7 @@ def capture(interface, source, source_port, seconds, path, layout=None):
                                                     fragments=fragments)
             if status == IGNORE:
                 continue
-            line = record_line(sizes, ranges, status, length, data)
+            line = record_line(sizes, ranges, status, length, data, evidence)
             if line is not None:
                 out.write(line + "\n")
                 out.flush()
@@ -730,7 +837,7 @@ def main(argv):
     try:
         if len(argv) == 4 and argv[0] == "probe" and argv[1] in PROBES:
             print(probe(argv[1], argv[2], argv[3]))
-        elif len(argv) in (6, 7) and argv[0] == "capture":
+        elif len(argv) in (6, 8) and argv[0] == "capture":
             return capture(*argv[1:])
         elif len(argv) == 3 and argv[0] == "classify":
             classify(argv[1], argv[2])
