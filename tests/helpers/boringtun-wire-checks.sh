@@ -283,8 +283,11 @@ bt_wire_show() { # <label> <file>
 # this shell's readings. Sets BT_WIRE_CAPTURE (its handle),
 # BT_WIRE_CAPTURE_FILE, BT_WIRE_CAPTURE_SECONDS, BT_WIRE_CAPTURE_READY (its
 # ready line) and BT_WIRE_CAPTURE_READY_CLOCK. On failure the child is ended
-# and collected.
-bt_wire_capture_start() { # <netns> <interface> <source> <port> <seconds> <file> [layout]
+# and collected. A layout comes with the receiving peer's public key, under
+# which the helper checks MAC1 consistency when a complete datagram fits
+# more than one packet kind (its Evidence: MAC1 consistency and
+# receiver-index correlation, not authentication).
+bt_wire_capture_start() { # <netns> <interface> <source> <port> <seconds> <file> [layout receiver-key]
 	local NETNS="$1" FILE="$6" PID START PARENT BEFORE READY
 	shift
 	BT_WIRE_CAPTURE=""
