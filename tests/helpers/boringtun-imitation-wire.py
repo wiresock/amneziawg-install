@@ -22,11 +22,13 @@
       follows the kind's S prefix, never from the prefix's content, and only
       the first 16 bytes of that S prefix are kept; "unknown", "ambiguous",
       "unresolved" and "malformed" keep none ("-"). RECEIVER KEY is the
-      static public key (base64) of the peer the datagrams are sent to: a
-      datagram that fits more than one kind is decided only by what that
-      receiver could verify of each reading (Evidence), and is ambiguous
-      when that does not decide it. The rest of each datagram is ciphertext
-      and is never recorded. FILE.state is the transcript:
+      static public key (base64) of the peer the datagrams are sent to. A
+      complete datagram that fits more than one kind is resolved by MAC1
+      consistency under that key and receiver-index correlation, in a fixed
+      precedence (Evidence), and is ambiguous when that leaves more than one
+      kind; neither check verifies a Noise handshake or any AEAD. The rest
+      of each datagram is ciphertext and is never recorded. FILE.state is
+      the transcript:
       "ready <pid> <start time> <ready clock>" once the socket listens, then
       exactly one end -- "complete <records> <end clock>" once SECONDS have
       passed since the ready clock, "stopped <records> <token>" after a
@@ -254,46 +256,71 @@ def message_of(datagram, sizes, kind):
 
 
 class Evidence:
-    """What the receiver of the recorded datagrams can verify of a reading,
-    for a datagram that fits more than one kind. The pinned BoringTun's
-    receiver decides such a datagram the same way: each reading must
-    authenticate, and one that fails does not end the search
-    (boringtun/src/noise/inbound.rs: receive). No reading wins by its kind.
+    """MAC1 consistency and receiver-index correlation, used to resolve a
+    complete datagram that fits more than one kind. Its purpose is to
+    resolve accidental classification collisions in controlled AWG 2.0
+    captures between correctly configured peers; it authenticates nothing.
 
-    A handshake reading (init, response) is authentic when its mac1 holds:
-    keyed BLAKE2s-128 over the message from its type tag up to mac1, keyed by
-    BLAKE2s-256("mac1----" || the receiver's static public key). BoringTun
-    writes the tag first and computes mac1 over it (handshake.rs:
-    append_mac1_and_mac2), and every receiver checks mac1 first. It covers
-    neither the S prefix nor the bytes after the message, so the SIP text
-    under test plays no part. Any bytes but a genuine message pass with
-    probability 2**-128.
+    A handshake reading (init, response) is MAC1-valid (authentic()) when
+    its mac1 field equals keyed BLAKE2s-128 over the message from its type
+    tag up to mac1, keyed by BLAKE2s-256("mac1----" || the receiving peer's
+    static public key), as BoringTun computes it after writing the tag
+    (handshake.rs: append_mac1_and_mac2). It covers neither the S prefix nor
+    the bytes after the message, so the SIP text under test plays no part.
+    A valid mac1 shows only that the reading is consistent with a handshake
+    message under a key derived from that public key: anyone who knows the
+    key can compute one, so it does not authenticate the sender, verify a
+    Noise handshake or establish an accepted session. Under a model of
+    random bytes, an accidental reading of unrelated bytes matches with
+    probability 2**-128; that bounds nothing a sender constructs.
 
-    A transport reading names its session by its receiver index. It is
-    confirmed when that index is the receiver of a response this capture saw
-    and authenticated (learn): for a session the client initiated, the
-    server's transport carries the index the client named in its
-    initiation, which the response returns. A session whose response the
-    capture did not see confirms nothing.
+    A response's receiver index (bytes 8-12) is recorded (learn) when a
+    complete datagram is classified a response and its mac1 is valid. A
+    transport reading whose receiver index (bytes 4-8) was recorded is
+    correlated with that response (confirmed): server transport on a session
+    the client initiated carries the index the response returned. The
+    correlation is evidence for the reading, not a check of the transport's
+    AEAD, replay counter or session membership; that unrelated bytes match a
+    recorded index by accident is unlikely only under a byte-distribution
+    assumption such as random bytes (about n/2**32 for n indices).
 
-    A cookie reading cannot be checked: its AEAD is keyed by the server's
-    static key and bound to the mac1 of the client's handshake that drew it,
-    which this capture does not record."""
+    Cookie readings are never checked: their AEAD is keyed by the server's
+    static key and bound to the mac1 of the client's handshake that drew
+    them, which this capture does not record.
+
+    The precedence for a complete datagram with more than one reading
+    (decide):
+      1. MAC1-valid handshake readings take precedence over every other
+         reading, a correlated transport included; more than one of them
+         stays ambiguous.
+      2. If no handshake reading is MAC1-valid, the handshake readings are
+         removed.
+      3. A remaining transport reading with a recorded receiver index takes
+         precedence over an unchecked cookie reading.
+      4. Otherwise the remaining readings stand: a sole one resolves by
+         elimination, more than one stays ambiguous, and none is no kind.
+    The pinned BoringTun receiver gates each reading on mac1 and then runs a
+    Noise or AEAD trial (boringtun/src/noise/inbound.rs: receive); this
+    helper runs neither trial, so it does not decide as that receiver does.
+    A datagram that fits a single kind is classified syntactically and is
+    not checked here."""
 
     def __init__(self, public_key):
         self.mac1_key = hashlib.blake2s(MAC1_LABEL + public_key).digest()
         self.sessions = set()
 
     def authentic(self, message):
-        """Whether the mac1 of a complete handshake MESSAGE holds."""
+        """Whether the mac1 of a complete handshake MESSAGE is valid under
+        the receiving peer's key: consistency, not authentication."""
         mac1 = hashlib.blake2s(message[:-32], digest_size=16, key=self.mac1_key).digest()
         return hmac.compare_digest(mac1, message[-32:-16])
 
     def decide(self, datagram, sizes, readings):
-        """The READINGS of a complete DATAGRAM that its receiver could still
-        take: the authentic handshake readings, if any; otherwise all but the
-        refuted handshake readings, and of those only the transport reading
-        when its session is confirmed, the rest being cookie readings."""
+        """The READINGS of a complete DATAGRAM that remain under the
+        precedence above: the MAC1-valid handshake readings, if any;
+        otherwise the readings that are not handshakes, narrowed to the
+        transport reading when its receiver index was recorded, the rest
+        being cookie readings."""
         authentic = [kind for kind in readings
                      if kind in HANDSHAKES and self.authentic(message_of(datagram, sizes, kind))]
         if authentic:
@@ -304,14 +331,14 @@ class Evidence:
         return rest
 
     def confirmed(self, datagram, sizes):
-        """Whether reading DATAGRAM as transport names a session this capture
-        saw a response authenticate."""
+        """Whether reading DATAGRAM as transport gives a receiver index
+        recorded from a MAC1-valid response: correlation only."""
         receiver = struct.unpack("<I", message_of(datagram, sizes, "transport")[4:8])[0]
         return receiver in self.sessions
 
     def learn(self, datagram, sizes):
-        """Remember the session of a complete DATAGRAM classified a
-        response, if its mac1 holds."""
+        """Record the receiver index of a complete DATAGRAM classified a
+        response, if its mac1 is valid."""
         response = message_of(datagram, sizes, "response")
         if self.authentic(response):
             self.sessions.add(struct.unpack("<I", response[8:12])[0])
@@ -326,10 +353,12 @@ def classify_datagram(length, head, sizes, ranges, evidence=None):
     when a kind whose length rule LENGTH meets has its tag beyond HEAD, so
     that a unique kind cannot be claimed; "unknown" when no kind fits. The
     prefix's content is never consulted. With EVIDENCE (an Evidence) and
-    the whole datagram in HEAD, more than one fitting kind is first decided
-    by what the receiver can verify (Evidence.decide), and is ambiguous only
-    if that leaves more than one; a fragment is never decided that way. A
-    complete datagram classified a response teaches EVIDENCE its session."""
+    the whole datagram in HEAD, more than one fitting kind is first
+    resolved by the precedence of Evidence.decide (MAC1 consistency, then
+    receiver-index correlation), and is ambiguous only if that leaves more
+    than one; a fragment is never resolved that way. A complete datagram
+    classified a response has its receiver index recorded in EVIDENCE if
+    its mac1 is valid (Evidence.learn)."""
     found = []
     unseen = False
     for name, index, size in KINDS:
@@ -536,8 +565,10 @@ def boot_centiseconds(nanoseconds):
 def capture(interface, source, source_port, seconds, path, layout=None, receiver=None):
     """Record the relevant datagrams; return the exit status. With LAYOUT,
     RECEIVER is the base64 static public key of the peer they are sent to:
-    the evidence that decides a datagram fitting more than one kind
-    (Evidence), learned in the order the datagrams arrive.
+    the key under which Evidence checks mac1 when a datagram fits more than
+    one kind, its receiver indices recorded in the order the datagrams
+    arrive. Its format is checked; whether it is the intended peer's key is
+    not.
 
     PATH.state is the transcript: "ready <pid> <start time> <ready clock>"
     once the socket is bound, then exactly one end. The clock is CLOCK_BOOTTIME

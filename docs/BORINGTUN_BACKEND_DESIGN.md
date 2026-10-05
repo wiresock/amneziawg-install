@@ -2511,12 +2511,20 @@ The kernel menu keeps its 7 options unchanged.
   kind comes from its length and type tag, not from the prefix: handshake
   responses and transport must carry a request line in every datagram when
   their S (S2, S4) is 31 bytes or more and in none below it, as must cookie
-  replies (S3) when the server sent any. A datagram that fits two kinds is
-  decided only by what the receiving client can verify of each reading: a
-  handshake message's mac1 under the client's static public key, and a
-  transport's receiver index against the session an authenticated response
-  opened. No reading wins by its kind. A cookie reading can never be
-  verified here, so a datagram this leaves undecided stays ambiguous. The
+  replies (S3) when the server sent any. For controlled AWG 2.0 traffic
+  between correctly configured peers, a complete datagram that fits more
+  than one kind is resolved by MAC1 consistency under the client's static
+  public key and receiver-index correlation. MAC1-valid handshake readings
+  take precedence. Otherwise the handshake readings are removed, and a
+  transport whose receiver index was recorded from a previously MAC1-valid
+  response takes precedence over an unchecked cookie reading. Remaining ties
+  stay ambiguous. A valid mac1 shows consistency with a key derived from
+  the public key, not a sender, a Noise handshake or a session; a recorded
+  index is correlation, not a check of transport AEAD, replay or session
+  state. Single-kind datagrams stay syntactic, and cookie cryptography is
+  not checked. The positive collision scenarios make the client's handshake
+  inside the capture and draw no cookie replies; a transport/cookie tie
+  without a recorded index stays undecided and fails. The
   checks fail closed
   (`tests/helpers/boringtun-wire-checks.sh`) and cover every recorded relevant
   observation: a datagram of no kind, of two kinds, one whose kind a short

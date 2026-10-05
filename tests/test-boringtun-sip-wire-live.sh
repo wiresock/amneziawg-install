@@ -7,11 +7,14 @@
 # reply, transport) is decided from its length and the AmneziaWG type tag after
 # that kind's S prefix, never from the SIP text under test
 # (tests/helpers/boringtun-imitation-wire.py). A datagram that fits more than
-# one kind is decided by what the client can verify of each reading: a
-# handshake message's mac1 under the client's public key, a transport's
-# receiver index against the session an authenticated response opened.
-# Nothing decides a cookie reading, so a transport that also fits the cookie
-# rule outside a seen session stays ambiguous.
+# one kind is resolved by MAC1 consistency under the client's public key and
+# receiver-index correlation: a MAC1-valid handshake reading takes
+# precedence; then a transport whose receiver index was recorded from a
+# MAC1-valid response takes precedence over an unchecked cookie reading.
+# Neither check verifies a Noise handshake or an AEAD. A transport that also
+# fits the cookie rule with no recorded index stays ambiguous. The positive
+# collision scenarios therefore make the client's handshake inside the
+# capture, and the server sends them no cookie replies.
 #
 # The pinned BoringTun writes a SIP request line into every S prefix of 31
 # bytes or more (SIP_REQUEST_LINE_MIN) and leaves a shorter one random, for
@@ -371,8 +374,8 @@ declare -A SIZES_OF=()
 # still running after it, and run its whole interval to completion; the
 # replay must finish. Both must exit 0 with their exact transcripts
 # (tests/helpers/boringtun-wire-checks.sh). The capture is given the client's
-# public key: a datagram that fits more than one kind is decided by what the
-# client can verify of each reading.
+# public key, under which a datagram that fits more than one kind is
+# resolved by MAC1 consistency and receiver-index correlation.
 run_scenario() { # <name> <S1> <S2> <S3> <S4> <cookies|no-cookies> [<H1,H2,H3,H4>]
 	local NAME="$1" S1="$2" S2="$3" S3="$4" S4="$5" COOKIES="$6" H="${7:-${H_RANGES}}" LAYOUT CAPTURE="${WORK}/$1.capture"
 	LAYOUT="${S1},${S2},${S3},${S4},${H}"
@@ -459,8 +462,8 @@ expect_scenario mixed init:absent response:required:random cookie:required:shape
 # H ranges in the installer's segments that make every response fit two
 # kinds: a response's S2 prefix ends in two filler spaces before its tag, so
 # the four bytes at S4=52 read 0x2020 | (tag & 0xffff) << 16, and with H2 =
-# 0x2a3b6f00-0x2a3b6fff that is 0x6fXX2020, inside H4. Its mac1, under the
-# client's key, decides it a response.
+# 0x2a3b6f00-0x2a3b6fff that is 0x6fXX2020, inside H4. Its mac1 is valid
+# under the client's key, so the response reading takes precedence.
 REPORTED_H="123456789-223456788,708538112-708538367,1234567890-1334567889,1862270976-1962270975"
 run_scenario reported 99 54 92 52 no-cookies "${REPORTED_H}"
 expect_scenario reported init:absent response:required:shaped cookie:absent transport:required:shaped
@@ -469,15 +472,15 @@ expect_scenario reported init:absent response:required:shaped cookie:absent tran
 # the length of a response at S2=81 and of a cookie reply at S3=109, and its
 # ciphertext at 81 and 109 falls in the wide H2 and H3 about one time in four
 # each; so does the response's ephemeral key at 109. H4's top byte 0x7f is
-# never SIP text. A reading whose mac1 fails is not the client's; a
-# transport whose receiver index is the session an authenticated response
-# opened is decided against an unconfirmable cookie reading.
+# never SIP text. A handshake reading whose mac1 is invalid is removed; a
+# transport whose receiver index was recorded from the MAC1-valid response
+# takes precedence over the unchecked cookie reading.
 CROSSED_H="5-104,65536-1073741823,1073741824-2130706431,2130706432-2147483647"
 run_scenario crossed 64 81 109 45 no-cookies "${CROSSED_H}"
 expect_scenario crossed init:absent response:required:shaped cookie:absent transport:required:shaped
 # The same layout with the handshake made before the capture: no response
-# names the session, so a ping reply that also fits the cookie rule cannot
-# be decided and stays ambiguous, which fails the check.
+# index is recorded, so a ping reply that also fits the cookie rule stays an
+# unresolved transport/cookie tie, ambiguous, which fails the check.
 echo "--- crossed, handshake before the capture"
 if setup_pair 64 81 109 45 "${CROSSED_H}" &&
 	ip netns exec "${NS_C}" ping -c 1 -W 2 -q "${TUN_S}" >/dev/null &&
@@ -486,7 +489,7 @@ if setup_pair 64 81 109 45 "${CROSSED_H}" &&
 	check "crossed, handshake before the capture: the capture ran until its authorized stop" \
 		bt_wire_capture_finish "${WORK}/unseen.capture" stop 10
 	if bt_wire_kinds "${WORK}/unseen.capture" 64,81,109,45; then
-		check "  ping replies that also fit the cookie rule stay ambiguous without their session's response (${BT_WIRE_SUMMARY[ambiguous]} ambiguous, ${BT_WIRE_SEEN[transport]} transport, ${BT_WIRE_SEEN[response]} response)" \
+		check "  ping replies that also fit the cookie rule stay ambiguous without a recorded response index (${BT_WIRE_SUMMARY[ambiguous]} ambiguous, ${BT_WIRE_SEEN[transport]} transport, ${BT_WIRE_SEEN[response]} response)" \
 			test "${BT_WIRE_SUMMARY[ambiguous]}" -ge 1 -a "${BT_WIRE_SEEN[response]}" = 0
 	else
 		bad "crossed, handshake before the capture: the capture has a valid per-kind result (${BT_WIRE_REASON})"

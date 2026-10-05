@@ -512,8 +512,9 @@ params_layout() {
 	printf '%s,%s,%s,%s,%s,%s,%s,%s' "$(params_s S1)" "$(params_s S2)" "$(params_s S3)" "$(params_s S4)" \
 		"$(params_h H1)" "$(params_h H2)" "$(params_h H3)" "$(params_h H4)"
 }
-# The test client's static public key, which the server's handshake messages
-# to it are authenticated for (mac1). Its private key is only piped.
+# The test client's static public key, from which the mac1 key of the
+# server's handshake messages to it derives; the wire helper checks their
+# MAC1 consistency with it. Its private key is only piped.
 client_public_key() {
 	sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p' "${CLIENT_CONF}" | head -n 1 | awg pubkey
 }
@@ -543,9 +544,9 @@ wire_prefixes() { # <imitation>
 	local CAPTURE="${WORK}/prefixes" COUNTS TOTAL MATCHING LAYOUT=()
 	# SIP shapes each packet kind by its own S, so its capture records the
 	# kind of every datagram, decided from its length and type tag. One that
-	# fits two kinds is decided by what the client can verify of each
-	# reading (mac1 under its public key, a session index), never by the
-	# kind; failing that it is ambiguous.
+	# fits two kinds is resolved by MAC1 consistency under the client's
+	# public key and receiver-index correlation, in the helper's fixed
+	# precedence, never by kind order; what that leaves is ambiguous.
 	[[ "$1" != sip ]] || LAYOUT=("$(params_layout)" "$(client_public_key)")
 	# The capture is ready before the traffic starts, must still be running
 	# when the traffic has passed, and is then stopped by an authorized SIGTERM

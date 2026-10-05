@@ -21,11 +21,14 @@
 # on a correct server with S2=26 S3=81 S4=22 (0/2054 shaped): S3 prefixes only
 # cookie replies, and none was sent.
 #
-# A datagram that fits more than one kind is decided by what the receiving
-# client can verify of each reading. Without that, the host check failed on a
-# correct server whose one handshake response, at S2=54, also fit the
-# transport rule at S4=52 (follow-up D). Genuine datagrams of the pinned
-# binary at those sizes anchor the mac1 check to the real wire.
+# A complete datagram that fits more than one kind is resolved by MAC1
+# consistency under the receiving client's public key and receiver-index
+# correlation, in a fixed precedence; neither verifies a Noise handshake or
+# an AEAD. Without that, the host check failed on a correct server whose one
+# handshake response, at S2=54, presumably also fit the transport rule at
+# S4=52 (follow-up D; that datagram's bytes were not retained, and genuine
+# reproductions show the mechanism). Genuine datagrams of the pinned binary
+# at those sizes anchor the mac1 computation to the real wire.
 
 set -uo pipefail
 
@@ -81,9 +84,10 @@ SERVER = bytes([192, 0, 2, 1])
 # Genuine datagrams of the pinned BoringTun (71d88784) SIP server at follow-up
 # D's sizes, S1=99 S2=54 S3=92 S4=52, with REPORTED's H ranges, recorded on the
 # client's side: the handshake response, which also fits the transport rule
-# (its four bytes at 52 are 0x6f602020, inside H4), and the first ping reply of
-# the session it opened. Public bytes only: SIP text, a handshake response,
-# ciphertext. GENUINE_KEY is the receiving client's static public key.
+# (its four bytes at 52 are 0x6f602020, inside H4), and the first ping reply
+# after it, which carries that response's receiver index. Public bytes only:
+# SIP text, a handshake response, ciphertext. GENUINE_KEY is the receiving
+# client's static public key.
 REPORTED = "99,54,92,52,123456789-223456788,708538112-708538367,1234567890-1334567889,1862270976-1962270975"
 GENUINE_KEY = "QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2g="
 GENUINE_RESPONSE = bytes.fromhex(
@@ -100,6 +104,8 @@ GENUINE_TRANSPORT = bytes.fromhex(
 # length of a response and of a cookie reply), and a receiving key of this
 # test's own. mac1 is computed here as the WireGuard protocol defines it,
 # independently of the helper; the genuine response above holds it too.
+# Their Noise fields and ciphertext are random bytes: they isolate the MAC1
+# and receiver-index rules and are no handshake or transport a peer accepts.
 CROSSED = "64,81,109,45,5-104,65536-1073741823,1073741824-2130706431,2130706432-2147483647"
 TEST_KEY = bytes(range(32))
 
@@ -166,7 +172,8 @@ elif cmd == "ambiguous":
     print(wire.kind_of(bytes(d), sizes, ranges))
 elif cmd == "evidence":
     # One "<case> <result>" per line: datagrams that fit more than one kind,
-    # with and without what the receiver can verify (wire.Evidence).
+    # with and without the helper's MAC1 and receiver-index evidence
+    # (wire.Evidence).
     key = wire.parse_public_key(GENUINE_KEY)
     sizes, ranges = wire.parse_layout(REPORTED)
     print("genuine-response-without-evidence", wire.kind_of(GENUINE_RESPONSE, sizes, ranges))
@@ -177,7 +184,7 @@ elif cmd == "evidence":
     status, length, data, _ = wire.frame_payload(ipv4(GENUINE_RESPONSE), SERVER, 51820, fragments=wire.Fragments())
     print("genuine-record", wire.record_line(sizes, ranges, status, length, data, wire.Evidence(key)).replace(" ", "_"))
     # Its first 136 bytes as a first fragment: both tags and mac1 are inside
-    # it, but a fragment is never decided.
+    # it, but a fragment is never resolved by evidence.
     udp = struct.pack(">HHHH", 51820, 40000, 8 + len(GENUINE_RESPONSE), 0) + GENUINE_RESPONSE
     status, length, data, _ = wire.frame_payload(raw(udp[:144], fragment=0x2000), SERVER, 51820, fragments=wire.Fragments())
     print("genuine-first-fragment", wire.record_line(sizes, ranges, status, length, data, wire.Evidence(key)).split(" ")[0])
@@ -193,11 +200,13 @@ elif cmd == "evidence":
         """A 173-byte transport whose bytes at 81 and 109 are AT81, AT109."""
         return put(put(transport(receiver), 81, at81), 109, at109)
     # A transport that also fits the response rule: the response reading's
-    # mac1 fails, so it is a transport, with or without a session.
+    # mac1 is invalid, so it is a transport, with or without a recorded
+    # receiver index.
     mirror = ping_reply(0xA1A1A1A1, at81=300000000)
     print("transport-also-response-without-evidence", kind(mirror, None))
     print("transport-also-response", kind(mirror, wire.Evidence(TEST_KEY)))
-    # A transport that also fits the cookie rule: decided only by its session.
+    # A transport that also fits the cookie rule: resolved only by a receiver
+    # index recorded from a MAC1-valid response.
     tie = ping_reply(0xB2B2B2B2, at109=1500000000)
     ev = wire.Evidence(TEST_KEY)
     print("session-response", kind(response(0xB2B2B2B2), ev))
@@ -225,6 +234,8 @@ elif cmd == "evidence":
     print("init-also-response", wire.kind_of(both, sizes, ranges, wire.Evidence(TEST_KEY)))
     neither = os.urandom(10) + init_message(valid=False, at56=300000000)
     print("forged-init-also-response", wire.kind_of(neither, sizes, ranges, wire.Evidence(TEST_KEY)))
+    # Both MAC1 results mocked valid: this checks that two MAC1-valid
+    # readings stay ambiguous, not two genuine handshakes.
     class Credulous(wire.Evidence):
         def authentic(self, message):
             return True
@@ -395,13 +406,18 @@ for LAYOUT in "29,26,81,22" "29,26,81,22,${H},5" "x,26,81,22,${H}" "29,26,81,655
 done
 assert_eq "accepted" "$(py layout "29,26,81,22,${H}")" "a valid layout is accepted"
 
-echo "=== More than one kind: what the receiver can verify decides ==="
+echo "=== More than one kind: MAC1 consistency and receiver-index correlation ==="
 # Follow-up D: main 2ff94d0's host SIP check failed on a correct server
 # (BoringTun Host run 37276248795, Debian 12, S1=99 S2=54 S3=92 S4=52). Its
-# one handshake response also fit the transport rule at S4=52, two filler
-# bytes and half its tag, and was recorded ambiguous. A reading wins only by
-# what the receiving client can verify: mac1 under its key, or a transport's
-# session as an authenticated response named it.
+# one handshake response presumably also fit the transport rule at S4=52,
+# two filler bytes and half its tag, and was recorded ambiguous; that
+# datagram was not retained, and genuine reproductions show the mechanism.
+# A complete datagram that fits more than one kind is resolved in a fixed
+# precedence: MAC1-valid handshake readings first; with none, handshake
+# readings are removed, and a transport whose receiver index was recorded
+# from a MAC1-valid response comes before an unchecked cookie reading; what
+# remains otherwise stands. No reading wins by kind order, and none of this
+# authenticates a handshake, a session or a transport.
 EVIDENCE="$(py evidence)"
 evidence_is() { # <case> <expected> <message>
 	assert_eq "$2" "$(awk -v c="$1" '$1 == c { print $2 }' <<<"${EVIDENCE}")" "$3"
@@ -409,30 +425,30 @@ evidence_is() { # <case> <expected> <message>
 evidence_is genuine-response-without-evidence ambiguous \
 	"follow-up D's genuine response fits the response and the transport rule: alone, ambiguous"
 evidence_is genuine-response response "  its mac1 holds under the client's key: a response"
-evidence_is genuine-ping-reply transport "  and the ping reply of the session it opened is a transport"
+evidence_is genuine-ping-reply transport "  and the genuine ping reply after it is a transport"
 evidence_is genuine-response-other-key transport \
 	"  under another key its mac1 fails and only its transport reading remains: no response is claimed"
 evidence_is genuine-record response_146_4f5054494f4e53207369703a6d40766f \
 	"  the capture's record path records it as a response, with its prefix"
-evidence_is genuine-first-fragment ambiguous "  a first fragment of it is not decided, though its tags and mac1 are inside"
+evidence_is genuine-first-fragment ambiguous "  a first fragment of it is not resolved by evidence, though its tags and mac1 are inside"
 evidence_is transport-also-response-without-evidence ambiguous "a transport that also fits the response rule: alone, ambiguous"
-evidence_is transport-also-response transport "  the response reading's mac1 fails: a transport, with or without its session"
-evidence_is session-response response "an authenticated response opens the session it names"
-evidence_is transport-also-cookie-in-session transport "a transport of that session that also fits the cookie rule is a transport"
-evidence_is transport-also-cookie-other-session ambiguous "  one naming another session stays ambiguous: a cookie reading is never refuted"
+evidence_is transport-also-response transport "  the response reading's mac1 is invalid: a transport, with or without a recorded index"
+evidence_is session-response response "a MAC1-valid response records the receiver index it names"
+evidence_is transport-also-cookie-in-session transport "a transport naming that recorded index that also fits the cookie rule is a transport"
+evidence_is transport-also-cookie-other-session ambiguous "  one naming another index stays ambiguous: a cookie reading is never checked"
 evidence_is transport-also-cookie-no-session ambiguous "  as does one before any response"
 evidence_is forged-response response "a response whose mac1 fails is still a response where it fits no other kind"
-evidence_is transport-also-cookie-after-forged-response ambiguous "  but it opens no session: a transport naming it stays ambiguous"
+evidence_is transport-also-cookie-after-forged-response ambiguous "  but it records no index: a transport naming it stays ambiguous"
 evidence_is transport-also-response-and-cookie-in-session transport \
-	"a transport of a session that also fits the response and the cookie rule is a transport"
-evidence_is transport-also-response-and-cookie-no-session ambiguous "  without its session it stays ambiguous"
+	"a transport naming a recorded index that also fits the response and the cookie rule is a transport"
+evidence_is transport-also-response-and-cookie-no-session ambiguous "  without a recorded index it stays ambiguous"
 evidence_is response-also-cookie response "a response that also fits the cookie rule is decided by its mac1"
 evidence_is forged-response-also-cookie cookie "  if that fails, the cookie reading is all that remains"
 evidence_is init-also-transport init "a server initiation that also fits the transport rule is decided by its mac1"
 evidence_is forged-init-also-transport transport "  if that fails, the transport reading is all that remains"
 evidence_is init-also-response init "an initiation that also fits the response rule: only the initiation's mac1 holds"
 evidence_is forged-init-also-response unknown "  when neither mac1 holds it is no kind"
-evidence_is two-authentic-readings ambiguous "two readings that both authenticate stay ambiguous: no kind wins by its order"
+evidence_is two-authentic-readings ambiguous "two MAC1-valid readings (mocked) stay ambiguous: no kind wins by its order"
 for KEY in "QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2g" "QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2g==" "" "not-a-key" \
 	"QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2g=x" "QZhn3Fgt6SXW24z7epWkvKtUNLJFyqiVehDDDRwUf2-="; do
 	assert_eq refused "$(py key "${KEY}")" "the receiver key '${KEY}' is refused"
@@ -799,7 +815,9 @@ assert_eq "1 '' not-run 0" "$(registration foreign)" \
 # line without its clock), readyearly (a ready clock before its start),
 # readylate (a ready clock after the caller saw it), endlate (an end clock
 # after the caller saw it end). With FAKE_EXPECT_KEY it starts only when given
-# a layout and that receiver key, as the consumer fixtures require. The
+# a layout and that receiver key: an expected-key guard that checks the
+# consumers forward the right key. The real helper checks only the key's
+# format; it cannot tell a well-formed wrong key at startup. The
 # replay prints its ready line and "replayed <n>" and exits FAKE_REPLAY_RC;
 # modes noready and noinit. `kinds` runs the real helper unless FAKE_KINDS
 # asks for empty or garbage output with exit 0; "owned" always runs the real
@@ -820,7 +838,8 @@ clock() {
 case "$1" in
 	capture)
 		# With FAKE_EXPECT_KEY, only a layout capture given that receiver key
-		# starts, as the real helper needs both.
+		# starts: the expected-key guard (the real helper needs a layout and
+		# a well-formed key, and checks only the format).
 		if [[ -n "${FAKE_EXPECT_KEY:-}" ]] && [[ $# -ne 8 || -z "$7" || "$8" != "${FAKE_EXPECT_KEY}" ]]; then
 			echo "fake capture: no layout with the receiver key ${FAKE_EXPECT_KEY}: $*" >&2
 			exit 1
@@ -1128,7 +1147,7 @@ expect_fixture "  recorded without it, the ambiguous response is rejected" rejec
 	host_case "${T}/genuine-without" FIXTURE_SIZES=99,54,92,52
 expect_fixture "  as is the missing response" reject "response datagrams were recorded (0)" \
 	host_case "${T}/genuine-without" FIXTURE_SIZES=99,54,92,52
-expect_fixture "a capture given another receiver key is not used" reject "the client-side capture started" \
+expect_fixture "a consumer that forwards another receiver key fails the fake capture's expected-key guard" reject "the client-side capture started" \
 	host_case "${T}/host-valid" FIXTURE_CONSUMER_KEY="${OTHER_KEY}"
 for SUMMARY in unknown ambiguous unresolved malformed; do
 	expect_fixture "valid records plus a ${SUMMARY} record are rejected" reject "no recorded server datagram is ${SUMMARY}" \
@@ -1165,7 +1184,7 @@ expect_fixture "  recorded without it, the ambiguous response is rejected" rejec
 	live_case "${T}/genuine-without" FIXTURE_SIZES=99,54,92,52
 expect_fixture "  as is the missing response" reject "response datagrams were recorded (0)" \
 	live_case "${T}/genuine-without" FIXTURE_SIZES=99,54,92,52
-expect_fixture "a scenario whose capture is given another receiver key is rejected" reject "the capture started" \
+expect_fixture "a scenario that forwards another receiver key fails the fake capture's expected-key guard" reject "the capture started" \
 	live_case "${T}/live-valid" FIXTURE_CONSUMER_KEY="${OTHER_KEY}"
 # The interval is the capture's own: a late start, or a caller late to
 # collect the status, neither shortens a whole interval nor lengthens a
