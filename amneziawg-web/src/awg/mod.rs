@@ -328,7 +328,7 @@ pub fn protocol_status_via_sudo() -> Result<String, AwgError> {
 /// mode through the root-owned helper and install script transaction.
 pub fn set_protocol_mode_via_sudo(operation: &str) -> Result<(), AwgError> {
     match operation {
-        "enable-awg3" | "enable-awg31" | "disable-awg3" => {}
+        "enable-awg31" | "disable-awg3" => {}
         _ => {
             return Err(AwgError::Parse(format!(
                 "unsupported protocol operation: {operation}"
@@ -344,6 +344,31 @@ pub fn set_protocol_mode_via_sudo(operation: &str) -> Result<(), AwgError> {
         return Err(AwgError::NonZeroExit {
             status: output.status.code().unwrap_or(-1),
             stderr,
+        });
+    }
+    Ok(())
+}
+
+fn imitation_command(settings: &crate::imitation::Settings) -> Result<Command, AwgError> {
+    crate::imitation::Settings::parse(&settings.protocol, &settings.domain)
+        .map_err(|error| AwgError::Parse(error.into()))?;
+    let mut command = Command::new(SUDO_BIN);
+    command.args([
+        "-n",
+        PRIVILEGED_HELPER_BIN,
+        "set-boringtun-imitation",
+        &settings.protocol,
+        &settings.domain,
+    ]);
+    Ok(command)
+}
+
+pub fn set_imitation_via_sudo(settings: &crate::imitation::Settings) -> Result<(), AwgError> {
+    let output = imitation_command(settings)?.output()?;
+    if !output.status.success() {
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr: "BoringTun imitation change failed".into(),
         });
     }
     Ok(())
@@ -679,6 +704,32 @@ fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn imitation_uses_fixed_command_and_preserves_empty_hostname_argument() {
+        for (protocol, domain) in [("none", ""), ("dns", ""), ("quic", "example.com")] {
+            let settings = crate::imitation::Settings::parse(protocol, domain).unwrap();
+            let command = imitation_command(&settings).unwrap();
+            assert_eq!(command.get_program(), SUDO_BIN);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [
+                    "-n",
+                    PRIVILEGED_HELPER_BIN,
+                    "set-boringtun-imitation",
+                    protocol,
+                    domain
+                ]
+            );
+        }
+        for (protocol, domain) in [("auto", ""), ("stun", "example.com"), ("quic", "--help")] {
+            assert!(imitation_command(&crate::imitation::Settings {
+                protocol: protocol.into(),
+                domain: domain.into(),
+            })
+            .is_err());
+        }
+    }
+
     const SAMPLE_DUMP: &str = "\
 awg0\tPRIVATE_KEY_REDACTED\tSERVER_PUBLIC_KEY_BASE64=\t51820\toff\n\
 awg0\tCLIENT1_PUBLIC_KEY=\t(none)\t203.0.113.42:12345\t10.8.0.2/32\t1700000000\t1024\t2048\toff\n\
@@ -937,12 +988,7 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
 
     #[test]
     fn protocol_commands_use_privileged_helper() {
-        for operation in [
-            "protocol-status",
-            "enable-awg3",
-            "enable-awg31",
-            "disable-awg3",
-        ] {
+        for operation in ["protocol-status", "enable-awg31", "disable-awg3"] {
             let mut cmd = Command::new(SUDO_BIN);
             cmd.args(["-n", PRIVILEGED_HELPER_BIN, operation]);
             let args: Vec<_> = cmd
@@ -954,6 +1000,14 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
     }
 
     // ── filter_disabled_peers tests ─────────────────────────────────
+
+    #[test]
+    fn retired_awg30_operation_is_rejected_before_sudo() {
+        assert!(matches!(
+            set_protocol_mode_via_sudo("enable-awg3"),
+            Err(AwgError::Parse(_))
+        ));
+    }
 
     #[test]
     fn filter_no_disabled_keys_returns_unchanged() {

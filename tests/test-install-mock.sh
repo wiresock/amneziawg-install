@@ -2529,13 +2529,15 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	chown root:root "${HELPER_INSTALL_SCRIPT}"
 	rm -f "${HELPER_PROTOCOL_CALLS}"
 	HELPER_PROTOCOL_DISPATCH_OK=0
-	if "${PRIVILEGED_HELPER}" enable-awg3 && \
-		"${PRIVILEGED_HELPER}" enable-awg31 && \
+	if "${PRIVILEGED_HELPER}" enable-awg31 && \
 		"${PRIVILEGED_HELPER}" disable-awg3 && \
-		[[ "$(sed -n '1p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg3" ]] && \
-		[[ "$(sed -n '2p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg31" ]] && \
-		[[ "$(sed -n '3p' "${HELPER_PROTOCOL_CALLS}")" == "--disable-awg3" ]]; then
+		[[ "$(cat "${HELPER_PROTOCOL_CALLS}")" == $'--enable-awg31\n--disable-awg3' ]]; then
 		HELPER_PROTOCOL_DISPATCH_OK=1
+	fi
+	# Retired AWG 3.0 must fail without reaching the installer.
+	if "${PRIVILEGED_HELPER}" enable-awg3 >/dev/null 2>&1 || \
+		[[ "$(cat "${HELPER_PROTOCOL_CALLS}")" != $'--enable-awg31\n--disable-awg3' ]]; then
+		HELPER_PROTOCOL_DISPATCH_OK=0
 	fi
 
 	# The installer supports root-controlled custom --env-file locations. The
@@ -2552,12 +2554,13 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	HELPER_CUSTOM_ENV_OK=0
 	if grep -Fqx "EnvironmentFile=${HELPER_CUSTOM_ENV_ROOT}/env.conf" \
 			/etc/systemd/system/amneziawg-web.service && \
-		"${PRIVILEGED_HELPER}" enable-awg3 && \
-		[[ "$(sed -n '4p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg3" ]]; then
+		"${PRIVILEGED_HELPER}" enable-awg31 && \
+		[[ "$(sed -n '3p' "${HELPER_PROTOCOL_CALLS}")" == "--enable-awg31" ]]; then
 		HELPER_CUSTOM_ENV_OK=1
 	fi
 	chmod 0777 "${HELPER_CUSTOM_ENV_ROOT}"
-	if "${PRIVILEGED_HELPER}" disable-awg3 >/dev/null 2>&1; then
+	if "${PRIVILEGED_HELPER}" disable-awg3 >/dev/null 2>&1 || \
+		[[ "$(wc -l < "${HELPER_PROTOCOL_CALLS}")" -ne 3 ]]; then
 		HELPER_CUSTOM_ENV_OK=0
 	fi
 	chmod 0700 "${HELPER_CUSTOM_ENV_ROOT}"
@@ -2610,7 +2613,7 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 		"${PRIVILEGED_HELPER}" reconcile-interface awg0 >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" read-params extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" protocol-status extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
-	"${PRIVILEGED_HELPER}" enable-awg3 extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
+	"${PRIVILEGED_HELPER}" disable-awg3 extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" enable-awg31 extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" read-server-state ../etc >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
 	"${PRIVILEGED_HELPER}" remove-client-if-key "${HELPER_TEST_INTERFACE}" alice invalid-key \
@@ -3416,6 +3419,48 @@ if [[ "${WEB_RESTORE_MANAGED_RC}" -ne 0 || ! -f "${WEB_AWG_SCRIPT_MARKER}" ]]; t
 	echo "FAIL: Could not restore installer-managed AWG lifecycle test fixture"
 	FAILED=$((FAILED + 1))
 fi
+
+echo ""
+echo "--- Web upgrader: binary-only BoringTun lifecycle compatibility ---"
+
+# Model the supported partial layout: companion scripts exist but the repo
+# lifecycle script is missing. Old BoringTun copies know the CLI flags but
+# cannot perform web mutations under the panel's read-only /usr sandbox.
+BINARY_ONLY_ROOT="$(mktemp -d /tmp/awg-binary-only.XXXXXX)"
+cp -a "${PROJECT_ROOT}/amneziawg-web" "${BINARY_ONLY_ROOT}/"
+cp -a "${PROJECT_ROOT}/scripts" "${BINARY_ONLY_ROOT}/"
+cp -p "${WEB_AWG_SCRIPT_PATH}" "${BINARY_ONLY_ROOT}/installed-script-backup"
+sed -i '/^AWG_INSTALLER_CAPABILITY_WEB_BORINGTUN=/d' "${WEB_AWG_SCRIPT_PATH}"
+BINARY_ONLY_BEFORE="$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}" "${WEB_AWG_SCRIPT_PATH}")"
+rm -f /tmp/systemctl-calls.log
+BINARY_ONLY_RC=0
+BINARY_ONLY_OUTPUT="$(bash "${BINARY_ONLY_ROOT}/amneziawg-web/scripts/amneziawg-web-upgrade.sh" \
+	--binary "${STUB_BINARY}" --install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" --data-dir "${WEB_TEST_DATA_DIR}" --force 2>&1)" || BINARY_ONLY_RC=$?
+if [[ "${BINARY_ONLY_RC}" -ne 0 ]] && \
+	grep -q 'full repository checkout' <<<"${BINARY_ONLY_OUTPUT}" && \
+	[[ "$(sha256sum "${WEB_TEST_INSTALL_DIR}/amneziawg-web" "${PRIVILEGED_HELPER}" "${SUDOERS_FILE}" "${WEB_AWG_SCRIPT_PATH}")" == "${BINARY_ONLY_BEFORE}" ]] && \
+	! grep -Eq '(stop|restart) amneziawg-web' /tmp/systemctl-calls.log 2>/dev/null; then
+	echo "OK: Binary-only upgrade rejects old BoringTun lifecycle before changing artifacts or service"
+else
+	echo "FAIL: Binary-only upgrade accepted an incompatible BoringTun lifecycle script"
+	FAILED=$((FAILED + 1))
+fi
+cp -p "${BINARY_ONLY_ROOT}/installed-script-backup" "${WEB_AWG_SCRIPT_PATH}"
+BINARY_ONLY_SCRIPT_HASH="$(sha256sum "${WEB_AWG_SCRIPT_PATH}")"
+BINARY_ONLY_RC=0
+BINARY_ONLY_OUTPUT="$(bash "${BINARY_ONLY_ROOT}/amneziawg-web/scripts/amneziawg-web-upgrade.sh" \
+	--binary "${STUB_BINARY}" --install-dir "${WEB_TEST_INSTALL_DIR}" \
+	--env-file "${WEB_TEST_ENV_FILE}" --data-dir "${WEB_TEST_DATA_DIR}" --force --no-restart 2>&1)" || BINARY_ONLY_RC=$?
+if [[ "${BINARY_ONLY_RC}" -eq 0 ]] && \
+	grep -q 'preserving compatible installed script' <<<"${BINARY_ONLY_OUTPUT}" && \
+	[[ "$(sha256sum "${WEB_AWG_SCRIPT_PATH}")" == "${BINARY_ONLY_SCRIPT_HASH}" ]]; then
+	echo "OK: Binary-only upgrade preserves the current sandbox-compatible BoringTun lifecycle"
+else
+	echo "FAIL: Binary-only upgrade did not preserve a compatible BoringTun lifecycle script"
+	FAILED=$((FAILED + 1))
+fi
+rm -rf "${BINARY_ONLY_ROOT}"
 
 echo ""
 echo "--- Web upgrader: failed sudoers preflight preserves live install ---"

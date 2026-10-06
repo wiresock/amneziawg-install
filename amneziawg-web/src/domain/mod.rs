@@ -522,7 +522,7 @@ mod tests {
         let long: String = "☃".repeat(200);
         let result = normalize_display_name(&long).unwrap();
         assert_eq!(result.chars().count(), MAX_DISPLAY_NAME_LEN);
-        assert!(result.is_empty() == false);
+        assert!(!result.is_empty());
     }
 
     // ── normalize_comment ───────────────────────────────────────────────────

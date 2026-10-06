@@ -1,21 +1,21 @@
 # AmneziaWG Installer
 
-Set up an [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscated VPN on any supported Linux server in under 2 minutes — with backward-compatible AWG 2.0 defaults, optional AWG 3.0 support, an optional web panel, and an optional traffic-obfuscation proxy (AmneziaWG 2.0 only).
+Set up an [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscated VPN on a supported Linux server using the default kernel backend or the experimental **BoringTun userspace backend**. Fresh installs use AWG 2.0; AWG 3.1, a web panel, and protocol imitation are optional.
 
 ```
-VPN install → (optional) Web panel → (optional) Obfuscation proxy → Manage clients
+Choose backend → Install VPN → (optional) Web panel → Manage clients
 ```
 
 ---
 
 ## 📖 Background
 
-This project started as a fork of [RomikB/amneziawg-install](https://github.com/RomikB/amneziawg-install). I needed a reliable way to stand up **AmneziaWG 2.0** servers for testing [WireSock Secure Connect](https://www.wiresock.net/), and the upstream script predated the 2.0 release — so I took it and extended it to generate and manage the new 2.0 obfuscation parameters (S3/S4 padding and the H1–H4 header ranges). It now also supports an explicit, capability-checked migration to **AmneziaWG 3.0** while preserving AWG 2.0 as the default for new and existing installations.
+This project started as a fork of [RomikB/amneziawg-install](https://github.com/RomikB/amneziawg-install). I needed a reliable way to stand up **AmneziaWG 2.0** servers for testing [WireSock Secure Connect](https://www.wiresock.net/), and the upstream script predated the 2.0 release — so I took it and extended it to generate and manage the new 2.0 obfuscation parameters (S3/S4 padding and the H1–H4 header ranges). It now also supports an explicit, capability-checked migration to **AmneziaWG 3.1**, while retaining AWG 2.0 defaults and preserving the mode of existing installations.
 
 Once the installer was solid, it was hard to stop:
 
 1. **`amneziawg-install.sh`** — the original script, extended for AmneziaWG 2.0 (S3/S4, H1–H4, migration from pre-2.0 installs), optional AmneziaWG 3.0 header protection, and optional AmneziaWG 3.1 (`RandomTrailers` / `DisableCookies`).
-2. **`amneziawg-web.sh`** — a web panel for managing clients and explicit AWG 2.0 / 3.0 / 3.1 migrations without touching the CLI.
+2. **`amneziawg-web.sh`** — a web panel for managing clients, switching between AWG 2.0 and 3.1, and configuring BoringTun's native protocol imitation without touching the CLI.
 3. **`amneziawg-proxy.sh`** — a UDP obfuscation proxy that takes traffic camouflage to the next level: it wraps AmneziaWG (AWG 2.0 only) so the datagrams on the wire look like a legitimate QUIC, DNS, STUN, or SIP service to Deep Packet Inspection (DPI).
 
 > **⚠️ amneziawg-proxy is compatible only with AmneziaWG 2.0 and is most powerful with WireSock Secure Connect 3.5+.**
@@ -30,8 +30,27 @@ Once the installer was solid, it was hard to stop:
 ```bash
 curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-install.sh
 chmod +x amneziawg-install.sh
+```
+
+Choose **one** backend for a fresh installation:
+
+**Kernel backend (default):**
+
+```bash
 sudo ./amneziawg-install.sh
 ```
+
+**BoringTun userspace backend (experimental):**
+
+```bash
+sudo AWG_BACKEND=boringtun AWG_BORINGTUN_IMITATE_PROTOCOL=none ./amneziawg-install.sh
+```
+
+BoringTun uses a downloaded, verified prebuilt binary instead of a kernel
+module. It requires a supported Debian/Ubuntu VM or bare-metal host with
+systemd, TUN and IPv6 socket support, on x86_64 or aarch64. This selects
+BoringTun only on a fresh install; it does not migrate an existing kernel
+installation. See [BoringTun requirements and lifecycle](#-experimental-boringtun-userspace-backend).
 
 **Add the web panel (optional):**
 
@@ -45,7 +64,16 @@ sudo ./amneziawg-web.sh install
 > standalone. If `git` is not available, clone the repository manually or use `--binary-src`
 > with a pre-built binary.
 
-**Add the obfuscation proxy (optional):**
+The panel is built from Rust source, including on BoringTun hosts. Install its
+build prerequisites and use `--install-rust` if needed; BoringTun itself is
+prebuilt. See [VPN + web panel](#-advanced-setup--vpn--web-panel).
+
+BoringTun users can enable **Off / DNS / QUIC / SIP / STUN** directly under
+**Protocol imitation · BoringTun** in the panel. No standalone proxy is needed.
+The pinned BoringTun release has no per-client **Auto** mode; see
+[native imitation and compatibility limits](#built-in-protocol-imitation-boringtun-only).
+
+**Add the obfuscation proxy (optional, kernel backend with AWG 2.0 only):**
 
 ```bash
 curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-proxy.sh
@@ -59,15 +87,15 @@ sudo ./amneziawg-proxy.sh
 
 ✅ **After installation:**
 - VPN server is running
-- AWG 2.0 remains active by default; [AWG 3.0](#-optional-awg-30-mode) is enabled only by an explicit migration after userspace and kernel capability checks pass (do not enable AWG 3.0 if using `amneziawg-proxy`)
+- AWG 2.0 remains active by default; [AWG 3.1](#-optional-awg-30--31-mode) requires an explicit migration after backend capability checks pass (do not enable AWG 3.x if using `amneziawg-proxy`)
 - A client config file is generated at `~/awg0-client-<name>.conf`
-- (If installed) Web panel listens on `127.0.0.1:8080` by default — access it on the server at `http://127.0.0.1:8080`, or change `AWG_WEB_LISTEN` / use a reverse proxy for remote access
+- (If installed) Web panel listens on `127.0.0.1:8080` by default. From your computer, run `ssh -N -L 8080:127.0.0.1:8080 user@server`, then open `http://localhost:8080` and sign in.
 
 ---
 
 ## 🧠 How It Works
 
-- **`amneziawg-install.sh`** — **required.** Installs the VPN server, generates obfuscation parameters, creates client configs, and can transactionally enable AWG 3.0 after capability checks or return the installation to AWG 2.0.
+- **`amneziawg-install.sh`** — **required.** Installs the VPN server with the selected backend, generates obfuscation parameters, creates client configs, and can transactionally enable AWG 3.1 after capability checks or return the installation to AWG 2.0. The CLI also retains legacy AWG 3.0 support.
 - **`amneziawg-web.sh`** — **optional.** Unified script for:
   - `install` — install the web panel
   - `upgrade` — upgrade the binary
@@ -83,8 +111,10 @@ sudo ./amneziawg-proxy.sh
 |------|-------------|
 | VPN server only | `amneziawg-install.sh` |
 | VPN + web panel | `amneziawg-install.sh` then `amneziawg-web.sh install` |
+| Userspace VPN without a kernel module | Fresh install with `sudo AWG_BACKEND=boringtun ./amneziawg-install.sh` |
+| Userspace VPN + native imitation and web panel | Fresh BoringTun install, then `amneziawg-web.sh install`; configure imitation in the panel |
 | VPN + DPI-resistant obfuscation | `amneziawg-install.sh` then `amneziawg-proxy.sh` *(AWG 2.0 only)* |
-| Everything | `amneziawg-install.sh`, then `amneziawg-web.sh install`, then `amneziawg-proxy.sh` *(AWG 2.0 only)* |
+| Kernel VPN + panel + standalone proxy | `amneziawg-install.sh`, then `amneziawg-web.sh install`, then `amneziawg-proxy.sh` *(AWG 2.0 only)* |
 | Advanced / development | Clone the repo, then run the scripts from the checkout |
 
 ---
@@ -115,6 +145,25 @@ sudo ./amneziawg-web.sh install
 
 The installer automatically downloads required files and builds the panel.
 Add `--install-rust` if Rust is not already installed on the server.
+
+For a **fresh BoringTun host**, replace the two installation commands above
+with this sequence after cloning:
+
+```bash
+sudo AWG_BACKEND=boringtun AWG_BORINGTUN_IMITATE_PROTOCOL=none ./amneziawg-install.sh
+
+# Panel build prerequisites on supported Debian/Ubuntu hosts
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libssl-dev
+sudo ./amneziawg-web.sh install --install-rust
+```
+
+Keep the default localhost binding and access the panel through an SSH tunnel.
+The header separates the configured AWG version from the running backend and
+panel version. The panel offers AWG **2.0** and **3.1**; a legacy 3.0 installation
+is still recognized and can switch to either. On BoringTun hosts, the imitation
+section shows configured and verified running settings separately and uses the
+installer's compatibility checks and rollback when applying changes.
 
 See [amneziawg-web/docs/INSTALL.md](amneziawg-web/docs/INSTALL.md) for all installer options.
 
@@ -389,7 +438,7 @@ you explicitly enable AWG 3.1.
 # Missing protocol state is reported as 2
 sudo ./amneziawg-install.sh --protocol-status
 
-# Probe userspace + running kernel support, then migrate the server and clients
+# Legacy AWG 3.0: probe the selected backend, then migrate the server and clients
 sudo ./amneziawg-install.sh --enable-awg3
 
 # Enable AWG 3.1 (AWG 3.0 plus RandomTrailers; DisableCookies stays off)
@@ -407,7 +456,8 @@ header key, validates all generated configs, and updates the server plus every
 recoverable client config as one transaction. If capability validation, file
 replacement, service restart, or the process itself fails, the previous state
 is restored. Redistribute every client config after a migration. The web panel
-exposes the same confirmed operations under **AWG protocol**.
+offers confirmed switches to AWG 2.0 and 3.1 under **AWG protocol**. Legacy
+AWG 3.0 remains available through the CLI, but cannot be selected in the panel.
 
 When `RandomTrailers` is on, upstream recommends identical `S1`–`S4` values to
 reduce packet-type misdetection. The installer warns if they differ and does
@@ -442,8 +492,9 @@ optional `MaxHandshakeAttempts`; this installer does not manage that field
 Instead of the AmneziaWG kernel module (built with DKMS), a server can run
 [WireSock BoringTun](https://github.com/Wiresock-Foundation/wiresock-boringtun),
 a userspace AmneziaWG implementation that serves the interface through a TUN
-device. Nothing is compiled on the server: no Rust toolchain, no DKMS and no
-kernel headers.
+device. The VPN backend uses a prebuilt binary: no Rust toolchain, DKMS or
+kernel headers are needed for BoringTun itself. The optional web panel has its
+own Rust build prerequisites.
 
 ```bash
 # Fresh install with the BoringTun backend
@@ -513,7 +564,12 @@ installer refuses a BoringTun host. Keep the kernel backend for proxy setups.
 
 **Web panel:** a BoringTun host needs a web panel whose copy of this script
 (`/usr/local/bin/amneziawg-install.sh`) is at least this version; the install
-refuses while an older copy is installed.
+refuses while an older copy is installed. Install or upgrade the panel and its
+privileged helper together from the same checkout. The header reports the
+configured protocol and verified running BoringTun release, without a proxy
+status entry. The panel manages clients, AWG 2.0/3.1 transitions and native
+imitation. Authentication and the default localhost binding apply to these
+controls as well.
 
 ### Upgrading and rolling back the BoringTun binary
 
@@ -610,6 +666,16 @@ The management menu of a BoringTun host shows the imitation and offers
 **7) Change BoringTun protocol imitation**. The hostname is optional: without
 one, BoringTun chooses its own. It must be a plain host name of letters,
 digits, hyphens and dots.
+
+The web panel exposes the same transaction under **Protocol imitation ·
+BoringTun**. Choose **Off**, **DNS**, **QUIC**, **SIP** or **STUN**, optionally
+enter a hostname for DNS/QUIC/SIP, and confirm the brief VPN restart. Saved and
+verified running settings are shown separately. Changing imitation preserves
+the AWG version and client configurations.
+
+The pinned BoringTun release uses one configured imitation mode per interface.
+It does **not** support the standalone proxy's per-client `auto` detection.
+An automatic/random hostname does not mean automatic protocol selection.
 
 A change is one transaction under the same lock as client changes. The new
 settings are validated on a temporary BoringTun instance. The running service

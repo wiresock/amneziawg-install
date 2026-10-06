@@ -74,6 +74,11 @@ AWG_BORINGTUN_IMITATE_DOMAIN=""
 # because an older copy would treat a BoringTun host as a kernel host. Later
 # installer versions must keep the line unchanged.
 AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"
+# Web mutations may run with read-only /usr. This contract includes reuse of
+# identical trusted generated helpers before attempting any temporary write.
+# Read as data by the companion web upgrader.
+# shellcheck disable=SC2034
+AWG_INSTALLER_CAPABILITY_WEB_BORINGTUN="web-boringtun-v1"
 
 # The immutable public BoringTun release that fresh BoringTun installs download.
 # These values are the installer's only trust anchor for the binary: they are
@@ -6171,28 +6176,33 @@ function _awgBtEnsureDirectory() {
 # Replace DEST with stdin atomically, as a root-owned file with MODE. An
 # identical file is left alone. _AWG_BT_FILE_CHANGED says whether DEST changed.
 function _awgBtWriteManagedFile() {
-	local DEST="$1" MODE="$2" TMP OWNER="" CURRENT_MODE=""
+	local DEST="$1" MODE="$2" TMP CONTENT OWNER="" CURRENT_MODE=""
 	_AWG_BT_FILE_CHANGED=0
 	if [[ -L "${DEST}" ]] || { [[ -e "${DEST}" ]] && [[ ! -f "${DEST}" ]]; }; then
 		_awgBtErr "refusing to replace ${DEST}: it is not a regular file"
 		cat >/dev/null
 		return 1
 	fi
+	# Check existing text before allocating in its directory. The web panel's
+	# sandbox makes /usr read-only, but may reuse helpers that already have the
+	# exact generated contents and trusted ownership/mode. A sentinel preserves
+	# every trailing newline when capturing stdin with command substitution.
+	CONTENT="$(cat && printf '.')" || return 1
+	CONTENT="${CONTENT%.}"
+	if [[ -f "${DEST}" ]]; then
+		read -r OWNER CURRENT_MODE <<<"$(_awgBtStatOwnerMode "${DEST}")"
+		if [[ "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${CURRENT_MODE}" == "${MODE#0}" ]] &&
+			cmp -s -- "${DEST}" <(printf '%s' "${CONTENT}"); then
+			return 0
+		fi
+	fi
 	if ! TMP="$(mktemp "${DEST%/*}/.${DEST##*/}.XXXXXX")"; then
-		cat >/dev/null
 		return 1
 	fi
-	if ! cat >"${TMP}" || ! chmod "${MODE}" -- "${TMP}" ||
+	if ! printf '%s' "${CONTENT}" >"${TMP}" || ! chmod "${MODE}" -- "${TMP}" ||
 		{ [[ "${EUID}" -eq 0 ]] && ! chown 0:0 -- "${TMP}"; }; then
 		rm -f -- "${TMP}"
 		return 1
-	fi
-	if [[ -f "${DEST}" ]] && cmp -s -- "${TMP}" "${DEST}"; then
-		read -r OWNER CURRENT_MODE <<<"$(_awgBtStatOwnerMode "${DEST}")"
-		if [[ "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${CURRENT_MODE}" == "${MODE#0}" ]]; then
-			rm -f -- "${TMP}"
-			return 0
-		fi
 	fi
 	if ! mv -f -- "${TMP}" "${DEST}"; then
 		rm -f -- "${TMP}"

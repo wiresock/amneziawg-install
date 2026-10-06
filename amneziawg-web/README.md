@@ -53,6 +53,11 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 - **Proxy session visibility** – when `amneziawg-proxy` is enabled (AmneziaWG 2.0
   interfaces only), reads its local status file and shows active remote client sessions
   on the peer list.
+- **Native BoringTun imitation** – the peer list offers Off, DNS, QUIC, SIP and
+  STUN, with an optional hostname for DNS/QUIC/SIP. No proxy is needed. Saved
+  settings and verified running settings are shown separately. Confirmed,
+  CSRF-protected changes use the installer's validated transaction and rollback;
+  client configurations and the AWG protocol version are preserved.
 - **Session cookie authentication** – Argon2id password verification,
   32-byte cryptographically random session IDs, configurable TTL.
 - **Bearer token** – optional static token for headless API access.
@@ -63,6 +68,7 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
   `login_success`, `login_failed`, `logout`,
   `user_create_requested`, `user_created`, `user_create_failed`,
   `user_remove_requested`, `user_removed`, `user_remove_failed`
+  and `imitation_applied` (including reapplying the current settings)
   written to the `events` table; queryable via `GET /api/events`.
 - **User lifecycle** – add and remove AmneziaWG clients directly from the panel,
   implemented natively in Rust (no install-script bridge for lifecycle operations).
@@ -205,6 +211,15 @@ For a full production setup, see [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Configuration
 
+The header distinguishes the configured **AWG protocol** (2.0, 3.0 or 3.1)
+from the **backend** (AWG kernel or BoringTun) and the **panel version**.
+For BoringTun, the version comes from the installer's verified running daemon,
+not an installed WireGuard kernel module or the AWG command-line tools.
+The standalone proxy is omitted on BoringTun hosts and when it is not installed.
+Unavailable runtime information is shown as unknown; it is never inferred from
+an unrelated module version. `/api/system/versions` retains its component fields
+and adds `runtime` details and the same `summary` used by the header.
+
 All settings are read from environment variables (or a `.env`-style file via systemd `EnvironmentFile`).
 
 | Variable | Default | Description |
@@ -239,9 +254,10 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `POST` | `/admin/peers/:id/restore` | Yes | Return an archived key to the normal list as a blank, still-disabled peer |
 | `POST` | `/admin/users/add` | Yes | HTML form: add new user (PRG redirect) |
 | `POST` | `/admin/users/:id/remove` | Yes | HTML form: remove user (PRG redirect) |
-| `POST` | `/admin/protocol/enable-awg3` | Yes | Confirmed HTML form: probe support and atomically migrate the interface plus all clients to AWG 3.0 (incompatible with `amneziawg-proxy`) |
 | `POST` | `/admin/protocol/enable-awg31` | Yes | Confirmed HTML form: migrate to AWG 3.1 (`RandomTrailers` on, `DisableCookies` off; incompatible with `amneziawg-proxy`) |
 | `POST` | `/admin/protocol/disable-awg3` | Yes | Confirmed HTML form: atomically return the interface plus all clients to AWG 2.0 |
+| `GET` | `/api/admin/imitation` | Yes | Fresh backend status with configured and verified running BoringTun imitation settings |
+| `POST` | `/admin/imitation` | Yes | Confirmed, CSRF-protected HTML form: change native BoringTun imitation through the installer transaction |
 | `GET` | `/login` | No | Login form |
 | `POST` | `/login` | No | Validate credentials, set cookie |
 | `POST` | `/logout` | No | Clear session cookie |
@@ -302,15 +318,19 @@ no shell interpolation.
 Protocol migration is also routed through the helper. It resolves only the
 root-owned lifecycle script recorded beside the service's configured
 environment file, accepts only fixed enable/disable operations, and suppresses
-script output. The header-protection key is provided to the unprivileged
+script output. The panel offers AWG 2.0 and AWG 3.1. Existing AWG 3.0
+installations are recognized as legacy and can switch to either offered mode;
+the panel has no action or helper command to enable AWG 3.0. The installer's
+standalone CLI retains its existing protocol support.
+The header-protection key is provided to the unprivileged
 process only through the existing safe-parameter projection needed to create
-AWG 3.0 client configs; it is never rendered in HTML, returned by the status
+AWG 3.x client configs; it is never rendered in HTML, returned by the status
 API, or written to application logs.
 
 > [!WARNING]
 > **Compatibility with amneziawg-proxy:**
-> `amneziawg-proxy` is compatible **only with AmneziaWG 2.0**. Enabling AWG 3.0 or 3.1 via
-> `/admin/protocol/enable-awg3` or `/admin/protocol/enable-awg31` will cause `amneziawg-proxy` to fail packet classification
+> `amneziawg-proxy` is compatible **only with AmneziaWG 2.0**. Enabling AWG 3.1 via
+> `/admin/protocol/enable-awg31` will cause `amneziawg-proxy` to fail packet classification
 > and stop camouflaging traffic. If `amneziawg-proxy` is in use, keep the interface on AWG 2.0.
 
 **Troubleshooting:** If peer polling fails with "Operation not permitted",

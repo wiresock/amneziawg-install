@@ -1,0 +1,86 @@
+<details id="imitation-panel" class="edit-form" hidden>
+<summary>Protocol imitation · BoringTun</summary>
+<p>Imitate DNS, QUIC, SIP or STUN directly in BoringTun. No proxy is required. This changes the server's outgoing packet prefixes; it does not change the AWG version or client configurations.</p>
+<p id="imitation-configured" class="meta" role="status">Configured: loading…</p>
+<p id="imitation-running" class="meta" role="status">Running: loading…</p>
+<form method="POST" action="/admin/imitation" id="imitation-form">
+  <input type="hidden" name="csrf_token" value="{{csrf}}">
+  <fieldset id="imitation-fields" disabled>
+    <label for="imitation-mode">Imitation mode</label>
+    <select id="imitation-mode" name="protocol">
+      <option value="none">Off</option>
+      <option value="dns">DNS</option>
+      <option value="quic">QUIC</option>
+      <option value="sip">SIP</option>
+      <option value="stun">STUN</option>
+    </select>
+    <div id="imitation-hostname" hidden>
+      <label for="imitation-domain">Hostname (optional)</label>
+      <input id="imitation-domain" name="domain" maxlength="253" placeholder="example.com" autocomplete="off" spellcheck="false" disabled>
+      <p class="meta">Leave blank for BoringTun's automatic hostname. Enter a hostname only, without a URL.</p>
+    </div>
+    <p id="imitation-hint" class="meta"></p>
+    <p>The VPN briefly restarts when changing a running interface. A stopped interface stays stopped. The installer checks compatibility and attempts rollback if applying the change fails.</p>
+    <label><input type="checkbox" name="confirm" value="yes" required> I understand that connected clients may briefly disconnect.</label>
+    <button type="submit">Apply imitation</button>
+  </fieldset>
+</form>
+</details>
+<script>
+(function() {
+  var panel = document.getElementById('imitation-panel');
+  var configured = document.getElementById('imitation-configured');
+  var running = document.getElementById('imitation-running');
+  var fields = document.getElementById('imitation-fields');
+  var mode = document.getElementById('imitation-mode');
+  var domain = document.getElementById('imitation-domain');
+  var hint = document.getElementById('imitation-hint');
+  var awg = null;
+  function usesHostname(protocol) { return ['dns', 'quic', 'sip'].indexOf(protocol) !== -1; }
+  function describe(settings) {
+    if (!settings) return 'unavailable';
+    var text = settings.protocol === 'none' ? 'Off' : settings.protocol.toUpperCase();
+    if (usesHostname(settings.protocol)) text += ' · ' + (settings.domain || 'automatic hostname');
+    return text;
+  }
+  function updateChoice() {
+    var uses = usesHostname(mode.value);
+    document.getElementById('imitation-hostname').hidden = !uses;
+    domain.disabled = !uses;
+    var notes = {
+      none: 'Imitation is disabled. Existing AWG obfuscation remains in use.',
+      dns: 'DNS probe replies are enabled. The VPN listening port stays unchanged.',
+      quic: 'QUIC probe replies are enabled. The VPN listening port stays unchanged.',
+      sip: 'SIP sends no probe replies. With AWG 3.x, SIP requires every S1–S4 value to be 30 or less; the installer rejects incompatible settings.',
+      stun: 'STUN probe replies are enabled and can be larger than requests. The VPN listening port stays unchanged.'
+    };
+    hint.textContent = notes[mode.value] || '';
+    if ((awg === '3.0' || awg === '3.1') && (mode.value === 'dns' || mode.value === 'stun')) {
+      hint.textContent += ' With AWG 3.x, this mode reduces header-masking nonce space; QUIC retains the full nonce. Payload encryption is unchanged.';
+    }
+  }
+  mode.addEventListener('change', updateChoice);
+  fetch('/api/admin/imitation', { credentials: 'same-origin' })
+    .then(function(response) { if (!response.ok) throw new Error('unavailable'); return response.json(); })
+    .then(function(data) {
+      if (data.backend === 'kernel') return;
+      panel.hidden = false;
+      if (new URLSearchParams(window.location.search).has('imitation_notice')) panel.open = true;
+      awg = data.protocol;
+      configured.textContent = 'Configured: ' + describe(data.imitation);
+      var state = (data.service_state === 'active' || data.service_state === 'inactive')
+        ? (data.daemon_state || 'unknown') : (data.service_state || 'unknown');
+      running.textContent = 'Running: ' + (data.daemon_imitation ? describe(data.daemon_imitation) : 'not verified (' + state + ')');
+      if (data.backend !== 'boringtun' || !data.imitation) return;
+      mode.value = data.imitation.protocol;
+      domain.value = data.imitation.domain;
+      fields.disabled = false;
+      updateChoice();
+    })
+    .catch(function() {
+      panel.hidden = false;
+      configured.textContent = 'Imitation status unavailable. Controls are disabled until the backend can be verified.';
+      running.textContent = '';
+    });
+})();
+</script>

@@ -31,10 +31,14 @@ jobs:
           bash -n tests/test-cargo-build-common.sh
           bash -n tests/test-awg3.sh
           bash -n tests/test-backend.sh
+          bash -n tests/test-web-backend-status.sh
+          bash -n tests/test-web-imitation.sh
+          bash -n tests/test-web-protocol-options.sh
           bash -n tests/test-boringtun-artifact.sh
           bash -n tests/test-boringtun-release.sh
           bash -n tests/test-boringtun-foreground-launcher.sh
           bash -n tests/test-boringtun-runtime.sh
+          bash -n tests/test-boringtun-managed-files.sh
           bash -n tests/test-boringtun-runtime-live.sh
           bash -n tests/test-boringtun-host.sh
           bash -n tests/test-boringtun-imitation.sh
@@ -68,6 +72,21 @@ jobs:
           bash -n tests/test-ubuntu-resolute-live.sh
           bash -n tests/test-install-mock.sh
 
+      - name: Web backend status regression
+        run: bash tests/test-web-backend-status.sh
+
+      - name: Web imitation regression
+        run: bash tests/test-web-imitation.sh
+
+      - name: Web imitation status display regression
+        run: node --test tests/test-web-imitation-ui.cjs
+
+      - name: Web protocol options regression
+        run: bash tests/test-web-protocol-options.sh
+
+      - name: BoringTun read-only helper regression
+        run: bash tests/test-boringtun-managed-files.sh
+
   shellcheck:
     runs-on: ubuntu-latest
     steps:
@@ -95,10 +114,14 @@ jobs:
           shellcheck --severity=warning tests/test-cargo-build-common.sh
           shellcheck --severity=warning tests/test-awg3.sh
           shellcheck --severity=warning tests/test-backend.sh
+          shellcheck --severity=warning tests/test-web-backend-status.sh
+          shellcheck --severity=warning tests/test-web-imitation.sh
+          shellcheck --severity=warning tests/test-web-protocol-options.sh
           shellcheck --severity=warning tests/test-boringtun-artifact.sh
           shellcheck --severity=warning tests/test-boringtun-release.sh
           shellcheck --severity=warning tests/test-boringtun-foreground-launcher.sh
           shellcheck --severity=warning tests/test-boringtun-runtime.sh
+          shellcheck --severity=warning tests/test-boringtun-managed-files.sh
           shellcheck --severity=warning tests/test-boringtun-runtime-live.sh
           shellcheck --severity=warning tests/test-boringtun-host.sh
           shellcheck --severity=warning tests/test-boringtun-imitation.sh
