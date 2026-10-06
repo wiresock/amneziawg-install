@@ -464,8 +464,8 @@ architectures are refused before anything is changed.
   kernel module package (`amneziawg-dkms`) is not pulled in, plus `nftables`,
   `iptables` and `qrencode`. No `amneziawg`, DKMS, headers or `deb-src` sources.
 - `boringtun-cli` from this repository's immutable public release
-  [`boringtun-cli-0.7.1-g71d88784ad29-b1`](https://github.com/wiresock/amneziawg-install/releases/tag/boringtun-cli-0.7.1-g71d88784ad29-b1),
-  built from WireSock BoringTun `71d88784ad29dc95871c105e26cc62f6acdd565b`. The
+  [`boringtun-cli-0.7.1-gae2ab44e9a68-b1`](https://github.com/wiresock/amneziawg-install/releases/tag/boringtun-cli-0.7.1-gae2ab44e9a68-b1),
+  built from WireSock BoringTun `ae2ab44e9a68ca1a3232d2e8b13f9db30a9b9dcf`. The
   installer downloads the archive for its architecture from that exact URL and
   checks it against SHA-256 values embedded in the script before extracting
   anything; then it checks the archive's layout, its `MANIFEST`, the binary's
@@ -527,7 +527,10 @@ sudo ./amneziawg-install.sh --rollback-boringtun
 
 **Explicit only.** Running a newer `amneziawg-install.sh` never switches the binary, and
 neither does anything else it does: clients, protocol changes, imitation changes and the menu
-leave the installed release alone.
+leave the installed release alone. A host installed by an earlier version, with
+`boringtun-cli-0.7.1-g71d88784ad29-b1`, keeps running that release until
+`--upgrade-boringtun` moves it to the one this version pins; until then `--backend-status`
+reports `upgrade_available=yes`.
 
 **What each command targets.**
 - **Upgrade:** only the release pinned in the installer itself, never a "latest" lookup.

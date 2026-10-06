@@ -5,11 +5,12 @@ This repository builds static `boringtun-cli` binaries from a pinned commit of
 for a future userspace AmneziaWG backend (see
 [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
 
-**Status: one release published.** `boringtun-cli-0.7.1-g71d88784ad29-b1`,
-built from the previous pin `71d88784ad29`, is public and is what the installer
-downloads. The current pin `ae2ab44e9a68` has an approved release contract and
-no release yet. Four separate stages handle the artifacts, and only the first
-two run on their own:
+**Status: two releases published.** `boringtun-cli-0.7.1-gae2ab44e9a68-b1`,
+built from the current pin `ae2ab44e9a68` under its approved release contract,
+is public and is what the installer downloads.
+`boringtun-cli-0.7.1-g71d88784ad29-b1`, built from the previous pin
+`71d88784ad29`, stays public for the installer versions that embed it. Four
+separate stages handle the artifacts, and only the first two run on their own:
 
 | Stage | What happens | Where |
 |---|---|---|
@@ -42,9 +43,11 @@ contract is a candidate and also after it is approved and published.
 `release.env` always matches `pin.env`. No test compares the installer's
 constants with `pin.env` or `release.env`; each contract is checked on its own
 terms, and the host tests and the public-release download use only the
-installer's constants. Today the pin is `ae2ab44e9a68`, the contract an
-approved, not yet published build 1, and the installer installs the published
-`boringtun-cli-0.7.1-g71d88784ad29-b1`.
+installer's constants. Today the three agree, each by its own terms: the pin
+is `ae2ab44e9a68`, the contract its approved and published build 1, and the
+installer installs that published release,
+`boringtun-cli-0.7.1-gae2ab44e9a68-b1`, which it adopted in a separate change
+after publication.
 
 ## Source pin
 
@@ -74,7 +77,9 @@ builds and installer trust anchors use the commit. The previous pin,
 `71d88784ad29dc95871c105e26cc62f6acdd565b` (tree
 `6f0f0a32a197fe71fb66c074cb1e56caf7024dd8`, upstream tag
 `awg3.1-integration-2026-09-28`), is the source of the published release
-`boringtun-cli-0.7.1-g71d88784ad29-b1` that the installer uses today.
+`boringtun-cli-0.7.1-g71d88784ad29-b1` that earlier installer versions embed;
+this installer embeds the current pin's release
+`boringtun-cli-0.7.1-gae2ab44e9a68-b1`.
 
 Upstream rewrote its history after that release. In the current history the
 old pin's tree is commit `8ba4d792dd071783d4864ef022258ff9d7c52bbd`, with
@@ -371,7 +376,7 @@ strict grammar as `pin.env` and refuses any disagreement with the pin:
 `BoringTun CLI <version> (WireSock <commit12>), build <build> (experimental)`.
 A published tag is never reused or moved, so once a build is public, any other
 bytes need a new build number. The build number is scoped to one source commit:
-a new pin starts again at build 1. The contract holds an `approved`, not yet
+a new pin starts again at build 1. The contract holds the `approved` and
 published build 1 of the current pin, `boringtun-cli-0.7.1-gae2ab44e9a68-b1`; the published
 release of the previous pin, `boringtun-cli-0.7.1-g71d88784ad29-b1`, stays
 side by side and is never moved, edited or replaced. Nothing built from the
@@ -454,10 +459,14 @@ top-level directory becomes a release in
 `/usr/local/lib/amneziawg-install/boringtun/`, and every start checks it against
 its `MANIFEST` (see §21.1 of [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
 `amneziawg-install.sh` embeds the tag, asset names and SHA-256 values of the
-release it installs, currently `boringtun-cli-0.7.1-g71d88784ad29-b1`. Moving
+release it installs, currently `boringtun-cli-0.7.1-gae2ab44e9a68-b1`. Moving
 the installer to a newer release is a separate change of those constants, with
 its own upgrade and rollback evidence; a candidate or even a published release
-of a newer pin does not change what the installer downloads. The tests check
+of a newer pin does not change what the installer downloads. A host keeps the
+release it has until `--upgrade-boringtun` moves it to the one its installer
+pins; the BoringTun Host workflow's x86_64 job proves that move from the
+release of the earlier installer `9f5a1afb87f7`
+(`boringtun-cli-0.7.1-g71d88784ad29-b1`). The tests check
 those constants only against themselves and against the public release they
 name, never against `pin.env` or `release.env` (see
 [Three contracts](#three-contracts)).

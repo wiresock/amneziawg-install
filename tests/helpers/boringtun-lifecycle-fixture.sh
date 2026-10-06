@@ -5,15 +5,20 @@
 # tests/test-boringtun-host-live.sh and tests/test-boringtun-kernel-coexistence.sh
 # on disposable hosts only.
 #
-# There is one published BoringTun release. To exercise --upgrade-boringtun and
-# --rollback-boringtun against it, these helpers build a second, older-looking
-# release in the store from the already verified pinned binary: the same bytes
-# under a synthetic source commit (feedface...), so its store name and
-# MANIFEST differ while its binary and version are the real ones. It is not a
-# published release and nothing claims it is. The installer cannot select it
-# by itself: the test makes it current by writing the link directly, as an
-# earlier installer would have left an older release, and the real pinned
-# release stays the upgrade target, downloaded through the public release path.
+# To exercise --upgrade-boringtun and --rollback-boringtun against the release
+# an installer pins, on every host, these helpers build a second,
+# older-looking release in the store from the already verified pinned binary:
+# the same bytes under a synthetic source commit (feedface...), so its store
+# name and MANIFEST differ while its binary and version are the real ones. It
+# is not a published release and nothing claims it is. The installer cannot
+# select it by itself: the test makes it current by writing the link directly,
+# as an earlier installer would have left an older release, and the real
+# pinned release stays the upgrade target, downloaded through the public
+# release path. Because the fixture relabels the pinned bytes, a lifecycle
+# with it never crosses a real version: it proves the lifecycle's mechanics,
+# not a cross-version upgrade or rollback. The x86_64 upgrade path of
+# tests/test-boringtun-host-live.sh (AWG_LIVE_PREVIOUS_INSTALLER) crosses one,
+# from the earlier installer's own published release.
 
 BT_FIXTURE_COMMIT="feedfacefeedfacefeedfacefeedfacefeedface"
 
