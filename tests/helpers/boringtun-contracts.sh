@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Checks of this repository's three BoringTun contracts, each on its own terms.
 # Sourced by tests/test-boringtun-artifact.sh, tests/test-boringtun-host.sh,
-# tests/test-boringtun-release.sh and tests/test-boringtun-public-release.sh.
+# tests/test-boringtun-release.sh, tests/test-boringtun-public-release.sh and
+# tests/test-boringtun-host-live.sh.
 #
 #  1. packaging/boringtun/pin.env, the artifact source pin: the WireSock
 #     BoringTun commit the artifact pipeline builds.
@@ -34,10 +35,38 @@ btc_embedded_value() { # <installer> <NAME>
 # the asset names must all follow from the embedded version, source commit and
 # build, and the four hashes must be four different SHA-256 values.
 btc_embedded_release_problems() { # <installer>
-	local INSTALLER="$1" NAME COUNT STEM ARCH
+	_btc_embedded_release_problems "$1" with-build
+}
+
+# The same checks for an installer version from before AWG_BT_RELEASE_BUILD
+# existed, read as data: 9f5a1afb87f7, the earlier installer that the live
+# upgrade test installs with, embeds every other name and no build number,
+# and its release is build 1. Here AWG_BT_RELEASE_BUILD must not be assigned
+# at all, and the tag must end in -b1. Only historical installers are held to
+# this; this repository's installer must embed its build
+# (btc_embedded_release_problems).
+btc_buildless_embedded_release_problems() { # <installer>
+	_btc_embedded_release_problems "$1" without-build
+}
+
+_btc_embedded_release_problems() { # <installer> <with-build | without-build>
+	local INSTALLER="$1" FORMAT="$2" NAME COUNT STEM ARCH
 	local -A E=()
+	case "${FORMAT}" in
+		with-build | without-build) ;;
+		*)
+			echo "'${FORMAT}' is not an embedded release format"
+			return 0
+			;;
+	esac
 	for NAME in ${BTC_EMBEDDED_NAMES}; do
 		COUNT="$(grep -c "^AWG_BT_RELEASE_${NAME}=" "${INSTALLER}")"
+		if [[ "${NAME}" == BUILD && "${FORMAT}" == without-build ]]; then
+			[[ "${COUNT}" == 0 ]] ||
+				echo "AWG_BT_RELEASE_BUILD is assigned ${COUNT} times, but an installer without a build number assigns it none"
+			E[BUILD]=1
+			continue
+		fi
 		[[ "${COUNT}" == 1 ]] || echo "AWG_BT_RELEASE_${NAME} is assigned ${COUNT} times, not once"
 		E[${NAME}]="$(btc_embedded_value "${INSTALLER}" "${NAME}" | head -n 1)"
 	done

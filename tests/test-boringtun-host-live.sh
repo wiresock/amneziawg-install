@@ -28,13 +28,22 @@
 # Then the binary lifecycle: a TEST FIXTURE older release made current, the
 # real pinned release removed and fetched again by --upgrade-boringtun, a
 # --rollback-boringtun to the fixture, an upgrade back and a no-op upgrade,
-# each with the tunnel's datapath and an unchanged configuration.
+# each with the tunnel's datapath and an unchanged configuration. The fixture
+# relabels the pinned release's own bytes, so these moves never cross a real
+# version: they prove the lifecycle's mechanics, not a cross-version rollback.
 #
 # With AWG_LIVE_PREVIOUS_INSTALLER=<path>, the fresh install runs that earlier
 # installer version instead, and everything after it runs this one: the
 # upgrade path from an installation without imitation (params without its
 # keys, a FORMAT=1 runtime file, the earlier helpers and a running daemon
-# started without --imitate-protocol).
+# started without --imitate-protocol) and with the earlier installer's own
+# release. The test first checks that release, read from the earlier
+# installer as data: its public download, its store entry and MANIFEST, the
+# store's selection and the running daemon. It then upgrades to this
+# installer's release with this installer's --upgrade-boringtun, a real
+# version transition, and checks the switch, the restarted daemon and
+# --backend-status; only then does it hold the host to this installer's
+# release.
 #
 # Requirements: root, systemd as PID 1, network access to the Amnezia PPA and
 # GitHub, no AmneziaWG kernel module, python3, and AWG_DISPOSABLE_HOST_TEST=1.
@@ -184,6 +193,10 @@ peer_count() {
 source "${SCRIPT_DIR}/helpers/boringtun-live-firewall.sh"
 # shellcheck source=helpers/boringtun-wire-checks.sh
 source "${SCRIPT_DIR}/helpers/boringtun-wire-checks.sh"
+# shellcheck source=helpers/boringtun-contracts.sh
+source "${SCRIPT_DIR}/helpers/boringtun-contracts.sh"
+# shellcheck source=helpers/boringtun-lifecycle-fixture.sh
+source "${SCRIPT_DIR}/helpers/boringtun-lifecycle-fixture.sh"
 fw_args() {
 	FW_ARGS=("/etc/amnezia/amneziawg/${IF}.conf" "${IF}" "${PORT}" "${PUBLIC_NIC}")
 }
@@ -194,6 +207,37 @@ scratch_clean() {
 	[[ -z "$(ip -o link show 2>/dev/null | grep -oE ' awg[pvb][0-9]+' || true)" ]] &&
 		[[ -z "$(find /run/amneziawg-install/scratch -mindepth 1 2>/dev/null)" ]] &&
 		[[ -z "$(systemctl list-units --all --plain --no-legend 'amneziawg-scratch-*' 2>/dev/null)" ]]
+}
+# fails <command...>: succeeds exactly when the command fails, for the
+# negative controls.
+fails() {
+	! "$@"
+}
+installation_hashes() {
+	sha256sum /etc/amnezia/amneziawg/params "/etc/amnezia/amneziawg/${IF}.conf" "/etc/amnezia/amneziawg/${IF}.boringtun" \
+		/etc/amnezia/amneziawg/clients/*.conf "${CLIENT_CONF}" 2>/dev/null | cut -d' ' -f1 | tr '\n' ' '
+}
+store_links() {
+	printf '%s %s' "$(readlink "${STORE}/current" 2>/dev/null || echo none)" "$(readlink "${STORE}/previous" 2>/dev/null || echo none)"
+}
+# The release lines of --backend-status, in its order.
+release_status() {
+	bash "${INSTALLER}" --backend-status 2>&1 |
+		grep -E '^(installed_release|pinned_release|previous_release|rollback_available|upgrade_available|daemon_release)=' | tr '\n' ' '
+}
+LIBEXEC=/usr/local/libexec/amneziawg-install
+# Whether both installed helpers are exactly the ones this installer renders.
+# Each rendering is read in full before the comparison: cmp on a pipe stops at
+# the first difference and leaves the renderer writing into a closed pipe. The
+# trailing x keeps trailing newlines in both sides.
+helpers_are_this_installers() {
+	local KIND FILE RENDERED
+	for KIND in launch ctl; do
+		FILE="${LIBEXEC}/awg-boringtun-launch"
+		[[ "${KIND}" == ctl ]] && FILE="${LIBEXEC}/awg-backend-ctl"
+		RENDERED="$(bash -c 'source "$1" && _awgBtRenderHelper "$2"' _ "${INSTALLER}" "${KIND}" && echo x)" || return 1
+		[[ "$(cat -- "${FILE}" && echo x)" == "${RENDERED}" ]] || return 1
+	done
 }
 
 dump_diagnostics() {
@@ -256,15 +300,143 @@ env AWG_BACKEND=boringtun AUTO_INSTALL=y SERVER_PUB_IP="${HOST_ADDR}" SERVER_PUB
 	SERVER_AWG_NIC="${IF}" SERVER_PORT="${PORT}" ENABLE_IPV6=n CREATE_INITIAL_CLIENT=n \
 	bash "${AWG_LIVE_PREVIOUS_INSTALLER:-${INSTALLER}}" >"${WORK}/install.log" 2>&1 </dev/null
 INSTALL_RC=$?
-[[ -z "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]] || echo "    (installed by the earlier installer ${AWG_LIVE_PREVIOUS_INSTALLER}; everything below runs this one)"
+[[ -z "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]] ||
+	echo "    (installed by the earlier installer ${AWG_LIVE_PREVIOUS_INSTALLER}, with its own release; everything below runs this one)"
 tail -n 25 "${WORK}/install.log" | sed 's/^/    | /'
 check "the installer completes" test "${INSTALL_RC}" -eq 0
 ((INSTALL_RC == 0)) || die "the install failed; nothing more to test"
 record_secret "$(sed -n "s/^SERVER_PRIV_KEY='\\(.*\\)'\$/\\1/p" /etc/amnezia/amneziawg/params)"
+# The log of the operation that downloaded this installer's release: the
+# fresh install, or the upgrade from the earlier installer's release below.
+RELEASE_LOG="${WORK}/install.log"
+
+# ── The earlier installer's release ─────────────────────────────────────────
+# What the earlier installer installed is its own embedded release, read from
+# it as data and checked before anything else runs: that installer predates
+# AWG_BT_RELEASE_BUILD, so its constants are held to the format without a
+# build number (tests/helpers/boringtun-contracts.sh), never to this
+# installer's. Its legacy state (params, runtime file and daemon command line)
+# is checked here too, before any operation of this installer touches it.
+if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
+	echo "=== The earlier installer's release"
+	PREVIOUS="${AWG_LIVE_PREVIOUS_INSTALLER}"
+	PROBLEMS="$(btc_buildless_embedded_release_problems "${PREVIOUS}")"
+	[[ -z "${PROBLEMS}" ]] || sed 's/^/    | /' <<<"${PROBLEMS}"
+	check "the earlier installer embeds a consistent release in the format without a build number" test -z "${PROBLEMS}"
+	PREV_TAG="$(btc_embedded_value "${PREVIOUS}" TAG)"
+	PREV_SOURCE_COMMIT="$(btc_embedded_value "${PREVIOUS}" SOURCE_COMMIT)"
+	PREV_ASSET="$(btc_embedded_value "${PREVIOUS}" "ASSET_${ARCH_KEY}")"
+	PREV_ARCHIVE_SHA256="$(btc_embedded_value "${PREVIOUS}" "ARCHIVE_SHA256_${ARCH_KEY}")"
+	PREV_BINARY_SHA256="$(btc_embedded_value "${PREVIOUS}" "BINARY_SHA256_${ARCH_KEY}")"
+	PREV_ID="${PREV_ASSET%.tar.gz}"
+	echo "    earlier installer's release: ${PREV_TAG}, ${ARCH} binary ${PREV_BINARY_SHA256}"
+	echo "    this installer's release:    ${RELEASE_TAG}, ${ARCH} binary ${BINARY_SHA256}"
+	check "  it is another release than this installer's, so the upgrade below crosses versions" \
+		test "${PREV_TAG}" != "${RELEASE_TAG}" -a "${PREV_ID}" != "${RELEASE_ID}" \
+		-a "${PREV_ARCHIVE_SHA256}" != "${ARCHIVE_SHA256}" -a "${PREV_BINARY_SHA256}" != "${BINARY_SHA256}"
+	check "it downloaded its own public release ${PREV_TAG}" \
+		grep -qF "Downloading https://github.com/wiresock/amneziawg-install/releases/download/${PREV_TAG}/${PREV_ASSET}" "${WORK}/install.log"
+	check "  and not this installer's release" bash -c '! grep -qF "/$1/" "$2"' _ "${RELEASE_TAG}" "${WORK}/install.log"
+	check "the store selects the earlier release ${PREV_ID}, with no previous release" test "$(store_links)" = "${PREV_ID} none"
+	check "  its binary has the earlier installer's embedded SHA-256" \
+		test "$(sha256sum "${STORE}/${PREV_ID}/boringtun-cli" 2>/dev/null | cut -d' ' -f1)" = "${PREV_BINARY_SHA256}"
+	check "  its MANIFEST names the earlier installer's source commit and binary SHA-256" \
+		bash -c 'grep -qx "source_commit=$2" "$1" && grep -qx "binary_sha256=$3" "$1"' _ \
+		"${STORE}/${PREV_ID}/MANIFEST" "${PREV_SOURCE_COMMIT}" "${PREV_BINARY_SHA256}"
+	curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 -o "${WORK}/${PREV_ASSET}" \
+		"https://github.com/wiresock/amneziawg-install/releases/download/${PREV_TAG}/${PREV_ASSET}"
+	check "  its public URL serves the earlier installer's embedded archive SHA-256" \
+		test "$(sha256sum "${WORK}/${PREV_ASSET}" 2>/dev/null | cut -d' ' -f1)" = "${PREV_ARCHIVE_SHA256}"
+	check "  and the installed release is that archive's content" \
+		bash -c 'for F in LICENSE MANIFEST THIRD-PARTY-LICENSES boringtun-cli; do tar -xzOf "$1" "$2/$F" | cmp -s - "$3/$F" || exit 1; done' _ \
+		"${WORK}/${PREV_ASSET}" "${PREV_ID}" "${STORE}/${PREV_ID}"
+	PREV_PID="$(main_pid)"
+	PREV_EXE="$(readlink "/proc/${PREV_PID}/exe" 2>/dev/null)"
+	check "${UNIT} is active" systemctl is-active --quiet "${UNIT}"
+	check "  its daemon executes the earlier release's binary" \
+		test -n "${PREV_EXE}" -a "${PREV_EXE}" = "$(readlink -f "${STORE}/${PREV_ID}/boringtun-cli")"
+	check "  with the earlier installer's embedded SHA-256" \
+		test "$(sha256sum "/proc/${PREV_PID}/exe" 2>/dev/null | cut -d' ' -f1)" = "${PREV_BINARY_SHA256}"
+	PREV_ARGS="$(tr '\0' ' ' <"/proc/${PREV_PID}/cmdline")"
+	check "upgrade: the earlier installer's params have no imitation keys" bash -c '! grep -q "^AWG_BORINGTUN_" /etc/amnezia/amneziawg/params'
+	check "upgrade: its runtime file is FORMAT=1 alone" test "$(grep -v '^#' "/etc/amnezia/amneziawg/${IF}.boringtun")" = "FORMAT=1"
+	check "upgrade: its daemon was started without --imitate-protocol" bash -c '[[ "$1" != *--imitate-protocol* ]]' _ "${PREV_ARGS}"
+fi
+
 bash "${INSTALLER}" --add-client client >"${WORK}/client-add.private" 2>&1 </dev/null
 check "--add-client creates the test client (its output, config and QR code stay private)" test "$?" -eq 0
+CLIENT_CONF="$(find /etc/amnezia/amneziawg/clients /root /home -maxdepth 2 -name "${IF}-client-client.conf" 2>/dev/null | head -n 1)"
+[[ -n "${CLIENT_CONF}" ]] || die "the installer did not write the test client's config"
+record_config_secrets "${CLIENT_CONF}"
+
+# ── Upgrade from the earlier installer's release ────────────────────────────
+# This installer's own --upgrade-boringtun moves the host to its release. The
+# upgrade is proven part by part (its exit status, the public download, the
+# store's current and previous releases, the restarted daemon's executable and
+# hash, and --backend-status); nothing below runs unless every part holds.
+# Negative controls show that each part rejects the state the earlier
+# installer left, which is what a skipped upgrade, or one that failed and kept
+# the earlier daemon, leaves behind.
+if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
+	echo "=== Upgrade from the earlier installer's release: --upgrade-boringtun"
+	RELEASE_DOWNLOAD="Downloading https://github.com/wiresock/amneziawg-install/releases/download/${RELEASE_TAG}/${ASSET}"
+	upgraded_links() {
+		test "$(store_links)" = "${RELEASE_ID} ${PREV_ID}"
+	}
+	daemon_runs_this_release() {
+		local PID
+		PID="$(main_pid)"
+		[[ -n "${PID}" && "${PID}" != 0 ]] &&
+			[[ "$(readlink "/proc/${PID}/exe" 2>/dev/null)" == "$(readlink -f "${STORE}/${RELEASE_ID}/boringtun-cli" 2>/dev/null)" ]] &&
+			[[ "$(sha256sum "/proc/${PID}/exe" 2>/dev/null | cut -d' ' -f1)" == "${BINARY_SHA256}" ]]
+	}
+	status_upgraded() {
+		test "$(release_status)" = \
+			"installed_release=${RELEASE_ID} pinned_release=${RELEASE_ID} previous_release=${PREV_ID} rollback_available=yes upgrade_available=no daemon_release=${RELEASE_ID} "
+	}
+	upgrade_proven() { # <exit status> <log>
+		[[ "$1" == 0 ]] && grep -qF "${RELEASE_DOWNLOAD}" "$2" && upgraded_links && daemon_runs_this_release && status_upgraded
+	}
+	check "this installer's --backend-status sees the earlier release installed and running, and offers its own" \
+		test "$(release_status)" = \
+		"installed_release=${PREV_ID} pinned_release=${RELEASE_ID} previous_release=none rollback_available=no upgrade_available=yes daemon_release=${PREV_ID} "
+	check "control: the earlier installer's state, as a skipped upgrade leaves it, does not pass as upgraded" \
+		fails upgrade_proven 0 "${WORK}/install.log"
+	check "control:   its store links are not the upgraded ones" fails upgraded_links
+	check "control:   its daemon, the earlier one still running, is not this release's" fails daemon_runs_this_release
+	check "control:   its --backend-status is not the upgraded one" fails status_upgraded
+	check "control:   the install log has no download of this release" fails grep -qF "${RELEASE_DOWNLOAD}" "${WORK}/install.log"
+	HASHES="$(installation_hashes)"
+	FAILED_BEFORE_UPGRADE="${FAILED}"
+	bash "${INSTALLER}" --upgrade-boringtun >"${WORK}/upgrade-from-previous.log" 2>&1 </dev/null
+	UPGRADE_RC=$?
+	tail -n 8 "${WORK}/upgrade-from-previous.log" | sed 's/^/    | /'
+	check "--upgrade-boringtun succeeds" test "${UPGRADE_RC}" -eq 0
+	check "  it downloaded this installer's release ${RELEASE_TAG} from its public URL" \
+		grep -qF "${RELEASE_DOWNLOAD}" "${WORK}/upgrade-from-previous.log"
+	check "  current is this installer's release and previous the earlier one" upgraded_links
+	check "  this release's binary has this installer's embedded SHA-256" \
+		test "$(sha256sum "${STORE}/${RELEASE_ID}/boringtun-cli" 2>/dev/null | cut -d' ' -f1)" = "${BINARY_SHA256}"
+	check "  the earlier release is kept, unchanged, as previous" \
+		test "$(sha256sum "${STORE}/${PREV_ID}/boringtun-cli" 2>/dev/null | cut -d' ' -f1)" = "${PREV_BINARY_SHA256}"
+	check "  the daemon was restarted" test "$(main_pid)" != "${PREV_PID}" -a "$(main_pid)" != 0
+	check "  the earlier daemon is gone" bash -c '[[ "$(readlink "/proc/$1/exe" 2>/dev/null)" != "$2" ]]' _ "${PREV_PID}" "${PREV_EXE}"
+	check "  the running daemon executes this release's binary, with this installer's embedded SHA-256" daemon_runs_this_release
+	check "  ${UNIT} runs this release by store name" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
+	check "  --backend-status: this release installed, pinned and running, the earlier one previous, rollback available" status_upgraded
+	check "  the helpers are now this installer's" helpers_are_this_installers
+	check "  params, the runtime file and every config are byte for byte the same" test "$(installation_hashes)" = "${HASHES}"
+	check "control: the proof of the upgrade accepts this state" upgrade_proven 0 "${WORK}/upgrade-from-previous.log"
+	check "control:   but not with a nonzero exit status, as after a failed upgrade" \
+		fails upgrade_proven 1 "${WORK}/upgrade-from-previous.log"
+	check "control:   nor with a log that has no download of this release" fails upgrade_proven 0 "${WORK}/install.log"
+	((FAILED == FAILED_BEFORE_UPGRADE)) ||
+		die "the upgrade from the earlier installer's release is not proven; nothing is checked against this installer's release"
+	RELEASE_LOG="${WORK}/upgrade-from-previous.log"
+fi
+
 check "it downloaded the public release ${RELEASE_TAG}" \
-	grep -qF "Downloading https://github.com/wiresock/amneziawg-install/releases/download/${RELEASE_TAG}/${ASSET}" "${WORK}/install.log"
+	grep -qF "Downloading https://github.com/wiresock/amneziawg-install/releases/download/${RELEASE_TAG}/${ASSET}" "${RELEASE_LOG}"
 check "the BoringTun preflight passed" grep -qF "BoringTun preflight passed" "${WORK}/install.log"
 check "no AmneziaWG kernel module is loaded" no_kernel_module
 check "no AmneziaWG kernel module is installed" bash -c '! modinfo -n amneziawg >/dev/null 2>&1'
@@ -309,9 +481,10 @@ check "the daemon executes the embedded release's binary" \
 	test "$(sha256sum "/proc/$(main_pid)/exe" 2>/dev/null | cut -d' ' -f1)" = "${BINARY_SHA256}"
 DAEMON_ARGS="$(tr '\0' ' ' <"/proc/$(main_pid)/cmdline")"
 if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
-	check "upgrade: the earlier installer's params have no imitation keys" bash -c '! grep -q "^AWG_BORINGTUN_" /etc/amnezia/amneziawg/params'
-	check "upgrade: its runtime file is FORMAT=1 alone" test "$(grep -v '^#' "/etc/amnezia/amneziawg/${IF}.boringtun")" = "FORMAT=1"
-	check "upgrade: its daemon was started without --imitate-protocol" bash -c '[[ "$1" != *--imitate-protocol* ]]' _ "${DAEMON_ARGS}"
+	check "upgrade: params still have no imitation keys" bash -c '! grep -q "^AWG_BORINGTUN_" /etc/amnezia/amneziawg/params'
+	check "upgrade: the runtime file is still FORMAT=1 alone" test "$(grep -v '^#' "/etc/amnezia/amneziawg/${IF}.boringtun")" = "FORMAT=1"
+	check "upgrade: the restarted daemon names the imitation that file means, none" \
+		bash -c '[[ "$1" == *" --imitate-protocol none ${2} " ]]' _ "${DAEMON_ARGS}" "${IF}"
 else
 	check "a fresh install imitates none" grep -qx "AWG_BORINGTUN_IMITATE_PROTOCOL='none'" /etc/amnezia/amneziawg/params
 	check "and names it on the daemon's command line" bash -c '[[ "$1" == *" --imitate-protocol none ${2} " ]]' _ "${DAEMON_ARGS}" "${IF}"
@@ -328,9 +501,6 @@ check "awg show all dump lists the interface" bash -c "awg show all dump | grep 
 # The client is a copy of the verified binary (outside the store, so the
 # uninstall's daemon check never mistakes it for the server) in the namespace.
 cp -- "${STORE}/${RELEASE_ID}/boringtun-cli" "${CLIENT_BIN}"
-CLIENT_CONF="$(find /etc/amnezia/amneziawg/clients /root /home -maxdepth 2 -name "${IF}-client-client.conf" 2>/dev/null | head -n 1)"
-[[ -n "${CLIENT_CONF}" ]] || die "the installer did not write the test client's config"
-record_config_secrets "${CLIENT_CONF}"
 # Positive controls for the output scan, on private files only: its key list
 # finds the keys in the client's config, and its QR pattern finds the rows of
 # that config's QR code.
@@ -695,15 +865,6 @@ check "the fixed-size SIP wire test passes" test "${SIP_WIRE_RC}" -eq 0
 # restarts; --rollback-boringtun returns to the fixture; a second upgrade
 # toggles back without a download, and a third is a no-op.
 echo "=== Binary lifecycle"
-# shellcheck source=helpers/boringtun-lifecycle-fixture.sh
-source "${SCRIPT_DIR}/helpers/boringtun-lifecycle-fixture.sh"
-installation_hashes() {
-	sha256sum /etc/amnezia/amneziawg/params "/etc/amnezia/amneziawg/${IF}.conf" "/etc/amnezia/amneziawg/${IF}.boringtun" \
-		/etc/amnezia/amneziawg/clients/*.conf "${CLIENT_CONF}" 2>/dev/null | cut -d' ' -f1 | tr '\n' ' '
-}
-store_links() {
-	printf '%s %s' "$(readlink "${STORE}/current" 2>/dev/null || echo none)" "$(readlink "${STORE}/previous" 2>/dev/null || echo none)"
-}
 lifecycle() { # <flag> <log>
 	bash "${INSTALLER}" "$1" >"${WORK}/$2" 2>&1 </dev/null
 }
@@ -768,19 +929,6 @@ datapath "after the lifecycle"
 # restart, which runs them, accepts it; the upgrade then returns to the pin.
 if [[ -n "${AWG_LIVE_BASE_INSTALLER:-}" ]]; then
 	echo "=== Binary lifecycle with the previous installer version's helpers"
-	LIBEXEC=/usr/local/libexec/amneziawg-install
-	# Each rendering is read in full before the comparison: cmp on a pipe stops
-	# at the first difference and leaves the renderer writing into a closed pipe.
-	# The trailing x keeps trailing newlines in both sides.
-	helpers_are_this_installers() {
-		local KIND FILE RENDERED
-		for KIND in launch ctl; do
-			FILE="${LIBEXEC}/awg-boringtun-launch"
-			[[ "${KIND}" == ctl ]] && FILE="${LIBEXEC}/awg-backend-ctl"
-			RENDERED="$(bash -c 'source "$1" && _awgBtRenderHelper "$2"' _ "${INSTALLER}" "${KIND}" && echo x)" || return 1
-			[[ "$(cat -- "${FILE}" && echo x)" == "${RENDERED}" ]] || return 1
-		done
-	}
 	bash -c 'source "$1" >/dev/null && _awgBtInstallHelpers' _ "${AWG_LIVE_BASE_INSTALLER}"
 	if helpers_are_this_installers; then
 		bad "the previous installer version's helpers are installed"

@@ -201,6 +201,40 @@ assert_contains "AWG_BT_RELEASE_TAG is assigned 2 times, not once" "$(btc_embedd
 	"a repeated assignment is inconsistent"
 rm -f -- "${T}/inconsistent-installer.sh"
 
+# Installer versions from before AWG_BT_RELEASE_BUILD existed, such as
+# 9f5a1afb87f7 that the live upgrade test installs with, embed every other
+# name and no build, for build 1. tests/test-boringtun-host-live.sh reads such
+# an installer as data with the check of that format, which keeps every other
+# check; the check of this installer's format still requires the build.
+buildless_installer() { # <file> [<sed script for one more change>]
+	sed -e '/^AWG_BT_RELEASE_BUILD=/d' -e 's/^\(AWG_BT_RELEASE_\(TAG\|BASE_URL\)=".*-b\)[0-9][0-9]*"$/\11"/' \
+		-e "${2:-}" "${INSTALLER}" >"$1"
+}
+buildless_installer "${T}/buildless-installer.sh"
+assert_eq "0 1" "$(grep -c '^AWG_BT_RELEASE_BUILD=' "${T}/buildless-installer.sh") $(grep -c '^AWG_BT_RELEASE_TAG=".*-b1"$' "${T}/buildless-installer.sh")" \
+	"(an installer without a build number, for build 1)"
+assert_eq "" "$(btc_buildless_embedded_release_problems "${T}/buildless-installer.sh")" \
+	"an installer without a build number is consistent in its own format"
+assert_contains "AWG_BT_RELEASE_BUILD is assigned 0 times, not once" "$(btc_embedded_release_problems "${T}/buildless-installer.sh")" \
+	"  the check of this installer's format refuses it: an installer today must embed its build"
+assert_contains "AWG_BT_RELEASE_BUILD is assigned 1 times, but an installer without a build number assigns it none" \
+	"$(btc_buildless_embedded_release_problems "${INSTALLER}")" "  the check of the format without a build refuses an installer that embeds one"
+buildless_installer "${T}/buildless-installer.sh" 's/^\(AWG_BT_RELEASE_TAG=".*-b\)1"$/\12"/'
+assert_contains "AWG_BT_RELEASE_TAG" "$(btc_buildless_embedded_release_problems "${T}/buildless-installer.sh")" \
+	"  without a build number, a tag of build 2 is inconsistent"
+buildless_installer "${T}/buildless-installer.sh" "s|^AWG_BT_RELEASE_ASSET_AARCH64=.*\$|AWG_BT_RELEASE_ASSET_AARCH64=\"boringtun-cli-${AWG_BT_RELEASE_VERSION}-gfedcba987654-linux-aarch64-musl.tar.gz\"|"
+assert_contains "AWG_BT_RELEASE_ASSET_AARCH64" "$(btc_buildless_embedded_release_problems "${T}/buildless-installer.sh")" \
+	"  without a build number, an asset of another commit is still inconsistent"
+buildless_installer "${T}/buildless-installer.sh" "s|^AWG_BT_RELEASE_BINARY_SHA256_X86_64=.*\$|AWG_BT_RELEASE_BINARY_SHA256_X86_64=\"${AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64}\"|"
+assert_contains "not four different values" "$(btc_buildless_embedded_release_problems "${T}/buildless-installer.sh")" \
+	"  without a build number, a repeated hash is still inconsistent"
+buildless_installer "${T}/buildless-installer.sh" '/^AWG_BT_RELEASE_SOURCE_COMMIT=/d'
+assert_contains "AWG_BT_RELEASE_SOURCE_COMMIT is assigned 0 times, not once" "$(btc_buildless_embedded_release_problems "${T}/buildless-installer.sh")" \
+	"  without a build number, every other name is still required"
+assert_contains "is not an embedded release format" "$(_btc_embedded_release_problems "${INSTALLER}" another-format)" \
+	"an unknown embedded release format is a problem, never a pass"
+rm -f -- "${T}/buildless-installer.sh"
+
 assert_eq "0" "$(grep -cE 'releases/latest|api\.github\.com|actions/artifacts' "${INSTALLER}")" \
 	"the installer never looks up a latest release, the GitHub API or Actions artifacts"
 assert_eq "1" "$(grep -c "^AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST=\"boringtun-host-v1\"$" "${INSTALLER}")" \

@@ -86,20 +86,20 @@ AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"
 # they name an earlier release. tests/test-boringtun-host.sh checks that they
 # are internally consistent, and tests/test-boringtun-public-release.sh that
 # the release is public with exactly these bytes.
-AWG_BT_RELEASE_TAG="boringtun-cli-0.7.1-g71d88784ad29-b1"
-AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/amneziawg-install/releases/download/boringtun-cli-0.7.1-g71d88784ad29-b1"
+AWG_BT_RELEASE_TAG="boringtun-cli-0.7.1-gae2ab44e9a68-b1"
+AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/amneziawg-install/releases/download/boringtun-cli-0.7.1-gae2ab44e9a68-b1"
 AWG_BT_RELEASE_VERSION="0.7.1"
 AWG_BT_RELEASE_SOURCE_REPOSITORY="https://github.com/Wiresock-Foundation/wiresock-boringtun"
-AWG_BT_RELEASE_SOURCE_COMMIT="71d88784ad29dc95871c105e26cc62f6acdd565b"
+AWG_BT_RELEASE_SOURCE_COMMIT="ae2ab44e9a68ca1a3232d2e8b13f9db30a9b9dcf"
 # The release's build number (the tag's -b<build>). It is part of the store
 # identity of builds from 2 on (_awgBtReleaseStoreId).
 AWG_BT_RELEASE_BUILD="1"
-AWG_BT_RELEASE_ASSET_X86_64="boringtun-cli-0.7.1-g71d88784ad29-linux-x86_64-musl.tar.gz"
-AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64="f519b535b177d703e4b1a64610943a69c040a858364fa995c311e29a5db17630"
-AWG_BT_RELEASE_BINARY_SHA256_X86_64="127b633d0b98568d8f686421ea8b3a4133de260e49de71cc470008759cf78721"
-AWG_BT_RELEASE_ASSET_AARCH64="boringtun-cli-0.7.1-g71d88784ad29-linux-aarch64-musl.tar.gz"
-AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64="7ad1e2b6c24d667b2e39ed6ad4620f1dfb94de3cf648a9733dcff3625559305d"
-AWG_BT_RELEASE_BINARY_SHA256_AARCH64="16b04cbebc3ba5fe45e8d5c940620522ed49d731642791e84368bfa393509c6b"
+AWG_BT_RELEASE_ASSET_X86_64="boringtun-cli-0.7.1-gae2ab44e9a68-linux-x86_64-musl.tar.gz"
+AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64="d509a73ef26b9b560e2b836709f0ab4332edde06f12d77a03a1ac31fe4d3a221"
+AWG_BT_RELEASE_BINARY_SHA256_X86_64="ad23145661408732b9e04b6edad6730134ef5fa06637f50892d1e46d523970e7"
+AWG_BT_RELEASE_ASSET_AARCH64="boringtun-cli-0.7.1-gae2ab44e9a68-linux-aarch64-musl.tar.gz"
+AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64="865e9aebcb6d3a28f4618f98e14fa667ecc7ceb47440f3a5e96be8e7ded9f50b"
+AWG_BT_RELEASE_BINARY_SHA256_AARCH64="32239dd79858f58a8cad1e3782c7867dc9d71c6ebe098410d184367eef95cf21"
 
 # Where the BoringTun runtime lives. The generated helpers embed these values
 # when they are written, so a helper never reads a path from its environment.
