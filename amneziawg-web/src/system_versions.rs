@@ -68,6 +68,28 @@ pub struct SystemVersions {
     pub summary: String,
 }
 
+/// Only installed component versions may be cached. Runtime status must be
+/// inspected again on every request, including after a failed probe.
+#[derive(Debug, Clone)]
+pub(crate) struct ComponentVersions {
+    pub amneziawg: VersionInfo,
+    pub web_panel: VersionInfo,
+    pub proxy: VersionInfo,
+}
+
+impl ComponentVersions {
+    pub(crate) fn with_runtime(self, runtime: RuntimeInfo) -> SystemVersions {
+        let summary = header_summary(&runtime, env!("CARGO_PKG_VERSION"), &self.proxy);
+        SystemVersions {
+            amneziawg: self.amneziawg,
+            web_panel: self.web_panel,
+            proxy: self.proxy,
+            runtime,
+            summary,
+        }
+    }
+}
+
 /// Protocol configuration and the backend actually serving it are independent
 /// of the version of any installed kernel module or command-line tools.
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
@@ -169,7 +191,11 @@ fn header_summary(runtime: &RuntimeInfo, web_version: &str, proxy: &VersionInfo)
             Some(version) => format!("BoringTun {version}"),
             None => format!(
                 "BoringTun ({})",
-                runtime.daemon_state.as_deref().unwrap_or("unknown")
+                match runtime.service_state.as_deref() {
+                    Some("active" | "inactive") =>
+                        runtime.daemon_state.as_deref().unwrap_or("unknown"),
+                    state => state.unwrap_or("unknown"),
+                }
             ),
         },
         Some("kernel") => match (
@@ -192,11 +218,9 @@ fn header_summary(runtime: &RuntimeInfo, web_version: &str, proxy: &VersionInfo)
     summary
 }
 
-pub async fn detect() -> SystemVersions {
-    let (amneziawg, proxy, runtime) =
-        tokio::join!(detect_amneziawg(), detect_proxy(), detect_runtime());
-    let summary = header_summary(&runtime, env!("CARGO_PKG_VERSION"), &proxy);
-    SystemVersions {
+pub(crate) async fn detect_components() -> ComponentVersions {
+    let (amneziawg, proxy) = tokio::join!(detect_amneziawg(), detect_proxy());
+    ComponentVersions {
         amneziawg,
         web_panel: VersionInfo::installed(
             "AmneziaWG Web Panel",
@@ -204,8 +228,6 @@ pub async fn detect() -> SystemVersions {
             "amneziawg-web",
         ),
         proxy,
-        runtime,
-        summary,
     }
 }
 
@@ -460,15 +482,27 @@ mod tests {
     }
 
     #[test]
-    fn stopped_or_unverified_backend_does_not_claim_an_installed_release_is_running() {
-        for state in ["stopped", "unverified"] {
+    fn boringtun_header_distinguishes_service_failure_from_stopped_daemon() {
+        for (service, daemon, expected) in [
+            ("inactive", "stopped", "stopped"),
+            ("failed", "stopped", "failed"),
+            ("activating", "stopped", "activating"),
+            ("deactivating", "stopped", "deactivating"),
+            ("active", "unverified", "unverified"),
+            ("", "stopped", "unknown"),
+        ] {
             let runtime = RuntimeInfo::parse(
-                &BORINGTUN_STATUS.replace("daemon_state=running", &format!("daemon_state={state}")),
+                &BORINGTUN_STATUS
+                    .replace("service_state=active", &format!("service_state={service}"))
+                    .replace("daemon_state=running", &format!("daemon_state={daemon}")),
             );
             assert_eq!(runtime.version, None);
             assert_eq!(runtime.release, None);
             let summary = header_summary(&runtime, "0.1.21", &VersionInfo::not_installed("Proxy"));
-            assert!(summary.contains(&format!("BoringTun ({state})")));
+            assert!(
+                summary.contains(&format!("BoringTun ({expected})")),
+                "{summary}"
+            );
             assert!(!summary.contains("0.7.1"));
             assert!(!summary.contains("Proxy:"));
         }

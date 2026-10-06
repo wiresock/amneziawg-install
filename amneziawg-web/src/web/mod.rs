@@ -38,7 +38,7 @@ use crate::domain::{
     normalize_comment, normalize_display_name, resolve_display_name, ConnectionStatus,
     IdentityStatus, PeerStatus, ONLINE_THRESHOLD_SECS,
 };
-use crate::system_versions::SystemVersions;
+use crate::system_versions::{ComponentVersions, RuntimeInfo, SystemVersions};
 
 // ── App state ────────────────────────────────────────────────────────────────
 
@@ -66,7 +66,7 @@ pub struct AppState {
     /// Set once after logging a non-`NotFound` canonicalization error so
     /// subsequent retries don't flood the logs.
     logged_canon_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Cached best-effort component/system version information for the UI.
+    /// Cached installed component versions; never contains live runtime state.
     system_versions_cache: std::sync::Arc<tokio::sync::RwLock<Option<CachedSystemVersions>>>,
     /// Best-effort system boot timestamp. Used to explain when interface
     /// counters likely started after a reboot.
@@ -77,7 +77,7 @@ pub struct AppState {
 
 #[derive(Clone)]
 struct CachedSystemVersions {
-    value: SystemVersions,
+    value: ComponentVersions,
     fetched_at: std::time::Instant,
 }
 
@@ -168,6 +168,19 @@ impl AppState {
     }
 
     async fn system_versions(&self) -> SystemVersions {
+        self.system_versions_with_runtime(crate::system_versions::detect_runtime())
+            .await
+    }
+
+    async fn system_versions_with_runtime(
+        &self,
+        runtime: impl std::future::Future<Output = RuntimeInfo>,
+    ) -> SystemVersions {
+        let (components, runtime) = tokio::join!(self.component_versions(), runtime);
+        components.with_runtime(runtime)
+    }
+
+    async fn component_versions(&self) -> ComponentVersions {
         {
             let cache = self.system_versions_cache.read().await;
             if let Some(cached) = cache.as_ref() {
@@ -184,7 +197,7 @@ impl AppState {
             }
         }
 
-        let value = crate::system_versions::detect().await;
+        let value = crate::system_versions::detect_components().await;
         *cache = Some(CachedSystemVersions {
             value: value.clone(),
             fetched_at: std::time::Instant::now(),
@@ -2808,12 +2821,21 @@ async fn post_imitation_form(
     headers: HeaderMap,
     Form(form): Form<ImitationChangeForm>,
 ) -> Result<Response, ApiError> {
+    post_imitation_change(&state, headers, form, crate::awg::set_imitation_via_sudo).await
+}
+
+async fn post_imitation_change(
+    state: &AppState,
+    headers: HeaderMap,
+    form: ImitationChangeForm,
+    apply: impl FnOnce(&crate::imitation::Settings) -> Result<(), crate::awg::AwgError> + Send + 'static,
+) -> Result<Response, ApiError> {
     if state.auth.enabled {
         let cookie = headers
             .get("cookie")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !validate_form_csrf(&state, cookie, form.csrf_token.as_deref().unwrap_or("")) {
+        if !validate_form_csrf(state, cookie, form.csrf_token.as_deref().unwrap_or("")) {
             return Ok(StatusCode::FORBIDDEN.into_response());
         }
     }
@@ -2832,13 +2854,12 @@ async fn post_imitation_form(
         Err(message) => return Ok((StatusCode::BAD_REQUEST, message).into_response()),
     };
     let detail = serde_json::to_string(&settings)?;
-    let result =
-        tokio::task::spawn_blocking(move || crate::awg::set_imitation_via_sudo(&settings)).await;
+    let result = tokio::task::spawn_blocking(move || apply(&settings)).await;
     *state.system_versions_cache.write().await = None;
     let notice = if matches!(result, Ok(Ok(()))) {
         log_event(
             &state.db.pool,
-            crate::db::events::EVT_IMITATION_CHANGED,
+            crate::db::events::EVT_IMITATION_APPLIED,
             None,
             None,
             Some(&detail),
@@ -8264,6 +8285,80 @@ mod tests {
     // ── User lifecycle UI tests ──────────────────────────────────────────
 
     #[tokio::test]
+    async fn imitation_apply_refreshes_cache_and_audits_only_success_including_reapplication() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            test_db().await,
+            AuthConfig::disabled(),
+            dir.path().into(),
+            dir.path().into(),
+            missing_proxy_sessions_file(),
+        );
+        let component = crate::system_versions::VersionInfo {
+            name: "cached".into(),
+            status: "unknown".into(),
+            version: None,
+            source: None,
+            error: None,
+        };
+        let mut successful = 0;
+        for succeeds in [false, true, true] {
+            *state.system_versions_cache.write().await = Some(CachedSystemVersions {
+                fetched_at: std::time::Instant::now(),
+                value: ComponentVersions {
+                    amneziawg: component.clone(),
+                    web_panel: component.clone(),
+                    proxy: component.clone(),
+                },
+            });
+            let response = post_imitation_change(
+                &state,
+                HeaderMap::new(),
+                ImitationChangeForm {
+                    csrf_token: None,
+                    confirm: Some("yes".into()),
+                    protocol: Some("quic".into()),
+                    domain: Some("example.com".into()),
+                },
+                move |settings| {
+                    assert_eq!(
+                        settings,
+                        &crate::imitation::Settings::parse("quic", "example.com").unwrap()
+                    );
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err(crate::awg::AwgError::Parse("private diagnostic".into()))
+                    }
+                },
+            )
+            .await
+            .unwrap_or_else(|_| panic!("unexpected API error"));
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                response.headers()["location"],
+                if succeeds {
+                    "/?imitation_notice=saved"
+                } else {
+                    "/?imitation_notice=failed"
+                }
+            );
+            assert!(state.system_versions_cache.read().await.is_none());
+            successful += usize::from(succeeds);
+            let events = list_events(&state.db.pool, None, None, 20).await.unwrap();
+            assert_eq!(events.len(), successful);
+            for event in events {
+                assert_eq!(event.action, "imitation_applied");
+                assert_eq!(event.actor, state.auth.username);
+                assert_eq!(
+                    event.detail.as_deref(),
+                    Some("{\"protocol\":\"quic\",\"domain\":\"example.com\"}")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn imitation_rejects_invalid_or_unconfirmed_changes_before_dispatch() {
         let app = test_router(test_db().await);
         for body in [
@@ -8421,6 +8516,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_component_versions_never_cache_runtime_or_failed_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            test_db().await,
+            AuthConfig::disabled(),
+            dir.path().into(),
+            dir.path().into(),
+            missing_proxy_sessions_file(),
+        );
+        let component = crate::system_versions::VersionInfo {
+            name: "cached component".into(),
+            status: "installed".into(),
+            version: Some("1.2.3".into()),
+            source: None,
+            error: None,
+        };
+        *state.system_versions_cache.write().await = Some(CachedSystemVersions {
+            fetched_at: std::time::Instant::now(),
+            value: ComponentVersions {
+                amneziawg: component.clone(),
+                web_panel: component.clone(),
+                proxy: component.clone(),
+            },
+        });
+        // Model CLI changes, a service failure, a failed probe, then recovery
+        // during the same five-minute component-cache window.
+        for (protocol, service, daemon, version, expected) in [
+            (
+                Some("2.0"),
+                Some("active"),
+                Some("running"),
+                Some("0.7.1"),
+                "BoringTun 0.7.1",
+            ),
+            (
+                Some("3.1"),
+                Some("failed"),
+                Some("stopped"),
+                None,
+                "BoringTun (failed)",
+            ),
+            (None, None, None, None, "Backend: unknown"),
+            (
+                Some("3.1"),
+                Some("active"),
+                Some("running"),
+                Some("0.7.2"),
+                "BoringTun 0.7.2",
+            ),
+        ] {
+            let runtime = RuntimeInfo {
+                protocol: protocol.map(str::to_owned),
+                backend: service.map(|_| "boringtun".into()),
+                service_state: service.map(str::to_owned),
+                daemon_state: daemon.map(str::to_owned),
+                version: version.map(str::to_owned),
+                ..Default::default()
+            };
+            let current = state
+                .system_versions_with_runtime(std::future::ready(runtime.clone()))
+                .await;
+            assert_eq!(current.runtime, runtime);
+            assert!(current.summary.contains(expected), "{}", current.summary);
+            assert_eq!(current.amneziawg, component);
+            assert!(state.system_versions_cache.read().await.is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn confirmed_protocol_attempt_expires_cached_status_even_on_failure() {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new(
@@ -8439,12 +8603,10 @@ mod tests {
         };
         *state.system_versions_cache.write().await = Some(CachedSystemVersions {
             fetched_at: std::time::Instant::now(),
-            value: SystemVersions {
+            value: ComponentVersions {
                 amneziawg: component.clone(),
                 web_panel: component.clone(),
                 proxy: component,
-                runtime: crate::system_versions::RuntimeInfo::default(),
-                summary: "cached protocol".into(),
             },
         });
         // Unsupported operations are rejected before spawning sudo, so this

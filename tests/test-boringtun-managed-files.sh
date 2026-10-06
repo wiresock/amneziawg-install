@@ -50,6 +50,16 @@ _awgBtInstallHelpers
 [[ "$_AWG_BT_HELPERS_CHANGED" == 1 ]]
 [[ "$(stat -c '%a' "$WORK/libexec/awg-backend-ctl")" == 755 ]]
 
+# Model a foreign owner without needing chown privileges. Check the writer
+# directly so a directory-trust check cannot hide a missing file-owner guard.
+BLOCK_WRITES=1
+AWG_BT_TRUSTED_UID="$(( $(id -u) + 1 ))"
+if _awgBtWriteManagedFile "$WORK/libexec/awg-backend-ctl" 0755 < "$WORK/libexec/awg-backend-ctl"; then
+    echo 'FAIL: foreign-owned helper accepted without replacement' >&2; exit 1
+fi
+AWG_BT_TRUSTED_UID="$(id -u)"
+BLOCK_WRITES=0
+
 # The managed-file writer must preserve exact input, including all trailing
 # newlines, no trailing newline, and an empty file.
 for content in $'one\n\n' 'two' ''; do

@@ -8,6 +8,9 @@ trap 'rm -rf -- "$WORK"' EXIT
 # Load function definitions without executing the CLI entry point.
 # shellcheck disable=SC1090
 source <(sed '/^main "\$@"$/d' "$ROOT/amneziawg-web/scripts/amneziawg-web-privileged")
+# Test the actual guard against the repository dispatcher, without executing
+# the installer. A dispatcher-format change must not silently disable the UI.
+installer_supports_backend_status "$ROOT/amneziawg-install.sh"
 require_root() { :; }
 resolve_awg_install_script() { printf '%s\n' "$WORK/installer"; }
 cat > "$WORK/installer" <<'EOF'

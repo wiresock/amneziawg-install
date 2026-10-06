@@ -349,18 +349,22 @@ pub fn set_protocol_mode_via_sudo(operation: &str) -> Result<(), AwgError> {
     Ok(())
 }
 
-pub fn set_imitation_via_sudo(settings: &crate::imitation::Settings) -> Result<(), AwgError> {
+fn imitation_command(settings: &crate::imitation::Settings) -> Result<Command, AwgError> {
     crate::imitation::Settings::parse(&settings.protocol, &settings.domain)
         .map_err(|error| AwgError::Parse(error.into()))?;
-    let output = Command::new(SUDO_BIN)
-        .args([
-            "-n",
-            PRIVILEGED_HELPER_BIN,
-            "set-boringtun-imitation",
-            &settings.protocol,
-            &settings.domain,
-        ])
-        .output()?;
+    let mut command = Command::new(SUDO_BIN);
+    command.args([
+        "-n",
+        PRIVILEGED_HELPER_BIN,
+        "set-boringtun-imitation",
+        &settings.protocol,
+        &settings.domain,
+    ]);
+    Ok(command)
+}
+
+pub fn set_imitation_via_sudo(settings: &crate::imitation::Settings) -> Result<(), AwgError> {
+    let output = imitation_command(settings)?.output()?;
     if !output.status.success() {
         return Err(AwgError::NonZeroExit {
             status: output.status.code().unwrap_or(-1),
@@ -699,6 +703,32 @@ fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imitation_uses_fixed_command_and_preserves_empty_hostname_argument() {
+        for (protocol, domain) in [("none", ""), ("dns", ""), ("quic", "example.com")] {
+            let settings = crate::imitation::Settings::parse(protocol, domain).unwrap();
+            let command = imitation_command(&settings).unwrap();
+            assert_eq!(command.get_program(), SUDO_BIN);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [
+                    "-n",
+                    PRIVILEGED_HELPER_BIN,
+                    "set-boringtun-imitation",
+                    protocol,
+                    domain
+                ]
+            );
+        }
+        for (protocol, domain) in [("auto", ""), ("stun", "example.com"), ("quic", "--help")] {
+            assert!(imitation_command(&crate::imitation::Settings {
+                protocol: protocol.into(),
+                domain: domain.into(),
+            })
+            .is_err());
+        }
+    }
 
     const SAMPLE_DUMP: &str = "\
 awg0\tPRIVATE_KEY_REDACTED\tSERVER_PUBLIC_KEY_BASE64=\t51820\toff\n\

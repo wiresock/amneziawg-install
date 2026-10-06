@@ -68,7 +68,9 @@
       if (new URLSearchParams(window.location.search).has('imitation_notice')) panel.open = true;
       awg = data.protocol;
       configured.textContent = 'Configured: ' + describe(data.imitation);
-      running.textContent = 'Running: ' + (data.daemon_imitation ? describe(data.daemon_imitation) : 'not verified (' + (data.daemon_state || data.service_state || 'unknown') + ')');
+      var state = (data.service_state === 'active' || data.service_state === 'inactive')
+        ? (data.daemon_state || 'unknown') : (data.service_state || 'unknown');
+      running.textContent = 'Running: ' + (data.daemon_imitation ? describe(data.daemon_imitation) : 'not verified (' + state + ')');
       if (data.backend !== 'boringtun' || !data.imitation) return;
       mode.value = data.imitation.protocol;
       domain.value = data.imitation.domain;

@@ -6,6 +6,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf -- "$WORK"' EXIT
 # shellcheck disable=SC1090
 source <(sed '/^main "\$@"$/d' "$ROOT/amneziawg-web/scripts/amneziawg-web-privileged")
+installer_supports_boringtun_imitation "$ROOT/amneziawg-install.sh"
 require_root() { :; }
 resolve_awg_install_script() { printf '%s\n' "$WORK/installer"; }
 export TEST_IMITATION_ARGS="$WORK/args"

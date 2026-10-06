@@ -688,6 +688,13 @@ resolve_awg_install_script_refresh() {
     # A standalone binary-only updater can still be used when the installed
     # lifecycle script already implements the protocol contract expected by
     # the refreshed helper. Fail before stopping the service otherwise.
+    # Early BoringTun scripts know these flags but always try writing helpers
+    # under /usr, which the panel's sandbox makes read-only. They must be
+    # refreshed from a full checkout before enabling web mutations.
+    if grep -qxF 'AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"' "${AWG_INSTALL_SCRIPT_DEST}" &&
+            ! grep -qxF 'AWG_INSTALLER_CAPABILITY_WEB_BORINGTUN="web-boringtun-v1"' "${AWG_INSTALL_SCRIPT_DEST}"; then
+        die "Upgrade from a full repository checkout: the installed BoringTun lifecycle script needs the web sandbox compatibility update."
+    fi
     if [[ -x "${AWG_INSTALL_SCRIPT_DEST}" ]] && \
             grep -q -- '--protocol-status' "${AWG_INSTALL_SCRIPT_DEST}" && \
             grep -q -- '--enable-awg3' "${AWG_INSTALL_SCRIPT_DEST}" && \

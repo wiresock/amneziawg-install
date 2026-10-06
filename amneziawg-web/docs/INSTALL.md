@@ -538,6 +538,13 @@ temporary directory automatically (source-mode upgrades will then build from tha
 checkout). Only the script itself needs to be present; the repository tree is
 fetched on demand when missing.
 
+When invoking the companion upgrader directly from a partial checkout with
+`--binary`, an older installed BoringTun lifecycle script must first be refreshed
+from a full checkout. The upgrader rejects this combination before changing
+artifacts or stopping the panel: earlier scripts cannot reuse generated helpers
+under the panel's read-only `/usr` sandbox. Current compatible lifecycle copies
+can still be retained during a binary-only upgrade.
+
 ### Default behavior
 
 The upgrade script stages and validates the application, any installer-managed
@@ -682,7 +689,7 @@ and the installer rejects incompatible settings.
 Authenticated endpoints: `GET /api/admin/imitation` reads fresh status;
 `POST /admin/imitation` accepts form fields `protocol`, optional `domain`,
 `confirm=yes` and the session's `csrf_token`. Successful changes are audited as
-`imitation_changed`. Installer output and key material are not returned.
+`imitation_applied`, including when the settings already match. Installer output and key material are not returned.
 
 ## Uninstaller reference
 

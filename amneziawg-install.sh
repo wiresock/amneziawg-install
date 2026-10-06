@@ -74,6 +74,11 @@ AWG_BORINGTUN_IMITATE_DOMAIN=""
 # because an older copy would treat a BoringTun host as a kernel host. Later
 # installer versions must keep the line unchanged.
 AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"
+# Web mutations may run with read-only /usr. This contract includes reuse of
+# identical trusted generated helpers before attempting any temporary write.
+# Read as data by the companion web upgrader.
+# shellcheck disable=SC2034
+AWG_INSTALLER_CAPABILITY_WEB_BORINGTUN="web-boringtun-v1"
 
 # The immutable public BoringTun release that fresh BoringTun installs download.
 # These values are the installer's only trust anchor for the binary: they are

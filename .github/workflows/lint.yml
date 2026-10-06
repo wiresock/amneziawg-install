@@ -78,6 +78,9 @@ jobs:
       - name: Web imitation regression
         run: bash tests/test-web-imitation.sh
 
+      - name: Web imitation status display regression
+        run: node --test tests/test-web-imitation-ui.cjs
+
       - name: Web protocol options regression
         run: bash tests/test-web-protocol-options.sh
 

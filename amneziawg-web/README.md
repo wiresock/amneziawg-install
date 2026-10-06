@@ -68,7 +68,7 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
   `login_success`, `login_failed`, `logout`,
   `user_create_requested`, `user_created`, `user_create_failed`,
   `user_remove_requested`, `user_removed`, `user_remove_failed`
-  and `imitation_changed`
+  and `imitation_applied` (including reapplying the current settings)
   written to the `events` table; queryable via `GET /api/events`.
 - **User lifecycle** – add and remove AmneziaWG clients directly from the panel,
   implemented natively in Rust (no install-script bridge for lifecycle operations).
