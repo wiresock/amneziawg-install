@@ -64,6 +64,7 @@ pub const EVT_USER_REMOVED: &str = "user_removed";
 pub const EVT_USER_REMOVE_FAILED: &str = "user_remove_failed";
 /// Audit event for a completed AWG 2.0/3.0 interface migration.
 pub const EVT_AWG_PROTOCOL_CHANGED: &str = "awg_protocol_changed";
+pub const EVT_IMITATION_CHANGED: &str = "imitation_changed";
 
 /// Maximum number of events that can be returned in a single [`list_events`] call.
 pub const MAX_EVENTS_LIMIT: i64 = 200;

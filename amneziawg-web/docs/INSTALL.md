@@ -172,6 +172,8 @@ we grant the service user passwordless sudo for one root-owned helper.  Its
 allow-listed operations provide:
 
 - `show-all` – read tunnel state with interface private keys and peer PSKs redacted
+- `backend-status` – read the configured protocol and verified runtime backend
+  through the trusted install script; returns only non-secret status fields
 - `remove-peer` – disable a validated peer on a validated interface
 - `reconcile-interface` – derive the trusted stripped config inside the helper,
   exclude a bounded list of validated disabled-peer keys, and sync it
@@ -654,6 +656,33 @@ sudo ./amneziawg-web.sh upgrade \
 8. **Restart** – restarts the service based on restart policy
 
 ---
+
+## Native BoringTun imitation
+
+On a BoringTun installation, expand **Protocol imitation · BoringTun** on the
+peer list. Choose **Off**, **DNS**, **QUIC**, **SIP** or **STUN**, optionally enter
+an ASCII hostname for DNS/QUIC/SIP, confirm the brief interruption, and apply.
+A blank hostname lets BoringTun choose automatically. This shapes the server's
+outgoing packet prefixes without installing a proxy, changing the listening
+port, changing AWG versions, or regenerating client configurations.
+
+The panel calls the root-owned helper's fixed `set-boringtun-imitation` command,
+which delegates to the trusted installer `--set-boringtun-imitation` transaction.
+Its compatibility checks, lifecycle lock, runtime verification and rollback
+remain in force. Running interfaces restart; stopped interfaces stay stopped.
+The status distinguishes persisted settings from a verified running daemon.
+The controls are hidden for the kernel backend and disabled when status is
+unavailable. Upgrade the panel and helper together from the same checkout.
+
+With AWG 3.x, SIP requires every S1–S4 value to be at most 30. DNS and STUN
+reduce header-masking nonce space; QUIC retains the full nonce. Payload
+encryption is unchanged. The panel shows these constraints with the selection,
+and the installer rejects incompatible settings.
+
+Authenticated endpoints: `GET /api/admin/imitation` reads fresh status;
+`POST /admin/imitation` accepts form fields `protocol`, optional `domain`,
+`confirm=yes` and the session's `csrf_token`. Successful changes are audited as
+`imitation_changed`. Installer output and key material are not returned.
 
 ## Uninstaller reference
 

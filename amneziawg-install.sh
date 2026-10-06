@@ -6171,28 +6171,33 @@ function _awgBtEnsureDirectory() {
 # Replace DEST with stdin atomically, as a root-owned file with MODE. An
 # identical file is left alone. _AWG_BT_FILE_CHANGED says whether DEST changed.
 function _awgBtWriteManagedFile() {
-	local DEST="$1" MODE="$2" TMP OWNER="" CURRENT_MODE=""
+	local DEST="$1" MODE="$2" TMP CONTENT OWNER="" CURRENT_MODE=""
 	_AWG_BT_FILE_CHANGED=0
 	if [[ -L "${DEST}" ]] || { [[ -e "${DEST}" ]] && [[ ! -f "${DEST}" ]]; }; then
 		_awgBtErr "refusing to replace ${DEST}: it is not a regular file"
 		cat >/dev/null
 		return 1
 	fi
+	# Check existing text before allocating in its directory. The web panel's
+	# sandbox makes /usr read-only, but may reuse helpers that already have the
+	# exact generated contents and trusted ownership/mode. A sentinel preserves
+	# every trailing newline when capturing stdin with command substitution.
+	CONTENT="$(cat && printf '.')" || return 1
+	CONTENT="${CONTENT%.}"
+	if [[ -f "${DEST}" ]]; then
+		read -r OWNER CURRENT_MODE <<<"$(_awgBtStatOwnerMode "${DEST}")"
+		if [[ "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${CURRENT_MODE}" == "${MODE#0}" ]] &&
+			cmp -s -- "${DEST}" <(printf '%s' "${CONTENT}"); then
+			return 0
+		fi
+	fi
 	if ! TMP="$(mktemp "${DEST%/*}/.${DEST##*/}.XXXXXX")"; then
-		cat >/dev/null
 		return 1
 	fi
-	if ! cat >"${TMP}" || ! chmod "${MODE}" -- "${TMP}" ||
+	if ! printf '%s' "${CONTENT}" >"${TMP}" || ! chmod "${MODE}" -- "${TMP}" ||
 		{ [[ "${EUID}" -eq 0 ]] && ! chown 0:0 -- "${TMP}"; }; then
 		rm -f -- "${TMP}"
 		return 1
-	fi
-	if [[ -f "${DEST}" ]] && cmp -s -- "${TMP}" "${DEST}"; then
-		read -r OWNER CURRENT_MODE <<<"$(_awgBtStatOwnerMode "${DEST}")"
-		if [[ "${OWNER}" == "${AWG_BT_TRUSTED_UID}" && "${CURRENT_MODE}" == "${MODE#0}" ]]; then
-			rm -f -- "${TMP}"
-			return 0
-		fi
 	fi
 	if ! mv -f -- "${TMP}" "${DEST}"; then
 		rm -f -- "${TMP}"

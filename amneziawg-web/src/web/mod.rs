@@ -636,6 +636,14 @@ pub struct ProtocolChangeForm {
     pub confirm: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ImitationChangeForm {
+    csrf_token: Option<String>,
+    confirm: Option<String>,
+    protocol: Option<String>,
+    domain: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProtocolStatusDto {
     pub version: String,
@@ -647,6 +655,7 @@ struct PeerListQuery {
     create_notice: Option<String>,
     peer_notice: Option<String>,
     protocol_notice: Option<String>,
+    imitation_notice: Option<String>,
     show_archived: Option<bool>,
 }
 
@@ -1199,11 +1208,12 @@ pub fn router_with_lifecycle_lock_dir(
         .route("/api/admin/users", post(api_create_user))
         .route("/api/admin/users/:id/remove", post(api_remove_user))
         .route("/api/admin/protocol", get(api_protocol_status))
+        .route("/api/admin/imitation", get(api_imitation_status))
+        .route("/admin/imitation", post(post_imitation_form))
         .route("/admin/users/add", post(post_add_user_form))
         .route("/admin/users/:id/remove", post(post_remove_user_form))
         .route("/admin/peers/:id/archive", post(post_archive_peer_form))
         .route("/admin/peers/:id/restore", post(post_restore_peer_form))
-        .route("/admin/protocol/enable-awg3", post(post_enable_awg3_form))
         .route("/admin/protocol/enable-awg31", post(post_enable_awg31_form))
         .route("/admin/protocol/disable-awg3", post(post_disable_awg3_form))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
@@ -1893,7 +1903,7 @@ async fn read_file_nofollow(path: &std::path::Path) -> std::io::Result<String> {
         Ok(content)
     })
     .await
-    .unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
 /// Fallback for non-Unix: regular async read (the `symlink_metadata`
@@ -2343,6 +2353,12 @@ async fn page_peer_list(
                 .protocol_notice
                 .as_deref()
                 .and_then(protocol_notice_message)
+        })
+        .or_else(|| {
+            query
+                .imitation_notice
+                .as_deref()
+                .and_then(imitation_notice_message)
         });
     Ok(Html(render_peer_list(
         &peers,
@@ -2698,7 +2714,6 @@ const CREATE_NOTICE_SYNC_REQUIRED: &str = "sync_required";
 const CREATE_NOTICE_METADATA_NOT_PERSISTED: &str = "metadata_not_persisted";
 const CREATE_NOTICE_SYNC_AND_METADATA: &str = "sync_and_metadata";
 const PEER_NOTICE_ARCHIVED: &str = "peer_archived";
-const PROTOCOL_NOTICE_AWG3_ENABLED: &str = "awg3_enabled";
 const PROTOCOL_NOTICE_AWG31_ENABLED: &str = "awg31_enabled";
 const PROTOCOL_NOTICE_AWG2_ENABLED: &str = "awg2_enabled";
 const PROTOCOL_NOTICE_FAILED: &str = "protocol_failed";
@@ -2749,9 +2764,6 @@ fn peer_archive_notice_message(code: &str) -> Option<&'static str> {
 
 fn protocol_notice_message(code: &str) -> Option<&'static str> {
     match code {
-        PROTOCOL_NOTICE_AWG3_ENABLED => Some(
-            "AWG 3.0 is active. Redistribute every regenerated client config before reconnecting clients.",
-        ),
         PROTOCOL_NOTICE_AWG31_ENABLED => Some(
             "AWG 3.1 is active. Redistribute every regenerated client config before reconnecting clients.",
         ),
@@ -2767,7 +2779,6 @@ fn protocol_notice_message(code: &str) -> Option<&'static str> {
 
 fn protocol_operation_notice(operation: &str) -> (&'static str, &'static str) {
     match operation {
-        "enable-awg3" => ("3.0", PROTOCOL_NOTICE_AWG3_ENABLED),
         "enable-awg31" => ("3.1", PROTOCOL_NOTICE_AWG31_ENABLED),
         _ => ("2.0", PROTOCOL_NOTICE_AWG2_ENABLED),
     }
@@ -2777,6 +2788,70 @@ fn protocol_operation_notice(operation: &str) -> (&'static str, &'static str) {
 async fn api_protocol_status() -> Result<Response, ApiError> {
     let version = tokio::task::spawn_blocking(crate::awg::protocol_status_via_sudo).await??;
     Ok(Json(ProtocolStatusDto { version }).into_response())
+}
+
+fn imitation_notice_message(code: &str) -> Option<&'static str> {
+    match code {
+        "saved" => Some("Imitation settings saved. Check the running state below. Client configurations are unchanged."),
+        "failed" => Some("The imitation change failed. Check the configured and running state below before retrying. The installer enforces backend and protocol compatibility and attempts rollback on failure."),
+        _ => None,
+    }
+}
+
+async fn api_imitation_status() -> Response {
+    // A fresh probe distinguishes persisted settings from the verified daemon.
+    Json(crate::system_versions::detect_runtime().await).into_response()
+}
+
+async fn post_imitation_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ImitationChangeForm>,
+) -> Result<Response, ApiError> {
+    if state.auth.enabled {
+        let cookie = headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !validate_form_csrf(&state, cookie, form.csrf_token.as_deref().unwrap_or("")) {
+            return Ok(StatusCode::FORBIDDEN.into_response());
+        }
+    }
+    if form.confirm.as_deref() != Some("yes") {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            "Confirm the brief VPN restart before applying imitation.",
+        )
+            .into_response());
+    }
+    let settings = match crate::imitation::Settings::parse(
+        form.protocol.as_deref().unwrap_or(""),
+        form.domain.as_deref().unwrap_or(""),
+    ) {
+        Ok(settings) => settings,
+        Err(message) => return Ok((StatusCode::BAD_REQUEST, message).into_response()),
+    };
+    let detail = serde_json::to_string(&settings)?;
+    let result =
+        tokio::task::spawn_blocking(move || crate::awg::set_imitation_via_sudo(&settings)).await;
+    *state.system_versions_cache.write().await = None;
+    let notice = if matches!(result, Ok(Ok(()))) {
+        log_event(
+            &state.db.pool,
+            crate::db::events::EVT_IMITATION_CHANGED,
+            None,
+            None,
+            Some(&detail),
+            &state.auth.username,
+        )
+        .await;
+        "saved"
+    } else {
+        // Do not relay installer output, which can contain configuration data.
+        tracing::error!("BoringTun imitation change failed");
+        "failed"
+    };
+    Ok(Redirect::to(&format!("/?imitation_notice={notice}")).into_response())
 }
 
 async fn post_protocol_change(
@@ -2809,6 +2884,9 @@ async fn post_protocol_change(
     let result =
         tokio::task::spawn_blocking(move || crate::awg::set_protocol_mode_via_sudo(operation))
             .await;
+    // A completed attempt may change the live protocol/backend state, even
+    // when recovery reports failure. Re-probe before rendering the header.
+    *state.system_versions_cache.write().await = None;
     let notice = match result {
         Ok(Ok(())) => {
             let (version, notice) = protocol_operation_notice(operation);
@@ -2834,14 +2912,6 @@ async fn post_protocol_change(
         }
     };
     Ok(Redirect::to(&format!("/?protocol_notice={notice}")).into_response())
-}
-
-async fn post_enable_awg3_form(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<ProtocolChangeForm>,
-) -> Result<Response, ApiError> {
-    post_protocol_change(&state, &headers, form, "enable-awg3").await
 }
 
 async fn post_enable_awg31_form(
@@ -3818,6 +3888,7 @@ fn html_head(title: &str) -> String {
   .back {{ margin-bottom: 1rem; display: block; }}
   .edit-form {{ margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; max-width: 480px; }}
   .edit-form h2 {{ margin-top: 0; font-size: 1.1rem; }}
+  #imitation-panel {{ margin-bottom: 2rem; }}
   .add-user-panel {{ max-width: 440px; padding: .75rem 1rem; }}
   .add-user-panel summary {{ cursor: pointer; font-weight: 700; font-size: 1.05rem; }}
   .add-user-panel[open] summary {{ margin-bottom: .75rem; }}
@@ -3857,7 +3928,7 @@ fn html_head(title: &str) -> String {
 fn nav_bar(csrf_token: &str) -> String {
     format!(
         r#"<nav class="nav">
-  <span class="nav-brand"><a href="/">AmneziaWG Panel</a><span id="system-versions" class="versions">AWG: checking &nbsp;·&nbsp; Web: {web_version} &nbsp;·&nbsp; Proxy: checking</span></span>
+  <span class="nav-brand"><a href="/">AmneziaWG Panel</a><span id="system-versions" class="versions">Protocol: checking &nbsp;·&nbsp; Backend: checking &nbsp;·&nbsp; Panel: {web_version}</span></span>
   <form class="nav-logout" method="POST" action="/logout">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <button type="submit">Log out</button>
@@ -3868,27 +3939,17 @@ fn nav_bar(csrf_token: &str) -> String {
   var el = document.getElementById('system-versions');
   if (!el || !window.fetch) return;
 
-  function text(label, item) {{
-    if (!item) return label + ': unknown';
-    if (item.version) return label + ': ' + item.version;
-    if (item.status === 'not_installed') return label + ': not installed';
-    return label + ': unknown';
-  }}
-
   fetch('/api/system/versions', {{ credentials: 'same-origin' }})
     .then(function(response) {{
       if (!response.ok) throw new Error('version request failed');
       return response.json();
     }})
     .then(function(data) {{
-      el.textContent = [
-        text('AWG', data.amneziawg),
-        text('Web', data.web_panel),
-        text('Proxy', data.proxy)
-      ].join(' · ');
+      if (typeof data.summary !== 'string') throw new Error('status summary missing');
+      el.textContent = data.summary;
     }})
     .catch(function() {{
-      el.textContent = 'AWG: unknown · Web: {web_version} · Proxy: unknown';
+      el.textContent = 'Protocol: unknown · Backend: unknown · Panel: {web_version}';
     }});
 }})();
 </script>
@@ -4017,21 +4078,17 @@ fn render_peer_list_with_error(
     )
 }
 
+fn render_imitation_controls(csrf_token: &str) -> String {
+    include_str!("imitation.html").replace("{{csrf}}", &esc(csrf_token))
+}
+
 fn render_protocol_controls(csrf_token: &str) -> String {
     format!(
         r#"<details class="edit-form protocol-panel">
 <summary>AWG protocol</summary>
 <p id="protocol-current" class="meta" role="status">Current mode: loading…</p>
-<section id="protocol-enable-awg3">
-  <p class="creation-warning"><strong>AWG 3.0 is not compatible with AWG 2.0 clients on the same interface.</strong> The server first probes kernel support, then atomically updates the server and every recoverable client config.</p>
-  <form method="POST" action="/admin/protocol/enable-awg3">
-    <input type="hidden" name="csrf_token" value="{csrf}">
-    <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
-    <button type="submit">Enable AWG 3.0</button>
-  </form>
-</section>
 <section id="protocol-enable-awg31">
-  <p class="creation-warning"><strong>AWG 3.1 adds RandomTrailers (must match on every client) on top of AWG 3.0.</strong> DisableCookies defaults to off (it disables Cookie Reply / anti-DoS). To change it, set <code>AWG_DISABLE_COOKIES</code> in the installer params file, then run <code>amneziawg-install.sh --enable-awg31</code> so the same-mode transaction updates the server and every client together. Regenerating clients or editing a generated file alone leaves the live server config stale. Existing AWG 3.0 installs are not upgraded automatically.</p>
+  <p class="creation-warning"><strong>AWG 3.1 requires compatible client software.</strong> The server checks backend support, then updates the interface and every recoverable client config together. Redistribute the regenerated configurations before clients reconnect.</p>
   <form method="POST" action="/admin/protocol/enable-awg31">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
@@ -4050,7 +4107,6 @@ fn render_protocol_controls(csrf_token: &str) -> String {
 <script>
 (function() {{
   var current = document.getElementById('protocol-current');
-  var enable3 = document.getElementById('protocol-enable-awg3');
   var enable31 = document.getElementById('protocol-enable-awg31');
   var disable = document.getElementById('protocol-disable-awg3');
   fetch('/api/admin/protocol', {{ credentials: 'same-origin' }})
@@ -4060,13 +4116,11 @@ fn render_protocol_controls(csrf_token: &str) -> String {
     }})
     .then(function(data) {{
       current.textContent = 'Current mode: AWG ' + data.version;
-      enable3.hidden = data.version === '3.0';
+      if (data.version === '3.0') {{
+        current.textContent += ' (legacy). Choose AWG 3.1 or AWG 2.0 below.';
+      }}
       enable31.hidden = data.version === '3.1';
       disable.hidden = data.version === '2.0';
-      var enable3Btn = enable3.querySelector('button[type="submit"]');
-      if (enable3Btn) {{
-        enable3Btn.textContent = data.version === '3.1' ? 'Switch to AWG 3.0' : 'Enable AWG 3.0';
-      }}
     }})
     .catch(function() {{
       current.textContent = 'Current mode unavailable. No change occurs until a confirmed action succeeds.';
@@ -4115,6 +4169,7 @@ fn render_peer_list_inner(
         ));
     }
     buf.push_str(&render_protocol_controls(csrf_token));
+    buf.push_str(&render_imitation_controls(csrf_token));
 
     if peers.is_empty() {
         buf.push_str("<p>No peers found. The poller may not have run yet.</p>\n");
@@ -6040,6 +6095,22 @@ mod tests {
         assert_eq!(json["web_panel"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(json.get("amneziawg").is_some());
         assert!(json.get("proxy").is_some());
+        assert!(
+            json.get("runtime").is_some(),
+            "report protocol/backend independently of module versions"
+        );
+        assert!(
+            json["summary"].as_str().is_some(),
+            "provide the backend-aware header text"
+        );
+    }
+
+    #[test]
+    fn nav_bar_does_not_guess_proxy_while_loading() {
+        let html = nav_bar("test-csrf");
+        assert!(html.contains("Protocol: checking"));
+        assert!(!html.contains("Proxy: checking"));
+        assert!(!html.contains("Proxy: unknown"));
     }
 
     // ── period_to_secs ────────────────────────────────────────────────────
@@ -8192,18 +8263,130 @@ mod tests {
 
     // ── User lifecycle UI tests ──────────────────────────────────────────
 
+    #[tokio::test]
+    async fn imitation_rejects_invalid_or_unconfirmed_changes_before_dispatch() {
+        let app = test_router(test_db().await);
+        for body in [
+            "protocol=quic&domain=example.com",
+            "confirm=yes&protocol=unknown",
+            "confirm=yes&protocol=none&domain=example.com",
+            "confirm=yes&protocol=stun&domain=example.com",
+            "confirm=yes&protocol=dns&domain=https%3A%2F%2Fexample.com",
+            "confirm=yes&protocol=quic&domain=bad..name",
+            "confirm=yes&protocol=sip&domain=-bad.test",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/imitation")
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn imitation_routes_require_authentication() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        for (method, path) in [
+            ("GET", "/api/admin/imitation"),
+            ("POST", "/admin/imitation"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .header("accept", "application/json")
+                        .body(Body::from("confirm=yes&protocol=none"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if path.starts_with("/api/") {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::SEE_OTHER
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn imitation_requires_csrf_for_authenticated_sessions() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        let login = do_login(app.clone(), "admin", "testpassword").await;
+        let session = session_cookie_value(&login);
+        for body in [
+            "confirm=yes&protocol=none",
+            "confirm=yes&protocol=none&csrf_token=bogus",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/imitation")
+                        .header("cookie", &session)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[test]
+    fn imitation_controls_escape_csrf_and_start_disabled() {
+        let html = render_imitation_controls("test\"<token>");
+        assert!(html.contains("test&quot;&lt;token&gt;"));
+        assert!(html.contains("id=\"imitation-fields\" disabled"));
+        assert!(html.contains("name=\"confirm\" value=\"yes\" required"));
+        assert!(html.contains("No proxy is required"));
+        assert_eq!(imitation_notice_message("<script>"), None);
+    }
+
     #[test]
     fn protocol_controls_require_confirmation_and_never_render_key_state() {
         let html = render_protocol_controls("protocol-csrf");
-        assert!(html.contains("/admin/protocol/enable-awg3"));
+        assert!(!html.contains("/admin/protocol/enable-awg3\""));
         assert!(html.contains("/admin/protocol/enable-awg31"));
         assert!(html.contains("/admin/protocol/disable-awg3"));
-        assert!(html.contains("Enable AWG 3.0"));
-        assert!(html.contains("Switch to AWG 3.0"));
+        assert!(!html.contains("Enable AWG 3.0"));
+        assert!(!html.contains("Switch to AWG 3.0"));
         assert!(html.contains("name=\"confirm\" value=\"yes\" required"));
         assert!(html.contains("name=\"csrf_token\" value=\"protocol-csrf\""));
         assert!(html.contains("/api/admin/protocol"));
         assert!(!html.contains("AWG_HEADER_PROTECTION_KEY"));
+    }
+
+    #[tokio::test]
+    async fn retired_awg30_protocol_route_is_not_available() {
+        let response = test_router(test_db().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/protocol/enable-awg3")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(protocol_notice_message("awg3_enabled"), None);
     }
 
     #[test]
@@ -8218,7 +8401,6 @@ mod tests {
     async fn protocol_change_form_rejects_missing_confirmation_before_dispatch() {
         let app = test_router(test_db().await);
         for path in [
-            "/admin/protocol/enable-awg3",
             "/admin/protocol/enable-awg31",
             "/admin/protocol/disable-awg3",
         ] {
@@ -8235,6 +8417,62 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_protocol_attempt_expires_cached_status_even_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            test_db().await,
+            AuthConfig::disabled(),
+            dir.path().into(),
+            dir.path().into(),
+            missing_proxy_sessions_file(),
+        );
+        let component = crate::system_versions::VersionInfo {
+            name: "cached".into(),
+            status: "unknown".into(),
+            version: None,
+            source: None,
+            error: None,
+        };
+        *state.system_versions_cache.write().await = Some(CachedSystemVersions {
+            fetched_at: std::time::Instant::now(),
+            value: SystemVersions {
+                amneziawg: component.clone(),
+                web_panel: component.clone(),
+                proxy: component,
+                runtime: crate::system_versions::RuntimeInfo::default(),
+                summary: "cached protocol".into(),
+            },
+        });
+        // Unsupported operations are rejected before spawning sudo, so this
+        // exercises a completed failed attempt without touching the host VPN.
+        for confirmed in [false, true] {
+            let response = post_protocol_change(
+                &state,
+                &HeaderMap::new(),
+                ProtocolChangeForm {
+                    csrf_token: None,
+                    confirm: confirmed.then(|| "yes".into()),
+                },
+                "unsupported-test-operation",
+            )
+            .await
+            .unwrap_or_else(|_| panic!("protocol handler returned an unexpected API error"));
+            assert_eq!(
+                response.status(),
+                if confirmed {
+                    StatusCode::SEE_OTHER
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            );
+            assert_eq!(
+                state.system_versions_cache.read().await.is_none(),
+                confirmed
+            );
         }
     }
 

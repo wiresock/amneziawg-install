@@ -8,6 +8,7 @@ mod awg;
 mod config_store;
 mod db;
 mod domain;
+mod imitation;
 mod poller;
 mod system_versions;
 mod web;

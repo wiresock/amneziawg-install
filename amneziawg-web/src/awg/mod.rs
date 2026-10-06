@@ -328,7 +328,7 @@ pub fn protocol_status_via_sudo() -> Result<String, AwgError> {
 /// mode through the root-owned helper and install script transaction.
 pub fn set_protocol_mode_via_sudo(operation: &str) -> Result<(), AwgError> {
     match operation {
-        "enable-awg3" | "enable-awg31" | "disable-awg3" => {}
+        "enable-awg31" | "disable-awg3" => {}
         _ => {
             return Err(AwgError::Parse(format!(
                 "unsupported protocol operation: {operation}"
@@ -344,6 +344,27 @@ pub fn set_protocol_mode_via_sudo(operation: &str) -> Result<(), AwgError> {
         return Err(AwgError::NonZeroExit {
             status: output.status.code().unwrap_or(-1),
             stderr,
+        });
+    }
+    Ok(())
+}
+
+pub fn set_imitation_via_sudo(settings: &crate::imitation::Settings) -> Result<(), AwgError> {
+    crate::imitation::Settings::parse(&settings.protocol, &settings.domain)
+        .map_err(|error| AwgError::Parse(error.into()))?;
+    let output = Command::new(SUDO_BIN)
+        .args([
+            "-n",
+            PRIVILEGED_HELPER_BIN,
+            "set-boringtun-imitation",
+            &settings.protocol,
+            &settings.domain,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(AwgError::NonZeroExit {
+            status: output.status.code().unwrap_or(-1),
+            stderr: "BoringTun imitation change failed".into(),
         });
     }
     Ok(())
@@ -937,12 +958,7 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
 
     #[test]
     fn protocol_commands_use_privileged_helper() {
-        for operation in [
-            "protocol-status",
-            "enable-awg3",
-            "enable-awg31",
-            "disable-awg3",
-        ] {
+        for operation in ["protocol-status", "enable-awg31", "disable-awg3"] {
             let mut cmd = Command::new(SUDO_BIN);
             cmd.args(["-n", PRIVILEGED_HELPER_BIN, operation]);
             let args: Vec<_> = cmd
@@ -954,6 +970,14 @@ awg0\tCLIENT2_PUB_KEY=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
     }
 
     // ── filter_disabled_peers tests ─────────────────────────────────
+
+    #[test]
+    fn retired_awg30_operation_is_rejected_before_sudo() {
+        assert!(matches!(
+            set_protocol_mode_via_sudo("enable-awg3"),
+            Err(AwgError::Parse(_))
+        ));
+    }
 
     #[test]
     fn filter_no_disabled_keys_returns_unchanged() {

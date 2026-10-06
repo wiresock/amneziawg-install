@@ -536,6 +536,55 @@ run_protocol_migration() {
     fi
 }
 
+# Reuse the installer's read-only, verified runtime inspection. Do not expose
+# raw output or partial results when inspection fails, and never accept a path
+# or flag from the caller.
+emit_backend_status() {
+    local install_script output line
+    install_script="$(resolve_awg_install_script)"
+    # Legacy installers treat unknown flags as interactive management. Never
+    # execute one to discover support. The host capability predates status,
+    # so also require its known dispatcher arm, read as data, never sourced.
+    if ! grep -qxF 'AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"' "${install_script}" ||
+        ! grep -qE '^[[:space:]]*(--set-boringtun-imitation\|)?--backend-status\)[[:space:]]*$' "${install_script}"; then
+        fail "install script does not support backend status"
+    fi
+    if ! output="$("${install_script}" --backend-status 2>/dev/null)"; then
+        fail "backend status inspection failed"
+    fi
+    while IFS= read -r line; do
+        case "${line%%=*}" in
+            backend|awg_protocol|service_state|module_state|daemon_state|daemon_release|imitation_protocol|imitation_domain|daemon_imitation_protocol|daemon_imitation_domain)
+                printf '%s\n' "${line}"
+                ;;
+        esac
+    done <<< "${output}"
+}
+
+run_boringtun_imitation() {
+    local protocol="$1" domain="$2" install_script
+    case "$protocol" in
+        none|dns|quic|sip|stun) ;;
+        *) fail "unsupported imitation protocol" ;;
+    esac
+    if [[ -n "$domain" ]]; then
+        case "$protocol" in dns|quic|sip) ;; *) fail "imitation mode does not use a hostname" ;; esac
+        local label='[A-Za-z0-9]([-A-Za-z0-9]{0,61}[A-Za-z0-9])?'
+        [[ ${#domain} -le 253 && "$domain" =~ ^${label}(\.${label})*$ ]] || fail "invalid imitation hostname"
+    fi
+    install_script="$(resolve_awg_install_script)"
+    # Older scripts can enter interactive management on unknown flags.
+    if ! grep -qxF 'AWG_INSTALLER_CAPABILITY_BORINGTUN_HOST="boringtun-host-v1"' "$install_script" ||
+        ! grep -qE '^[[:space:]]*--set-boringtun-imitation(\|--backend-status)?\)[[:space:]]*$' "$install_script"; then
+        fail "install script does not support BoringTun imitation"
+    fi
+    # The installer enforces backend/compatibility checks and owns the lock,
+    # atomic update, restart verification and rollback. Never relay its output.
+    if ! "$install_script" --set-boringtun-imitation "$protocol" "$domain" >/dev/null 2>&1; then
+        fail "BoringTun imitation change failed"
+    fi
+}
+
 emit_safe_server_state() {
     local interface="$1"
     local path="${AWG_CONFIG_ROOT}/${interface}.conf"
@@ -854,9 +903,14 @@ main() {
             emit_protocol_status
             return 0
             ;;
-        enable-awg3)
+        backend-status)
             require_arg_count "${subcommand}" 0 "$#"
-            run_protocol_migration --enable-awg3
+            emit_backend_status
+            return 0
+            ;;
+        set-boringtun-imitation)
+            require_arg_count "${subcommand}" 2 "$#"
+            run_boringtun_imitation "$1" "$2"
             return 0
             ;;
         enable-awg31)
