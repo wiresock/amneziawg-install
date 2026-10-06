@@ -213,17 +213,76 @@ scratch_clean() {
 fails() {
 	! "$@"
 }
-installation_hashes() {
-	sha256sum /etc/amnezia/amneziawg/params "/etc/amnezia/amneziawg/${IF}.conf" "/etc/amnezia/amneziawg/${IF}.boringtun" \
-		/etc/amnezia/amneziawg/clients/*.conf "${CLIENT_CONF}" 2>/dev/null | cut -d' ' -f1 | tr '\n' ' '
+# file_hashes <file>...: one "<SHA-256>  <file>" line per file, in order, or
+# a failure that prints nothing. Every file must be read: the hashing must
+# succeed, and its output must name exactly these files, one hash each, so
+# that a failed, partial or incomplete read is never a snapshot. Only hashes
+# and names are printed, never contents. HASH_COMMAND is the hashing command;
+# only the controls below replace it.
+HASH_COMMAND=(sha256sum)
+file_hashes() {
+	local OUTPUT LINE I=0
+	local -a FILES=("$@")
+	((${#FILES[@]} > 0)) || return 1
+	OUTPUT="$("${HASH_COMMAND[@]}" -- "${FILES[@]}")" || return 1
+	while IFS= read -r LINE; do
+		((I < ${#FILES[@]})) && [[ "${LINE}" =~ ^[0-9a-f]{64}\ \ (.+)$ && "${BASH_REMATCH[1]}" == "${FILES[I]}" ]] || return 1
+		I=$((I + 1))
+	done <<<"${OUTPUT}"
+	((I == ${#FILES[@]})) || return 1
+	printf '%s\n' "${OUTPUT}"
 }
+# snapshot_unchanged <baseline status> <baseline> <snapshot command...>: the
+# baseline was read completely, a new snapshot is read completely, and the two
+# are the same. Two failed or empty reads never match.
+snapshot_unchanged() {
+	local NOW
+	[[ "$1" == 0 && -n "$2" ]] || return 1
+	NOW="$("${@:3}")" || return 1
+	[[ -n "${NOW}" && "${NOW}" == "$2" ]]
+}
+# The configuration whose bytes must survive the binary's moves: params, the
+# interface's config and runtime file, every client config the installer keeps
+# and the test client's config.
+installation_hashes() {
+	local -a CLIENTS
+	shopt -s nullglob
+	CLIENTS=(/etc/amnezia/amneziawg/clients/*.conf)
+	shopt -u nullglob
+	file_hashes /etc/amnezia/amneziawg/params "/etc/amnezia/amneziawg/${IF}.conf" "/etc/amnezia/amneziawg/${IF}.boringtun" \
+		"${CLIENTS[@]}" "${CLIENT_CONF}"
+}
+# installation_baseline: the snapshot installation_unchanged compares with, in
+# HASHES, and in HASHES_RC whether it was read completely.
+installation_baseline() {
+	HASHES="$(installation_hashes)"
+	HASHES_RC=$?
+}
+installation_unchanged() {
+	snapshot_unchanged "${HASHES_RC}" "${HASHES}" installation_hashes
+}
+HASHES=""
+HASHES_RC=1
 store_links() {
 	printf '%s %s' "$(readlink "${STORE}/current" 2>/dev/null || echo none)" "$(readlink "${STORE}/previous" 2>/dev/null || echo none)"
 }
-# The release lines of --backend-status, in its order.
+# The release lines of --backend-status, in its order. The command's own exit
+# status is checked first: when it fails, whatever it printed, or prints none
+# of these lines, this fails and prints nothing, so a failed status is never
+# evidence of a state.
 release_status() {
-	bash "${INSTALLER}" --backend-status 2>&1 |
-		grep -E '^(installed_release|pinned_release|previous_release|rollback_available|upgrade_available|daemon_release)=' | tr '\n' ' '
+	local OUTPUT LINES
+	OUTPUT="$(bash "${INSTALLER}" --backend-status 2>&1)" || return 1
+	LINES="$(grep -E '^(installed_release|pinned_release|previous_release|rollback_available|upgrade_available|daemon_release)=' <<<"${OUTPUT}")" ||
+		return 1
+	tr '\n' ' ' <<<"${LINES}"
+}
+# release_status_is <lines>: --backend-status succeeds, and its release lines
+# are exactly these.
+release_status_is() {
+	local STATUS
+	STATUS="$(release_status)" || return 1
+	[[ "${STATUS}" == "$1" ]]
 }
 LIBEXEC=/usr/local/libexec/amneziawg-install
 # Whether both installed helpers are exactly the ones this installer renders.
@@ -272,6 +331,98 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "${WORK}"
 chmod 0700 "${WORK}"
+
+# ── Controls of the status and configuration checks ─────────────────────────
+# release_status_is and installation_unchanged are evidence only if a failed
+# command or an incomplete read can never pass them. These controls run the
+# same helpers against TEST STUBS and files of their own, never against the
+# installation: a --backend-status that prints the expected lines and then
+# fails, and hash reads that fail, fail after printing every hash, or succeed
+# with a hash missing.
+echo "=== Controls of the status and configuration checks (TEST STUBS)"
+CONTROLS="${WORK}/controls"
+mkdir -p "${CONTROLS}/files"
+STATUS_STUB="${CONTROLS}/backend-status-stub.sh"
+cat >"${STATUS_STUB}" <<'EOF'
+#!/bin/bash
+# TEST STUB of `amneziawg-install.sh --backend-status`: prints the fields in
+# STUB_FIELDS as status lines, then exits with STUB_RC.
+[[ "${1:-}" == --backend-status ]] || exit 64
+printf '%s\n' backend=boringtun ${STUB_FIELDS}
+[[ "${STUB_RC}" == 0 ]] || echo "TEST STUB: --backend-status failed after printing its fields" >&2
+exit "${STUB_RC}"
+EOF
+cat >"${CONTROLS}/hash-then-fail.sh" <<'EOF'
+#!/bin/bash
+# TEST STUB of sha256sum: hashes every file, then fails.
+sha256sum "$@"
+exit 7
+EOF
+cat >"${CONTROLS}/hash-omit-last.sh" <<'EOF'
+#!/bin/bash
+# TEST STUB of sha256sum: succeeds, but leaves out the last file.
+sha256sum "${@:1:$#-1}"
+EOF
+chmod 0755 "${STATUS_STUB}" "${CONTROLS}/hash-then-fail.sh" "${CONTROLS}/hash-omit-last.sh"
+# with_status_stub <exit status> <fields> <command...>: the command, with the
+# TEST STUB in place of this installer's --backend-status.
+with_status_stub() {
+	local INSTALLER="${STATUS_STUB}"
+	local -x STUB_RC="$1" STUB_FIELDS="$2"
+	"${@:3}"
+}
+# with_hash_command <command> <command...>: the second command, with the
+# first in place of sha256sum.
+with_hash_command() {
+	local -a HASH_COMMAND=("$1")
+	"${@:2}"
+}
+FIELDS="installed_release=new pinned_release=new previous_release=old rollback_available=yes upgrade_available=no daemon_release=new"
+check "control: release lines from a --backend-status that succeeds are accepted" \
+	with_status_stub 0 "${FIELDS}" release_status_is "${FIELDS} "
+for RC in 1 7 143; do
+	check "control: the same release lines from a --backend-status that exits ${RC} are rejected" \
+		fails with_status_stub "${RC}" "${FIELDS}" release_status_is "${FIELDS} "
+done
+check "control: a --backend-status that succeeds without release lines is rejected" fails with_status_stub 0 "" release_status_is ""
+
+HASH_FILES=("${CONTROLS}/files/params" "${CONTROLS}/files/config" "${CONTROLS}/files/client")
+control_hashes() {
+	file_hashes "${HASH_FILES[@]}"
+}
+printf 'params\n' >"${CONTROLS}/files/params"
+printf 'config\n' >"${CONTROLS}/files/config"
+printf 'client\n' >"${CONTROLS}/files/client"
+BASELINE="$(control_hashes)"
+BASELINE_RC=$?
+check "control: a complete read names each file once, with its hash" \
+	test "${BASELINE_RC}" -eq 0 -a "$(cut -d' ' -f3- <<<"${BASELINE}" | tr '\n' ' ')" = "${HASH_FILES[*]} "
+check "control: two complete reads of the same files match" snapshot_unchanged "${BASELINE_RC}" "${BASELINE}" control_hashes
+printf 'changed\n' >"${CONTROLS}/files/config"
+check "control: a changed file does not match" fails snapshot_unchanged "${BASELINE_RC}" "${BASELINE}" control_hashes
+printf 'config\n' >"${CONTROLS}/files/config"
+mv -- "${CONTROLS}/files/client" "${CONTROLS}/files/client.away"
+check "  (with a file unreadable, the raw hashing prints the same partial output each time, and fails)" \
+	bash -c 'A="$(sha256sum -- "$@" 2>/dev/null)"; RA=$?; B="$(sha256sum -- "$@" 2>/dev/null)"; RB=$?; [[ -n "${A}" && "${A}" == "${B}" && ${RA} -ne 0 && ${RB} -ne 0 ]]' _ "${HASH_FILES[@]}"
+FAILED_READ="$(control_hashes)"
+FAILED_READ_RC=$?
+check "control: a failed read is no snapshot: it fails and prints nothing" test "${FAILED_READ_RC}" -ne 0 -a -z "${FAILED_READ}"
+check "control: two failed reads with the same partial output do not match" \
+	fails snapshot_unchanged "${FAILED_READ_RC}" "${FAILED_READ}" control_hashes
+check "control: a complete baseline does not match a failed read after it" \
+	fails snapshot_unchanged "${BASELINE_RC}" "${BASELINE}" control_hashes
+mv -- "${CONTROLS}/files/client.away" "${CONTROLS}/files/client"
+check "control: a failed baseline read does not match a complete read after it" \
+	fails snapshot_unchanged "${FAILED_READ_RC}" "${FAILED_READ}" control_hashes
+check "control: hashing that prints every hash and then fails is no snapshot" \
+	fails with_hash_command "${CONTROLS}/hash-then-fail.sh" control_hashes
+check "  and does not match a complete baseline" \
+	fails with_hash_command "${CONTROLS}/hash-then-fail.sh" snapshot_unchanged "${BASELINE_RC}" "${BASELINE}" control_hashes
+check "control: hashing that succeeds but leaves a file out is no snapshot" \
+	fails with_hash_command "${CONTROLS}/hash-omit-last.sh" control_hashes
+check "  and does not match a complete baseline" \
+	fails with_hash_command "${CONTROLS}/hash-omit-last.sh" snapshot_unchanged "${BASELINE_RC}" "${BASELINE}" control_hashes
+check "control: the complete files still match after these controls" snapshot_unchanged "${BASELINE_RC}" "${BASELINE}" control_hashes
 
 echo "=== Host"
 uname -srm
@@ -390,15 +541,15 @@ if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 			[[ "$(readlink "/proc/${PID}/exe" 2>/dev/null)" == "$(readlink -f "${STORE}/${RELEASE_ID}/boringtun-cli" 2>/dev/null)" ]] &&
 			[[ "$(sha256sum "/proc/${PID}/exe" 2>/dev/null | cut -d' ' -f1)" == "${BINARY_SHA256}" ]]
 	}
+	UPGRADED_FIELDS="installed_release=${RELEASE_ID} pinned_release=${RELEASE_ID} previous_release=${PREV_ID} rollback_available=yes upgrade_available=no daemon_release=${RELEASE_ID}"
 	status_upgraded() {
-		test "$(release_status)" = \
-			"installed_release=${RELEASE_ID} pinned_release=${RELEASE_ID} previous_release=${PREV_ID} rollback_available=yes upgrade_available=no daemon_release=${RELEASE_ID} "
+		release_status_is "${UPGRADED_FIELDS} "
 	}
 	upgrade_proven() { # <exit status> <log>
 		[[ "$1" == 0 ]] && grep -qF "${RELEASE_DOWNLOAD}" "$2" && upgraded_links && daemon_runs_this_release && status_upgraded
 	}
 	check "this installer's --backend-status sees the earlier release installed and running, and offers its own" \
-		test "$(release_status)" = \
+		release_status_is \
 		"installed_release=${PREV_ID} pinned_release=${RELEASE_ID} previous_release=none rollback_available=no upgrade_available=yes daemon_release=${PREV_ID} "
 	check "control: the earlier installer's state, as a skipped upgrade leaves it, does not pass as upgraded" \
 		fails upgrade_proven 0 "${WORK}/install.log"
@@ -406,7 +557,7 @@ if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 	check "control:   its daemon, the earlier one still running, is not this release's" fails daemon_runs_this_release
 	check "control:   its --backend-status is not the upgraded one" fails status_upgraded
 	check "control:   the install log has no download of this release" fails grep -qF "${RELEASE_DOWNLOAD}" "${WORK}/install.log"
-	HASHES="$(installation_hashes)"
+	installation_baseline
 	FAILED_BEFORE_UPGRADE="${FAILED}"
 	bash "${INSTALLER}" --upgrade-boringtun >"${WORK}/upgrade-from-previous.log" 2>&1 </dev/null
 	UPGRADE_RC=$?
@@ -425,11 +576,16 @@ if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 	check "  ${UNIT} runs this release by store name" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
 	check "  --backend-status: this release installed, pinned and running, the earlier one previous, rollback available" status_upgraded
 	check "  the helpers are now this installer's" helpers_are_this_installers
-	check "  params, the runtime file and every config are byte for byte the same" test "$(installation_hashes)" = "${HASHES}"
+	check "  params, the runtime file and every config are byte for byte the same, each read completely before and after" \
+		installation_unchanged
 	check "control: the proof of the upgrade accepts this state" upgrade_proven 0 "${WORK}/upgrade-from-previous.log"
 	check "control:   but not with a nonzero exit status, as after a failed upgrade" \
 		fails upgrade_proven 1 "${WORK}/upgrade-from-previous.log"
 	check "control:   nor with a log that has no download of this release" fails upgrade_proven 0 "${WORK}/install.log"
+	check "control:   it accepts a TEST STUB --backend-status that prints the upgraded fields and succeeds" \
+		with_status_stub 0 "${UPGRADED_FIELDS}" upgrade_proven 0 "${WORK}/upgrade-from-previous.log"
+	check "control:   but not one that prints every upgraded field and then exits nonzero" \
+		fails with_status_stub 1 "${UPGRADED_FIELDS}" upgrade_proven 0 "${WORK}/upgrade-from-previous.log"
 	((FAILED == FAILED_BEFORE_UPGRADE)) ||
 		die "the upgrade from the earlier installer's release is not proven; nothing is checked against this installer's release"
 	RELEASE_LOG="${WORK}/upgrade-from-previous.log"
@@ -878,7 +1034,7 @@ rm -rf -- "${STORE:?}/${RELEASE_ID}"
 systemctl restart "${UNIT}"
 check "the service runs the fixture release" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${FIXTURE_ID}"
 datapath "on the fixture release"
-HASHES="$(installation_hashes)"
+installation_baseline
 bash "${INSTALLER}" --backend-status >"${WORK}/status" 2>&1
 check "status: installed is the fixture, the pin is offered as an upgrade, no previous" \
 	test "$(grep -E '^(installed_release|pinned_release|previous_release|rollback_available|upgrade_available|daemon_release)=' "${WORK}/status" | tr '\n' ' ')" = \
@@ -895,7 +1051,7 @@ check "  the pinned binary has the embedded SHA-256" test "$(sha256sum "${STORE}
 check "  the daemon was restarted onto it" test "$(main_pid)" != "${PID}" -a "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
 check_served "after the upgrade"
 check "  the imitation is kept" bash -c '[[ "$(tr "\0" " " <"/proc/$1/cmdline")" == *"--imitate-protocol dns --imitate-domain example.com "* ]]' _ "$(main_pid)"
-check "  params, the runtime file and every config are byte for byte the same" test "$(installation_hashes)" = "${HASHES}"
+check "  params, the runtime file and every config are byte for byte the same" installation_unchanged
 check "  no scratch interface, unit or record is left" scratch_clean
 datapath "after the upgrade"
 bash "${INSTALLER}" --backend-status >"${WORK}/status" 2>&1
@@ -908,7 +1064,7 @@ tail -n 4 "${WORK}/rollback.log" | sed 's/^/    | /'
 check "--rollback-boringtun succeeds" test "${RC}" -eq 0
 check "  current is the fixture again and previous the pinned release" test "$(store_links)" = "${FIXTURE_ID} ${RELEASE_ID}"
 check "  the daemon runs the fixture's binary" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${FIXTURE_ID}"
-check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
+check "  the configuration is unchanged" installation_unchanged
 datapath "after the rollback"
 lifecycle --upgrade-boringtun upgrade2.log
 check "a second --upgrade-boringtun toggles back" test "$?" -eq 0 -a "$(store_links)" = "${RELEASE_ID} ${FIXTURE_ID}"
@@ -918,7 +1074,7 @@ PID="$(main_pid)"
 lifecycle --upgrade-boringtun upgrade3.log
 check "a third --upgrade-boringtun is a no-op" grep -q "already current; nothing was changed" "${WORK}/upgrade3.log"
 check "  that restarted nothing" test "$(main_pid)" = "${PID}"
-check "  and left the configuration as it was" test "$(installation_hashes)" = "${HASHES}"
+check "  and left the configuration as it was" installation_unchanged
 datapath "after the lifecycle"
 
 # ── Binary lifecycle with the previous installer version's helpers ──────────
@@ -938,7 +1094,7 @@ if [[ -n "${AWG_LIVE_BASE_INSTALLER:-}" ]]; then
 	B2_ID="$(bt_fixture_build2 "${STORE}" "${RELEASE_ID}")"
 	check "a TEST FIXTURE build 2 of the pinned commit is built (${B2_ID})" test -n "${B2_ID}" -a -d "${STORE}/${B2_ID}"
 	bt_fixture_make_previous "${STORE}" "${B2_ID}"
-	HASHES="$(installation_hashes)"
+	installation_baseline
 	lifecycle --rollback-boringtun rollback-b2.log
 	RC=$?
 	tail -n 4 "${WORK}/rollback-b2.log" | sed 's/^/    | /'
@@ -949,12 +1105,12 @@ if [[ -n "${AWG_LIVE_BASE_INSTALLER:-}" ]]; then
 	check "  the active instance is the one its start recorded" \
 		bash -c 'source "$1" && _awgBtCheckServedByBoringtun "$2"' _ "${INSTALLER}" "${IF}"
 	check "  ${IF} is a TUN device with its UAPI answering" test -e "/sys/class/net/${IF}/tun_flags" -a "$(awg show "${IF}" listen-port 2>/dev/null)" = "${PORT}"
-	check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
+	check "  the configuration is unchanged" installation_unchanged
 	datapath "on the -b2 release"
 	lifecycle --upgrade-boringtun upgrade-b2.log
 	check "--upgrade-boringtun returns to the pin" test "$?" -eq 0 -a "$(store_links)" = "${RELEASE_ID} ${B2_ID}"
 	check "  the service runs the pinned binary" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"
-	check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
+	check "  the configuration is unchanged" installation_unchanged
 	datapath "back on the pinned release"
 
 	# The pin already current while the service is stopped and the previous
@@ -979,7 +1135,7 @@ if [[ -n "${AWG_LIVE_BASE_INSTALLER:-}" ]]; then
 	check "  (which refuse current -b2: the next start would fail)" \
 		bash -c '! bash -c '\''source <(head -n -2 "$1") >/dev/null 2>&1 && _awgBtVerifyStore'\'' _ "$1" 2>/dev/null' _ "${LIBEXEC}/awg-boringtun-launch"
 	STARTS_BEFORE="$(systemctl show -p InvocationID -p ActiveEnterTimestampMonotonic --value "${UNIT}" | tr '\n' ' ')"
-	HASHES="$(installation_hashes)"
+	installation_baseline
 	bash "${B2_INSTALLER}" --upgrade-boringtun >"${WORK}/upgrade-pinned-b2.log" 2>&1 </dev/null
 	RC=$?
 	sed 's/^/    | /' "${WORK}/upgrade-pinned-b2.log"
@@ -992,7 +1148,7 @@ if [[ -n "${AWG_LIVE_BASE_INSTALLER:-}" ]]; then
 	check "  both helpers are reconciled" helpers_are_this_installers
 	check "  it says so, and that the service was left stopped" \
 		bash -c 'grep -q "helpers in .* were updated" "$1" && grep -q "was left inactive" "$1" && ! grep -q "nothing was changed" "$1"' _ "${WORK}/upgrade-pinned-b2.log"
-	check "  the configuration is unchanged" test "$(installation_hashes)" = "${HASHES}"
+	check "  the configuration is unchanged" installation_unchanged
 	check "a plain systemctl start then succeeds" systemctl start "${UNIT}"
 	check "  the service runs the -b2 binary current selects" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${B2_ID}"
 	check "  the active instance is the one its start recorded" \
