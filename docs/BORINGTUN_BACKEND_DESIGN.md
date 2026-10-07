@@ -2891,12 +2891,18 @@ explains its behaviour, and offers it only when the installed binary supports it
   hint, that it fits no packet kind under the server's layout, that its sender exited 0 and
   reported exactly that datagram, that exactly it reached the server's interface before the
   client started, and that the peer's handshake came within the hint's 30 s lifetime.
-- History of the planted hint. The hint first planted was the wire helper's 247-byte SIP probe;
-  under the installer's random layouts it is a transport candidate whenever its four bytes at S4
-  fall in H4 (about one layout in four for the S4 values of the failing jobs), and then
-  BoringTun, correctly, takes it for AmneziaWG traffic and never learns it. That made two of
-  four BoringTun Host jobs fail, and one of four again after a change that only re-sent the
-  same datagram.
+- History of the planted hint. Observed: BoringTun Host on `3ae5b73` failed in two of four
+  jobs and on `60f699d`, which re-sent the same datagram before each ping, in one of four; in
+  each failure the planted-hint peer under AWG 2.0 got no SIP-shaped response or transport
+  while its tunnel worked, and the real SIP client passed. The hint then planted was the wire
+  helper's 247-byte SIP probe. Those jobs logged the S sizes (S4 109, 133 and 37) but neither
+  H4 nor what reached the server. Reproduced: on the published binary, with the S sizes of one
+  failing job and an H4 holding the probe's four bytes at S4, the probe is a transport
+  candidate and is never learned; with another H4 it is learned; the 27-byte line is learned
+  under either. Inferred, not established: that this mechanism caused the CI failures. It is
+  consistent with them (a random installer H4 holds the probe's bytes at those S4 offsets about
+  one time in four), but without the jobs' H4 or a record of their traffic it is not shown; a
+  lost or unanswered datagram, for example, is not excluded by those logs.
 - The BoringTun Host jobs that start from an earlier installer (`9f5a1afb87f7`, release
   `71d88784` build 1, and `c7cd737c221a`, release `ae2ab44e9a68` build 1) then use those real,
   different binaries: a rollback with `auto` is refused and changes nothing; with `quic` it
