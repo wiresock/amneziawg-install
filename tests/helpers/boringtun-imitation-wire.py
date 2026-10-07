@@ -65,8 +65,9 @@
   send <kind> <host> <port> <source port>
       Send one probe of KIND (as probe) to HOST:PORT from SOURCE PORT and
       print "sent <length>", without waiting for a reply: under imitation
-      auto, the first datagram a client's imitation sends, which leaves a
-      hint for that source.
+      auto, the datagram a client's imitation sends before a handshake, which
+      leaves a hint for that source. The port may be shared with a running
+      client (SO_REUSEADDR, which BoringTun's sockets also set).
 
   kinds sip <file> <S1,S2,S3,S4>
       For a LAYOUT capture, after validating every record against the sizes
@@ -183,6 +184,9 @@ def send(kind, host, port, source_port):
     sport = parse_number(source_port, "source port", 65535)
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     with socket.socket(family, socket.SOCK_DGRAM) as sock:
+        # BoringTun's sockets set SO_REUSEADDR, so this one can share the port
+        # of a running client, as that client's own imitation datagram would.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("::" if family == socket.AF_INET6 else "0.0.0.0", sport))
         sock.sendto(request, (host, int(port)))
     return "sent %d" % len(request)

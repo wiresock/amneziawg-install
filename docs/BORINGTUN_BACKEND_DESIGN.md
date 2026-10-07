@@ -2844,7 +2844,9 @@ explains its behaviour, and offers it only when the installed binary supports it
 - The host live test sets `auto` through the installer on the installed daemon and connects
   six installer-generated clients: `dns`, `quic`, `sip` and `stun` clients (copies of the
   verified binary running those imitations), one without imitation, and one without imitation
-  whose port first sends a SIP-shaped datagram (a planted hint). Two networks hold three
+  whose port sends a SIP-shaped datagram before each round of traffic (a planted hint, sent as
+  a SIP client's imitation sends one before each handshake attempt; a single hint sent once
+  before the client started was not learned in two of four CI jobs). Two networks hold three
   clients each, on different ports behind one address. Each client's stream is recorded on its
   side with `capture-to` (the destination port filter of `boringtun-imitation-wire.py`) and
   held to its learned protocol (`classify-auto`, or the per-kind SIP rule); the server's

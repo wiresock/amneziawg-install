@@ -544,13 +544,18 @@ import socket, subprocess, sys
 listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 listener.bind(("127.0.0.1", 0))
 listener.settimeout(5)
+# The source port is held, as a running client's is, by a socket with
+# SO_REUSEADDR (BoringTun sets it on its sockets).
+holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+holder.bind(("0.0.0.0", int(sys.argv[2])))
 out = subprocess.run([sys.executable, sys.argv[1], "send", "sip", "127.0.0.1", str(listener.getsockname()[1]), sys.argv[2]],
                      capture_output=True, text=True)
 data, source = listener.recvfrom(65535)
 print(out.returncode, out.stdout.strip() == "sent %d" % len(data), source[1] == int(sys.argv[2]), data.startswith(b"OPTIONS sip:"))
 PY
 )"
-assert_eq "0 True True True" "${SENT}" "send sends one SIP probe from the given source port and says how long it was"
+assert_eq "0 True True True" "${SENT}" "send sends one SIP probe from the given source port, shared with a running client's socket, and says how long it was"
 
 echo "=== IPv4/UDP framing before payload ==="
 assert_eq "datagram 77 77 whole" "$(py frame valid)" "a valid frame yields its UDP payload"

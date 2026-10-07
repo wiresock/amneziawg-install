@@ -96,11 +96,11 @@ mutant downloaded_target_kept "current unchanged, and the release this attempt d
 
 # Helpers of an earlier installer version (review S1).
 mutant helpers_not_reconciled "the installed launcher accepts the new current, so the next start can run b2" \
-	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
-	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n'
+	$'"${TARGET}" "${CURRENT_ID}" || return 1\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
+	$'"${TARGET}" "${CURRENT_ID}" || return 1\n\tfi\n'
 mutant helper_failure_ignored "helper update fails: no restart" \
-	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
-	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || :\n'
+	$'"${TARGET}" "${CURRENT_ID}" || return 1\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
+	$'"${TARGET}" "${CURRENT_ID}" || return 1\n\tfi\n\t_awgBtReconcileLifecycleHelpers || :\n'
 # ... also when current already is the pin (residual S1).
 PINNED_RECONCILE=$'\t\t\t# before anything else changes; a stopped service stays stopped.\n\t\t\t_awgBtReconcileLifecycleHelpers || return 1\n'
 PINNED_SERVED=$'\t\t\tif ((ACTIVE)) && ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}" >/dev/null 2>&1; then'

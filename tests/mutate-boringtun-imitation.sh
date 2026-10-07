@@ -84,8 +84,8 @@ mutant advisory_off_by_one test-boringtun-imitation "(32 is enough)" \
 mutant advisory_dns_hostname test-boringtun-imitation "dns with a hostname" \
 	'[[ -z "${DOMAIN}" ]] || NAMED=$((${#DOMAIN} + 33))' '[[ -z "${DOMAIN}" ]] || NAMED=$((${#DOMAIN} + 32))'
 mutant no_awg3_warning test-boringtun-imitation "AWG 3.0: the header-protection trade-off is stated" \
-	$'\tif [[ "${VERSION}" == "${AWG_PROTOCOL_VERSION_3}" || "${VERSION}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then\n\t\techo -e' \
-	$'\tif false; then\n\t\techo -e'
+	$'\tif [[ "${VERSION}" == "${AWG_PROTOCOL_VERSION_3}" || "${VERSION}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then\n\t\techo -e "${ORANGE}- AmneziaWG $(awgProtocolDisplayName "${VERSION}"): header protection takes its nonce from the first 12 bytes of each S prefix, and imitation' \
+	$'\tif false; then\n\t\techo -e "${ORANGE}- AmneziaWG $(awgProtocolDisplayName "${VERSION}"): header protection takes its nonce from the first 12 bytes of each S prefix, and imitation'
 
 # The --set-boringtun-imitation transaction.
 mutant no_noop test-boringtun-imitation "without touching the runtime" \

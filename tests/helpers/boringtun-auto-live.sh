@@ -14,9 +14,10 @@
 # acdns, acquic, acsip and acstun run --imitate-protocol dns, quic, sip and
 # stun, so their own pre-handshake imitation datagrams are what the server
 # learns from. acnone runs none and sends no such datagram: its peer stays
-# unresolved. acsipinj runs none too, but its port first sends one SIP-shaped
-# datagram (`boringtun-imitation-wire.py send sip`), the hint a SIP client's
-# imitation leaves: the server must then shape SIP for that peer, under AWG
+# unresolved. acsipinj runs none too, but its port sends a SIP-shaped datagram
+# (`boringtun-imitation-wire.py send sip`) before each round of traffic, the
+# hint a SIP client's imitation leaves before each handshake attempt: the
+# server must then shape SIP for that peer, under AWG
 # 2.0, and must refuse it (random padding) under AWG 3.0 once an S prefix is
 # 31 bytes or more. BoringTun as a client refuses SIP with header protection
 # there itself, which is why the hint is planted that way.
@@ -128,7 +129,16 @@ bt_auto_start() { # <name>
 		test "$(awg show "${NAME}" listen-port 2>/dev/null)" = "${BT_AUTO_PORT[${NAME}]}"
 }
 
+# A client with a planted hint sends it from its own port before each round
+# of pings, as a SIP client's imitation does before each handshake attempt.
+# A single hint sent once before the client started was not learned in two of
+# four CI jobs (BoringTun discards a pending hint on a roam, and a handshake
+# retried from another source port would be one; that cause is not proven).
+# Once a protocol is learned, further hints cannot change it.
 bt_auto_ping() { # <name> [count]
+	if [[ -n "${BT_AUTO_INJECT[$1]}" ]]; then
+		ip netns exec "${BT_AUTO_NS[$1]}" python3 "${WIRE}" send "${BT_AUTO_INJECT[$1]}" "${BT_AUTO_SERVER[$1]}" "${PORT}" "${BT_AUTO_PORT[$1]}" >/dev/null 2>&1
+	fi
 	ip netns exec "${BT_AUTO_NS[$1]}" ping -I "$1" -c "${2:-1}" -i 0.2 -W 2 "${SERVER_TUNNEL_ADDR}" >/dev/null 2>&1
 }
 
