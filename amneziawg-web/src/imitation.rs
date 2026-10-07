@@ -9,9 +9,14 @@ pub struct Settings {
 
 impl Settings {
     /// Match the installer's strict ASCII LDH hostname rules at the HTTP edge.
+    /// `auto` lets BoringTun choose DNS, QUIC, SIP or STUN for each
+    /// authenticated peer and takes no hostname, as the installer requires.
     pub fn parse(protocol: &str, domain: &str) -> Result<Self, &'static str> {
-        if !matches!(protocol, "none" | "dns" | "quic" | "sip" | "stun") {
-            return Err("Choose Off, DNS, QUIC, SIP or STUN.");
+        if !matches!(protocol, "none" | "dns" | "quic" | "sip" | "stun" | "auto") {
+            return Err("Choose Off, DNS, QUIC, SIP, STUN or Auto.");
+        }
+        if protocol == "auto" && !domain.is_empty() {
+            return Err("Auto chooses the protocol for each client and takes no hostname.");
         }
         if !domain.is_empty() {
             if !matches!(protocol, "dns" | "quic" | "sip") {
@@ -76,5 +81,23 @@ mod tests {
         assert!(Settings::parse("dns", &maximum).is_ok());
         assert!(Settings::parse("dns", &(maximum + "d")).is_err());
         assert!(Settings::parse("--help", "").is_err());
+    }
+
+    #[test]
+    fn auto_is_accepted_only_without_a_hostname() {
+        assert_eq!(
+            Settings::parse("auto", ""),
+            Ok(Settings {
+                protocol: "auto".into(),
+                domain: String::new(),
+            })
+        );
+        assert_eq!(
+            Settings::parse("auto", "example.com"),
+            Err("Auto chooses the protocol for each client and takes no hostname.")
+        );
+        for invalid in ["Auto", "AUTO", "auto ", "automatic"] {
+            assert!(Settings::parse(invalid, "").is_err(), "{invalid}");
+        }
     }
 }

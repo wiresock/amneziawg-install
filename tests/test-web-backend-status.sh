@@ -26,12 +26,12 @@ if [[ "${TEST_KERNEL_STATUS:-}" == 1 ]]; then
     printf '%s\n' 'backend=kernel' 'awg_protocol=3.1' 'service_state=active' 'module_state=loaded' 'SERVER_PRIV_KEY=must-not-escape'
     exit 0
 fi
-printf '%s\n' 'backend=boringtun' 'awg_protocol=2.0' 'service_state=active' 'daemon_state=running' 'daemon_release=boringtun-cli-0.7.1-gae2ab44e9a68-linux-x86_64-musl' 'imitation_protocol=quic' 'imitation_domain=example.com' 'daemon_imitation_protocol=dns' 'daemon_imitation_domain=' 'SERVER_PRIV_KEY=must-not-escape'
+printf '%s\n' 'backend=boringtun' 'awg_protocol=2.0' 'service_state=active' 'daemon_state=running' 'daemon_release=boringtun-cli-0.7.1-gb94943906b11-linux-x86_64-musl' 'imitation_protocol=auto' 'imitation_domain=' 'daemon_imitation_protocol=auto' 'daemon_imitation_domain=' 'previous_release=boringtun-cli-0.7.1-gae2ab44e9a68-linux-x86_64-musl' 'imitation_auto_support=supported' 'SERVER_PRIV_KEY=must-not-escape'
 exit "${TEST_STATUS_EXIT:-0}"
 EOF
 chmod 700 "$WORK/installer"
 output="$(main backend-status)"
-[[ "$output" == $'backend=boringtun\nawg_protocol=2.0\nservice_state=active\ndaemon_state=running\ndaemon_release=boringtun-cli-0.7.1-gae2ab44e9a68-linux-x86_64-musl\nimitation_protocol=quic\nimitation_domain=example.com\ndaemon_imitation_protocol=dns\ndaemon_imitation_domain=' ]]
+[[ "$output" == $'backend=boringtun\nawg_protocol=2.0\nservice_state=active\ndaemon_state=running\ndaemon_release=boringtun-cli-0.7.1-gb94943906b11-linux-x86_64-musl\nimitation_protocol=auto\nimitation_domain=\ndaemon_imitation_protocol=auto\ndaemon_imitation_domain=\nimitation_auto_support=supported' ]]
 export TEST_KERNEL_STATUS=1
 output="$(main backend-status)"
 [[ "$output" == $'backend=kernel\nawg_protocol=3.1\nservice_state=active\nmodule_state=loaded' ]]

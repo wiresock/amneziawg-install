@@ -2806,7 +2806,7 @@ async fn api_protocol_status() -> Result<Response, ApiError> {
 fn imitation_notice_message(code: &str) -> Option<&'static str> {
     match code {
         "saved" => Some("Imitation settings saved. Check the running state below. Client configurations are unchanged."),
-        "failed" => Some("The imitation change failed. Check the configured and running state below before retrying. The installer enforces backend and protocol compatibility and attempts rollback on failure."),
+        "failed" => Some("The imitation change failed. Check the configured and running state below before retrying. The installer enforces backend and protocol compatibility, refuses Auto when the installed BoringTun binary does not support it, and attempts rollback on failure."),
         _ => None,
     }
 }
@@ -8359,11 +8359,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn imitation_auto_is_dispatched_without_a_hostname_and_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            test_db().await,
+            AuthConfig::disabled(),
+            dir.path().into(),
+            dir.path().into(),
+            missing_proxy_sessions_file(),
+        );
+        let response = post_imitation_change(
+            &state,
+            HeaderMap::new(),
+            ImitationChangeForm {
+                csrf_token: None,
+                confirm: Some("yes".into()),
+                protocol: Some("auto".into()),
+                domain: Some(String::new()),
+            },
+            |settings| {
+                assert_eq!(settings.protocol, "auto");
+                assert_eq!(settings.domain, "");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("unexpected API error"));
+        assert_eq!(response.headers()["location"], "/?imitation_notice=saved");
+        let events = list_events(&state.db.pool, None, None, 20).await.unwrap();
+        assert_eq!(
+            events[0].detail.as_deref(),
+            Some("{\"protocol\":\"auto\",\"domain\":\"\"}")
+        );
+        // A hostname with auto never reaches the privileged helper.
+        let response = post_imitation_change(
+            &state,
+            HeaderMap::new(),
+            ImitationChangeForm {
+                csrf_token: None,
+                confirm: Some("yes".into()),
+                protocol: Some("auto".into()),
+                domain: Some("example.com".into()),
+            },
+            |_| panic!("auto with a hostname was dispatched"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("unexpected API error"));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn imitation_controls_offer_auto_without_a_hostname() {
+        let html = render_imitation_controls("token");
+        assert!(html.contains("<option value=\"auto\" id=\"imitation-mode-auto\" disabled>"));
+        assert!(html.contains("authenticated"));
+        assert!(html.contains("does not detect"));
+    }
+
+    #[tokio::test]
     async fn imitation_rejects_invalid_or_unconfirmed_changes_before_dispatch() {
         let app = test_router(test_db().await);
         for body in [
             "protocol=quic&domain=example.com",
             "confirm=yes&protocol=unknown",
+            "confirm=yes&protocol=Auto",
+            "confirm=yes&protocol=auto&domain=example.com",
+            "protocol=auto",
             "confirm=yes&protocol=none&domain=example.com",
             "confirm=yes&protocol=stun&domain=example.com",
             "confirm=yes&protocol=dns&domain=https%3A%2F%2Fexample.com",

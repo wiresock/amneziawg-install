@@ -7,6 +7,7 @@ trap 'rm -rf -- "$WORK"' EXIT
 # shellcheck disable=SC1090
 source <(sed '/^main "\$@"$/d' "$ROOT/amneziawg-web/scripts/amneziawg-web-privileged")
 installer_supports_boringtun_imitation "$ROOT/amneziawg-install.sh"
+installer_supports_boringtun_imitation_auto "$ROOT/amneziawg-install.sh"
 require_root() { :; }
 resolve_awg_install_script() { printf '%s\n' "$WORK/installer"; }
 export TEST_IMITATION_ARGS="$WORK/args"
@@ -47,6 +48,20 @@ reject quic example.com extra
 reject invalid ''
 reject none example.com
 reject stun example.com
+# auto needs an installer that declares it: one without the line refuses the
+# value, so the helper never passes it there.
+reject auto ''
+sed -i '2a AWG_INSTALLER_CAPABILITY_BORINGTUN_IMITATION_AUTO="boringtun-imitation-auto-v1"' "$WORK/installer"
+output="$(main set-boringtun-imitation auto '')"
+[[ -z "$output" ]]
+[[ "$(cat "$WORK/args")" == $'--set-boringtun-imitation\nauto' ]]
+reject auto example.com
+reject Auto ''
+reject AUTO ''
+for protocol in none dns quic sip stun; do
+    main set-boringtun-imitation "$protocol" '' >/dev/null
+    [[ "$(cat "$WORK/args")" == "$(printf '%s\n' --set-boringtun-imitation "$protocol")" ]]
+done
 for domain in '-bad.test' 'bad-.test' 'bad..test' 'bad.test.' 'https://example.com' 'bad_name' 'bad name' '$bad' $'bad\nname' "$(printf '%064d' 0).test"; do
     reject dns "$domain"
 done
@@ -63,4 +78,4 @@ touch "$WORK/legacy-was-executed"
 EOF
 reject quic example.com
 [[ ! -e "$WORK/legacy-was-executed" ]]
-echo 'PASS: imitation argv validation, supported modes, suppressed installer output, failure and legacy rejection'
+echo 'PASS: imitation argv validation, supported modes including auto, auto capability gating, suppressed installer output, failure and legacy rejection'
