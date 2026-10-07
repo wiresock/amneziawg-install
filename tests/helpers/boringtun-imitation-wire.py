@@ -51,7 +51,9 @@
       <hex>"; the first fragment of a fragmented datagram as "<clock>
       <address> <port> fragment <length>", a frame that is not valid
       IPv4/UDP as "<clock> <address> - malformed <length> <its first 40
-      bytes>". Several source
+      bytes>", and frames its packet socket dropped (PACKET_STATISTICS,
+      polled after every wakeup, into a 32 MiB receive buffer) as "<clock> -
+      drops <count> <clock of the poll before>". Several source
       addresses, any source port, and with "any" every interface of the
       namespace, also one created later: what reached the server from its
       clients, in arrival order. Transcript and exit statuses are capture's.
@@ -72,8 +74,9 @@
       EPOCH is when the server's state was last empty; the record must have
       been ready by then. Nothing the server sent is consulted. "undecided
       <reason>" (exit 1) when the record cannot decide: a malformed frame from
-      that address, or a fragment from that port, that could have been the
-      client's hint or initiation, no initiation, a hint at the edge
+      that address, a fragment from that port, or frames the record dropped,
+      at a time they could have been the client's hint or initiation; no
+      initiation; a hint at the edge
       of its lifetime, a peer that learned inside the window after a session
       without it, or an outcome that depends on which initiation was
       accepted first.
@@ -652,6 +655,27 @@ def record_line(sizes, ranges, status, length, data, evidence=None):
 
 
 MALFORMED_KEPT = 40
+# A record's receive buffer: a bulk transfer through the tunnel must not
+# overflow it while the record writes. Drops are reported regardless.
+RECORD_BUFFER = 32 * 1024 * 1024
+SOL_PACKET = 263
+PACKET_STATISTICS = 6
+
+
+def record_buffer(sock):
+    """Enlarge SOCK's receive buffer, past rmem_max where root may."""
+    for option in (getattr(socket, "SO_RCVBUFFORCE", 33), socket.SO_RCVBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, option, RECORD_BUFFER)
+            return
+        except OSError:
+            continue
+
+
+def packet_drops(sock):
+    """Frames the packet socket dropped since the last call
+    (PACKET_STATISTICS, which resets on reading)."""
+    return struct.unpack("II", sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))[1]
 
 
 def full_record_line(clock, frame, status, length, data, fragmented):
@@ -756,6 +780,8 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
     signal.set_wakeup_fd(wake_write)
     signal.signal(signal.SIGTERM, lambda signum, frame: stop.append(signum))
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
+    if full:
+        record_buffer(sock)
     if not (full and interface == "any"):
         sock.bind((interface, 0))
     fragments = Fragments()
@@ -764,6 +790,9 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
         ready = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
         write_state(state_path, "ready %d %d %d" % (own_identity() + (boot_centiseconds(ready),)))
         deadline = ready + duration
+        polled = boot_centiseconds(ready)
+        if full:
+            packet_drops(sock)
         while not stop:
             left = deadline - time.clock_gettime_ns(time.CLOCK_BOOTTIME)
             if left <= 0:
@@ -771,7 +800,16 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
             readable = select.select([sock, wake_read], [], [], left / 10 ** 9)[0]
             if wake_read in readable:
                 os.read(wake_read, 64)
+            if full:
+                # Frames the socket dropped since the last poll: the record
+                # says when, so that nothing can count as complete across it.
+                now, dropped = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME)), packet_drops(sock)
+                if dropped:
+                    out.write("%d - drops %d %d\n" % (now, dropped, polled))
+                    records += 1
+                polled = now
             if sock not in readable:
+                out.flush()
                 continue
             frame = sock.recv(65535)
             clock = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME))
@@ -787,7 +825,13 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
                 line = record_line(sizes, ranges, status, length, data, evidence)
             if line is not None:
                 out.write(line + "\n")
-                out.flush()
+                if not full:
+                    out.flush()
+                records += 1
+        if full:
+            now, dropped = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME)), packet_drops(sock)
+            if dropped:
+                out.write("%d - drops %d %d\n" % (now, dropped, polled))
                 records += 1
     if not stop:
         end = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME))
@@ -1289,14 +1333,16 @@ def policy_allows(protocol, sizes, hp_key):
 RECORD_DATAGRAM = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) (0|[1-9][0-9]{0,4}) (0|[1-9][0-9]{0,4}) (-|(?:[0-9a-f]{2})+)")
 RECORD_FRAGMENT = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) (0|[1-9][0-9]{0,4}) fragment (0|[1-9][0-9]{0,4})")
 RECORD_MALFORMED = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) - malformed (0|[1-9][0-9]{0,4}) ((?:[0-9a-f]{2}){0,40})")
+RECORD_DROPS = re.compile(r"(0|[1-9][0-9]{0,17}) - drops ([1-9][0-9]{0,9}) (0|[1-9][0-9]{0,17})")
 
 
 def full_records(path):
     """The records of a finished `record` and its ready clock. Its transcript
     must be a ready line and a stopped or complete end that counts every
     record, every record well formed, its clocks never going back. A record is
-    (clock, address, port, kind, data), KIND "datagram", "fragment" (no data)
-    or "malformed" (port None, data the frame's first bytes)."""
+    (clock, address, port, kind, data), KIND "datagram", "fragment" (no data),
+    "malformed" (port None, data the frame's first bytes) or "drops" (address
+    and port None, data (frames dropped, clock of the poll before))."""
     with open(path + ".state") as state:
         transcript = state.read().splitlines()
     ready = re.fullmatch(r"ready [0-9]+ [0-9]+ (0|[1-9][0-9]{0,17})", transcript[0]) if transcript else None
@@ -1306,6 +1352,14 @@ def full_records(path):
     last = int(ready.group(1))
     for number, line in capture_lines(path):
         where = "%s:%d" % (path, number)
+        drops = RECORD_DROPS.fullmatch(line)
+        if drops:
+            clock, since = int(drops.group(1)), int(drops.group(3))
+            if clock < last or since > clock:
+                raise InputError("%s goes back in time" % where)
+            last = clock
+            records.append((clock, None, None, "drops", (int(drops.group(2)), since)))
+            continue
         for kind, pattern in (("datagram", RECORD_DATAGRAM), ("fragment", RECORD_FRAGMENT), ("malformed", RECORD_MALFORMED)):
             match = pattern.fullmatch(line)
             if match:
@@ -1419,9 +1473,10 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
     between the clocks START and END. EPOCH is when the server's state was
     last empty (its start); the record must have been ready by then. Returns
     1, after "undecided <reason>", when the record cannot decide: a malformed
-    frame from that address, or a fragment from that port, at a time when it
-    could have been the client's hint or initiation, no initiation, a hint at the edge
-    of its lifetime, a peer that learned inside the window after a session
+    frame from that address, a fragment from that port, or frames the record
+    dropped, at a time they could have been the client's hint or initiation;
+    no initiation; a hint at the edge of its lifetime; a peer that learned
+    inside the window after a session
     without it, or an outcome that depends on which initiation the server
     accepted first (each initiation up to the first one the client's own
     transport follows is tried as that one)."""
@@ -1447,14 +1502,20 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
         if ready > epoch:
             raise Undecided("the record was ready at %d, after the server's state was last empty at %d" % (ready, epoch))
         events = []
-        # Frames from the address whose datagram is unknown: a malformed one
-        # (its port unknown) and a fragment from the client's port.
+        # (from, to, what) of datagrams the record cannot tell: a malformed
+        # frame from the address (its port unknown), a fragment from the
+        # client's port, and frames the record's socket dropped, from any
+        # source, at some time since its poll before.
         unknown = []
         for clock, source, source_port, kind, data in records:
+            if kind == "drops":
+                if clock >= epoch and data[1] <= window_end:
+                    unknown.append((data[1], clock, "%d frames the record dropped between %d and %d" % (data[0], data[1], clock)))
+                continue
             if clock < epoch or clock > window_end or source != address:
                 continue
             if kind == "malformed" or (kind == "fragment" and source_port == port):
-                unknown.append((clock, kind, data))
+                unknown.append((clock, clock, "a %s frame from %s at %d (%s)" % (kind, address, clock, data.hex() or "-")))
             elif source_port == port:
                 events.append((clock, data))
         # The client sends transport only once a response reached it, so the
@@ -1483,15 +1544,13 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
             # the client sent anything; such a frame is taken as not the
             # client's own initiation, which would need the client running.
             decided = learned_at if learned is not None else window_end
-            for clock, kind, data in unknown:
-                if clock <= decided and clock >= events[0][0] - HINT_LIFETIME_CS - HINT_LIFETIME_MARGIN_CS:
-                    raise Undecided("a %s frame from %s arrived at %d, when it could have been this client's hint or initiation (%s)"
-                                    % (kind, address, clock, data.hex() or "-"))
+            for start, end, what in unknown:
+                if start <= decided and end >= events[0][0] - HINT_LIFETIME_CS - HINT_LIFETIME_MARGIN_CS:
+                    raise Undecided("%s, when they could have been this client's hint or initiation" % what)
         if len(set(outcomes)) > 1:
             raise Undecided("the outcome depends on which of %d initiations the server accepted (%s)" % (initiations, ", ".join(outcomes)))
-        for clock, kind, data in unknown:
-            print("a %s frame from %s at %d (%s) could not have been this client's hint or initiation"
-                  % (kind, address, clock, data.hex() or "-"))
+        for _, _, what in unknown:
+            print("%s: not when they could have been this client's hint or initiation" % what)
     except Undecided as reason:
         print("undecided %s" % reason)
         return 1

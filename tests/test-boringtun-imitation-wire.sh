@@ -772,6 +772,14 @@ elif case == "malformed-29s-before":
     # hold the slot when that datagram arrived.
     lines.append("1600 %s - malformed 28 4500001c" % A)
     sequence(4500, [SIP_HINT, initiation(layout), transport(layout)])
+elif case == "drops-during":
+    # The record's socket dropped frames, from any source, while the hint
+    # slot mattered.
+    sequence(2000, [SIP_HINT, initiation(layout), transport(layout)])
+    lines.insert(1, "2000 - drops 3 1990")
+elif case == "drops-long-before":
+    lines.append("1700 - drops 120 1650")
+    sequence(4900, [SIP_HINT, initiation(layout), transport(layout)])
 elif case == "fragment":
     sequence(2000, [SIP_HINT, initiation(layout), transport(layout)])
     lines.insert(1, "2000 %s 41006 fragment 1400" % A)
@@ -825,10 +833,10 @@ for CASE in "stun-colliding|0 expect random" "stun-clear|0 expect stun" "other-p
 	"other-address|0 expect random" "age-28|0 expect sip" "age-32|0 expect random" \
 	"first-hint-wins|0 expect quic" "new-hint-after-expiry|0 expect sip" "from-initiation|0 expect dns" \
 	"hp-sip-large|0 expect random" "hp-sip-small|0 expect sip" "malformed-long-before|0 expect sip" \
-	"malformed-after-learning|0 expect sip" "fragment-other-port|0 expect sip"; do
+	"malformed-after-learning|0 expect sip" "fragment-other-port|0 expect sip" "drops-long-before|0 expect sip"; do
 	assert_eq "${CASE#*|}" "$(auto_case "${CASE%%|*}" 2>&1)" "auto-expect, ${CASE%%|*}: ${CASE#*|}"
 done
-for CASE in age-30 no-initiation malformed malformed-29s-before fragment late-record hp-unmasked-initiation; do
+for CASE in age-30 no-initiation malformed malformed-29s-before drops-during fragment late-record hp-unmasked-initiation; do
 	GOT="$(auto_case "${CASE}" 2>&1)"
 	assert_true "auto-expect, ${CASE}: undecided, exit 1, never a guess (${GOT})" bash -c '[[ "$1" == "1 undecided "* ]]' _ "${GOT}"
 done
