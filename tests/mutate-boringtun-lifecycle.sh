@@ -176,4 +176,15 @@ mutant status_previous_equal_current "a previous that names current is invalid" 
 mutant status_no_daemon_release "and is shown to run the old release" \
 	'[[ ! "${DAEMON_PID}" =~ ^[1-9][0-9]*$ ]] || DAEMON_RELEASE="$(_awgBtDaemonRelease "${DAEMON_PID}")"' ':'
 
+# Imitation auto and a target binary without it.
+mutant rollback_skips_auto_check "active:   naming the release and the imitation" \
+	$'\t\t_awgBtLifecycleTargetRunsImitation rollback "${TARGET}" "${CURRENT_ID}" || return 1\n' ''
+mutant upgrade_skips_auto_check "auto configured: an upgrade target without auto is refused" \
+	'if [[ "${MODE}" == upgrade ]] && ! _awgBtLifecycleTargetRunsImitation upgrade "${TARGET}" "${CURRENT_ID}"; then' 'if false; then'
+mutant lifecycle_auto_check_by_version "active:   naming the release and the imitation" \
+	$'\t_awgBtBinaryImitationSupport "${_AWG_BT_VERIFIED_BIN}" "${AWG_BORINGTUN_IMITATE_PROTOCOL}"\n\tRC=$?\n\t((RC == 0)) && return 0' \
+	$'\t[[ "${_AWG_BT_VERIFIED_VERSION}" == 0.7.1 ]]\n\tRC=$?\n\t((RC == 0)) && return 0'
+mutant status_rollback_ignores_imitation "status: with auto configured, a rollback to a previous binary without it is not offered" \
+	'if [[ "${ROLLBACK}" == yes ]] && ! _awgBtReleaseImitationSupport "${PREVIOUS}" "${AWG_BORINGTUN_IMITATE_PROTOCOL}"; then' 'if false; then'
+
 mutation_main "BoringTun lifecycle" "${PROJECT_ROOT}" "$@"

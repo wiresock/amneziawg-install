@@ -1076,7 +1076,8 @@ previous_release=none
 rollback_available=no
 upgrade_available=no
 daemon_release=none
-unmanaged_releases=0" "${OUT}" "the BoringTun report, key by key"
+unmanaged_releases=0
+imitation_auto_support=unknown" "${OUT}" "the BoringTun report, key by key (the stubbed store's binary cannot be asked about auto)"
 assert_not_contains "${MOCK_KEY}" "${OUT}${ERR}" "  no key is printed"
 
 make_install boringtun quic "" 3
@@ -1130,7 +1131,7 @@ run bash "${INSTALLER}" --backend-status extra
 assert_rc 1 "${RC}" "--backend-status takes no argument"
 run bash "${INSTALLER}" --set-boringtun-imitation
 assert_rc 1 "${RC}" "--set-boringtun-imitation needs a protocol"
-assert_contains "Usage: amneziawg-install.sh --set-boringtun-imitation <none|dns|quic|sip|stun> [hostname]" "${ERR}" "  and prints its usage"
+assert_contains "Usage: amneziawg-install.sh --set-boringtun-imitation <none|dns|quic|sip|stun|auto> [hostname]" "${ERR}" "  and prints its usage"
 run bash "${INSTALLER}" --set-boringtun-imitation dns a.example extra
 assert_rc 1 "${RC}" "and at most a hostname after it"
 

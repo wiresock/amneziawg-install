@@ -850,8 +850,8 @@ is kept verbatim.
 
 - **Install time:** `AWG_BORINGTUN_IMITATE_PROTOCOL` and `AWG_BORINGTUN_IMITATE_DOMAIN` from
   the environment (fresh installs only), or an interactive question defaulting to `none`.
-- **Change:** `--set-boringtun-imitation <none|dns|quic|sip|stun> [domain]` runs as a
-  transaction:
+- **Change:** `--set-boringtun-imitation <none|dns|quic|sip|stun> [domain]` (`auto` too since
+  §21.5) runs as a transaction:
   1. Take the lock and load params.
   2. Require `AWG_BACKEND=boringtun` and validate the new values.
   3. Print the warnings in §9.4.
@@ -933,7 +933,7 @@ is already broken), so it is listed separately for maintainer sign-off (PR 8).
 
 | Aspect | Standalone `amneziawg-proxy` | BoringTun built-in imitation |
 |---|---|---|
-| Protocols | quic, dns, stun, sip, **auto** | dns, quic, sip, stun (no auto) |
+| Protocols | quic, dns, stun, sip, **auto** | dns, quic, sip, stun; from `b94943906b11` also **auto**, chosen per authenticated peer from the client's own imitation (§21.5) |
 | Where shaping happens | Rewrites the S-prefix of AWG 2.0 packets in flight | Generates the S-prefix natively while building packets |
 | AWG versions | 2.0 only; rewriting the prefix breaks 3.x header protection | 2.0, 3.0 and 3.1 (with the caveats in §9.4) |
 | Probe responses | QUIC VN, DNS answer (optionally real, forwarded upstream), STUN Binding Success, SIP 100 Trying; optional stateful QUIC handshake continuation | DNS SERVFAIL, STUN Binding Success, QUIC VN; no SIP responder; no DNS forwarding; no QUIC continuation |
@@ -2780,6 +2780,82 @@ the stricter structural check is a known follow-up.
   installer renders. It rolls back to a TEST FIXTURE build 2 of the pinned commit (a `-b2`
   name those helpers refuse) through systemd's real restart, and upgrades back, with the
   datapath checked each time.
+
+### 21.5 Imitation `auto` as implemented (adoption of `b94943906b11` build 1)
+
+The change that adopts `boringtun-cli-0.7.1-gb94943906b11-b1` (WireSock BoringTun
+`b94943906b11`, upstream pull request #78) points `AWG_BT_RELEASE_*` at that release and
+offers its server imitation mode `auto` everywhere the fixed modes are offered. BoringTun's
+engine is not changed. In `auto`, a responder learns `dns`, `quic`, `sip` or `stun` for each
+authenticated peer from the client's own pre-handshake imitation datagrams (hints keyed by
+source address and port, 30 s, at most 1024), pins it for that peer, keeps it across roaming,
+and pads an unresolved peer with random S padding. S1–S4 and H1–H4 stay configured.
+
+**Values.** `auto` joins `none`, `dns`, `quic`, `sip` and `stun` in
+`_awgBtImitationProtocolValid`, so params, the runtime file (`IMITATE_PROTOCOL=auto`), the
+generated helpers and the daemon's command line (`--imitate-protocol auto`) carry it as they
+carry the others. It takes no hostname (`_awgBtImitationCheck` refuses one, as BoringTun's CLI
+does), so `--imitate-domain` never follows it. Fresh installs take
+`AWG_BORINGTUN_IMITATE_PROTOCOL=auto`; both menus list it as option 6; the usage reads
+`<none|dns|quic|sip|stun|auto>`.
+
+**Header protection.** `checkBoringtunImitationProtocolCompat` does not refuse `auto`: the
+policy binds what a peer learns. A learned `sip` is not activated while any S prefix is 31
+bytes or more (the peer stays unresolved, random padding), and a learned `dns` or `stun` has
+the nonce trade-offs of §9.4. `printBoringtunAutoImitationWarnings` states these, and that
+`auto` needs recognizable client traffic and does not detect S/H settings. Nothing disables
+header protection or changes framing.
+
+**Binaries without `auto`.** The releases before `b94943906b11` report the same version, 0.7.1,
+and refuse `--imitate-protocol auto` as a usage error. The installer therefore asks the
+verified binary: `_awgBtBinaryImitationSupport` runs
+`env -i PATH=… NO_COLOR=1 <binary> --imitate-protocol auto --version` (bounded by
+`AWG_BT_PROBE_TIMEOUT`): the version means yes; status 2 with clap's "invalid value 'auto'"
+means no; anything else is unknown and treated as no. Fixed modes are never probed. The check
+runs:
+- in `--set-boringtun-imitation auto`, after the compatibility check and before the unit state
+  is read or anything is prepared (`requireBoringtunImitationSupport`), with the guidance to
+  run `--upgrade-boringtun` (or, if the pin itself lacked it, that no upgrade helps);
+- in `--rollback-boringtun` with `auto` persisted, against the previous release before the
+  helpers are reconciled, and in `--upgrade-boringtun` against the downloaded target before it
+  is validated (`_awgBtLifecycleTargetRunsImitation`), with the guidance to select a fixed
+  imitation or `none` first; `--backend-status` then reports `rollback_available=no`;
+- in the fresh-install preflight, in every scratch instance (also those of a lifecycle
+  candidate) and in the generated launcher, so that a hand-edited or interrupted state never
+  surfaces as a daemon usage error.
+
+A fixed imitation or `none` is always accepted, also with `auto` persisted on a binary
+without it, which is the way out of that state.
+
+**Status and panel.** `--backend-status` shows `auto` as configured
+(`imitation_protocol=auto`) and running (`daemon_imitation_protocol=auto`), plus
+`imitation_auto_support=supported|unsupported|unknown` for the installed binary. Nothing per
+peer is reported: BoringTun does not expose what a peer learned. The web panel's privileged
+helper passes `imitation_auto_support` through and forwards `auto` only to an installer that
+carries `AWG_INSTALLER_CAPABILITY_BORINGTUN_IMITATION_AUTO="boringtun-imitation-auto-v1"`.
+The panel accepts `auto` only with an empty hostname, disables the hostname control for it,
+explains its behaviour, and offers it only when the installed binary supports it.
+
+**Evidence.**
+- `tests/test-boringtun-imitation-auto.sh` (unit) runs the store's real verification against
+  TEST FIXTURE binaries that parse `--imitate-protocol` as clap does, with and without `auto`,
+  at the same version; `tests/test-boringtun-lifecycle.sh` adds the refused rollback, the
+  rollback with a fixed imitation, the re-upgrade and a refused upgrade target.
+- The host live test sets `auto` through the installer on the installed daemon and connects
+  six installer-generated clients: `dns`, `quic`, `sip` and `stun` clients (copies of the
+  verified binary running those imitations), one without imitation, and one without imitation
+  whose port first sends a SIP-shaped datagram (a planted hint). Two networks hold three
+  clients each, on different ports behind one address. Each client's stream is recorded on its
+  side with `capture-to` (the destination port filter of `boringtun-imitation-wire.py`) and
+  held to its learned protocol (`classify-auto`, or the per-kind SIP rule); the server's
+  endpoints show the shared addresses with distinct ports. Under AWG 3.0 the planted SIP hint
+  must leave its peer random when an S prefix is 31 bytes or more.
+- The BoringTun Host jobs that start from an earlier installer (`9f5a1afb87f7`, release
+  `71d88784` build 1, and `c7cd737c221a`, release `ae2ab44e9a68` build 1) then use those real,
+  different binaries: a rollback with `auto` is refused and changes nothing; with `quic` it
+  returns the service to the earlier binary, whose `auto` is refused; the upgrade back
+  restores this release without a download; `auto` applies again. Every step checks the
+  datapath and unchanged configuration hashes.
 
 ## 22. Current functions and files that will need modification
 
