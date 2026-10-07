@@ -367,6 +367,13 @@ elif cmd == "layout":
         print("accepted")
     except wire.InputError:
         print("refused")
+elif cmd == "chacha20":
+    print(wire.chacha20_block(bytes(range(32)), 1, bytes.fromhex("000000090000004a00000000")).hex())
+elif cmd == "full-record":
+    payload = os.urandom(77)
+    for frame in (ipv4(payload), ipv4(os.urandom(1384), fragment=0x2000, udp_length=1408), ipv4(os.urandom(12), ihl=4)):
+        status, length, data, fragmented = wire.frame_payload(frame, SERVER, None, fragments=wire.Fragments())
+        print(wire.full_record_line(1700, frame, status, length, data, fragmented).replace(payload.hex(), "<its bytes>"))
 PY
 }
 kinds() { # <capture> <S1,S2,S3,S4>
@@ -573,6 +580,278 @@ for CASE in "probe ${COLLIDING} 247 transport" "probe ${CLEAR} 247 none" "send $
 done
 "${REAL_PYTHON}" "${WIRE_REAL}" candidates send dns "${CLEAR}" >/dev/null 2>&1
 assert_eq 2 "$?" "candidates knows only the datagrams send and probe send (usage)"
+
+echo "=== Auto: what the server can learn, from what reached it (detect, inbound_candidates, auto-expect) ==="
+# The pre-initiation datagrams of real BoringTun clients (the published
+# b94943906b11 binary, --imitate-protocol dns, quic, sip and stun), recorded
+# whole on the server's side under S1-S4 40 and narrow H ranges: imitation
+# datagrams and Jc junk, public bytes only.
+PRELUDES="${SCRIPT_DIR}/fixtures/boringtun-auto-preludes"
+# Upstream's own detection vectors (noise/imitation/detect.rs tests), and the
+# recorded preludes: what each is detected as.
+DETECTED="$("${REAL_PYTHON}" - "${WIRE_REAL}" "${PRELUDES}" <<'PY'
+import importlib.util, struct, sys
+spec = importlib.util.spec_from_file_location("wire", sys.argv[1])
+wire = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wire)
+def dns_query(txid):
+    return bytes([txid[0], txid[1], 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]) + b"\x07example\x03com\x00" + bytes([0, 1, 0, 1])
+stun = b"\x00\x01\x00\x00" + bytes.fromhex("2112a442") + b"\xab" * 12
+quic = bytes([0xC3]) + struct.pack(">I", 1) + bytes([4, 1, 2, 3, 4, 0]) + bytes(16)
+def version(value):
+    return quic[:1] + struct.pack(">I", value) + quic[5:]
+bad_stun = bytearray(stun); bad_stun[3] = 4
+q0 = bytearray(dns_query(b"\x01\x02")); q0[5] = 0
+q1 = bytearray(dns_query(b"\x01\x02")); q1[12] = 0xC0
+q2 = bytearray(dns_query(b"\x01\x02")); q2[-1] = 9
+cases = [("dns query", dns_query(b"\x12\x34")), ("dns query, txid c0", dns_query(b"\xc0\x34")),
+         ("dns query, txid ff", dns_query(b"\xff\x34")), ("stun binding request", stun), ("quic v1 initial", quic),
+         ("INVITE", b"INVITE sip:a@b SIP/2.0\r\n\r\n"), ("OPTIONS", b"OPTIONS sip:a@b SIP/2.0\r\n\r\n"),
+         ("sip/2.0 response", b"sip/2.0 100 Trying\r\n\r\n"), ("BYE with a multibyte name", b"BYE sip:x\xc3\xa4@b SIP/2.0\r\n\r\n"),
+         ("SUBSCRIBE", b"SUBSCRIBE \xc3\xa4 SIP/2.0\r\n\r\n"), ("empty", b""), ("one byte", b"\x00"), ("six c0", b"\xc0" * 6),
+         ("quic draft 0", version(0xFF000000)), ("quic draft 1", version(0xFF000001)), ("quic grease", version(0x1A2A3A4A)),
+         ("quic version 2 (unassigned)", version(2)), ("stun with a wrong length", bytes(bad_stun)),
+         ("dns, no question", bytes(q0)), ("dns, compressed name", bytes(q1)), ("dns, bad qclass", bytes(q2)),
+         ("dns, cut short", dns_query(b"\x01\x02")[:14])]
+for name, data in cases:
+    print("%s: %s" % (name, wire.detect(data)))
+for protocol in ("dns", "quic", "sip", "stun"):
+    found = [wire.detect(bytes.fromhex(line)) for line in open("%s/%s.hex" % (sys.argv[2], protocol)).read().split()]
+    print("recorded %s prelude: %s" % (protocol, " ".join(str(item) for item in found)))
+PY
+)"
+assert_eq "dns query: dns
+dns query, txid c0: dns
+dns query, txid ff: dns
+stun binding request: stun
+quic v1 initial: quic
+INVITE: sip
+OPTIONS: sip
+sip/2.0 response: sip
+BYE with a multibyte name: sip
+SUBSCRIBE: sip
+empty: None
+one byte: None
+six c0: None
+quic draft 0: None
+quic draft 1: quic
+quic grease: quic
+quic version 2 (unassigned): None
+stun with a wrong length: None
+dns, no question: None
+dns, compressed name: None
+dns, bad qclass: None
+dns, cut short: None
+recorded dns prelude: dns dns dns dns dns dns
+recorded quic prelude: quic quic None None
+recorded sip prelude: sip sip sip sip sip
+recorded stun prelude: stun stun None None None" "${DETECTED}" \
+	"detect: upstream's own vectors, and what real clients send before their initiation (Jc junk aside, two QUIC datagrams carry a v1 connection ID over 20 bytes, which upstream does not take for QUIC)"
+
+assert_eq "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e" \
+	"$(py chacha20 2>&1)" "the header-protection keystream's ChaCha20 block is RFC 8439's (section 2.3.2 test vector)"
+
+# auto-expect over synthetic records: the datagrams a client sends, its
+# initiations (mac1 computed here, as WireGuard defines it, under the
+# server's public key) and its transport, each with its clock. CASE names
+# what it builds; the helper's verdict is compared with what upstream's rules
+# give for it, worked out in the comment of each case.
+STUN_CLEAR="110,57,133,36,66166068-166166067,862271148-962271147,1349667297-1449667296,2030000000-2129999999"
+auto_case() { # <case> [auto-expect arguments after the record...]
+	"${REAL_PYTHON}" - "${WIRE_REAL}" "${PRELUDES}" "${T}/auto-record" "$@" <<'PY'
+import base64, hashlib, importlib.util, os, struct, sys
+spec = importlib.util.spec_from_file_location("wire", sys.argv[1])
+wire = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wire)
+preludes, path, case = sys.argv[2], sys.argv[3], sys.argv[4]
+SERVER = bytes(range(32, 64))
+HP = bytes(range(64, 96))
+with open(path + ".hp", "w") as key:
+    key.write(base64.b64encode(HP).decode() + "\n")
+COLLIDING = "110,57,133,36,66166068-166166067,862271148-962271147,1349667297-1449667296,1917290954-2017290953"
+CLEAR = "110,57,133,36,66166068-166166067,862271148-962271147,1349667297-1449667296,2030000000-2129999999"
+NARROW = "40,40,40,40,100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100"
+SHORT = "20,24,28,30,100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100"
+def recorded(protocol):
+    return [bytes.fromhex(line) for line in open("%s/%s.hex" % (preludes, protocol)).read().split()]
+def mask(datagram, offset, length, hp):
+    if not hp:
+        return datagram
+    stream = wire.hp_keystream(HP, datagram, length)
+    return datagram[:offset] + bytes(a ^ b for a, b in zip(datagram[offset:offset + length], stream)) + datagram[offset + length:]
+def initiation(layout, prefix=None, valid=True, hp=False):
+    sizes, ranges = wire.parse_layout(layout)
+    body = struct.pack("<II", ranges[0][0] + 7, 0x01020304) + os.urandom(108)
+    mac = hashlib.blake2s(body, digest_size=16, key=hashlib.blake2s(b"mac1----" + SERVER).digest()).digest()
+    if not valid:
+        mac = bytes(b ^ 1 for b in mac)
+    head = (prefix or b"")[:sizes[0]] + os.urandom(max(0, sizes[0] - len(prefix or b"")))
+    return mask(head + body + mac + bytes(16), sizes[0], 148, hp)
+def transport(layout, counter=0, hp=False):
+    sizes, ranges = wire.parse_layout(layout)
+    datagram = os.urandom(sizes[3]) + struct.pack("<IIQ", ranges[3][0] + 9, 0x0A0B0C0D, counter) + os.urandom(48)
+    return mask(datagram, sizes[3], 16, hp)
+SIP_HINT = b"OPTIONS sip:a@b SIP/2.0\r\n\r\n"
+A, B, OTHER = "192.0.2.2", "198.51.100.2", "192.0.2.9"
+lines = []
+def add(clock, data, address=A, port=41006):
+    lines.append("%d %s %d %d %s" % (clock, address, port, len(data), data.hex() or "-"))
+def sequence(start, datagrams, address=A, port=41006):
+    for index, data in enumerate(datagrams):
+        add(start + index, data, address, port)
+ready, end = 1000, None
+layout, hp = CLEAR, False
+# Each case: a sequence of what reached the server; the arguments the shell
+# passes decide the window.
+if case == "stun-colliding":
+    # Both STUN requests are transport candidates under H4 (their bytes at 36
+    # are in it), the junk is detected as nothing: no hint; the initiation's
+    # random S1 prefix is no protocol either. Unresolved: random.
+    layout = COLLIDING
+    sequence(2000, recorded("stun") + [initiation(layout), transport(layout)])
+elif case == "stun-clear":
+    # Only H4 differs: the first STUN request is a hint, learned at the
+    # initiation.
+    sequence(2000, recorded("stun") + [initiation(layout), transport(layout)])
+elif case == "other-port":
+    # The same sequence from another port of the same address leaves a hint
+    # for that port only; this client's own datagrams are junk-free.
+    sequence(2000, recorded("stun"), port=41007)
+    sequence(2010, [initiation(layout), transport(layout)])
+elif case == "other-address":
+    sequence(2000, recorded("stun"), address=OTHER)
+    sequence(2010, [initiation(layout), transport(layout)])
+elif case in ("age-28", "age-32", "age-30"):
+    # A hint lives 30 s from its arrival; near that edge nothing is decided.
+    add(2000, SIP_HINT)
+    seconds = {"age-28": 28, "age-32": 32, "age-30": 30.2}[case]
+    sequence(2000 + int(seconds * 100), [initiation(layout), transport(layout)])
+elif case == "first-hint-wins":
+    # The first detected protocol per source stays while it lives.
+    sequence(2000, [recorded("quic")[0], SIP_HINT, initiation(layout), transport(layout)])
+elif case == "new-hint-after-expiry":
+    add(2000, recorded("quic")[0])
+    sequence(5200, [SIP_HINT, initiation(layout), transport(layout)])
+elif case == "from-initiation":
+    # No hint: detect over the initiation datagram, whose S1 prefix is a DNS
+    # query here, selects dns.
+    layout = NARROW
+    query = bytes([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]) + b"\x16" + b"a" * 22 + b"\x00\x00\x01\x00\x01"
+    assert len(query) == 40
+    sequence(2000, [initiation(layout, prefix=query), transport(layout)])
+elif case == "hp-sip-large":
+    # Header protection with an S of 31 bytes or more refuses sip.
+    layout, hp = NARROW, True
+    sequence(2000, [SIP_HINT, initiation(layout, hp=True), transport(layout, hp=True)])
+elif case == "hp-sip-small":
+    # With every S of 12 to 30 bytes, sip is kept.
+    layout, hp = SHORT, True
+    sequence(2000, [SIP_HINT, initiation(layout, hp=True), transport(layout, hp=True)])
+elif case == "hp-unmasked-initiation":
+    # Under header protection an unmasked initiation fits no kind: no
+    # initiation at all.
+    layout, hp = NARROW, True
+    sequence(2000, [SIP_HINT, initiation(layout), transport(layout, hp=True)])
+elif case == "no-initiation":
+    sequence(2000, [SIP_HINT, initiation(layout, valid=False), transport(layout)])
+elif case == "malformed":
+    sequence(2000, [SIP_HINT, initiation(layout), transport(layout)])
+    lines.insert(1, "2000 %s - malformed 28" % A)
+elif case == "fragment":
+    sequence(2000, [SIP_HINT, initiation(layout), transport(layout)])
+    lines.insert(1, "2000 %s 41006 fragment 1400" % A)
+elif case == "late-record":
+    ready = 2500
+    sequence(3000, [SIP_HINT, initiation(layout), transport(layout)])
+elif case == "retry-unresolved-first":
+    # An initiation without a hint (unresolved), then -- no transport in
+    # between -- a SIP hint and a second initiation that learns it, then the
+    # client's transport. Whether the first initiation was accepted cannot be
+    # told; either way sip is learned at the second one.
+    sequence(2000, [initiation(layout)])
+    sequence(2600, [SIP_HINT, initiation(layout), transport(layout)])
+elif case == "answered-then-learned":
+    # The first initiation is answered (the client's transport follows), so
+    # it was accepted: unresolved; a later handshake learns sip.
+    sequence(2000, [initiation(layout), transport(layout), transport(layout, counter=1)])
+    sequence(14000, [SIP_HINT, initiation(layout), transport(layout)])
+elif case in ("retry-after-collision", "retry-after-transport"):
+    # A quic hint and an initiation, then a STUN request that is an
+    # AmneziaWG transport candidate here, or the client's own transport;
+    # 35 s later a SIP hint and a second initiation. A recognizable datagram
+    # is no sign of a session, so after the collision either initiation may
+    # be the first the server accepted, quic or sip: undecided. The client's
+    # transport shows the first was answered: quic.
+    layout = COLLIDING
+    follow = recorded("stun")[0] if case == "retry-after-collision" else transport(layout)
+    sequence(2000, [recorded("quic")[0], initiation(layout), follow])
+    sequence(5500, [SIP_HINT, initiation(layout), transport(layout)])
+else:
+    raise SystemExit("no case " + case)
+with open(path, "w") as out:
+    out.write("".join(line + "\n" for line in lines))
+with open(path + ".state", "w") as state:
+    state.write("ready 1 1 %d\nstopped %d %s\n" % (ready, len(lines), "0" * 32))
+args = sys.argv[5:]
+argv = ["auto-expect", path, args[0] if args else A, args[1] if len(args) > 1 else "41006", layout,
+        base64.b64encode(SERVER).decode(), path + ".hp" if hp else "-", "off",
+        args[2] if len(args) > 2 else "1500", args[3] if len(args) > 3 else "1900", args[4] if len(args) > 4 else "20000"]
+import contextlib, io
+buffer = io.StringIO()
+with contextlib.redirect_stdout(buffer):
+    status = wire.main(argv)
+print("%d %s" % (status, buffer.getvalue().splitlines()[-1] if buffer.getvalue() else "-"))
+PY
+}
+for CASE in "stun-colliding|0 expect random" "stun-clear|0 expect stun" "other-port|0 expect random" \
+	"other-address|0 expect random" "age-28|0 expect sip" "age-32|0 expect random" \
+	"first-hint-wins|0 expect quic" "new-hint-after-expiry|0 expect sip" "from-initiation|0 expect dns" \
+	"hp-sip-large|0 expect random" "hp-sip-small|0 expect sip"; do
+	assert_eq "${CASE#*|}" "$(auto_case "${CASE%%|*}" 2>&1)" "auto-expect, ${CASE%%|*}: ${CASE#*|}"
+done
+for CASE in age-30 no-initiation malformed fragment late-record hp-unmasked-initiation; do
+	GOT="$(auto_case "${CASE}" 2>&1)"
+	assert_true "auto-expect, ${CASE}: undecided, exit 1, never a guess (${GOT})" bash -c '[[ "$1" == "1 undecided "* ]]' _ "${GOT}"
+done
+GOT="$(auto_case retry-unresolved-first 2>&1)"
+assert_true "auto-expect, two initiations before any transport, over a window that spans both: undecided (${GOT})" \
+	bash -c '[[ "$1" == "1 undecided "*"inside the window"* ]]' _ "${GOT}"
+assert_eq "0 expect sip" "$(auto_case retry-unresolved-first 192.0.2.2 41006 1500 2700 20000 2>&1)" \
+	"auto-expect, the same record over a window that starts after sip was learned: sip"
+assert_eq "0 expect random" "$(auto_case answered-then-learned 192.0.2.2 41006 1500 1900 3000 2>&1)" \
+	"auto-expect, an answered unresolved session, a window before the later handshake: random"
+GOT="$(auto_case answered-then-learned 192.0.2.2 41006 1500 1900 20000 2>&1)"
+assert_true "auto-expect, the same record over a window that spans the later learning: undecided (${GOT})" \
+	bash -c '[[ "$1" == "1 undecided "*"inside the window"* ]]' _ "${GOT}"
+assert_eq "0 expect sip" "$(auto_case answered-then-learned 192.0.2.2 41006 1500 15000 20000 2>&1)" \
+	"auto-expect, the same record over a window after it: sip"
+GOT="$(auto_case retry-after-collision 192.0.2.2 41006 1500 5600 20000 2>&1)"
+assert_true "auto-expect, a retry after a colliding STUN request, quic or sip by which initiation was accepted first: undecided (${GOT})" \
+	bash -c '[[ "$1" == "1 undecided "*"depends on which"* ]]' _ "${GOT}"
+assert_eq "0 expect quic" "$(auto_case retry-after-transport 192.0.2.2 41006 1500 5600 20000 2>&1)" \
+	"auto-expect, the same retry after the client's own transport: the first initiation was answered, quic"
+GOT="$(auto_case stun-clear 192.0.2.2 41006 1500 1900 1950 2>&1)"
+assert_true "auto-expect, a window that ends before any initiation: undecided (${GOT})" \
+	bash -c '[[ "$1" == "1 undecided no initiation"* ]]' _ "${GOT}"
+printf '1000 192.0.2.2 41006 3 abcd\n' >"${T}/bad-record"
+printf 'ready 1 1 900\nstopped 1 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
+"${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
+assert_eq 1 "$?" "auto-expect refuses a record whose length is not that of its bytes"
+printf '1000 192.0.2.2 41006 2 abcd\n999 192.0.2.2 41006 2 abcd\n' >"${T}/bad-record"
+printf 'ready 1 1 900\nstopped 2 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
+"${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
+assert_eq 1 "$?" "auto-expect refuses a record whose clock goes back"
+printf '1000 192.0.2.2 41006 2 abcd\n' >"${T}/bad-record"
+printf 'ready 1 1 900\nstopped 2 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
+"${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
+assert_eq 1 "$?" "auto-expect refuses a record whose transcript does not count its records"
+printf 'ready 1 1 900\n' >"${T}/bad-record.state"
+"${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
+assert_eq 1 "$?" "auto-expect refuses a record that has not ended"
+assert_eq "1700 192.0.2.1 51820 77 <its bytes>
+1700 192.0.2.1 51820 fragment 1400
+1700 192.0.2.1 - malformed 40" "$(py full-record 2>&1)" \
+	"record lines: a whole datagram with its bytes, a first fragment by its length, a malformed frame without a port"
 
 echo "=== IPv4/UDP framing before payload ==="
 assert_eq "datagram 77 77 whole" "$(py frame valid)" "a valid frame yields its UDP payload"
@@ -1347,19 +1626,19 @@ echo "=== The auto hint test's scenarios: planting and stale evidence (tests/tes
 # to the end is never judged, so no earlier scenario's files can stand in for
 # its evidence.
 HINT_LIVE="${SCRIPT_DIR}/test-boringtun-auto-hint-live.sh"
-for FUNCTION in run_scenario scenario plant_ok plant_expected; do
+for FUNCTION in run_scenario scenario plant_ok plant_expected capture_format; do
 	assert_true "${FUNCTION} is extracted from test-boringtun-auto-hint-live.sh" test -n "$(extract "${HINT_LIVE}" "${FUNCTION}")"
 done
-hint_case() { # [VAR=value...]: FIX_SENT, FIX_RC, FIX_SETUP, FIX_STALE
+hint_case() { # [VAR=value...]: FIX_SENT, FIX_RC, FIX_SETUP, FIX_ORACLE, FIX_STALE
 	# shellcheck disable=SC2034 # the fixture settings are read by the extracted functions
 	(
 		# shellcheck disable=SC2163 # the arguments are VAR=value assignments
-		export FIX_SENT="sent 27" FIX_RC=0 FIX_SETUP=0 FIX_STALE="" "$@"
+		export FIX_SENT="sent 27" FIX_RC=0 FIX_SETUP=0 FIX_ORACLE="expect sip" FIX_STALE="" "$@"
 		WORK="${T}/hint-work"
 		rm -rf "${WORK}" && mkdir -p "${WORK}"
-		NS_C=fixture VETH_C=fixture IF_C=fixture ADDR_S=203.0.113.1 ADDR_C=203.0.113.2
+		NS_S=fixture NS_C=fixture VETH_S=fixture VETH_C=fixture IF_C=fixture ADDR_S=203.0.113.1 ADDR_C=203.0.113.2
 		PORT=51998 CLIENT_PORT=41006 TUN_S=10.78.0.1 TUN_C=10.78.0.2 CAPTURE_SECONDS=12 S_SIZES=27,113,125,37 H_RANGES="${H}"
-		CLIENT_PUB="${FIXTURE_KEY}"
+		SERVER_PUB="${FIXTURE_KEY}" CLIENT_PUB="${FIXTURE_KEY}" STUN_PRELUDE="${PRELUDES}/stun.hex" EXPECT=""
 		PASSED=0 FAILED=0
 		ok() { echo "  OK: $1"; PASSED=$((PASSED + 1)); }
 		bad() { echo "  FAIL: $1"; FAILED=$((FAILED + 1)); }
@@ -1368,16 +1647,20 @@ hint_case() { # [VAR=value...]: FIX_SENT, FIX_RC, FIX_SETUP, FIX_STALE
 		start_peer() { :; }
 		ip() { :; }
 		tunnel_up() { :; }
-		bt_wire_capture_start() { echo fresh >"$6"; }
+		bt_wire_capture_start() { BT_WIRE_CAPTURE_READY_CLOCK=100; echo fresh >"$6"; }
+		bt_wire_capture_park() { :; }
+		bt_wire_capture_resume() { :; }
 		bt_wire_capture_finish() { :; }
+		bt_wire_now() { BT_WIRE_NOW=200; }
 		plant() { printf '%s\n' "${FIX_SENT}"; return "${FIX_RC}"; }
+		python3() { if [[ "$2" == auto-expect ]]; then echo "${FIX_ORACLE}"; else command python3 "$@"; fi; }
 		judge() { echo "  JUDGED $1 from: $(cat "${WORK}/$1.capture")"; ok "the stand-in judge ran"; }
-		for FUNCTION in run_scenario scenario plant_ok plant_expected; do
+		for FUNCTION in run_scenario scenario plant_ok plant_expected capture_format; do
 			eval "$(extract "${HINT_LIVE}" "${FUNCTION}")"
 		done
-		[[ -z "${FIX_STALE}" ]] || printf 'STALE\n' >"${WORK}/hint.capture"
+		[[ -z "${FIX_STALE}" ]] || printf 'STALE\n' | tee "${WORK}/hint.capture" "${WORK}/hint.expect" "${WORK}/hint.format" >/dev/null
 		if declare -F scenario >/dev/null; then
-			scenario hint hint 0 judge
+			scenario hint hint 0 none sip
 		else
 			run_scenario hint hint 0
 		fi
@@ -1392,12 +1675,20 @@ for REPORT in "sent 28" "sent 27 more" "sent 27:" ""; do
 	expect_fixture "planting that exits 0 but reports '${REPORT}' fails the scenario" reject "sent from 203.0.113.2:41006 (exit 0, '${REPORT}'" \
 		hint_case FIX_SENT="${REPORT}"
 done
-for CASE in "FIX_RC=1|planting failed" "FIX_SETUP=1|the setup failed"; do
+expect_fixture "a record that decides nothing fails the scenario" reject "decides what it selected for the client (undecided" \
+	hint_case FIX_ORACLE="undecided no initiation from this client was recorded by the end of the window"
+for CASE in "FIX_RC=1|planting failed" "FIX_SETUP=1|the setup failed" "FIX_ORACLE=undecided x|the record decided nothing"; do
 	OUTPUT="$(hint_case FIX_STALE=1 "${CASE%%|*}" 2>&1)"
-	assert_true "when ${CASE#*|}, an earlier scenario's capture is removed and nothing is judged" \
-		bash -c '[[ "$1" != *JUDGED* && "$1" == *"none of its evidence is judged"* ]] && ! grep -qs STALE "$2"/hint.capture' \
+	assert_true "when ${CASE#*|}, an earlier scenario's files are removed and nothing is judged" \
+		bash -c '[[ "$1" != *JUDGED* && "$1" == *"none of its evidence is judged"* ]] && ! grep -qs STALE "$2"/hint.expect "$2"/hint.format "$2"/hint.capture' \
 		_ "${OUTPUT}" "${T}/hint-work"
 done
+assert_eq "sent 5: 104 108 95 57 95" "$(
+	# shellcheck disable=SC2034 # read by the extracted plant_expected
+	STUN_PRELUDE="${PRELUDES}/stun.hex"
+	eval "$(extract "${HINT_LIVE}" plant_expected)"
+	plant_expected stun-sequence
+)" "the recorded STUN sequence is planted only with the report of all five datagrams, in order"
 
 echo "=== The fixture judge itself ==="
 crashing_fixture() {

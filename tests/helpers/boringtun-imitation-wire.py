@@ -45,6 +45,37 @@
       ones of this stream; records, transcript and exit statuses are those
       of capture.
 
+  record <destination port> <interface|any> <source address[,address...]> <source port|any> <seconds> <file>
+      capture-to, but every datagram is recorded whole, with the clock it
+      was received at: "<clock> <source address> <source port> <length>
+      <hex>"; the first fragment of a fragmented datagram as "<clock>
+      <address> <port> fragment <length>", a frame that is not valid
+      IPv4/UDP as "<clock> <address> - malformed <length>". Several source
+      addresses, any source port, and with "any" every interface of the
+      namespace, also one created later: what reached the server from its
+      clients, in arrival order. Transcript and exit statuses are capture's.
+
+  auto-expect <record> <address> <port> <layout> <server public key> <hp key file|-> <on|off> <epoch> <start> <end>
+      From a finished record (its transcript checked), derive what an
+      imitation auto server selects for the client at ADDRESS:PORT, by the
+      pinned BoringTun's own rules restated here (see "Imitation auto"
+      below): which of its datagrams fit an AmneziaWG packet kind under
+      LAYOUT (through the header-protection mask when HP KEY FILE holds the
+      base64 key; "on" for RandomTrailers), which protocol each of the others
+      is detected as, the hint that leaves (first per source, 30 s), the
+      genuine initiations (mac1 under the server's public key), and the
+      selection at the first one accepted, with the header-protection
+      policy. Prints one line per datagram that mattered, then "expect
+      <dns|quic|sip|stun|random>" for the server's datagrams to that client
+      between the clocks START and END (centiseconds of CLOCK_BOOTTIME).
+      EPOCH is when the server's state was last empty; the record must have
+      been ready by then. Nothing the server sent is consulted. "undecided
+      <reason>" (exit 1) when the record cannot decide: a malformed or
+      fragmented frame from that address, no initiation, a hint at the edge
+      of its lifetime, a peer that learned inside the window after a session
+      without it, or an outcome that depends on which initiation was
+      accepted first.
+
   classify <protocol> <file>
       For a capture without layout, print "<datagrams> <matching>": how many
       recorded prefixes have the shape PROTOCOL's imitation gives an S
@@ -551,8 +582,8 @@ def frame_payload(frame, source, source_port, destination=None, destination_port
     """(status, datagram length, datagram bytes, fragmented) for one IPv4 frame.
 
     Relevance is decided by addressing alone: the IPv4 source address (and
-    destination, when given), the IPv4 protocol, and the UDP ports. Every
-    length is validated before any byte counts as payload: the IPv4 header
+    destination, when given), the IPv4 protocol, and the UDP ports (a
+    SOURCE_PORT of None admits any source port). Every length is validated before any byte counts as payload: the IPv4 header
     length and total length within the frame, the UDP header within the IPv4
     payload, and the UDP length equal to the IPv4 payload -- or, for a first
     fragment, larger than it and a multiple of 8 bytes carried. A first
@@ -582,8 +613,9 @@ def frame_payload(frame, source, source_port, destination=None, destination_port
     if len(body) < 8:
         return MALFORMED, len(frame), b"", more
     sport, dport, udp_length = struct.unpack(">HHH", body[:6])
-    if sport != source_port or (destination_port is not None and dport != destination_port):
-        if (more and fragments is not None and destination_port is not None and sport == source_port
+    port_ok = source_port is None or sport == source_port
+    if not port_ok or (destination_port is not None and dport != destination_port):
+        if (more and fragments is not None and destination_port is not None and port_ok
                 and udp_length > len(body) and not len(body) % 8):
             # The first fragment of a datagram to another port: its later
             # fragments, which carry no ports, are then continuations.
@@ -615,6 +647,26 @@ def record_line(sizes, ranges, status, length, data, evidence=None):
         return "%s %d -" % (kind, length)
     prefix = data[:min(PREFIX_KEPT, sizes[KIND_NAMES.index(kind)])]
     return "%s %d %s" % (kind, length, prefix.hex() or "-")
+
+
+def full_record_line(clock, frame, status, length, data, fragmented):
+    """The `record` line of one relevant frame, or None for a continuation:
+    "<clock> <source address> <source port> <length> <hex>" for a whole
+    datagram, "<clock> <source address> <source port> fragment <length>" for
+    the first fragment of one (its later fragments are never inspected), and
+    "<clock> <source address> - malformed <frame length>" for a frame that is
+    not valid IPv4/UDP. CLOCK is CLOCK_BOOTTIME in centiseconds, read when the
+    frame was received."""
+    if status == CONTINUATION:
+        return None
+    address = socket.inet_ntoa(frame[12:16])
+    if status == MALFORMED:
+        return "%d %s - malformed %d" % (clock, address, length)
+    header = (frame[0] & 0x0F) * 4
+    sport = struct.unpack(">H", frame[header:header + 2])[0]
+    if fragmented:
+        return "%d %s %d fragment %d" % (clock, address, sport, length)
+    return "%d %s %d %d %s" % (clock, address, sport, length, data.hex() or "-")
 
 
 def write_state(path, line):
@@ -654,9 +706,14 @@ def boot_centiseconds(nanoseconds):
     return nanoseconds // 10 ** 7
 
 
-def capture(interface, source, source_port, seconds, path, layout=None, receiver=None, destination_port=None):
+def capture(interface, source, source_port, seconds, path, layout=None, receiver=None, destination_port=None,
+            full=False):
     """Record the relevant datagrams; return the exit status. With
-    DESTINATION_PORT, only those sent to that port are relevant. With LAYOUT,
+    DESTINATION_PORT, only those sent to that port are relevant. With FULL
+    (the `record` command), each datagram is recorded whole with its clock
+    (full_record_line); SOURCE may then be several addresses, comma-separated,
+    SOURCE_PORT "any", and INTERFACE "any" for every interface of the network
+    namespace, including those created after the capture is ready. With LAYOUT,
     RECEIVER is the base64 static public key of the peer they are sent to:
     the key under which Evidence checks mac1 when a datagram fits more than
     one kind, its receiver indices recorded in the order the datagrams
@@ -677,8 +734,11 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
     written whole: a stop is only acted on between records."""
     sizes, ranges = parse_layout(layout) if layout else (None, None)
     evidence = Evidence(parse_public_key(receiver)) if layout else None
-    wanted_source = socket.inet_aton(source)
-    wanted_port = parse_number(source_port, "port", 65535)
+    sources = source.split(",") if full else [source]
+    wanted_sources = {socket.inet_aton(address) for address in sources}
+    if len(wanted_sources) != len(sources) or any(not address for address in sources):
+        raise InputError("the source addresses %r are not distinct IPv4 addresses" % source)
+    wanted_port = None if full and source_port == "any" else parse_number(source_port, "port", 65535)
     wanted_destination = None if destination_port is None else parse_number(destination_port, "destination port", 65535)
     duration = parse_number(seconds, "capture seconds", 86400) * 10 ** 9
     state_path, stop_path = path + ".state", path + ".stop"
@@ -690,7 +750,8 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
     signal.set_wakeup_fd(wake_write)
     signal.signal(signal.SIGTERM, lambda signum, frame: stop.append(signum))
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
-    sock.bind((interface, 0))
+    if not (full and interface == "any"):
+        sock.bind((interface, 0))
     fragments = Fragments()
     records = 0
     with open(path, "w") as out:
@@ -706,11 +767,18 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
                 os.read(wake_read, 64)
             if sock not in readable:
                 continue
-            status, length, data, _ = frame_payload(sock.recv(65535), wanted_source, wanted_port,
-                                                    destination_port=wanted_destination, fragments=fragments)
+            frame = sock.recv(65535)
+            clock = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME))
+            if len(frame) < 16 or frame[12:16] not in wanted_sources:
+                continue
+            status, length, data, fragmented = frame_payload(frame, frame[12:16], wanted_port,
+                                                             destination_port=wanted_destination, fragments=fragments)
             if status == IGNORE:
                 continue
-            line = record_line(sizes, ranges, status, length, data, evidence)
+            if full:
+                line = full_record_line(clock, frame, status, length, data, fragmented)
+            else:
+                line = record_line(sizes, ranges, status, length, data, evidence)
             if line is not None:
                 out.write(line + "\n")
                 out.flush()
@@ -997,6 +1065,415 @@ def kinds(protocol, path, sizes_text):
     print("\n".join(rows))
 
 
+# ── Imitation auto: what the server can learn, from what reached it ─────────
+# A restatement of the pinned BoringTun's rules (b94943906b11), so that the
+# protocol an auto server must select for a peer is derived from the
+# datagrams that reached it, never from what it sent:
+#   - inbound_candidates: amnezia.rs candidates_under_mask, header protection
+#     included (header_protection.rs type_mask);
+#   - detect: noise/imitation/detect.rs with quic/version_negotiation.rs
+#     parse_long_header, stun.rs binding_request_len and dns.rs question_end;
+#   - the hint cache: device/imitation_auto.rs ImitationHints (only a
+#     datagram with no AmneziaWG candidate is observed; the first detected
+#     protocol per source address and port; HINT_LIFETIME 30 s, not extended
+#     by repeats; a connected peer's own pending hint, noise/imitation/auto.rs,
+#     behaves alike for its one source);
+#   - selection: noise/mod.rs commit_with_imitation (at an accepted handshake
+#     initiation while nothing is learned: the live hint, else detect over
+#     the initiation datagram itself; then pinned) and amnezia.rs
+#     resolve_imitation / check_header_protection_nonce (with header
+#     protection, sip is refused while any S is 31 bytes or more, and every
+#     protocol while any S is below 12).
+QUIC_REAL_VERSIONS = (0x00000001, 0x6B3343CF)
+QUIC_MAX_CID = 20
+STUN_MAX_REQUEST = 1024
+SIP_DETECT_PREFIXES = (b"SUBSCRIBE ", b"REGISTER ", b"OPTIONS ", b"MESSAGE ", b"INVITE ", b"CANCEL ",
+                       b"NOTIFY ", b"INFO ", b"ACK ", b"BYE ", b"SIP/")
+HINT_LIFETIME_CS = 3000
+# A hint whose age at a decision is this close to its lifetime is not
+# decided either way: the recorder's clock is read after the kernel delivered
+# the frame, the server's when its worker handled it.
+HINT_LIFETIME_MARGIN_CS = 100
+HP_NONCE_SIZE = 12
+
+
+def chacha20_block(key, counter, nonce):
+    """One 64-byte ChaCha20 block (RFC 8439 section 2.3): 32-byte KEY, 32-bit
+    block COUNTER, 12-byte NONCE."""
+    def rotl(value, count):
+        return ((value << count) & 0xFFFFFFFF) | (value >> (32 - count))
+
+    def quarter(x, a, b, c, d):
+        x[a] = (x[a] + x[b]) & 0xFFFFFFFF
+        x[d] = rotl(x[d] ^ x[a], 16)
+        x[c] = (x[c] + x[d]) & 0xFFFFFFFF
+        x[b] = rotl(x[b] ^ x[c], 12)
+        x[a] = (x[a] + x[b]) & 0xFFFFFFFF
+        x[d] = rotl(x[d] ^ x[a], 8)
+        x[c] = (x[c] + x[d]) & 0xFFFFFFFF
+        x[b] = rotl(x[b] ^ x[c], 7)
+
+    state = [0x61707865, 0x3320646E, 0x79622D32, 0x6B206574]
+    state += list(struct.unpack("<8I", key)) + [counter] + list(struct.unpack("<3I", nonce))
+    work = list(state)
+    for _ in range(10):
+        quarter(work, 0, 4, 8, 12)
+        quarter(work, 1, 5, 9, 13)
+        quarter(work, 2, 6, 10, 14)
+        quarter(work, 3, 7, 11, 15)
+        quarter(work, 0, 5, 10, 15)
+        quarter(work, 1, 6, 11, 12)
+        quarter(work, 2, 7, 8, 13)
+        quarter(work, 3, 4, 9, 14)
+    return struct.pack("<16I", *((work[i] + state[i]) & 0xFFFFFFFF for i in range(16)))
+
+
+def hp_keystream(key, datagram, length):
+    """The header-protection keystream of DATAGRAM: ChaCha20 under KEY with
+    the datagram's first 12 bytes as nonce, from block 0."""
+    nonce = bytes(datagram[:HP_NONCE_SIZE])
+    stream = b"".join(chacha20_block(key, block, nonce) for block in range((length + 63) // 64))
+    return stream[:length]
+
+
+def quic_long_header(data):
+    if len(data) < 7 or data[0] & 0xC0 != 0xC0:
+        return False
+    version = struct.unpack(">I", data[1:5])[0]
+    capped = version in QUIC_REAL_VERSIONS
+    known = (capped or (version & 0xFFFFFF00 == 0xFF000000 and version & 0xFF != 0)
+             or version & 0x0F0F0F0F == 0x0A0A0A0A)
+    if not known:
+        return False
+    dcid = data[5]
+    if capped and dcid > QUIC_MAX_CID:
+        return False
+    dcid_end = 6 + dcid
+    if dcid_end >= len(data):
+        return False
+    scid = data[dcid_end]
+    if capped and scid > QUIC_MAX_CID:
+        return False
+    return len(data) >= dcid_end + 1 + scid
+
+
+def stun_binding_request(data):
+    if not 20 <= len(data) <= STUN_MAX_REQUEST or data[:2] != b"\x00\x01" or data[4:8] != STUN_COOKIE:
+        return False
+    length = struct.unpack(">H", data[2:4])[0]
+    return length % 4 == 0 and len(data) == 20 + length
+
+
+def dns_qname_end(data, start):
+    position, total = start, 0
+    while True:
+        if position >= len(data):
+            return None
+        label = data[position]
+        if label & 0xC0:
+            return None
+        if label == 0:
+            return position + 1
+        if label > 63:
+            return None
+        total += 1 + label
+        if total + 1 > 255:
+            return None
+        position += 1 + label
+
+
+def dns_query(data):
+    if len(data) < 12 or data[2] & 0xF8 or data[3] & 0xCF:
+        return False
+    if struct.unpack(">HHH", data[4:10]) != (1, 0, 0):
+        return False
+    end = dns_qname_end(data, 12)
+    if end is None or len(data) < end + 4:
+        return False
+    return struct.unpack(">H", data[end + 2:end + 4])[0] in (1, 3, 4, 255)
+
+
+def detect(data):
+    """The protocol upstream's detect() recognizes in DATA, or None."""
+    if not data:
+        return None
+    if quic_long_header(data):
+        return "quic"
+    has_cookie = len(data) >= 8 and data[4:8] == STUN_COOKIE
+    if stun_binding_request(data):
+        return "stun"
+    if not has_cookie and dns_query(data):
+        return "dns"
+    head = bytes(data[:10])
+    if any(len(head) >= len(prefix) and head[:len(prefix)].lower() == prefix.lower()
+           for prefix in SIP_DETECT_PREFIXES):
+        return "sip"
+    return None
+
+
+def inbound_candidates(datagram, sizes, ranges, hp_key=None, trailers=False):
+    """The AmneziaWG packet kinds DATAGRAM fits on arrival (upstream's
+    inbound_candidates): a handshake kind of exactly S + its size (at least,
+    with RandomTrailers), transport of at least S4 + 32, and the type tag
+    after the S prefix -- read through the header-protection mask when a key
+    is set -- in the kind's H range. With a key, a datagram shorter than the
+    nonce fits nothing, and a kind whose S is below 12 is never read."""
+    mask = b"\x00" * 4
+    if hp_key is not None:
+        if len(datagram) < HP_NONCE_SIZE:
+            return []
+        mask = hp_keystream(hp_key, datagram, 4)
+    found = []
+    for name, index, size in KINDS:
+        offset = sizes[index]
+        if name == "transport" or trailers:
+            fits = len(datagram) >= offset + size
+        else:
+            fits = len(datagram) == offset + size
+        if not fits or (hp_key is not None and offset < HP_NONCE_SIZE):
+            continue
+        tag = struct.unpack("<I", bytes(a ^ b for a, b in zip(datagram[offset:offset + 4], mask)))[0]
+        if ranges[index][0] <= tag <= ranges[index][1]:
+            found.append(name)
+    return found
+
+
+def genuine_initiation(datagram, candidates, sizes, mac1_key, hp_key=None):
+    """Whether DATAGRAM is a handshake initiation to the server: an init
+    candidate whose 148-byte message (unmasked with the header-protection
+    keystream when a key is set) carries a mac1 valid under the server's
+    public key. That is what the server checks before its Noise trial; a
+    sender that knows the public key can compute it, so it identifies the
+    initiation of a correctly configured client and authenticates no one."""
+    if "init" not in candidates:
+        return False
+    message = bytes(datagram[sizes[0]:sizes[0] + 148])
+    if hp_key is not None:
+        message = bytes(a ^ b for a, b in zip(message, hp_keystream(hp_key, datagram, 148)))
+    mac1 = hashlib.blake2s(message[:-32], digest_size=16, key=mac1_key).digest()
+    return hmac.compare_digest(mac1, message[-32:-16])
+
+
+def client_transport(datagram, candidates, sizes, hp_key=None):
+    """Whether DATAGRAM reads as the client's own transport: a transport
+    candidate that no protocol detector recognizes, whose 64-bit counter
+    (bytes 8-16 of the message, which header protection masks with the rest
+    of its 16-byte header) is below 2**32. A session's counters start at 0; an
+    imitation datagram that happens to fit the transport rule is recognized,
+    and random junk has a counter that small about once in 2**32."""
+    if "transport" not in candidates or detect(datagram) is not None:
+        return False
+    header = bytes(datagram[sizes[3]:sizes[3] + 16])
+    if hp_key is not None:
+        header = bytes(a ^ b for a, b in zip(header, hp_keystream(hp_key, datagram, 16)))
+    return struct.unpack("<Q", header[8:16])[0] < 2 ** 32
+
+
+def policy_allows(protocol, sizes, hp_key):
+    """Whether resolve_imitation keeps PROTOCOL: without header protection
+    always; with it, never while an S is below the nonce, and sip only while
+    every S is below SIP_REQUEST_LINE_MIN."""
+    if hp_key is None:
+        return True
+    if min(sizes) < HP_NONCE_SIZE:
+        return False
+    return not (protocol == "sip" and max(sizes) >= SIP_REQUEST_LINE_MIN)
+
+
+RECORD_DATAGRAM = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) (0|[1-9][0-9]{0,4}) (0|[1-9][0-9]{0,4}) (-|(?:[0-9a-f]{2})+)")
+RECORD_FRAGMENT = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) (0|[1-9][0-9]{0,4}) fragment (0|[1-9][0-9]{0,4})")
+RECORD_MALFORMED = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) - malformed (0|[1-9][0-9]{0,4})")
+
+
+def full_records(path):
+    """The records of a finished `record` and its ready clock. Its transcript
+    must be a ready line and a stopped or complete end that counts every
+    record, every record well formed, its clocks never going back. A record is
+    (clock, address, port, kind, data), KIND "datagram", "fragment" or
+    "malformed" (port None)."""
+    with open(path + ".state") as state:
+        transcript = state.read().splitlines()
+    ready = re.fullmatch(r"ready [0-9]+ [0-9]+ (0|[1-9][0-9]{0,17})", transcript[0]) if transcript else None
+    if len(transcript) != 2 or not ready:
+        raise InputError("%s.state is not a ready line and one end" % path)
+    records = []
+    last = int(ready.group(1))
+    for number, line in capture_lines(path):
+        where = "%s:%d" % (path, number)
+        for kind, pattern in (("datagram", RECORD_DATAGRAM), ("fragment", RECORD_FRAGMENT), ("malformed", RECORD_MALFORMED)):
+            match = pattern.fullmatch(line)
+            if match:
+                break
+        else:
+            raise InputError("%s is not a record line: %r" % (where, line[:80]))
+        clock = int(match.group(1))
+        try:
+            socket.inet_aton(match.group(2))
+        except OSError:
+            raise InputError("%s has no IPv4 source address" % where) from None
+        if clock < last:
+            raise InputError("%s goes back in time" % where)
+        last = clock
+        if kind == "datagram":
+            data = b"" if match.group(5) == "-" else bytes.fromhex(match.group(5))
+            if len(data) != int(match.group(4)):
+                raise InputError("%s: its length is not that of its bytes" % where)
+            records.append((clock, match.group(2), int(match.group(3)), kind, data))
+        elif kind == "fragment":
+            records.append((clock, match.group(2), int(match.group(3)), kind, b""))
+        else:
+            records.append((clock, match.group(2), None, kind, b""))
+    end = re.fullmatch(r"(?:stopped ([0-9]+) [0-9a-f]{32}|complete ([0-9]+) [0-9]+)", transcript[1])
+    if not end or int(end.group(1) or end.group(2)) != len(records):
+        raise InputError("%s.state does not end with a stop or completion that counts its %d records" % (path, len(records)))
+    return records, int(ready.group(1))
+
+
+class Undecided(Exception):
+    """The record does not decide what the server selected."""
+
+
+def simulate_auto(events, sizes, ranges, mac1_key, hp_key, trailers, ignored):
+    """Replay one client's datagrams (clock, data), in arrival order, through
+    the hint cache and the selection; the genuine initiations whose indices
+    are in IGNORED are taken as not accepted. Returns (learned protocol or
+    None, the clock it was learned at, the accepted initiations' clocks,
+    notes)."""
+    pending = None
+    learned = None
+    learned_at = None
+    accepted = []
+    notes = []
+    initiation = 0
+    start = events[0][0] if events else 0
+
+    def live(clock):
+        age = clock - pending[1]
+        if abs(age - HINT_LIFETIME_CS) < HINT_LIFETIME_MARGIN_CS:
+            raise Undecided("a hint was %.2f s old when it mattered, too close to its 30 s lifetime to decide" % (age / 100))
+        return age < HINT_LIFETIME_CS
+
+    for clock, data in events:
+        at = "+%.2fs %d B" % ((clock - start) / 100, len(data))
+        candidates = inbound_candidates(data, sizes, ranges, hp_key, trailers)
+        if not candidates:
+            found = detect(data)
+            if learned is None and found is not None:
+                if pending is None or not live(clock):
+                    pending = (found, clock)
+                    notes.append("%s: %s, fits no AmneziaWG kind: the hint" % (at, found))
+                else:
+                    notes.append("%s: %s, fits no AmneziaWG kind; the live %s hint stays" % (at, found, pending[0]))
+            elif learned is None:
+                notes.append("%s: no protocol detected, fits no AmneziaWG kind" % at)
+            continue
+        if not genuine_initiation(data, candidates, sizes, mac1_key, hp_key):
+            if learned is None and not (accepted and client_transport(data, candidates, sizes, hp_key)):
+                found = detect(data)
+                notes.append("%s: %san AmneziaWG %s candidate: never a hint" % (at, found + ", but " if found else "", "/".join(candidates)))
+            continue
+        index = initiation
+        initiation += 1
+        if index in ignored:
+            continue
+        accepted.append(clock)
+        if learned is not None:
+            continue
+        hint = pending[0] if pending is not None and live(clock) else None
+        selected = hint or detect(data)
+        origin = "the hint" if hint else "the initiation datagram"
+        if selected is None:
+            notes.append("%s: initiation %d, no live hint and nothing detected in it: unresolved" % (at, index + 1))
+        elif policy_allows(selected, sizes, hp_key):
+            learned, learned_at, pending = selected, clock, None
+            notes.append("%s: initiation %d selects %s from %s: learned" % (at, index + 1, selected, origin))
+        else:
+            notes.append("%s: initiation %d, %s from %s refused by the header-protection policy: unresolved" % (at, index + 1, selected, origin))
+    return learned, learned_at, accepted, notes
+
+
+def window_expectation(learned, learned_at, accepted, window_start, window_end):
+    """What the server's datagrams to the client between WINDOW_START and
+    WINDOW_END must be, or Undecided."""
+    if learned is not None and learned_at <= window_start:
+        return learned
+    if learned is not None and learned_at <= window_end:
+        if any(clock < learned_at for clock in accepted):
+            raise Undecided("the peer learned %s inside the window, after a session without it" % learned)
+        return learned
+    if not any(clock <= window_end for clock in accepted):
+        raise Undecided("no initiation from this client was recorded by the end of the window")
+    return "random"
+
+
+def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trailers_text, epoch_text, start_text, end_text):
+    """Print how an auto server treats the client at ADDRESS:PORT, from the
+    finished `record` at PATH: one line per datagram from it that mattered,
+    then "expect <dns|quic|sip|stun|random>" for the server's datagrams to it
+    between the clocks START and END. EPOCH is when the server's state was
+    last empty (its start); the record must have been ready by then. Returns
+    1, after "undecided <reason>", when the record cannot decide: a malformed
+    or fragmented frame from that address, no initiation, a hint at the edge
+    of its lifetime, a peer that learned inside the window after a session
+    without it, or an outcome that depends on which initiation the server
+    accepted first (each initiation up to the first one the client's own
+    transport follows is tried as that one)."""
+    sizes, ranges = parse_layout(layout)
+    port = parse_number(port_text, "port", 65535)
+    mac1_key = hashlib.blake2s(MAC1_LABEL + parse_public_key(server_key)).digest()
+    hp_key = None
+    if hp_key_path != "-":
+        with open(hp_key_path) as source:
+            hp_key = parse_public_key(source.read().strip())
+    if trailers_text not in ("on", "off"):
+        raise InputError("RandomTrailers is on or off, not %r" % trailers_text)
+    trailers = trailers_text == "on"
+    epoch = parse_number(epoch_text, "epoch", 2 ** 62, WIDE_NUMBER)
+    window_start = parse_number(start_text, "window start", 2 ** 62, WIDE_NUMBER)
+    window_end = parse_number(end_text, "window end", 2 ** 62, WIDE_NUMBER)
+    try:
+        socket.inet_aton(address)
+    except OSError:
+        raise InputError("%r is not an IPv4 address" % address) from None
+    records, ready = full_records(path)
+    try:
+        if ready > epoch:
+            raise Undecided("the record was ready at %d, after the server's state was last empty at %d" % (ready, epoch))
+        events = []
+        for clock, source, source_port, kind, data in records:
+            if clock < epoch or clock > window_end or source != address:
+                continue
+            if kind == "malformed" or (kind == "fragment" and source_port == port):
+                raise Undecided("a %s frame from %s arrived at %d" % (kind, address, clock))
+            if source_port == port:
+                events.append((clock, data))
+        # The client sends transport only once a response reached it, so the
+        # first initiation followed by a transport candidate before the next
+        # initiation bounds the one the server accepted first; any before it
+        # may have gone unanswered.
+        initiations = 0
+        bound = None
+        for _, data in events:
+            candidates = inbound_candidates(data, sizes, ranges, hp_key, trailers)
+            if genuine_initiation(data, candidates, sizes, mac1_key, hp_key):
+                initiations += 1
+            elif initiations and bound is None and client_transport(data, candidates, sizes, hp_key):
+                bound = initiations
+        outcomes = []
+        for skipped in range(bound or max(initiations, 1)):
+            learned, learned_at, accepted, notes = simulate_auto(events, sizes, ranges, mac1_key, hp_key, trailers, set(range(skipped)))
+            if skipped == 0:
+                print("\n".join(notes) if notes else "no datagram from %s:%d" % (address, port))
+            outcomes.append(window_expectation(learned, learned_at, accepted, window_start, window_end))
+        if len(set(outcomes)) > 1:
+            raise Undecided("the outcome depends on which of %d initiations the server accepted (%s)" % (initiations, ", ".join(outcomes)))
+    except Undecided as reason:
+        print("undecided %s" % reason)
+        return 1
+    print("expect %s" % outcomes[0])
+    return 0
+
+
 def main(argv):
     try:
         if len(argv) == 4 and argv[0] == "probe" and argv[1] in PROBES:
@@ -1005,6 +1482,10 @@ def main(argv):
             return capture(*argv[1:])
         elif len(argv) in (7, 9) and argv[0] == "capture-to":
             return capture(*argv[2:], destination_port=argv[1])
+        elif len(argv) == 7 and argv[0] == "record":
+            return capture(*argv[2:], destination_port=argv[1], full=True)
+        elif len(argv) == 11 and argv[0] == "auto-expect":
+            return auto_expect(*argv[1:])
         elif len(argv) == 3 and argv[0] == "classify":
             classify(argv[1], argv[2])
         elif len(argv) == 3 and argv[0] == "classify-auto":

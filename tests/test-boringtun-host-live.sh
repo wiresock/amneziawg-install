@@ -1046,6 +1046,7 @@ RC=$?
 check "auto with a hostname is refused" test "${RC}" -ne 0
 check "  saying that auto takes none" grep -q "auto takes no hostname" "${WORK}/imitation.log"
 check "  before anything changed" test "$(main_pid)" = "${PID}" -a "$(status_line imitation_protocol)" = "imitation_protocol=none"
+bt_auto_record_start "AWG 2.0"
 bash "${INSTALLER}" --set-boringtun-imitation auto >"${WORK}/imitation.log" 2>&1 </dev/null
 RC=$?
 tail -n 14 "${WORK}/imitation.log" | sed 's/^/    | /'
@@ -1087,6 +1088,7 @@ done
 bt_auto_setup
 bt_auto_mixed_clients
 echo "--- auto: AWG 3.0 keeps auto"
+bt_auto_record_start "AWG 3.0"
 bash "${INSTALLER}" --enable-awg3 >"${WORK}/protocol.log" 2>&1 </dev/null
 RC=$?
 tail -n 8 "${WORK}/protocol.log" | sed 's/^/    | /'
@@ -1197,11 +1199,13 @@ SIP_WIRE_RC="${PIPESTATUS[0]}"
 check "the fixed-size SIP wire test passes" test "${SIP_WIRE_RC}" -eq 0
 
 # ── Auto hints, fixed layout ────────────────────────────────────────────────
-# The planted SIP hint of the auto checks, on the same verified binary with
-# fixed sizes: a SIP datagram long enough to be an AmneziaWG candidate is
-# never a hint, the 27-byte hint is learned, and under AWG 3.0 BoringTun's own
-# warning shows the header-protection refusal of that hint
-# (tests/test-boringtun-auto-hint-live.sh).
+# What an auto server learns, on the same verified binary with fixed layouts
+# (tests/test-boringtun-auto-hint-live.sh): a SIP datagram long enough to be
+# an AmneziaWG candidate is never a hint, the 27-byte hint is learned, under
+# AWG 3.0 BoringTun's own warning shows the header-protection refusal of that
+# hint, a recorded STUN client's datagrams are or are not learned by H4 alone,
+# and real dns, quic, sip and stun clients are learned under a layout their
+# datagrams do not fit; each outcome derived from what reached the server.
 echo "=== Auto hints (fixed layout)"
 check "the auto hint test runs the embedded release's binary" \
 	test "$(sha256sum "${CLIENT_BIN}" | cut -d' ' -f1)" = "${BINARY_SHA256}"

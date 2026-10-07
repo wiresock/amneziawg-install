@@ -2846,26 +2846,53 @@ explains its behaviour, and offers it only when the installed binary supports it
   verified binary running those imitations), one without imitation, and one without imitation
   whose port first sends a 27-byte SIP request line (a planted hint). Two networks hold three
   clients each, on different ports behind one address. Each client's stream is recorded on its
-  side with `capture-to` (the destination port filter of `boringtun-imitation-wire.py`) and
-  held to its learned protocol (`classify-auto`, or the per-kind SIP rule); the server's
-  endpoints show the shared addresses with distinct ports. Under AWG 3.0 the planted SIP hint
-  must leave its peer random when an S prefix is 31 bytes or more.
+  side with `capture-to` (the destination port filter of `boringtun-imitation-wire.py`); the
+  server's endpoints show the shared addresses with distinct ports.
+- What the server must have selected for each peer is derived from what reached it, never
+  from what it sent. Each stage runs the wire helper's `record` on the host, from before the
+  daemon serving it started, which keeps every datagram from the client addresses whole with
+  its clock; `auto-expect` then applies the pinned BoringTun's rules to one client's
+  datagrams: AmneziaWG packet-kind candidates (through the header-protection mask under AWG
+  3.x) are never hints, the rest are classified as `detect()` does, the first per source
+  address and port is the hint for 30 s, and the client's genuine initiation (mac1 under the
+  server's public key) selects the live hint or, without one, what its own datagram is
+  detected as, subject to the header-protection policy. The candidate and detection rules
+  agree with upstream's own `inbound_candidates()` and `detect()` on 3,926 vectors (recorded
+  client datagrams, fuzzed protocol datagrams and random bytes under random and constructed
+  layouts, 719 with header protection), run once against an unmodified export of
+  `b94943906b11`. A record that cannot decide (a fragment or malformed frame from the client's
+  address, no initiation, a hint at the edge of its lifetime, an outcome that depends on which
+  initiation was accepted first, or a peer that learned during an observation after an
+  unresolved session) fails the observation. Each capture is then held to the decision: a
+  learned `dns`, `quic` or `stun` shapes every datagram but its probe replies (`classify-auto`),
+  a learned `sip` follows the per-kind SIP rule, an unresolved peer shows no `dns`, `stun` or
+  `sip` shape; each capture must also fail against the opposite outcome where the two can be
+  told apart. No real client is assumed to be learned under the installer's random layouts.
+- `tests/test-boringtun-auto-hint-live.sh` fixes the layouts so that outcomes are known, and
+  checks that the record gives them: the wire helper's 247-byte SIP probe under an H4 that
+  holds its bytes at S4 (a transport candidate, never learned); the 27-byte SIP hint (learned;
+  under AWG 3.0 it draws BoringTun's warning that the header-protection policy refused sip,
+  which no run without a hint shows, the positive evidence the installed daemon, logging errors
+  only, cannot give); the five datagrams a real STUN client sent before its initiation,
+  recorded whole and sent again unchanged, under two layouts that differ only in H4 (both STUN
+  requests are transport candidates under one, and nothing is learned; under the other the
+  first is the hint, and `stun` is learned); real `dns`, `quic`, `sip` and `stun` clients under
+  a layout their datagrams practically never fit (each learned); and real STUN clients under the
+  layout of an independent review, S1–S4 110,57,133,25 with H4 1740000000–1839999999, where
+  their STUN requests are transport candidates in some runs and not in others, so the record
+  decides each run. Cross-controls hold each known pair's captures to the other's outcome.
 - The planted hint is shorter than any AmneziaWG datagram (32 bytes: a transport behind an S4
   of 0), because BoringTun hands only datagrams that fit no packet kind to probe
-  classification, the only door that records a hint. The hint first planted was the wire
-  helper's 247-byte SIP probe; under the installer's random layouts it is a transport candidate
-  whenever its four bytes at S4 fall in H4 (about one layout in four for the S4 values of the
-  failing jobs), and then BoringTun, correctly, takes it for AmneziaWG traffic and never
-  learns it. That made two of four BoringTun Host jobs fail, and one of four again after a
-  change that only re-sent the same datagram. The live test now shows, for the planted hint,
-  that it fits no packet kind under the server's layout, that it was sent, that exactly it
-  reached the server's interface before the client started, and that the peer's handshake
-  came within the hint's 30 s lifetime. `tests/test-boringtun-auto-hint-live.sh` keeps the
-  mechanism on a fixed layout (the failing job's S sizes with an H4 that holds the probe's
-  bytes): the probe is never learned, the 27-byte hint is, and under AWG 3.0 the hint draws
-  BoringTun's warning that the header-protection policy refused the learned sip, which no run
-  without a hint shows. That warning is the positive evidence for the AWG 3.0 case, which the
-  installed daemon (logging errors only) cannot give.
+  classification, the only door that records a hint. The live test shows, for the planted
+  hint, that it fits no packet kind under the server's layout, that its sender exited 0 and
+  reported exactly that datagram, that exactly it reached the server's interface before the
+  client started, and that the peer's handshake came within the hint's 30 s lifetime.
+- History of the planted hint. The hint first planted was the wire helper's 247-byte SIP probe;
+  under the installer's random layouts it is a transport candidate whenever its four bytes at S4
+  fall in H4 (about one layout in four for the S4 values of the failing jobs), and then
+  BoringTun, correctly, takes it for AmneziaWG traffic and never learns it. That made two of
+  four BoringTun Host jobs fail, and one of four again after a change that only re-sent the
+  same datagram.
 - The BoringTun Host jobs that start from an earlier installer (`9f5a1afb87f7`, release
   `71d88784` build 1, and `c7cd737c221a`, release `ae2ab44e9a68` build 1) then use those real,
   different binaries: a rollback with `auto` is refused and changes nothing; with `quic` it

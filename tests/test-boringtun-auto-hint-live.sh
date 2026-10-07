@@ -1,39 +1,57 @@
 #!/bin/bash
-# Live, deterministic test of the planted SIP hint that the imitation auto
-# checks of tests/test-boringtun-host-live.sh rely on, on the given
-# boringtun-cli (the verified binary of the release under test). A server with
-# --imitate-protocol auto (at --verbosity info, so that its warnings are
-# visible) and a stock client (--imitate-protocol none, listen port 41006) run
-# in fresh network namespaces with fixed S1-S4 and H1-H4. Before the client
-# starts, a datagram is sent to the server from the client's address and
-# port; the client's side then records the server's datagrams while the
-# client pings through the tunnel.
+# Live test of what an imitation auto server learns, on the given
+# boringtun-cli (the verified binary of the release under test), with layouts
+# fixed so that the outcome is known. A server with --imitate-protocol auto
+# (at --verbosity info, so that its warnings are visible) and one client
+# (listen port 41006) run in fresh network namespaces. Before the client
+# starts, a scenario may send datagrams to the server from the client's
+# address and port; the client's side then records the server's datagrams
+# while the client pings through the tunnel.
 #
-# The layout is S1=27 S2=113 S3=125 S4=37 with H4 1767000000-1866999999, the S
-# sizes of the BoringTun Host job that failed (run 37615364152) and an H4 that
-# holds the four bytes the 247-byte SIP probe of
-# tests/helpers/boringtun-imitation-wire.py has at offset 37. Under it:
-#   collision: that probe, the hint the live test planted before, is an
-#     AmneziaWG transport candidate (at least S4 + 32 bytes, its tag at S4 in
-#     H4), so the server takes it for AmneziaWG traffic and never for a hint:
-#     no response or transport to that client carries a SIP request line.
-#     This is the failure the host test saw whenever its random layout made
-#     the probe a candidate.
-#   hint: the 27-byte request line that `send sip` plants, shorter than any
-#     AmneziaWG datagram, is learned: with S2 and S4 of 31 bytes or more,
-#     every response and transport carries a request line.
-#   AWG 3.0, hint: with a header-protection key the same hint draws
-#     BoringTun's warning that the header-protection policy refused the
-#     learned sip, and no datagram to the client carries a SIP shape.
-#   AWG 3.0, no hint: no such warning, and no SIP shape either; so the
-#     warning above is the hint's.
-# Every capture must be ready before its traffic, run its whole interval and
-# complete (tests/helpers/boringtun-wire-checks.sh).
+# What the server must have selected is never read from what it sent. The
+# server's side records everything that reaches it from the client's address
+# (the helper's record), and the helper's auto-expect derives the selection
+# from that record by the pinned BoringTun's own rules: which datagrams fit
+# an AmneziaWG packet kind (never a hint), which protocol each other one is
+# detected as, the 30 s hint, the client's genuine initiation and the
+# header-protection policy. The server's datagrams to the client are then
+# held to that expectation. Each scenario whose layout and traffic were
+# chosen to give a known outcome also checks that the record gives it.
+#
+#   collision (S 27,113,125,37, H4 1767000000-1866999999): the 247-byte SIP
+#     probe of tests/helpers/boringtun-imitation-wire.py, which the live test
+#     once planted, is an AmneziaWG transport candidate here (its four bytes
+#     at 37 fall in H4), so it is never a hint: random.
+#   hint: the 27-byte request line `send sip` plants, shorter than any
+#     AmneziaWG datagram, is learned: sip.
+#   hp-hint, hp-none: with header protection that hint draws BoringTun's
+#     warning that the policy refused sip (an S is 31 bytes or more) and the
+#     peer stays random; without a hint there is no warning, so the warning
+#     is the hint's.
+#   stun-replay-colliding, stun-replay-clear (S 110,57,133,36, the review's
+#     H1-H3): the five datagrams a real STUN client sent before its
+#     initiation, recorded whole, are sent again unchanged, then a client
+#     without imitation connects. Under H4 1917290954-2017290953 both STUN
+#     requests are transport candidates (bytes 36-39 of each fall in H4) and
+#     the junk is detected as nothing: random. With only H4 changed to
+#     2030000000-2129999999 the first request is a hint: stun.
+#   genuine-dns, -quic, -sip, -stun (S 40, H ranges 100 wide): real clients of
+#     each imitation, under a layout their datagrams practically never fit;
+#     each must be learned, and the record must show eligible evidence.
+#   reviewed-stun-1..3 (S 110,57,133,25, H4 1740000000-1839999999, the
+#     review's case): real STUN clients, whose STUN requests are transport
+#     candidates there in some runs and not in others. No outcome is
+#     assumed: the record decides each run, and the server must match it.
+# Cross-controls then hold captures to the expectation of the opposite
+# scenario (collision against hint, colliding against clear STUN replay):
+# a server that learned without eligible evidence, or did not learn with it,
+# fails.
+#
 # A scenario's evidence is judged only if every step of it succeeded: the
-# setup, the capture, the planted datagram (its sender's exit status and its
-# exact report), the client, the tunnel and the capture's completion. Its
-# capture is removed before it starts, so nothing of an earlier scenario can
-# stand in for its own.
+# setup, the server-side record, the client-side capture, the planted
+# traffic (its sender's exit status and its exact report), the tunnel, and a
+# decision from the record. Its files are removed before it starts, so
+# nothing of an earlier scenario can stand in for its own.
 #
 # Requirements: root, ip (iproute2) with network namespaces, /dev/net/tun, awg
 # (amneziawg-tools), ping, python3 and AWG_DISPOSABLE_HOST_TEST=1. With
@@ -46,6 +64,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC2034 # read by the sourced boringtun-wire-checks.sh
 WIRE="${SCRIPT_DIR}/helpers/boringtun-imitation-wire.py"
+STUN_PRELUDE="${SCRIPT_DIR}/fixtures/boringtun-auto-preludes/stun.hex"
 BIN="${1:-}"
 RUN_ID="$(printf '%04x' $((RANDOM % 65536)))"
 NS_S="awgah-s-${RUN_ID}"
@@ -60,13 +79,21 @@ TUN_S="10.78.0.1"
 TUN_C="10.78.0.2"
 PORT=51998
 CLIENT_PORT=41006
-S_SIZES="27,113,125,37"
-H_RANGES="100000001-100000100,200000001-200000100,300000001-300000100,1767000000-1866999999"
+NARROW_H123="100000001-100000100,200000001-200000100,300000001-300000100"
+REVIEW_H123="66166068-166166067,862271148-962271147,1349667297-1449667296"
+LAYOUT_SIP="27,113,125,37|${NARROW_H123},1767000000-1866999999"
+LAYOUT_STUN_COLLIDING="110,57,133,36|${REVIEW_H123},1917290954-2017290953"
+LAYOUT_STUN_CLEAR="110,57,133,36|${REVIEW_H123},2030000000-2129999999"
+LAYOUT_POSITIVE="40,40,40,40|${NARROW_H123},400000001-400000100"
+LAYOUT_REVIEWED="110,57,133,25|${REVIEW_H123},1740000000-1839999999"
+S_SIZES=""
+H_RANGES=""
 CAPTURE_SECONDS=12
 REFUSAL='auto imitation refused by header-protection policy; retaining random prefixes'
 WORK=""
 PEERS=()
 CREATED_NETNS=()
+EXPECT=""
 PASSED=0
 FAILED=0
 
@@ -106,9 +133,10 @@ for TOOL in ip awg ping python3; do
 	command -v "${TOOL}" >/dev/null 2>&1 || die "${TOOL} is required"
 done
 [[ -c /dev/net/tun ]] || die "/dev/net/tun is required"
+[[ -s "${STUN_PRELUDE}" ]] || die "${STUN_PRELUDE} is required"
 
-# Stop this run's peers (owned children), then remove the namespaces it made
-# and the UAPI nodes of its own interface names.
+# Stop this run's peers and captures (owned children), then remove the
+# namespaces it made and the UAPI nodes of its own interface names.
 teardown() {
 	local HANDLE NETNS IF
 	for HANDLE in "${PEERS[@]}"; do
@@ -118,6 +146,10 @@ teardown() {
 	done
 	PEERS=()
 	bt_wire_cleanup
+	# shellcheck disable=SC2034 # the sourced boringtun-wire-checks.sh's capture state
+	BT_WIRE_CAPTURE=""
+	# shellcheck disable=SC2034 # the sourced boringtun-wire-checks.sh's capture state
+	BT_WIRE_PARKED=()
 	for NETNS in "${CREATED_NETNS[@]}"; do
 		ip netns delete "${NETNS}" 2>/dev/null
 	done
@@ -145,7 +177,13 @@ if [[ -n "${AWG_LIVE_SECRET_SCAN:-}" ]]; then
 fi
 SERVER_PUB="$(awg pubkey <<<"${SERVER_KEY}")"
 CLIENT_PUB="$(awg pubkey <<<"${CLIENT_KEY}")"
+# For auto-expect, which unmasks with it; never printed.
+(umask 077 && printf '%s\n' "${HP_KEY}" >"${WORK}/hp.key")
 
+use_layout() { # <S1,S2,S3,S4|H1,H2,H3,H4>
+	S_SIZES="${1%%|*}"
+	H_RANGES="${1#*|}"
+}
 shared_lines() { # <hp 0|1>
 	local S1 S2 S3 S4 H1 H2 H3 H4
 	IFS=, read -r S1 S2 S3 S4 <<<"${S_SIZES}"
@@ -207,36 +245,46 @@ setup() { # <hp 0|1>
 	: >"${WORK}/server.log"
 	start_peer "${NS_S}" "${IF_S}" "${WORK}/server.log" "${WORK}/server.conf" "${TUN_S}" "${TUN_C}" auto info
 }
-# The datagram a scenario plants from the client's port, by name: the
-# helper's 27-byte SIP hint, the 247-byte SIP probe, or nothing. Each sender
-# reports exactly what it sent (plant_expected) and exits 0 only if it sent it.
-plant() { # <hint|probe|none>
+# The datagrams a scenario plants from the client's port, by name: the
+# helper's 27-byte SIP hint, the 247-byte SIP probe, the recorded STUN
+# client's pre-initiation datagrams in order, or nothing. Each sender reports
+# exactly what it sent (plant_expected) and exits 0 only if it sent it.
+plant() { # <hint|probe|stun-sequence|none>
 	case "$1" in
 		hint)
 			ip netns exec "${NS_C}" python3 "${WIRE}" send sip "${ADDR_S}" "${PORT}" "${CLIENT_PORT}"
 			;;
-		probe)
-			ip netns exec "${NS_C}" python3 - "${WIRE}" "${ADDR_S}" "${PORT}" "${CLIENT_PORT}" <<'PY'
-import importlib.util, socket, sys
+		probe | stun-sequence)
+			ip netns exec "${NS_C}" python3 - "${WIRE}" "${ADDR_S}" "${PORT}" "${CLIENT_PORT}" "$1" "${STUN_PRELUDE}" <<'PY'
+import importlib.util, socket, sys, time
 spec = importlib.util.spec_from_file_location("wire", sys.argv[1])
 wire = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wire)
-request, _ = wire.sip_probe()
+if sys.argv[5] == "probe":
+    datagrams = [wire.sip_probe()[0]]
+else:
+    datagrams = [bytes.fromhex(line) for line in open(sys.argv[6]).read().split()]
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
     sock.bind(("0.0.0.0", int(sys.argv[4])))
-    if sock.sendto(request, (sys.argv[2], int(sys.argv[3]))) != len(request):
-        sys.exit("short send")
-print("sent %d" % len(request))
+    for datagram in datagrams:
+        if sock.sendto(datagram, (sys.argv[2], int(sys.argv[3]))) != len(datagram):
+            sys.exit("short send")
+        time.sleep(0.015)
+if sys.argv[5] == "probe":
+    print("sent %d" % len(datagrams[0]))
+else:
+    print("sent %d: %s" % (len(datagrams), " ".join(str(len(d)) for d in datagrams)))
 PY
 			;;
 		none) echo "sent nothing" ;;
 		*) return 2 ;;
 	esac
 }
-plant_expected() { # <hint|probe|none>
+plant_expected() { # <hint|probe|stun-sequence|none>
 	case "$1" in
 		hint) echo "sent 27" ;;
 		probe) echo "sent 247" ;;
+		stun-sequence) printf 'sent %s: %s\n' "$(grep -c . "${STUN_PRELUDE}")" "$(awk '{ printf "%s%d", (NR == 1 ? "" : " "), length($0) / 2 }' "${STUN_PRELUDE}")" ;;
 		none) echo "sent nothing" ;;
 	esac
 }
@@ -249,89 +297,165 @@ plant_ok() { # <exit status> <report> <kind>
 tunnel_up() {
 	ip netns exec "${NS_C}" ping -c 15 -i 0.2 -W 2 -q "${TUN_S}" >/dev/null
 }
-# One scenario: plant, then start the client and ping inside a capture of the
-# server's datagrams. Returns 0 only if every step succeeded; its capture is
+# The client-side capture's form: per packet kind where a learned sip is
+# possible and the tags can be read (no header protection), else prefixes.
+capture_format() { # <plant> <hp> <client imitation>
+	if (($2 == 0)) && [[ "$1" =~ ^(hint|probe)$ || "$3" == sip ]]; then echo kinds; else echo prefixes; fi
+}
+# One scenario: the server, its record of what reaches it, the client-side
+# capture, the planted traffic, the client, then the decision from the
+# record (EXPECT). Returns 0 only if every step succeeded; its files are
 # removed first and written anew.
-run_scenario() { # <name> <hint|probe|none> <hp 0|1>
-	local NAME="$1" CAPTURE="${WORK}/$1.capture" SENT RC FAILED_BEFORE="${FAILED}"
+run_scenario() { # <name> <hint|probe|stun-sequence|none> <hp 0|1> [client imitation]
+	local NAME="$1" PLANT="$2" HP="$3" IMITATION="${4:-none}" CAPTURE="${WORK}/$1.capture" RECORD="${WORK}/$1.record"
+	local SENT RC FAILED_BEFORE="${FAILED}" EPOCH START END ORACLE FORMAT HP_FILE=-
 	local -a LAYOUT=()
-	rm -f -- "${CAPTURE}" "${CAPTURE}".*
-	echo "--- ${NAME}: S1-S4 ${S_SIZES}, H4 ${H_RANGES##*,}, planted: $2$( (($3)) && echo ', header protection')"
-	if ! setup "$3"; then
+	EXPECT=""
+	rm -f -- "${CAPTURE}" "${CAPTURE}".* "${RECORD}" "${RECORD}".* "${WORK}/${NAME}".{expect,format,sizes}
+	FORMAT="$(capture_format "${PLANT}" "${HP}" "${IMITATION}")"
+	echo "--- ${NAME}: S1-S4 ${S_SIZES}, H4 ${H_RANGES##*,}, client ${IMITATION}, planted: ${PLANT}$( ((HP)) && echo ', header protection')"
+	if ! setup "${HP}"; then
 		bad "${NAME}: the server could not be set up"
 		return 1
 	fi
-	(($3)) || LAYOUT=("${S_SIZES},${H_RANGES}" "${CLIENT_PUB}")
+	# Nothing in the client's namespace has sent anything yet, so the record
+	# that is ready now holds everything that reaches the server from there.
+	if ! BT_WIRE_CAPTURE_RECORD=1 BT_WIRE_CAPTURE_TO_PORT="${PORT}" bt_wire_capture_start "${NS_S}" "${VETH_S}" "${ADDR_C}" any 600 "${RECORD}"; then
+		bad "${NAME}: the server-side record of what reaches the server started"
+		return 1
+	fi
+	EPOCH="${BT_WIRE_CAPTURE_READY_CLOCK}"
+	if ! bt_wire_capture_park record; then
+		bad "${NAME}: the server-side record runs alongside the client-side capture"
+		return 1
+	fi
+	[[ "${FORMAT}" != kinds ]] || LAYOUT=("${S_SIZES},${H_RANGES}" "${CLIENT_PUB}")
 	if ! bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" "${CAPTURE_SECONDS}" "${CAPTURE}" "${LAYOUT[@]}"; then
-		bad "${NAME}: the capture started"
+		bad "${NAME}: the client-side capture started"
 		return 1
 	fi
-	SENT="$(plant "$2" 2>&1)"
+	START="${BT_WIRE_CAPTURE_READY_CLOCK}"
+	SENT="$(plant "${PLANT}" 2>&1)"
 	RC=$?
-	if ! plant_ok "${RC}" "${SENT}" "$2"; then
-		bad "${NAME}: the planted datagram was sent from ${ADDR_C}:${CLIENT_PORT} (exit ${RC}, '${SENT}'; wanted exit 0 and '$(plant_expected "$2")')"
+	if ! plant_ok "${RC}" "${SENT}" "${PLANT}"; then
+		bad "${NAME}: the planted datagrams were sent from ${ADDR_C}:${CLIENT_PORT} (exit ${RC}, '${SENT}'; wanted exit 0 and '$(plant_expected "${PLANT}")')"
 		return 1
 	fi
-	ok "${NAME}: the planted datagram was sent from ${ADDR_C}:${CLIENT_PORT} before the client started (${SENT})"
-	if ! start_peer "${NS_C}" "${IF_C}" "${WORK}/client.log" "${WORK}/client.conf" "${TUN_C}" "${TUN_S}" none error; then
+	ok "${NAME}: the planted datagrams were sent from ${ADDR_C}:${CLIENT_PORT} before the client started (${SENT})"
+	if ! start_peer "${NS_C}" "${IF_C}" "${WORK}/client.log" "${WORK}/client.conf" "${TUN_C}" "${TUN_S}" "${IMITATION}" error; then
 		bad "${NAME}: the client could not be set up"
 		return 1
 	fi
 	check "${NAME}: the client reaches the server through the tunnel (15 pings)" tunnel_up
-	check "${NAME}: the capture outlived the traffic, ran its whole ${CAPTURE_SECONDS} s and completed with all its records" \
+	check "${NAME}: the client-side capture outlived the traffic, ran its whole ${CAPTURE_SECONDS} s and completed with all its records" \
 		bt_wire_capture_finish "${CAPTURE}" complete "$((CAPTURE_SECONDS + 10))"
-	((FAILED == FAILED_BEFORE))
+	bt_wire_now
+	END="${BT_WIRE_NOW}"
+	if bt_wire_capture_resume record && bt_wire_capture_finish "${RECORD}" stop 10; then
+		ok "${NAME}: the server-side record ran from before the planted traffic until its authorized stop ($(wc -l <"${RECORD}") datagrams)"
+	else
+		bad "${NAME}: the server-side record ran from before the planted traffic until its authorized stop"
+		return 1
+	fi
+	((HP == 0)) || HP_FILE="${WORK}/hp.key"
+	ORACLE="$(python3 "${WIRE}" auto-expect "${RECORD}" "${ADDR_C}" "${CLIENT_PORT}" "${S_SIZES},${H_RANGES}" "${SERVER_PUB}" \
+		"${HP_FILE}" off "${EPOCH}" "${START}" "${END}" 2>&1)"
+	sed 's/^/    record | /' <<<"${ORACLE}"
+	if [[ "${ORACLE##*$'\n'}" =~ ^expect\ (dns|quic|sip|stun|random)$ ]]; then
+		EXPECT="${BASH_REMATCH[1]}"
+		ok "${NAME}: what reached the server decides what it selected for the client: ${EXPECT}"
+	else
+		bad "${NAME}: what reached the server decides what it selected for the client (${ORACLE##*$'\n'})"
+		return 1
+	fi
+	((FAILED == FAILED_BEFORE)) || return 1
+	printf '%s\n' "${EXPECT}" >"${WORK}/${NAME}.expect"
+	printf '%s\n' "${FORMAT}" >"${WORK}/${NAME}.format"
+	printf '%s\n' "${S_SIZES}" >"${WORK}/${NAME}.sizes"
 }
-# Run a scenario and, only if it ran to the end, its JUDGE <name>: no
-# earlier scenario's capture or server log can stand in for its evidence.
-scenario() { # <name> <hint|probe|none> <hp 0|1> <judge>
-	if ! run_scenario "$1" "$2" "$3"; then
+# Hold a scenario's capture to its expectation.
+judge() { # <name>
+	local EXPECT_OF FORMAT
+	EXPECT_OF="$(cat "${WORK}/$1.expect")"
+	FORMAT="$(cat "${WORK}/$1.format")"
+	if [[ "${EXPECT_OF}" == sip && "${FORMAT}" == kinds ]]; then
+		bt_wire_assert_sip "$1" "${WORK}/$1.capture" "$(cat "${WORK}/$1.sizes")" \
+			init:optional response:required cookie:optional transport:required
+		return
+	fi
+	if bt_wire_auto_verdict "${EXPECT_OF}" "${WORK}/$1.capture" "${FORMAT}" "$(cat "${WORK}/$1.sizes")"; then
+		ok "$1: the server's datagrams to the client are ${EXPECT_OF}, as the record decided (${BT_WIRE_REASON})"
+	else
+		bad "$1: the server's datagrams to the client are ${EXPECT_OF}, as the record decided (${BT_WIRE_REASON})"
+	fi
+}
+# Run a scenario and, only if it ran to the end, judge it; with KNOWN, the
+# record must also give that outcome.
+scenario() { # <name> <plant> <hp 0|1> <client imitation> <known outcome|->
+	if ! run_scenario "$1" "$2" "$3" "$4"; then
 		bad "$1: the scenario did not run to the end, so none of its evidence is judged"
 		return 1
 	fi
-	"$4" "$1"
+	[[ "$5" == - ]] || check "$1: the record gives ${5}, the outcome this layout and traffic were chosen for (${EXPECT})" test "${EXPECT}" = "$5"
+	judge "$1"
+}
+# Hold one scenario's capture to another's expectation, which it must fail.
+cross_control() { # <scenario whose capture> <scenario whose expectation>
+	local OTHER
+	if [[ ! -s "${WORK}/$1.expect" || ! -s "${WORK}/$2.expect" ]]; then
+		bad "cross-control $1 against $2: both scenarios ran to the end"
+		return
+	fi
+	OTHER="$(cat "${WORK}/$2.expect")"
+	if [[ "${OTHER}" == "$(cat "${WORK}/$1.expect")" ]]; then
+		bad "cross-control $1 against $2: their records decide different outcomes (both ${OTHER})"
+	elif bt_wire_auto_verdict "${OTHER}" "${WORK}/$1.capture" "$(cat "${WORK}/$1.format")" "$(cat "${WORK}/$1.sizes")"; then
+		bad "cross-control: $1's capture passes as ${OTHER}, $2's outcome (${BT_WIRE_REASON})"
+	else
+		ok "cross-control: $1's capture fails as ${OTHER}, $2's outcome (${BT_WIRE_REASON})"
+	fi
 }
 refusals() {
 	sed 's/\x1b\[[0-9;]*m//g' "${WORK}/server.log" | grep -cF "${REFUSAL}"
 }
-judge_collision() {
-	bt_wire_kinds "${WORK}/$1.capture" "${S_SIZES}" ||
-		bad "$1: the capture has a complete, valid per-kind result (${BT_WIRE_REASON})"
-	check "$1: responses were recorded (${BT_WIRE_SEEN[response]:-0}), none with a SIP request line (${BT_WIRE_SHAPED[response]:-?})" \
-		test "${BT_WIRE_SEEN[response]:-0}" -ge 1 -a "${BT_WIRE_SHAPED[response]:-1}" -eq 0
-	check "$1: transports were recorded (${BT_WIRE_SEEN[transport]:-0}), none with a SIP request line (${BT_WIRE_SHAPED[transport]:-?}): the probe was taken for AmneziaWG, never for a hint" \
-		test "${BT_WIRE_SEEN[transport]:-0}" -ge 10 -a "${BT_WIRE_SHAPED[transport]:-1}" -eq 0
-}
-judge_hint() {
-	bt_wire_assert_sip "$1" "${WORK}/$1.capture" "${S_SIZES}" init:optional response:required:shaped cookie:optional transport:required:shaped
-}
-judge_unshaped() { # <name>: no dns, stun or sip shape
-	local COUNTS
-	COUNTS="$(python3 "${WIRE}" classify-auto none "${WORK}/$1.capture" 2>&1)"
-	check "$1: the server sent datagrams, none with a dns, stun or sip shape (${COUNTS})" \
-		bash -c '[[ "$1" =~ ^([0-9]+)\ 0\ 0\ ([0-9]+)$ ]] && ((BASH_REMATCH[1] >= 10))' _ "${COUNTS}"
-}
-judge_hp_hint() {
-	check "AWG 3.0, hint: BoringTun warns that the header-protection policy refused the learned sip" \
-		bash -c 'sed "s/\x1b\[[0-9;]*m//g" "$1" | grep -F "$2" | grep -q "\"sip\""' _ "${WORK}/server.log" "${REFUSAL}"
-	judge_unshaped "$1"
-}
-judge_hp_none() {
-	check "AWG 3.0, no hint: no refusal warning ($(refusals))" test "$(refusals)" -eq 0
-	judge_unshaped "$1"
-}
 
 echo "=== Auto hints on $("${BIN}" --version 2>/dev/null) ($(sha256sum "${BIN}" | cut -d' ' -f1))"
-LAYOUT_TEXT="${S_SIZES},${H_RANGES}"
-check "the 247-byte SIP probe is an AmneziaWG transport candidate under this layout" \
-	test "$(python3 "${WIRE}" candidates probe sip "${LAYOUT_TEXT}")" = "247 transport"
+use_layout "${LAYOUT_SIP}"
+check "the 247-byte SIP probe is an AmneziaWG transport candidate under S ${S_SIZES}, H4 ${H_RANGES##*,}" \
+	test "$(python3 "${WIRE}" candidates probe sip "${S_SIZES},${H_RANGES}")" = "247 transport"
 check "the 27-byte SIP hint fits no AmneziaWG packet kind under it" \
-	test "$(python3 "${WIRE}" candidates send sip "${LAYOUT_TEXT}")" = "27 none"
+	test "$(python3 "${WIRE}" candidates send sip "${S_SIZES},${H_RANGES}")" = "27 none"
 
-scenario collision probe 0 judge_collision
-scenario hint hint 0 judge_hint
-scenario hp-hint hint 1 judge_hp_hint
-scenario hp-none none 1 judge_hp_none
+scenario collision probe 0 none random
+scenario hint hint 0 none sip
+if scenario hp-hint hint 1 none random; then
+	check "hp-hint: BoringTun warns that the header-protection policy refused the learned sip" \
+		bash -c 'sed "s/\x1b\[[0-9;]*m//g" "$1" | grep -F "$2" | grep -q "\"sip\""' _ "${WORK}/server.log" "${REFUSAL}"
+fi
+if scenario hp-none none 1 none random; then
+	check "hp-none: no refusal warning ($(refusals))" test "$(refusals)" -eq 0
+fi
+cross_control collision hint
+cross_control hint collision
+
+use_layout "${LAYOUT_STUN_COLLIDING}"
+scenario stun-replay-colliding stun-sequence 0 none random
+use_layout "${LAYOUT_STUN_CLEAR}"
+scenario stun-replay-clear stun-sequence 0 none stun
+cross_control stun-replay-colliding stun-replay-clear
+cross_control stun-replay-clear stun-replay-colliding
+
+use_layout "${LAYOUT_POSITIVE}"
+for PROTOCOL in dns quic sip stun; do
+	scenario "genuine-${PROTOCOL}" none 0 "${PROTOCOL}" "${PROTOCOL}"
+done
+
+use_layout "${LAYOUT_REVIEWED}"
+OUTCOMES=""
+for RUN in 1 2 3; do
+	scenario "reviewed-stun-${RUN}" none 0 stun - && OUTCOMES+=" ${EXPECT}"
+done
+echo "    (real STUN clients under the reviewed layout; the record decided:${OUTCOMES:- nothing})"
 
 echo
 echo "BoringTun auto hint test: ${PASSED} passed, ${FAILED} failed"
