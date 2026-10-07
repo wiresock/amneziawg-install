@@ -197,6 +197,8 @@ source "${SCRIPT_DIR}/helpers/boringtun-wire-checks.sh"
 source "${SCRIPT_DIR}/helpers/boringtun-contracts.sh"
 # shellcheck source=helpers/boringtun-lifecycle-fixture.sh
 source "${SCRIPT_DIR}/helpers/boringtun-lifecycle-fixture.sh"
+# shellcheck source=helpers/boringtun-auto-live.sh
+source "${SCRIPT_DIR}/helpers/boringtun-auto-live.sh"
 fw_args() {
 	FW_ARGS=("/etc/amnezia/amneziawg/${IF}.conf" "${IF}" "${PORT}" "${PUBLIC_NIC}")
 }
@@ -317,6 +319,7 @@ cleanup() {
 	trap - EXIT
 	((FAILED == 0)) || dump_diagnostics
 	[[ -n "${CLIENT_PID}" ]] && kill "${CLIENT_PID}" 2>/dev/null
+	bt_auto_cleanup
 	bt_wire_cleanup
 	local PID
 	for PID in "${LISTENER_PIDS[@]}"; do
@@ -471,9 +474,21 @@ RELEASE_LOG="${WORK}/install.log"
 if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 	echo "=== The earlier installer's release"
 	PREVIOUS="${AWG_LIVE_PREVIOUS_INSTALLER}"
-	PROBLEMS="$(btc_buildless_embedded_release_problems "${PREVIOUS}")"
+	# Two earlier installers are covered: the last one without protocol
+	# imitation (9f5a1afb87f7), whose release constants predate the build
+	# number, and the one that embedded the release before this one
+	# (c7cd737c221a), with a build number and imitation none.
+	if grep -q '^AWG_BT_RELEASE_BUILD=' "${PREVIOUS}"; then
+		PROBLEMS="$(btc_embedded_release_problems "${PREVIOUS}")"
+		PREV_FORMAT="with a build number"
+	else
+		PROBLEMS="$(btc_buildless_embedded_release_problems "${PREVIOUS}")"
+		PREV_FORMAT="without a build number"
+	fi
+	PREV_IMITATES=0
+	grep -q '^function _awgBtImitationProtocolValid()' "${PREVIOUS}" && PREV_IMITATES=1
 	[[ -z "${PROBLEMS}" ]] || sed 's/^/    | /' <<<"${PROBLEMS}"
-	check "the earlier installer embeds a consistent release in the format without a build number" test -z "${PROBLEMS}"
+	check "the earlier installer embeds a consistent release in the format ${PREV_FORMAT}" test -z "${PROBLEMS}"
 	PREV_TAG="$(btc_embedded_value "${PREVIOUS}" TAG)"
 	PREV_SOURCE_COMMIT="$(btc_embedded_value "${PREVIOUS}" SOURCE_COMMIT)"
 	PREV_ASSET="$(btc_embedded_value "${PREVIOUS}" "ASSET_${ARCH_KEY}")"
@@ -509,9 +524,19 @@ if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 	check "  with the earlier installer's embedded SHA-256" \
 		test "$(sha256sum "/proc/${PREV_PID}/exe" 2>/dev/null | cut -d' ' -f1)" = "${PREV_BINARY_SHA256}"
 	PREV_ARGS="$(tr '\0' ' ' <"/proc/${PREV_PID}/cmdline")"
-	check "upgrade: the earlier installer's params have no imitation keys" bash -c '! grep -q "^AWG_BORINGTUN_" /etc/amnezia/amneziawg/params'
+	if ((PREV_IMITATES)); then
+		check "upgrade: the earlier installer's params persist imitation none" \
+			test "$(grep '^AWG_BORINGTUN_' /etc/amnezia/amneziawg/params | tr '\n' ' ')" = "AWG_BORINGTUN_IMITATE_PROTOCOL='none' AWG_BORINGTUN_IMITATE_DOMAIN='' "
+		check "upgrade: its daemon names it on its command line" bash -c '[[ "$1" == *" --imitate-protocol none ${2} " ]]' _ "${PREV_ARGS}" "${IF}"
+	else
+		check "upgrade: the earlier installer's params have no imitation keys" bash -c '! grep -q "^AWG_BORINGTUN_" /etc/amnezia/amneziawg/params'
+		check "upgrade: its daemon was started without --imitate-protocol" bash -c '[[ "$1" != *--imitate-protocol* ]]' _ "${PREV_ARGS}"
+	fi
 	check "upgrade: its runtime file is FORMAT=1 alone" test "$(grep -v '^#' "/etc/amnezia/amneziawg/${IF}.boringtun")" = "FORMAT=1"
-	check "upgrade: its daemon was started without --imitate-protocol" bash -c '[[ "$1" != *--imitate-protocol* ]]' _ "${PREV_ARGS}"
+	check "upgrade: the earlier binary does not support imitation auto, as its own answer says" \
+		bash -c 'source "$1" && _awgBtBinaryImitationSupport "$2" auto; [[ $? == 1 ]]' _ "${INSTALLER}" "${STORE}/${PREV_ID}/boringtun-cli"
+	check "  although it reports the same version as this installer's release" \
+		test "$("${STORE}/${PREV_ID}/boringtun-cli" --version 2>/dev/null)" = "boringtun $(installer_value AWG_BT_RELEASE_VERSION)"
 fi
 
 bash "${INSTALLER}" --add-client client >"${WORK}/client-add.private" 2>&1 </dev/null
@@ -637,7 +662,11 @@ check "the daemon executes the embedded release's binary" \
 	test "$(sha256sum "/proc/$(main_pid)/exe" 2>/dev/null | cut -d' ' -f1)" = "${BINARY_SHA256}"
 DAEMON_ARGS="$(tr '\0' ' ' <"/proc/$(main_pid)/cmdline")"
 if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
-	check "upgrade: params still have no imitation keys" bash -c '! grep -q "^AWG_BORINGTUN_" /etc/amnezia/amneziawg/params'
+	if ((PREV_IMITATES)); then
+		check "upgrade: params still persist imitation none" grep -qx "AWG_BORINGTUN_IMITATE_PROTOCOL='none'" /etc/amnezia/amneziawg/params
+	else
+		check "upgrade: params still have no imitation keys" bash -c '! grep -q "^AWG_BORINGTUN_" /etc/amnezia/amneziawg/params'
+	fi
 	check "upgrade: the runtime file is still FORMAT=1 alone" test "$(grep -v '^#' "/etc/amnezia/amneziawg/${IF}.boringtun")" = "FORMAT=1"
 	check "upgrade: the restarted daemon names the imitation that file means, none" \
 		bash -c '[[ "$1" == *" --imitate-protocol none ${2} " ]]' _ "${DAEMON_ARGS}" "${IF}"
@@ -997,6 +1026,161 @@ imitation_step sip pbx.example
 imitation_step stun
 imitation_step none
 datapath "after the imitation cycle"
+
+# ── Imitation auto ──────────────────────────────────────────────────────────
+# The installed daemon with --imitate-protocol auto, set through the installer,
+# and clients with different imitation settings on the one server port
+# (tests/helpers/boringtun-auto-live.sh). The probe responder answers what
+# each probe is; SIP and QUIC v1 stay silent, and loopback is never answered.
+echo "=== Imitation auto"
+auto_status() {
+	bash "${INSTALLER}" --backend-status 2>/dev/null |
+		grep -E '^(imitation_protocol|imitation_domain|imitation_domain_mode|daemon_state|daemon_imitation_protocol|daemon_imitation_domain|imitation_auto_support)=' |
+		tr '\n' ' '
+}
+check "before auto: the installed binary is reported to support it" test "$(status_line imitation_auto_support)" = "imitation_auto_support=supported"
+HASHES_BEFORE_AUTO="$(client_config_hashes)"
+PID="$(main_pid)"
+bash "${INSTALLER}" --set-boringtun-imitation auto example.com >"${WORK}/imitation.log" 2>&1 </dev/null
+RC=$?
+check "auto with a hostname is refused" test "${RC}" -ne 0
+check "  saying that auto takes none" grep -q "auto takes no hostname" "${WORK}/imitation.log"
+check "  before anything changed" test "$(main_pid)" = "${PID}" -a "$(status_line imitation_protocol)" = "imitation_protocol=none"
+bash "${INSTALLER}" --set-boringtun-imitation auto >"${WORK}/imitation.log" 2>&1 </dev/null
+RC=$?
+tail -n 14 "${WORK}/imitation.log" | sed 's/^/    | /'
+check "auto: --set-boringtun-imitation auto succeeds" test "${RC}" -eq 0
+check "auto: the warnings explain the per-peer selection" grep -q "for each authenticated peer" "${WORK}/imitation.log"
+check "auto: no client config was rewritten" test "$(client_config_hashes)" = "${HASHES_BEFORE_AUTO}"
+check "auto: params persist it, without a hostname" \
+	test "$(grep '^AWG_BORINGTUN_' /etc/amnezia/amneziawg/params | tr '\n' ' ')" = "AWG_BORINGTUN_IMITATE_PROTOCOL='auto' AWG_BORINGTUN_IMITATE_DOMAIN='' "
+check "auto: the runtime file says 'FORMAT=1 IMITATE_PROTOCOL=auto'" \
+	test "$(grep -v '^#' "/etc/amnezia/amneziawg/${IF}.boringtun" | tr '\n' ' ' | sed 's/ $//')" = "FORMAT=1 IMITATE_PROTOCOL=auto"
+check_served "auto"
+ARGS="$(tr '\0' ' ' <"/proc/$(main_pid)/cmdline")"
+check "auto: the daemon runs --imitate-protocol auto, the interface last" bash -c '[[ "$1" == *" --imitate-protocol auto ${2} " ]]' _ "${ARGS}" "${IF}"
+check "auto: with no --imitate-domain" bash -c '[[ "$1" != *--imitate-domain* ]]' _ "${ARGS}"
+check "auto: the daemon's environment is only NO_COLOR and PATH" \
+	test "$(tr '\0' '\n' <"/proc/$(main_pid)/environ" | cut -d= -f1 | sort | tr '\n' ' ')" = "NO_COLOR PATH "
+check "auto: --backend-status reports auto configured and running, and the binary's support, nothing per peer" \
+	test "$(auto_status)" = "imitation_protocol=auto imitation_domain= imitation_domain_mode=none daemon_state=running daemon_imitation_protocol=auto daemon_imitation_domain= imitation_auto_support=supported "
+check "auto: the listen port is still ${PORT}" test "$(awg show "${IF}" listen-port 2>/dev/null)" = "${PORT}"
+check "auto: no transaction directory is left" bash -c '! compgen -G "/etc/amnezia/amneziawg/.awg-imitation.*" >/dev/null'
+check "auto: no scratch interface, unit or record is left" scratch_clean
+bash "${INSTALLER}" --set-boringtun-imitation auto >"${WORK}/imitation.log" 2>&1 </dev/null
+check "auto: setting it again changes nothing" grep -q "already auto" "${WORK}/imitation.log"
+datapath "auto, a client without imitation"
+for KIND in dns stun quic quic-v1 sip; do
+	EXPECTED=silent
+	case "${KIND}" in
+		dns) EXPECTED=servfail ;;
+		stun) EXPECTED=binding-success ;;
+		quic) EXPECTED=version-negotiation ;;
+	esac
+	GOT="$(ip netns exec "${NS}" python3 "${WIRE}" probe "${KIND}" "${HOST_ADDR}" "${PORT}" 2>&1)"
+	check "auto: a ${KIND} probe from ${CLIENT_ADDR} gets ${EXPECTED} (${GOT})" test "${GOT}" = "${EXPECTED}"
+done
+for KIND in dns stun; do
+	GOT="$(python3 "${WIRE}" probe "${KIND}" 127.0.0.1 "${PORT}" 2>&1)"
+	check "auto: a ${KIND} probe from loopback is never answered (${GOT})" test "${GOT}" = silent
+done
+bt_auto_setup
+bt_auto_mixed_clients
+echo "--- auto: AWG 3.0 keeps auto"
+bash "${INSTALLER}" --enable-awg3 >"${WORK}/protocol.log" 2>&1 </dev/null
+RC=$?
+tail -n 8 "${WORK}/protocol.log" | sed 's/^/    | /'
+check "auto: --enable-awg3 succeeds" test "${RC}" -eq 0
+check "  and first states what a learned dns does to header protection" grep -q "A learned dns leaves 16 random bits" "${WORK}/protocol.log"
+check "  params keep auto" grep -qx "AWG_BORINGTUN_IMITATE_PROTOCOL='auto'" /etc/amnezia/amneziawg/params
+check "  and the daemon runs it" test "$(status_line daemon_imitation_protocol)" = "daemon_imitation_protocol=auto"
+check_served "AWG 3.0 with auto"
+bt_auto_header_protection
+bash "${INSTALLER}" --disable-awg3 >"${WORK}/protocol.log" 2>&1 </dev/null
+check "auto: back to AWG 2.0 under auto" test "$?" -eq 0
+check "  keeps auto" test "$(status_line daemon_imitation_protocol)" = "daemon_imitation_protocol=auto"
+bt_auto_teardown
+datapath "auto, after the mixed clients left"
+
+# ── Across releases: auto, a rollback to the earlier release, re-upgrade ────
+# With an earlier installer, previous is the earlier installer's own
+# published release, whose binary has no auto: a real version transition,
+# never a relabelled copy. The rollback must refuse auto and change nothing;
+# with a fixed imitation it must move the service onto that binary, keep
+# traffic and configuration, and refuse auto there; the upgrade back must
+# restore this release without a download, after which auto applies again.
+if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
+	echo "=== Across releases: auto, rollback to ${PREV_ID} and re-upgrade"
+	check "current is this installer's release, previous the earlier one" test "$(store_links)" = "${RELEASE_ID} ${PREV_ID}"
+	check "status: with auto configured, no rollback is offered to a previous binary without it" \
+		release_status_is "installed_release=${RELEASE_ID} pinned_release=${RELEASE_ID} previous_release=${PREV_ID} rollback_available=no upgrade_available=no daemon_release=${RELEASE_ID} "
+	installation_baseline
+	PID="$(main_pid)"
+	lifecycle_log() { # <flag> <log>
+		bash "${INSTALLER}" "$1" >"${WORK}/$2" 2>&1 </dev/null
+	}
+	lifecycle_log --rollback-boringtun rollback-auto.log
+	RC=$?
+	tail -n 4 "${WORK}/rollback-auto.log" | sed 's/^/    | /'
+	check "--rollback-boringtun with auto configured is refused" test "${RC}" -ne 0
+	check "  naming the earlier release and auto" grep -qF "${PREV_ID} does not support the configured protocol imitation auto" "${WORK}/rollback-auto.log"
+	check "  with the way out: a fixed imitation or none first" grep -q -- "--set-boringtun-imitation" "${WORK}/rollback-auto.log"
+	check "  current and previous are unchanged" test "$(store_links)" = "${RELEASE_ID} ${PREV_ID}"
+	check "  the daemon was not restarted" test "$(main_pid)" = "${PID}"
+	check "  and still executes this release's binary, running auto" \
+		bash -c 'daemon() { [[ "$(sha256sum "/proc/$1/exe" 2>/dev/null | cut -d" " -f1)" == "$2" && "$(tr "\0" " " <"/proc/$1/cmdline")" == *"--imitate-protocol auto "* ]]; }; daemon "$@"' _ "$(main_pid)" "${BINARY_SHA256}"
+	check "  params, the runtime file and every config are byte for byte the same" installation_unchanged
+	check "  the tunnel still carries traffic" wait_for 10 tunnel_ping
+	bash "${INSTALLER}" --set-boringtun-imitation quic cdn.example.org >"${WORK}/imitation.log" 2>&1 </dev/null
+	check "a fixed imitation, quic, is selected first" test "$?" -eq 0
+	check "status: now the rollback is offered" \
+		release_status_is "installed_release=${RELEASE_ID} pinned_release=${RELEASE_ID} previous_release=${PREV_ID} rollback_available=yes upgrade_available=no daemon_release=${RELEASE_ID} "
+	installation_baseline
+	PID="$(main_pid)"
+	lifecycle_log --rollback-boringtun rollback-cross.log
+	RC=$?
+	tail -n 6 "${WORK}/rollback-cross.log" | sed 's/^/    | /'
+	check "--rollback-boringtun to the earlier release succeeds" test "${RC}" -eq 0
+	check "  current is the earlier release and previous this installer's" test "$(store_links)" = "${PREV_ID} ${RELEASE_ID}"
+	check "  the daemon was restarted onto the earlier binary" test "$(main_pid)" != "${PID}" -a "$(bt_unit_release "${UNIT}" "${STORE}")" = "${PREV_ID}"
+	check "  which has the earlier installer's embedded SHA-256" \
+		test "$(sha256sum "/proc/$(main_pid)/exe" 2>/dev/null | cut -d' ' -f1)" = "${PREV_BINARY_SHA256}"
+	check "  and is not this release's binary" test "${PREV_BINARY_SHA256}" != "${BINARY_SHA256}"
+	check "  it runs the fixed imitation" \
+		bash -c '[[ "$(tr "\0" " " <"/proc/$1/cmdline")" == *" --imitate-protocol quic --imitate-domain cdn.example.org ${2} "* ]]' _ "$(main_pid)" "${IF}"
+	check "  status: the earlier release installed and running, this one previous and offered as the upgrade" \
+		release_status_is "installed_release=${PREV_ID} pinned_release=${RELEASE_ID} previous_release=${RELEASE_ID} rollback_available=yes upgrade_available=yes daemon_release=${PREV_ID} "
+	check "  status: the installed binary does not support auto" test "$(status_line imitation_auto_support)" = "imitation_auto_support=unsupported"
+	check "  params, the runtime file and every config are byte for byte the same" installation_unchanged
+	check "  the active instance is the one its start recorded" \
+		bash -c 'source "$1" && _awgBtCheckServedByBoringtun "$2"' _ "${INSTALLER}" "${IF}"
+	wire_prefixes quic
+	PID="$(main_pid)"
+	bash "${INSTALLER}" --set-boringtun-imitation auto >"${WORK}/imitation.log" 2>&1 </dev/null
+	RC=$?
+	sed -n '/ERROR/p' "${WORK}/imitation.log" | sed 's/^/    | /'
+	check "on the earlier release, auto is refused" test "${RC}" -ne 0
+	check "  saying that its binary does not support it" grep -qF "the installed BoringTun release ${PREV_ID} does not support protocol imitation auto" "${WORK}/imitation.log"
+	check "  with the upgrade to run" grep -q -- "--upgrade-boringtun" "${WORK}/imitation.log"
+	check "  before anything changed" installation_unchanged
+	check "  the daemon was not restarted" test "$(main_pid)" = "${PID}"
+	lifecycle_log --upgrade-boringtun reupgrade.log
+	RC=$?
+	tail -n 6 "${WORK}/reupgrade.log" | sed 's/^/    | /'
+	check "--upgrade-boringtun back to this release succeeds" test "${RC}" -eq 0
+	check "  without downloading it again" bash -c '! grep -q "Downloading" "$1"' _ "${WORK}/reupgrade.log"
+	check "  current is this installer's release and previous the earlier one" test "$(store_links)" = "${RELEASE_ID} ${PREV_ID}"
+	check "  the daemon executes this release's binary, with this installer's embedded SHA-256" daemon_runs_this_release
+	check "  status: back where the upgrade left it" status_upgraded
+	check "  params, the runtime file and every config are byte for byte the same" installation_unchanged
+	datapath "re-upgraded from ${PREV_ID}"
+	bash "${INSTALLER}" --set-boringtun-imitation auto >"${WORK}/imitation.log" 2>&1 </dev/null
+	check "after the re-upgrade, auto applies again" test "$?" -eq 0
+	check "  and the daemon runs it" bash -c '[[ "$(tr "\0" " " <"/proc/$1/cmdline")" == *" --imitate-protocol auto ${2} "* ]]' _ "$(main_pid)" "${IF}"
+	datapath "auto after the re-upgrade"
+	bash "${INSTALLER}" --set-boringtun-imitation none >/dev/null 2>&1 </dev/null
+	check "back to imitation none" test "$(status_line daemon_imitation_protocol)" = "daemon_imitation_protocol=none"
+fi
 
 # ── SIP imitation per packet kind, fixed sizes ──────────────────────────────
 # The installer draws S1-S4 at random, so the cycle above checks whichever

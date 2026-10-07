@@ -460,6 +460,97 @@ assert_eq 2 "$?" "a capture given a layout without the receiver key is refused (
 "${REAL_PYTHON}" "${WIRE_REAL}" "${CAPTURE_ARGS[@]}" not-a-key >/dev/null 2>&1
 assert_eq "1 absent" "$? $(test -e "${T}/args.capture.state" && echo present || echo absent)" \
 	"  as is one given a key that is not 32 base64 bytes, before it writes anything"
+"${REAL_PYTHON}" "${WIRE_REAL}" capture-to 40001 lo 127.0.0.1 51820 1 "${T}/to.capture" "29,26,81,22,${H}" >/dev/null 2>&1
+assert_eq 2 "$?" "capture-to given a layout without the receiver key is refused (usage)"
+for PORT in x 0x10 65536 -1 ""; do
+	"${REAL_PYTHON}" "${WIRE_REAL}" capture-to "${PORT}" lo 127.0.0.1 51820 1 "${T}/to.capture" >/dev/null 2>&1
+	assert_eq "1 absent" "$? $(test -e "${T}/to.capture.state" && echo present || echo absent)" \
+		"capture-to refuses the destination port '${PORT}' before it writes anything"
+done
+
+echo "=== One client's stream among several behind one address (capture-to) ==="
+# Datagrams from the server 192.0.2.1:51820 to two clients behind 192.0.2.2,
+# ports 40001 and 40002, through frame_payload as capture-to uses it.
+CAPTURE_TO="$("${REAL_PYTHON}" - "${WIRE_REAL}" <<'PY'
+import importlib.util, struct, sys
+spec = importlib.util.spec_from_file_location("wire", sys.argv[1])
+wire = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wire)
+SERVER, CLIENT = bytes([192, 0, 2, 1]), bytes([192, 0, 2, 2])
+
+def frame(dport, payload, ident=1, offset=0, more=False, udp_length=None, body=None):
+    if body is None:
+        body = struct.pack(">HHHH", 51820, dport, udp_length or 8 + len(payload), 0) + payload
+    flags = (0x2000 if more else 0) | (offset // 8)
+    return struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(body), ident, flags, 64, 17, 0, SERVER, CLIENT) + body
+
+def status(result):
+    return {wire.DATAGRAM: "datagram", wire.IGNORE: "ignore", wire.MALFORMED: "malformed",
+            wire.CONTINUATION: "continuation"}[result[0]]
+
+out = []
+frags = wire.Fragments()
+for dport in (40001, 40002):
+    out.append(status(wire.frame_payload(frame(dport, b"x" * 40), SERVER, 51820, destination_port=40001, fragments=frags)))
+# A datagram of 1600 bytes to the other client, in two fragments.
+first = struct.pack(">HHHH", 51820, 40002, 1608, 0) + b"y" * 1472
+out.append(status(wire.frame_payload(frame(0, b"", ident=7, more=True, body=first), SERVER, 51820, destination_port=40001, fragments=frags)))
+out.append(status(wire.frame_payload(frame(0, b"", ident=7, offset=1480, body=b"y" * 128), SERVER, 51820, destination_port=40001, fragments=frags)))
+# The same later fragment with no first fragment seen is malformed, as before.
+out.append(status(wire.frame_payload(frame(0, b"", ident=8, offset=1480, body=b"y" * 128), SERVER, 51820, destination_port=40001, fragments=frags)))
+# Without a destination port every client's datagram is relevant, as capture records it.
+out.append(status(wire.frame_payload(frame(40002, b"x" * 40), SERVER, 51820, fragments=wire.Fragments())))
+print(" ".join(out))
+PY
+)"
+assert_eq "datagram ignore ignore continuation malformed datagram" "${CAPTURE_TO}" \
+	"capture-to records its client's datagram, skips the other client's and that one's later fragment, and still flags an orphan fragment"
+
+echo "=== Auto: shaped prefixes, probe replies and the rest (classify-auto) ==="
+# Prefixes as a capture without layout records them: a dns-shaped S prefix
+# (flags 0x0120, one question), a DNS SERVFAIL reply, a stun-shaped prefix
+# (Binding Request, magic cookie), a Binding Success, a QUIC short header, a
+# Version Negotiation, a SIP request line, and random bytes.
+DNS_S="12340120000100000000000107657861"
+DNS_REPLY="12348182000100000000000007657861"
+STUN_S="000100002112a442aabbccddeeff0011"
+STUN_REPLY="010100302112a442aabbccddeeff0011"
+QUIC_S="4f0011223344556677889900aabbccdd"
+QUIC_REPLY="80000000000811223344556677880811"
+SIP_S="$(printf 'OPTIONS sip:a@b ' | od -An -tx1 | tr -d ' \n')"
+RANDOM_S="9c3e5f17a20b44d1e8c0f7a6b5d4c3b2"
+printf '%s\n' "${DNS_S}" "${DNS_S}" "${DNS_REPLY}" >"${T}/auto-dns"
+printf '%s\n' "${STUN_S}" "${STUN_REPLY}" "${STUN_REPLY}" "${RANDOM_S}" >"${T}/auto-stun"
+printf '%s\n' "${QUIC_S}" "${QUIC_REPLY}" >"${T}/auto-quic"
+printf '%s\n' "${SIP_S}" "${RANDOM_S}" >"${T}/auto-sip"
+printf '%s\n' "${RANDOM_S}" "${RANDOM_S}" "${QUIC_S}" >"${T}/auto-none"
+printf '%s\n' "${RANDOM_S}" "${DNS_S}" "${STUN_S}" "${SIP_S}" >"${T}/auto-none-shaped"
+for CASE in "dns auto-dns 3 2 1 0" "stun auto-stun 4 1 2 1" "quic auto-quic 2 1 1 0" "sip auto-sip 2 1 0 1" \
+	"none auto-none 3 0 0 3" "none auto-none-shaped 4 3 0 1" "dns auto-stun 4 0 0 4"; do
+	read -r PROTOCOL FILE WANT <<<"${CASE}"
+	assert_eq "${WANT}" "$("${REAL_PYTHON}" "${WIRE_REAL}" classify-auto "${PROTOCOL}" "${T}/${FILE}" 2>&1)" \
+		"classify-auto ${PROTOCOL} on ${FILE}: datagrams, shaped, probe replies, other"
+done
+printf '%s\n' "${DNS_S}" "response 124 -" >"${T}/auto-mixed"
+"${REAL_PYTHON}" "${WIRE_REAL}" classify-auto dns "${T}/auto-mixed" >/dev/null 2>&1
+assert_eq 1 "$?" "classify-auto refuses a per-kind record, as classify does"
+"${REAL_PYTHON}" "${WIRE_REAL}" classify-auto auto "${T}/auto-dns" >/dev/null 2>&1
+assert_eq 1 "$?" "classify-auto has no classification for auto itself"
+"${REAL_PYTHON}" "${WIRE_REAL}" send sip 127.0.0.1 9 70000 >/dev/null 2>&1
+assert_eq 1 "$?" "send refuses a source port beyond 65535"
+SEND_PORT=$((30000 + RANDOM % 20000))
+SENT="$("${REAL_PYTHON}" - "${WIRE_REAL}" "${SEND_PORT}" <<'PY'
+import socket, subprocess, sys
+listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+listener.bind(("127.0.0.1", 0))
+listener.settimeout(5)
+out = subprocess.run([sys.executable, sys.argv[1], "send", "sip", "127.0.0.1", str(listener.getsockname()[1]), sys.argv[2]],
+                     capture_output=True, text=True)
+data, source = listener.recvfrom(65535)
+print(out.returncode, out.stdout.strip() == "sent %d" % len(data), source[1] == int(sys.argv[2]), data.startswith(b"OPTIONS sip:"))
+PY
+)"
+assert_eq "0 True True True" "${SENT}" "send sends one SIP probe from the given source port and says how long it was"
 
 echo "=== IPv4/UDP framing before payload ==="
 assert_eq "datagram 77 77 whole" "$(py frame valid)" "a valid frame yields its UDP payload"

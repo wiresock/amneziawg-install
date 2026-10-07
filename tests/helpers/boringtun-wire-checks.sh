@@ -286,9 +286,13 @@ bt_wire_show() { # <label> <file>
 # and collected. A layout comes with the receiving peer's public key, under
 # which the helper checks MAC1 consistency when a complete datagram fits
 # more than one packet kind (its Evidence: MAC1 consistency and
-# receiver-index correlation, not authentication).
+# receiver-index correlation, not authentication). With BT_WIRE_CAPTURE_TO_PORT
+# set, the capture records only the datagrams to that destination port
+# (capture-to): the stream to one of several clients behind one address.
 bt_wire_capture_start() { # <netns> <interface> <source> <port> <seconds> <file> [layout receiver-key]
 	local NETNS="$1" FILE="$6" PID START PARENT BEFORE READY
+	local -a COMMAND=(capture)
+	[[ -z "${BT_WIRE_CAPTURE_TO_PORT:-}" ]] || COMMAND=(capture-to "${BT_WIRE_CAPTURE_TO_PORT}")
 	shift
 	BT_WIRE_CAPTURE=""
 	BT_WIRE_CAPTURE_FILE="${FILE}"
@@ -302,7 +306,7 @@ bt_wire_capture_start() { # <netns> <interface> <source> <port> <seconds> <file>
 	rm -f -- "${FILE}" "${FILE}.state" "${FILE}.stop" "${FILE}.stop.new" "${FILE}.stderr"
 	bt_wire_now
 	BEFORE="${BT_WIRE_NOW}"
-	bt_wire_spawn BT_WIRE_CAPTURE /dev/null "${FILE}.stderr" ip netns exec "${NETNS}" python3 "${WIRE}" capture "$@" || return 1
+	bt_wire_spawn BT_WIRE_CAPTURE /dev/null "${FILE}.stderr" ip netns exec "${NETNS}" python3 "${WIRE}" "${COMMAND[@]}" "$@" || return 1
 	read -r PID START PARENT <<<"${BT_WIRE_CAPTURE}"
 	if bt_wire_wait_first_line "${BT_WIRE_CAPTURE}" "${FILE}.state" "^ready ${PID} ${START} (0|[1-9][0-9]{0,17})$" 10; then
 		READY="${BASH_REMATCH[1]}"

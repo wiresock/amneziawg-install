@@ -8,11 +8,19 @@ name: BoringTun Host
 # moves the binary through --upgrade-boringtun and --rollback-boringtun (a TEST
 # FIXTURE older release, the pinned bytes relabelled, against the real pinned
 # one)
-# and uninstalls. The x86_64 job installs with the last installer version
-# without protocol imitation, checks the earlier release that installer
-# installs, upgrades it to this installer's release with this installer's
-# --upgrade-boringtun and manages the host with this one, the upgrade path;
-# the aarch64 and Debian jobs install with this one. A separate job
+# and uninstalls. Every job also runs the imitation mode auto: clients with
+# different imitation settings, several behind one address on different ports,
+# share the server port, and the server's datagrams to each are checked on the
+# wire. Two earlier installers start the upgrade paths: the last version
+# without protocol imitation (9f5a1afb87f7, release 71d88784 build 1; x86_64),
+# and the version that embedded the published ae2ab44e9a68 build 1 (c7cd737c221a;
+# x86_64 and aarch64). Each installs its own release, which the test checks,
+# upgrades to this installer's release with this installer's
+# --upgrade-boringtun, then proves on those real, different binaries that a
+# rollback refuses auto, rolls back with a fixed imitation, refuses auto on the
+# earlier binary and upgrades again, with traffic and an unchanged
+# configuration; the aarch64 fresh and the Debian jobs install with this one.
+# A separate job
 # downloads the public release that the installer embeds anonymously, and one
 # proves coexistence with an installed AmneziaWG kernel module. Every job uses
 # the release named by the installer's AWG_BT_RELEASE_* constants, never
@@ -33,6 +41,7 @@ on:
       - tests/helpers/boringtun-live-firewall.sh
       - tests/helpers/boringtun-imitation-wire.py
       - tests/helpers/boringtun-lifecycle-fixture.sh
+      - tests/helpers/boringtun-auto-live.sh
       - .github/workflows/boringtun-host.yml
   pull_request:
     branches: [main]
@@ -47,6 +56,7 @@ on:
       - tests/helpers/boringtun-live-firewall.sh
       - tests/helpers/boringtun-imitation-wire.py
       - tests/helpers/boringtun-lifecycle-fixture.sh
+      - tests/helpers/boringtun-auto-live.sh
       - .github/workflows/boringtun-host.yml
   workflow_dispatch:
 
@@ -76,19 +86,35 @@ jobs:
         run: bash tests/test-boringtun-public-release.sh
 
   live:
-    name: Fresh host install (${{ matrix.arch }})
+    name: Host install (${{ matrix.arch }}, ${{ matrix.path }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
+          # The last installer without protocol imitation, and its release.
           - arch: x86_64
             runner: ubuntu-24.04
-            upgrade: true
+            path: upgrade from 9f5a1af
+            previous: 9f5a1afb87f73fd44b83e8abc8a0388efceeb8d5
+            base: true
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            upgrade: false
+            path: fresh
+            previous: ""
+            base: false
+          # The installer that embedded boringtun-cli-0.7.1-gae2ab44e9a68-b1.
+          - arch: x86_64
+            runner: ubuntu-24.04
+            path: upgrade from ae2ab44 b1
+            previous: c7cd737c221a7357a4d5be74d972dabf02fa11db
+            base: false
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            path: upgrade from ae2ab44 b1
+            previous: c7cd737c221a7357a4d5be74d972dabf02fa11db
+            base: false
     steps:
       - uses: actions/checkout@v6
         with:
@@ -101,21 +127,22 @@ jobs:
           uname -m
           test "$(uname -m)" = "$EXPECTED"
 
-      # The upgrade path starts from main at the last commit before protocol
-      # imitation (the BoringTun host install as released), fetched by its
-      # fixed SHA so that it never follows main. It installs its own embedded
-      # release, which the test reads from it as data.
-      - name: Fetch the last installer without protocol imitation
-        if: matrix.upgrade
+      # An upgrade path starts from an earlier installer on main, fetched by
+      # its fixed SHA so that it never follows main. It installs its own
+      # embedded release, which the test reads from it as data.
+      - name: Fetch the earlier installer
+        if: matrix.previous != ''
+        env:
+          PREVIOUS: ${{ matrix.previous }}
         run: |
-          git fetch --no-tags --depth=1 origin 9f5a1afb87f73fd44b83e8abc8a0388efceeb8d5
+          git fetch --no-tags --depth=1 origin "$PREVIOUS"
           git show FETCH_HEAD:amneziawg-install.sh >"$RUNNER_TEMP/previous-installer.sh"
           echo "AWG_LIVE_PREVIOUS_INSTALLER=$RUNNER_TEMP/previous-installer.sh" >>"$GITHUB_ENV"
 
       # The helper-compatibility step runs the binary lifecycle with the
       # helpers that the PR 6 base installer renders, fetched by its fixed SHA.
       - name: Fetch the installer before the binary lifecycle
-        if: matrix.upgrade
+        if: matrix.base
         run: |
           git fetch --no-tags --depth=1 origin 78b780bc8df73b86fa1c2722e7af2bd4e11e2a6a
           git show FETCH_HEAD:amneziawg-install.sh >"$RUNNER_TEMP/base-installer.sh"
@@ -132,7 +159,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: boringtun-host-diagnostics-${{ matrix.arch }}
+          name: boringtun-host-diagnostics-${{ matrix.arch }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/diagnostics
           retention-days: 7
 

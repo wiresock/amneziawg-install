@@ -37,6 +37,14 @@
       in centiseconds, the clock of /proc/uptime. Any other end leaves no end
       line and exits nonzero.
 
+  capture-to <destination port> <interface> <source address> <source port> <seconds> <file> [<layout> <receiver key>]
+      capture, of the datagrams to DESTINATION PORT only: the stream to one
+      client where several share an address. A first fragment of a datagram
+      to another port is remembered (Fragments), so that its later
+      fragments are skipped as that datagram's, never recorded as malformed
+      ones of this stream; records, transcript and exit statuses are those
+      of capture.
+
   classify <protocol> <file>
       For a capture without layout, print "<datagrams> <matching>": how many
       recorded prefixes have the shape PROTOCOL's imitation gives an S
@@ -44,6 +52,21 @@
       type and magic cookie; quic: a 1-RTT short header; sip: a request
       line). Any line that is not a prefix -- a malformed frame, a per-kind
       record -- is refused (exit 1).
+
+  classify-auto <dns|quic|sip|stun|none> <file>
+      For a capture without layout of the datagrams to one client of an
+      imitation auto server, print "<datagrams> <shaped> <replies> <other>":
+      prefixes with the shape of that protocol's imitation (as classify),
+      replies of its probe responder (servfail, binding-success,
+      version-negotiation), and the rest. For none, an unresolved peer,
+      shaped counts the prefixes with any dns, stun or sip shape. Refuses
+      what classify refuses.
+
+  send <kind> <host> <port> <source port>
+      Send one probe of KIND (as probe) to HOST:PORT from SOURCE PORT and
+      print "sent <length>", without waiting for a reply: under imitation
+      auto, the first datagram a client's imitation sends, which leaves a
+      hint for that source.
 
   kinds sip <file> <S1,S2,S3,S4>
       For a LAYOUT capture, after validating every record against the sizes
@@ -150,6 +173,19 @@ PROBES = {
     "quic-v1": lambda: quic_probe(0x00000001),
     "sip": sip_probe,
 }
+
+
+def send(kind, host, port, source_port):
+    """Send one probe of KIND to HOST:PORT from SOURCE PORT, without waiting
+    for a reply: under imitation auto, the datagram a client's own imitation
+    sends first, which leaves a hint for that source address and port."""
+    request, _ = PROBES[kind]()
+    sport = parse_number(source_port, "source port", 65535)
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as sock:
+        sock.bind(("::" if family == socket.AF_INET6 else "0.0.0.0", sport))
+        sock.sendto(request, (host, int(port)))
+    return "sent %d" % len(request)
 
 
 def probe(kind, host, port):
@@ -496,6 +532,11 @@ def frame_payload(frame, source, source_port, destination=None, destination_port
         return MALFORMED, len(frame), b"", more
     sport, dport, udp_length = struct.unpack(">HHH", body[:6])
     if sport != source_port or (destination_port is not None and dport != destination_port):
+        if (more and fragments is not None and destination_port is not None and sport == source_port
+                and udp_length > len(body) and not len(body) % 8):
+            # The first fragment of a datagram to another port: its later
+            # fragments, which carry no ports, are then continuations.
+            fragments.first(key, udp_length, len(body))
         return IGNORE, len(frame), b"", more
     if udp_length < 8:
         return MALFORMED, len(frame), b"", more
@@ -562,8 +603,9 @@ def boot_centiseconds(nanoseconds):
     return nanoseconds // 10 ** 7
 
 
-def capture(interface, source, source_port, seconds, path, layout=None, receiver=None):
-    """Record the relevant datagrams; return the exit status. With LAYOUT,
+def capture(interface, source, source_port, seconds, path, layout=None, receiver=None, destination_port=None):
+    """Record the relevant datagrams; return the exit status. With
+    DESTINATION_PORT, only those sent to that port are relevant. With LAYOUT,
     RECEIVER is the base64 static public key of the peer they are sent to:
     the key under which Evidence checks mac1 when a datagram fits more than
     one kind, its receiver indices recorded in the order the datagrams
@@ -586,6 +628,7 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
     evidence = Evidence(parse_public_key(receiver)) if layout else None
     wanted_source = socket.inet_aton(source)
     wanted_port = parse_number(source_port, "port", 65535)
+    wanted_destination = None if destination_port is None else parse_number(destination_port, "destination port", 65535)
     duration = parse_number(seconds, "capture seconds", 86400) * 10 ** 9
     state_path, stop_path = path + ".state", path + ".stop"
     if os.path.lexists(stop_path):
@@ -613,7 +656,7 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
             if sock not in readable:
                 continue
             status, length, data, _ = frame_payload(sock.recv(65535), wanted_source, wanted_port,
-                                                    fragments=fragments)
+                                                    destination_port=wanted_destination, fragments=fragments)
             if status == IGNORE:
                 continue
             line = record_line(sizes, ranges, status, length, data, evidence)
@@ -835,6 +878,45 @@ def classify(protocol, path):
     print(total, matching)
 
 
+def probe_reply(protocol, prefix):
+    """Whether PREFIX starts a reply of PROTOCOL's probe responder (a DNS
+    response with one question, a STUN Binding Success, a QUIC Version
+    Negotiation), which never has the shape of that imitation's S prefix."""
+    if protocol == "dns":
+        return len(prefix) >= 6 and bool(prefix[2] & 0x80) and prefix[4:6] == b"\x00\x01"
+    if protocol == "stun":
+        return prefix[:2] == b"\x01\x01" and prefix[4:8] == STUN_COOKIE
+    if protocol == "quic":
+        return len(prefix) >= 5 and bool(prefix[0] & 0x80) and prefix[1:5] == b"\x00\x00\x00\x00"
+    return False
+
+
+# What an unresolved peer's random S padding must not look like. QUIC's short
+# header is a single bit pattern that a quarter of random first bytes have.
+UNRESOLVED_SHAPES = ("dns", "stun", "sip")
+
+
+def classify_auto(protocol, path):
+    """For a capture without layout of the datagrams to one client of an auto
+    server, print "<datagrams> <shaped> <replies> <other>": prefixes with the
+    shape of PROTOCOL's imitation, replies of its probe responder (to the
+    client's own imitation datagrams), and the rest. For "none", an
+    unresolved peer, shaped counts the prefixes that have any of the dns,
+    stun or sip shapes."""
+    if protocol not in ("dns", "quic", "sip", "stun", "none"):
+        raise InputError("no auto classification for %r" % protocol)
+    total = matching = replies = 0
+    for prefix in legacy_prefixes(path):
+        total += 1
+        if protocol == "none":
+            matching += any(shaped(name, prefix) for name in UNRESOLVED_SHAPES)
+        elif shaped(protocol, prefix):
+            matching += 1
+        elif probe_reply(protocol, prefix):
+            replies += 1
+    print(total, matching, replies, total - matching - replies)
+
+
 def kinds(protocol, path, sizes_text):
     """Every row at once, after the whole capture is validated: four packet
     kinds, then the four summaries, in this order."""
@@ -870,8 +952,14 @@ def main(argv):
             print(probe(argv[1], argv[2], argv[3]))
         elif len(argv) in (6, 8) and argv[0] == "capture":
             return capture(*argv[1:])
+        elif len(argv) in (7, 9) and argv[0] == "capture-to":
+            return capture(*argv[2:], destination_port=argv[1])
         elif len(argv) == 3 and argv[0] == "classify":
             classify(argv[1], argv[2])
+        elif len(argv) == 3 and argv[0] == "classify-auto":
+            classify_auto(argv[1], argv[2])
+        elif len(argv) == 5 and argv[0] == "send" and argv[1] in PROBES:
+            print(send(*argv[1:]))
         elif len(argv) == 4 and argv[0] == "kinds":
             kinds(argv[1], argv[2], argv[3])
         elif len(argv) == 8 and argv[0] == "replay":
