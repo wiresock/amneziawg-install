@@ -2844,14 +2844,28 @@ explains its behaviour, and offers it only when the installed binary supports it
 - The host live test sets `auto` through the installer on the installed daemon and connects
   six installer-generated clients: `dns`, `quic`, `sip` and `stun` clients (copies of the
   verified binary running those imitations), one without imitation, and one without imitation
-  whose port sends a SIP-shaped datagram before each round of traffic (a planted hint, sent as
-  a SIP client's imitation sends one before each handshake attempt; a single hint sent once
-  before the client started was not learned in two of four CI jobs). Two networks hold three
+  whose port first sends a 27-byte SIP request line (a planted hint). Two networks hold three
   clients each, on different ports behind one address. Each client's stream is recorded on its
   side with `capture-to` (the destination port filter of `boringtun-imitation-wire.py`) and
   held to its learned protocol (`classify-auto`, or the per-kind SIP rule); the server's
   endpoints show the shared addresses with distinct ports. Under AWG 3.0 the planted SIP hint
   must leave its peer random when an S prefix is 31 bytes or more.
+- The planted hint is shorter than any AmneziaWG datagram (32 bytes: a transport behind an S4
+  of 0), because BoringTun hands only datagrams that fit no packet kind to probe
+  classification, the only door that records a hint. The hint first planted was the wire
+  helper's 247-byte SIP probe; under the installer's random layouts it is a transport candidate
+  whenever its four bytes at S4 fall in H4 (about one layout in four for the S4 values of the
+  failing jobs), and then BoringTun, correctly, takes it for AmneziaWG traffic and never
+  learns it. That made two of four BoringTun Host jobs fail, and one of four again after a
+  change that only re-sent the same datagram. The live test now shows, for the planted hint,
+  that it fits no packet kind under the server's layout, that it was sent, that exactly it
+  reached the server's interface before the client started, and that the peer's handshake
+  came within the hint's 30 s lifetime. `tests/test-boringtun-auto-hint-live.sh` keeps the
+  mechanism on a fixed layout (the failing job's S sizes with an H4 that holds the probe's
+  bytes): the probe is never learned, the 27-byte hint is, and under AWG 3.0 the hint draws
+  BoringTun's warning that the header-protection policy refused the learned sip, which no run
+  without a hint shows. That warning is the positive evidence for the AWG 3.0 case, which the
+  installed daemon (logging errors only) cannot give.
 - The BoringTun Host jobs that start from an earlier installer (`9f5a1afb87f7`, release
   `71d88784` build 1, and `c7cd737c221a`, release `ae2ab44e9a68` build 1) then use those real,
   different binaries: a rollback with `auto` is refused and changes nothing; with `quic` it

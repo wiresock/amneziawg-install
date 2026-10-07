@@ -14,13 +14,24 @@
 # acdns, acquic, acsip and acstun run --imitate-protocol dns, quic, sip and
 # stun, so their own pre-handshake imitation datagrams are what the server
 # learns from. acnone runs none and sends no such datagram: its peer stays
-# unresolved. acsipinj runs none too, but its port sends a SIP-shaped datagram
-# (`boringtun-imitation-wire.py send sip`) before each round of traffic, the
-# hint a SIP client's imitation leaves before each handshake attempt: the
-# server must then shape SIP for that peer, under AWG
-# 2.0, and must refuse it (random padding) under AWG 3.0 once an S prefix is
-# 31 bytes or more. BoringTun as a client refuses SIP with header protection
-# there itself, which is why the hint is planted that way.
+# unresolved. acsipinj runs none too, but before it starts, its port sends one
+# SIP request line (`boringtun-imitation-wire.py send sip`, 27 bytes), the
+# hint a SIP client's imitation leaves before its handshake: the server must
+# then shape SIP for that peer under AWG 2.0. Under AWG 3.0 with an S prefix
+# of 31 bytes or more the same hint must leave the peer random; BoringTun as
+# a client refuses SIP with header protection there itself, which is why the
+# hint is planted. The installed daemon logs at error level only, so the
+# header-protection refusal itself is shown by
+# tests/test-boringtun-auto-hint-live.sh, which reads BoringTun's warning.
+#
+# The planted hint is evidence only if it is one. bt_auto_plant shows that it
+# fits no AmneziaWG packet kind (it is shorter than the smallest, so the
+# server hands it to probe classification, the only door that records a
+# hint; a longer SIP datagram is an AmneziaWG transport whenever its bytes at
+# S4 fall in H4, and then it is never a hint), that it was sent, that exactly
+# it reached the server's interface from the client's address and port before
+# the client existed, and, after the traffic, that the peer's authenticated
+# handshake came within the 30 s a hint lives.
 #
 # Each client's stream is recorded on its side, from the server's address
 # and port to that client's port only (capture-to), before the client starts
@@ -47,18 +58,26 @@ BT_AUTO_VETH_CLIENT2="awgvc1"
 BT_AUTO_HOST_ADDR2="198.51.100.1"
 BT_AUTO_CLIENT_ADDR2="198.51.100.2"
 BT_AUTO_CLIENTS="acdns acquic acsip acstun acnone acsipinj"
-declare -gA BT_AUTO_NS=() BT_AUTO_VETH=() BT_AUTO_SERVER=() BT_AUTO_ADDR=() BT_AUTO_PORT=() BT_AUTO_METRIC=()
-declare -gA BT_AUTO_IMITATE=() BT_AUTO_INJECT=() BT_AUTO_CONF=() BT_AUTO_TUNNEL=() BT_AUTO_PID=()
+# A name for the host's own network namespace, so that a capture can run on a
+# host-side link (bt_wire_capture_start enters a named namespace).
+BT_AUTO_HOST_NS="awgautohost"
+BT_AUTO_HOST_NS_MADE=0
+# How long a planted hint lives in the pinned BoringTun (HINT_LIFETIME).
+BT_AUTO_HINT_LIFETIME=30
+declare -gA BT_AUTO_NS=() BT_AUTO_VETH=() BT_AUTO_HOST_VETH=() BT_AUTO_SERVER=() BT_AUTO_ADDR=() BT_AUTO_PORT=() BT_AUTO_METRIC=()
+declare -gA BT_AUTO_IMITATE=() BT_AUTO_INJECT=() BT_AUTO_CONF=() BT_AUTO_TUNNEL=() BT_AUTO_PID=() BT_AUTO_PLANTED=()
 
 bt_auto_define() { # <name> <ns 1|2> <port> <metric> <imitate> [inject]
 	if [[ "$2" == 1 ]]; then
 		BT_AUTO_NS[$1]="${NS}"
 		BT_AUTO_VETH[$1]="${VETH_CLIENT}"
+		BT_AUTO_HOST_VETH[$1]="${VETH_HOST}"
 		BT_AUTO_SERVER[$1]="${HOST_ADDR}"
 		BT_AUTO_ADDR[$1]="${CLIENT_ADDR}"
 	else
 		BT_AUTO_NS[$1]="${BT_AUTO_NS2}"
 		BT_AUTO_VETH[$1]="${BT_AUTO_VETH_CLIENT2}"
+		BT_AUTO_HOST_VETH[$1]="${BT_AUTO_VETH_HOST2}"
 		BT_AUTO_SERVER[$1]="${BT_AUTO_HOST_ADDR2}"
 		BT_AUTO_ADDR[$1]="${BT_AUTO_CLIENT_ADDR2}"
 	fi
@@ -97,19 +116,74 @@ bt_auto_cleanup() {
 	done
 	ip netns delete "${BT_AUTO_NS2}" 2>/dev/null
 	ip link delete "${BT_AUTO_VETH_HOST2}" 2>/dev/null
+	# Only the name this run gave the host's namespace; the namespace stays.
+	if ((BT_AUTO_HOST_NS_MADE)); then
+		ip netns delete "${BT_AUTO_HOST_NS}" 2>/dev/null
+		BT_AUTO_HOST_NS_MADE=0
+	fi
 	return 0
 }
 
+# Plant a client's hint before the client starts, and prove each step: the
+# datagram fits no AmneziaWG packet kind under this server's layout (and is
+# shorter than any, so no S size, H range or key makes it one), the send
+# succeeded, and exactly that datagram reached the server's interface from
+# the client's address and port, recorded on the host side before the client
+# exists. BT_AUTO_PLANTED records when it was sent, for
+# bt_auto_hint_in_lifetime.
+bt_auto_plant() { # <label> <name>
+	local LABEL="$1" NAME="$2" KIND="${BT_AUTO_INJECT[$2]}" CANDIDATES SENT RC ARRIVED="${WORK}/auto-$2.hint" WANT
+	BT_AUTO_PLANTED[${NAME}]=""
+	CANDIDATES="$(python3 "${WIRE}" candidates send "${KIND}" "$(params_layout)" 2>&1)"
+	check "${LABEL}: ${NAME}'s ${KIND} hint fits no AmneziaWG packet kind under this server's layout, and is shorter than any (${CANDIDATES})" \
+		bash -c '[[ "$1" =~ ^([0-9]+)\ none$ ]] && ((BASH_REMATCH[1] < 32))' _ "${CANDIDATES}"
+	if ! BT_WIRE_CAPTURE_TO_PORT="${PORT}" bt_wire_capture_start "${BT_AUTO_HOST_NS}" "${BT_AUTO_HOST_VETH[${NAME}]}" \
+		"${BT_AUTO_ADDR[${NAME}]}" "${BT_AUTO_PORT[${NAME}]}" 60 "${ARRIVED}"; then
+		bad "${LABEL}: the server-side capture of ${NAME}'s port ${BT_AUTO_PORT[${NAME}]} started"
+		return 1
+	fi
+	BT_AUTO_PLANTED[${NAME}]="$(bt_auto_uptime)"
+	SENT="$(ip netns exec "${BT_AUTO_NS[${NAME}]}" python3 "${WIRE}" send "${KIND}" "${BT_AUTO_SERVER[${NAME}]}" "${PORT}" "${BT_AUTO_PORT[${NAME}]}" 2>&1)"
+	RC=$?
+	check "${LABEL}: the hint was sent from ${BT_AUTO_ADDR[${NAME}]}:${BT_AUTO_PORT[${NAME}]} to ${BT_AUTO_SERVER[${NAME}]}:${PORT} (${SENT})" \
+		bash -c '[[ "$1" == 0 && "$2" =~ ^sent\ [0-9]+$ ]]' _ "${RC}" "${SENT}"
+	wait_for 5 test -s "${ARRIVED}"
+	if ! bt_wire_capture_finish "${ARRIVED}" stop 10; then
+		bad "${LABEL}: the server-side capture of ${NAME}'s port ran until its authorized stop"
+		return 1
+	fi
+	WANT="$(python3 -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("wire", sys.argv[1]); w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
+print(w.HINTS[sys.argv[2]][:w.PREFIX_KEPT].hex())' "${WIRE}" "${KIND}")"
+	check "${LABEL}: exactly that datagram reached the server's interface from ${BT_AUTO_ADDR[${NAME}]}:${BT_AUTO_PORT[${NAME}]}, before ${NAME} started" \
+		test "$(cat "${ARRIVED}")" = "${WANT}"
+}
+
+# Boot time in centiseconds (CLOCK_BOOTTIME, as /proc/uptime gives it): one
+# monotonic clock for the hint and the tunnel. BoringTun's own handshake
+# timestamps follow the wall clock, which a container host may step.
+bt_auto_uptime() {
+	local UP
+	read -r UP _ </proc/uptime
+	printf '%s\n' "$((10#${UP%.*} * 100 + 10#${UP#*.}))"
+}
+
+# The peer's first authenticated handshake came after its hint, because the
+# client did not exist before the hint reached the server, and before its
+# first ping through the tunnel succeeded at UP. Within the hint's lifetime
+# from the hint to that ping, the hint was there when the server selected the
+# peer's imitation.
+bt_auto_hint_in_lifetime() { # <label> <name> <tunnel up, boot centiseconds>
+	check "$1: ${2}'s tunnel was up $(((${3:-0} - ${BT_AUTO_PLANTED[$2]:-0}) / 100)) s after its hint, within the ${BT_AUTO_HINT_LIFETIME} s a hint lives, so its handshake was too" \
+		bash -c '[[ "$1" =~ ^[0-9]+$ && "$2" =~ ^[0-9]+$ ]] && (($2 >= $1 && $2 - $1 < $3 * 100))' _ \
+		"${BT_AUTO_PLANTED[$2]:-}" "${3:-}" "${BT_AUTO_HINT_LIFETIME}"
+}
+
 # Start a client with the installer-generated config as it is now, its listen
-# port fixed and its endpoint the server address of its network. A client
-# with a planted hint sends that datagram from its port first.
+# port fixed and its endpoint the server address of its network.
 bt_auto_start() { # <name>
 	local NAME="$1" NSX="${BT_AUTO_NS[$1]}"
 	bt_auto_stop "${NAME}"
-	if [[ -n "${BT_AUTO_INJECT[${NAME}]}" ]] &&
-		! ip netns exec "${NSX}" python3 "${WIRE}" send "${BT_AUTO_INJECT[${NAME}]}" "${BT_AUTO_SERVER[${NAME}]}" "${PORT}" "${BT_AUTO_PORT[${NAME}]}" >/dev/null; then
-		return 1
-	fi
 	ip netns exec "${NSX}" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "${CLIENT_BIN}" --foreground --disable-drop-privileges \
 		--verbosity error --imitate-protocol "${BT_AUTO_IMITATE[${NAME}]}" "${NAME}" >"${WORK}/${NAME}.log" 2>&1 &
 	BT_AUTO_PID[${NAME}]=$!
@@ -129,16 +203,7 @@ bt_auto_start() { # <name>
 		test "$(awg show "${NAME}" listen-port 2>/dev/null)" = "${BT_AUTO_PORT[${NAME}]}"
 }
 
-# A client with a planted hint sends it from its own port before each round
-# of pings, as a SIP client's imitation does before each handshake attempt.
-# A single hint sent once before the client started was not learned in two of
-# four CI jobs (BoringTun discards a pending hint on a roam, and a handshake
-# retried from another source port would be one; that cause is not proven).
-# Once a protocol is learned, further hints cannot change it.
 bt_auto_ping() { # <name> [count]
-	if [[ -n "${BT_AUTO_INJECT[$1]}" ]]; then
-		ip netns exec "${BT_AUTO_NS[$1]}" python3 "${WIRE}" send "${BT_AUTO_INJECT[$1]}" "${BT_AUTO_SERVER[$1]}" "${PORT}" "${BT_AUTO_PORT[$1]}" >/dev/null 2>&1
-	fi
 	ip netns exec "${BT_AUTO_NS[$1]}" ping -I "$1" -c "${2:-1}" -i 0.2 -W 2 "${SERVER_TUNNEL_ADDR}" >/dev/null 2>&1
 }
 
@@ -149,9 +214,15 @@ bt_auto_ping() { # <name> [count]
 # capture, so that its imitation datagrams, handshake and responses are
 # recorded, 0 for a client that is already up.
 bt_auto_observe() { # <label> <name> <expect> <start 1|0>
-	local LABEL="$1" NAME="$2" EXPECT="$3" START="$4" CAPTURE="${WORK}/auto-$2.capture" COUNTS TOTAL SHAPED REPLIES OTHER
+	local LABEL="$1" NAME="$2" EXPECT="$3" START="$4" CAPTURE="${WORK}/auto-$2.capture" COUNTS TOTAL SHAPED REPLIES OTHER UP
 	local -a LAYOUT=()
 	[[ "${EXPECT}" != sip ]] || LAYOUT=("$(params_layout)" "$(bt_auto_public_key "${NAME}")")
+	if ((START)) && [[ -n "${BT_AUTO_INJECT[${NAME}]}" ]]; then
+		bt_auto_stop "${NAME}"
+		if ! bt_auto_plant "${LABEL}" "${NAME}"; then
+			return
+		fi
+	fi
 	if ! BT_WIRE_CAPTURE_TO_PORT="${BT_AUTO_PORT[${NAME}]}" bt_wire_capture_start "${BT_AUTO_NS[${NAME}]}" "${BT_AUTO_VETH[${NAME}]}" \
 		"${BT_AUTO_SERVER[${NAME}]}" "${PORT}" 300 "${CAPTURE}" "${LAYOUT[@]}"; then
 		bad "${LABEL}: the capture of the server's datagrams to ${NAME}'s port ${BT_AUTO_PORT[${NAME}]} started"
@@ -160,11 +231,15 @@ bt_auto_observe() { # <label> <name> <expect> <start 1|0>
 	if ((START)) && ! bt_auto_start "${NAME}"; then
 		bad "${LABEL}: ${NAME} starts with its installer-generated config (imitation ${BT_AUTO_IMITATE[${NAME}]}${BT_AUTO_INJECT[${NAME}]:+, a planted ${BT_AUTO_INJECT[${NAME}]} hint})"
 	fi
-	if wait_for 20 bt_auto_ping "${NAME}" && bt_auto_ping "${NAME}" 20; then
+	UP=""
+	if wait_for 20 bt_auto_ping "${NAME}" && UP="$(bt_auto_uptime)" && bt_auto_ping "${NAME}" 20; then
 		ok "${LABEL}: ${NAME} (${BT_AUTO_ADDR[${NAME}]}:${BT_AUTO_PORT[${NAME}]}) reaches ${SERVER_TUNNEL_ADDR} through its tunnel (21 pings)"
 	else
 		bad "${LABEL}: ${NAME} (${BT_AUTO_ADDR[${NAME}]}:${BT_AUTO_PORT[${NAME}]}) reaches ${SERVER_TUNNEL_ADDR} through its tunnel"
 		sed 's/^/    client | /' "${WORK}/${NAME}.log"
+	fi
+	if ((START)) && [[ -n "${BT_AUTO_INJECT[${NAME}]}" ]]; then
+		bt_auto_hint_in_lifetime "${LABEL}" "${NAME}" "${UP}"
 	fi
 	if bt_wire_capture_finish "${CAPTURE}" stop 10; then
 		ok "${LABEL}: the capture of ${NAME}'s stream ran from before its traffic until its authorized stop ($(wc -l <"${CAPTURE}") records)"
@@ -216,6 +291,14 @@ bt_auto_setup() {
 	bt_auto_define acnone 2 41005 13 none
 	check "a second client network ${BT_AUTO_NS2} (${BT_AUTO_CLIENT_ADDR2}) is set up" bt_auto_network
 	ip -n "${BT_AUTO_NS2}" route add default via "${BT_AUTO_HOST_ADDR2}" 2>/dev/null
+	if ip netns list 2>/dev/null | grep -qE "^${BT_AUTO_HOST_NS}( |$)"; then
+		bad "the namespace name ${BT_AUTO_HOST_NS} is free (it exists, is not this run's and is left alone)"
+	elif ip netns attach "${BT_AUTO_HOST_NS}" "$$"; then
+		BT_AUTO_HOST_NS_MADE=1
+		ok "the host's own network namespace is named ${BT_AUTO_HOST_NS} for host-side captures"
+	else
+		bad "the host's own network namespace is named ${BT_AUTO_HOST_NS} for host-side captures"
+	fi
 	for NAME in ${BT_AUTO_CLIENTS}; do
 		bash "${INSTALLER}" --add-client "${NAME}" >"${WORK}/${NAME}-add.private" 2>&1 </dev/null
 		check "--add-client ${NAME} (its output, config and QR code stay private)" test "$?" -eq 0
@@ -244,6 +327,7 @@ bt_auto_teardown() {
 bt_auto_mixed_clients() {
 	local NAME EXPECT ENDPOINT PIDS=() FAILED_PINGS=0 PID
 	echo "--- auto: six clients with different imitation settings share one server port"
+	echo "    (under this server's layout, the 247-byte SIP probe would fit: $(python3 "${WIRE}" candidates probe sip "$(params_layout)" 2>&1); the 27-byte hint fits: $(python3 "${WIRE}" candidates send sip "$(params_layout)" 2>&1))"
 	for NAME in ${BT_AUTO_CLIENTS}; do
 		EXPECT="${BT_AUTO_IMITATE[${NAME}]}"
 		[[ "${EXPECT}" != none ]] || EXPECT=random
@@ -274,10 +358,15 @@ bt_auto_mixed_clients() {
 }
 
 # Under AWG 3.0 the clients reconnect with their regenerated configs. A
-# learned dns is shaped as before; a learned sip, here the planted hint of
-# acsipinj, is refused while an S prefix is 31 bytes or more, and its peer
-# keeps random padding. BoringTun clients cannot run sip with header
-# protection at those sizes, so acsip does not take part.
+# learned dns is shaped as before. acsipinj's hint is planted and proven as
+# under AWG 2.0, where this server learned it from the same datagram; with an
+# S prefix of 31 bytes or more its peer must keep random padding. That this is
+# BoringTun's header-protection refusal, and not a hint that never counted, is
+# not visible here (the installed daemon logs errors only): the evidence is
+# the proven hint, the AWG 2.0 control above, and the refusal warning that
+# tests/test-boringtun-auto-hint-live.sh reads from the same binary.
+# BoringTun clients cannot run sip with header protection at those sizes, so
+# acsip does not take part.
 bt_auto_header_protection() {
 	local NAME LARGEST=0 SIZE
 	for NAME in S1 S2 S3 S4; do
@@ -291,7 +380,7 @@ bt_auto_header_protection() {
 	bt_auto_observe "auto, AWG 3.0" acdns dns 1
 	bt_auto_observe "auto, AWG 3.0" acnone random 1
 	if ((LARGEST >= 31)); then
-		bt_auto_observe "auto, AWG 3.0, a learned sip with an S prefix of ${LARGEST} bytes" acsipinj random 1
+		bt_auto_observe "auto, AWG 3.0, a proven SIP hint with an S prefix of ${LARGEST} bytes" acsipinj random 1
 	else
 		echo "    (every S prefix is 30 bytes or less: a learned sip stays random there anyway)"
 	fi

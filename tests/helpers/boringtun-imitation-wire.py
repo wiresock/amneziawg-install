@@ -62,12 +62,18 @@
       shaped counts the prefixes with any dns, stun or sip shape. Refuses
       what classify refuses.
 
-  send <kind> <host> <port> <source port>
-      Send one probe of KIND (as probe) to HOST:PORT from SOURCE PORT and
+  send sip <host> <port> <source port>
+      Send the SIP hint (a 27-byte request line, shorter than any AmneziaWG
+      datagram, so never taken for one) to HOST:PORT from SOURCE PORT and
       print "sent <length>", without waiting for a reply: under imitation
-      auto, the datagram a client's imitation sends before a handshake, which
-      leaves a hint for that source. The port may be shared with a running
-      client (SO_REUSEADDR, which BoringTun's sockets also set).
+      auto, what a client's imitation sends before a handshake, which leaves
+      a hint for that source.
+
+  candidates <send|probe> <kind> <layout>
+      Print "<length> <kinds>": the length of the datagram that send (or
+      probe) sends for KIND, and the AmneziaWG packet kinds it fits under
+      LAYOUT without header protection ("none" if it fits none). A datagram
+      that fits a kind is AmneziaWG traffic to the server, never a hint.
 
   kinds sip <file> <S1,S2,S3,S4>
       For a LAYOUT capture, after validating every record against the sizes
@@ -176,20 +182,61 @@ PROBES = {
 }
 
 
+# The smallest AmneziaWG datagram: a transport message (32 bytes) behind an S4
+# of 0. Anything shorter fits no packet kind's length rule under any S sizes,
+# H ranges or header-protection key (inbound_candidates in the pinned
+# BoringTun tests the length first), so the server always hands it to probe
+# classification, the only door that records an auto hint. A longer datagram
+# can be an AmneziaWG candidate under some layouts: the SIP probe below is a
+# transport candidate whenever its four bytes at S4 fall in H4, and then it is
+# never a hint.
+AWG_MIN_DATAGRAM = 32
+# The hints `send` plants: upstream's own SIP detection vector, a request
+# line and an empty header section.
+HINTS = {
+    "sip": b"OPTIONS sip:a@b SIP/2.0\r\n\r\n",
+}
+assert all(len(hint) < AWG_MIN_DATAGRAM for hint in HINTS.values())
+
+
 def send(kind, host, port, source_port):
-    """Send one probe of KIND to HOST:PORT from SOURCE PORT, without waiting
+    """Send the hint of KIND to HOST:PORT from SOURCE PORT, without waiting
     for a reply: under imitation auto, the datagram a client's own imitation
-    sends first, which leaves a hint for that source address and port."""
-    request, _ = PROBES[kind]()
+    sends before its handshake, which leaves a hint for that source address
+    and port. It is shorter than any AmneziaWG datagram, so it is never taken
+    for one."""
+    request = HINTS[kind]
     sport = parse_number(source_port, "source port", 65535)
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     with socket.socket(family, socket.SOCK_DGRAM) as sock:
-        # BoringTun's sockets set SO_REUSEADDR, so this one can share the port
-        # of a running client, as that client's own imitation datagram would.
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("::" if family == socket.AF_INET6 else "0.0.0.0", sport))
         sock.sendto(request, (host, int(port)))
     return "sent %d" % len(request)
+
+
+def candidates(source, kind, layout):
+    """The AmneziaWG packet kinds the datagram that `send` (SOURCE "send") or
+    `probe` (SOURCE "probe") would send for KIND fits under LAYOUT, without
+    header protection: each kind whose length rule and H range its bytes meet
+    (classify_datagram's rule, which is inbound_candidates' in the pinned
+    BoringTun without a header-protection key or RandomTrailers), or "none".
+    A datagram with any candidate is AmneziaWG traffic to the server and never
+    an auto hint."""
+    sizes, ranges = parse_layout(layout)
+    if source == "send":
+        datagram = HINTS[kind]
+    else:
+        datagram, _ = PROBES[kind]()
+    found = []
+    for name, index, size in KINDS:
+        offset = sizes[index]
+        length = len(datagram)
+        if (length < offset + size) if name == "transport" else (length != offset + size):
+            continue
+        tag = struct.unpack("<I", datagram[offset:offset + 4])[0]
+        if ranges[index][0] <= tag <= ranges[index][1]:
+            found.append(name)
+    return "%d %s" % (len(datagram), " ".join(found) or "none")
 
 
 def probe(kind, host, port):
@@ -962,8 +1009,11 @@ def main(argv):
             classify(argv[1], argv[2])
         elif len(argv) == 3 and argv[0] == "classify-auto":
             classify_auto(argv[1], argv[2])
-        elif len(argv) == 5 and argv[0] == "send" and argv[1] in PROBES:
+        elif len(argv) == 5 and argv[0] == "send" and argv[1] in HINTS:
             print(send(*argv[1:]))
+        elif (len(argv) == 4 and argv[0] == "candidates" and
+              ((argv[1] == "send" and argv[2] in HINTS) or (argv[1] == "probe" and argv[2] in PROBES))):
+            print(candidates(*argv[1:]))
         elif len(argv) == 4 and argv[0] == "kinds":
             kinds(argv[1], argv[2], argv[3])
         elif len(argv) == 8 and argv[0] == "replay":

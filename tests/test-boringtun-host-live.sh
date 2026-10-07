@@ -1196,6 +1196,19 @@ bash "${SCRIPT_DIR}/test-boringtun-sip-wire-live.sh" "${CLIENT_BIN}" 2>&1 | sed 
 SIP_WIRE_RC="${PIPESTATUS[0]}"
 check "the fixed-size SIP wire test passes" test "${SIP_WIRE_RC}" -eq 0
 
+# ── Auto hints, fixed layout ────────────────────────────────────────────────
+# The planted SIP hint of the auto checks, on the same verified binary with
+# fixed sizes: a SIP datagram long enough to be an AmneziaWG candidate is
+# never a hint, the 27-byte hint is learned, and under AWG 3.0 BoringTun's own
+# warning shows the header-protection refusal of that hint
+# (tests/test-boringtun-auto-hint-live.sh).
+echo "=== Auto hints (fixed layout)"
+check "the auto hint test runs the embedded release's binary" \
+	test "$(sha256sum "${CLIENT_BIN}" | cut -d' ' -f1)" = "${BINARY_SHA256}"
+bash "${SCRIPT_DIR}/test-boringtun-auto-hint-live.sh" "${CLIENT_BIN}" 2>&1 | sed 's/^/    | /'
+AUTO_HINT_RC="${PIPESTATUS[0]}"
+check "the auto hint test passes" test "${AUTO_HINT_RC}" -eq 0
+
 # ── Binary lifecycle ────────────────────────────────────────────────────────
 # A TEST FIXTURE older release (tests/helpers/boringtun-lifecycle-fixture.sh:
 # the verified binary under a synthetic source commit) is made current, as an

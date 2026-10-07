@@ -544,18 +544,35 @@ import socket, subprocess, sys
 listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 listener.bind(("127.0.0.1", 0))
 listener.settimeout(5)
-# The source port is held, as a running client's is, by a socket with
-# SO_REUSEADDR (BoringTun sets it on its sockets).
-holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-holder.bind(("0.0.0.0", int(sys.argv[2])))
 out = subprocess.run([sys.executable, sys.argv[1], "send", "sip", "127.0.0.1", str(listener.getsockname()[1]), sys.argv[2]],
                      capture_output=True, text=True)
 data, source = listener.recvfrom(65535)
-print(out.returncode, out.stdout.strip() == "sent %d" % len(data), source[1] == int(sys.argv[2]), data.startswith(b"OPTIONS sip:"))
+print(out.returncode, out.stdout.strip(), source[1] == int(sys.argv[2]), data == b"OPTIONS sip:a@b SIP/2.0\r\n\r\n")
 PY
 )"
-assert_eq "0 True True True" "${SENT}" "send sends one SIP probe from the given source port, shared with a running client's socket, and says how long it was"
+assert_eq "0 sent 27 True True" "${SENT}" \
+	"send sends the 27-byte SIP request line from the given source port, shorter than any AmneziaWG datagram, and says so"
+"${REAL_PYTHON}" "${WIRE_REAL}" send dns 127.0.0.1 9 40000 >/dev/null 2>&1
+assert_eq 2 "$?" "send plants only the hints it knows to be no AmneziaWG datagram (usage)"
+
+echo "=== Which planted datagram the server can take for AmneziaWG (candidates) ==="
+# The S sizes of the BoringTun Host job whose planted 247-byte SIP probe was
+# not learned (run 37615364152), with an H4 that holds the probe's bytes at
+# S4 = 37, and with one that does not.
+H_LOW="100000001-100000100,200000001-200000100,300000001-300000100"
+COLLIDING="27,113,125,37,${H_LOW},1767000000-1866999999"
+CLEAR="27,113,125,37,${H_LOW},1900000000-1999999999"
+# Every u32 in some H range, every S at 0, and H4 holding the probe's first
+# four bytes ("OPTI", 1230262351): the widest a layout can be.
+EVERYTHING="0,0,0,0,0-1073741823,2147483648-3221225471,3221225472-4294967295,1073741824-2147483647"
+for CASE in "probe ${COLLIDING} 247 transport" "probe ${CLEAR} 247 none" "send ${COLLIDING} 27 none" "send ${CLEAR} 27 none" \
+	"send ${EVERYTHING} 27 none" "probe ${EVERYTHING} 247 transport"; do
+	read -r SOURCE LAYOUT WANT_LENGTH WANT_KINDS <<<"${CASE}"
+	assert_eq "${WANT_LENGTH} ${WANT_KINDS}" "$("${REAL_PYTHON}" "${WIRE_REAL}" candidates "${SOURCE}" sip "${LAYOUT}" 2>&1)" \
+		"candidates: the ${SOURCE} sip datagram under ${LAYOUT%%,1*}… fits: ${WANT_KINDS}"
+done
+"${REAL_PYTHON}" "${WIRE_REAL}" candidates send dns "${CLEAR}" >/dev/null 2>&1
+assert_eq 2 "$?" "candidates knows only the datagrams send and probe send (usage)"
 
 echo "=== IPv4/UDP framing before payload ==="
 assert_eq "datagram 77 77 whole" "$(py frame valid)" "a valid frame yields its UDP payload"
