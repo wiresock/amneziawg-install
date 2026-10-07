@@ -29,6 +29,11 @@
 #     warning above is the hint's.
 # Every capture must be ready before its traffic, run its whole interval and
 # complete (tests/helpers/boringtun-wire-checks.sh).
+# A scenario's evidence is judged only if every step of it succeeded: the
+# setup, the capture, the planted datagram (its sender's exit status and its
+# exact report), the client, the tunnel and the capture's completion. Its
+# capture is removed before it starts, so nothing of an earlier scenario can
+# stand in for its own.
 #
 # Requirements: root, ip (iproute2) with network namespaces, /dev/net/tun, awg
 # (amneziawg-tools), ping, python3 and AWG_DISPOSABLE_HOST_TEST=1. With
@@ -203,7 +208,8 @@ setup() { # <hp 0|1>
 	start_peer "${NS_S}" "${IF_S}" "${WORK}/server.log" "${WORK}/server.conf" "${TUN_S}" "${TUN_C}" auto info
 }
 # The datagram a scenario plants from the client's port, by name: the
-# helper's 27-byte SIP hint, the 247-byte SIP probe, or nothing.
+# helper's 27-byte SIP hint, the 247-byte SIP probe, or nothing. Each sender
+# reports exactly what it sent (plant_expected) and exits 0 only if it sent it.
 plant() { # <hint|probe|none>
 	case "$1" in
 		hint)
@@ -218,18 +224,38 @@ spec.loader.exec_module(wire)
 request, _ = wire.sip_probe()
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
     sock.bind(("0.0.0.0", int(sys.argv[4])))
-    sock.sendto(request, (sys.argv[2], int(sys.argv[3])))
+    if sock.sendto(request, (sys.argv[2], int(sys.argv[3]))) != len(request):
+        sys.exit("short send")
 print("sent %d" % len(request))
 PY
 			;;
 		none) echo "sent nothing" ;;
+		*) return 2 ;;
 	esac
 }
+plant_expected() { # <hint|probe|none>
+	case "$1" in
+		hint) echo "sent 27" ;;
+		probe) echo "sent 247" ;;
+		none) echo "sent nothing" ;;
+	esac
+}
+# Planting succeeded only with exit status 0 and exactly the report its kind
+# gives: a sender that failed, or reported anything else, sent nothing that
+# can count.
+plant_ok() { # <exit status> <report> <kind>
+	[[ "$1" == 0 && -n "$2" && "$2" == "$(plant_expected "$3")" ]]
+}
+tunnel_up() {
+	ip netns exec "${NS_C}" ping -c 15 -i 0.2 -W 2 -q "${TUN_S}" >/dev/null
+}
 # One scenario: plant, then start the client and ping inside a capture of the
-# server's datagrams.
+# server's datagrams. Returns 0 only if every step succeeded; its capture is
+# removed first and written anew.
 run_scenario() { # <name> <hint|probe|none> <hp 0|1>
-	local NAME="$1" CAPTURE="${WORK}/$1.capture" SENT
+	local NAME="$1" CAPTURE="${WORK}/$1.capture" SENT RC FAILED_BEFORE="${FAILED}"
 	local -a LAYOUT=()
+	rm -f -- "${CAPTURE}" "${CAPTURE}".*
 	echo "--- ${NAME}: S1-S4 ${S_SIZES}, H4 ${H_RANGES##*,}, planted: $2$( (($3)) && echo ', header protection')"
 	if ! setup "$3"; then
 		bad "${NAME}: the server could not be set up"
@@ -240,20 +266,59 @@ run_scenario() { # <name> <hint|probe|none> <hp 0|1>
 		bad "${NAME}: the capture started"
 		return 1
 	fi
-	SENT="$(plant "$2")"
-	check "${NAME}: the planted datagram was sent from ${ADDR_C}:${CLIENT_PORT} before the client started (${SENT})" \
-		bash -c '[[ "$1" == "sent nothing" || "$1" =~ ^sent\ [0-9]+$ ]]' _ "${SENT}"
+	SENT="$(plant "$2" 2>&1)"
+	RC=$?
+	if ! plant_ok "${RC}" "${SENT}" "$2"; then
+		bad "${NAME}: the planted datagram was sent from ${ADDR_C}:${CLIENT_PORT} (exit ${RC}, '${SENT}'; wanted exit 0 and '$(plant_expected "$2")')"
+		return 1
+	fi
+	ok "${NAME}: the planted datagram was sent from ${ADDR_C}:${CLIENT_PORT} before the client started (${SENT})"
 	if ! start_peer "${NS_C}" "${IF_C}" "${WORK}/client.log" "${WORK}/client.conf" "${TUN_C}" "${TUN_S}" none error; then
 		bad "${NAME}: the client could not be set up"
 		return 1
 	fi
-	check "${NAME}: the client reaches the server through the tunnel" \
-		ip netns exec "${NS_C}" ping -c 15 -i 0.2 -W 2 -q "${TUN_S}" >/dev/null
+	check "${NAME}: the client reaches the server through the tunnel (15 pings)" tunnel_up
 	check "${NAME}: the capture outlived the traffic, ran its whole ${CAPTURE_SECONDS} s and completed with all its records" \
 		bt_wire_capture_finish "${CAPTURE}" complete "$((CAPTURE_SECONDS + 10))"
+	((FAILED == FAILED_BEFORE))
+}
+# Run a scenario and, only if it ran to the end, its JUDGE <name>: no
+# earlier scenario's capture or server log can stand in for its evidence.
+scenario() { # <name> <hint|probe|none> <hp 0|1> <judge>
+	if ! run_scenario "$1" "$2" "$3"; then
+		bad "$1: the scenario did not run to the end, so none of its evidence is judged"
+		return 1
+	fi
+	"$4" "$1"
 }
 refusals() {
 	sed 's/\x1b\[[0-9;]*m//g' "${WORK}/server.log" | grep -cF "${REFUSAL}"
+}
+judge_collision() {
+	bt_wire_kinds "${WORK}/$1.capture" "${S_SIZES}" ||
+		bad "$1: the capture has a complete, valid per-kind result (${BT_WIRE_REASON})"
+	check "$1: responses were recorded (${BT_WIRE_SEEN[response]:-0}), none with a SIP request line (${BT_WIRE_SHAPED[response]:-?})" \
+		test "${BT_WIRE_SEEN[response]:-0}" -ge 1 -a "${BT_WIRE_SHAPED[response]:-1}" -eq 0
+	check "$1: transports were recorded (${BT_WIRE_SEEN[transport]:-0}), none with a SIP request line (${BT_WIRE_SHAPED[transport]:-?}): the probe was taken for AmneziaWG, never for a hint" \
+		test "${BT_WIRE_SEEN[transport]:-0}" -ge 10 -a "${BT_WIRE_SHAPED[transport]:-1}" -eq 0
+}
+judge_hint() {
+	bt_wire_assert_sip "$1" "${WORK}/$1.capture" "${S_SIZES}" init:optional response:required:shaped cookie:optional transport:required:shaped
+}
+judge_unshaped() { # <name>: no dns, stun or sip shape
+	local COUNTS
+	COUNTS="$(python3 "${WIRE}" classify-auto none "${WORK}/$1.capture" 2>&1)"
+	check "$1: the server sent datagrams, none with a dns, stun or sip shape (${COUNTS})" \
+		bash -c '[[ "$1" =~ ^([0-9]+)\ 0\ 0\ ([0-9]+)$ ]] && ((BASH_REMATCH[1] >= 10))' _ "${COUNTS}"
+}
+judge_hp_hint() {
+	check "AWG 3.0, hint: BoringTun warns that the header-protection policy refused the learned sip" \
+		bash -c 'sed "s/\x1b\[[0-9;]*m//g" "$1" | grep -F "$2" | grep -q "\"sip\""' _ "${WORK}/server.log" "${REFUSAL}"
+	judge_unshaped "$1"
+}
+judge_hp_none() {
+	check "AWG 3.0, no hint: no refusal warning ($(refusals))" test "$(refusals)" -eq 0
+	judge_unshaped "$1"
 }
 
 echo "=== Auto hints on $("${BIN}" --version 2>/dev/null) ($(sha256sum "${BIN}" | cut -d' ' -f1))"
@@ -263,29 +328,10 @@ check "the 247-byte SIP probe is an AmneziaWG transport candidate under this lay
 check "the 27-byte SIP hint fits no AmneziaWG packet kind under it" \
 	test "$(python3 "${WIRE}" candidates send sip "${LAYOUT_TEXT}")" = "27 none"
 
-run_scenario collision probe 0
-bt_wire_kinds "${WORK}/collision.capture" "${S_SIZES}" ||
-	bad "collision: the capture has a complete, valid per-kind result (${BT_WIRE_REASON})"
-check "collision: responses were recorded (${BT_WIRE_SEEN[response]:-0}), none with a SIP request line (${BT_WIRE_SHAPED[response]:-?})" \
-	test "${BT_WIRE_SEEN[response]:-0}" -ge 1 -a "${BT_WIRE_SHAPED[response]:-1}" -eq 0
-check "collision: transports were recorded (${BT_WIRE_SEEN[transport]:-0}), none with a SIP request line (${BT_WIRE_SHAPED[transport]:-?}): the probe was taken for AmneziaWG, never for a hint" \
-	test "${BT_WIRE_SEEN[transport]:-0}" -ge 10 -a "${BT_WIRE_SHAPED[transport]:-1}" -eq 0
-
-run_scenario hint hint 0
-bt_wire_assert_sip "hint" "${WORK}/hint.capture" "${S_SIZES}" init:optional response:required:shaped cookie:optional transport:required:shaped
-
-run_scenario hp-hint hint 1
-check "AWG 3.0, hint: BoringTun warns that the header-protection policy refused the learned sip" \
-	bash -c 'sed "s/\x1b\[[0-9;]*m//g" "$1" | grep -F "$2" | grep -q "\"sip\""' _ "${WORK}/server.log" "${REFUSAL}"
-COUNTS="$(python3 "${WIRE}" classify-auto none "${WORK}/hp-hint.capture" 2>&1)"
-check "AWG 3.0, hint: the server sent datagrams, none with a dns, stun or sip shape (${COUNTS})" \
-	bash -c '[[ "$1" =~ ^([0-9]+)\ 0\ 0\ ([0-9]+)$ ]] && ((BASH_REMATCH[1] >= 10))' _ "${COUNTS}"
-
-run_scenario hp-none none 1
-check "AWG 3.0, no hint: no refusal warning ($(refusals))" test "$(refusals)" -eq 0
-COUNTS="$(python3 "${WIRE}" classify-auto none "${WORK}/hp-none.capture" 2>&1)"
-check "AWG 3.0, no hint: the server sent datagrams, none with a dns, stun or sip shape (${COUNTS})" \
-	bash -c '[[ "$1" =~ ^([0-9]+)\ 0\ 0\ ([0-9]+)$ ]] && ((BASH_REMATCH[1] >= 10))' _ "${COUNTS}"
+scenario collision probe 0 judge_collision
+scenario hint hint 0 judge_hint
+scenario hp-hint hint 1 judge_hp_hint
+scenario hp-none none 1 judge_hp_none
 
 echo
 echo "BoringTun auto hint test: ${PASSED} passed, ${FAILED} failed"

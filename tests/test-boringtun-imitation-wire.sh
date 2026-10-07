@@ -1340,6 +1340,65 @@ for KINDS_MODE in empty garbage; do
 		"the capture has a complete, valid per-kind result" live_case "${T}/live-valid" FAKE_KINDS="${KINDS_MODE}"
 done
 
+echo "=== The auto hint test's scenarios: planting and stale evidence (tests/test-boringtun-auto-hint-live.sh) ==="
+# Its scenario runner, extracted verbatim, with every external step stubbed
+# to succeed except the one a case breaks. Planting counts only with exit
+# status 0 and exactly the report its kind gives; a scenario that did not run
+# to the end is never judged, so no earlier scenario's files can stand in for
+# its evidence.
+HINT_LIVE="${SCRIPT_DIR}/test-boringtun-auto-hint-live.sh"
+for FUNCTION in run_scenario scenario plant_ok plant_expected; do
+	assert_true "${FUNCTION} is extracted from test-boringtun-auto-hint-live.sh" test -n "$(extract "${HINT_LIVE}" "${FUNCTION}")"
+done
+hint_case() { # [VAR=value...]: FIX_SENT, FIX_RC, FIX_SETUP, FIX_STALE
+	# shellcheck disable=SC2034 # the fixture settings are read by the extracted functions
+	(
+		# shellcheck disable=SC2163 # the arguments are VAR=value assignments
+		export FIX_SENT="sent 27" FIX_RC=0 FIX_SETUP=0 FIX_STALE="" "$@"
+		WORK="${T}/hint-work"
+		rm -rf "${WORK}" && mkdir -p "${WORK}"
+		NS_C=fixture VETH_C=fixture IF_C=fixture ADDR_S=203.0.113.1 ADDR_C=203.0.113.2
+		PORT=51998 CLIENT_PORT=41006 TUN_S=10.78.0.1 TUN_C=10.78.0.2 CAPTURE_SECONDS=12 S_SIZES=27,113,125,37 H_RANGES="${H}"
+		CLIENT_PUB="${FIXTURE_KEY}"
+		PASSED=0 FAILED=0
+		ok() { echo "  OK: $1"; PASSED=$((PASSED + 1)); }
+		bad() { echo "  FAIL: $1"; FAILED=$((FAILED + 1)); }
+		check() { local M="$1"; shift; if "$@"; then ok "${M}"; else bad "${M}"; fi; }
+		setup() { return "${FIX_SETUP}"; }
+		start_peer() { :; }
+		ip() { :; }
+		tunnel_up() { :; }
+		bt_wire_capture_start() { echo fresh >"$6"; }
+		bt_wire_capture_finish() { :; }
+		plant() { printf '%s\n' "${FIX_SENT}"; return "${FIX_RC}"; }
+		judge() { echo "  JUDGED $1 from: $(cat "${WORK}/$1.capture")"; ok "the stand-in judge ran"; }
+		for FUNCTION in run_scenario scenario plant_ok plant_expected; do
+			eval "$(extract "${HINT_LIVE}" "${FUNCTION}")"
+		done
+		[[ -z "${FIX_STALE}" ]] || printf 'STALE\n' >"${WORK}/hint.capture"
+		if declare -F scenario >/dev/null; then
+			scenario hint hint 0 judge
+		else
+			run_scenario hint hint 0
+		fi
+		echo "complete assertions=$((PASSED + FAILED)) failures=${FAILED}"
+		((FAILED == 0))
+	)
+}
+expect_fixture "a planted hint sent with exit 0 and the report 'sent 27' counts, and the scenario is judged" pass - hint_case
+expect_fixture "planting that reports 'sent 27' but exits 1 fails the scenario" reject "sent from 203.0.113.2:41006 (exit 1, 'sent 27'" \
+	hint_case FIX_RC=1
+for REPORT in "sent 28" "sent 27 more" "sent 27:" ""; do
+	expect_fixture "planting that exits 0 but reports '${REPORT}' fails the scenario" reject "sent from 203.0.113.2:41006 (exit 0, '${REPORT}'" \
+		hint_case FIX_SENT="${REPORT}"
+done
+for CASE in "FIX_RC=1|planting failed" "FIX_SETUP=1|the setup failed"; do
+	OUTPUT="$(hint_case FIX_STALE=1 "${CASE%%|*}" 2>&1)"
+	assert_true "when ${CASE#*|}, an earlier scenario's capture is removed and nothing is judged" \
+		bash -c '[[ "$1" != *JUDGED* && "$1" == *"none of its evidence is judged"* ]] && ! grep -qs STALE "$2"/hint.capture' \
+		_ "${OUTPUT}" "${T}/hint-work"
+done
+
 echo "=== The fixture judge itself ==="
 crashing_fixture() {
 	(exit 3)
