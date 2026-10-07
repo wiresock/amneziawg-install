@@ -687,16 +687,21 @@ for each authenticated peer, from the imitation datagrams that peer's client
 sends before its handshake, so clients with different imitation settings can
 share one server and port. What to know:
 
-- It needs **recognizable client traffic**. A client that sends no DNS, QUIC,
-  SIP or STUN pre-handshake datagrams (a standard AmneziaWG client, for
-  example), or whose datagrams are lost, leaves its peer unresolved: the
-  server pads that peer's packets with random S padding, as with `none`. A
+- It is **best effort** and needs **recognizable client traffic**. A client
+  that sends no DNS, QUIC, SIP or STUN pre-handshake datagrams (a standard
+  AmneziaWG client, for example), or whose datagrams are lost, leaves its peer
+  unresolved. Even a datagram that arrives may not count: one that also fits
+  this server's AmneziaWG S/H framing is taken for AmneziaWG traffic, never as
+  a hint, and a client's own imitation datagrams can, depending on the S1–S4
+  and H1–H4 values. A peer for which nothing was learned is padded with random
+  S padding, as with `none`; it may still be learned at a later handshake. A
   learned protocol is kept for the peer and survives roaming.
+- A working tunnel, and `auto` configured and running, do not show that any
+  peer is imitated. The status shows `auto` as configured and running, and
+  nothing per peer: BoringTun does not report which protocol a peer learned.
 - It does **not detect S1–S4, H1–H4** or any other AmneziaWG setting; clients
   still need this server's values. It takes no hostname (BoringTun uses its own
   generated ones), and the installer and panel refuse one.
-- The status shows `auto` as configured and running, and nothing per peer:
-  BoringTun does not report which protocol a peer learned.
 - Probes: the listen port may answer DNS, QUIC and STUN probes as those
   imitations do; SIP gets no reply.
 - **Header protection is not relaxed.** Under AWG 3.0/3.1 a learned `dns` or

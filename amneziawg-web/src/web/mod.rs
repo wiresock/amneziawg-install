@@ -8414,6 +8414,9 @@ mod tests {
         assert!(html.contains("<option value=\"auto\" id=\"imitation-mode-auto\" disabled>"));
         assert!(html.contains("authenticated"));
         assert!(html.contains("does not detect"));
+        assert!(html.contains("Auto is best effort"));
+        assert!(html.contains("AWG S/H framing counts as AWG traffic, not as a hint"));
+        assert!(html.contains("do not show that a client is imitated"));
     }
 
     #[tokio::test]

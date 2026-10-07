@@ -677,8 +677,12 @@ configurations.
 **Auto (per client)** lets BoringTun choose DNS, QUIC, SIP or STUN separately for
 each authenticated peer, from the recognizable imitation traffic its client
 sends before the handshake, so clients with different imitation settings share
-one port. A client without such traffic stays unresolved and gets random S
-padding. Auto does not detect S1–S4, H1–H4 or other AWG settings, and takes no
+one port. Auto is best effort. A client without such traffic, or whose traffic
+is lost, stays unresolved and gets random S padding; so does a client none of
+whose imitation datagrams counts: one that also fits this server's AWG S/H
+framing counts as AWG traffic, not as a hint, which depends on the S1–S4 and
+H1–H4 values. A working connection, and Auto shown as running, do not show that
+a client is imitated. Auto does not detect S1–S4, H1–H4 or other AWG settings, and takes no
 hostname: the hostname field is disabled for it and a hostname is rejected. The
 status shows Auto as configured and running only; BoringTun does not report
 which protocol each peer learned. Auto is offered only when the installer reports

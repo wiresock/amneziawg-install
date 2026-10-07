@@ -763,6 +763,20 @@ assert_contains "per authenticated peer" "${OUT}" "  selection is per authentica
 assert_contains "recognizable" "${OUT}" "  and needs recognizable client traffic"
 assert_contains "does not detect" "${OUT}" "  and auto does not detect the client's S1-S4 or H1-H4"
 assert_contains "random S padding" "${OUT}" "  an unresolved peer gets random padding"
+assert_contains "best effort" "${OUT}" "  auto is best effort"
+assert_contains "also fits this server's AmneziaWG S/H framing is taken for AmneziaWG traffic" "${OUT}" \
+	"  a datagram that arrives but fits the configured S/H framing is no hint"
+assert_contains "A working tunnel, and auto configured and running, do not show that any peer is imitated" "${OUT}" \
+	"  neither a working tunnel nor a running auto shows successful imitation"
+assert_not_contains "%" "${OUT}" "  no per-datagram share is offered as a chance of anything"
+assert_not_contains "guarantee" "${OUT}" "  nothing is said to guarantee learning"
+# The README's auto section as one line, so that a phrase may wrap.
+README_AUTO="$(sed -n '/^\*\*`auto` (opt-in)\.\*\*/,/^A change is one transaction/p' "${PROJECT_ROOT}/README.md" | tr -s ' \r\n' ' ')"
+assert_contains "best effort" "${README_AUTO}" "README: auto is best effort"
+assert_contains "fits this server's AmneziaWG S/H framing" "${README_AUTO}" \
+	"README: a delivered datagram that fits the configured S/H framing is no hint"
+assert_contains "do not show that any peer is imitated" "${README_AUTO}" \
+	"README: neither a working tunnel nor a running auto shows successful imitation"
 assert_not_contains "16 random bits" "${OUT}" "  AWG 2.0 has no header-protection warning"
 run warnings 3.1
 assert_contains "header protection" "${OUT}" "AWG 3.1: the header-protection trade-offs are stated"

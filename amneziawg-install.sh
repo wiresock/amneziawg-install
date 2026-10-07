@@ -2139,9 +2139,10 @@ function printBoringtunAutoImitationWarnings() { # <AWG protocol version>
 	local VERSION="$1"
 	echo -e "${ORANGE}Protocol imitation: $(boringtunImitationDisplay auto "")${NC}"
 	echo "- BoringTun selects dns, quic, sip or stun separately for each authenticated peer, from the imitation that peer's client sends before its handshake, so clients with different imitation settings can share this server and its port. The protocol a peer learned is kept for that peer and survives roaming."
-	echo "- It needs recognizable client traffic: until a client's DNS, QUIC, SIP or STUN pre-handshake datagrams are recognized (a client without imitation sends none, and they can be lost), its peer is unresolved and gets random S padding, as with none."
+	echo "- It is best effort and needs recognizable client traffic. A client without imitation sends no DNS, QUIC, SIP or STUN pre-handshake datagrams, and sent ones can be lost. Even one that arrives may not count: a datagram that also fits this server's AmneziaWG S/H framing is taken for AmneziaWG traffic, never as a hint, and a client's own imitation datagrams can, depending on the S1-S4 and H1-H4 values. A peer for which nothing was learned is unresolved and gets random S padding, as with none; it may still be learned at a later handshake."
+	echo "- A working tunnel, and auto configured and running, do not show that any peer is imitated: BoringTun does not report which protocol each peer learned, so neither does this installer."
 	echo "- auto does not detect S1-S4, H1-H4 or any other AmneziaWG setting: clients still need this server's values. Client configs do not change."
-	echo "- Probes: the listen port may answer DNS, QUIC and STUN probes as those imitations do; SIP probes get no reply. BoringTun does not report which protocol each peer learned, so neither does this installer."
+	echo "- Probes: the listen port may answer DNS, QUIC and STUN probes as those imitations do; SIP probes get no reply."
 	echo "  All probe replies share a budget of 16 KiB/s (BoringTun's default); loopback, link-local, multicast and broadcast sources are never answered."
 	echo "- The listen port stays ${SERVER_PORT:-unchanged}: the installer never moves it, because a new port needs new client configs."
 	if [[ "${VERSION}" == "${AWG_PROTOCOL_VERSION_3}" || "${VERSION}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then

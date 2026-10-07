@@ -2789,7 +2789,10 @@ offers its server imitation mode `auto` everywhere the fixed modes are offered. 
 engine is not changed. In `auto`, a responder learns `dns`, `quic`, `sip` or `stun` for each
 authenticated peer from the client's own pre-handshake imitation datagrams (hints keyed by
 source address and port, 30 s, at most 1024), pins it for that peer, keeps it across roaming,
-and pads an unresolved peer with random S padding. S1–S4 and H1–H4 stay configured.
+and pads an unresolved peer with random S padding. S1–S4 and H1–H4 stay configured. It is best
+effort: only a datagram that fits no AmneziaWG packet kind under the configured S/H framing
+can be a hint, so a client's own imitation datagrams that also fit it (which depends on the
+S1–S4 and H1–H4 values) leave its peer unresolved unless another one counts.
 
 **Values.** `auto` joins `none`, `dns`, `quic`, `sip` and `stun` in
 `_awgBtImitationProtocolValid`, so params, the runtime file (`IMITATE_PROTOCOL=auto`), the
@@ -2803,8 +2806,9 @@ does), so `--imitate-domain` never follows it. Fresh installs take
 policy binds what a peer learns. A learned `sip` is not activated while any S prefix is 31
 bytes or more (the peer stays unresolved, random padding), and a learned `dns` or `stun` has
 the nonce trade-offs of §9.4. `printBoringtunAutoImitationWarnings` states these, and that
-`auto` needs recognizable client traffic and does not detect S/H settings. Nothing disables
-header protection or changes framing.
+`auto` is best effort, needs recognizable client traffic that does not fit the S/H framing,
+does not detect S/H settings, and that neither a working tunnel nor `auto` running shows that
+a peer is imitated. Nothing disables header protection or changes framing.
 
 **Binaries without `auto`.** The releases before `b94943906b11` report the same version, 0.7.1,
 and refuse `--imitate-protocol auto` as a usage error. The installer therefore asks the

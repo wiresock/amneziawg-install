@@ -72,6 +72,10 @@ test('configured and running auto are shown as such, without per-peer claims', a
     assert.match(hint, /authenticated/);
     assert.match(hint, /recognizable/);
     assert.match(hint, /does not detect S1–S4 or H1–H4/);
+    assert.match(hint, /best effort/);
+    assert.match(hint, /also fits this server's AWG S\/H framing counts as AWG traffic, not as a hint/);
+    assert.match(hint, /A working connection, and Auto shown as running, do not show that a client is imitated/);
+    assert.doesNotMatch(hint, /%|guarantee/);
 });
 
 test('auto under AWG 3.x states the header-protection consequences', async () => {
