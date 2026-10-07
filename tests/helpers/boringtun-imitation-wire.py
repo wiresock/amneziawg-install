@@ -50,7 +50,8 @@
       was received at: "<clock> <source address> <source port> <length>
       <hex>"; the first fragment of a fragmented datagram as "<clock>
       <address> <port> fragment <length>", a frame that is not valid
-      IPv4/UDP as "<clock> <address> - malformed <length>". Several source
+      IPv4/UDP as "<clock> <address> - malformed <length> <its first 40
+      bytes>". Several source
       addresses, any source port, and with "any" every interface of the
       namespace, also one created later: what reached the server from its
       clients, in arrival order. Transcript and exit statuses are capture's.
@@ -70,8 +71,9 @@
       between the clocks START and END (centiseconds of CLOCK_BOOTTIME).
       EPOCH is when the server's state was last empty; the record must have
       been ready by then. Nothing the server sent is consulted. "undecided
-      <reason>" (exit 1) when the record cannot decide: a malformed or
-      fragmented frame from that address, no initiation, a hint at the edge
+      <reason>" (exit 1) when the record cannot decide: a malformed frame from
+      that address, or a fragment from that port, that could have been the
+      client's hint or initiation, no initiation, a hint at the edge
       of its lifetime, a peer that learned inside the window after a session
       without it, or an outcome that depends on which initiation was
       accepted first.
@@ -649,19 +651,23 @@ def record_line(sizes, ranges, status, length, data, evidence=None):
     return "%s %d %s" % (kind, length, prefix.hex() or "-")
 
 
+MALFORMED_KEPT = 40
+
+
 def full_record_line(clock, frame, status, length, data, fragmented):
     """The `record` line of one relevant frame, or None for a continuation:
     "<clock> <source address> <source port> <length> <hex>" for a whole
     datagram, "<clock> <source address> <source port> fragment <length>" for
     the first fragment of one (its later fragments are never inspected), and
-    "<clock> <source address> - malformed <frame length>" for a frame that is
-    not valid IPv4/UDP. CLOCK is CLOCK_BOOTTIME in centiseconds, read when the
+    "<clock> <source address> - malformed <frame length> <hex>" for a frame
+    that is not valid IPv4/UDP, with its first MALFORMED_KEPT bytes (headers)
+    to tell what it was. CLOCK is CLOCK_BOOTTIME in centiseconds, read when the
     frame was received."""
     if status == CONTINUATION:
         return None
     address = socket.inet_ntoa(frame[12:16])
     if status == MALFORMED:
-        return "%d %s - malformed %d" % (clock, address, length)
+        return "%d %s - malformed %d %s" % (clock, address, length, frame[:MALFORMED_KEPT].hex())
     header = (frame[0] & 0x0F) * 4
     sport = struct.unpack(">H", frame[header:header + 2])[0]
     if fragmented:
@@ -1282,15 +1288,15 @@ def policy_allows(protocol, sizes, hp_key):
 
 RECORD_DATAGRAM = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) (0|[1-9][0-9]{0,4}) (0|[1-9][0-9]{0,4}) (-|(?:[0-9a-f]{2})+)")
 RECORD_FRAGMENT = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) (0|[1-9][0-9]{0,4}) fragment (0|[1-9][0-9]{0,4})")
-RECORD_MALFORMED = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) - malformed (0|[1-9][0-9]{0,4})")
+RECORD_MALFORMED = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) - malformed (0|[1-9][0-9]{0,4}) ((?:[0-9a-f]{2}){0,40})")
 
 
 def full_records(path):
     """The records of a finished `record` and its ready clock. Its transcript
     must be a ready line and a stopped or complete end that counts every
     record, every record well formed, its clocks never going back. A record is
-    (clock, address, port, kind, data), KIND "datagram", "fragment" or
-    "malformed" (port None)."""
+    (clock, address, port, kind, data), KIND "datagram", "fragment" (no data)
+    or "malformed" (port None, data the frame's first bytes)."""
     with open(path + ".state") as state:
         transcript = state.read().splitlines()
     ready = re.fullmatch(r"ready [0-9]+ [0-9]+ (0|[1-9][0-9]{0,17})", transcript[0]) if transcript else None
@@ -1322,7 +1328,7 @@ def full_records(path):
         elif kind == "fragment":
             records.append((clock, match.group(2), int(match.group(3)), kind, b""))
         else:
-            records.append((clock, match.group(2), None, kind, b""))
+            records.append((clock, match.group(2), None, kind, bytes.fromhex(match.group(4))))
     end = re.fullmatch(r"(?:stopped ([0-9]+) [0-9a-f]{32}|complete ([0-9]+) [0-9]+)", transcript[1])
     if not end or int(end.group(1) or end.group(2)) != len(records):
         raise InputError("%s.state does not end with a stop or completion that counts its %d records" % (path, len(records)))
@@ -1413,7 +1419,8 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
     between the clocks START and END. EPOCH is when the server's state was
     last empty (its start); the record must have been ready by then. Returns
     1, after "undecided <reason>", when the record cannot decide: a malformed
-    or fragmented frame from that address, no initiation, a hint at the edge
+    frame from that address, or a fragment from that port, at a time when it
+    could have been the client's hint or initiation, no initiation, a hint at the edge
     of its lifetime, a peer that learned inside the window after a session
     without it, or an outcome that depends on which initiation the server
     accepted first (each initiation up to the first one the client's own
@@ -1440,12 +1447,15 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
         if ready > epoch:
             raise Undecided("the record was ready at %d, after the server's state was last empty at %d" % (ready, epoch))
         events = []
+        # Frames from the address whose datagram is unknown: a malformed one
+        # (its port unknown) and a fragment from the client's port.
+        unknown = []
         for clock, source, source_port, kind, data in records:
             if clock < epoch or clock > window_end or source != address:
                 continue
             if kind == "malformed" or (kind == "fragment" and source_port == port):
-                raise Undecided("a %s frame from %s arrived at %d" % (kind, address, clock))
-            if source_port == port:
+                unknown.append((clock, kind, data))
+            elif source_port == port:
                 events.append((clock, data))
         # The client sends transport only once a response reached it, so the
         # first initiation followed by a transport candidate before the next
@@ -1465,8 +1475,23 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
             if skipped == 0:
                 print("\n".join(notes) if notes else "no datagram from %s:%d" % (address, port))
             outcomes.append(window_expectation(learned, learned_at, accepted, window_start, window_end))
+            # An unknown datagram could have been this client's hint, or have
+            # held the hint slot of its source while it lived. It changes
+            # nothing if it came after the selection was pinned (or,
+            # unresolved, after the window), or so long before the client's
+            # first recorded datagram that a hint from it had expired before
+            # the client sent anything; such a frame is taken as not the
+            # client's own initiation, which would need the client running.
+            decided = learned_at if learned is not None else window_end
+            for clock, kind, data in unknown:
+                if clock <= decided and clock >= events[0][0] - HINT_LIFETIME_CS - HINT_LIFETIME_MARGIN_CS:
+                    raise Undecided("a %s frame from %s arrived at %d, when it could have been this client's hint or initiation (%s)"
+                                    % (kind, address, clock, data.hex() or "-"))
         if len(set(outcomes)) > 1:
             raise Undecided("the outcome depends on which of %d initiations the server accepted (%s)" % (initiations, ", ".join(outcomes)))
+        for clock, kind, data in unknown:
+            print("a %s frame from %s at %d (%s) could not have been this client's hint or initiation"
+                  % (kind, address, clock, data.hex() or "-"))
     except Undecided as reason:
         print("undecided %s" % reason)
         return 1

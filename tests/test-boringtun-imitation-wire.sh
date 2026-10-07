@@ -373,7 +373,8 @@ elif cmd == "full-record":
     payload = os.urandom(77)
     for frame in (ipv4(payload), ipv4(os.urandom(1384), fragment=0x2000, udp_length=1408), ipv4(os.urandom(12), ihl=4)):
         status, length, data, fragmented = wire.frame_payload(frame, SERVER, None, fragments=wire.Fragments())
-        print(wire.full_record_line(1700, frame, status, length, data, fragmented).replace(payload.hex(), "<its bytes>"))
+        line = wire.full_record_line(1700, frame, status, length, data, fragmented)
+        print(line.replace(payload.hex(), "<its bytes>").replace(" " + frame[:40].hex(), " <its first 40 bytes>"))
 PY
 }
 kinds() { # <capture> <S1,S2,S3,S4>
@@ -755,11 +756,28 @@ elif case == "hp-unmasked-initiation":
 elif case == "no-initiation":
     sequence(2000, [SIP_HINT, initiation(layout, valid=False), transport(layout)])
 elif case == "malformed":
+    # A frame whose datagram is unknown, while it could have been the hint.
     sequence(2000, [SIP_HINT, initiation(layout), transport(layout)])
-    lines.insert(1, "2000 %s - malformed 28" % A)
+    lines.insert(1, "2000 %s - malformed 28 4500001c" % A)
+elif case == "malformed-long-before":
+    # Its hint, had it been one, expired before the client sent anything.
+    lines.append("1600 %s - malformed 28 4500001c" % A)
+    sequence(4800, [SIP_HINT, initiation(layout), transport(layout)])
+elif case == "malformed-after-learning":
+    # Nothing changes a pinned selection.
+    sequence(2000, [SIP_HINT, initiation(layout), transport(layout)])
+    lines.append("2500 %s - malformed 28 4500001c" % A)
+elif case == "malformed-29s-before":
+    # 29 s before the client's first datagram, a hint from it would still
+    # hold the slot when that datagram arrived.
+    lines.append("1600 %s - malformed 28 4500001c" % A)
+    sequence(4500, [SIP_HINT, initiation(layout), transport(layout)])
 elif case == "fragment":
     sequence(2000, [SIP_HINT, initiation(layout), transport(layout)])
     lines.insert(1, "2000 %s 41006 fragment 1400" % A)
+elif case == "fragment-other-port":
+    sequence(2000, [SIP_HINT, initiation(layout), transport(layout)])
+    lines.insert(1, "2000 %s 41007 fragment 1400" % A)
 elif case == "late-record":
     ready = 2500
     sequence(3000, [SIP_HINT, initiation(layout), transport(layout)])
@@ -806,10 +824,11 @@ PY
 for CASE in "stun-colliding|0 expect random" "stun-clear|0 expect stun" "other-port|0 expect random" \
 	"other-address|0 expect random" "age-28|0 expect sip" "age-32|0 expect random" \
 	"first-hint-wins|0 expect quic" "new-hint-after-expiry|0 expect sip" "from-initiation|0 expect dns" \
-	"hp-sip-large|0 expect random" "hp-sip-small|0 expect sip"; do
+	"hp-sip-large|0 expect random" "hp-sip-small|0 expect sip" "malformed-long-before|0 expect sip" \
+	"malformed-after-learning|0 expect sip" "fragment-other-port|0 expect sip"; do
 	assert_eq "${CASE#*|}" "$(auto_case "${CASE%%|*}" 2>&1)" "auto-expect, ${CASE%%|*}: ${CASE#*|}"
 done
-for CASE in age-30 no-initiation malformed fragment late-record hp-unmasked-initiation; do
+for CASE in age-30 no-initiation malformed malformed-29s-before fragment late-record hp-unmasked-initiation; do
 	GOT="$(auto_case "${CASE}" 2>&1)"
 	assert_true "auto-expect, ${CASE}: undecided, exit 1, never a guess (${GOT})" bash -c '[[ "$1" == "1 undecided "* ]]' _ "${GOT}"
 done
@@ -850,7 +869,7 @@ printf 'ready 1 1 900\n' >"${T}/bad-record.state"
 assert_eq 1 "$?" "auto-expect refuses a record that has not ended"
 assert_eq "1700 192.0.2.1 51820 77 <its bytes>
 1700 192.0.2.1 51820 fragment 1400
-1700 192.0.2.1 - malformed 40" "$(py full-record 2>&1)" \
+1700 192.0.2.1 - malformed 40 <its first 40 bytes>" "$(py full-record 2>&1)" \
 	"record lines: a whole datagram with its bytes, a first fragment by its length, a malformed frame without a port"
 
 echo "=== IPv4/UDP framing before payload ==="

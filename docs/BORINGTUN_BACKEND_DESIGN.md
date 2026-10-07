@@ -2864,9 +2864,10 @@ explains its behaviour, and offers it only when the installed binary supports it
   agree with upstream's own `inbound_candidates()` and `detect()` on 3,926 vectors (recorded
   client datagrams, fuzzed protocol datagrams and random bytes under random and constructed
   layouts, 719 with header protection), run once against an unmodified export of
-  `b94943906b11`. A record that cannot decide (a fragment or malformed frame from the client's
-  address, no initiation, a hint at the edge of its lifetime, an outcome that depends on which
-  initiation was accepted first, or a peer that learned during an observation after an
+  `b94943906b11`. A record that cannot decide (a malformed frame from the client's address, or
+  a fragment from its port, at a time it could have been the client's hint or initiation; no
+  initiation; a hint at the edge of its lifetime; an outcome that depends on which
+  initiation was accepted first; or a peer that learned during an observation after an
   unresolved session) fails the observation. Each capture is then held to the decision: a
   learned `dns`, `quic` or `stun` shapes every datagram but its probe replies (`classify-auto`),
   a learned `sip` follows the per-kind SIP rule, an unresolved peer shows no `dns`, `stun` or
