@@ -5,11 +5,13 @@ This repository builds static `boringtun-cli` binaries from a pinned commit of
 for a future userspace AmneziaWG backend (see
 [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
 
-**Status: two releases published, one candidate prepared.** The current pin
-`b94943906b11` has a `candidate` release contract,
-`boringtun-cli-0.7.1-gb94943906b11-b1`: its archives are built and verified
-by a run of the preparation branch, not yet by a run of `main`, and it is not
-approved, published or used by any installer.
+**Status: two releases published, one approved and not yet published.** The
+current pin `b94943906b11` has an `approved` release contract,
+`boringtun-cli-0.7.1-gb94943906b11-b1`: BoringTun Artifacts run 37528826713
+of `main` (installer commit `41fe7d903f1903fc5962baf53b551a2dc27aad15`) built
+and attested its archives, the BoringTun Release dry run 37531214445 of that
+run passed, and no tag or release of that name exists yet. It is not used by
+any installer.
 `boringtun-cli-0.7.1-gae2ab44e9a68-b1`, built from the previous pin
 `ae2ab44e9a68`, is public and is what the installer downloads.
 `boringtun-cli-0.7.1-g71d88784ad29-b1`, built from the pin before it,
@@ -48,13 +50,15 @@ contract is a candidate and also after it is approved and published.
 constants with `pin.env` or `release.env`; each contract is checked on its own
 terms, and the host tests and the public-release download use only the
 installer's constants. Today they differ, as intended while a release is being
-prepared: the pin is `b94943906b11` and the contract its build 1, still a
-`candidate`, while the installer installs the published release of the
-previous pin, `boringtun-cli-0.7.1-gae2ab44e9a68-b1`. The candidate goes on
-through the stages in [From a pin to a release](#from-a-pin-to-a-release):
-a BoringTun Artifacts run of `main` that reproduces its bytes and attests them
-under the `main` identity, a BoringTun Release dry run of that run, approval,
-publication, and only then the separate installer change that adopts it.
+prepared: the pin is `b94943906b11` and the contract its build 1, `approved`
+and not yet published, while the installer installs the published release of
+the previous pin, `boringtun-cli-0.7.1-gae2ab44e9a68-b1`. Of the stages in
+[From a pin to a release](#from-a-pin-to-a-release), the BoringTun Artifacts
+run of `main` that reproduced its bytes and attested them under the `main`
+identity (run 37528826713, commit `41fe7d903f1903fc5962baf53b551a2dc27aad15`),
+the BoringTun Release dry run of that run (37531214445) and the approval are
+done; publication must be dispatched for exactly that run and commit, and only
+then comes the separate installer change that adopts it.
 
 ## Source pin
 
@@ -401,8 +405,8 @@ strict grammar as `pin.env` and refuses any disagreement with the pin:
 A published tag is never reused or moved, so once a build is public, any other
 bytes need a new build number. The build number is scoped to one source commit:
 a new pin starts again at build 1. The contract holds build 1 of the current
-pin, `boringtun-cli-0.7.1-gb94943906b11-b1`, as a `candidate`: no tag or
-release of that name exists. The published releases of the earlier pins,
+pin, `boringtun-cli-0.7.1-gb94943906b11-b1`, as `approved` and not yet
+published: no tag or release of that name exists. The published releases of the earlier pins,
 `boringtun-cli-0.7.1-gae2ab44e9a68-b1` and
 `boringtun-cli-0.7.1-g71d88784ad29-b1`, stay side by side and are never
 moved, edited or replaced. Nothing built from the
