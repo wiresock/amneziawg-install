@@ -284,6 +284,32 @@ else:
     print("sent %d: %s" % (len(datagrams), " ".join(str(len(d)) for d in datagrams)))
 PY
 			;;
+		forgery)
+			# A real STUN client's first request, then an initiation whose mac1
+			# is consistent with the server's public key but which is no Noise
+			# handshake, and a transport candidate with counter 1: what anyone
+			# who knows the public key can send.
+			ip netns exec "${NS_C}" python3 - "${WIRE}" "${ADDR_S}" "${PORT}" "${CLIENT_PORT}" "${STUN_PRELUDE}" \
+				"${S_SIZES},${H_RANGES}" "${SERVER_PUB}" <<'PY'
+import base64, hashlib, importlib.util, os, socket, struct, sys, time
+spec = importlib.util.spec_from_file_location("wire", sys.argv[1])
+wire = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wire)
+sizes, ranges = wire.parse_layout(sys.argv[6])
+key = hashlib.blake2s(b"mac1----" + base64.b64decode(sys.argv[7])).digest()
+body = struct.pack("<II", ranges[0][0], 0x0BADF00D) + os.urandom(108)
+initiation = os.urandom(sizes[0]) + body + hashlib.blake2s(body, digest_size=16, key=key).digest() + bytes(16)
+transport = os.urandom(sizes[3]) + struct.pack("<IIQ", ranges[3][0], 0x0BADF00D, 1) + os.urandom(16)
+datagrams = [bytes.fromhex(open(sys.argv[5]).read().split()[0]), initiation, transport]
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    sock.bind(("0.0.0.0", int(sys.argv[4])))
+    for datagram in datagrams:
+        if sock.sendto(datagram, (sys.argv[2], int(sys.argv[3]))) != len(datagram):
+            sys.exit("short send")
+        time.sleep(0.015)
+print("sent %d: %s" % (len(datagrams), " ".join(str(len(d)) for d in datagrams)))
+PY
+			;;
 		none) echo "sent nothing" ;;
 		*) return 2 ;;
 	esac
@@ -293,6 +319,8 @@ plant_expected() { # <hint|probe|stun-sequence|none>
 		hint) echo "sent 27" ;;
 		probe) echo "sent 247" ;;
 		stun-sequence) printf 'sent %s: %s\n' "$(grep -c . "${STUN_PRELUDE}")" "$(awk '{ printf "%s%d", (NR == 1 ? "" : " "), length($0) / 2 }' "${STUN_PRELUDE}")" ;;
+		forgery) printf 'sent 3: %d %d %d\n' "$(($(head -n 1 "${STUN_PRELUDE}" | tr -d '\n' | wc -c) / 2))" \
+			"$((${S_SIZES%%,*} + 148))" "$((${S_SIZES##*,} + 32))" ;;
 		none) echo "sent nothing" ;;
 	esac
 }
@@ -485,6 +513,237 @@ for RUN in 1 2 3; do
 	scenario "reviewed-stun-${RUN}" none 0 stun - && OUTCOMES+=" ${EXPECT}"
 done
 echo "    (real STUN clients under the reviewed layout; the record decided:${OUTCOMES:- nothing})"
+
+# ── Histories an earlier model got wrong, on the binary ─────────────────────
+# Each was a counterexample to an earlier version of auto-expect (review of
+# 3ad670b): it must now give the outcome the evidence establishes, or be
+# undecided, never the wrong one. Layout: S 40, H ranges 100 wide.
+#   policy-retry: AWG 3.0. A SIP hint, a client without imitation (the
+#     policy refuses sip), then the same port's client restarted with DNS
+#     imitation. Its queries reach the connected socket the first session
+#     opened, whose tunnel takes them as its own hint: the binary learns dns.
+#     With the socket seen in the server's socket table before the restart
+#     and the same socket (its cookie) after the observed window, the record
+#     decides dns; without that evidence it is undecided, since the queries
+#     could have reached the listener, where the refused SIP hint holds the
+#     slot.
+#   forgery: a STUN request, a forged initiation and transport candidate,
+#     32 s later a SIP hint and a client without imitation: undecided (which
+#     initiations were accepted, and whether the STUN hint had expired, is
+#     not in the evidence). The binary's output is shown.
+#   early-gap: a STUN client's session, 32 s later a SIP hint and the same
+#     port's client without imitation: the peer stays stun, which the full
+#     record decides; with the first session replaced by a drop interval,
+#     undecided.
+#   paused-record: a SIP hint reaches the server while the record is paused;
+#     32 s later, resumed, a client without imitation. The record stamps the
+#     hint at its arrival, and the outcome is undecided (whether the server
+#     processed it more than 30 s before the initiation is not in the
+#     evidence). The binary's output is shown.
+CX_NAME="" CX_HP=0 CX_RECORD="" CX_EPOCH="" CX_EST="" CX_START="" CX_END="" CX_CAPTURE=""
+cx_begin() { # <name> <hp 0|1>
+	CX_NAME="$1" CX_HP="$2" CX_RECORD="${WORK}/$1.record" CX_EST=""
+	rm -f -- "${WORK}/$1".* "${WORK}/$1"-*
+	echo "--- $1: S1-S4 ${S_SIZES}, H4 ${H_RANGES##*,}$( (($2)) && echo ', header protection')"
+	if ! setup "$2"; then
+		bad "$1: the namespaces could not be set up"
+		return 1
+	fi
+	if ! BT_WIRE_CAPTURE_RECORD=1 BT_WIRE_CAPTURE_TO_PORT="${PORT}" bt_wire_capture_start "${NS_S}" "${VETH_S}" "${ADDR_C}" any 900 "${CX_RECORD}" ||
+		! bt_wire_capture_park record; then
+		bad "$1: the server-side record started before the server"
+		return 1
+	fi
+	sleep 0.05
+	EPOCH=""
+	if ! start_server || [[ ! "${EPOCH}" =~ ^[0-9]+$ ]]; then
+		bad "$1: the server could not be set up"
+		return 1
+	fi
+	CX_EPOCH="${EPOCH}"
+}
+cx_plant() { # <plant>
+	local SENT RC
+	SENT="$(plant "$1" 2>&1)"
+	RC=$?
+	if ! plant_ok "${RC}" "${SENT}" "$1"; then
+		bad "${CX_NAME}: the planted datagrams were sent (exit ${RC}, '${SENT}')"
+		return 1
+	fi
+	ok "${CX_NAME}: the planted datagrams were sent from ${ADDR_C}:${CLIENT_PORT} (${SENT})"
+}
+# Start the client and wait for its first ping: an establishment.
+cx_client() { # <imitation>
+	local BORN
+	bt_wire_now
+	BORN="${BT_WIRE_NOW}"
+	if ! start_peer "${NS_C}" "${IF_C}" "${WORK}/client.log" "${WORK}/client.conf" "${TUN_C}" "${TUN_S}" "$1" error ||
+		! wait_for 20 tunnel_ping; then
+		bad "${CX_NAME}: a client with imitation $1 reaches the server"
+		return 1
+	fi
+	bt_wire_now
+	CX_EST+="${CX_EST:+,}${BORN}:${BT_WIRE_NOW}"
+	ok "${CX_NAME}: a client with imitation $1 reaches the server (started at ${BORN}, first ping at ${BT_WIRE_NOW})"
+}
+cx_client_stop() {
+	local HANDLE="${PEERS[-1]}"
+	bt_wire_signal "${HANDLE}" TERM
+	bt_wire_await "${HANDLE}" 5 || bt_wire_signal "${HANDLE}" KILL
+	bt_wire_collect "${HANDLE}" >/dev/null 2>&1
+	unset 'PEERS[-1]'
+	rm -f -- "/var/run/wireguard/${IF_C}.sock" "/var/run/amneziawg/${IF_C}.sock"
+	wait_for 5 bash -c '! ip -n "$1" link show "$2" >/dev/null 2>&1' _ "${NS_C}" "${IF_C}"
+}
+# The observed window: the server's datagrams to the client over 15 pings.
+cx_window() { # <prefixes|kinds>
+	local -a LAYOUT=()
+	CX_CAPTURE="${WORK}/${CX_NAME}.capture"
+	[[ "$1" != kinds ]] || LAYOUT=("${S_SIZES},${H_RANGES}" "${CLIENT_PUB}")
+	if ! bt_wire_capture_start "${NS_C}" "${VETH_C}" "${ADDR_S}" "${PORT}" 6 "${CX_CAPTURE}" "${LAYOUT[@]}"; then
+		bad "${CX_NAME}: the client-side capture started"
+		return 1
+	fi
+	CX_START="${BT_WIRE_CAPTURE_READY_CLOCK}"
+	check "${CX_NAME}: the client reaches the server through the tunnel (15 pings)" tunnel_up
+	if ! bt_wire_capture_finish "${CX_CAPTURE}" complete 20; then
+		bad "${CX_NAME}: the client-side capture completed"
+		return 1
+	fi
+	bt_wire_now
+	CX_END="${BT_WIRE_NOW}"
+}
+cx_end() {
+	if bt_wire_capture_resume record && bt_wire_capture_finish "${CX_RECORD}" stop 10; then
+		ok "${CX_NAME}: the server-side record ran until its authorized stop ($(wc -l <"${CX_RECORD}") lines)"
+	else
+		bad "${CX_NAME}: the server-side record ran until its authorized stop"
+		return 1
+	fi
+}
+cx_oracle() { # <record> <connected|->: prints the oracle's output
+	local HP_FILE=-
+	((CX_HP == 0)) || HP_FILE="${WORK}/hp.key"
+	python3 "${WIRE}" auto-expect "$1" "${ADDR_C}" "${CLIENT_PORT}" "${S_SIZES},${H_RANGES}" "${SERVER_PUB}" "${HP_FILE}" off \
+		"${CX_EPOCH}" "${CX_START}" "${CX_END}" "${CX_EST}" "$2" 2>&1
+}
+cx_expect() { # <label> <record> <connected|-> <expected protocol|undecided>
+	local ORACLE
+	ORACLE="$(cx_oracle "$2" "$3")"
+	sed 's/^/    record | /' <<<"${ORACLE}"
+	if [[ "$4" == undecided ]]; then
+		check "${CX_NAME}: $1: the record does not decide, and says so (${ORACLE##*$'\n'})" \
+			bash -c '[[ "$1" == "undecided "* ]]' _ "${ORACLE##*$'\n'}"
+	else
+		check "${CX_NAME}: $1: the record decides $4 (${ORACLE##*$'\n'})" test "${ORACLE##*$'\n'}" = "expect $4"
+	fi
+}
+# The binary's output, against the outcomes in question, for the record.
+cx_show() { # <format> <outcome...>
+	local OUTCOME
+	for OUTCOME in "${@:2}"; do
+		if bt_wire_auto_verdict "${OUTCOME}" "${CX_CAPTURE}" "$1" "${S_SIZES}"; then
+			echo "    (${CX_NAME}: the server's datagrams are ${OUTCOME}: ${BT_WIRE_REASON})"
+		else
+			echo "    (${CX_NAME}: the server's datagrams are not ${OUTCOME}: ${BT_WIRE_REASON})"
+		fi
+	done
+}
+# The server's socket connected to the client's endpoint: its cookie (unique
+# for as long as the system runs), if the server process owns it.
+connected_socket() {
+	local PID
+	read -r PID _ <<<"${PEERS[0]}"
+	ip netns exec "${NS_S}" ss -Huanpe dst "${ADDR_C}:${CLIENT_PORT}" 2>/dev/null |
+		awk -v owner="pid=${PID}," 'index($0, owner) { for (i = 1; i <= NF; i++) if ($i ~ /^sk:/) print substr($i, 4) }'
+}
+# Pause or resume the parked record (owned STOP/CONT).
+record_signal() { # <STOP|CONT>
+	local HANDLE PID START
+	HANDLE="${BT_WIRE_PARKED[record]%%|*}"
+	read -r PID START _ <<<"${HANDLE}"
+	python3 "${WIRE}" owned "${PID}" "${START}" "$1" >/dev/null
+}
+
+use_layout "${LAYOUT_POSITIVE}"
+policy_retry() {
+	local BEFORE AFTER SEEN
+	cx_begin policy-retry 1 && cx_plant hint && cx_client none || return
+	check "policy-retry: BoringTun warns that the header-protection policy refused the learned sip" \
+		bash -c 'sed "s/\x1b\[[0-9;]*m//g" "$1" | grep -F "$2" | grep -q "\"sip\""' _ "${WORK}/server.log" "${REFUSAL}"
+	BEFORE="$(connected_socket)"
+	bt_wire_now
+	SEEN="${BT_WIRE_NOW}"
+	check "policy-retry: after the first session the server has a socket connected to ${ADDR_C}:${CLIENT_PORT} (sk:${BEFORE:-none})" test -n "${BEFORE}"
+	cx_client_stop
+	cx_client dns && cx_window prefixes || return
+	AFTER="$(connected_socket)"
+	check "policy-retry: the same connected socket after the observed window (sk:${AFTER:-none}), so it existed throughout" \
+		test -n "${AFTER}" -a "${AFTER}" = "${BEFORE}"
+	cx_end || return
+	cx_expect "with the connected socket seen at ${SEEN}" "${CX_RECORD}" "${SEEN}" dns
+	if bt_wire_auto_verdict dns "${CX_CAPTURE}" prefixes; then
+		ok "policy-retry: the server's datagrams to the restarted client are dns, as the record decided (${BT_WIRE_REASON})"
+	else
+		bad "policy-retry: the server's datagrams to the restarted client are dns, as the record decided (${BT_WIRE_REASON})"
+	fi
+	cx_expect "without the socket evidence" "${CX_RECORD}" - undecided
+}
+forgery() {
+	cx_begin forgery 0 && cx_plant forgery || return
+	echo "    (forgery: waiting 32 s, past the STUN hint's lifetime)"
+	sleep 32
+	cx_plant hint && cx_client none && cx_window kinds && cx_end || return
+	cx_expect "a forged initiation and transport" "${CX_RECORD}" - undecided
+	cx_show kinds sip random
+}
+early_gap() {
+	local SPLIT GAP="${WORK}/early-gap-hidden.record" FIRST LAST COUNT
+	cx_begin early-gap 0 && cx_client stun || return
+	sleep 1
+	cx_client_stop
+	bt_wire_now
+	SPLIT="${BT_WIRE_NOW}"
+	echo "    (early-gap: waiting 32 s, past the STUN hint's lifetime)"
+	sleep 32
+	cx_plant hint && cx_client none && cx_window prefixes && cx_end || return
+	cx_expect "the whole record" "${CX_RECORD}" - stun
+	if bt_wire_auto_verdict stun "${CX_CAPTURE}" prefixes; then
+		ok "early-gap: the server's datagrams to the reconnected client are stun, as the record decided (${BT_WIRE_REASON})"
+	else
+		bad "early-gap: the server's datagrams to the reconnected client are stun, as the record decided (${BT_WIRE_REASON})"
+	fi
+	# The same record with the first session's lines replaced by a drop
+	# interval spanning them, as if the record had lost them.
+	read -r FIRST LAST COUNT < <(awk -v cut="${SPLIT}" '$2 != "-" { a = $1; sub(/~.*/, "", a); if (a + 0 < cut) { n++; if (!f) f = a; l = a } } END { print f, l + 1, n }' "${CX_RECORD}")
+	awk -v cut="${SPLIT}" -v first="${FIRST}" -v last="${LAST}" -v count="${COUNT}" '
+		$2 != "-" { a = $1; sub(/~.*/, "", a); if (a + 0 < cut) { if (!done) { print last " - drops " count " " first; done = 1 } next } }
+		{ print }' "${CX_RECORD}" >"${GAP}"
+	sed "s/^\(stopped\|complete\) [0-9]*/\1 $(wc -l <"${GAP}")/" "${CX_RECORD}.state" >"${GAP}.state"
+	echo "    (early-gap: ${COUNT} lines of the first session, ${FIRST} to ${LAST}, replaced by a drop interval)"
+	cx_expect "the first session hidden by a drop interval" "${GAP}" - undecided
+}
+paused_record() {
+	local PLANTED STAMP
+	cx_begin paused-record 0 || return
+	check "paused-record: the record is paused" record_signal STOP
+	bt_wire_now
+	PLANTED="${BT_WIRE_NOW}"
+	cx_plant hint || return
+	echo "    (paused-record: waiting 32 s while the record is paused)"
+	sleep 32
+	check "paused-record: the record resumes" record_signal CONT
+	cx_client none && cx_window kinds && cx_end || return
+	STAMP="$(awk -v hint="$(printf 'OPTIONS sip:a@b SIP/2.0\r\n\r\n' | od -An -tx1 | tr -d ' \n')" '$5 == hint { print $1; exit }' "${CX_RECORD}")"
+	check "paused-record: the hint is stamped at its arrival (${STAMP:-none}), not when the resumed record read it (planted at ${PLANTED})" \
+		bash -c '[[ "$1" =~ ^[0-9]+$ ]] && (($1 >= $2 && $1 <= $2 + 100))' _ "${STAMP}" "${PLANTED}"
+	cx_expect "a hint 32 s older than the initiation" "${CX_RECORD}" - undecided
+	cx_show kinds sip random
+}
+policy_retry
+forgery
+early_gap
+paused_record
 
 echo
 echo "BoringTun auto hint test: ${PASSED} passed, ${FAILED} failed"

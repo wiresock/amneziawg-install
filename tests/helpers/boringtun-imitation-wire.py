@@ -138,11 +138,11 @@
       limit each copy without a cookie MAC draws a cookie reply. The datagram
       is held in memory only.
 
-  owned <pid> <start time> <check|TERM|KILL|STOP>
+  owned <pid> <start time> <check|TERM|KILL|STOP|CONT>
       Probe or signal the process with that PID only if it is still the one
       that recorded that start time, through a pidfd (owned): never a process
       that was given the PID later. STOP returns once every thread of it is
-      stopped.
+      stopped; CONT continues it.
 
 The probe formats are those the pinned BoringTun classifies
 (boringtun/src/noise/imitation/detect.rs at the pinned commit).
@@ -1098,7 +1098,8 @@ def replay(interface, client, server, server_port, layout, count, seconds):
     return 0
 
 
-OWNED_ACTIONS = {"check": None, "TERM": signal.SIGTERM, "KILL": signal.SIGKILL, "STOP": signal.SIGSTOP}
+OWNED_ACTIONS = {"check": None, "TERM": signal.SIGTERM, "KILL": signal.SIGKILL, "STOP": signal.SIGSTOP,
+                 "CONT": signal.SIGCONT}
 
 
 def all_stopped(fd, pid, start):
@@ -1129,7 +1130,7 @@ def owned(pid_text, start_text, action):
     pid = parse_number(pid_text, "PID", 4194304)
     start = parse_number(start_text, "start time", 2 ** 62, WIDE_NUMBER)
     if action not in OWNED_ACTIONS:
-        raise InputError("the action is check, TERM, KILL or STOP, not %r" % action)
+        raise InputError("the action is check, TERM, KILL, STOP or CONT, not %r" % action)
     try:
         fd = os.pidfd_open(pid)
     except ProcessLookupError:
