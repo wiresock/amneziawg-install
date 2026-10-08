@@ -10,10 +10,13 @@
 #
 # What the server must have selected is never read from what it sent. The
 # server's side records everything that reaches it from the client's address
-# (the helper's record), and the helper's auto-expect derives the selection
-# from that record by the pinned BoringTun's own rules: which datagrams fit
-# an AmneziaWG packet kind (never a hint), which protocol each other one is
-# detected as, the 30 s hint, the client's genuine initiation and the
+# (the helper's record, ready before the server starts), and the helper's
+# auto-expect derives the selection from that record and the client side's
+# evidence of acceptance (the client's start and its first ping) by the
+# pinned BoringTun's own rules, over every history that evidence allows:
+# which datagrams fit an AmneziaWG packet kind (never a hint), which protocol
+# each other one is detected as, the 30 s hints of the listener and of a
+# connected socket, which initiations were accepted and the
 # header-protection policy. The server's datagrams to the client are then
 # held to that expectation. Each scenario whose layout and traffic were
 # chosen to give a known outcome also checks that the record gives it.

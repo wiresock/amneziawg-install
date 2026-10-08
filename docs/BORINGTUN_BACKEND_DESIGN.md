@@ -2852,24 +2852,43 @@ explains its behaviour, and offers it only when the installed binary supports it
   clients each, on different ports behind one address. Each client's stream is recorded on its
   side with `capture-to` (the destination port filter of `boringtun-imitation-wire.py`); the
   server's endpoints show the shared addresses with distinct ports.
-- What the server must have selected for each peer is derived from what reached it, never
-  from what it sent. Each stage runs the wire helper's `record` on the host, from before the
-  daemon serving it started, which keeps every datagram from the client addresses whole with
-  its clock; `auto-expect` then applies the pinned BoringTun's rules to one client's
-  datagrams: AmneziaWG packet-kind candidates (through the header-protection mask under AWG
-  3.x) are never hints, the rest are classified as `detect()` does, the first per source
-  address and port is the hint for 30 s, and the client's genuine initiation (mac1 under the
-  server's public key) selects the live hint or, without one, what its own datagram is
-  detected as, subject to the header-protection policy. The candidate and detection rules
-  agree with upstream's own `inbound_candidates()` and `detect()` on 3,926 vectors (recorded
-  client datagrams, fuzzed protocol datagrams and random bytes under random and constructed
-  layouts, 719 with header protection), run once against an unmodified export of
-  `b94943906b11`. The record reports the frames its packet socket dropped (`PACKET_STATISTICS`).
-  A record that cannot decide (a malformed frame from the client's address, a fragment from its
-  port, or dropped frames, at a time they could have been the client's hint or initiation; no
-  initiation; a hint at the edge of its lifetime; an outcome that depends on which
-  initiation was accepted first; or a peer that learned during an observation after an
-  unresolved session) fails the observation. Each capture is then held to the decision: a
+- What the server must have selected for each peer is derived from what reached it and from
+  the scenario's own evidence, never from what the server sent.
+  - *Recording.* Each stage runs the wire helper's `record` on the host from before the daemon
+    serving it started (its process start is the epoch). Every frame from the client addresses
+    is kept whole with the kernel's receive timestamp, converted to CLOCK_BOOTTIME when the
+    clocks did not step (otherwise the interval it must have arrived in). The drop counters'
+    baseline is taken before the record is ready, every drop is written as an interval, and a
+    stop drains the queue through a cutoff within a budget; the last line says `complete` or
+    `incomplete`. A record not complete through the observation fails it.
+  - *Rules.* `auto-expect` restates the pinned BoringTun: AmneziaWG packet-kind candidates
+    (through the header-protection mask under AWG 3.x) are never hints, the rest are classified
+    as `detect()` does. The listener keeps the device's hints (first per source address and
+    port, 30 s from processing); after a peer's first accepted initiation its endpoint moves to
+    a connected socket whose tunnel keeps a hint of its own; a selection takes the live hint of
+    the socket it happened on, else what the initiation datagram is detected as, under the
+    header-protection policy; a learned protocol is pinned. Each socket is drained by one
+    worker at a time, in queue order. The candidate and detection rules agree with upstream's
+    own `inbound_candidates()` and `detect()` on 3,926 vectors (719 with header protection), run
+    against an unmodified export of `b94943906b11`; the rest is a restatement, checked live.
+  - *Evidence.* No datagram's syntax proves that the server accepted it (a mac1 is computable
+    from the public key). Acceptance comes from the client side: a client process started at
+    one clock pinged through the tunnel by another, so one of its initiations that arrived in
+    between was accepted and answered by then; that time is also the only upper bound on when
+    the server processed anything (no earlier than its arrival). A socket connected to the
+    client, seen in the server's socket table with the same cookie before and after an
+    observation, pins when the endpoint moved to it.
+  - *Histories.* Every history this evidence allows is replayed: which initiations were
+    accepted, where the endpoint moved to the connected socket, and each hint-lifetime
+    comparison the bounds leave open, both ways. The outcome is decided only if every history
+    gives it; otherwise the observation fails as undecided. So is one with frames the record
+    dropped or could not read between the epoch and the point the selection was certainly
+    pinned (a learned protocol outlives any hint), a clock step, or a history outside the model
+    (more than 1024 hint sources, 10 initiations, or 540 s after the first, when a connected
+    socket may expire). It assumes what the scenarios control: a client keeps its endpoint, and
+    the server is not reconfigured during a history. Expiry of a hint can rarely be proven, so
+    histories that depend on it stay undecided.
+  - *Judging.* Each capture is then held to the decision: a
   learned `dns`, `quic` or `stun` shapes every datagram but its probe replies (`classify-auto`),
   a learned `sip` follows the per-kind SIP rule, an unresolved peer shows no `dns`, `stun` or
   `sip` shape; each capture must also fail against the opposite outcome where the two can be
@@ -2886,7 +2905,16 @@ explains its behaviour, and offers it only when the installed binary supports it
   a layout their datagrams practically never fit (each learned); and real STUN clients under the
   layout of an independent review, S1–S4 110,57,133,25 with H4 1740000000–1839999999, where
   their STUN requests are transport candidates in some runs and not in others, so the record
-  decides each run. Cross-controls hold each known pair's captures to the other's outcome.
+  decides each run. Cross-controls hold each known pair's captures to the other's outcome. It
+  also replays the histories an earlier model got wrong: a policy-refused SIP hint followed by
+  the same port's client with DNS imitation (dns with the connected socket seen, matched by the
+  binary; undecided without that evidence), a forged initiation and transport candidate,
+  a first session hidden by a drop interval, and a hint that waited in a paused record's queue
+  (each undecided; the whole early-gap record decides stun, matched by the binary).
+- `tests/test-boringtun-record-live.sh` checks the record on a real packet socket: a frame that
+  waited 2.2 s in the queue is stamped at its arrival, 50 frames queued at a stop are recorded,
+  a 4 KiB buffer overflowed just after readiness has every frame recorded or reported, a stop
+  under continuing traffic ends within its budget, and an unauthorized stop ends interrupted.
 - The planted hint is shorter than any AmneziaWG datagram (32 bytes: a transport behind an S4
   of 0), because BoringTun hands only datagrams that fit no packet kind to probe
   classification, the only door that records a hint. The live test shows, for the planted

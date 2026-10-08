@@ -213,16 +213,19 @@ bt_auto_ping() { # <name> [count]
 # sent. For each stage, a record runs on the host from before the daemon that
 # serves the stage started until the stage's last observation ended: every
 # datagram that reaches the host from either client address to the server
-# port, whole, with its clock (the helper's record). At the stage's end the
-# helper's auto-expect derives, for each observation of a client, what the
-# server selected for that peer from that record alone, by the pinned
-# BoringTun's own rules: which of the client's datagrams fit an AmneziaWG
-# packet kind under the server's layout (never a hint), which protocol each
-# other one is detected as, the hint per source address and port and its
-# 30 s life, the client's genuine initiation (mac1 under the server's public
-# key), and the header-protection policy. Each capture is then held to that
+# port, whole, with its kernel arrival time (the helper's record). At the
+# stage's end the helper's auto-expect derives, for each observation of a
+# client, what the server selected for that peer from that record and the
+# client side's evidence of acceptance (when each of its processes started
+# and first pinged through the tunnel), by the pinned BoringTun's own rules
+# replayed over every history that evidence allows: which of the client's
+# datagrams fit an AmneziaWG packet kind under the server's layout (never a
+# hint), which protocol each other one is detected as, the listener's and a
+# connected socket's hints and their 30 s, which initiations were accepted,
+# and the header-protection policy. Each capture is then held to that
 # expectation (bt_wire_auto_verdict, or the per-kind SIP rule for a learned
-# sip); a record that cannot decide fails the observation.
+# sip); a record that cannot decide fails the observation, and so does one
+# not complete through it.
 BT_AUTO_STAGE=""
 BT_AUTO_RECORD=""
 BT_AUTO_RECORD_READY=""
