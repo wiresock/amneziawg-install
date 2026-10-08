@@ -96,11 +96,11 @@ mutant downloaded_target_kept "current unchanged, and the release this attempt d
 
 # Helpers of an earlier installer version (review S1).
 mutant helpers_not_reconciled "the installed launcher accepts the new current, so the next start can run b2" \
-	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
-	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n'
+	$'"${TARGET}" "${CURRENT_ID}" || return 1\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
+	$'"${TARGET}" "${CURRENT_ID}" || return 1\n\tfi\n'
 mutant helper_failure_ignored "helper update fails: no restart" \
-	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
-	$'\t\tTARGET="${PREVIOUS_ID}"\n\tfi\n\t_awgBtReconcileLifecycleHelpers || :\n'
+	$'"${TARGET}" "${CURRENT_ID}" || return 1\n\tfi\n\t_awgBtReconcileLifecycleHelpers || return 1\n' \
+	$'"${TARGET}" "${CURRENT_ID}" || return 1\n\tfi\n\t_awgBtReconcileLifecycleHelpers || :\n'
 # ... also when current already is the pin (residual S1).
 PINNED_RECONCILE=$'\t\t\t# before anything else changes; a stopped service stays stopped.\n\t\t\t_awgBtReconcileLifecycleHelpers || return 1\n'
 PINNED_SERVED=$'\t\t\tif ((ACTIVE)) && ! _awgBtCheckServedByBoringtun "${SERVER_AWG_NIC}" >/dev/null 2>&1; then'
@@ -175,5 +175,16 @@ mutant status_previous_equal_current "a previous that names current is invalid" 
 	'if [[ "${PREVIOUS}" == "${INSTALLED}" ]] || ! _awgBtVerifyRelease "${PREVIOUS}" 2>/dev/null; then' 'if ! _awgBtVerifyRelease "${PREVIOUS}" 2>/dev/null; then'
 mutant status_no_daemon_release "and is shown to run the old release" \
 	'[[ ! "${DAEMON_PID}" =~ ^[1-9][0-9]*$ ]] || DAEMON_RELEASE="$(_awgBtDaemonRelease "${DAEMON_PID}")"' ':'
+
+# Imitation auto and a target binary without it.
+mutant rollback_skips_auto_check "active:   naming the release and the imitation" \
+	$'\t\t_awgBtLifecycleTargetRunsImitation rollback "${TARGET}" "${CURRENT_ID}" || return 1\n' ''
+mutant upgrade_skips_auto_check "auto configured: an upgrade target without auto is refused" \
+	'if [[ "${MODE}" == upgrade ]] && ! _awgBtLifecycleTargetRunsImitation upgrade "${TARGET}" "${CURRENT_ID}"; then' 'if false; then'
+mutant lifecycle_auto_check_by_version "active:   naming the release and the imitation" \
+	$'\t_awgBtBinaryImitationSupport "${_AWG_BT_VERIFIED_BIN}" "${AWG_BORINGTUN_IMITATE_PROTOCOL}"\n\tRC=$?\n\t((RC == 0)) && return 0' \
+	$'\t[[ "${_AWG_BT_VERIFIED_VERSION}" == 0.7.1 ]]\n\tRC=$?\n\t((RC == 0)) && return 0'
+mutant status_rollback_ignores_imitation "status: with auto configured, a rollback to a previous binary without it is not offered" \
+	'if [[ "${ROLLBACK}" == yes ]] && ! _awgBtReleaseImitationSupport "${PREVIOUS}" "${AWG_BORINGTUN_IMITATE_PROTOCOL}"; then' 'if false; then'
 
 mutation_main "BoringTun lifecycle" "${PROJECT_ROOT}" "$@"

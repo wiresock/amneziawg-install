@@ -850,8 +850,8 @@ is kept verbatim.
 
 - **Install time:** `AWG_BORINGTUN_IMITATE_PROTOCOL` and `AWG_BORINGTUN_IMITATE_DOMAIN` from
   the environment (fresh installs only), or an interactive question defaulting to `none`.
-- **Change:** `--set-boringtun-imitation <none|dns|quic|sip|stun> [domain]` runs as a
-  transaction:
+- **Change:** `--set-boringtun-imitation <none|dns|quic|sip|stun> [domain]` (`auto` too since
+  §21.5) runs as a transaction:
   1. Take the lock and load params.
   2. Require `AWG_BACKEND=boringtun` and validate the new values.
   3. Print the warnings in §9.4.
@@ -933,7 +933,7 @@ is already broken), so it is listed separately for maintainer sign-off (PR 8).
 
 | Aspect | Standalone `amneziawg-proxy` | BoringTun built-in imitation |
 |---|---|---|
-| Protocols | quic, dns, stun, sip, **auto** | dns, quic, sip, stun (no auto) |
+| Protocols | quic, dns, stun, sip, **auto** | dns, quic, sip, stun; from `b94943906b11` also **auto**, chosen per authenticated peer from the client's own imitation (§21.5) |
 | Where shaping happens | Rewrites the S-prefix of AWG 2.0 packets in flight | Generates the S-prefix natively while building packets |
 | AWG versions | 2.0 only; rewriting the prefix breaks 3.x header protection | 2.0, 3.0 and 3.1 (with the caveats in §9.4) |
 | Probe responses | QUIC VN, DNS answer (optionally real, forwarded upstream), STUN Binding Success, SIP 100 Trying; optional stateful QUIC handshake continuation | DNS SERVFAIL, STUN Binding Success, QUIC VN; no SIP responder; no DNS forwarding; no QUIC continuation |
@@ -2780,6 +2780,165 @@ the stricter structural check is a known follow-up.
   installer renders. It rolls back to a TEST FIXTURE build 2 of the pinned commit (a `-b2`
   name those helpers refuse) through systemd's real restart, and upgrades back, with the
   datapath checked each time.
+
+### 21.5 Imitation `auto` as implemented (adoption of `b94943906b11` build 1)
+
+The change that adopts `boringtun-cli-0.7.1-gb94943906b11-b1` (WireSock BoringTun
+`b94943906b11`, upstream pull request #78) points `AWG_BT_RELEASE_*` at that release and
+offers its server imitation mode `auto` everywhere the fixed modes are offered. BoringTun's
+engine is not changed. In `auto`, a responder learns `dns`, `quic`, `sip` or `stun` for each
+authenticated peer from the client's own pre-handshake imitation datagrams (hints keyed by
+source address and port, 30 s, at most 1024), pins it for that peer, keeps it across roaming,
+and pads an unresolved peer with random S padding. S1–S4 and H1–H4 stay configured. It is best
+effort: only a datagram that fits no AmneziaWG packet kind under the configured S/H framing
+can be a hint, so a client's own imitation datagrams that also fit it (which depends on the
+S1–S4 and H1–H4 values) leave its peer unresolved unless another one counts.
+
+**Values.** `auto` joins `none`, `dns`, `quic`, `sip` and `stun` in
+`_awgBtImitationProtocolValid`, so params, the runtime file (`IMITATE_PROTOCOL=auto`), the
+generated helpers and the daemon's command line (`--imitate-protocol auto`) carry it as they
+carry the others. It takes no hostname (`_awgBtImitationCheck` refuses one, as BoringTun's CLI
+does), so `--imitate-domain` never follows it. Fresh installs take
+`AWG_BORINGTUN_IMITATE_PROTOCOL=auto`; both menus list it as option 6; the usage reads
+`<none|dns|quic|sip|stun|auto>`.
+
+**Header protection.** `checkBoringtunImitationProtocolCompat` does not refuse `auto`: the
+policy binds what a peer learns. A learned `sip` is not activated while any S prefix is 31
+bytes or more (the peer stays unresolved, random padding), and a learned `dns` or `stun` has
+the nonce trade-offs of §9.4. `printBoringtunAutoImitationWarnings` states these, and that
+`auto` is best effort, needs recognizable client traffic that does not fit the S/H framing,
+does not detect S/H settings, and that neither a working tunnel nor `auto` running shows that
+a peer is imitated. Nothing disables header protection or changes framing.
+
+**Binaries without `auto`.** The releases before `b94943906b11` report the same version, 0.7.1,
+and refuse `--imitate-protocol auto` as a usage error. The installer therefore asks the
+verified binary: `_awgBtBinaryImitationSupport` runs
+`env -i PATH=… NO_COLOR=1 <binary> --imitate-protocol auto --version` (bounded by
+`AWG_BT_PROBE_TIMEOUT`): the version means yes; status 2 with clap's "invalid value 'auto'"
+means no; anything else is unknown and treated as no. Fixed modes are never probed. The check
+runs:
+- in `--set-boringtun-imitation auto`, after the compatibility check and before the unit state
+  is read or anything is prepared (`requireBoringtunImitationSupport`), with the guidance to
+  run `--upgrade-boringtun` (or, if the pin itself lacked it, that no upgrade helps);
+- in `--rollback-boringtun` with `auto` persisted, against the previous release before the
+  helpers are reconciled, and in `--upgrade-boringtun` against the downloaded target before it
+  is validated (`_awgBtLifecycleTargetRunsImitation`), with the guidance to select a fixed
+  imitation or `none` first; `--backend-status` then reports `rollback_available=no`;
+- in the fresh-install preflight, in every scratch instance (also those of a lifecycle
+  candidate) and in the generated launcher, so that a hand-edited or interrupted state never
+  surfaces as a daemon usage error.
+
+A fixed imitation or `none` is always accepted, also with `auto` persisted on a binary
+without it, which is the way out of that state.
+
+**Status and panel.** `--backend-status` shows `auto` as configured
+(`imitation_protocol=auto`) and running (`daemon_imitation_protocol=auto`), plus
+`imitation_auto_support=supported|unsupported|unknown` for the installed binary. Nothing per
+peer is reported: BoringTun does not expose what a peer learned. The web panel's privileged
+helper passes `imitation_auto_support` through and forwards `auto` only to an installer that
+carries `AWG_INSTALLER_CAPABILITY_BORINGTUN_IMITATION_AUTO="boringtun-imitation-auto-v1"`.
+The panel accepts `auto` only with an empty hostname, disables the hostname control for it,
+explains its behaviour, and offers it only when the installed binary supports it.
+
+**Evidence.**
+- `tests/test-boringtun-imitation-auto.sh` (unit) runs the store's real verification against
+  TEST FIXTURE binaries that parse `--imitate-protocol` as clap does, with and without `auto`,
+  at the same version; `tests/test-boringtun-lifecycle.sh` adds the refused rollback, the
+  rollback with a fixed imitation, the re-upgrade and a refused upgrade target.
+- The host live test sets `auto` through the installer on the installed daemon and connects
+  six installer-generated clients: `dns`, `quic`, `sip` and `stun` clients (copies of the
+  verified binary running those imitations), one without imitation, and one without imitation
+  whose port first sends a 27-byte SIP request line (a planted hint). Two networks hold three
+  clients each, on different ports behind one address. Each client's stream is recorded on its
+  side with `capture-to` (the destination port filter of `boringtun-imitation-wire.py`); the
+  server's endpoints show the shared addresses with distinct ports.
+- What the server must have selected for each peer is derived from what reached it and from
+  the scenario's own evidence, never from what the server sent.
+  - *Recording.* Each stage runs the wire helper's `record` on the host from before the daemon
+    serving it started (its process start is the epoch). Every frame from the client addresses
+    is kept whole with the kernel's receive timestamp, converted to CLOCK_BOOTTIME when the
+    clocks did not step (otherwise the interval it must have arrived in). The drop counters'
+    baseline is taken before the record is ready, every drop is written as an interval, and a
+    stop drains the queue through a cutoff within a budget; the last line says `complete` or
+    `incomplete`. A record not complete through the observation fails it.
+  - *Rules.* `auto-expect` restates the pinned BoringTun: AmneziaWG packet-kind candidates
+    (through the header-protection mask under AWG 3.x) are never hints, the rest are classified
+    as `detect()` does. The listener keeps the device's hints (first per source address and
+    port, 30 s from processing); after a peer's first accepted initiation its endpoint moves to
+    a connected socket whose tunnel keeps a hint of its own; a selection takes the live hint of
+    the socket it happened on, else what the initiation datagram is detected as, under the
+    header-protection policy; a learned protocol is pinned. Each socket is drained by one
+    worker at a time, in queue order. The candidate and detection rules agree with upstream's
+    own `inbound_candidates()` and `detect()` on 3,926 vectors (719 with header protection), run
+    against an unmodified export of `b94943906b11`; the rest is a restatement, checked live.
+  - *Evidence.* No datagram's syntax proves that the server accepted it (a mac1 is computable
+    from the public key). Acceptance comes from the client side: a client process started at
+    one clock pinged through the tunnel by another, so one of its initiations that arrived in
+    between was accepted and answered by then; that time is also the only upper bound on when
+    the server processed anything (no earlier than its arrival). A socket connected to the
+    client, seen in the server's socket table with the same cookie before and after an
+    observation, pins when the endpoint moved to it.
+  - *Histories.* Every history this evidence allows is replayed: which initiations were
+    accepted, where the endpoint moved to the connected socket, and each hint-lifetime
+    comparison the bounds leave open, both ways. The outcome is decided only if every history
+    gives it; otherwise the observation fails as undecided. So is one with frames the record
+    dropped or could not read between the epoch and the point the selection was certainly
+    pinned (a learned protocol outlives any hint), a clock step, or a history outside the model
+    (more than 1024 hint sources, 10 initiations, or 540 s after the first, when a connected
+    socket may expire). It assumes what the scenarios control: a client keeps its endpoint, and
+    the server is not reconfigured during a history. Expiry of a hint can rarely be proven, so
+    histories that depend on it stay undecided.
+  - *Judging.* Each capture is then held to the decision: a
+  learned `dns`, `quic` or `stun` shapes every datagram but its probe replies (`classify-auto`),
+  a learned `sip` follows the per-kind SIP rule, an unresolved peer shows no `dns`, `stun` or
+  `sip` shape; each capture must also fail against the opposite outcome where the two can be
+  told apart. No real client is assumed to be learned under the installer's random layouts.
+- `tests/test-boringtun-auto-hint-live.sh` fixes the layouts so that outcomes are known, and
+  checks that the record gives them: the wire helper's 247-byte SIP probe under an H4 that
+  holds its bytes at S4 (a transport candidate, never learned); the 27-byte SIP hint (learned;
+  under AWG 3.0 it draws BoringTun's warning that the header-protection policy refused sip,
+  which no run without a hint shows, the positive evidence the installed daemon, logging errors
+  only, cannot give); the five datagrams a real STUN client sent before its initiation,
+  recorded whole and sent again unchanged, under two layouts that differ only in H4 (both STUN
+  requests are transport candidates under one, and nothing is learned; under the other the
+  first is the hint, and `stun` is learned); real `dns`, `quic`, `sip` and `stun` clients under
+  a layout their datagrams practically never fit (each learned); and real STUN clients under the
+  layout of an independent review, S1–S4 110,57,133,25 with H4 1740000000–1839999999, where
+  their STUN requests are transport candidates in some runs and not in others, so the record
+  decides each run. Cross-controls hold each known pair's captures to the other's outcome. It
+  also replays the histories an earlier model got wrong: a policy-refused SIP hint followed by
+  the same port's client with DNS imitation (dns with the connected socket seen, matched by the
+  binary; undecided without that evidence), a forged initiation and transport candidate,
+  a first session hidden by a drop interval, and a hint that waited in a paused record's queue
+  (each undecided; the whole early-gap record decides stun, matched by the binary).
+- `tests/test-boringtun-record-live.sh` checks the record on a real packet socket: a frame that
+  waited 2.2 s in the queue is stamped at its arrival, 50 frames queued at a stop are recorded,
+  a 4 KiB buffer overflowed just after readiness has every frame recorded or reported, a stop
+  under continuing traffic ends within its budget, and an unauthorized stop ends interrupted.
+- The planted hint is shorter than any AmneziaWG datagram (32 bytes: a transport behind an S4
+  of 0), because BoringTun hands only datagrams that fit no packet kind to probe
+  classification, the only door that records a hint. The live test shows, for the planted
+  hint, that it fits no packet kind under the server's layout, that its sender exited 0 and
+  reported exactly that datagram, that exactly it reached the server's interface before the
+  client started, and that the peer's handshake came within the hint's 30 s lifetime.
+- History of the planted hint. Observed: BoringTun Host on `3ae5b73` failed in two of four
+  jobs and on `60f699d`, which re-sent the same datagram before each ping, in one of four; in
+  each failure the planted-hint peer under AWG 2.0 got no SIP-shaped response or transport
+  while its tunnel worked, and the real SIP client passed. The hint then planted was the wire
+  helper's 247-byte SIP probe. Those jobs logged the S sizes (S4 109, 133 and 37) but neither
+  H4 nor what reached the server. Reproduced: on the published binary, with the S sizes of one
+  failing job and an H4 holding the probe's four bytes at S4, the probe is a transport
+  candidate and is never learned; with another H4 it is learned; the 27-byte line is learned
+  under either. Inferred, not established: that this mechanism caused the CI failures. It is
+  consistent with them (a random installer H4 holds the probe's bytes at those S4 offsets about
+  one time in four), but without the jobs' H4 or a record of their traffic it is not shown; a
+  lost or unanswered datagram, for example, is not excluded by those logs.
+- The BoringTun Host jobs that start from an earlier installer (`9f5a1afb87f7`, release
+  `71d88784` build 1, and `c7cd737c221a`, release `ae2ab44e9a68` build 1) then use those real,
+  different binaries: a rollback with `auto` is refused and changes nothing; with `quic` it
+  returns the service to the earlier binary, whose `auto` is refused; the upgrade back
+  restores this release without a download; `auto` applies again. Every step checks the
+  datapath and unchanged configuration hashes.
 
 ## 22. Current functions and files that will need modification
 

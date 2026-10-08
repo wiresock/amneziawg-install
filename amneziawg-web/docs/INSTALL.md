@@ -667,11 +667,30 @@ sudo ./amneziawg-web.sh upgrade \
 ## Native BoringTun imitation
 
 On a BoringTun installation, expand **Protocol imitation · BoringTun** on the
-peer list. Choose **Off**, **DNS**, **QUIC**, **SIP** or **STUN**, optionally enter
-an ASCII hostname for DNS/QUIC/SIP, confirm the brief interruption, and apply.
-A blank hostname lets BoringTun choose automatically. This shapes the server's
-outgoing packet prefixes without installing a proxy, changing the listening
-port, changing AWG versions, or regenerating client configurations.
+peer list. Choose **Off**, **DNS**, **QUIC**, **SIP**, **STUN** or **Auto**,
+optionally enter an ASCII hostname for DNS/QUIC/SIP, confirm the brief
+interruption, and apply. A blank hostname lets BoringTun choose automatically.
+This shapes the server's outgoing packet prefixes without installing a proxy,
+changing the listening port, changing AWG versions, or regenerating client
+configurations.
+
+**Auto (per client)** lets BoringTun choose DNS, QUIC, SIP or STUN separately for
+each authenticated peer, from the recognizable imitation traffic its client
+sends before the handshake, so clients with different imitation settings share
+one port. Auto is best effort. A client without such traffic, or whose traffic
+is lost, stays unresolved and gets random S padding; so does a client none of
+whose imitation datagrams counts: one that also fits this server's AWG S/H
+framing counts as AWG traffic, not as a hint, which depends on the S1–S4 and
+H1–H4 values. A working connection, and Auto shown as running, do not show that
+a client is imitated. Auto does not detect S1–S4, H1–H4 or other AWG settings, and takes no
+hostname: the hostname field is disabled for it and a hostname is rejected. The
+status shows Auto as configured and running only; BoringTun does not report
+which protocol each peer learned. Auto is offered only when the installer reports
+that the installed BoringTun binary supports it (`imitation_auto_support`);
+otherwise the panel explains why, for example that
+`amneziawg-install.sh --upgrade-boringtun` is needed, and the installer refuses
+the change before anything is modified. The helper passes `auto` only to an
+installer script that declares support for it.
 
 The panel calls the root-owned helper's fixed `set-boringtun-imitation` command,
 which delegates to the trusted installer `--set-boringtun-imitation` transaction.
@@ -684,7 +703,10 @@ unavailable. Upgrade the panel and helper together from the same checkout.
 With AWG 3.x, SIP requires every S1–S4 value to be at most 30. DNS and STUN
 reduce header-masking nonce space; QUIC retains the full nonce. Payload
 encryption is unchanged. The panel shows these constraints with the selection,
-and the installer rejects incompatible settings.
+and the installer rejects incompatible settings. Under Auto, the same policy
+binds what a peer learns: a learned SIP is not activated while any S1–S4 value
+is 31 or more (that peer keeps random padding), and header protection and
+framing are never changed automatically.
 
 Authenticated endpoints: `GET /api/admin/imitation` reads fresh status;
 `POST /admin/imitation` accepts form fields `protocol`, optional `domain`,

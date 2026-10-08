@@ -1512,6 +1512,141 @@ assert_eq "2" "$(restarts)" "  the original release is restarted"
 after_case "a hash failure status after the switch" "after the switch; restoring" 1 "${AMNEZIAWG_DIR}/params 3 status"
 after_case "a configuration that changes during the switch" "changed during the switch" 1 "" verify-touch
 
+echo "=== Imitation auto and a binary without it ==="
+# release_parsing <name> <version> <commit> <build> <protocols>: a fixture
+# release whose boringtun-cli parses --imitate-protocol as clap does in the
+# real binaries: a value outside PROTOCOLS is a usage error (status 2) before
+# --version. Both 0.7.1 fixtures below report 0.7.1, as the published
+# ae2ab44e9a68 and b94943906b11 releases do, so only the binary's own answer
+# tells them apart. TEST FIXTURES; none is a published release.
+release_parsing() {
+	local NAME="$1" DIR
+	release "$1" "$2" "$3" "$4"
+	DIR="${FIXTURE}/${NAME}/${ARCHIVE_ID_[${NAME}]}"
+	cat >"${DIR}/boringtun-cli" <<EOF
+#!/bin/sh
+# TEST FIXTURE ${NAME}, knows: $5
+echo "run ${NAME} \$*" >>${EXEC_LOG}
+while [ \$# -gt 0 ]; do
+	case "\$1" in
+		--imitate-protocol)
+			case " $5 " in
+				*" \$2 "*) shift 2; continue ;;
+			esac
+			echo "error: invalid value '\$2' for '--imitate-protocol <imitate-protocol>'" >&2
+			exit 2
+			;;
+		--version) echo "boringtun $2"; exit 0 ;;
+		*) shift ;;
+	esac
+done
+exit 0
+EOF
+	chmod 0755 "${DIR}/boringtun-cli"
+	write_manifest "${DIR}" "$2" "$3"
+	tar --no-recursion --numeric-owner --owner=0 --group=0 -czf "${FIXTURE}/serve/fixture-${NAME}/${ARCHIVE_ID_[${NAME}]}.tar.gz" -C "${FIXTURE}/${NAME}" \
+		"${ARCHIVE_ID_[${NAME}]}/" "${ARCHIVE_ID_[${NAME}]}/LICENSE" "${ARCHIVE_ID_[${NAME}]}/MANIFEST" \
+		"${ARCHIVE_ID_[${NAME}]}/THIRD-PARTY-LICENSES" "${ARCHIVE_ID_[${NAME}]}/boringtun-cli"
+	ARCHIVE_SHA_["${NAME}"]="$(sha256sum "${FIXTURE}/serve/fixture-${NAME}/${ARCHIVE_ID_[${NAME}]}.tar.gz" | cut -d' ' -f1)"
+	BINARY_SHA_["${NAME}"]="$(sha256sum "${DIR}/boringtun-cli" | cut -d' ' -f1)"
+}
+release_parsing withauto 0.7.1 "5555555555555555555555555555555555555555" 1 "none dns quic sip stun auto"
+release_parsing noauto 0.7.1 "6666666666666666666666666666666666666666" 1 "none dns quic sip stun"
+release_parsing noautonext 0.7.2 "7777777777777777777777777777777777777777" 1 "none dns quic sip stun"
+
+for STATE in active inactive failed; do
+	make_install auto
+	echo "${STATE}" >"${S}/active-state"
+	rm -rf -- "${STORE:?}"/*
+	store_release withauto
+	store_release noauto
+	links withauto noauto
+	pin_to withauto
+	STATE_BEFORE="$(lifecycle_state)"
+	BEFORE_HASHES="$(config_hashes)"
+	WORK_BEFORE="$(work_dirs)"
+	: >"${EXEC_LOG}"
+	run rollback
+	assert_rc 1 "${RC}" "${STATE}, auto configured: the rollback to a binary without auto is refused"
+	assert_contains "${STORE_ID_[noauto]} does not support the configured protocol imitation auto" "${ERR}" "${STATE}:   naming the release and the imitation"
+	assert_contains "--set-boringtun-imitation" "${ERR}" "${STATE}:   with the way out: a fixed imitation or none first"
+	assert_contains "current is still ${STORE_ID_[withauto]}" "${ERR}" "${STATE}:   and that current did not change"
+	assert_eq "${STATE_BEFORE}" "$(lifecycle_state)" "${STATE}:   current, previous and the store are unchanged"
+	assert_eq "${BEFORE_HASHES}" "$(config_hashes)" "${STATE}:   params, configs and the runtime file are unchanged"
+	assert_eq "0" "$(restarts)" "${STATE}:   no restart"
+	assert_not_contains "validate" "$(cat "${S}/log")" "${STATE}:   refused before the scratch validation"
+	assert_eq "run noauto --imitate-protocol auto --version" "$(grep '^run noauto ' "${EXEC_LOG}")" "${STATE}:   the target binary was asked, never started"
+	assert_eq "${WORK_BEFORE}" "$(work_dirs)" "${STATE}:   no private work directory is created"
+done
+
+make_install auto
+rm -rf -- "${STORE:?}"/*
+store_release withauto
+store_release noauto
+links withauto noauto
+pin_to withauto
+run status
+assert_contains "imitation_auto_support=supported" "${OUT}" "status: the current binary supports auto"
+assert_contains $'previous_release='"${STORE_ID_[noauto]}"$'\nrollback_available=no' "${OUT}" \
+	"status: with auto configured, a rollback to a previous binary without it is not offered"
+
+# The way out: a fixed imitation first, then the rollback.
+make_install quic cdn.example.org
+rm -rf -- "${STORE:?}"/*
+store_release withauto
+store_release noauto
+links withauto noauto
+pin_to withauto
+run status
+assert_contains "rollback_available=yes" "${OUT}" "status: with a fixed imitation the rollback is offered again"
+BEFORE_HASHES="$(config_hashes)"
+run rollback
+assert_rc 0 "${RC}" "quic configured: the rollback to the binary without auto succeeds"
+assert_eq "current=${STORE_ID_[noauto]} previous=${STORE_ID_[withauto]}" "$(lifecycle_state | sed 's/ store=.*//')" "  current is the earlier binary, previous the one with auto"
+assert_contains "validate candidate=${STORE_ID_[noauto]} current=${STORE_ID_[withauto]} imitation=quic|cdn.example.org" "$(cat "${S}/log")" \
+	"  the earlier binary was validated with the fixed imitation"
+assert_eq "1" "$(restarts)" "  one restart"
+assert_eq "${BINARY_SHA_[noauto]}" "$(current_bytes)" "  current runs the earlier bytes"
+assert_eq "${BEFORE_HASHES}" "$(config_hashes)" "  params, configs and the runtime file are unchanged"
+run status
+assert_contains "imitation_auto_support=unsupported" "${OUT}" "  status: the current binary does not support auto"
+run setBoringtunImitation auto
+assert_rc 1 "${RC}" "  and auto is refused on it"
+assert_contains "--upgrade-boringtun" "${ERR}" "    with the upgrade to run"
+assert_eq "${BEFORE_HASHES}" "$(config_hashes)" "    and nothing changed"
+: >"${S}/log"
+run upgrade
+assert_rc 0 "${RC}" "the re-upgrade to the binary with auto succeeds"
+assert_eq "current=${STORE_ID_[withauto]} previous=${STORE_ID_[noauto]}" "$(lifecycle_state | sed 's/ store=.*//')" "  current has auto again"
+assert_eq "${BEFORE_HASHES}" "$(config_hashes)" "  and the configuration is unchanged"
+run status
+assert_contains "imitation_auto_support=supported" "${OUT}" "  status: auto is supported again"
+
+# An upgrade whose target cannot run the configured auto, as a later pin
+# without it would be: it is downloaded, asked, refused and removed again.
+make_install auto
+rm -rf -- "${STORE:?}"/*
+store_release withauto
+links withauto
+pin_to noautonext
+: >"${S}/curl-log"
+BEFORE_HASHES="$(config_hashes)"
+run upgrade
+assert_rc 1 "${RC}" "auto configured: an upgrade target without auto is refused"
+assert_contains "${STORE_ID_[noautonext]} does not support the configured protocol imitation auto" "${ERR}" "  saying why"
+assert_eq "current=${STORE_ID_[withauto]} previous=none store=[$(sorted ${STORE_ID_[withauto]} current)]" "$(lifecycle_state)" \
+	"  current unchanged, and the release this attempt downloaded is removed"
+assert_eq "${BEFORE_HASHES}" "$(config_hashes)" "  the configuration is unchanged"
+assert_eq "0" "$(restarts)" "  no restart"
+# A fixed imitation upgrades to it as before.
+make_install dns
+rm -rf -- "${STORE:?}"/*
+store_release withauto
+links withauto
+pin_to noautonext
+run upgrade
+assert_rc 0 "${RC}" "dns configured: the same target is accepted"
+
 echo "=== Command line ==="
 run bash "${INSTALLER}" --upgrade-boringtun "${STORE_ID_[old]}"
 assert_rc 1 "${RC}" "--upgrade-boringtun takes no release argument"

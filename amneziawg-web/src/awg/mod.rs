@@ -706,7 +706,12 @@ mod tests {
 
     #[test]
     fn imitation_uses_fixed_command_and_preserves_empty_hostname_argument() {
-        for (protocol, domain) in [("none", ""), ("dns", ""), ("quic", "example.com")] {
+        for (protocol, domain) in [
+            ("none", ""),
+            ("dns", ""),
+            ("quic", "example.com"),
+            ("auto", ""),
+        ] {
             let settings = crate::imitation::Settings::parse(protocol, domain).unwrap();
             let command = imitation_command(&settings).unwrap();
             assert_eq!(command.get_program(), SUDO_BIN);
@@ -721,7 +726,12 @@ mod tests {
                 ]
             );
         }
-        for (protocol, domain) in [("auto", ""), ("stun", "example.com"), ("quic", "--help")] {
+        for (protocol, domain) in [
+            ("auto", "example.com"),
+            ("Auto", ""),
+            ("stun", "example.com"),
+            ("quic", "--help"),
+        ] {
             assert!(imitation_command(&crate::imitation::Settings {
                 protocol: protocol.into(),
                 domain: domain.into(),

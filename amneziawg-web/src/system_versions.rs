@@ -103,6 +103,11 @@ pub struct RuntimeInfo {
     pub release: Option<String>,
     pub imitation: Option<crate::imitation::Settings>,
     pub daemon_imitation: Option<crate::imitation::Settings>,
+    /// Whether the installed BoringTun binary runs imitation `auto`:
+    /// `supported`, `unsupported` or `unknown`, as the installer reports it.
+    /// `None` when the installer does not report it (an older version). It
+    /// describes the binary only; BoringTun does not expose per-peer state.
+    pub imitation_auto_support: Option<String>,
 }
 
 impl RuntimeInfo {
@@ -146,6 +151,12 @@ impl RuntimeInfo {
                 value("imitation_domain"),
             )
             .ok();
+            info.imitation_auto_support = match value("imitation_auto_support") {
+                "supported" | "unsupported" | "unknown" => {
+                    Some(value("imitation_auto_support").into())
+                }
+                _ => None,
+            };
         }
         // Report only the release verified by the installer's live-daemon check.
         if info.backend.as_deref() == Some("boringtun")
@@ -608,6 +619,51 @@ mod tests {
             "backend=boringtun\nimitation_protocol=quic\nimitation_domain=<script>\n",
         );
         assert!(runtime.imitation.is_none());
+    }
+
+    #[test]
+    fn auto_status_reports_configured_running_and_binary_support_only() {
+        let status = "backend=boringtun\nimitation_protocol=auto\nimitation_domain=\n\
+            service_state=active\ndaemon_state=running\n\
+            daemon_imitation_protocol=auto\ndaemon_imitation_domain=\n";
+        for support in ["supported", "unsupported", "unknown"] {
+            let runtime =
+                RuntimeInfo::parse(&format!("{status}imitation_auto_support={support}\n"));
+            assert_eq!(runtime.imitation.as_ref().unwrap().protocol, "auto");
+            assert_eq!(runtime.imitation.as_ref().unwrap().domain, "");
+            assert_eq!(runtime.daemon_imitation.as_ref().unwrap().protocol, "auto");
+            assert_eq!(runtime.imitation_auto_support.as_deref(), Some(support));
+        }
+        // An older installer reports no support line, and an unknown value is
+        // never passed on: the panel then treats auto as unavailable.
+        assert_eq!(RuntimeInfo::parse(status).imitation_auto_support, None);
+        assert_eq!(
+            RuntimeInfo::parse(&format!("{status}imitation_auto_support=<b>yes</b>\n"))
+                .imitation_auto_support,
+            None
+        );
+        assert_eq!(
+            RuntimeInfo::parse("backend=kernel\nimitation_auto_support=supported\n")
+                .imitation_auto_support,
+            None
+        );
+        // A hostname with auto is damaged status, not a configuration.
+        assert!(RuntimeInfo::parse(
+            "backend=boringtun\nimitation_protocol=auto\nimitation_domain=example.com\n"
+        )
+        .imitation
+        .is_none());
+        let json = serde_json::to_value(RuntimeInfo::parse(&format!(
+            "{status}imitation_auto_support=supported\n"
+        )))
+        .unwrap();
+        let keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        assert!(
+            !keys
+                .iter()
+                .any(|key| key.contains("learn") || key.contains("peer")),
+            "{keys:?}"
+        );
     }
 
     #[test]

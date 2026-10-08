@@ -21,6 +21,7 @@ source "${SCRIPT_DIR}/helpers/mutation-engine.sh"
 
 mutation_suite test-boringtun-imitation '^BoringTun imitation tests: ([0-9]+) passed, ([0-9]+) failed$' '^  FAIL: '
 mutation_suite test-boringtun-runtime '^BoringTun runtime tests: ([0-9]+) passed, ([0-9]+) failed$' '^  FAIL: '
+mutation_suite test-boringtun-imitation-auto '^BoringTun auto imitation tests: ([0-9]+) passed, ([0-9]+) failed$' '^  FAIL: '
 
 INSTALLER=amneziawg-install.sh
 T=$'\t'
@@ -67,7 +68,8 @@ mutant launcher_ignores_runtime_file test-boringtun-runtime "the daemon gets the
 mutant scratch_without_imitation test-boringtun-imitation "a scratch BoringTun instance runs the persisted imitation" \
 	'"${NAME}" "${AWG_BORINGTUN_IMITATE_PROTOCOL:-none}" "${AWG_BORINGTUN_IMITATE_DOMAIN:-}" || return 1' '"${NAME}" || return 1'
 mutant helper_without_check test-boringtun-imitation "the launcher carries _awgBtImitationCheck" \
-	'_awgBtImitationDomainValid _awgBtImitationCheck _awgBtStatOwnerMode' '_awgBtImitationDomainValid _awgBtStatOwnerMode'
+	'_awgBtImitationDomainValid _awgBtImitationCheck _awgBtBinaryImitationSupport _awgBtStatOwnerMode' \
+	'_awgBtImitationDomainValid _awgBtBinaryImitationSupport _awgBtStatOwnerMode'
 
 # The warnings and the SIP refusal under AWG 3.x.
 mutant sip_not_refused test-boringtun-imitation "sip with AWG 3.0 and an S of 31 is refused" \
@@ -82,8 +84,8 @@ mutant advisory_off_by_one test-boringtun-imitation "(32 is enough)" \
 mutant advisory_dns_hostname test-boringtun-imitation "dns with a hostname" \
 	'[[ -z "${DOMAIN}" ]] || NAMED=$((${#DOMAIN} + 33))' '[[ -z "${DOMAIN}" ]] || NAMED=$((${#DOMAIN} + 32))'
 mutant no_awg3_warning test-boringtun-imitation "AWG 3.0: the header-protection trade-off is stated" \
-	$'\tif [[ "${VERSION}" == "${AWG_PROTOCOL_VERSION_3}" || "${VERSION}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then\n\t\techo -e' \
-	$'\tif false; then\n\t\techo -e'
+	$'\tif [[ "${VERSION}" == "${AWG_PROTOCOL_VERSION_3}" || "${VERSION}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then\n\t\techo -e "${ORANGE}- AmneziaWG $(awgProtocolDisplayName "${VERSION}"): header protection takes its nonce from the first 12 bytes of each S prefix, and imitation' \
+	$'\tif false; then\n\t\techo -e "${ORANGE}- AmneziaWG $(awgProtocolDisplayName "${VERSION}"): header protection takes its nonce from the first 12 bytes of each S prefix, and imitation'
 
 # The --set-boringtun-imitation transaction.
 mutant no_noop test-boringtun-imitation "without touching the runtime" \
@@ -147,5 +149,43 @@ mutant kernel_menu_changed test-boringtun-imitation "the kernel menu says nothin
 	$'\tif [[ "${AWG_BACKEND:-}" == "${AWG_BACKEND_BORINGTUN}" ]]; then\n\t\tmanageBoringtunMenu' $'\tif true; then\n\t\tmanageBoringtunMenu'
 mutant awg3_not_confirmed test-boringtun-imitation "AWG 3.0: enabling an imitation asks first, and N cancels" \
 	'if [[ "${PROTOCOL}" != "${AWG_BT_IMITATE_NONE}" ]] && awgProtocolUsesHeaderProtection; then' 'if false; then'
+
+# Imitation auto: its values, the binary's own answer about it, and every
+# place that must refuse it on a binary without it.
+AUTO=test-boringtun-imitation-auto
+mutant auto_not_a_protocol "${AUTO}" "auto is an imitation protocol" \
+	'none | dns | quic | sip | stun | auto) return 0 ;;' 'none | dns | quic | sip | stun) return 0 ;;'
+mutant auto_hostname_generic "${AUTO}" "and the refusal says that auto takes none" \
+	$'\tif [[ "${PROTOCOL}" == auto ]]; then\n\t\t_awgBtErr "auto takes no hostname' $'\tif false; then\n\t\t_awgBtErr "auto takes no hostname'
+mutant probe_always_yes "${AUTO}" "a binary that refuses the value does not" \
+	$'\t[[ "${2-}" == auto ]] || return 0\n\tOUTPUT=' $'\treturn 0\n\tOUTPUT='
+mutant probe_unclear_is_yes "${AUTO}" "an answer that is neither (prints-other) is unknown, never support" \
+	$'\tif ((RC == 0)) && [[ "${OUTPUT}" =~ ^boringtun\\ [0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then' $'\tif ((RC == 0)); then'
+mutant probe_any_error_is_no "${AUTO}" "an answer that is neither (refuses-with-1) is unknown, never support" \
+	$'\tif ((RC == 2)) && [[ "${OUTPUT}" == *"invalid value \'auto\' for \'--imitate-protocol"* ]]; then' $'\tif ((RC != 0)); then'
+mutant probe_inherits_environment "${AUTO}" "the probe runs the binary with a clean environment" \
+	'env -i "PATH=${AWG_BT_PATH}" NO_COLOR=1 "$1" \' 'env "PATH=${AWG_BT_PATH}" NO_COLOR=1 "$1" \'
+mutant probe_unbounded "${AUTO}" "and is stopped after the probe timeout" \
+	'OUTPUT="$(timeout --kill-after=2 "${AWG_BT_PROBE_TIMEOUT}" env -i' 'OUTPUT="$(env -i'
+mutant set_without_support_check "${AUTO}" "active, binary without auto: auto is refused" \
+	$'\trequireBoringtunImitationSupport "${PROTOCOL}" || return 1\n' ''
+mutant set_support_unclear_accepted "${AUTO}" "a binary whose answer is unclear cannot take auto" \
+	$'\t((RC == 0)) && return 0\n\tif ((RC != 1)); then' $'\t((RC != 1)) && return 0\n\tif ((RC != 1)); then'
+mutant launcher_without_support_check "${AUTO}" "the launcher says that the binary lacks auto" \
+	'if ! _awgBtBinaryImitationSupport "${_AWG_BT_VERIFIED_BIN}" "${_AWG_BT_IMITATE_PROTOCOL}"; then' 'if false; then'
+mutant scratch_without_support_check "${AUTO}" "the scratch refusal says that the binary lacks auto" \
+	'if ! _awgBtBinaryImitationSupport "${_AWG_BT_VERIFIED_BIN}" "${AWG_BORINGTUN_IMITATE_PROTOCOL:-none}"; then'$'\n'"${T}${T}_awgBtErr" \
+	'if false; then'$'\n'"${T}${T}_awgBtErr"
+mutant preflight_without_support_check "${AUTO}" "the preflight says that the binary lacks auto" \
+	'if ! _awgBtBinaryImitationSupport "${_AWG_BT_VERIFIED_BIN}" "${AWG_BORINGTUN_IMITATE_PROTOCOL:-none}"; then'$'\n'"${T}${T}echo -e" \
+	'if false; then'$'\n'"${T}${T}echo -e"
+mutant status_support_unreported "${AUTO}" "the installed binary supports auto" \
+	'0) AUTO_SUPPORT=supported ;;' '0) ;;'
+mutant auto_warnings_generic "${AUTO}" "and needs recognizable client traffic" \
+	$'\tif [[ "${PROTOCOL}" == auto ]]; then\n\t\tprintBoringtunAutoImitationWarnings' $'\tif false; then\n\t\tprintBoringtunAutoImitationWarnings'
+mutant auto_refused_like_sip "${AUTO}" "AWG 3.0 with S sizes over 30: auto is not refused, as sip would be" \
+	$'\t[[ "$1" == sip ]] || return 0\n\t[[ "$2" ==' $'\t[[ "$1" == sip || "$1" == auto ]] || return 0\n\t[[ "$2" =='
+mutant change_menu_without_auto "${AUTO}" "AWG 2.0: 6 selects auto, asks no hostname and runs the transaction" \
+	$'\tlocal -a PROTOCOLS=(none dns quic sip stun auto)\n\tlocal CHOICE="" DEFAULT=1 I PROTOCOL' $'\tlocal -a PROTOCOLS=(none dns quic sip stun)\n\tlocal CHOICE="" DEFAULT=1 I PROTOCOL'
 
 mutation_main "BoringTun imitation" "${PROJECT_ROOT}" "$@"

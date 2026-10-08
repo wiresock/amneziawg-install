@@ -54,10 +54,13 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
   interfaces only), reads its local status file and shows active remote client sessions
   on the peer list.
 - **Native BoringTun imitation** – the peer list offers Off, DNS, QUIC, SIP and
-  STUN, with an optional hostname for DNS/QUIC/SIP. No proxy is needed. Saved
-  settings and verified running settings are shown separately. Confirmed,
-  CSRF-protected changes use the installer's validated transaction and rollback;
-  client configurations and the AWG protocol version are preserved.
+  STUN, with an optional hostname for DNS/QUIC/SIP, and Auto, which lets
+  BoringTun choose one of those for each authenticated client from that client's
+  own imitation traffic, best effort (no hostname; offered only when the
+  installed BoringTun binary supports it). No proxy is needed. Saved settings and verified running
+  settings are shown separately. Confirmed, CSRF-protected changes use the
+  installer's validated transaction and rollback; client configurations and the
+  AWG protocol version are preserved.
 - **Session cookie authentication** – Argon2id password verification,
   32-byte cryptographically random session IDs, configurable TTL.
 - **Bearer token** – optional static token for headless API access.

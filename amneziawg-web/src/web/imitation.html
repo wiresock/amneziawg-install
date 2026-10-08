@@ -1,6 +1,6 @@
 <details id="imitation-panel" class="edit-form" hidden>
 <summary>Protocol imitation · BoringTun</summary>
-<p>Imitate DNS, QUIC, SIP or STUN directly in BoringTun. No proxy is required. This changes the server's outgoing packet prefixes; it does not change the AWG version or client configurations.</p>
+<p>Imitate DNS, QUIC, SIP or STUN directly in BoringTun, or let Auto choose one for each client. No proxy is required. This changes the server's outgoing packet prefixes; it does not change the AWG version or client configurations.</p>
 <p id="imitation-configured" class="meta" role="status">Configured: loading…</p>
 <p id="imitation-running" class="meta" role="status">Running: loading…</p>
 <form method="POST" action="/admin/imitation" id="imitation-form">
@@ -13,7 +13,9 @@
       <option value="quic">QUIC</option>
       <option value="sip">SIP</option>
       <option value="stun">STUN</option>
+      <option value="auto" id="imitation-mode-auto" disabled>Auto (per client)</option>
     </select>
+    <p id="imitation-auto-note" class="meta" hidden></p>
     <div id="imitation-hostname" hidden>
       <label for="imitation-domain">Hostname (optional)</label>
       <input id="imitation-domain" name="domain" maxlength="253" placeholder="example.com" autocomplete="off" spellcheck="false" disabled>
@@ -33,15 +35,33 @@
   var running = document.getElementById('imitation-running');
   var fields = document.getElementById('imitation-fields');
   var mode = document.getElementById('imitation-mode');
+  var autoOption = document.getElementById('imitation-mode-auto');
+  var autoNote = document.getElementById('imitation-auto-note');
   var domain = document.getElementById('imitation-domain');
   var hint = document.getElementById('imitation-hint');
   var awg = null;
   function usesHostname(protocol) { return ['dns', 'quic', 'sip'].indexOf(protocol) !== -1; }
   function describe(settings) {
     if (!settings) return 'unavailable';
+    // Only the configured or running mode is known: BoringTun does not report
+    // which protocol each peer learned under Auto.
+    if (settings.protocol === 'auto') return 'Auto · chosen per authenticated peer';
     var text = settings.protocol === 'none' ? 'Off' : settings.protocol.toUpperCase();
     if (usesHostname(settings.protocol)) text += ' · ' + (settings.domain || 'automatic hostname');
     return text;
+  }
+  // Auto needs an installed BoringTun binary that has it; the installer asks
+  // the binary itself and reports supported, unsupported or unknown. An older
+  // installer reports nothing, and Auto stays unavailable.
+  function showAutoSupport(support) {
+    var notes = {
+      unsupported: 'Auto is unavailable: the installed BoringTun binary does not support it. Run amneziawg-install.sh --upgrade-boringtun on the server, then reload this page.',
+      unknown: 'Auto is unavailable: whether the installed BoringTun binary supports it could not be confirmed.'
+    };
+    autoOption.disabled = support !== 'supported';
+    autoNote.hidden = support === 'supported';
+    autoNote.textContent = support === 'supported' ? '' : (notes[support] ||
+      'Auto is unavailable: the installed amneziawg-install.sh does not report Auto support. Update it together with the web panel.');
   }
   function updateChoice() {
     var uses = usesHostname(mode.value);
@@ -52,11 +72,15 @@
       dns: 'DNS probe replies are enabled. The VPN listening port stays unchanged.',
       quic: 'QUIC probe replies are enabled. The VPN listening port stays unchanged.',
       sip: 'SIP sends no probe replies. With AWG 3.x, SIP requires every S1–S4 value to be 30 or less; the installer rejects incompatible settings.',
-      stun: 'STUN probe replies are enabled and can be larger than requests. The VPN listening port stays unchanged.'
+      stun: 'STUN probe replies are enabled and can be larger than requests. The VPN listening port stays unchanged.',
+      auto: 'BoringTun chooses DNS, QUIC, SIP or STUN separately for each authenticated peer, from the recognizable imitation traffic its client sends before the handshake, so clients with different imitation settings can share this port. Auto is best effort: a client without imitation sends no such traffic, sent traffic can be lost, and a datagram that also fits this server\'s AWG S/H framing counts as AWG traffic, not as a hint, which can happen to a client\'s own imitation traffic depending on the S1–S4 and H1–H4 values. A client for which nothing was learned gets random S padding. A working connection, and Auto shown as running, do not show that a client is imitated. Auto does not detect S1–S4 or H1–H4 or other AWG settings; clients still need this server\'s values. Auto takes no hostname. Only the configured and running mode is shown: BoringTun does not report which protocol each peer learned.'
     };
     hint.textContent = notes[mode.value] || '';
     if ((awg === '3.0' || awg === '3.1') && (mode.value === 'dns' || mode.value === 'stun')) {
       hint.textContent += ' With AWG 3.x, this mode reduces header-masking nonce space; QUIC retains the full nonce. Payload encryption is unchanged.';
+    }
+    if ((awg === '3.0' || awg === '3.1') && mode.value === 'auto') {
+      hint.textContent += ' With AWG 3.x, a learned DNS or STUN reduces header-masking nonce space for that peer, and a learned SIP is not activated while any S1–S4 value is 31 or more: that peer keeps random padding. Header protection and framing are never changed automatically. Payload encryption is unchanged.';
     }
   }
   mode.addEventListener('change', updateChoice);
@@ -72,6 +96,7 @@
         ? (data.daemon_state || 'unknown') : (data.service_state || 'unknown');
       running.textContent = 'Running: ' + (data.daemon_imitation ? describe(data.daemon_imitation) : 'not verified (' + state + ')');
       if (data.backend !== 'boringtun' || !data.imitation) return;
+      showAutoSupport(data.imitation_auto_support);
       mode.value = data.imitation.protocol;
       domain.value = data.imitation.domain;
       fields.disabled = false;

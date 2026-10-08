@@ -552,6 +552,14 @@ installer_supports_boringtun_imitation() {
         grep -qE '^[[:space:]]*--set-boringtun-imitation(\|--backend-status)?\)[[:space:]]*$' "$1"
 }
 
+# Installers before auto refuse the value; this line, read as data, says that
+# the script accepts it. Whether the installed BoringTun binary runs it is the
+# installer's own check, before anything changes.
+installer_supports_boringtun_imitation_auto() {
+    installer_supports_boringtun_imitation "$1" &&
+        grep -qxF 'AWG_INSTALLER_CAPABILITY_BORINGTUN_IMITATION_AUTO="boringtun-imitation-auto-v1"' "$1"
+}
+
 emit_backend_status() {
     local install_script output line
     install_script="$(resolve_awg_install_script)"
@@ -563,7 +571,7 @@ emit_backend_status() {
     fi
     while IFS= read -r line; do
         case "${line%%=*}" in
-            backend|awg_protocol|service_state|module_state|daemon_state|daemon_release|imitation_protocol|imitation_domain|daemon_imitation_protocol|daemon_imitation_domain)
+            backend|awg_protocol|service_state|module_state|daemon_state|daemon_release|imitation_protocol|imitation_domain|daemon_imitation_protocol|daemon_imitation_domain|imitation_auto_support)
                 printf '%s\n' "${line}"
                 ;;
         esac
@@ -573,7 +581,7 @@ emit_backend_status() {
 run_boringtun_imitation() {
     local protocol="$1" domain="$2" install_script
     case "$protocol" in
-        none|dns|quic|sip|stun) ;;
+        none|dns|quic|sip|stun|auto) ;;
         *) fail "unsupported imitation protocol" ;;
     esac
     if [[ -n "$domain" ]]; then
@@ -585,6 +593,9 @@ run_boringtun_imitation() {
     # Older scripts can enter interactive management on unknown flags.
     if ! installer_supports_boringtun_imitation "$install_script"; then
         fail "install script does not support BoringTun imitation"
+    fi
+    if [[ "$protocol" == auto ]] && ! installer_supports_boringtun_imitation_auto "$install_script"; then
+        fail "install script does not support BoringTun imitation auto"
     fi
     # The installer enforces backend/compatibility checks and owns the lock,
     # atomic update, restart verification and rollback. Never relay its output.

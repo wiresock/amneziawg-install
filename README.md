@@ -515,8 +515,8 @@ architectures are refused before anything is changed.
   kernel module package (`amneziawg-dkms`) is not pulled in, plus `nftables`,
   `iptables` and `qrencode`. No `amneziawg`, DKMS, headers or `deb-src` sources.
 - `boringtun-cli` from this repository's immutable public release
-  [`boringtun-cli-0.7.1-gae2ab44e9a68-b1`](https://github.com/wiresock/amneziawg-install/releases/tag/boringtun-cli-0.7.1-gae2ab44e9a68-b1),
-  built from WireSock BoringTun `ae2ab44e9a68ca1a3232d2e8b13f9db30a9b9dcf`. The
+  [`boringtun-cli-0.7.1-gb94943906b11-b1`](https://github.com/wiresock/amneziawg-install/releases/tag/boringtun-cli-0.7.1-gb94943906b11-b1),
+  built from WireSock BoringTun `b94943906b11641e274b3c950cc905aaf1631c59`. The
   installer downloads the archive for its architecture from that exact URL and
   checks it against SHA-256 values embedded in the script before extracting
   anything; then it checks the archive's layout, its `MANIFEST`, the binary's
@@ -584,9 +584,11 @@ sudo ./amneziawg-install.sh --rollback-boringtun
 **Explicit only.** Running a newer `amneziawg-install.sh` never switches the binary, and
 neither does anything else it does: clients, protocol changes, imitation changes and the menu
 leave the installed release alone. A host installed by an earlier version, with
-`boringtun-cli-0.7.1-g71d88784ad29-b1`, keeps running that release until
-`--upgrade-boringtun` moves it to the one this version pins; until then `--backend-status`
-reports `upgrade_available=yes`.
+`boringtun-cli-0.7.1-g71d88784ad29-b1` or `boringtun-cli-0.7.1-gae2ab44e9a68-b1`, keeps running
+that release until `--upgrade-boringtun` moves it to the one this version pins; until then
+`--backend-status` reports `upgrade_available=yes`. Those releases have no imitation mode
+`auto`, although they report the same version (`0.7.1`): the installer asks the binary itself
+and refuses `auto` on them (see [Built-in protocol imitation](#built-in-protocol-imitation-boringtun-only)).
 
 **What each command targets.**
 - **Upgrade:** only the release pinned in the installer itself, never a "latest" lookup.
@@ -620,7 +622,9 @@ finds the pin already installed.
    - the server config and every client config.
 
    A rollback is refused, without changing anything, when the older binary does not accept
-   today's settings (for example a protocol mode enabled after the upgrade).
+   today's settings (for example a protocol mode enabled after the upgrade). With imitation
+   `auto` configured, a rollback to a binary without it is refused before anything else:
+   select a fixed imitation or `none` first, then roll back.
 3. `current` and `previous` are switched atomically, and an active service is restarted and
    checked: the right binary, its TUN device, UAPI, listen port, imitation and peers.
 4. A stopped or failed service is switched but not started.
@@ -631,12 +635,15 @@ Params, client configs, the imitation and the listen port never change.
 
 **Status.** `--backend-status` adds:
 - `previous_release`, `rollback_available` and `upgrade_available`. `rollback_available=yes`
-  means a previous release is there and passes the store check; the rollback itself still
-  validates it against today's settings and can refuse;
+  means a previous release is there, passes the store check and runs the configured imitation
+  (`auto` needs a binary that has it); the rollback itself still validates it against today's
+  settings and can refuse;
 - `daemon_release`, the release the running daemon executes, which shows a service that still
   runs an old binary;
 - `unmanaged_releases`: release directories neither link names, which are reported but never
-  removed automatically.
+  removed automatically;
+- `imitation_auto_support`: `supported`, `unsupported` or `unknown`, whether the installed
+  binary runs imitation `auto`, from the binary's own answer.
 
 **Builds.** A later build of the same BoringTun source commit (for example `-b2`) is stored
 under its own name, so it can sit beside build 1. Hosts installed before this version keep
@@ -646,16 +653,18 @@ their store as it is.
 
 A BoringTun server can shape the S1–S4 prefixes of the packets it sends as
 `dns`, `quic`, `sip` or `stun`, and answer probes of that service on its listen
-port. This uses BoringTun's own imitation; it needs no proxy. The default is
-`none`, and the kernel backend has no imitation at all.
+port, or, with `auto`, choose one of those for each client. This uses
+BoringTun's own imitation; it needs no proxy. The default is `none`, and the
+kernel backend has no imitation at all.
 
 ```bash
 # Choose it on a fresh BoringTun install (an interactive install asks)
 sudo AWG_BACKEND=boringtun AWG_BORINGTUN_IMITATE_PROTOCOL=dns \
   AWG_BORINGTUN_IMITATE_DOMAIN=example.com AUTO_INSTALL=y ./amneziawg-install.sh
 
-# Change it later: none, dns, quic, sip or stun, and a hostname for dns, quic or sip
+# Change it later: none, dns, quic, sip, stun or auto, and a hostname for dns, quic or sip
 sudo ./amneziawg-install.sh --set-boringtun-imitation quic cdn.example.org
+sudo ./amneziawg-install.sh --set-boringtun-imitation auto
 sudo ./amneziawg-install.sh --set-boringtun-imitation none
 
 # Show the backend, the imitation and the running daemon (key=value, no secrets)
@@ -668,14 +677,44 @@ one, BoringTun chooses its own. It must be a plain host name of letters,
 digits, hyphens and dots.
 
 The web panel exposes the same transaction under **Protocol imitation ·
-BoringTun**. Choose **Off**, **DNS**, **QUIC**, **SIP** or **STUN**, optionally
-enter a hostname for DNS/QUIC/SIP, and confirm the brief VPN restart. Saved and
-verified running settings are shown separately. Changing imitation preserves
-the AWG version and client configurations.
+BoringTun**. Choose **Off**, **DNS**, **QUIC**, **SIP**, **STUN** or **Auto**,
+optionally enter a hostname for DNS/QUIC/SIP, and confirm the brief VPN restart.
+Saved and verified running settings are shown separately. Changing imitation
+preserves the AWG version and client configurations.
 
-The pinned BoringTun release uses one configured imitation mode per interface.
-It does **not** support the standalone proxy's per-client `auto` detection.
-An automatic/random hostname does not mean automatic protocol selection.
+**`auto` (opt-in).** BoringTun picks `dns`, `quic`, `sip` or `stun` separately
+for each authenticated peer, from the imitation datagrams that peer's client
+sends before its handshake, so clients with different imitation settings can
+share one server and port. What to know:
+
+- It is **best effort** and needs **recognizable client traffic**. A client
+  that sends no DNS, QUIC, SIP or STUN pre-handshake datagrams (a standard
+  AmneziaWG client, for example), or whose datagrams are lost, leaves its peer
+  unresolved. Even a datagram that arrives may not count: one that also fits
+  this server's AmneziaWG S/H framing is taken for AmneziaWG traffic, never as
+  a hint, and a client's own imitation datagrams can, depending on the S1–S4
+  and H1–H4 values. A peer for which nothing was learned is padded with random
+  S padding, as with `none`; it may still be learned at a later handshake. A
+  learned protocol is kept for the peer and survives roaming.
+- A working tunnel, and `auto` configured and running, do not show that any
+  peer is imitated. The status shows `auto` as configured and running, and
+  nothing per peer: BoringTun does not report which protocol a peer learned.
+- It does **not detect S1–S4, H1–H4** or any other AmneziaWG setting; clients
+  still need this server's values. It takes no hostname (BoringTun uses its own
+  generated ones), and the installer and panel refuse one.
+- Probes: the listen port may answer DNS, QUIC and STUN probes as those
+  imitations do; SIP gets no reply.
+- **Header protection is not relaxed.** Under AWG 3.0/3.1 a learned `dns` or
+  `stun` has the nonce trade-offs below, and a learned `sip` is not activated
+  while any of S1–S4 is 31 bytes or more: that peer stays unresolved with random
+  padding. Nothing is disabled and the S/H framing is never changed
+  automatically, so `auto`, unlike `sip`, is accepted at any S size.
+- It needs the BoringTun release this installer pins
+  (`boringtun-cli-0.7.1-gb94943906b11-b1`) or a later one. Earlier releases report
+  the same version but refuse `auto`; the installer asks the installed binary,
+  and refuses `auto` before changing anything, pointing to
+  `--upgrade-boringtun`. `--backend-status` reports this as
+  `imitation_auto_support`.
 
 A change is one transaction under the same lock as client changes. The new
 settings are validated on a temporary BoringTun instance. The running service
