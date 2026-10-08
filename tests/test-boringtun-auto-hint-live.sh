@@ -305,6 +305,9 @@ plant_ok() { # <exit status> <report> <kind>
 tunnel_up() {
 	ip netns exec "${NS_C}" ping -c 15 -i 0.2 -W 2 -q "${TUN_S}" >/dev/null
 }
+tunnel_ping() {
+	ip netns exec "${NS_C}" ping -c 1 -W 1 -q "${TUN_S}" >/dev/null
+}
 # The client-side capture's form: per packet kind where a learned sip is
 # possible and the tags can be read (no header protection), else prefixes.
 capture_format() { # <plant> <hp> <client imitation>
@@ -316,7 +319,7 @@ capture_format() { # <plant> <hp> <client imitation>
 # removed first and written anew.
 run_scenario() { # <name> <hint|probe|stun-sequence|none> <hp 0|1> [client imitation]
 	local NAME="$1" PLANT="$2" HP="$3" IMITATION="${4:-none}" CAPTURE="${WORK}/$1.capture" RECORD="${WORK}/$1.record"
-	local SENT RC FAILED_BEFORE="${FAILED}" EPOCH START END ORACLE FORMAT HP_FILE=-
+	local SENT RC FAILED_BEFORE="${FAILED}" EPOCH START END BORN UP ORACLE FORMAT HP_FILE=-
 	local -a LAYOUT=()
 	EXPECT=""
 	rm -f -- "${CAPTURE}" "${CAPTURE}".* "${RECORD}" "${RECORD}".* "${WORK}/${NAME}".{expect,format,sizes}
@@ -357,11 +360,22 @@ run_scenario() { # <name> <hint|probe|stun-sequence|none> <hp 0|1> [client imita
 		return 1
 	fi
 	ok "${NAME}: the planted datagrams were sent from ${ADDR_C}:${CLIENT_PORT} before the client started (${SENT})"
+	# The client side's evidence that the server accepted one of this
+	# client's initiations: the client process started at BORN and pinged
+	# through the tunnel at UP.
+	bt_wire_now
+	BORN="${BT_WIRE_NOW}"
 	if ! start_peer "${NS_C}" "${IF_C}" "${WORK}/client.log" "${WORK}/client.conf" "${TUN_C}" "${TUN_S}" "${IMITATION}" error; then
 		bad "${NAME}: the client could not be set up"
 		return 1
 	fi
-	check "${NAME}: the client reaches the server through the tunnel (15 pings)" tunnel_up
+	if ! wait_for 20 tunnel_ping; then
+		bad "${NAME}: the client's first ping through the tunnel succeeded"
+		return 1
+	fi
+	bt_wire_now
+	UP="${BT_WIRE_NOW}"
+	check "${NAME}: the client reaches the server through the tunnel (a first ping after $(((UP - BORN) * 10)) ms, then 15)" tunnel_up
 	check "${NAME}: the client-side capture outlived the traffic, ran its whole ${CAPTURE_SECONDS} s and completed with all its records" \
 		bt_wire_capture_finish "${CAPTURE}" complete "$((CAPTURE_SECONDS + 10))"
 	bt_wire_now
@@ -374,7 +388,7 @@ run_scenario() { # <name> <hint|probe|stun-sequence|none> <hp 0|1> [client imita
 	fi
 	((HP == 0)) || HP_FILE="${WORK}/hp.key"
 	ORACLE="$(python3 "${WIRE}" auto-expect "${RECORD}" "${ADDR_C}" "${CLIENT_PORT}" "${S_SIZES},${H_RANGES}" "${SERVER_PUB}" \
-		"${HP_FILE}" off "${EPOCH}" "${START}" "${END}" 2>&1)"
+		"${HP_FILE}" off "${EPOCH}" "${START}" "${END}" "${BORN}:${UP}" - 2>&1)"
 	sed 's/^/    record | /' <<<"${ORACLE}"
 	if [[ "${ORACLE##*$'\n'}" =~ ^expect\ (dns|quic|sip|stun|random)$ ]]; then
 		EXPECT="${BASH_REMATCH[1]}"

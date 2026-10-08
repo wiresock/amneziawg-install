@@ -58,28 +58,33 @@
       namespace, also one created later: what reached the server from its
       clients, in arrival order. Transcript and exit statuses are capture's.
 
-  auto-expect <record> <address> <port> <layout> <server public key> <hp key file|-> <on|off> <epoch> <start> <end>
-      From a finished record (its transcript checked), derive what an
-      imitation auto server selects for the client at ADDRESS:PORT, by the
-      pinned BoringTun's own rules restated here (see "Imitation auto"
-      below): which of its datagrams fit an AmneziaWG packet kind under
-      LAYOUT (through the header-protection mask when HP KEY FILE holds the
-      base64 key; "on" for RandomTrailers), which protocol each of the others
-      is detected as, the hint that leaves (first per source, 30 s), the
-      genuine initiations (mac1 under the server's public key), and the
-      selection at the first one accepted, with the header-protection
-      policy. Prints one line per datagram that mattered, then "expect
-      <dns|quic|sip|stun|random>" for the server's datagrams to that client
-      between the clocks START and END (centiseconds of CLOCK_BOOTTIME).
-      EPOCH is when the server's state was last empty; the record must have
-      been ready by then. Nothing the server sent is consulted. "undecided
-      <reason>" (exit 1) when the record cannot decide: a malformed frame from
-      that address, a fragment from that port, or frames the record dropped,
-      at a time they could have been the client's hint or initiation; no
-      initiation; a hint at the edge
-      of its lifetime, a peer that learned inside the window after a session
-      without it, or an outcome that depends on which initiation was
-      accepted first.
+  auto-expect <record> <address> <port> <layout> <server public key> <hp key file|-> <on|off> <epoch> <start> <end> [<establishments|-> [<connected|->]]
+      From a finished record (its transcript checked) and the scenario's
+      evidence, derive what an imitation auto server selects for the client
+      at ADDRESS:PORT, by the pinned BoringTun's own rules restated here (see
+      "Imitation auto" below): which of its datagrams fit an AmneziaWG packet
+      kind under LAYOUT (through the header-protection mask when HP KEY FILE
+      holds the base64 key; "on" for RandomTrailers), which protocol each of
+      the others is detected as, the listener's hints and a connected
+      socket's own, the selection at an accepted initiation, and the
+      header-protection policy. Nothing the server sent is consulted, and no
+      datagram's syntax counts as proof that it was accepted: every
+      initiation candidate may or may not have been, as ESTABLISHMENTS allow
+      ("<client start>:<first ping>,...": some initiation that client process
+      sent was accepted and answered by its first ping). CONNECTED is when a
+      socket connected to the client's endpoint was seen; without it, where
+      the endpoint's datagrams moved to that socket is open. Each history the
+      evidence allows is replayed, with every hint-lifetime comparison the
+      arrival and processing bounds leave open taken both ways; prints one
+      history's trace, then "expect <dns|quic|sip|stun|random>" for the
+      server's datagrams to that client between the clocks START and END
+      (centiseconds of CLOCK_BOOTTIME) if every history gives it. EPOCH is
+      when the server's state was last empty; the record must have been ready
+      before it and be complete through END. Otherwise "undecided <reason>"
+      (exit 1): histories that disagree, a clock step, frames the record
+      dropped or could not read from the epoch until the selection was
+      certainly pinned, no initiation, or a history the model does not
+      support (see auto_expect).
 
   classify <protocol> <file>
       For a capture without layout, print "<datagrams> <matching>": how many
@@ -1332,8 +1337,8 @@ def kinds(protocol, path, sizes_text):
 #   - the hint cache: device/imitation_auto.rs ImitationHints (only a
 #     datagram with no AmneziaWG candidate is observed; the first detected
 #     protocol per source address and port; HINT_LIFETIME 30 s, not extended
-#     by repeats; a connected peer's own pending hint, noise/imitation/auto.rs,
-#     behaves alike for its one source);
+#     by repeats), on the listener; a connected socket's tunnel keeps its own
+#     pending hint (noise/imitation/auto.rs), a separate state (History);
 #   - selection: noise/mod.rs commit_with_imitation (at an accepted handshake
 #     initiation while nothing is learned: the live hint, else detect over
 #     the initiation datagram itself; then pinned) and amnezia.rs
@@ -1346,10 +1351,6 @@ STUN_MAX_REQUEST = 1024
 SIP_DETECT_PREFIXES = (b"SUBSCRIBE ", b"REGISTER ", b"OPTIONS ", b"MESSAGE ", b"INVITE ", b"CANCEL ",
                        b"NOTIFY ", b"INFO ", b"ACK ", b"BYE ", b"SIP/")
 HINT_LIFETIME_CS = 3000
-# A hint whose age at a decision is this close to its lifetime is not
-# decided either way: the recorder's clock is read after the kernel delivered
-# the frame, the server's when its worker handled it.
-HINT_LIFETIME_MARGIN_CS = 100
 HP_NONCE_SIZE = 12
 
 
@@ -1510,21 +1511,6 @@ def genuine_initiation(datagram, candidates, sizes, mac1_key, hp_key=None):
     return hmac.compare_digest(mac1, message[-32:-16])
 
 
-def client_transport(datagram, candidates, sizes, hp_key=None):
-    """Whether DATAGRAM reads as the client's own transport: a transport
-    candidate that no protocol detector recognizes, whose 64-bit counter
-    (bytes 8-16 of the message, which header protection masks with the rest
-    of its 16-byte header) is below 2**32. A session's counters start at 0; an
-    imitation datagram that happens to fit the transport rule is recognized,
-    and random junk has a counter that small about once in 2**32."""
-    if "transport" not in candidates or detect(datagram) is not None:
-        return False
-    header = bytes(datagram[sizes[3]:sizes[3] + 16])
-    if hp_key is not None:
-        header = bytes(a ^ b for a, b in zip(header, hp_keystream(hp_key, datagram, 16)))
-    return struct.unpack("<Q", header[8:16])[0] < 2 ** 32
-
-
 def policy_allows(protocol, sizes, hp_key):
     """Whether resolve_imitation keeps PROTOCOL: without header protection
     always; with it, never while an S is below the nonce, and sip only while
@@ -1634,101 +1620,225 @@ def read_record(path):
 
 
 class Undecided(Exception):
-    """The record does not decide what the server selected."""
+    """The record and the evidence do not decide what the server selected."""
 
 
-def simulate_auto(events, sizes, ranges, mac1_key, hp_key, trailers, ignored):
-    """Replay one client's datagrams (earliest arrival, latest arrival, data),
-    in queue order, through
-    the hint cache and the selection; the genuine initiations whose indices
-    are in IGNORED are taken as not accepted. Returns (learned protocol or
-    None, the clock it was learned at, the accepted initiations' clocks,
-    notes)."""
-    pending = None
-    learned = None
-    learned_at = None
-    accepted = []
-    notes = []
-    initiation = 0
-    start = events[0][0] if events else 0
+# What the model supports, from the pinned BoringTun's code:
+#   - one listener socket per family, each drained by one worker at a time
+#     (EPOLLONESHOT), so datagrams on it are processed in queue order, no
+#     earlier than they arrived; the same holds for each connected socket;
+#   - the listener keeps the device's hints (ImitationHints: the first
+#     detected protocol per source address and port, for HINT_LIFETIME from
+#     its processing; never extended; discarded when a selection there
+#     learns a protocol); its acceptance selects the live hint, else what the
+#     initiation datagram itself is detected as;
+#   - after a peer's first accepted initiation the device connects a socket
+#     to its endpoint; from some point on, the endpoint's datagrams reach that
+#     socket, whose tunnel keeps a hint of its own (AutoImitation: replaced
+#     once expired, cleared when something is learned and on a new path); a
+#     connected socket closes only on a roam, the peer's removal or
+#     ConnectionExpired (3 * REJECT_AFTER_TIME after the session, 540 s);
+#   - a learned protocol is pinned; a refused one (the header-protection
+#     policy) changes nothing.
+# What it takes as given, from the scenario: the client keeps one endpoint;
+# the server is not reconfigured during the history (a peer removal or a
+# framing change clears the device's hints); fewer than MAX_HINT_SOURCES
+# sources leave hints.
+MAX_HINT_SOURCES = 1024
+MAX_INITIATIONS = 10
+MAX_HISTORIES = 20000
+CONNECTION_EXPIRY_CS = 54000
+INFINITY = float("inf")
 
-    def live(low, high):
-        # The pending hint's age, from the two arrivals' bounds.
-        youngest, oldest = low - pending[2], high - pending[1]
-        if oldest < HINT_LIFETIME_CS - HINT_LIFETIME_MARGIN_CS:
-            return True
-        if youngest >= HINT_LIFETIME_CS + HINT_LIFETIME_MARGIN_CS:
-            return False
-        raise Undecided("a hint was %.2f to %.2f s old when it mattered, which its 30 s lifetime does not decide"
-                        % (max(youngest, 0) / 100, oldest / 100))
 
-    for low, clock, data in events:
-        at = "+%.2fs %d B" % ((clock - start) / 100, len(data))
-        candidates = inbound_candidates(data, sizes, ranges, hp_key, trailers)
+class Datagram:
+    """One of the client's datagrams in queue order: arrival bounds LOW and
+    HIGH, KIND "hint" (fits no AmneziaWG kind; PROTOCOL the one detected),
+    "initiation" (an init candidate with a mac1 consistent with the server's
+    key: a valid initiation or a forgery, which syntax cannot tell; DETECTED
+    what the datagram itself is detected as) or "other"."""
+
+    def __init__(self, frame, sizes, ranges, mac1_key, hp_key, trailers):
+        self.low, self.high, self.size = frame.low, frame.high, len(frame.data)
+        candidates = inbound_candidates(frame.data, sizes, ranges, hp_key, trailers)
+        self.protocol = self.detected = None
         if not candidates:
-            found = detect(data)
-            if learned is None and found is not None:
-                if pending is None or not live(low, clock):
-                    pending = (found, low, clock)
-                    notes.append("%s: %s, fits no AmneziaWG kind: the hint" % (at, found))
-                else:
-                    notes.append("%s: %s, fits no AmneziaWG kind; the live %s hint stays" % (at, found, pending[0]))
-            elif learned is None:
-                notes.append("%s: no protocol detected, fits no AmneziaWG kind" % at)
-            continue
-        if not genuine_initiation(data, candidates, sizes, mac1_key, hp_key):
-            if learned is None and not (accepted and client_transport(data, candidates, sizes, hp_key)):
-                found = detect(data)
-                notes.append("%s: %san AmneziaWG %s candidate: never a hint" % (at, found + ", but " if found else "", "/".join(candidates)))
-            continue
-        index = initiation
-        initiation += 1
-        if index in ignored:
-            continue
-        accepted.append(clock)
-        if learned is not None:
-            continue
-        hint = pending[0] if pending is not None and live(low, clock) else None
-        selected = hint or detect(data)
-        origin = "the hint" if hint else "the initiation datagram"
-        if selected is None:
-            notes.append("%s: initiation %d, no live hint and nothing detected in it: unresolved" % (at, index + 1))
-        elif policy_allows(selected, sizes, hp_key):
-            learned, learned_at, pending = selected, clock, None
-            notes.append("%s: initiation %d selects %s from %s: learned" % (at, index + 1, selected, origin))
+            self.protocol = detect(frame.data)
+            self.kind = "hint" if self.protocol else "other"
+        elif genuine_initiation(frame.data, candidates, sizes, mac1_key, hp_key):
+            self.kind = "initiation"
+            self.detected = detect(frame.data)
         else:
-            notes.append("%s: initiation %d, %s from %s refused by the header-protection policy: unresolved" % (at, index + 1, selected, origin))
-    return learned, learned_at, accepted, notes
+            self.kind = "other"
 
 
-def window_expectation(learned, learned_at, accepted, window_start, window_end):
-    """What the server's datagrams to the client between WINDOW_START and
-    WINDOW_END must be, or Undecided."""
-    if learned is not None and learned_at <= window_start:
+class Branch(Exception):
+    """A timing comparison the evidence does not decide: explore both."""
+
+
+class History:
+    """One history of what the server did with the client's datagrams: which
+    initiations it accepted (ACCEPTED, indices), from which datagram on its
+    endpoint's datagrams reached the connected socket (SWITCH, or None), and
+    the outcomes of the timing comparisons the evidence leaves open
+    (CHOICES, consumed in order)."""
+
+    def __init__(self, datagrams, accepted, switch, choices, establishments, steps):
+        self.datagrams, self.accepted, self.switch, self.choices = datagrams, accepted, switch, choices
+        self.first = min(accepted) if accepted else None
+        self.used = 0
+        self.steps = steps
+        self.bound = [INFINITY] * len(datagrams)
+        for start, up in establishments:
+            # Some initiation the client process started at START sent, and
+            # the server accepted and answered, was processed by UP: the
+            # earliest of those it may have been, and everything queued
+            # before it on the same socket.
+            possible = [k for k in accepted if datagrams[k].low <= up and datagrams[k].high >= start]
+            paths = {self.path(k) for k in possible}
+            if len(paths) != 1:
+                continue
+            earliest, path = min(possible), paths.pop()
+            for index in range(earliest + 1):
+                if self.path(index) == path:
+                    self.bound[index] = min(self.bound[index], up + 1)
+
+    def path(self, index):
+        if self.first is not None and index > self.first and self.switch is not None and index >= self.switch:
+            return "connected"
+        return "listener"
+
+    def choose(self):
+        if self.used == len(self.choices):
+            raise Branch()
+        self.used += 1
+        return self.choices[self.used - 1]
+
+    def live(self, inserted, at):
+        """Whether the hint the datagram at INSERTED left is still live when
+        the datagram at AT is processed: certain from the bounds, else a
+        choice."""
+        oldest = self.bound[at] - self.datagrams[inserted].low
+        youngest = self.datagrams[at].low - self.bound[inserted]
+        if not self.steps:
+            if oldest < HINT_LIFETIME_CS:
+                return True
+            if youngest > HINT_LIFETIME_CS:
+                return False
+        return self.choose()
+
+    def run(self):
+        """(learned protocol or None, index it was learned at, notes)."""
+        listener = tunnel = None
+        learned = learned_at = None
+        notes = []
+        for index, datagram in enumerate(self.datagrams):
+            path = self.path(index)
+            where = "#%d %s, %d B, %s" % (index + 1, path, datagram.size, datagram.kind)
+            if datagram.kind == "hint":
+                if path == "listener":
+                    if listener is not None and not self.live(listener[1], index):
+                        listener = None
+                    if listener is None:
+                        listener = (datagram.protocol, index)
+                        notes.append("%s %s: the listener's hint" % (where, datagram.protocol))
+                elif learned is None:
+                    if tunnel is None or not self.live(tunnel[1], index):
+                        tunnel = (datagram.protocol, index)
+                        notes.append("%s %s: the tunnel's hint" % (where, datagram.protocol))
+                continue
+            if datagram.kind != "initiation":
+                continue
+            if index not in self.accepted:
+                notes.append("%s: not accepted" % where)
+                continue
+            if learned is None:
+                cache = listener if path == "listener" else tunnel
+                hint = cache[0] if cache is not None and self.live(cache[1], index) else None
+                selected = hint or datagram.detected
+                if selected is None:
+                    notes.append("%s: accepted; no live hint, nothing detected in it: unresolved" % where)
+                elif policy_allows_auto(selected, self):
+                    learned, learned_at, tunnel = selected, index, None
+                    if path == "listener":
+                        listener = None
+                    notes.append("%s: accepted; %s from %s: learned" % (where, selected, "the hint" if hint else "itself"))
+                else:
+                    notes.append("%s: accepted; %s refused by the header-protection policy: unresolved" % (where, selected))
+            if index == self.first:
+                tunnel = None
+        return learned, learned_at, notes
+
+
+def policy_allows_auto(protocol, history):
+    return policy_allows(protocol, history.sizes, history.hp_key)
+
+
+def history_expectation(history, learned, learned_at, window_start, window_end):
+    """What the server's datagrams to the client between the window's clocks
+    are under HISTORY."""
+    datagrams = history.datagrams
+    sessions = [k for k in history.accepted if datagrams[k].low <= window_end]
+    if learned is not None and history.bound[learned_at] <= window_start:
         return learned
-    if learned is not None and learned_at <= window_end:
-        if any(clock < learned_at for clock in accepted):
-            raise Undecided("the peer learned %s inside the window, after a session without it" % learned)
+    if learned is not None and datagrams[learned_at].low <= window_end:
+        if any(k < learned_at for k in history.accepted):
+            raise Undecided("the peer may have learned %s inside the window, after a session without it" % learned)
         return learned
-    if not any(clock <= window_end for clock in accepted):
-        raise Undecided("no initiation from this client was recorded by the end of the window")
+    if not sessions:
+        raise Undecided("no initiation accepted by the window's end")
     return "random"
 
 
-def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trailers_text, epoch_text, start_text, end_text):
+def parse_establishments(text):
+    """"START:UP,..." -> [(start, up)]: a client process started at START
+    completed a handshake by UP (its first successful ping), so the server
+    accepted and answered an initiation that arrived between them."""
+    if text == "-":
+        return []
+    pairs = []
+    for item in text.split(","):
+        start, colon, up = item.partition(":")
+        if not colon:
+            raise InputError("an establishment is START:UP, not %r" % item)
+        start = parse_number(start, "establishment start", 2 ** 62, WIDE_NUMBER)
+        up = parse_number(up, "establishment", 2 ** 62, WIDE_NUMBER)
+        if start > up:
+            raise InputError("an establishment %r ends before it starts" % item)
+        pairs.append((start, up))
+    return pairs
+
+
+def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trailers_text, epoch_text, start_text, end_text,
+                establishments_text="-", connected_text="-"):
     """Print how an auto server treats the client at ADDRESS:PORT, from the
-    finished `record` at PATH: one line per datagram from it that mattered,
-    then "expect <dns|quic|sip|stun|random>" for the server's datagrams to it
-    between the clocks START and END. EPOCH is when the server's state was
-    last empty (its start); the record must have been ready by then. Returns
-    1, after "undecided <reason>", when the record cannot decide: a malformed
-    frame from that address, a fragment from that port, or frames the record
-    dropped, at a time they could have been the client's hint or initiation;
-    no initiation; a hint at the edge of its lifetime; a peer that learned
-    inside the window after a session
-    without it, or an outcome that depends on which initiation the server
-    accepted first (each initiation up to the first one the client's own
-    transport follows is tried as that one)."""
+    finished `record` at PATH and the scenario's evidence, then "expect
+    <dns|quic|sip|stun|random>" for the server's datagrams to the client
+    between the clocks START and END, or "undecided <reason>" (exit 1).
+
+    EPOCH is when the server's state was last empty (its process start); the
+    record must have been ready before it and complete through END.
+    ESTABLISHMENTS ("START:UP,...", or "-") are the client-side evidence of
+    acceptance: a client process started at START pinged through the tunnel
+    by UP. Nothing in a datagram proves that the server accepted it, so every
+    initiation candidate (mac1 consistent with the server's key) may or may
+    not have been accepted, subject to that evidence. CONNECTED (a clock, or
+    "-") is when a socket connected to the client's endpoint was seen in the
+    server's socket table; without it, the point from which the endpoint's
+    datagrams reached that socket is open.
+
+    Every history the evidence allows is replayed (History): which
+    initiations were accepted, where the endpoint moved to the connected
+    socket, and each hint-lifetime comparison the arrival and processing
+    bounds leave open (the server processes a datagram no earlier than its
+    arrival; the only upper bound is an establishment's UP). The outcome is
+    decided only if every history gives the same one. Undecided also: an
+    incomplete record, a clock step, frames the record dropped or could not
+    read (a malformed frame from the address, a fragment from the port) at a
+    time they could have changed the outcome (from the epoch until the
+    selection was pinned, or the window's end), more than MAX_HINT_SOURCES
+    hint sources, more initiations than MAX_INITIATIONS, or a window ending
+    more than CONNECTION_EXPIRY_CS after the first possible acceptance."""
     sizes, ranges = parse_layout(layout)
     port = parse_number(port_text, "port", 65535)
     mac1_key = hashlib.blake2s(MAC1_LABEL + parse_public_key(server_key)).digest()
@@ -1742,75 +1852,121 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
     epoch = parse_number(epoch_text, "epoch", 2 ** 62, WIDE_NUMBER)
     window_start = parse_number(start_text, "window start", 2 ** 62, WIDE_NUMBER)
     window_end = parse_number(end_text, "window end", 2 ** 62, WIDE_NUMBER)
+    establishments = parse_establishments(establishments_text)
+    connected = None if connected_text == "-" else parse_number(connected_text, "connected", 2 ** 62, WIDE_NUMBER)
     try:
         socket.inet_aton(address)
     except OSError:
         raise InputError("%r is not an IPv4 address" % address) from None
     record = read_record(path)
     try:
-        if record.ready + 1 > epoch:
-            raise Undecided("the record was ready at %d, not before the server's state was last empty at %d" % (record.ready, epoch))
-        if record.end is None or record.end[0] != "complete" or record.end[1] < window_end:
-            raise Undecided("the record is not complete through the window's end at %d (%s)"
-                            % (window_end, "no end marker" if record.end is None else "%s %d" % record.end))
-        for since, clock in record.steps:
-            if clock >= epoch and since <= window_end:
-                raise Undecided("a clock stepped between %d and %d, so arrival times do not compare" % (since, clock))
-        events = []
-        # (from, to, what) of datagrams the record cannot tell: a malformed
-        # frame from the address (its port unknown), a fragment from the
-        # client's port, and frames the record's socket dropped, from any
-        # source, at some time since its poll before.
-        unknown = []
-        for since, clock, count in record.drops:
-            if clock >= epoch and since <= window_end:
-                unknown.append((since, clock, "%d frames the record dropped between %d and %d" % (count, since, clock)))
-        for frame in record.frames:
-            if frame.high < epoch or frame.low > window_end or frame.address != address:
-                continue
-            if frame.kind == "malformed" or (frame.kind == "fragment" and frame.port == port):
-                unknown.append((frame.low, frame.high, "a %s frame from %s at %d~%d (%s)"
-                                % (frame.kind, address, frame.low, frame.high, frame.data.hex() or "-")))
-            elif frame.port == port:
-                events.append((frame.low, frame.high, frame.data))
-        # The client sends transport only once a response reached it, so the
-        # first initiation followed by a transport candidate before the next
-        # initiation bounds the one the server accepted first; any before it
-        # may have gone unanswered.
-        initiations = 0
-        bound = None
-        for _, _, data in events:
-            candidates = inbound_candidates(data, sizes, ranges, hp_key, trailers)
-            if genuine_initiation(data, candidates, sizes, mac1_key, hp_key):
-                initiations += 1
-            elif initiations and bound is None and client_transport(data, candidates, sizes, hp_key):
-                bound = initiations
-        outcomes = []
-        for skipped in range(bound or max(initiations, 1)):
-            learned, learned_at, accepted, notes = simulate_auto(events, sizes, ranges, mac1_key, hp_key, trailers, set(range(skipped)))
-            if skipped == 0:
-                print("\n".join(notes) if notes else "no datagram from %s:%d" % (address, port))
-            outcomes.append(window_expectation(learned, learned_at, accepted, window_start, window_end))
-            # An unknown datagram could have been this client's hint, or have
-            # held the hint slot of its source while it lived. It changes
-            # nothing if it came after the selection was pinned (or,
-            # unresolved, after the window), or so long before the client's
-            # first recorded datagram that a hint from it had expired before
-            # the client sent anything; such a frame is taken as not the
-            # client's own initiation, which would need the client running.
-            decided = learned_at if learned is not None else window_end
-            for start, end, what in unknown:
-                if start <= decided and end >= events[0][0] - HINT_LIFETIME_CS - HINT_LIFETIME_MARGIN_CS:
-                    raise Undecided("%s, when they could have been this client's hint or initiation" % what)
-        if len(set(outcomes)) > 1:
-            raise Undecided("the outcome depends on which of %d initiations the server accepted (%s)" % (initiations, ", ".join(outcomes)))
-        for _, _, what in unknown:
-            print("%s: not when they could have been this client's hint or initiation" % what)
+        outcome, notes = decide(record, address, port, sizes, ranges, mac1_key, hp_key, trailers, epoch,
+                                window_start, window_end, establishments, connected)
     except Undecided as reason:
         print("undecided %s" % reason)
         return 1
-    print("expect %s" % outcomes[0])
+    print("\n".join(notes))
+    print("expect %s" % outcome)
     return 0
+
+
+def decide(record, address, port, sizes, ranges, mac1_key, hp_key, trailers, epoch, window_start, window_end,
+           establishments, connected):
+    """(outcome, notes of one history) or Undecided."""
+    if record.ready + 1 > epoch:
+        raise Undecided("the record was ready at %d, not before the server's state was last empty at %d" % (record.ready, epoch))
+    if record.end is None or record.end[0] != "complete" or record.end[1] < window_end:
+        raise Undecided("the record is not complete through the window's end at %d (%s)"
+                        % (window_end, "no end marker" if record.end is None else "%s %d" % record.end))
+    steps = [step for step in record.steps if step[1] >= epoch and step[0] <= window_end]
+    # What the record cannot tell: frames it dropped (any source), a
+    # malformed frame from the address (its port unknown), a fragment from
+    # the client's port.
+    gaps = [(since, clock, "%d frames the record dropped between %d and %d" % (count, since, clock))
+            for since, clock, count in record.drops if clock >= epoch and since <= window_end]
+    frames, sources = [], set()
+    for frame in record.frames:
+        if frame.high < epoch or frame.low > window_end:
+            continue
+        if frame.kind == "datagram" and frame.port is not None:
+            if not inbound_candidates(frame.data, sizes, ranges, hp_key, trailers) and detect(frame.data):
+                sources.add((frame.address, frame.port))
+        if frame.address != address:
+            continue
+        if frame.low < epoch:
+            gaps.append((frame.low, frame.high, "a frame from %s that may have arrived before the epoch (%d~%d)"
+                         % (address, frame.low, frame.high)))
+        elif frame.kind == "malformed" or (frame.kind == "fragment" and frame.port == port):
+            gaps.append((frame.low, frame.high, "a %s frame from %s at %d~%d (%s)"
+                         % (frame.kind, address, frame.low, frame.high, frame.data.hex() or "-")))
+        elif frame.kind == "datagram" and frame.port == port:
+            frames.append(frame)
+    if len(sources) >= MAX_HINT_SOURCES:
+        raise Undecided("%d sources left hints, as many as the device keeps" % len(sources))
+    datagrams = [Datagram(frame, sizes, ranges, mac1_key, hp_key, trailers) for frame in frames]
+    initiations = [index for index, datagram in enumerate(datagrams) if datagram.kind == "initiation"]
+    if not initiations:
+        raise Undecided("no initiation from this client reached the server by the window's end")
+    if len(initiations) > MAX_INITIATIONS:
+        raise Undecided("%d initiations are more histories than this model enumerates" % len(initiations))
+    if window_end - datagrams[initiations[0]].low > CONNECTION_EXPIRY_CS:
+        raise Undecided("the window ends so long after the first initiation that a connected socket may have expired")
+    relevant = [index for index, datagram in enumerate(datagrams) if datagram.kind in ("hint", "initiation")]
+    outcomes = {}
+    shown = None
+    histories = 0
+    for mask in range(1, 1 << len(initiations)):
+        accepted = {initiations[bit] for bit in range(len(initiations)) if mask >> bit & 1}
+        if not all(any(datagrams[k].low <= up and datagrams[k].high >= start for k in accepted)
+                   for start, up in establishments):
+            continue
+        first = min(accepted)
+        switches = [None] + [index for index in relevant if index > first]
+        if connected is not None:
+            # Datagrams that arrived after the connected socket was seen
+            # reached it.
+            later = [index for index in relevant if index > first and datagrams[index].low > connected]
+            if later:
+                switches = [switch for switch in switches if switch is not None and switch <= later[0]]
+        for switch in switches:
+            pending = [[]]
+            while pending:
+                choices = pending.pop()
+                histories += 1
+                if histories > MAX_HISTORIES:
+                    raise Undecided("more than %d histories" % MAX_HISTORIES)
+                history = History(datagrams, accepted, switch, choices, establishments, steps)
+                history.sizes, history.hp_key = sizes, hp_key
+                try:
+                    learned, learned_at, notes = history.run()
+                except Branch:
+                    pending.append(choices + [False])
+                    pending.append(choices + [True])
+                    continue
+                pinned = history.bound[learned_at] if learned is not None else INFINITY
+                for low, high, what in gaps:
+                    if high >= epoch and low <= min(pinned, window_end):
+                        raise Undecided("%s, before the selection was certainly pinned" % what)
+                outcome = history_expectation(history, learned, learned_at, window_start, window_end)
+                outcomes.setdefault(outcome, describe(history, initiations))
+                if shown is None:
+                    shown = notes
+    if not outcomes:
+        raise Undecided("no history agrees with the establishments %s%s" % (
+            establishments or "given", "; the record has a gap: %s" % gaps[0][2] if gaps else ""))
+    if len(outcomes) > 1:
+        raise Undecided("the outcome depends on the history: " +
+                        "; ".join("%s if %s" % (outcome, how) for outcome, how in sorted(outcomes.items())))
+    for low, high, what in gaps:
+        shown.append("%s: after the selection was pinned or before the epoch, it cannot change it" % what)
+    shown.append("%d histories of %d initiations considered" % (histories, len(initiations)))
+    return next(iter(outcomes)), shown
+
+
+def describe(history, initiations):
+    accepted = ",".join("#%d" % (k + 1) for k in sorted(history.accepted))
+    switch = "never" if history.switch is None else "from #%d" % (history.switch + 1)
+    return "accepted %s, connected socket %s, timing choices %s" % (accepted, switch, history.choices or "none")
 
 
 def main(argv):
@@ -1823,7 +1979,7 @@ def main(argv):
             return capture(*argv[2:], destination_port=argv[1])
         elif len(argv) == 7 and argv[0] == "record":
             return record(*argv[1:])
-        elif len(argv) == 11 and argv[0] == "auto-expect":
+        elif len(argv) in (11, 12, 13) and argv[0] == "auto-expect":
             return auto_expect(*argv[1:])
         elif len(argv) == 3 and argv[0] == "classify":
             classify(argv[1], argv[2])

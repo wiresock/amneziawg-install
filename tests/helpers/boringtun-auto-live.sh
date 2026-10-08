@@ -230,6 +230,11 @@ BT_AUTO_EPOCH=""
 BT_AUTO_EPOCH_PID=""
 BT_AUTO_SEQ=0
 BT_AUTO_PENDING=()
+# The client side's evidence of acceptance, per client and stage: when each of
+# its processes started (BT_AUTO_BORN) and "<started>:<first ping>" for every
+# observation (BT_AUTO_EST), so that some initiation it sent between them was
+# accepted and answered by then.
+declare -gA BT_AUTO_BORN=() BT_AUTO_EST=()
 
 # Header protection is on (AWG 3.0 and 3.1) and its key, from params; the key
 # goes only to a file of mode 0600 that auto-expect reads.
@@ -262,6 +267,8 @@ bt_auto_record_start() { # <stage>
 	BT_AUTO_EPOCH=""
 	BT_AUTO_EPOCH_PID=""
 	BT_AUTO_PENDING=()
+	BT_AUTO_BORN=()
+	BT_AUTO_EST=()
 	if BT_WIRE_CAPTURE_RECORD=1 BT_WIRE_CAPTURE_TO_PORT="${PORT}" bt_wire_capture_start - any \
 		"${CLIENT_ADDR},${BT_AUTO_CLIENT_ADDR2}" any 3600 "${BT_AUTO_RECORD}" &&
 		BT_AUTO_RECORD_READY="${BT_WIRE_CAPTURE_READY_CLOCK}" && bt_wire_capture_park auto-record; then
@@ -308,6 +315,7 @@ bt_auto_observe() { # <label> <name> <start 1|0>
 		return
 	fi
 	BEGIN="${BT_WIRE_CAPTURE_READY_CLOCK}"
+	((START)) && BT_AUTO_BORN[${NAME}]="$(bt_auto_uptime)"
 	if ((START)) && ! bt_auto_start "${NAME}"; then
 		bad "${LABEL}: ${NAME} starts with its installer-generated config (imitation ${BT_AUTO_IMITATE[${NAME}]}${BT_AUTO_INJECT[${NAME}]:+, a planted ${BT_AUTO_INJECT[${NAME}]} hint})"
 	fi
@@ -329,6 +337,9 @@ bt_auto_observe() { # <label> <name> <start 1|0>
 	fi
 	bt_wire_now
 	END="${BT_WIRE_NOW}"
+	if [[ -n "${UP}" && -n "${BT_AUTO_BORN[${NAME}]:-}" ]]; then
+		BT_AUTO_EST[${NAME}]+="${BT_AUTO_EST[${NAME}]:+,}${BT_AUTO_BORN[${NAME}]}:${UP}"
+	fi
 	BT_AUTO_PENDING+=("${LABEL}|${NAME}|${CAPTURE}|${FORMAT}|${BEGIN}|${END}|${START}")
 }
 
@@ -365,7 +376,8 @@ bt_auto_judge_stage() {
 	for ENTRY in "${BT_AUTO_PENDING[@]}"; do
 		IFS='|' read -r LABEL NAME CAPTURE FORMAT BEGIN END START <<<"${ENTRY}"
 		ORACLE="$(python3 "${WIRE}" auto-expect "${BT_AUTO_RECORD}" "${BT_AUTO_ADDR[${NAME}]}" "${BT_AUTO_PORT[${NAME}]}" \
-			"$(params_layout)" "${SERVER_KEY}" "${HP_FILE}" "$(bt_auto_trailers)" "${BT_AUTO_EPOCH}" "${BEGIN}" "${END}" 2>&1)"
+			"$(params_layout)" "${SERVER_KEY}" "${HP_FILE}" "$(bt_auto_trailers)" "${BT_AUTO_EPOCH}" "${BEGIN}" "${END}" \
+			"${BT_AUTO_EST[${NAME}]:--}" - 2>&1)"
 		sed "s/^/    ${NAME} record | /" <<<"${ORACLE}"
 		if [[ ! "${ORACLE##*$'\n'}" =~ ^expect\ (dns|quic|sip|stun|random)$ ]]; then
 			bad "${LABEL}: what reached the server from ${NAME} decides what it selected (${ORACLE##*$'\n'})"
