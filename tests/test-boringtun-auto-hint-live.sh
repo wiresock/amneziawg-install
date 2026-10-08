@@ -222,7 +222,7 @@ make_netns() { # <name>
 	ip netns add "$1" || return 1
 	CREATED_NETNS+=("$1")
 }
-# Fresh namespaces and a server; the client is only configured.
+# Fresh namespaces and both peers' configs; nothing runs yet.
 setup() { # <hp 0|1>
 	teardown
 	make_netns "${NS_S}" && make_netns "${NS_C}" || return 1
@@ -243,7 +243,15 @@ setup() { # <hp 0|1>
 	} >"${WORK}/client.conf"
 	chmod 0600 "${WORK}/server.conf" "${WORK}/client.conf"
 	: >"${WORK}/server.log"
-	start_peer "${NS_S}" "${IF_S}" "${WORK}/server.log" "${WORK}/server.conf" "${TUN_S}" "${TUN_C}" auto info
+}
+# Start the server and set EPOCH to its process's start (centiseconds of
+# CLOCK_BOOTTIME, from the start time its owned handle recorded, rounded
+# down): its state, hints included, is empty then.
+start_server() {
+	local START
+	start_peer "${NS_S}" "${IF_S}" "${WORK}/server.log" "${WORK}/server.conf" "${TUN_S}" "${TUN_C}" auto info || return 1
+	read -r _ START _ <<<"${PEERS[-1]}"
+	EPOCH="$((START * 100 / $(getconf CLK_TCK)))"
 }
 # The datagrams a scenario plants from the client's port, by name: the
 # helper's 27-byte SIP hint, the 247-byte SIP probe, the recorded STUN
@@ -315,18 +323,25 @@ run_scenario() { # <name> <hint|probe|stun-sequence|none> <hp 0|1> [client imita
 	FORMAT="$(capture_format "${PLANT}" "${HP}" "${IMITATION}")"
 	echo "--- ${NAME}: S1-S4 ${S_SIZES}, H4 ${H_RANGES##*,}, client ${IMITATION}, planted: ${PLANT}$( ((HP)) && echo ', header protection')"
 	if ! setup "${HP}"; then
-		bad "${NAME}: the server could not be set up"
+		bad "${NAME}: the namespaces could not be set up"
 		return 1
 	fi
-	# Nothing in the client's namespace has sent anything yet, so the record
-	# that is ready now holds everything that reaches the server from there.
+	# The record is ready before the server exists, so it holds everything
+	# that reaches the server from the client's address.
 	if ! BT_WIRE_CAPTURE_RECORD=1 BT_WIRE_CAPTURE_TO_PORT="${PORT}" bt_wire_capture_start "${NS_S}" "${VETH_S}" "${ADDR_C}" any 600 "${RECORD}"; then
 		bad "${NAME}: the server-side record of what reaches the server started"
 		return 1
 	fi
-	EPOCH="${BT_WIRE_CAPTURE_READY_CLOCK}"
 	if ! bt_wire_capture_park record; then
 		bad "${NAME}: the server-side record runs alongside the client-side capture"
+		return 1
+	fi
+	EPOCH=""
+	# A clock tick apart, so that the server's start cannot fall in the
+	# centisecond the record became ready in.
+	sleep 0.05
+	if ! start_server || [[ ! "${EPOCH}" =~ ^[0-9]+$ ]]; then
+		bad "${NAME}: the server could not be set up"
 		return 1
 	fi
 	[[ "${FORMAT}" != kinds ]] || LAYOUT=("${S_SIZES},${H_RANGES}" "${CLIENT_PUB}")

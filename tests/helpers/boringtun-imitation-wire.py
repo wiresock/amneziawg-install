@@ -657,46 +657,288 @@ def record_line(sizes, ranges, status, length, data, evidence=None):
 MALFORMED_KEPT = 40
 # A record's receive buffer: a bulk transfer through the tunnel must not
 # overflow it while the record writes. Drops are reported regardless.
+# BT_WIRE_RECORD_BUFFER (bytes) overrides it, for the overflow regression.
 RECORD_BUFFER = 32 * 1024 * 1024
 SOL_PACKET = 263
 PACKET_STATISTICS = 6
+SO_TIMESTAMPNS = getattr(socket, "SO_TIMESTAMPNS", 35)
+# Frames read per wakeup before drops and clocks are polled again.
+RECORD_BATCH = 256
+# How long the shutdown drain may take before the record ends incomplete,
+# and how long past the cutoff the queue must still be found empty: a frame
+# stamped just before the cutoff may be queued a moment later.
+RECORD_DRAIN_NS = 5 * 10 ** 9
+RECORD_SETTLE_NS = 10 ** 8
+# The longest a wait lasts, so that drops and clocks are polled while idle.
+RECORD_IDLE_NS = 5 * 10 ** 8
+# How far two readings of a clock offset may differ without counting as a
+# step of the realtime clock or a suspend (boottime against monotonic).
+CLOCK_TOLERANCE_NS = 2 * 10 ** 6
 
 
-def record_buffer(sock):
-    """Enlarge SOCK's receive buffer, past rmem_max where root may."""
-    for option in (getattr(socket, "SO_RCVBUFFORCE", 33), socket.SO_RCVBUF):
+class ClockSample:
+    """One reading of the clocks: CLOCK_BOOTTIME (BOOT), the offset of
+    CLOCK_REALTIME from it (REAL_OFFSET, bracketed by two realtime readings,
+    whose spread is REAL_ERROR) and the offset of CLOCK_MONOTONIC from it
+    (MONO_OFFSET). Kernel receive timestamps are realtime; the shell's clock
+    is boottime (/proc/uptime); the server measures hint ages on monotonic."""
+
+    def __init__(self, boot, real_offset, real_error, mono_offset):
+        self.boot, self.real_offset, self.real_error, self.mono_offset = boot, real_offset, real_error, mono_offset
+
+    def steady_since(self, earlier):
+        """Whether neither offset moved between EARLIER and this reading."""
+        return (abs(self.real_offset - earlier.real_offset) <= CLOCK_TOLERANCE_NS + self.real_error + earlier.real_error
+                and abs(self.mono_offset - earlier.mono_offset) <= CLOCK_TOLERANCE_NS)
+
+
+class SystemClocks:
+    def sample(self):
+        real_before = time.clock_gettime_ns(time.CLOCK_REALTIME)
+        boot = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        mono = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        real_after = time.clock_gettime_ns(time.CLOCK_REALTIME)
+        return ClockSample(boot, (real_before + real_after) // 2 - boot, real_after - real_before, boot - mono)
+
+    def boot(self):
+        return time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+
+    def sleep(self, nanoseconds):
+        time.sleep(nanoseconds / 10 ** 9)
+
+
+class PacketSource:
+    """The record's packet socket: every IPv4 frame the namespace receives
+    (or one interface's), each with the kernel's receive timestamp."""
+
+    def __init__(self, interface, buffer):
+        self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
+        for option in (getattr(socket, "SO_RCVBUFFORCE", 33), socket.SO_RCVBUF):
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, option, buffer)
+                break
+            except OSError:
+                continue
+        self.sock.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
+        if interface != "any":
+            self.sock.bind((interface, 0))
+        self.sock.setblocking(False)
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def read(self):
+        """(frame, kernel receive time in realtime nanoseconds or None), or
+        None once the queue is empty."""
         try:
-            sock.setsockopt(socket.SOL_SOCKET, option, RECORD_BUFFER)
+            frame, ancillary, _, _ = self.sock.recvmsg(65535, socket.CMSG_SPACE(16))
+        except BlockingIOError:
+            return None
+        stamp = None
+        for level, kind, data in ancillary:
+            if level == socket.SOL_SOCKET and kind == SO_TIMESTAMPNS and len(data) >= 16:
+                seconds, nanoseconds = struct.unpack("qq", data[:16])
+                stamp = seconds * 10 ** 9 + nanoseconds or None
+        return frame, stamp
+
+    def drops(self):
+        """Frames dropped since the last call (PACKET_STATISTICS, which
+        resets on reading)."""
+        return struct.unpack("II", self.sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))[1]
+
+
+def centiseconds_down(nanoseconds):
+    return nanoseconds // 10 ** 7
+
+
+def centiseconds_up(nanoseconds):
+    return -(-nanoseconds // 10 ** 7)
+
+
+class Recorder:
+    """What the `record` command writes, one line per relevant frame, in the
+    order the packet socket delivered them (its queue order):
+
+      "<arrival> <address> <port> <length> <hex>"      a whole datagram
+      "<arrival> <address> <port> fragment <length>"   a first fragment
+      "<arrival> <address> - malformed <length> <hex>" not valid IPv4/UDP,
+                                                       its first 40 bytes
+
+    ARRIVAL is the kernel's receive time in centiseconds of CLOCK_BOOTTIME,
+    converted from the realtime timestamp with the offset read at the time it
+    was read, when the offsets did not move since the queue was last seen
+    empty; otherwise, or without a timestamp, "<from>~<to>": the frame arrived
+    after the queue was last seen empty and before it was read. Markers:
+
+      "<clock> - drops <count> <since>"   frames the socket dropped since the
+                                          poll at SINCE (polled after every
+                                          batch, from a baseline taken before
+                                          the record was ready)
+      "<clock> - clock-step <since>"      the realtime or the boottime clock
+                                          stepped (or the system suspended)
+                                          since the reading at SINCE
+      "<clock> - complete <cutoff>"       the last line: every frame that
+                                          arrived by CUTOFF is recorded or
+                                          counted in a drops line
+      "<clock> - incomplete <cutoff>"     the last line when the queue could
+                                          not be drained to CUTOFF in time
+    """
+
+    def __init__(self, source, clocks, out, wanted_sources, wanted_port, destination_port, created):
+        self.source, self.clocks, self.out = source, clocks, out
+        self.wanted_sources, self.wanted_port, self.destination_port = wanted_sources, wanted_port, destination_port
+        self.fragments = Fragments()
+        self.records = 0
+        # Every queued frame arrived after this reading: the socket's
+        # creation, then each time the queue was found empty.
+        self.empty = created
+        self.last = created
+        self.polled = created.boot
+
+    def write(self, line):
+        self.out.write(line + "\n")
+        self.records += 1
+
+    def begin(self):
+        """Take the drop counters' baseline, then the reading at which the
+        record counts as ready: every drop after it is reported."""
+        before = self.clocks.sample()
+        self.source.drops()
+        ready = self.clocks.sample()
+        self.polled = before.boot
+        return ready
+
+    def arrival(self, stamp, now):
+        """The arrival field of a frame read at reading NOW."""
+        low, high = self.empty.boot, self.clocks.boot()
+        if stamp is not None and now.steady_since(self.empty):
+            boot = stamp - now.real_offset
+            slack = CLOCK_TOLERANCE_NS + now.real_error
+            if low - slack <= boot <= high + slack:
+                return "%d" % centiseconds_down(min(max(boot, low), high))
+        return "%d~%d" % (centiseconds_down(low), centiseconds_up(high))
+
+    def frame(self, frame, stamp, now):
+        if len(frame) < 16 or frame[12:16] not in self.wanted_sources:
             return
+        status, length, data, fragmented = frame_payload(frame, frame[12:16], self.wanted_port,
+                                                         destination_port=self.destination_port, fragments=self.fragments)
+        if status in (IGNORE, CONTINUATION):
+            return
+        at = self.arrival(stamp, now)
+        address = socket.inet_ntoa(frame[12:16])
+        if status == MALFORMED:
+            self.write("%s %s - malformed %d %s" % (at, address, length, frame[:MALFORMED_KEPT].hex()))
+            return
+        header = (frame[0] & 0x0F) * 4
+        sport = struct.unpack(">H", frame[header:header + 2])[0]
+        if fragmented:
+            self.write("%s %s %d fragment %d" % (at, address, sport, length))
+        else:
+            self.write("%s %s %d %d %s" % (at, address, sport, length, data.hex() or "-"))
+
+    def batch(self, limit):
+        """Read up to LIMIT frames; True if the queue was found empty."""
+        now = self.clocks.sample()
+        for _ in range(limit):
+            item = self.source.read()
+            if item is None:
+                self.empty = self.clocks.sample()
+                return True
+            self.frame(item[0], item[1], now)
+        return False
+
+    def poll(self):
+        """Report drops and clock steps since the last poll."""
+        dropped = self.source.drops()
+        now = self.clocks.sample()
+        if dropped:
+            self.write("%d - drops %d %d" % (centiseconds_up(now.boot), dropped, centiseconds_down(self.polled)))
+        if not now.steady_since(self.last):
+            self.write("%d - clock-step %d" % (centiseconds_up(now.boot), centiseconds_down(self.last.boot)))
+        self.polled, self.last = now.boot, now
+
+    def finish(self, cutoff):
+        """Drain the queue through CUTOFF (a boottime reading), within
+        RECORD_DRAIN_NS, report the drops and write the end marker. True if
+        the record is complete through CUTOFF."""
+        give_up = self.clocks.boot() + RECORD_DRAIN_NS
+        complete = False
+        while self.clocks.boot() < give_up:
+            if self.batch(RECORD_BATCH):
+                if self.empty.boot >= cutoff + RECORD_SETTLE_NS:
+                    complete = True
+                    break
+                self.clocks.sleep(RECORD_SETTLE_NS // 4)
+        self.poll()
+        self.write("%d - %s %d" % (centiseconds_up(self.clocks.boot()), "complete" if complete else "incomplete",
+                                   centiseconds_down(cutoff)))
+        self.out.flush()
+        return complete
+
+
+def record(destination_port, interface, sources_text, source_port, seconds, path, source=None, clocks=None):
+    """The `record` command: every frame from SOURCES to DESTINATION_PORT
+    (Recorder), through a cutoff at the deadline or at an authorized stop.
+    PATH.state is capture's transcript ("ready ..."; "complete <records> <end
+    clock>" at the deadline, "stopped <records> <token>" after an authorized
+    SIGTERM, both status 0; "interrupted <records>", status 3). The records
+    count every line, markers included; whether the record is complete is its
+    last line's to say, and a reader must check it."""
+    sources = sources_text.split(",")
+    wanted_sources = set()
+    for address in sources:
+        try:
+            wanted_sources.add(socket.inet_aton(address))
         except OSError:
-            continue
-
-
-def packet_drops(sock):
-    """Frames the packet socket dropped since the last call
-    (PACKET_STATISTICS, which resets on reading)."""
-    return struct.unpack("II", sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))[1]
-
-
-def full_record_line(clock, frame, status, length, data, fragmented):
-    """The `record` line of one relevant frame, or None for a continuation:
-    "<clock> <source address> <source port> <length> <hex>" for a whole
-    datagram, "<clock> <source address> <source port> fragment <length>" for
-    the first fragment of one (its later fragments are never inspected), and
-    "<clock> <source address> - malformed <frame length> <hex>" for a frame
-    that is not valid IPv4/UDP, with its first MALFORMED_KEPT bytes (headers)
-    to tell what it was. CLOCK is CLOCK_BOOTTIME in centiseconds, read when the
-    frame was received."""
-    if status == CONTINUATION:
-        return None
-    address = socket.inet_ntoa(frame[12:16])
-    if status == MALFORMED:
-        return "%d %s - malformed %d %s" % (clock, address, length, frame[:MALFORMED_KEPT].hex())
-    header = (frame[0] & 0x0F) * 4
-    sport = struct.unpack(">H", frame[header:header + 2])[0]
-    if fragmented:
-        return "%d %s %d fragment %d" % (clock, address, sport, length)
-    return "%d %s %d %d %s" % (clock, address, sport, length, data.hex() or "-")
+            raise InputError("%r is not an IPv4 address" % address) from None
+    if len(wanted_sources) != len(sources):
+        raise InputError("the source addresses %r are not distinct" % sources_text)
+    wanted_port = None if source_port == "any" else parse_number(source_port, "port", 65535)
+    wanted_destination = parse_number(destination_port, "destination port", 65535)
+    duration = parse_number(seconds, "record seconds", 86400) * 10 ** 9
+    buffer = parse_number(os.environ.get("BT_WIRE_RECORD_BUFFER", str(RECORD_BUFFER)), "record buffer", 2 ** 31 - 1)
+    state_path, stop_path = path + ".state", path + ".stop"
+    if os.path.lexists(stop_path):
+        raise InputError("%s exists before the record started" % stop_path)
+    stop = []
+    wake_read, wake_write = os.pipe()
+    os.set_blocking(wake_read, False)
+    os.set_blocking(wake_write, False)
+    signal.set_wakeup_fd(wake_write)
+    signal.signal(signal.SIGTERM, lambda signum, frame: stop.append(signum))
+    clocks = clocks or SystemClocks()
+    created = clocks.sample()
+    source = source or PacketSource(interface, buffer)
+    with open(path, "w") as out:
+        recorder = Recorder(source, clocks, out, wanted_sources, wanted_port, wanted_destination, created)
+        ready = recorder.begin()
+        write_state(state_path, "ready %d %d %d" % (own_identity() + (centiseconds_down(ready.boot),)))
+        deadline = ready.boot + duration
+        while not stop:
+            left = deadline - clocks.boot()
+            if left <= 0:
+                break
+            select.select([source, wake_read], [], [], min(left, RECORD_IDLE_NS) / 10 ** 9)
+            try:
+                os.read(wake_read, 64)
+            except BlockingIOError:
+                pass
+            if recorder.batch(RECORD_BATCH):
+                out.flush()
+            recorder.poll()
+        cutoff = clocks.boot()
+        if not stop or stop_token(stop_path) is not None:
+            recorder.finish(cutoff)
+    if not stop:
+        write_state(state_path, "complete %d %d" % (recorder.records, centiseconds_up(clocks.boot())))
+        return 0
+    token = stop_token(stop_path)
+    if token is None:
+        write_state(state_path, "interrupted %d" % recorder.records)
+        return 3
+    write_state(state_path, "stopped %d %s" % (recorder.records, token))
+    return 0
 
 
 def write_state(path, line):
@@ -736,14 +978,9 @@ def boot_centiseconds(nanoseconds):
     return nanoseconds // 10 ** 7
 
 
-def capture(interface, source, source_port, seconds, path, layout=None, receiver=None, destination_port=None,
-            full=False):
+def capture(interface, source, source_port, seconds, path, layout=None, receiver=None, destination_port=None):
     """Record the relevant datagrams; return the exit status. With
-    DESTINATION_PORT, only those sent to that port are relevant. With FULL
-    (the `record` command), each datagram is recorded whole with its clock
-    (full_record_line); SOURCE may then be several addresses, comma-separated,
-    SOURCE_PORT "any", and INTERFACE "any" for every interface of the network
-    namespace, including those created after the capture is ready. With LAYOUT,
+    DESTINATION_PORT, only those sent to that port are relevant. With LAYOUT,
     RECEIVER is the base64 static public key of the peer they are sent to:
     the key under which Evidence checks mac1 when a datagram fits more than
     one kind, its receiver indices recorded in the order the datagrams
@@ -764,11 +1001,8 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
     written whole: a stop is only acted on between records."""
     sizes, ranges = parse_layout(layout) if layout else (None, None)
     evidence = Evidence(parse_public_key(receiver)) if layout else None
-    sources = source.split(",") if full else [source]
-    wanted_sources = {socket.inet_aton(address) for address in sources}
-    if len(wanted_sources) != len(sources) or any(not address for address in sources):
-        raise InputError("the source addresses %r are not distinct IPv4 addresses" % source)
-    wanted_port = None if full and source_port == "any" else parse_number(source_port, "port", 65535)
+    wanted_source = socket.inet_aton(source)
+    wanted_port = parse_number(source_port, "port", 65535)
     wanted_destination = None if destination_port is None else parse_number(destination_port, "destination port", 65535)
     duration = parse_number(seconds, "capture seconds", 86400) * 10 ** 9
     state_path, stop_path = path + ".state", path + ".stop"
@@ -780,19 +1014,13 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
     signal.set_wakeup_fd(wake_write)
     signal.signal(signal.SIGTERM, lambda signum, frame: stop.append(signum))
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
-    if full:
-        record_buffer(sock)
-    if not (full and interface == "any"):
-        sock.bind((interface, 0))
+    sock.bind((interface, 0))
     fragments = Fragments()
     records = 0
     with open(path, "w") as out:
         ready = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
         write_state(state_path, "ready %d %d %d" % (own_identity() + (boot_centiseconds(ready),)))
         deadline = ready + duration
-        polled = boot_centiseconds(ready)
-        if full:
-            packet_drops(sock)
         while not stop:
             left = deadline - time.clock_gettime_ns(time.CLOCK_BOOTTIME)
             if left <= 0:
@@ -800,38 +1028,16 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
             readable = select.select([sock, wake_read], [], [], left / 10 ** 9)[0]
             if wake_read in readable:
                 os.read(wake_read, 64)
-            if full:
-                # Frames the socket dropped since the last poll: the record
-                # says when, so that nothing can count as complete across it.
-                now, dropped = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME)), packet_drops(sock)
-                if dropped:
-                    out.write("%d - drops %d %d\n" % (now, dropped, polled))
-                    records += 1
-                polled = now
             if sock not in readable:
-                out.flush()
                 continue
-            frame = sock.recv(65535)
-            clock = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME))
-            if len(frame) < 16 or frame[12:16] not in wanted_sources:
-                continue
-            status, length, data, fragmented = frame_payload(frame, frame[12:16], wanted_port,
-                                                             destination_port=wanted_destination, fragments=fragments)
+            status, length, data, _ = frame_payload(sock.recv(65535), wanted_source, wanted_port,
+                                                    destination_port=wanted_destination, fragments=fragments)
             if status == IGNORE:
                 continue
-            if full:
-                line = full_record_line(clock, frame, status, length, data, fragmented)
-            else:
-                line = record_line(sizes, ranges, status, length, data, evidence)
+            line = record_line(sizes, ranges, status, length, data, evidence)
             if line is not None:
                 out.write(line + "\n")
-                if not full:
-                    out.flush()
-                records += 1
-        if full:
-            now, dropped = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME)), packet_drops(sock)
-            if dropped:
-                out.write("%d - drops %d %d\n" % (now, dropped, polled))
+                out.flush()
                 records += 1
     if not stop:
         end = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME))
@@ -1330,35 +1536,75 @@ def policy_allows(protocol, sizes, hp_key):
     return not (protocol == "sip" and max(sizes) >= SIP_REQUEST_LINE_MIN)
 
 
-RECORD_DATAGRAM = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) (0|[1-9][0-9]{0,4}) (0|[1-9][0-9]{0,4}) (-|(?:[0-9a-f]{2})+)")
-RECORD_FRAGMENT = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) (0|[1-9][0-9]{0,4}) fragment (0|[1-9][0-9]{0,4})")
-RECORD_MALFORMED = re.compile(r"(0|[1-9][0-9]{0,17}) ([0-9.]{7,15}) - malformed (0|[1-9][0-9]{0,4}) ((?:[0-9a-f]{2}){0,40})")
-RECORD_DROPS = re.compile(r"(0|[1-9][0-9]{0,17}) - drops ([1-9][0-9]{0,9}) (0|[1-9][0-9]{0,17})")
+ARRIVAL = r"((?:0|[1-9][0-9]{0,17})(?:~(?:0|[1-9][0-9]{0,17}))?)"
+CLOCK = r"(0|[1-9][0-9]{0,17})"
+RECORD_DATAGRAM = re.compile(ARRIVAL + r" ([0-9.]{7,15}) (0|[1-9][0-9]{0,4}) (0|[1-9][0-9]{0,4}) (-|(?:[0-9a-f]{2})+)")
+RECORD_FRAGMENT = re.compile(ARRIVAL + r" ([0-9.]{7,15}) (0|[1-9][0-9]{0,4}) fragment (0|[1-9][0-9]{0,4})")
+RECORD_MALFORMED = re.compile(ARRIVAL + r" ([0-9.]{7,15}) - malformed (0|[1-9][0-9]{0,4}) ((?:[0-9a-f]{2}){0,40})")
+RECORD_DROPS = re.compile(CLOCK + r" - drops ([1-9][0-9]{0,9}) " + CLOCK)
+RECORD_STEP = re.compile(CLOCK + r" - clock-step " + CLOCK)
+RECORD_END = re.compile(CLOCK + r" - (complete|incomplete) " + CLOCK)
 
 
-def full_records(path):
-    """The records of a finished `record` and its ready clock. Its transcript
-    must be a ready line and a stopped or complete end that counts every
-    record, every record well formed, its clocks never going back. A record is
-    (clock, address, port, kind, data), KIND "datagram", "fragment" (no data),
-    "malformed" (port None, data the frame's first bytes) or "drops" (address
-    and port None, data (frames dropped, clock of the poll before))."""
+class Frame:
+    """One recorded frame: its arrival between LOW and HIGH (centiseconds of
+    CLOCK_BOOTTIME; an exact stamp is the centisecond it fell in, so HIGH is
+    LOW + 1), its source, KIND "datagram", "fragment" (no data) or
+    "malformed" (port None, data its first bytes), and INDEX, its position in
+    the socket's queue order."""
+
+    def __init__(self, index, arrival, address, port, kind, data):
+        if "~" in arrival:
+            low, high = (int(part) for part in arrival.split("~"))
+        else:
+            low = int(arrival)
+            high = low + 1
+        self.index, self.low, self.high = index, low, high
+        self.address, self.port, self.kind, self.data = address, port, kind, data
+
+
+class Record:
+    """A finished `record`: READY, its ready clock; FRAMES in queue order;
+    DROPS (since, clock, count) and STEPS (since, clock) intervals; END
+    ("complete" or "incomplete", cutoff), from its last line."""
+
+    def __init__(self, ready, frames, drops, steps, end):
+        self.ready, self.frames, self.drops, self.steps, self.end = ready, frames, drops, steps, end
+
+
+def read_record(path):
+    """Parse a finished `record`. Its transcript must be a ready line and a
+    stopped or complete end that counts every line; every line must be well
+    formed; an end marker must be the last line and only there. Arrival
+    stamps may go back (frames from different interfaces or CPUs), queue
+    order is the line order."""
     with open(path + ".state") as state:
         transcript = state.read().splitlines()
     ready = re.fullmatch(r"ready [0-9]+ [0-9]+ (0|[1-9][0-9]{0,17})", transcript[0]) if transcript else None
     if len(transcript) != 2 or not ready:
         raise InputError("%s.state is not a ready line and one end" % path)
-    records = []
-    last = int(ready.group(1))
+    frames, drops, steps, end = [], [], [], None
+    lines = 0
     for number, line in capture_lines(path):
+        lines += 1
         where = "%s:%d" % (path, number)
-        drops = RECORD_DROPS.fullmatch(line)
-        if drops:
-            clock, since = int(drops.group(1)), int(drops.group(3))
-            if clock < last or since > clock:
-                raise InputError("%s goes back in time" % where)
-            last = clock
-            records.append((clock, None, None, "drops", (int(drops.group(2)), since)))
+        if end is not None:
+            raise InputError("%s follows the record's end marker" % where)
+        marker = RECORD_END.fullmatch(line)
+        if marker:
+            end = (marker.group(2), int(marker.group(3)))
+            continue
+        marker = RECORD_DROPS.fullmatch(line)
+        if marker:
+            if int(marker.group(3)) > int(marker.group(1)):
+                raise InputError("%s: its interval goes back" % where)
+            drops.append((int(marker.group(3)), int(marker.group(1)), int(marker.group(2))))
+            continue
+        marker = RECORD_STEP.fullmatch(line)
+        if marker:
+            if int(marker.group(2)) > int(marker.group(1)):
+                raise InputError("%s: its interval goes back" % where)
+            steps.append((int(marker.group(2)), int(marker.group(1))))
             continue
         for kind, pattern in (("datagram", RECORD_DATAGRAM), ("fragment", RECORD_FRAGMENT), ("malformed", RECORD_MALFORMED)):
             match = pattern.fullmatch(line)
@@ -1366,27 +1612,25 @@ def full_records(path):
                 break
         else:
             raise InputError("%s is not a record line: %r" % (where, line[:80]))
-        clock = int(match.group(1))
+        if "~" in match.group(1) and int(match.group(1).split("~")[0]) > int(match.group(1).split("~")[1]):
+            raise InputError("%s: its arrival interval goes back" % where)
         try:
             socket.inet_aton(match.group(2))
         except OSError:
             raise InputError("%s has no IPv4 source address" % where) from None
-        if clock < last:
-            raise InputError("%s goes back in time" % where)
-        last = clock
         if kind == "datagram":
             data = b"" if match.group(5) == "-" else bytes.fromhex(match.group(5))
             if len(data) != int(match.group(4)):
                 raise InputError("%s: its length is not that of its bytes" % where)
-            records.append((clock, match.group(2), int(match.group(3)), kind, data))
+            frames.append(Frame(len(frames), match.group(1), match.group(2), int(match.group(3)), kind, data))
         elif kind == "fragment":
-            records.append((clock, match.group(2), int(match.group(3)), kind, b""))
+            frames.append(Frame(len(frames), match.group(1), match.group(2), int(match.group(3)), kind, b""))
         else:
-            records.append((clock, match.group(2), None, kind, bytes.fromhex(match.group(4))))
-    end = re.fullmatch(r"(?:stopped ([0-9]+) [0-9a-f]{32}|complete ([0-9]+) [0-9]+)", transcript[1])
-    if not end or int(end.group(1) or end.group(2)) != len(records):
-        raise InputError("%s.state does not end with a stop or completion that counts its %d records" % (path, len(records)))
-    return records, int(ready.group(1))
+            frames.append(Frame(len(frames), match.group(1), match.group(2), None, kind, bytes.fromhex(match.group(4))))
+    count = re.fullmatch(r"(?:stopped ([0-9]+) [0-9a-f]{32}|complete ([0-9]+) [0-9]+)", transcript[1])
+    if not count or int(count.group(1) or count.group(2)) != lines:
+        raise InputError("%s.state does not end with a stop or completion that counts its %d lines" % (path, lines))
+    return Record(int(ready.group(1)), frames, drops, steps, end)
 
 
 class Undecided(Exception):
@@ -1394,7 +1638,8 @@ class Undecided(Exception):
 
 
 def simulate_auto(events, sizes, ranges, mac1_key, hp_key, trailers, ignored):
-    """Replay one client's datagrams (clock, data), in arrival order, through
+    """Replay one client's datagrams (earliest arrival, latest arrival, data),
+    in queue order, through
     the hint cache and the selection; the genuine initiations whose indices
     are in IGNORED are taken as not accepted. Returns (learned protocol or
     None, the clock it was learned at, the accepted initiations' clocks,
@@ -1407,20 +1652,24 @@ def simulate_auto(events, sizes, ranges, mac1_key, hp_key, trailers, ignored):
     initiation = 0
     start = events[0][0] if events else 0
 
-    def live(clock):
-        age = clock - pending[1]
-        if abs(age - HINT_LIFETIME_CS) < HINT_LIFETIME_MARGIN_CS:
-            raise Undecided("a hint was %.2f s old when it mattered, too close to its 30 s lifetime to decide" % (age / 100))
-        return age < HINT_LIFETIME_CS
+    def live(low, high):
+        # The pending hint's age, from the two arrivals' bounds.
+        youngest, oldest = low - pending[2], high - pending[1]
+        if oldest < HINT_LIFETIME_CS - HINT_LIFETIME_MARGIN_CS:
+            return True
+        if youngest >= HINT_LIFETIME_CS + HINT_LIFETIME_MARGIN_CS:
+            return False
+        raise Undecided("a hint was %.2f to %.2f s old when it mattered, which its 30 s lifetime does not decide"
+                        % (max(youngest, 0) / 100, oldest / 100))
 
-    for clock, data in events:
+    for low, clock, data in events:
         at = "+%.2fs %d B" % ((clock - start) / 100, len(data))
         candidates = inbound_candidates(data, sizes, ranges, hp_key, trailers)
         if not candidates:
             found = detect(data)
             if learned is None and found is not None:
-                if pending is None or not live(clock):
-                    pending = (found, clock)
+                if pending is None or not live(low, clock):
+                    pending = (found, low, clock)
                     notes.append("%s: %s, fits no AmneziaWG kind: the hint" % (at, found))
                 else:
                     notes.append("%s: %s, fits no AmneziaWG kind; the live %s hint stays" % (at, found, pending[0]))
@@ -1439,7 +1688,7 @@ def simulate_auto(events, sizes, ranges, mac1_key, hp_key, trailers, ignored):
         accepted.append(clock)
         if learned is not None:
             continue
-        hint = pending[0] if pending is not None and live(clock) else None
+        hint = pending[0] if pending is not None and live(low, clock) else None
         selected = hint or detect(data)
         origin = "the hint" if hint else "the initiation datagram"
         if selected is None:
@@ -1497,34 +1746,40 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
         socket.inet_aton(address)
     except OSError:
         raise InputError("%r is not an IPv4 address" % address) from None
-    records, ready = full_records(path)
+    record = read_record(path)
     try:
-        if ready > epoch:
-            raise Undecided("the record was ready at %d, after the server's state was last empty at %d" % (ready, epoch))
+        if record.ready + 1 > epoch:
+            raise Undecided("the record was ready at %d, not before the server's state was last empty at %d" % (record.ready, epoch))
+        if record.end is None or record.end[0] != "complete" or record.end[1] < window_end:
+            raise Undecided("the record is not complete through the window's end at %d (%s)"
+                            % (window_end, "no end marker" if record.end is None else "%s %d" % record.end))
+        for since, clock in record.steps:
+            if clock >= epoch and since <= window_end:
+                raise Undecided("a clock stepped between %d and %d, so arrival times do not compare" % (since, clock))
         events = []
         # (from, to, what) of datagrams the record cannot tell: a malformed
         # frame from the address (its port unknown), a fragment from the
         # client's port, and frames the record's socket dropped, from any
         # source, at some time since its poll before.
         unknown = []
-        for clock, source, source_port, kind, data in records:
-            if kind == "drops":
-                if clock >= epoch and data[1] <= window_end:
-                    unknown.append((data[1], clock, "%d frames the record dropped between %d and %d" % (data[0], data[1], clock)))
+        for since, clock, count in record.drops:
+            if clock >= epoch and since <= window_end:
+                unknown.append((since, clock, "%d frames the record dropped between %d and %d" % (count, since, clock)))
+        for frame in record.frames:
+            if frame.high < epoch or frame.low > window_end or frame.address != address:
                 continue
-            if clock < epoch or clock > window_end or source != address:
-                continue
-            if kind == "malformed" or (kind == "fragment" and source_port == port):
-                unknown.append((clock, clock, "a %s frame from %s at %d (%s)" % (kind, address, clock, data.hex() or "-")))
-            elif source_port == port:
-                events.append((clock, data))
+            if frame.kind == "malformed" or (frame.kind == "fragment" and frame.port == port):
+                unknown.append((frame.low, frame.high, "a %s frame from %s at %d~%d (%s)"
+                                % (frame.kind, address, frame.low, frame.high, frame.data.hex() or "-")))
+            elif frame.port == port:
+                events.append((frame.low, frame.high, frame.data))
         # The client sends transport only once a response reached it, so the
         # first initiation followed by a transport candidate before the next
         # initiation bounds the one the server accepted first; any before it
         # may have gone unanswered.
         initiations = 0
         bound = None
-        for _, data in events:
+        for _, _, data in events:
             candidates = inbound_candidates(data, sizes, ranges, hp_key, trailers)
             if genuine_initiation(data, candidates, sizes, mac1_key, hp_key):
                 initiations += 1
@@ -1567,7 +1822,7 @@ def main(argv):
         elif len(argv) in (7, 9) and argv[0] == "capture-to":
             return capture(*argv[2:], destination_port=argv[1])
         elif len(argv) == 7 and argv[0] == "record":
-            return capture(*argv[2:], destination_port=argv[1], full=True)
+            return record(*argv[1:])
         elif len(argv) == 11 and argv[0] == "auto-expect":
             return auto_expect(*argv[1:])
         elif len(argv) == 3 and argv[0] == "classify":

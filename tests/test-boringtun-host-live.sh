@@ -1213,6 +1213,15 @@ bash "${SCRIPT_DIR}/test-boringtun-auto-hint-live.sh" "${CLIENT_BIN}" 2>&1 | sed
 AUTO_HINT_RC="${PIPESTATUS[0]}"
 check "the auto hint test passes" test "${AUTO_HINT_RC}" -eq 0
 
+# ── The server-side record's completeness ───────────────────────────────────
+# The record the auto checks derive their expectations from, on a real
+# packet socket: arrival stamps, drain at the stop, drops and end markers
+# (tests/test-boringtun-record-live.sh).
+echo "=== Record completeness"
+bash "${SCRIPT_DIR}/test-boringtun-record-live.sh" 2>&1 | sed 's/^/    | /'
+RECORD_LIVE_RC="${PIPESTATUS[0]}"
+check "the record completeness test passes" test "${RECORD_LIVE_RC}" -eq 0
+
 # ── Binary lifecycle ────────────────────────────────────────────────────────
 # A TEST FIXTURE older release (tests/helpers/boringtun-lifecycle-fixture.sh:
 # the verified binary under a synthetic source commit) is made current, as an

@@ -369,12 +369,99 @@ elif cmd == "layout":
         print("refused")
 elif cmd == "chacha20":
     print(wire.chacha20_block(bytes(range(32)), 1, bytes.fromhex("000000090000004a00000000")).hex())
-elif cmd == "full-record":
-    payload = os.urandom(77)
-    for frame in (ipv4(payload), ipv4(os.urandom(1384), fragment=0x2000, udp_length=1408), ipv4(os.urandom(12), ihl=4)):
-        status, length, data, fragmented = wire.frame_payload(frame, SERVER, None, fragments=wire.Fragments())
-        line = wire.full_record_line(1700, frame, status, length, data, fragmented)
-        print(line.replace(payload.hex(), "<its bytes>").replace(" " + frame[:40].hex(), " <its first 40 bytes>"))
+elif cmd == "recorder":
+    # recorder <case>: the record's core (Recorder) on a scripted packet
+    # source and scripted clocks, its lines printed with bytes abbreviated.
+    import io
+    case = sys.argv[3]
+    SECOND = 10 ** 9
+
+    class Clocks:
+        def __init__(self):
+            self.boot_ns, self.real_offset, self.mono_offset = 100 * SECOND, 1_700_000_000 * SECOND, 5 * SECOND
+
+        def sample(self):
+            self.boot_ns += 1000
+            return wire.ClockSample(self.boot_ns, self.real_offset, 0, self.mono_offset)
+
+        def boot(self):
+            self.boot_ns += 1000
+            return self.boot_ns
+
+        def sleep(self, nanoseconds):
+            self.boot_ns += nanoseconds
+
+    class Source:
+        """Frames queued with their kernel stamps; DROPPED counts like
+        PACKET_STATISTICS and resets on reading; ENDLESS keeps the queue full."""
+
+        def __init__(self):
+            self.queue, self.dropped, self.endless = [], 0, False
+
+        def read(self):
+            if self.endless:
+                clocks.sleep(10 ** 7)
+                return (ipv4(b"x" * 8), None)
+            return self.queue.pop(0) if self.queue else None
+
+        def drops(self):
+            dropped, self.dropped = self.dropped, 0
+            return dropped
+
+    clocks, source, out = Clocks(), Source(), io.StringIO()
+    source.dropped = 7  # before the record exists: not its business
+    recorder = wire.Recorder(source, clocks, out, {SERVER}, None, 40000, clocks.sample())
+    def stamped(payload, before_ns):
+        return (ipv4(payload), clocks.boot_ns - before_ns + clocks.real_offset)
+    ready = recorder.begin()
+    if case == "delayed-ready":
+        # Drops after readiness, before the first poll, are reported.
+        source.dropped = 993
+        clocks.sleep(SECOND)
+        recorder.batch(256)
+        recorder.poll()
+        recorder.finish(clocks.boot())
+    elif case == "queued-at-stop":
+        # Everything queued when the stop came is read before the end marker.
+        source.queue = [stamped(b"p%02d" % i, 2 * SECOND) for i in range(50)]
+        recorder.finish(clocks.boot())
+    elif case == "dequeue-delay":
+        # A frame read 2.2 s after it arrived is recorded at its arrival.
+        clocks.sleep(3 * SECOND)
+        arrived = clocks.boot_ns - 22 * SECOND // 10
+        source.queue = [(ipv4(b"late"), arrived + clocks.real_offset)]
+        recorder.batch(256)
+        print("arrival-error-cs %d" % (int(out.getvalue().split()[0]) - arrived // 10 ** 7))
+        recorder.finish(clocks.boot())
+    elif case == "no-stamp":
+        clocks.sleep(SECOND)
+        source.queue = [(ipv4(b"none"), None)]
+        recorder.batch(256)
+        recorder.finish(clocks.boot())
+    elif case == "clock-step":
+        # The realtime clock steps while the frame waits: its stamp no longer
+        # converts, so its arrival is the interval it must lie in.
+        clocks.sleep(SECOND)
+        source.queue = [stamped(b"step", SECOND // 2)]
+        clocks.real_offset += 3 * SECOND
+        recorder.batch(256)
+        recorder.poll()
+        recorder.finish(clocks.boot())
+    elif case == "suspend":
+        clocks.sleep(SECOND)
+        clocks.mono_offset += 40 * SECOND
+        recorder.poll()
+        recorder.finish(clocks.boot())
+    elif case == "endless":
+        # Traffic that never lets the queue empty: the drain gives up in time.
+        source.endless = True
+        recorder.finish(clocks.boot())
+    print("ready %d" % wire.centiseconds_down(ready.boot))
+    for line in out.getvalue().splitlines():
+        fields = line.split(" ")
+        if len(fields) == 5 and fields[1] != "-":
+            fields[4] = "<%d bytes>" % (len(fields[4]) // 2)
+        print(" ".join(fields))
 PY
 }
 kinds() { # <capture> <S1,S2,S3,S4>
@@ -814,6 +901,8 @@ elif case in ("retry-after-collision", "retry-after-transport"):
     sequence(5500, [SIP_HINT, initiation(layout), transport(layout)])
 else:
     raise SystemExit("no case " + case)
+# Complete through a cutoff after every window these cases use.
+lines.append("99999 - complete 99998")
 with open(path, "w") as out:
     out.write("".join(line + "\n" for line in lines))
 with open(path + ".state", "w") as state:
@@ -864,10 +953,17 @@ printf '1000 192.0.2.2 41006 3 abcd\n' >"${T}/bad-record"
 printf 'ready 1 1 900\nstopped 1 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
 "${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
 assert_eq 1 "$?" "auto-expect refuses a record whose length is not that of its bytes"
-printf '1000 192.0.2.2 41006 2 abcd\n999 192.0.2.2 41006 2 abcd\n' >"${T}/bad-record"
-printf 'ready 1 1 900\nstopped 2 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
+printf '1000 192.0.2.2 41006 2 abcd\n3000 - complete 2999\n1001 192.0.2.2 41006 2 abcd\n' >"${T}/bad-record"
+printf 'ready 1 1 900\nstopped 3 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
 "${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
-assert_eq 1 "$?" "auto-expect refuses a record whose clock goes back"
+assert_eq 1 "$?" "auto-expect refuses a record with a line after its end marker"
+for END in "" "3000 - incomplete 2999" "1900 - complete 1899"; do
+	{ printf '1000 192.0.2.2 41006 2 abcd\n'; [[ -z "${END}" ]] || printf '%s\n' "${END}"; } >"${T}/bad-record"
+	printf 'ready 1 1 900\nstopped %d %s\n' "$((${END:+1} + 1))" "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
+	GOT="$("${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 2>&1)"
+	assert_true "auto-expect: a record ${END:+ending '${END}'}${END:-without an end marker} is not complete through the window: undecided (${GOT##*$'\n'})" \
+		bash -c '[[ "$1" == "undecided the record is not complete through"* ]]' _ "${GOT##*$'\n'}"
+done
 printf '1000 192.0.2.2 41006 2 abcd\n' >"${T}/bad-record"
 printf 'ready 1 1 900\nstopped 2 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
 "${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
@@ -875,10 +971,27 @@ assert_eq 1 "$?" "auto-expect refuses a record whose transcript does not count i
 printf 'ready 1 1 900\n' >"${T}/bad-record.state"
 "${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
 assert_eq 1 "$?" "auto-expect refuses a record that has not ended"
-assert_eq "1700 192.0.2.1 51820 77 <its bytes>
-1700 192.0.2.1 51820 fragment 1400
-1700 192.0.2.1 - malformed 40 <its first 40 bytes>" "$(py full-record 2>&1)" \
-	"record lines: a whole datagram with its bytes, a first fragment by its length, a malformed frame without a port"
+echo "=== The record's completeness and arrival times (Recorder, on a scripted socket and clocks) ==="
+# The packet socket and the clocks are scripted (py recorder); the record's
+# core is the helper's own. The socket's clock is 100 s after boot when it is
+# created; frames come from 192.0.2.1 to port 40000.
+for CASE in delayed-ready queued-at-stop dequeue-delay no-stamp clock-step suspend endless; do
+	py recorder "${CASE}" >"${T}/recorder-${CASE}" 2>&1
+done
+assert_true "the drop counters' baseline comes before readiness: 993 drops after it, before the first poll, are reported, the 7 before the record existed are not ($(grep -c ' drops ' "${T}/recorder-delayed-ready"))" \
+	bash -c 'grep -qE "^[0-9]+ - drops 993 [0-9]+$" "$1" && ! grep -q " drops 7 " "$1" && [[ "$(tail -n 1 "$1")" =~ \ -\ complete\ [0-9]+$ ]]' _ "${T}/recorder-delayed-ready"
+assert_true "a stop drains the queue: all 50 queued frames are recorded before the complete marker ($(grep -c '<3 bytes>' "${T}/recorder-queued-at-stop"))" \
+	bash -c '[[ "$(grep -c "<3 bytes>" "$1")" == 50 && "$(tail -n 1 "$1")" =~ \ -\ complete\ [0-9]+$ ]]' _ "${T}/recorder-queued-at-stop"
+assert_true "a frame read 2.2 s after it arrived is recorded at its kernel arrival time, not when it was read ($(grep arrival-error "${T}/recorder-dequeue-delay"))" \
+	bash -c 'grep -qx "arrival-error-cs 0" "$1"' _ "${T}/recorder-dequeue-delay"
+assert_true "a frame without a kernel stamp is recorded with the interval it must have arrived in ($(grep '<4 bytes>' "${T}/recorder-no-stamp"))" \
+	bash -c 'grep -qE "^[0-9]+~[0-9]+ 192\.0\.2\.1 51820 4 <4 bytes>$" "$1"' _ "${T}/recorder-no-stamp"
+assert_true "a realtime step while a frame waits: its stamp is not converted, it gets its interval, and the step is marked ($(grep -c clock-step "${T}/recorder-clock-step"))" \
+	bash -c 'grep -qE "^[0-9]+~[0-9]+ 192\.0\.2\.1 51820 4 <4 bytes>$" "$1" && grep -qE "^[0-9]+ - clock-step [0-9]+$" "$1"' _ "${T}/recorder-clock-step"
+assert_true "a suspend (boottime moving against monotonic, the server's clock) is marked as a clock step" \
+	bash -c 'grep -qE "^[0-9]+ - clock-step [0-9]+$" "$1"' _ "${T}/recorder-suspend"
+assert_true "traffic that never lets the queue empty: the drain gives up within its budget and the record ends incomplete ($(tail -n 1 "${T}/recorder-endless"))" \
+	bash -c '[[ "$(tail -n 1 "$1")" =~ \ -\ incomplete\ [0-9]+$ ]]' _ "${T}/recorder-endless"
 
 echo "=== IPv4/UDP framing before payload ==="
 assert_eq "datagram 77 77 whole" "$(py frame valid)" "a valid frame yields its UDP payload"
@@ -1671,6 +1784,8 @@ hint_case() { # [VAR=value...]: FIX_SENT, FIX_RC, FIX_SETUP, FIX_ORACLE, FIX_STA
 		bad() { echo "  FAIL: $1"; FAILED=$((FAILED + 1)); }
 		check() { local M="$1"; shift; if "$@"; then ok "${M}"; else bad "${M}"; fi; }
 		setup() { return "${FIX_SETUP}"; }
+		start_server() { EPOCH=101; }
+		sleep() { :; }
 		start_peer() { :; }
 		ip() { :; }
 		tunnel_up() { :; }
