@@ -641,6 +641,28 @@ for name, port, fail in (("final-failed-last-dump", 52132, True), ("final-pendin
               for marker in markers))
     check("%s: and auto-expect does not decide (%s)" % (name, verdict), verdict.startswith("undecided the hint #"))
 
+print("--- canary-identity")
+# The watched port becomes free when the socket closes; with this
+# namespace's ephemeral range locked to it, the canary's bind(port 0) is
+# given that very port. Only the canary's own notification (its cookie) may
+# be set aside: the socket's must still reach the record. Controls: a canary
+# on an ordinary port with the socket left open decides sip (final-clean
+# above); with every notification held past the wait, nothing since the
+# watch began is covered.
+markers, verdict, bound = final_collection("canary-port-reuse", 52134, close=True, flood=True, delay=0.09, lock_port=True)
+check("canary-port-reuse: the canary was given the watched port (%s)" % bound, bound[-1:] == [52134])
+check("canary-port-reuse: the socket's unknown lifetime still reaches the record (%s)" % markers,
+      any(" - delivery unknown " in marker and marker.endswith(" any") and int(marker.split()[4]) <= int(markers[0].split()[0])
+          for marker in markers))
+check("canary-port-reuse: and auto-expect does not decide (%s)" % verdict, verdict.startswith("undecided the hint #"))
+markers, verdict, _ = final_collection("canary-missing", 52135, close=False, flood=False, block=True)
+check("canary-missing: no notification in time, so nothing since the watch began is covered (%s)" % markers,
+      any(" - delivery unknown " in marker and marker.endswith(" any") and int(marker.split()[4]) <= int(markers[0].split()[0])
+          for marker in markers))
+check("canary-missing: and auto-expect does not decide (%s)" % verdict, verdict.startswith("undecided the hint #"))
+with open(PORT_RANGE) as current:
+    restored = current.read().split()
+check("the namespace's ephemeral port range is restored (%s)" % restored, restored != ["52134", "52134"])
 
 print()
 print("BoringTun record live test: %d passed, %d failed" % (PASSED, FAILED))

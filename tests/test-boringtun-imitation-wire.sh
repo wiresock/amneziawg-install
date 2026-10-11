@@ -848,6 +848,13 @@ elif cmd == "recorder":
             # fails; the poll after it succeeds.
             watch.during_dump[3] = [(7, 40000, CLIENT_PEER)]
             watch.fail_at = 3
+        elif case == "delivery-canary-port-reuse":
+            # The fifth review's second case: the watched port is free and
+            # the canary is given it; a server socket's destruction on that
+            # port is notified while the final collection waits.
+            watch.identity = 40000
+            canary = watch.canary
+            watch.canary = lambda: (watch.gone_events.append((7, 40000, CLIENT_PEER)), canary())[1]
         print("poll-cs %d" % (clocks.boot_ns // 10 ** 7))
         recorder.poll()
         cutoff = clocks.boot()
@@ -1592,7 +1599,7 @@ for CASE in delayed-ready queued-at-stop dequeue-delay no-stamp clock-step suspe
 	delivery-new-socket delivery-reconnected delivery-retired delivery-unseen delivery-other-port delivery-namespace \
 	delivery-dump-fails delivery-events-lost delivery-unavailable delivery-during-dump delivery-final-dump \
 	delivery-final-last-dump delivery-final-settle delivery-slow-notifications delivery-final-failed-last-dump \
-	delivery-dump-fails-pending capture-queued capture-drops capture-endless; do
+	delivery-dump-fails-pending delivery-canary-port-reuse capture-queued capture-drops capture-endless; do
 	py recorder "${CASE}" >"${T}/recorder-${CASE}" 2>&1
 done
 # "<from>~<to>" or "<clock>" of the frame line (4 payload bytes) in a
@@ -1655,7 +1662,8 @@ assert_eq "" "$(delivery_lines delivery-quiet)" "  and a clean final collection 
 # reach the record (the unseen socket's whole life, and, the last reading
 # having failed, everything since the watch began); in a regular poll, the
 # failed reading reports the unseen socket at once, and the next one does not
-# repeat or drop it.
+# repeat or drop it. The canary is set aside by its cookie alone: given the
+# watched port, it leaves the server socket's notification in place.
 assert_eq "unknown poll any
 unknown watch any
 unknown watch any" "$(delivery_lines delivery-final-failed-last-dump)" \
@@ -1663,6 +1671,8 @@ unknown watch any" "$(delivery_lines delivery-final-failed-last-dump)" \
 assert_eq "unknown poll any
 unknown watch any" "$(delivery_lines delivery-dump-fails-pending)" \
 	"a failed regular dump reports an unseen socket notified during it, once"
+assert_eq "unknown watch any" "$(delivery_lines delivery-canary-port-reuse)" \
+	"a canary given the watched port sets aside only its own notification (by cookie): the server socket's stays"
 for CASE in delivery-quiet delivery-final-dump delivery-slow-notifications; do
 	assert_true "the watch ends with delivery-end, just before the end marker, from a time after the cutoff (${CASE})" \
 		bash -c 'END="$(tail -n 2 "$1" | head -n 1)"; [[ "${END}" =~ ^[0-9]+\ -\ delivery-end\ ([0-9]+)$ ]] && ((BASH_REMATCH[1] >= $2))' _ \

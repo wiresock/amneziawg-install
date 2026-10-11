@@ -806,6 +806,7 @@ INET_DIAG_SKMEMINFO = 7
 SK_MEMINFO_DROPS = 8
 # SKNLGRP_INET_UDP_DESTROY (2) and SKNLGRP_INET6_UDP_DESTROY (4), as bits.
 UDP_DESTROY_GROUPS = (1 << 1) | (1 << 3)
+SO_COOKIE = getattr(socket, "SO_COOKIE", 57)
 # The namespace's counters of IPv4 datagrams dropped after the packet tap and
 # before any UDP socket's queue: IP header, address and routing errors,
 # discards, reverse-path filtering, no socket on the port, checksums.
@@ -1021,28 +1022,31 @@ class DeliveryWatch:
             self.lost = True
 
     def canary(self):
-        """Bind a UDP socket of its own to a free port and close it: the
-        port its destruction will be notified for."""
+        """Bind a UDP socket of its own to a free port, read its cookie
+        (SO_COOKIE, the identity sock_diag notifies its destruction under)
+        while it is open, and close it: that cookie. The port is no identity:
+        once the watched port is free, the canary may be given it."""
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             probe.bind(("0.0.0.0", 0))
-            return probe.getsockname()[1]
+            return struct.unpack("=Q", probe.getsockopt(socket.SOL_SOCKET, SO_COOKIE, 8))[0]
 
     def settle(self, clocks, until):
         """Collect notifications until the boottime clock reaches UNTIL.
         True if the destruction of a canary socket, closed at the start, was
         notified by then: notifications are flowing. Not a proof that every
-        earlier one has arrived."""
+        earlier one has arrived. Only the canary's own notification, by its
+        cookie, is set aside; every other one stays pending, whatever its
+        port. Without the canary's cookie, False."""
         try:
-            port = self.canary()
+            identity = self.canary()
         except OSError:
             return False
         seen = False
         while True:
             self.collect()
-            mine = [event for event in self.pending if event[1] == port]
-            if mine:
+            if any(event[0] == identity for event in self.pending):
                 seen = True
-                self.pending = [event for event in self.pending if event[1] != port]
+                self.pending = [event for event in self.pending if event[0] != identity]
             if clocks.boot() >= until:
                 return seen
             clocks.sleep(RECORD_SETTLE_NS // 20)
