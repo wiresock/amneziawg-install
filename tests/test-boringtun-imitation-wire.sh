@@ -428,7 +428,10 @@ elif cmd == "recorder":
 
     clocks, source, out = Clocks(), Source(), io.StringIO()
     source.dropped = 7  # before the record exists: not its business
-    recorder = wire.Recorder(source, clocks, out, {SERVER}, None, 40000, clocks.sample())
+    if case.startswith("capture-"):
+        recorder = wire.CaptureRecorder(source, clocks, out, SERVER, 51820, None, clocks.sample(), None, None, None)
+    else:
+        recorder = wire.Recorder(source, clocks, out, {SERVER}, None, 40000, clocks.sample())
     def stamped(payload, before_ns):
         return (ipv4(payload), clocks.boot_ns - before_ns + clocks.real_offset)
     def preempted_after_reset():
@@ -535,6 +538,18 @@ elif cmd == "recorder":
             source.hooks[source.calls + 1] = preempted_after_reset
             recorder.poll()
         recorder.finish(clocks.boot())
+    elif case in ("capture-queued", "capture-drops", "capture-endless"):
+        # capture's records on the record's machinery: what is queued at the
+        # stop is drained; a dropped frame or an unfinished drain leaves it
+        # not whole.
+        good = bytes.fromhex("000100002112a442") + bytes(92)
+        source.queue = [(ipv4(good), None) for _ in range(22)] + [(ipv4(bytes(100)), None)]
+        if case == "capture-drops":
+            source.dropped = 3
+        if case == "capture-endless":
+            source.endless = True
+        recorder.finish(clocks.boot())
+        print("capture records %d losses %d complete %s" % (recorder.records, recorder.losses, recorder.complete))
     print("ready %d" % wire.centiseconds_down(ready.boot))
     for line in out.getvalue().splitlines():
         fields = line.split(" ")
@@ -1149,7 +1164,7 @@ echo "=== The record's completeness and arrival times (Recorder, on a scripted s
 # core is the helper's own. The socket's clock is 100 s after boot when it is
 # created; frames come from 192.0.2.1 to port 40000.
 for CASE in delayed-ready queued-at-stop dequeue-delay no-stamp clock-step suspend endless wide-after wide-empty straddle \
-	narrow-boundary poll-preempted begin-preempted finish-preempted; do
+	narrow-boundary poll-preempted begin-preempted finish-preempted capture-queued capture-drops capture-endless; do
 	py recorder "${CASE}" >"${T}/recorder-${CASE}" 2>&1
 done
 # "<from>~<to>" or "<clock>" of the frame line (4 payload bytes) in a
@@ -1173,6 +1188,12 @@ for CASE in poll-preempted begin-preempted finish-preempted; do
 		bash -c 'read -r CLOCK _ _ _ SINCE <<<"$1"; [[ -n "${CLOCK}" ]] && ((SINCE <= $2 && $2 <= $3 && $3 <= CLOCK))' _ \
 		"${MARKER}" "$(cs_of "${CASE}" reset)" "$(cs_of "${CASE}" lost)"
 done
+assert_eq "capture records 23 losses 0 complete True" "$(grep '^capture ' "${T}/recorder-capture-queued")" \
+	"capture's records: the 22 good and the 1 bad datagram queued at the stop are all drained and recorded"
+assert_eq "capture records 23 losses 3 complete True" "$(grep '^capture ' "${T}/recorder-capture-drops")" \
+	"  its packet socket's drops are counted"
+assert_true "  and a drain that cannot finish says so ($(grep '^capture ' "${T}/recorder-capture-endless"))" \
+	bash -c 'grep -q "^capture records [0-9]* losses 0 complete False$" "$1"' _ "${T}/recorder-capture-endless"
 assert_true "the drop counters' baseline comes before readiness: 993 drops after it, before the first poll, are reported, the 7 before the record existed are not ($(grep -c ' drops ' "${T}/recorder-delayed-ready"))" \
 	bash -c 'grep -qE "^[0-9]+ - drops 993 [0-9]+$" "$1" && ! grep -q " drops 7 " "$1" && [[ "$(tail -n 1 "$1")" =~ \ -\ complete\ [0-9]+$ ]]' _ "${T}/recorder-delayed-ready"
 assert_true "a stop drains the queue: all 50 queued frames are recorded before the complete marker ($(grep -c '<3 bytes>' "${T}/recorder-queued-at-stop"))" \

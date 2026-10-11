@@ -33,9 +33,13 @@
       exactly one end -- "complete <records> <end clock>" once SECONDS have
       passed since the ready clock, "stopped <records> <token>" after a
       SIGTERM that FILE.stop authorized (both exit 0), or "interrupted
-      <records>" after one it did not (exit 3). The clocks are CLOCK_BOOTTIME
-      in centiseconds, the clock of /proc/uptime. Any other end leaves no end
-      line and exits nonzero.
+      <records>" after one it did not (exit 3). Either controlled end first
+      drains the socket's queue past the cutoff and counts its drops, as
+      record does; a capture whose drain did not finish or that dropped a
+      frame ends "incomplete <records> <dropped> <cutoff clock>" instead
+      (exit 4): only a whole capture says complete or stopped. The clocks are
+      CLOCK_BOOTTIME in centiseconds, the clock of /proc/uptime. Any other end
+      leaves no end line and exits nonzero.
 
   capture-to <destination port> <interface> <source address> <source port> <seconds> <file> [<layout> <receiver key>]
       capture, of the datagrams to DESTINATION PORT only: the stream to one
@@ -56,7 +60,9 @@
       drops <count> <clock before the previous poll>". Several source
       addresses, any source port, and with "any" every interface of the
       namespace, also one created later: what reached the server from its
-      clients, in arrival order. Transcript and exit statuses are capture's.
+      clients, in arrival order. Its transcript is capture's, but its end is
+      "complete" or "stopped" in either case: whether the record is complete
+      is its last line's to say.
 
   auto-expect <record> <address> <port> <layout> <server public key> <hp key file|-> <on|off> <epoch> <start> <end> [<establishments|-> [<connected|->]]
       From a finished record (its transcript checked) and the scenario's
@@ -892,6 +898,15 @@ class Recorder:
             self.empty = empty
         return empty is not None
 
+    def lost(self, count, since, clock):
+        self.write("%d - drops %d %d" % (clock, count, since))
+
+    def stepped(self, since, clock):
+        self.write("%d - clock-step %d" % (clock, since))
+
+    def ended(self, complete, cutoff, clock):
+        self.write("%d - %s %d" % (clock, "complete" if complete else "incomplete", cutoff))
+
     def poll(self):
         """Report drops and clock steps since the last poll."""
         before = self.clocks.sample()
@@ -899,9 +914,9 @@ class Recorder:
         now = self.clocks.sample()
         clock, since = centiseconds_up(now.boot), centiseconds_down(self.polled)
         if dropped:
-            self.write("%d - drops %d %d" % (clock, dropped, since))
+            self.lost(dropped, since, clock)
         if not now.steady_since(self.last):
-            self.write("%d - clock-step %d" % (clock, centiseconds_down(self.last.boot)))
+            self.stepped(centiseconds_down(self.last.boot), clock)
         self.polled, self.last = before.boot, now
 
     def finish(self, cutoff):
@@ -918,10 +933,82 @@ class Recorder:
                     break
                 self.clocks.sleep(RECORD_SETTLE_NS // 4)
         self.poll()
-        self.write("%d - %s %d" % (centiseconds_up(self.clocks.boot()), "complete" if complete else "incomplete",
-                                   centiseconds_down(cutoff)))
+        self.ended(complete, centiseconds_down(cutoff), centiseconds_up(self.clocks.boot()))
         self.out.flush()
         return complete
+
+
+class CaptureRecorder(Recorder):
+    """capture's records (record_line) through the record's machinery: the
+    same drain at the end and the same drop counting, with no clocks in the
+    lines. LOSSES counts the frames its packet socket dropped; COMPLETE says
+    whether the drain reached its cutoff."""
+
+    def __init__(self, source, clocks, out, wanted_source, wanted_port, destination_port, created, sizes, ranges, evidence):
+        super().__init__(source, clocks, out, {wanted_source}, wanted_port, destination_port, created)
+        self.sizes, self.ranges, self.evidence = sizes, ranges, evidence
+        self.losses = 0
+        self.complete = False
+        self.cutoff = None
+
+    def frame(self, frame, stamp, read, after):
+        if len(frame) < 16 or frame[12:16] not in self.wanted_sources:
+            return
+        status, length, data, _ = frame_payload(frame, frame[12:16], self.wanted_port,
+                                                destination_port=self.destination_port, fragments=self.fragments)
+        if status == IGNORE:
+            return
+        line = record_line(self.sizes, self.ranges, status, length, data, self.evidence)
+        if line is not None:
+            self.write(line)
+
+    def lost(self, count, since, clock):
+        self.losses += count
+
+    def stepped(self, since, clock):
+        pass
+
+    def ended(self, complete, cutoff, clock):
+        self.complete, self.cutoff = complete, cutoff
+
+
+def observe(recorder, source, clocks, duration, state_path, stop_path, stop, wake_read, out):
+    """Run RECORDER from its readiness until DURATION has passed or an
+    authorized stop, then drain it (finish). Returns (how it ended:
+    "complete", "stopped" or "interrupted", the stop token)."""
+    ready = recorder.begin()
+    write_state(state_path, "ready %d %d %d" % (own_identity() + (centiseconds_down(ready.boot),)))
+    deadline = ready.boot + duration
+    while not stop:
+        left = deadline - clocks.boot()
+        if left <= 0:
+            break
+        select.select([source, wake_read], [], [], min(left, RECORD_IDLE_NS) / 10 ** 9)
+        try:
+            os.read(wake_read, 64)
+        except BlockingIOError:
+            pass
+        if recorder.batch(RECORD_BATCH):
+            out.flush()
+        recorder.poll()
+    cutoff = clocks.boot()
+    token = stop_token(stop_path) if stop else None
+    if stop and token is None:
+        return "interrupted", None
+    recorder.finish(cutoff)
+    return ("stopped" if stop else "complete"), token
+
+
+def listen_for_stop():
+    """A SIGTERM handler that notes the signal, and the read end of the pipe
+    it wakes select() through."""
+    stop = []
+    wake_read, wake_write = os.pipe()
+    os.set_blocking(wake_read, False)
+    os.set_blocking(wake_write, False)
+    signal.set_wakeup_fd(wake_write)
+    signal.signal(signal.SIGTERM, lambda signum, frame: stop.append(signum))
+    return stop, wake_read
 
 
 def record(destination_port, interface, sources_text, source_port, seconds, path, source=None, clocks=None):
@@ -948,43 +1035,20 @@ def record(destination_port, interface, sources_text, source_port, seconds, path
     state_path, stop_path = path + ".state", path + ".stop"
     if os.path.lexists(stop_path):
         raise InputError("%s exists before the record started" % stop_path)
-    stop = []
-    wake_read, wake_write = os.pipe()
-    os.set_blocking(wake_read, False)
-    os.set_blocking(wake_write, False)
-    signal.set_wakeup_fd(wake_write)
-    signal.signal(signal.SIGTERM, lambda signum, frame: stop.append(signum))
+    stop, wake_read = listen_for_stop()
     clocks = clocks or SystemClocks()
     created = clocks.sample()
     source = source or PacketSource(interface, buffer)
     with open(path, "w") as out:
         recorder = Recorder(source, clocks, out, wanted_sources, wanted_port, wanted_destination, created)
-        ready = recorder.begin()
-        write_state(state_path, "ready %d %d %d" % (own_identity() + (centiseconds_down(ready.boot),)))
-        deadline = ready.boot + duration
-        while not stop:
-            left = deadline - clocks.boot()
-            if left <= 0:
-                break
-            select.select([source, wake_read], [], [], min(left, RECORD_IDLE_NS) / 10 ** 9)
-            try:
-                os.read(wake_read, 64)
-            except BlockingIOError:
-                pass
-            if recorder.batch(RECORD_BATCH):
-                out.flush()
-            recorder.poll()
-        cutoff = clocks.boot()
-        if not stop or stop_token(stop_path) is not None:
-            recorder.finish(cutoff)
-    if not stop:
-        write_state(state_path, "complete %d %d" % (recorder.records, centiseconds_up(clocks.boot())))
-        return 0
-    token = stop_token(stop_path)
-    if token is None:
+        end, token = observe(recorder, source, clocks, duration, state_path, stop_path, stop, wake_read, out)
+    if end == "interrupted":
         write_state(state_path, "interrupted %d" % recorder.records)
         return 3
-    write_state(state_path, "stopped %d %s" % (recorder.records, token))
+    if end == "stopped":
+        write_state(state_path, "stopped %d %s" % (recorder.records, token))
+    else:
+        write_state(state_path, "complete %d %d" % (recorder.records, centiseconds_down(clocks.boot())))
     return 0
 
 
@@ -1025,7 +1089,8 @@ def boot_centiseconds(nanoseconds):
     return nanoseconds // 10 ** 7
 
 
-def capture(interface, source, source_port, seconds, path, layout=None, receiver=None, destination_port=None):
+def capture(interface, source, source_port, seconds, path, layout=None, receiver=None, destination_port=None,
+            packets=None, clocks=None):
     """Record the relevant datagrams; return the exit status. With
     DESTINATION_PORT, only those sent to that port are relevant. With LAYOUT,
     RECEIVER is the base64 static public key of the peer they are sent to:
@@ -1034,67 +1099,57 @@ def capture(interface, source, source_port, seconds, path, layout=None, receiver
     arrive. Its format is checked; whether it is the intended peer's key is
     not.
 
+    The capture runs on the record's machinery (CaptureRecorder): its packet
+    socket's drops are counted from a baseline taken before it is ready,
+    and at its end -- the deadline or an authorized stop, the cutoff -- it
+    drains its queue until it is found empty RECORD_SETTLE_NS past the
+    cutoff, within RECORD_DRAIN_NS. It is whole only if that drain finished
+    and no frame was dropped: what the socket received before the cutoff is
+    then all in the file.
+
     PATH.state is the transcript: "ready <pid> <start time> <ready clock>"
     once the socket is bound, then exactly one end. The clock is CLOCK_BOOTTIME
     in centiseconds, the clock of /proc/uptime, read when the capture is ready;
-    its deadline is SECONDS after that reading. At the deadline, "complete
-    <records> <end clock>" (status 0), the end clock read once the deadline
-    has passed: the end clock is at least SECONDS later than the ready clock.
-    On SIGTERM, "stopped <records> <token>" (status 0) when PATH.stop holds
-    the caller's stop authorization, else "interrupted <records>" (status 3):
-    a TERM nobody authorized is not a controlled stop. A PATH.stop that exists
-    before the start is refused. Anything else -- an exception, another
-    signal -- leaves no end line and a nonzero status. A record is always
-    written whole: a stop is only acted on between records."""
+    its deadline is SECONDS after that reading. A whole capture ends
+    "complete <records> <end clock>" at the deadline (status 0), the end
+    clock read once the deadline has passed and the queue was drained: the
+    end clock is at least SECONDS later than the ready clock; or, on SIGTERM
+    when PATH.stop holds the caller's stop authorization, "stopped <records>
+    <token>" (status 0). A capture that is not whole ends "incomplete
+    <records> <dropped> <cutoff clock>" (status 4) either way. A SIGTERM
+    nobody authorized ends it "interrupted <records>" (status 3), undrained:
+    a TERM nobody authorized is not a controlled stop. A PATH.stop that
+    exists before the start is refused. Anything else -- an exception,
+    another signal -- leaves no end line and a nonzero status. A record is
+    always written whole: a stop is only acted on between records."""
     sizes, ranges = parse_layout(layout) if layout else (None, None)
     evidence = Evidence(parse_public_key(receiver)) if layout else None
     wanted_source = socket.inet_aton(source)
     wanted_port = parse_number(source_port, "port", 65535)
     wanted_destination = None if destination_port is None else parse_number(destination_port, "destination port", 65535)
     duration = parse_number(seconds, "capture seconds", 86400) * 10 ** 9
+    buffer = parse_number(os.environ.get("BT_WIRE_RECORD_BUFFER", str(RECORD_BUFFER)), "capture buffer", 2 ** 31 - 1)
     state_path, stop_path = path + ".state", path + ".stop"
     if os.path.lexists(stop_path):
         raise InputError("%s exists before the capture started" % stop_path)
-    stop = []
-    wake_read, wake_write = os.pipe()
-    os.set_blocking(wake_write, False)
-    signal.set_wakeup_fd(wake_write)
-    signal.signal(signal.SIGTERM, lambda signum, frame: stop.append(signum))
-    sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
-    sock.bind((interface, 0))
-    fragments = Fragments()
-    records = 0
+    stop, wake_read = listen_for_stop()
+    clocks = clocks or SystemClocks()
+    created = clocks.sample()
+    packets = packets or PacketSource(interface, buffer)
     with open(path, "w") as out:
-        ready = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
-        write_state(state_path, "ready %d %d %d" % (own_identity() + (boot_centiseconds(ready),)))
-        deadline = ready + duration
-        while not stop:
-            left = deadline - time.clock_gettime_ns(time.CLOCK_BOOTTIME)
-            if left <= 0:
-                break
-            readable = select.select([sock, wake_read], [], [], left / 10 ** 9)[0]
-            if wake_read in readable:
-                os.read(wake_read, 64)
-            if sock not in readable:
-                continue
-            status, length, data, _ = frame_payload(sock.recv(65535), wanted_source, wanted_port,
-                                                    destination_port=wanted_destination, fragments=fragments)
-            if status == IGNORE:
-                continue
-            line = record_line(sizes, ranges, status, length, data, evidence)
-            if line is not None:
-                out.write(line + "\n")
-                out.flush()
-                records += 1
-    if not stop:
-        end = boot_centiseconds(time.clock_gettime_ns(time.CLOCK_BOOTTIME))
-        write_state(state_path, "complete %d %d" % (records, end))
-        return 0
-    token = stop_token(stop_path)
-    if token is None:
-        write_state(state_path, "interrupted %d" % records)
+        recorder = CaptureRecorder(packets, clocks, out, wanted_source, wanted_port, wanted_destination, created,
+                                   sizes, ranges, evidence)
+        end, token = observe(recorder, packets, clocks, duration, state_path, stop_path, stop, wake_read, out)
+    if end == "interrupted":
+        write_state(state_path, "interrupted %d" % recorder.records)
         return 3
-    write_state(state_path, "stopped %d %s" % (records, token))
+    if not recorder.complete or recorder.losses:
+        write_state(state_path, "incomplete %d %d %d" % (recorder.records, recorder.losses, recorder.cutoff))
+        return 4
+    if end == "stopped":
+        write_state(state_path, "stopped %d %s" % (recorder.records, token))
+    else:
+        write_state(state_path, "complete %d %d" % (recorder.records, boot_centiseconds(clocks.boot())))
     return 0
 
 

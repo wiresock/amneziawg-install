@@ -347,7 +347,10 @@ bt_wire_capture_start() { # <netns> <interface> <source> <port> <seconds> <file>
 #    clock and no later than this shell's clock once it saw the capture end
 #    (the timing contract above).
 # Either way it must exit 0 within SECONDS, and <records> must be the number
-# of records in FILE. Prints the reason and returns 1 otherwise.
+# of records in FILE. Its end comes only after it drained its queue past the
+# cutoff with no frame dropped; a capture that could not ends "incomplete
+# <records> <dropped> <cutoff>" with status 4, and fails here. Prints the
+# reason and returns 1 otherwise.
 bt_wire_capture_finish() { # <file> <stop|complete> <seconds>
 	local FILE="$1" MODE="$2" LIMIT="$3" PID START PARENT TOKEN="" RECORDS ENDED READY END="" SPAN WANT_END TRANSCRIPT=()
 	read -r PID START PARENT <<<"${BT_WIRE_CAPTURE}"
@@ -428,6 +431,20 @@ bt_wire_capture_finish() { # <file> <stop|complete> <seconds>
 	bt_wire_show state "${FILE}.state"
 	bt_wire_show capture "${FILE}.stderr"
 	return 1
+}
+
+# Whether CAPTURE is whole, as its transcript says: exactly its ready line and
+# an end that counts its records, which a capture writes only after it
+# drained its queue past its cutoff and dropped nothing. What a capture
+# judges must be whole: a count of good datagrams says nothing of the ones it
+# missed.
+bt_wire_capture_whole() { # <capture>
+	local RECORDS TRANSCRIPT=()
+	[[ -f "$1" && -f "$1.state" ]] || return 1
+	RECORDS="$(wc -l <"$1")" || return 1
+	mapfile -t TRANSCRIPT <"$1.state"
+	[[ "${#TRANSCRIPT[@]}" -eq 2 && "${TRANSCRIPT[0]}" =~ ^ready\ [0-9]+\ [0-9]+\ [0-9]+$ &&
+		"${TRANSCRIPT[1]}" =~ ^(complete\ ${RECORDS}\ [0-9]+|stopped\ ${RECORDS}\ [0-9a-f]{32})$ ]]
 }
 
 # One capture is "the capture started last" at a time. To run another while
@@ -567,10 +584,15 @@ bt_wire_validate_kinds() { # <output> <S1,S2,S3,S4>
 		INDEX=$((INDEX + 1))
 	done
 }
-# Run `kinds sip` on CAPTURE and validate its whole output. The helper's
-# status and its output are both required; its stderr is shown on failure.
+# Run `kinds sip` on CAPTURE, which must be whole, and validate its whole
+# output. The helper's status and its output are both required; its stderr
+# is shown on failure.
 bt_wire_kinds() { # <capture> <S1,S2,S3,S4>
 	local OUTPUT
+	if ! bt_wire_capture_whole "$1"; then
+		BT_WIRE_REASON="the capture is not whole: its transcript does not end complete or stopped with all its records ($(tr '\n' ' ' <"$1.state" 2>/dev/null))"
+		return 1
+	fi
 	if ! OUTPUT="$(python3 "${WIRE}" kinds sip "$1" "$2" 2>"$1.kinds-stderr")"; then
 		BT_WIRE_REASON="the helper failed: $(tr '\n' ' ' <"$1.kinds-stderr")"
 		return 1
@@ -643,7 +665,8 @@ bt_wire_assert_sip() { # <label> <capture> <S1,S2,S3,S4> <kind:rule[:shaped|rand
 # says the server selected for that peer: dns, quic, sip or stun, or random
 # for an unresolved peer. Sets BT_WIRE_REASON to the counts it judged by,
 # and changes no test counter, so that a caller can also hold a capture to an
-# expectation it must contradict. A capture without layout ("prefixes") is
+# expectation it must contradict. The capture must be whole
+# (bt_wire_capture_whole). A capture without layout ("prefixes") is
 # counted by classify-auto: a learned dns, quic or stun needs at least 10
 # datagrams of its shape and nothing but its probe replies besides; random
 # needs at least 10 datagrams and none with a dns, stun or sip shape (QUIC's
@@ -663,6 +686,10 @@ bt_wire_auto_verdict() { # <dns|quic|sip|stun|random> <capture> <prefixes|kinds>
 		if ! COUNTS="$(python3 "${WIRE}" classify-auto "$([[ "${EXPECT}" == random ]] && echo none || echo "${EXPECT}")" "${CAPTURE}" 2>&1)" ||
 			[[ ! "${COUNTS}" =~ ^(0|[1-9][0-9]*)\ (0|[1-9][0-9]*)\ (0|[1-9][0-9]*)\ (0|[1-9][0-9]*)$ ]]; then
 			BT_WIRE_REASON="no valid classification ('${COUNTS:-}')"
+			return 1
+		fi
+		if ! bt_wire_capture_whole "${CAPTURE}"; then
+			BT_WIRE_REASON="the capture is not whole: its transcript does not end complete or stopped with all its records ($(tr '\n' ' ' <"${CAPTURE}.state" 2>/dev/null))"
 			return 1
 		fi
 		read -r TOTAL SHAPED REPLIES OTHER <<<"${COUNTS}"

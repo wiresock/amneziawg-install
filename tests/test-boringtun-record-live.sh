@@ -21,6 +21,11 @@
 #                   begins before the reset (third review, finding 4).
 #   clock-preempted-1, -2: a clock reading stopped 3 s between its realtime
 #                   reads; each arrival still holds its send (finding 3).
+#   capture:        the client side's capture, stopped after 20 STUN-shaped
+#                   datagrams while 2 more and 1 unshaped arrive, ends at its
+#                   deadline or an authorized stop with all 23, and the STUN
+#                   verdict fails; a clean control passes; an overflowed
+#                   capture ends incomplete and is never judged (finding 1).
 #
 # Requirements: root, ip (iproute2) with network namespaces, python3 and
 # AWG_DISPOSABLE_HOST_TEST=1.
@@ -309,6 +314,79 @@ for which, label in ((1, "the reading before the queue was found empty"), (2, "t
     check("preempting %s: each arrival holds its send (%d, %d) and is at most 4 s wide (%s)" % (label, first, second, bounds),
           len(bounds) == 2 and all(low - 1 <= at <= high and high - low <= 400 for (low, high), at in zip(bounds, (first, second))))
 
+print("--- capture")
+CAPTURE_PORT = 41010
+capture_receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+capture_receiver.bind(("127.0.0.1", CAPTURE_PORT))
+capture_receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+capture_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+capture_sender.bind(("127.0.0.1", 52000))
+GOOD = bytes.fromhex("000100002112a442") + bytes(92)
+BAD = bytes(100)
+
+
+def start_capture(name, seconds, buffer=None):
+    path = WORK / (name + ".capture")
+    env = dict(os.environ)
+    if buffer:
+        env["BT_WIRE_RECORD_BUFFER"] = str(buffer)
+    process = subprocess.Popen([sys.executable, "-B", WIRE, "capture", "lo", "127.0.0.1", "52000", str(seconds), str(path)],
+                               env=env)
+    state = pathlib.Path(str(path) + ".state")
+    for _ in range(500):
+        if state.exists() and state.read_text().startswith("ready "):
+            return process, path
+        time.sleep(0.01)
+    process.kill()
+    raise SystemExit("the capture did not become ready")
+
+
+def verdict(path):
+    """bt_wire_auto_verdict stun on the capture: (status, reason)."""
+    checks = os.path.join(os.path.dirname(WIRE), "boringtun-wire-checks.sh")
+    result = subprocess.run(["bash", "-c", 'WIRE="$1"; source "$2"; bt_wire_auto_verdict stun "$3" prefixes; echo "$? ${BT_WIRE_REASON}"',
+                             "_", WIRE, checks, str(path)], capture_output=True, text=True)
+    status, _, reason = result.stdout.strip().rpartition("\n")[2].partition(" ")
+    return int(status) if status.isdigit() else 9, reason
+
+
+for mode in ("deadline", "authorized-stop", "clean"):
+    process, path = start_capture("capture-" + mode, 3)
+    for _ in range(20):
+        capture_sender.sendto(GOOD, ("127.0.0.1", CAPTURE_PORT))
+    for _ in range(500):
+        if path.exists() and len(lines(path)) == 20:
+            break
+        time.sleep(0.01)
+    pause(process)
+    for datagram in (GOOD, GOOD, GOOD if mode == "clean" else BAD):
+        capture_sender.sendto(datagram, ("127.0.0.1", CAPTURE_PORT))
+    if mode == "authorized-stop":
+        rc = stop(process, path)
+    else:
+        time.sleep(3.1)
+        process.send_signal(signal.SIGCONT)
+        rc = process.wait(timeout=30)
+    transcript = pathlib.Path(str(path) + ".state").read_text().splitlines()
+    status, reason = verdict(path)
+    check("%s: it exits 0 and its end counts all 23 datagrams, the 3 that arrived while it was stopped too (%d, %s)"
+          % (mode, rc, transcript[-1:]), rc == 0 and len(lines(path)) == 23 and transcript[-1].split()[1] == "23")
+    if mode == "clean":
+        check("clean: 23 STUN-shaped datagrams pass the STUN verdict (%s)" % reason, status == 0)
+    else:
+        check("%s: the unshaped datagram fails the STUN verdict (%s)" % (mode, reason), status == 1 and " 1 other" in reason)
+
+process, path = start_capture("capture-overflow", 3, buffer=4096)
+pause(process)
+for _ in range(1000):
+    capture_sender.sendto(GOOD, ("127.0.0.1", CAPTURE_PORT))
+process.send_signal(signal.SIGCONT)
+rc = process.wait(timeout=30)
+transcript = pathlib.Path(str(path) + ".state").read_text().splitlines()
+status, reason = verdict(path)
+check("a capture whose socket dropped frames ends incomplete with status 4, its drops counted (%d, %s)" % (rc, transcript[-1:]),
+      rc == 4 and transcript[-1].startswith("incomplete ") and int(transcript[-1].split()[2]) > 0)
+check("and no verdict judges it, however many good datagrams it holds (%s)" % reason, status == 1 and "not whole" in reason)
 
 print()
 print("BoringTun record live test: %d passed, %d failed" % (PASSED, FAILED))
