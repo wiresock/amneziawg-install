@@ -91,10 +91,11 @@
       when the server's state was last empty; the record must have been ready
       before it, be complete through END and have watched delivery to the
       server's sockets. Otherwise "undecided <reason>" (exit 1): histories
-      that disagree, a clock step, frames the record dropped or could not
-      read, or a hint the server's sockets may have lost, from the epoch
-      until the selection was certainly pinned, no initiation, or a history
-      the model does not support (see auto_expect).
+      that disagree (the server accepting none of the client's initiations
+      is one, unless an establishment excludes it), a clock step, frames the
+      record dropped or could not read, or a hint the server's sockets may
+      have lost, from the epoch until the selection was certainly pinned, no
+      initiation, or a history the model does not support (see auto_expect).
 
   classify <protocol> <file>
       For a capture without layout, print "<datagrams> <matching>": how many
@@ -2171,7 +2172,9 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
     acceptance: a client process started at START pinged through the tunnel
     by UP. Nothing in a datagram proves that the server accepted it, so every
     initiation candidate (mac1 consistent with the server's key) may or may
-    not have been accepted, subject to that evidence. CONNECTED (a clock, or
+    not have been accepted, subject to that evidence, and that the server
+    accepted none is one of the histories: without an establishment (or a
+    connected socket) the outcome is undecided. CONNECTED (a clock, or
     "-") is when a socket connected to the client's endpoint was seen in the
     server's socket table; without it, the point from which the endpoint's
     datagrams reached that socket is open.
@@ -2284,11 +2287,19 @@ def decide(record, address, port, sizes, ranges, mac1_key, hp_key, trailers, epo
     outcomes = {}
     shown = None
     histories = 0
-    for mask in range(1, 1 << len(initiations)):
+    # Every set of accepted initiations, the empty one too: syntax proves no
+    # acceptance, so only an establishment (or a connected socket) excludes
+    # that the server accepted none.
+    for mask in range(1 << len(initiations)):
         accepted = {initiations[bit] for bit in range(len(initiations)) if mask >> bit & 1}
         if not all(any(datagrams[k].low <= up and datagrams[k].high >= start for k in accepted)
                    for start, up in establishments):
             continue
+        if not accepted:
+            if connected is not None:
+                continue
+            raise Undecided("nothing shows that the server accepted any of this client's initiations "
+                            "(no establishment), and if it accepted none it selected nothing")
         first = min(accepted)
         switches = [None] + [index for index in relevant if index > first]
         if connected is not None:

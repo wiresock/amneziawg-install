@@ -1131,6 +1131,21 @@ elif case == "no-establishment":
     # processed, or whether the initiation was accepted.
     sequence(2000, [SIP_HINT, initiation(), transport()])
     est = []
+elif case in ("no-acceptance-evidence", "connected-acceptance", "establishment-elsewhere"):
+    # Finding 5 of the third review: a lone initiation candidate, its mac1
+    # consistent with the server's key (anyone can compute one) and its S1
+    # prefix a DNS query. Nothing shows that the server accepted it; if it
+    # accepted none, it selected nothing, and the outcome is undecided, not
+    # dns and not random. A socket connected to the client's endpoint shows
+    # an acceptance: dns. An establishment no initiation fits contradicts
+    # the record: undecided.
+    layout = NARROW
+    query = bytes([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]) + b"\x16" + b"a" * 22 + b"\x00\x00\x01\x00\x01"
+    sequence(2000, [initiation(prefix=query)])
+    est = {"no-acceptance-evidence": [], "connected-acceptance": [], "establishment-elsewhere": [(3000, 3100)]}[case]
+    if case == "connected-acceptance":
+        connected = "2100"
+    window = (2100, 2500)
 elif case in ("delivery-any", "delivery-endpoint", "delivery-unknown", "delivery-other-endpoint", "delivery-after-pin",
               "delivery-initiation", "unwatched"):
     # Finding 2 of the third review: a complete record shows what reached
@@ -1215,20 +1230,23 @@ for CASE in "stun-colliding|0 expect random" "stun-clear|0 expect stun" "other-p
 	"hp-sip-large|0 expect random" "hp-sip-small|0 expect sip" "policy-retry-connected|0 expect dns" \
 	"gap-full|0 expect stun" "gap-before-epoch|0 expect stun" "gap-after-pin|0 expect stun" "timing-fresh|0 expect sip" "timing-untimed-fresh|0 expect sip" \
 	"malformed-other-address|0 expect sip" "malformed-after-pin|0 expect sip" "fragment-other-port|0 expect sip" \
-	"delivery-other-endpoint|0 expect sip" "delivery-after-pin|0 expect sip" \
+	"connected-acceptance|0 expect dns" "delivery-other-endpoint|0 expect sip" "delivery-after-pin|0 expect sip" \
 	"delivery-initiation|0 expect sip"; do
 	assert_eq "${CASE#*|}" "$(auto_case "${CASE%%|*}" 2>&1)" "auto-expect, ${CASE%%|*}: ${CASE#*|}"
 done
 for CASE in age-30 age-32 hp-unmasked-initiation no-initiation policy-retry forgery gap-hidden timing-paused timing-untimed \
 	timing-step malformed malformed-early drops-during fragment late-record straddles-epoch retry retry-window-after \
-	no-establishment delivery-any delivery-endpoint delivery-unknown unwatched \
+	no-establishment no-acceptance-evidence establishment-elsewhere delivery-any delivery-endpoint delivery-unknown unwatched \
 	poll-gap-hidden; do
 	GOT="$(auto_case "${CASE}" 2>&1)"
 	assert_true "auto-expect, ${CASE}: undecided, exit 1, never a guess (${GOT})" bash -c '[[ "$1" == "1 undecided "* ]]' _ "${GOT}"
 done
 # The reasons the third review's cases are undecided for: the evidence each
 # lacks, not a format the record no longer has.
-for CASE in "delivery-any|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost 4780 datagrams from anyone" \
+for CASE in "no-acceptance-evidence|nothing shows that the server accepted any of this client's initiations" \
+	"no-establishment|nothing shows that the server accepted any of this client's initiations" \
+	"establishment-elsewhere|no history agrees with the establishments" \
+	"delivery-any|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost 4780 datagrams from anyone" \
 	"delivery-endpoint|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost 1 datagrams from 192.0.2.2:41006" \
 	"delivery-unknown|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost unknown datagrams" \
 	"unwatched|the record did not watch delivery to the server's UDP sockets" \
@@ -1236,6 +1254,15 @@ for CASE in "delivery-any|the hint #1 (2000~2001) may not have reached the serve
 	GOT="$(auto_case "${CASE%%|*}" 2>&1)"
 	assert_true "auto-expect, ${CASE%%|*}: undecided because ${CASE#*|} (${GOT})" \
 		bash -c '[[ "$1" == "1 undecided $2"* ]]' _ "${GOT}" "${CASE#*|}"
+done
+# Establishment evidence that is not well formed is refused, not read as
+# none.
+auto_case from-initiation >/dev/null 2>&1
+for EST in "2040:1995" "1995" "x:2040" "1995:2040,"; do
+	GOT="$("${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/auto-record" 192.0.2.2 41006 \
+		"40,40,40,40,100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100" \
+		"$("${REAL_PYTHON}" -c 'import base64; print(base64.b64encode(bytes(range(32, 64))).decode())')" - off 1500 1900 20000 "${EST}" - 2>&1)"
+	assert_true "auto-expect refuses the establishments '${EST}' (${GOT})" bash -c '[[ "$1" == "ERROR: "* ]]' _ "${GOT}"
 done
 GOT="$(auto_case stun-clear 1500 1900 1950 2>&1)"
 assert_true "auto-expect, a window that ends before any initiation: undecided (${GOT})" \
