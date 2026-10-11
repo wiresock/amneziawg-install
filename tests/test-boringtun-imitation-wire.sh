@@ -1362,6 +1362,29 @@ elif case == "no-establishment":
     # processed, or whether the initiation was accepted.
     sequence(2000, [SIP_HINT, initiation(), transport()])
     est = []
+elif case in ("connected-after-window", "connected-covering-window", "connected-before-epoch",
+              "connected-before-initiation", "connected-in-window"):
+    # Finding 4 of the fourth review: a socket connected to the client, seen
+    # at CONNECTED, shows an acceptance of an initiation that arrived after
+    # the epoch, no later than CONNECTED; not one inside an earlier window.
+    # A mac1-consistent initiation with a DNS-query prefix at 2000, a plain
+    # one at 3000, no establishment, the window 2100-2500:
+    #   seen at 3100: the acceptance may be the one at 3000, and nothing was
+    #     accepted in the window: undecided (the earlier model forced the
+    #     forgery accepted: dns); the same over a window covering 3000;
+    #   seen at 1400, before the epoch (1500): no evidence about this server;
+    #   seen at 1900 with only the DNS one: no initiation before it, a
+    #     contradiction: undecided;
+    #   seen at 2300 with only the DNS one: it was accepted by then: dns.
+    layout = NARROW
+    query = bytes([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]) + b"\x16" + b"a" * 22 + b"\x00\x00\x01\x00\x01"
+    add(2000, initiation(prefix=query))
+    if case in ("connected-after-window", "connected-covering-window"):
+        add(3000, initiation())
+    est = []
+    connected = {"connected-after-window": "3100", "connected-covering-window": "3100", "connected-before-epoch": "1400",
+                 "connected-before-initiation": "1900", "connected-in-window": "2300"}[case]
+    window = (3100, 3500) if case == "connected-covering-window" else (2100, 2500)
 elif case in ("watch-not-ended", "watch-ended-early"):
     # The watch must end with its final collection; where it ended, nothing
     # after is covered. A SIP hint, then the client.
@@ -1476,7 +1499,7 @@ for CASE in "stun-colliding|0 expect random" "stun-clear|0 expect stun" "other-p
 	"hp-sip-large|0 expect random" "hp-sip-small|0 expect sip" "policy-retry-connected|0 expect dns" \
 	"gap-full|0 expect stun" "gap-before-epoch|0 expect stun" "gap-after-pin|0 expect stun" "timing-fresh|0 expect sip" "timing-untimed-fresh|0 expect sip" \
 	"malformed-other-address|0 expect sip" "malformed-after-pin|0 expect sip" "fragment-other-port|0 expect sip" \
-	"connected-acceptance|0 expect dns" "delivery-other-endpoint|0 expect sip" \
+	"connected-acceptance|0 expect dns" "connected-in-window|0 expect dns" "delivery-other-endpoint|0 expect sip" \
 	"delivery-after-pin|0 expect sip" \
 	"delivery-initiation|0 expect sip"; do
 	assert_eq "${CASE#*|}" "$(auto_case "${CASE%%|*}" 2>&1)" "auto-expect, ${CASE%%|*}: ${CASE#*|}"
@@ -1484,13 +1507,17 @@ done
 for CASE in age-30 age-32 hp-unmasked-initiation no-initiation policy-retry forgery gap-hidden timing-paused timing-untimed \
 	timing-step malformed malformed-early drops-during fragment late-record straddles-epoch retry retry-window-after \
 	no-establishment no-acceptance-evidence establishment-elsewhere delivery-any delivery-endpoint delivery-unknown unwatched \
-	poll-gap-hidden watch-not-ended watch-ended-early; do
+	poll-gap-hidden connected-after-window connected-covering-window connected-before-epoch connected-before-initiation \
+	watch-not-ended watch-ended-early; do
 	GOT="$(auto_case "${CASE}" 2>&1)"
 	assert_true "auto-expect, ${CASE}: undecided, exit 1, never a guess (${GOT})" bash -c '[[ "$1" == "1 undecided "* ]]' _ "${GOT}"
 done
 # The reasons the third review's cases are undecided for: the evidence each
 # lacks, not a format the record no longer has.
-for CASE in "watch-not-ended|the record's delivery watch did not end with its final collection" \
+for CASE in "connected-after-window|no initiation accepted by the window's end" \
+	"connected-before-epoch|the connected socket was seen at 1400, before the server's state was last empty at 1500" \
+	"connected-before-initiation|no history agrees with the establishments [(1500, 1900)]" \
+	"watch-not-ended|the record's delivery watch did not end with its final collection" \
 	"watch-ended-early|the hint #1 (2000~2001) may not have reached the server: the delivery watch covers nothing from 1998 on" \
 	"no-acceptance-evidence|nothing shows that the server accepted any of this client's initiations" \
 	"no-establishment|nothing shows that the server accepted any of this client's initiations" \

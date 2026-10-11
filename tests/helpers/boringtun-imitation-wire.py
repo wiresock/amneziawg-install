@@ -82,8 +82,10 @@
       initiation candidate may or may not have been, as ESTABLISHMENTS allow
       ("<client start>:<first ping>,...": some initiation that client process
       sent was accepted and answered by its first ping). CONNECTED is when a
-      socket connected to the client's endpoint was seen; without it, where
-      the endpoint's datagrams moved to that socket is open. Each history the
+      socket connected to the client's endpoint was seen: some initiation
+      that arrived between EPOCH and then was accepted by then, and the
+      endpoint's later datagrams reached that socket; without it, where the
+      endpoint's datagrams moved to that socket is open. Each history the
       evidence allows is replayed, with every hint-lifetime comparison the
       arrival and processing bounds leave open taken both ways; prints one
       history's trace, then "expect <dns|quic|sip|stun|random>" for the
@@ -2310,8 +2312,13 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
     accepted none is one of the histories: without an establishment (or a
     connected socket) the outcome is undecided. CONNECTED (a clock, or
     "-") is when a socket connected to the client's endpoint was seen in the
-    server's socket table; without it, the point from which the endpoint's
-    datagrams reached that socket is open.
+    server's socket table. It is time-bounded evidence: one of the client's
+    initiations arrived after EPOCH and was accepted by CONNECTED (an
+    establishment from EPOCH to CONNECTED, the record then read through
+    CONNECTED), and the endpoint's datagrams after CONNECTED reached that
+    socket. Seen before EPOCH, it is no evidence about this server
+    (undecided). Without it, the point from which the endpoint's datagrams
+    reached that socket is open.
 
     Every history the evidence allows is replayed (History): which
     initiations were accepted, where the endpoint moved to the connected
@@ -2362,23 +2369,37 @@ def decide(record, address, port, sizes, ranges, mac1_key, hp_key, trailers, epo
     """(outcome, notes of one history) or Undecided."""
     if record.ready + 1 > epoch:
         raise Undecided("the record was ready at %d, not before the server's state was last empty at %d" % (record.ready, epoch))
-    if record.end is None or record.end[0] != "complete" or record.end[1] < window_end:
-        raise Undecided("the record is not complete through the window's end at %d (%s)"
-                        % (window_end, "no end marker" if record.end is None else "%s %d" % record.end))
+    # A socket connected to the client's endpoint, seen at CONNECTED, shows
+    # that the server accepted one of the client's initiations, which
+    # arrived after the epoch and was processed by then: an establishment
+    # from the epoch to CONNECTED. It does not say which initiation, so the
+    # record is read through CONNECTED, past the window if need be: one
+    # after the window may be the accepted one, and then none within it was.
+    horizon = window_end
+    if connected is not None:
+        if connected < epoch:
+            raise Undecided("the connected socket was seen at %d, before the server's state was last empty at %d: "
+                            "it is no evidence about this server" % (connected, epoch))
+        establishments = establishments + [(epoch, connected)]
+        horizon = max(window_end, connected)
+    if record.end is None or record.end[0] != "complete" or record.end[1] < horizon:
+        raise Undecided("the record is not complete through %d, the %s (%s)"
+                        % (horizon, "window's end" if horizon == window_end else "connected socket's observation",
+                           "no end marker" if record.end is None else "%s %d" % record.end))
     if record.watch is None:
         raise Undecided("the record did not watch delivery to the server's UDP sockets, so it cannot tell whether "
                         "what it saw reached them")
     if record.delivery_end is None:
         raise Undecided("the record's delivery watch did not end with its final collection")
-    steps = [step for step in record.steps if step[1] >= epoch and step[0] <= window_end]
+    steps = [step for step in record.steps if step[1] >= epoch and step[0] <= horizon]
     # What the record cannot tell: frames it dropped (any source), a
     # malformed frame from the address (its port unknown), a fragment from
     # the client's port.
     gaps = [(since, clock, "%d frames the record dropped between %d and %d" % (count, since, clock))
-            for since, clock, count in record.drops if clock >= epoch and since <= window_end]
+            for since, clock, count in record.drops if clock >= epoch and since <= horizon]
     frames, sources = [], set()
     for frame in record.frames:
-        if frame.high < epoch or frame.low > window_end:
+        if frame.high < epoch or frame.low > horizon:
             continue
         if frame.kind == "datagram" and frame.port is not None:
             if not inbound_candidates(frame.data, sizes, ranges, hp_key, trailers) and detect(frame.data):
@@ -2434,8 +2455,6 @@ def decide(record, address, port, sizes, ranges, mac1_key, hp_key, trailers, epo
                    for start, up in establishments):
             continue
         if not accepted:
-            if connected is not None:
-                continue
             raise Undecided("nothing shows that the server accepted any of this client's initiations "
                             "(no establishment), and if it accepted none it selected nothing")
         first = min(accepted)
@@ -2463,7 +2482,7 @@ def decide(record, address, port, sizes, ranges, mac1_key, hp_key, trailers, epo
                     continue
                 pinned = history.bound[learned_at] if learned is not None else INFINITY
                 for low, high, what in gaps:
-                    if high >= epoch and low <= min(pinned, window_end):
+                    if high >= epoch and low <= min(pinned, horizon):
                         raise Undecided("%s, before the selection was certainly pinned" % what)
                 outcome = history_expectation(history, learned, learned_at, window_start, window_end)
                 outcomes.setdefault(outcome, describe(history, initiations))
