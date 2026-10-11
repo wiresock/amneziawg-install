@@ -526,7 +526,7 @@ elif cmd in ("netlink", "rawwatch"):
                 self.events = Events()
 
             def canary(self):
-                self.events.queue.append(nlmsg(20, diag(socket.AF_INET, 33333, cookie=99)))
+                self.events.queue.append(nlmsg(20, diag(socket.AF_INET, 33333, cookie=33333)))
                 return 33333
 
         wire.namespace_losses = lambda: 0
@@ -640,7 +640,7 @@ elif cmd == "recorder":
         def __init__(self):
             super().__init__(40000)
             self.sockets, self.counter, self.gone_events, self.fail = {}, 0, [], set()
-            self.dumps, self.during_dump = 0, {}
+            self.dumps, self.during_dump, self.identity = 0, {}, 33333
 
         def subscribe(self):
             if "subscribe" in self.fail:
@@ -654,13 +654,19 @@ elif cmd == "recorder":
             return found
 
         def canary(self):
+            # Its notification carries IDENTITY as both cookie and port: the
+            # canary's whether it is matched by cookie or by port. A case
+            # that gives the canary the watched port adds a server socket's
+            # notification on that port too.
             if "slow" not in self.fail:
-                self.gone_events.append((99, 33333, "any"))
-            return 33333
+                self.gone_events.append((self.identity, self.identity, "any"))
+            return self.identity
 
     def scripted_sockets(port):
         watch.dumps += 1
         watch.gone_events.extend(watch.during_dump.pop(watch.dumps, []))
+        if watch.dumps == getattr(watch, "fail_at", None):
+            raise OSError(errno.EINTR, "dump failed")
         if "dump" in watch.fail:
             watch.fail.discard("dump")
             raise OSError(errno.EIO, "dump failed")
@@ -830,6 +836,18 @@ elif cmd == "recorder":
             watch.canary = lambda: (watch.gone_events.append((7, 40000, CLIENT_PEER)), canary())[1]
         elif case == "delivery-slow-notifications":
             watch.fail.add("slow")
+        elif case == "delivery-final-failed-last-dump":
+            # The fifth review's first case: an unseen socket's destruction
+            # is notified while the final collection waits, then its last
+            # dump fails.
+            canary = watch.canary
+            watch.canary = lambda: (watch.gone_events.append((7, 40000, CLIENT_PEER)), canary())[1]
+            watch.fail_at = 5
+        elif case == "delivery-dump-fails-pending":
+            # The same in a regular poll: notified during its dump, which
+            # fails; the poll after it succeeds.
+            watch.during_dump[3] = [(7, 40000, CLIENT_PEER)]
+            watch.fail_at = 3
         print("poll-cs %d" % (clocks.boot_ns // 10 ** 7))
         recorder.poll()
         cutoff = clocks.boot()
@@ -1573,7 +1591,8 @@ for CASE in delayed-ready queued-at-stop dequeue-delay no-stamp clock-step suspe
 	narrow-boundary poll-preempted begin-preempted finish-preempted delivery-quiet delivery-listener delivery-connected \
 	delivery-new-socket delivery-reconnected delivery-retired delivery-unseen delivery-other-port delivery-namespace \
 	delivery-dump-fails delivery-events-lost delivery-unavailable delivery-during-dump delivery-final-dump \
-	delivery-final-last-dump delivery-final-settle delivery-slow-notifications capture-queued capture-drops capture-endless; do
+	delivery-final-last-dump delivery-final-settle delivery-slow-notifications delivery-final-failed-last-dump \
+	delivery-dump-fails-pending capture-queued capture-drops capture-endless; do
 	py recorder "${CASE}" >"${T}/recorder-${CASE}" 2>&1
 done
 # "<from>~<to>" or "<clock>" of the frame line (4 payload bytes) in a
@@ -1632,6 +1651,18 @@ done
 assert_eq "unknown watch any" "$(delivery_lines delivery-slow-notifications)" \
 	"final collection: a canary whose destruction is not notified in time leaves everything since the watch began unknown"
 assert_eq "" "$(delivery_lines delivery-quiet)" "  and a clean final collection reports nothing"
+# The fifth review: notifications received before a failed last dump still
+# reach the record (the unseen socket's whole life, and, the last reading
+# having failed, everything since the watch began); in a regular poll, the
+# failed reading reports the unseen socket at once, and the next one does not
+# repeat or drop it.
+assert_eq "unknown poll any
+unknown watch any
+unknown watch any" "$(delivery_lines delivery-final-failed-last-dump)" \
+	"final collection, its last dump failing after an unseen socket's destruction was notified: unknown since the watch began"
+assert_eq "unknown poll any
+unknown watch any" "$(delivery_lines delivery-dump-fails-pending)" \
+	"a failed regular dump reports an unseen socket notified during it, once"
 for CASE in delivery-quiet delivery-final-dump delivery-slow-notifications; do
 	assert_true "the watch ends with delivery-end, just before the end marker, from a time after the cutoff (${CASE})" \
 		bash -c 'END="$(tail -n 2 "$1" | head -n 1)"; [[ "${END}" =~ ^[0-9]+\ -\ delivery-end\ ([0-9]+)$ ]] && ((BASH_REMATCH[1] >= $2))' _ \

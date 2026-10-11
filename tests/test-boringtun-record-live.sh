@@ -64,7 +64,7 @@ WORK="$(mktemp -d /var/tmp/awg-record-live.XXXXXX)"
 ip netns add "${NETNS}" && ip -n "${NETNS}" link set lo up || die "cannot set up namespace ${NETNS}"
 
 ip netns exec "${NETNS}" python3 - "${WIRE}" "${WORK}" <<'PY'
-import base64, hashlib, importlib.util, io, os, pathlib, signal, socket, struct, subprocess, sys, threading, time
+import base64, errno, hashlib, importlib.util, io, os, pathlib, signal, socket, struct, subprocess, sys, threading, time
 WIRE, WORK = sys.argv[1], pathlib.Path(sys.argv[2])
 PASSED = FAILED = 0
 LOADED = []
@@ -520,13 +520,39 @@ INITIATION = bytes(40) + BODY + hashlib.blake2s(BODY, digest_size=16, key=hashli
     + bytes(16)
 
 
-def final_collection(name, port, close, flood):
+class Gate:
+    """The watch's notification socket, held shut until UNTIL (monotonic):
+    real notifications, delivered late."""
+
+    def __init__(self, sock):
+        self.sock, self.until = sock, 0.0
+
+    def recv(self, size):
+        if time.monotonic() < self.until:
+            raise BlockingIOError()
+        return self.sock.recv(size)
+
+    def close(self):
+        self.sock.close()
+
+
+PORT_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
+
+
+def final_collection(name, port, close, flood, delay=0.0, fail_last=False, lock_port=False, block=False):
+    """CLOSE: the socket is closed during the final collection's first dump
+    (its notifications then held DELAY s); FAIL_LAST: the last dump fails
+    (an injected OSError); LOCK_PORT: this namespace's ephemeral range is
+    the watched port alone during the final collection, so the canary's
+    bind(port 0) gets that port once the socket is gone; BLOCK: every
+    notification is held past the final collection's wait."""
     clocks = wire.SystemClocks()
     created = clocks.sample()
     packets = wire.PacketSource("lo", 32 * 1024 * 1024)
     watch, out = wire.DeliveryWatch(port), io.StringIO()
     recorder = wire.Recorder(packets, clocks, out, {socket.inet_aton("127.0.0.1")}, None, port, created, watch)
     ready = recorder.begin()
+    gate = watch.events = Gate(watch.events)
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     if flood:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
@@ -542,22 +568,44 @@ def final_collection(name, port, close, flood):
     up = boot_cs() + 1
     time.sleep(0.2)
     cutoff = clocks.boot()
-    real_dump = wire.udp_sockets
+    real_dump, real_socket, dumps, bound = wire.udp_sockets, socket.socket, [0], []
 
-    def closing_dump(watched):
-        server.close()
-        time.sleep(0.05)
+    def final_dump(watched):
+        dumps[0] += 1
+        if dumps[0] == 1 and close:
+            server.close()
+            gate.until = time.monotonic() + delay
+            time.sleep(0.05 if not delay else 0.02)
+        if dumps[0] == 2 and fail_last:
+            raise OSError(errno.EINTR, "injected: the last dump failed")
         return real_dump(watched)
 
-    if close:
-        wire.udp_sockets = closing_dump
+    class Recording(real_socket):
+        def bind(self, address):
+            real_socket.bind(self, address)
+            if self.family == socket.AF_INET and address[1] == 0:
+                bound.append(self.getsockname()[1])
+
+    with open(PORT_RANGE) as current:
+        saved_range = current.read().strip()
+    wire.udp_sockets = final_dump
+    wire.socket.socket = Recording
+    if block:
+        gate.until = time.monotonic() + 1.0
+    if lock_port:
+        with open(PORT_RANGE, "w") as locked:
+            locked.write("%d %d\n" % (port, port))
     try:
         recorder.finish(cutoff)
     finally:
-        wire.udp_sockets = real_dump
+        wire.udp_sockets, wire.socket.socket = real_dump, real_socket
+        with open(PORT_RANGE, "w") as restored:
+            restored.write(saved_range.replace("\t", " ") + "\n")
         server.close()
         packets.sock.close()
         watch.events.close()
+    if bound:
+        print("    (%s: the canary was bound to port %d)" % (name, bound[-1]))
     path = WORK / (name + ".record")
     path.write_text(out.getvalue())
     pathlib.Path(str(path) + ".state").write_text("ready 1 1 %d\nstopped %d %s\n" % (wire.centiseconds_down(ready.boot),
@@ -567,17 +615,32 @@ def final_collection(name, port, close, flood):
                               str(up + 2), str(wire.centiseconds_down(cutoff)), "%d:%d" % (born, up), "-"],
                              capture_output=True, text=True).stdout.strip().splitlines()
     markers = [line for line in out.getvalue().splitlines() if " - " in line]
-    return markers, verdict[-1] if verdict else "-"
+    return markers, verdict[-1] if verdict else "-", bound
 
 
-markers, verdict = final_collection("final-clean", 52130, close=False, flood=False)
+markers, verdict, _ = final_collection("final-clean", 52130, close=False, flood=False)
 check("clean control: the socket stays open; no loss is reported and the record decides sip (%s; %s)" % (markers, verdict),
       verdict == "expect sip" and not any(" - delivery unknown " in marker for marker in markers))
 for name, port, flood in (("final-closed", 52131, False), ("final-closed-flooded", 52129, True)):
-    markers, verdict = final_collection(name, port, close=True, flood=flood)
+    markers, verdict, _ = final_collection(name, port, close=True, flood=flood)
     check("%s: closed during the final dump, its unknown lifetime reaches the record (%s)" % (name, markers),
           any(marker.endswith(" any") and " - delivery unknown " in marker for marker in markers))
     check("%s: and auto-expect does not decide (%s)" % (name, verdict), verdict.startswith("undecided the hint #"))
+
+print("--- final-pending")
+# The fifth review's cases, real drops and real notifications: the socket
+# (200 datagrams into 4 KiB, a SIP hint, an initiation) closes during the
+# final collection's first dump and its notifications are held 90 ms, so
+# that they arrive while the watch waits. Then the last dump fails (an
+# injected OSError): the notifications already received must still reach
+# the record. Control: the same with a last dump that succeeds.
+for name, port, fail in (("final-failed-last-dump", 52132, True), ("final-pending-control", 52133, False)):
+    markers, verdict, _ = final_collection(name, port, close=True, flood=True, delay=0.09, fail_last=fail)
+    check("%s: the socket's unknown lifetime, since the watch began, reaches the record (%s)" % (name, markers),
+          any(" - delivery unknown " in marker and marker.endswith(" any") and int(marker.split()[4]) <= int(markers[0].split()[0])
+              for marker in markers))
+    check("%s: and auto-expect does not decide (%s)" % (name, verdict), verdict.startswith("undecided the hint #"))
+
 
 print()
 print("BoringTun record live test: %d passed, %d failed" % (PASSED, FAILED))

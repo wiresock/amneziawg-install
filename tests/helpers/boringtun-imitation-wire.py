@@ -963,7 +963,9 @@ class DeliveryWatch:
         before it was destroyed.
       - Lost, cut or malformed notifications: unknown since the watch began,
         for any. A failed or incomplete dump or counter reading: unknown
-        since the last reading, for any; its notifications wait for the next.
+        since the last reading, for any; the notifications received are
+        reconciled all the same (an unseen socket's destruction is reported
+        then), the others wait for the next reading.
     The final collection is settle() and a last read(): see Recorder.finish.
     """
 
@@ -976,6 +978,7 @@ class DeliveryWatch:
         self.events = None
         self.pending = []
         self.lost = False
+        self.failed = False
 
     def subscribe(self):
         self.events = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_SOCK_DIAG)
@@ -1044,14 +1047,36 @@ class DeliveryWatch:
                 return seen
             clocks.sleep(RECORD_SETTLE_NS // 20)
 
+    def unseen(self, current=()):
+        """The pending destructions on the port of sockets no reading saw
+        (nor CURRENT): their whole lives are unknown, for any endpoint. They
+        leave the pending list, so that each is reported once."""
+        losses, kept = [], []
+        for event in self.pending:
+            cookie, port, _ = event
+            if port == self.port and cookie not in self.known and cookie not in current and cookie not in self.gone:
+                self.gone.add(cookie)
+                losses.append((None, "any", True))
+            else:
+                kept.append(event)
+        self.pending = kept
+        return losses
+
     def read(self):
         losses = []
+        self.failed = False
         self.collect()
         try:
             current = udp_sockets(self.port)
             counted = namespace_losses()
         except OSError:
+            # The reading failed, but the notifications received stand on
+            # their own: a socket on the port that no reading saw is
+            # reported now, not left for a reading that may never come.
+            self.failed = True
+            self.collect()
             losses.append((None, "any", False))
+            losses.extend(self.unseen())
             if self.lost:
                 self.lost = False
                 losses.append((None, "any", True))
@@ -1067,10 +1092,7 @@ class DeliveryWatch:
             if cookie not in current:
                 self.gone.add(cookie)
                 losses.append((None, peer, False))
-        for cookie, port, _ in self.pending:
-            if port == self.port and cookie not in self.known and cookie not in current and cookie not in self.gone:
-                self.gone.add(cookie)
-                losses.append((None, "any", True))
+        losses.extend(self.unseen(current))
         if counted != self.counted:
             losses.append((counted - self.counted if counted > self.counted else None, "any", False))
         if self.lost:
@@ -1258,7 +1280,8 @@ class Recorder:
         (notifications, dump, notifications); then notifications are read
         for RECORD_SETTLE_NS, while a canary socket's destruction must be
         notified (else everything since the watch began is unknown); then a
-        last reading. A socket that no reading saw and that was destroyed
+        last reading, which must succeed (else, again, everything since the
+        watch began is unknown). A socket that no reading saw and that was destroyed
         before the first of these two dumps was notified by the second
         reading, if its notification came within RECORD_SETTLE_NS (the
         stated assumption); one created after the first dump began may be
@@ -1279,7 +1302,10 @@ class Recorder:
             timely = self.delivery.settle(self.clocks, self.clocks.boot() + RECORD_SETTLE_NS)
             self.poll()
             clock = centiseconds_up(self.clocks.boot())
-            if not timely:
+            # Without the canary's notification, or with a last reading that
+            # failed (nothing comes after it to reconcile what it missed),
+            # nothing since the watch began is covered.
+            if not timely or self.delivery.failed:
                 self.undelivered(None, centiseconds_down(self.watched), clock, "any")
             self.write("%d - delivery-end %d" % (clock, centiseconds_down(first)))
         self.ended(complete, centiseconds_down(cutoff), centiseconds_up(self.clocks.boot()))
