@@ -902,11 +902,15 @@ class DeliveryWatch:
 
     read() returns the losses since the last reading, as (count or None for
     "cannot be ruled out", peer, since the watch began): a counter that
-    grew (a connected socket's for its endpoint, the others for any); a
-    socket gone since the last reading (it may have dropped datagrams after
-    it); a socket destroyed that no reading saw (its whole life is unknown:
-    since the watch began); lost notifications or a failed reading (for any
-    endpoint, since the watch began when notifications were lost)."""
+    grew (for the socket's endpoint if it was connected to that same
+    endpoint at both readings -- the daemon connects a socket once, right
+    after binding it -- else for any); a socket gone since the last reading
+    (it may have dropped datagrams after it); a socket destroyed that no
+    reading saw (its whole life is unknown: since the watch began, and for
+    any endpoint, whatever it was connected to when destroyed: nothing shows
+    what it was bound or connected to before); lost notifications or a
+    failed reading (for any endpoint, since the watch began when
+    notifications were lost)."""
 
     def __init__(self, port):
         self.port = port
@@ -969,10 +973,10 @@ class DeliveryWatch:
             if cookie not in current:
                 self.gone.add(cookie)
                 losses.append((None, peer, False))
-        for cookie, port, peer in destroyed or ():
+        for cookie, port, _ in destroyed or ():
             if port == self.port and cookie not in self.known and cookie not in current and cookie not in self.gone:
                 self.gone.add(cookie)
-                losses.append((None, peer, True))
+                losses.append((None, "any", True))
         if counted != self.counted:
             losses.append((counted - self.counted if counted > self.counted else None, "any", False))
         self.known, self.counted = current, counted

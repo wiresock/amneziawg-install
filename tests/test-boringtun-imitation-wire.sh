@@ -1334,8 +1334,8 @@ assert_eq "2 poll any" "$(delivery_lines delivery-new-socket)" "a socket first s
 assert_eq "4 poll any" "$(delivery_lines delivery-reconnected)" "  as may one connected since the last reading"
 assert_eq "unknown poll 192.0.2.1:51820" "$(delivery_lines delivery-retired)" \
 	"a socket gone since the last reading may have lost its endpoint's datagrams after it: unknown"
-assert_eq "unknown watch 192.0.2.1:51820" "$(delivery_lines delivery-unseen)" \
-	"a socket on the port destroyed before any reading saw it: unknown since the watch began"
+assert_eq "unknown watch any" "$(delivery_lines delivery-unseen)" \
+	"a socket on the port destroyed before any reading saw it: unknown since the watch began, for any endpoint (connected to the client when destroyed, it may have taken anyone's datagrams before)"
 assert_eq "" "$(delivery_lines delivery-other-port)" "  one on another port is not the server's"
 assert_eq "4 poll any" "$(delivery_lines delivery-namespace)" "datagrams the namespace dropped before any socket are losses for any endpoint"
 assert_eq "unknown poll any" "$(delivery_lines delivery-dump-fails)" "a reading that fails leaves the interval unknown"

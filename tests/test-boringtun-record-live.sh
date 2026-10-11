@@ -64,9 +64,20 @@ WORK="$(mktemp -d /var/tmp/awg-record-live.XXXXXX)"
 ip netns add "${NETNS}" && ip -n "${NETNS}" link set lo up || die "cannot set up namespace ${NETNS}"
 
 ip netns exec "${NETNS}" python3 - "${WIRE}" "${WORK}" <<'PY'
-import os, pathlib, signal, socket, subprocess, sys, threading, time
+import base64, hashlib, importlib.util, io, os, pathlib, signal, socket, struct, subprocess, sys, threading, time
 WIRE, WORK = sys.argv[1], pathlib.Path(sys.argv[2])
 PASSED = FAILED = 0
+LOADED = []
+
+
+def load_wire():
+    """The helper as a module, for the parts run in this process."""
+    if not LOADED:
+        spec = importlib.util.spec_from_file_location("wire", WIRE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        LOADED.append(module)
+    return LOADED[0]
 
 
 def check(message, condition):
@@ -386,11 +397,35 @@ check("the listener's %d drops are reported for any endpoint (%s)" % (lost, [" "
       lost > 0 and counted("any") == lost)
 check("the connected socket's %d drops for its endpoint, 127.0.0.1:41007 (%d)" % (lost_connected, counted("127.0.0.1:41007")),
       lost_connected > 0 and counted("127.0.0.1:41007") == lost_connected)
+since_watch = [row for row in unknown("any") if int(row[4]) <= int(watch[0])]
 check("each socket closed after a reading saw it leaves what it lost after that reading unknown, once",
-      len(unknown("any")) == 1 and len(unknown("127.0.0.1:41007")) == 1)
-check("a socket created and closed while no reading could see it: unknown since the watch began",
-      len(unknown("127.0.0.1:41012")) == 1 and int(unknown("127.0.0.1:41012")[0][4]) <= int(watch[0]))
-check("and nothing for anyone else", all(row[5] in ("any", "127.0.0.1:41007", "127.0.0.1:41012") for row in found))
+      len(unknown("any")) - len(since_watch) == 1 and len(unknown("127.0.0.1:41007")) == 1)
+check("a socket created and closed while no reading could see it (connected to 127.0.0.1:41012 when closed): unknown "
+      "since the watch began, for any endpoint", len(since_watch) == 1)
+check("and nothing for anyone else", all(row[5] in ("any", "127.0.0.1:41007") for row in found))
+
+print("--- unseen-connect")
+# The fourth review's socket: bound to the watched port with a 4 KiB buffer,
+# it drops datagrams from 127.0.0.1:41006, is then connected to
+# 127.0.0.1:41007 and closed before any reading sees it. Its destruction
+# names 41007, but its losses were 41006's: the watch must not narrow them.
+UNSEEN_PORT = 52127
+watcher = load_wire().DeliveryWatch(UNSEEN_PORT)
+check("the watch begins on port %d" % UNSEEN_PORT, watcher.begin())
+unseen = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+unseen.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+unseen.bind(("127.0.0.1", UNSEEN_PORT))
+for _ in range(200):
+    sender.sendto(bytes(80), ("127.0.0.1", UNSEEN_PORT))
+dropped = load_wire().udp_sockets(UNSEEN_PORT)
+unseen.connect(("127.0.0.1", 41007))
+unseen.close()
+time.sleep(0.05)
+losses = watcher.read()
+check("the socket dropped 41006's datagrams before it was connected (%s)" % dropped,
+      any(drops > 0 for _, drops in dropped.values()))
+check("its unseen lifetime is unknown for any endpoint, not only 41007 (%s)" % losses, losses == [(None, "any", True)])
+watcher.events.close()
 
 print("--- capture")
 CAPTURE_PORT = 41010
@@ -465,6 +500,7 @@ status, reason = verdict(path)
 check("a capture whose socket dropped frames ends incomplete with status 4, its drops counted (%d, %s)" % (rc, transcript[-1:]),
       rc == 4 and transcript[-1].startswith("incomplete ") and int(transcript[-1].split()[2]) > 0)
 check("and no verdict judges it, however many good datagrams it holds (%s)" % reason, status == 1 and "not whole" in reason)
+
 
 print()
 print("BoringTun record live test: %d passed, %d failed" % (PASSED, FAILED))
