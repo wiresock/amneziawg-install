@@ -369,6 +369,210 @@ elif cmd == "layout":
         print("refused")
 elif cmd == "chacha20":
     print(wire.chacha20_block(bytes(range(32)), 1, bytes.fromhex("000000090000004a00000000")).hex())
+elif cmd in ("netlink", "rawwatch"):
+    # Decoder fault injections, not kernel replies seen in normal runs: the
+    # helper's own netlink decoder (udp_sockets, DeliveryWatch.destroyed) on
+    # raw datagrams scripted here, through a stand-in for the kernel's
+    # sock_diag socket.
+    #   netlink <case>: one dump or one notification batch; prints what the
+    #     decoder made of it, or "refused: <reason>".
+    #   rawwatch <case>: a whole record on scripted frames and clocks, its
+    #     delivery watch on raw replies with one fault, then auto-expect on
+    #     that record: the verdict line.
+    import base64, contextlib, errno, io, socket
+    case = sys.argv[3]
+    SECOND = 10 ** 9
+    MULTI, INTR = wire.NLM_F_MULTI, wire.NLM_F_DUMP_INTR
+
+    def nlmsg(kind, payload=b"", flags=0, seq=1):
+        return struct.pack("=IHHII", 16 + len(payload), kind, flags, seq, 0) + payload + bytes(-len(payload) % 4)
+
+    def status(code):
+        return struct.pack("=i", code)
+
+    def diag(family, sport, cookie=1, drops=0, attribute=True):
+        message = (bytes([family, 7, 0, 0]) + struct.pack(">HH", sport, 0) + bytes(32) + struct.pack("=III", 0, cookie, 0)
+                   + bytes(20))
+        if attribute:
+            message += struct.pack("=HH", 40, wire.INET_DIAG_SKMEMINFO) + struct.pack("=9I", *([0] * 8 + [drops]))
+        return message
+
+    LISTENER = nlmsg(20, diag(socket.AF_INET, 51998), MULTI)
+    DONE = nlmsg(3, status(0), MULTI)
+    real_socket = socket.socket
+    dumps = []  # one list of datagrams per dump, consumed in order; default: complete
+
+    class Link:
+        """A sock_diag socket: a dump's replies, then nothing."""
+
+        def __init__(self, *args):
+            self.replies = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def send(self, data):
+            family = data[16]
+            default = [LISTENER + DONE] if family == socket.AF_INET else [DONE]
+            self.replies = list(dumps.pop(0) or default) if dumps else default
+
+        def recv(self, size):
+            return self.replies.pop(0) if self.replies else b""
+
+    def netlink_socket(family, *args):
+        return Link() if family == socket.AF_NETLINK else real_socket(family, *args)
+
+    class Events:
+        """The notification socket: queued datagrams, then EAGAIN."""
+
+        def __init__(self):
+            self.queue = []
+
+        def recv(self, size):
+            if not self.queue:
+                raise BlockingIOError()
+            return self.queue.pop(0)
+
+    wire.socket.socket = netlink_socket
+    if cmd == "netlink":
+        cases = {
+            "dump-empty": [DONE],
+            "dump-listener": [LISTENER + DONE],
+            "dump-two-datagrams": [LISTENER, DONE],
+            "dump-interrupted": [nlmsg(3, status(0), MULTI | INTR)],
+            "dump-interrupted-socket": [nlmsg(20, diag(socket.AF_INET, 51998), MULTI | INTR) + DONE],
+            "dump-failed-completion": [nlmsg(3, status(-errno.EINTR), MULTI)],
+            "dump-completion-without-status": [nlmsg(3, b"", MULTI)],
+            "dump-error": [nlmsg(2, status(-errno.ENOENT) + bytes(16))],
+            "dump-error-zero": [nlmsg(2, status(0) + bytes(16))],
+            "dump-no-completion": [LISTENER],
+            "dump-after-completion": [DONE + LISTENER],
+            "dump-other-sequence": [nlmsg(20, diag(socket.AF_INET, 51998), MULTI, seq=7) + DONE],
+            "dump-not-multipart": [nlmsg(20, diag(socket.AF_INET, 51998), 0) + DONE],
+            "dump-other-family": [nlmsg(20, diag(socket.AF_INET6, 51998), MULTI) + DONE],
+            "dump-no-drop-counter": [nlmsg(20, diag(socket.AF_INET, 51998, attribute=False), MULTI) + DONE],
+            "dump-bad-attribute": [nlmsg(20, diag(socket.AF_INET, 51998) [:-36] + struct.pack("=HH", 400, 7), MULTI) + DONE],
+            "dump-short-socket": [nlmsg(20, bytes(40), MULTI) + DONE],
+            "dump-truncated": [(LISTENER + DONE)[:-6]],
+            "dump-trailing-bytes": [LISTENER + DONE + bytes(8)],
+            "dump-overrun": [nlmsg(4) + DONE],
+            "dump-unknown-type": [nlmsg(99) + DONE],
+        }
+        if case.startswith("dump-"):
+            dumps.extend([cases[case], [DONE]])
+            try:
+                print(wire.udp_sockets(51998))
+            except OSError as error:
+                print("refused: %s" % (error.strerror or error))
+        else:
+            watch = wire.DeliveryWatch(51998)
+            watch.events = Events()
+            watch.events.queue = {
+                "events-none": [],
+                "events-one": [nlmsg(20, diag(socket.AF_INET, 51998, cookie=9))],
+                "events-overrun": [nlmsg(4)],
+                "events-error": [nlmsg(2, status(-errno.ENOBUFS) + bytes(16))],
+                "events-short": [bytes(8)],
+                "events-truncated": [nlmsg(20, diag(socket.AF_INET, 51998, cookie=9))[:50]],
+                "events-short-socket": [nlmsg(20, bytes(16))],
+                "events-empty-datagram": [b""],
+            }[case]
+            try:
+                print(watch.destroyed())
+            except OSError as error:
+                print("refused: %s" % (error.strerror or error))
+    else:
+        # rawwatch: a SIP hint and a mac1-consistent initiation from
+        # 192.0.2.2:41006 to port 51998, then the record's polls; the fault
+        # hits the reading after the hint (the second; the first is the
+        # baseline), its two dumps or the notifications before it.
+        KEY = bytes(range(32, 64))
+        NARROW = "40,40,40,40,100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100"
+        SIP_HINT = b"OPTIONS sip:a@b SIP/2.0\r\n\r\n"
+        body = struct.pack("<II", 100000007, 0x01020304) + bytes(108)
+        mac = hashlib.blake2s(body, digest_size=16, key=hashlib.blake2s(b"mac1----" + KEY).digest()).digest()
+        INITIATION = bytes(40) + body + mac + bytes(16)
+
+        class Clocks:
+            def __init__(self):
+                self.boot_ns, self.real_offset = 100 * SECOND, 1_700_000_000 * SECOND
+
+            def sample(self):
+                self.boot_ns += 1000
+                return wire.ClockSample(self.boot_ns, self.real_offset, 0, 5 * SECOND)
+
+            def boot(self):
+                self.boot_ns += 1000
+                return self.boot_ns
+
+            def sleep(self, nanoseconds):
+                self.boot_ns += nanoseconds
+
+        class Source:
+            def __init__(self):
+                self.queue = []
+
+            def read(self):
+                return self.queue.pop(0) if self.queue else None
+
+            def drops(self):
+                return 0
+
+        class RawWatch(wire.DeliveryWatch):
+            def subscribe(self):
+                self.events = Events()
+
+            def canary(self):
+                self.events.queue.append(nlmsg(20, diag(socket.AF_INET, 33333, cookie=99)))
+                return 33333
+
+        wire.namespace_losses = lambda: 0
+        fault = {
+            "raw-clean": [None, None],
+            "raw-begin-failed": [[nlmsg(3, status(-errno.EINTR), MULTI)], None],
+            "raw-dump-interrupted": [None, None, [nlmsg(3, status(0), MULTI | INTR)], None],
+            "raw-dump-failed": [None, None, [nlmsg(3, status(-errno.EINTR), MULTI)], None],
+            "raw-dump-error": [None, None, None, [nlmsg(2, status(-errno.ENOENT) + bytes(16))]],
+            "raw-dump-truncated": [None, None, [(LISTENER + DONE)[:-6]], None],
+            "raw-dump-other-sequence": [None, None, [nlmsg(20, diag(socket.AF_INET, 51998), MULTI, seq=7) + DONE], None],
+        }.get(case, [None, None])
+        dumps.extend(fault)
+        clocks, source, out, watch = Clocks(), Source(), io.StringIO(), RawWatch(51998)
+        recorder = wire.Recorder(source, clocks, out, {socket.inet_aton("192.0.2.2")}, None, 51998, clocks.sample(), watch)
+        ready = recorder.begin()
+        clocks.sleep(SECOND)
+        hint_at = clocks.boot_ns - SECOND // 2
+        source.queue = [(ipv4(SIP_HINT, src="192.0.2.2", dst="192.0.2.1", sport=41006, dport=51998), hint_at + clocks.real_offset),
+                        (ipv4(INITIATION, src="192.0.2.2", dst="192.0.2.1", sport=41006, dport=51998),
+                         hint_at + SECOND // 10 + clocks.real_offset)]
+        recorder.batch(256)
+        if case == "raw-notification-overrun":
+            watch.events.queue.append(nlmsg(4))
+        if case == "raw-notification-short":
+            watch.events.queue.append(bytes(8))
+        recorder.poll()
+        clocks.sleep(SECOND)
+        recorder.poll()
+        cutoff = clocks.boot()
+        recorder.finish(cutoff)
+        path = os.path.join(sys.argv[4], case + ".record")
+        with open(path, "w") as record:
+            record.write(out.getvalue())
+        with open(path + ".state", "w") as state:
+            state.write("ready 1 1 %d\nstopped %d %s\n" % (wire.centiseconds_down(ready.boot), recorder.records, "0" * 32))
+        cs = wire.centiseconds_down
+        initiation_cs = cs(hint_at + SECOND // 10)
+        argv = ["auto-expect", path, "192.0.2.2", "41006", NARROW, base64.b64encode(KEY).decode(), "-", "off",
+                str(cs(ready.boot) + 1), str(initiation_cs + 5), str(cs(cutoff)), "%d:%d" % (initiation_cs - 5, initiation_cs + 5), "-"]
+        verdict = io.StringIO()
+        with contextlib.redirect_stdout(verdict):
+            status_code = wire.main(argv)
+        markers = [line for line in out.getvalue().splitlines() if " - " in line]
+        print("markers: %s" % " | ".join(markers))
+        print("%d %s" % (status_code, verdict.getvalue().splitlines()[-1] if verdict.getvalue() else "-"))
 elif cmd == "recorder":
     # recorder <case>: the record's core (Recorder) on a scripted packet
     # source and scripted clocks, its lines printed with bytes abbreviated.
@@ -1426,6 +1630,43 @@ assert_true "a suspend (boottime moving against monotonic, the server's clock) i
 	bash -c 'grep -qE "^[0-9]+ - clock-step [0-9]+$" "$1"' _ "${T}/recorder-suspend"
 assert_true "traffic that never lets the queue empty: the drain gives up within its budget and the record ends incomplete ($(tail -n 1 "${T}/recorder-endless"))" \
 	bash -c '[[ "$(tail -n 1 "$1")" =~ \ -\ incomplete\ [0-9]+$ ]]' _ "${T}/recorder-endless"
+
+echo "=== The delivery watch's netlink decoder (decoder fault injections) ==="
+# Raw sock_diag replies and notifications scripted here, through a stand-in
+# for the kernel's socket: the decoder's own error paths, not replies seen in
+# the live runs. Only a dump that completes with status 0 is a snapshot; an
+# empty table is one.
+assert_eq "{}" "$(py netlink dump-empty 2>&1)" "a completed dump of no socket is an empty snapshot"
+assert_eq "{1: ('any', 0)}" "$(py netlink dump-listener 2>&1)" "a completed dump of the listener"
+assert_eq "{1: ('any', 0)}" "$(py netlink dump-two-datagrams 2>&1)" "  also across two datagrams"
+for CASE in dump-interrupted dump-interrupted-socket dump-failed-completion dump-completion-without-status dump-error \
+	dump-error-zero dump-no-completion dump-after-completion dump-other-sequence dump-not-multipart dump-other-family \
+	dump-no-drop-counter dump-bad-attribute dump-short-socket dump-truncated dump-trailing-bytes dump-overrun dump-unknown-type; do
+	GOT="$(py netlink "${CASE}" 2>&1)"
+	assert_true "a dump reply ${CASE#dump-} is no snapshot (${GOT})" bash -c '[[ "$1" == "refused: "* ]]' _ "${GOT}"
+done
+assert_eq "[]" "$(py netlink events-none 2>&1)" "no notification pending: none"
+assert_eq "[(9, 51998, 'any')]" "$(py netlink events-one 2>&1)" "a destruction notification"
+for CASE in events-overrun events-error events-short events-truncated events-short-socket events-empty-datagram; do
+	GOT="$(py netlink "${CASE}" 2>&1)"
+	assert_true "notifications ${CASE#events-}: refused, so the watch counts them as lost (${GOT})" bash -c '[[ "$1" == "refused: "* ]]' _ "${GOT}"
+done
+# The same faults through the watch, the record and auto-expect: a SIP hint
+# and an initiation the client's ping establishes; the fault hits the
+# reading after the hint. Clean, the record decides sip; with any fault it
+# reaches the record (no watch, or an unknown loss) and nothing is decided.
+GOT="$(py rawwatch raw-clean "${T}" 2>&1)"
+assert_true "raw replies, no fault: the record decides sip ($(tail -n 1 <<<"${GOT}"))" \
+	bash -c '[[ "$(tail -n 1 <<<"$1")" == "0 expect sip" && "$1" == *" - delivery-watch 51998"* && "$1" != *" - delivery unknown"* ]]' _ "${GOT}"
+GOT="$(py rawwatch raw-begin-failed "${T}" 2>&1)"
+assert_true "a failed baseline dump: the record does not watch, and decides nothing ($(tail -n 1 <<<"${GOT}"))" \
+	bash -c '[[ "$(tail -n 1 <<<"$1")" == "1 undecided the record did not watch delivery"* && "$1" != *"delivery-watch"* ]]' _ "${GOT}"
+for CASE in raw-dump-interrupted raw-dump-failed raw-dump-error raw-dump-truncated raw-dump-other-sequence \
+	raw-notification-overrun raw-notification-short; do
+	GOT="$(py rawwatch "${CASE}" "${T}" 2>&1)"
+	assert_true "${CASE#raw-}: an unknown loss reaches the record, and the hint is not trusted ($(tail -n 1 <<<"${GOT}"))" \
+		bash -c '[[ "$1" == *" - delivery unknown "*" any"* && "$(tail -n 1 <<<"$1")" == "1 undecided the hint #1 "* ]]' _ "${GOT}"
+done
 
 echo "=== IPv4/UDP framing before payload ==="
 assert_eq "datagram 77 77 whole" "$(py frame valid)" "a valid frame yields its UDP payload"

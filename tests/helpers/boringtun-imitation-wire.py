@@ -791,6 +791,15 @@ NETLINK_SOCK_DIAG = 4
 SOCK_DIAG_BY_FAMILY = 20
 NLMSG_ERROR, NLMSG_DONE = 2, 3
 NLM_F_REQUEST_DUMP = 0x301
+NLM_F_MULTI = 0x2
+NLM_F_DUMP_INTR = 0x10
+# A dump request's sequence number; each dump uses a socket of its own, so a
+# reply that carries another one answers no request of this reader.
+DIAG_SEQUENCE = 1
+# Larger than any datagram the kernel sends on these sockets (a dump batch
+# or a notification is at most a few pages), so a reply is never cut short
+# unnoticed: a cut message fails its length check.
+DIAG_RECEIVE = 1 << 20
 INET_DIAG_SKMEMINFO = 7
 SK_MEMINFO_DROPS = 8
 # SKNLGRP_INET_UDP_DESTROY (2) and SKNLGRP_INET6_UDP_DESTROY (4), as bits.
@@ -804,23 +813,41 @@ NAMESPACE_LOSSES = (("Ip", "InHdrErrors"), ("Ip", "InAddrErrors"), ("Ip", "InUnk
 
 
 def netlink_messages(data):
-    """(type, payload) of each netlink message in DATA."""
+    """(type, flags, sequence, payload) of each netlink message in DATA, one
+    received datagram. Anything that is not whole messages to its end -- an
+    empty datagram, a header or a message cut short, a length below the
+    header's -- is an OSError: the evidence is malformed."""
+    if not data:
+        raise OSError("an empty netlink datagram")
     offset = 0
-    while offset + 16 <= len(data):
-        length, kind = struct.unpack_from("=IH", data, offset)
+    while offset < len(data):
+        if len(data) - offset < 16:
+            raise OSError("a truncated netlink header")
+        length, kind, flags, sequence = struct.unpack_from("=IHHI", data, offset)
         if length < 16 or offset + length > len(data):
             raise OSError("a truncated netlink message")
-        yield kind, data[offset + 16:offset + length]
+        yield kind, flags, sequence, data[offset + 16:offset + length]
         offset += (length + 3) & ~3
+
+
+def netlink_status(payload, what):
+    """The errno (positive, or 0) of an NLMSG_DONE or NLMSG_ERROR payload."""
+    if len(payload) < 4:
+        raise OSError("a %s without its status" % what)
+    return -struct.unpack_from("=i", payload)[0]
 
 
 def diag_socket(payload):
     """(cookie, local port, peer, drops or None) of an inet_diag_msg; PEER
     is "any" for a socket connected to no one, "<address>:<port>" for one
-    connected to an IPv4 endpoint (also IPv4-mapped), "v6" otherwise."""
+    connected to an IPv4 endpoint (also IPv4-mapped), "v6" otherwise. A
+    message cut short, of another family or with a malformed attribute is an
+    OSError."""
     if len(payload) < 72:
         raise OSError("a short inet_diag message")
     family = payload[0]
+    if family not in (socket.AF_INET, socket.AF_INET6):
+        raise OSError("an inet_diag message of family %d" % family)
     local_port, peer_port = struct.unpack_from(">HH", payload, 4)
     low, high = struct.unpack_from("=II", payload, 44)
     destination = payload[24:40]
@@ -834,10 +861,12 @@ def diag_socket(payload):
         peer = "v6"
     drops = None
     offset = 72
-    while offset + 4 <= len(payload):
+    while offset < len(payload):
+        if len(payload) - offset < 4:
+            raise OSError("a truncated inet_diag attribute")
         length, kind = struct.unpack_from("=HH", payload, offset)
-        if length < 4:
-            break
+        if length < 4 or offset + length > len(payload):
+            raise OSError("a malformed inet_diag attribute")
         if kind == INET_DIAG_SKMEMINFO and length >= 4 + 4 * (SK_MEMINFO_DROPS + 1):
             drops = struct.unpack_from("=I", payload, offset + 4 + 4 * SK_MEMINFO_DROPS)[0]
         offset += (length + 3) & ~3
@@ -846,30 +875,47 @@ def diag_socket(payload):
 
 def udp_sockets(port):
     """{cookie: (peer, drops)} of the namespace's UDP sockets (IPv4 and
-    IPv6) bound to PORT."""
+    IPv6) bound to PORT, or an OSError unless both dumps completed: each
+    reply must answer this dump (its sequence), be a multipart socket
+    message of the requested family with its drop counter, carry no
+    NLM_F_DUMP_INTR (the socket tables changed under the dump), and end with
+    NLMSG_DONE whose status is 0. An error reply, a failed or missing
+    completion, or anything malformed is no snapshot. An empty table is one,
+    when its dump completes."""
     found = {}
     for family in (socket.AF_INET, socket.AF_INET6):
         request = struct.pack("=BBBBI", family, socket.IPPROTO_UDP, 1 << (INET_DIAG_SKMEMINFO - 1), 0, 0xFFFFFFFF) + bytes(48)
         with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_SOCK_DIAG) as link:
-            link.send(struct.pack("=IHHII", 16 + len(request), SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST_DUMP, 1, 0) + request)
+            link.send(struct.pack("=IHHII", 16 + len(request), SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST_DUMP, DIAG_SEQUENCE, 0)
+                      + request)
             done = False
             while not done:
-                for kind, payload in netlink_messages(link.recv(1 << 16)):
+                for kind, flags, sequence, payload in netlink_messages(link.recv(DIAG_RECEIVE)):
+                    if done:
+                        raise OSError("a message after the dump's completion")
+                    if sequence != DIAG_SEQUENCE:
+                        raise OSError("a reply to another request (sequence %d)" % sequence)
+                    if flags & NLM_F_DUMP_INTR:
+                        raise OSError(errno.EINTR, "the sock_diag dump was interrupted")
                     if kind == NLMSG_DONE:
+                        code = netlink_status(payload, "dump completion")
+                        if code:
+                            raise OSError(code, "the sock_diag dump failed")
                         done = True
-                        break
-                    if kind == NLMSG_ERROR:
-                        code = -struct.unpack_from("=i", payload)[0]
-                        if family == socket.AF_INET6 and code == errno.ENOENT:
-                            done = True  # no IPv6 in this kernel: no IPv6 socket either
-                            break
-                        raise OSError(code, "sock_diag refused the dump")
-                    if kind == SOCK_DIAG_BY_FAMILY:
+                    elif kind == NLMSG_ERROR:
+                        raise OSError(netlink_status(payload, "netlink error") or errno.EPROTO, "sock_diag refused the dump")
+                    elif kind == SOCK_DIAG_BY_FAMILY:
+                        if not flags & NLM_F_MULTI:
+                            raise OSError("a socket message outside a multipart dump")
+                        if payload[:1] != bytes([family]):
+                            raise OSError("a socket message of another family")
                         cookie, local_port, peer, drops = diag_socket(payload)
                         if drops is None:
                             raise OSError("sock_diag gave no drop counter")
                         if local_port == port:
                             found[cookie] = (peer, drops)
+                    else:
+                        raise OSError("an unexpected netlink message (type %d)" % kind)
     return found
 
 
@@ -913,9 +959,9 @@ class DeliveryWatch:
       - A socket destroyed that no reading saw: unknown since the watch began,
         for any endpoint: nothing shows what it was bound or connected to
         before it was destroyed.
-      - Lost notifications: unknown since the watch began, for any. A failed
-        dump or counter reading: unknown since the last reading, for any; its
-        notifications wait for the next.
+      - Lost, cut or malformed notifications: unknown since the watch began,
+        for any. A failed or incomplete dump or counter reading: unknown
+        since the last reading, for any; its notifications wait for the next.
     The final collection is settle() and a last read(): see Recorder.finish.
     """
 
@@ -948,16 +994,19 @@ class DeliveryWatch:
 
     def destroyed(self):
         """[(cookie, local port, peer)] of the UDP sockets destroyed since
-        the last call."""
+        the last call; an OSError if notifications were lost (ENOBUFS, an
+        NLMSG_OVERRUN or error message) or a datagram is not whole
+        notifications."""
         found = []
         while True:
             try:
-                data = self.events.recv(1 << 16)
+                data = self.events.recv(DIAG_RECEIVE)
             except BlockingIOError:
                 return found
-            for kind, payload in netlink_messages(data):
-                if kind == SOCK_DIAG_BY_FAMILY:
-                    found.append(diag_socket(payload)[:3])
+            for kind, _, _, payload in netlink_messages(data):
+                if kind != SOCK_DIAG_BY_FAMILY:
+                    raise OSError("a notification of type %d: notifications may be lost" % kind)
+                found.append(diag_socket(payload)[:3])
 
     def collect(self):
         """Add the notifications received so far to those pending."""
