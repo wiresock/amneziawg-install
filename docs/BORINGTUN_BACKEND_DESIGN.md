@@ -2856,11 +2856,43 @@ explains its behaviour, and offers it only when the installed binary supports it
   the scenario's own evidence, never from what the server sent.
   - *Recording.* Each stage runs the wire helper's `record` on the host from before the daemon
     serving it started (its process start is the epoch). Every frame from the client addresses
-    is kept whole with the kernel's receive timestamp, converted to CLOCK_BOOTTIME when the
-    clocks did not step (otherwise the interval it must have arrived in). The drop counters'
-    baseline is taken before the record is ready, every drop is written as an interval, and a
-    stop drains the queue through a cutoff within a budget; the last line says `complete` or
-    `incomplete`. A record not complete through the observation fails it.
+    is kept whole with the kernel's receive timestamp. The timestamp is converted to
+    CLOCK_BOOTTIME with the realtime offset's whole bracket from the two clock readings around
+    the frame's wait in the queue, so a reading preempted between its realtime reads widens the
+    arrival into an interval and never moves an exact stamp; arrivals are written as one
+    centisecond only when the bounds fall in it. The drop counters' baseline is taken before the
+    record is ready. Each counter is read between two clock readings, and each loss interval
+    runs from the reading before the previous reset to the one after this one, so preemption
+    inside a poll widens an interval and never leaves a loss outside it. A stop drains the queue
+    until a read after a clock reading 0.1 s past the cutoff finds it empty, within 5 s; the last
+    line says `complete` or `incomplete`. A record not complete through the observation fails
+    it.
+  - *Observation boundary.* What `complete` proves: every frame queued to the record's packet
+    socket before that final empty read is recorded or counted as dropped. That this covers
+    every frame the kernel received by the cutoff rests on one stated assumption, not on a
+    kernel ordering guarantee: the kernel queues a received frame to the record's socket, and
+    delivers it to a UDP socket, within 0.1 s of its receive timestamp (both happen in the same
+    receive path, in an order that depends on the kernel version and on how the packet socket
+    is bound). The same assumption bounds an arrival without a usable timestamp from below and
+    the datagrams a delivery loss may have hit. The observations need completeness only
+    through the selection's pinning, which comes seconds before the cutoff.
+  - *Delivery.* A complete record shows what reached the namespace, not what reached the
+    daemon: a datagram can still be dropped at a full UDP receive queue. The record therefore
+    watches every UDP socket bound to the server's port in its namespace (`sock_diag`), by cookie
+    and drop counter: the listener's losses count for any endpoint, a connected socket's for its
+    endpoint. A socket gone since the last reading, or destroyed before any reading saw it
+    (`sock_diag`'s destruction notifications), leaves its losses unknown; so do lost
+    notifications and failed readings. The namespace's counters of datagrams dropped before any
+    socket (IP errors and discards, no socket on the port, checksums, reverse-path filtering)
+    count for any endpoint. A record without the watch decides nothing. A hint whose arrival
+    such a loss may have hit is a gap. Not covered: a datagram dropped by a netfilter rule (no
+    counter), or delivered to another process's socket on the port; the scenarios add no such
+    rule or socket.
+  - *Client captures.* The client side's captures run on the same machinery: drops counted
+    from a baseline before readiness, and at the deadline or an authorized stop, the same
+    drain past the cutoff. Only a capture that drained and dropped nothing ends `complete` or
+    `stopped`; otherwise it ends `incomplete` and fails, and no verdict judges a capture that
+    is not whole, whatever its counts.
   - *Rules.* `auto-expect` restates the pinned BoringTun: AmneziaWG packet-kind candidates
     (through the header-protection mask under AWG 3.x) are never hints, the rest are classified
     as `detect()` does. The listener keeps the device's hints (first per source address and
@@ -2877,13 +2909,16 @@ explains its behaviour, and offers it only when the installed binary supports it
     between was accepted and answered by then; that time is also the only upper bound on when
     the server processed anything (no earlier than its arrival). A socket connected to the
     client, seen in the server's socket table with the same cookie before and after an
-    observation, pins when the endpoint moved to it.
+    observation, pins when the endpoint moved to it, and also shows an acceptance. That the
+    server accepted none of the client's initiations is one of the histories, so without such
+    evidence nothing is decided.
   - *Histories.* Every history this evidence allows is replayed: which initiations were
     accepted, where the endpoint moved to the connected socket, and each hint-lifetime
     comparison the bounds leave open, both ways. The outcome is decided only if every history
     gives it; otherwise the observation fails as undecided. So is one with frames the record
-    dropped or could not read between the epoch and the point the selection was certainly
-    pinned (a learned protocol outlives any hint), a clock step, or a history outside the model
+    dropped or could not read, or a hint the server's sockets may have lost, between the epoch
+    and the point the selection was certainly pinned (a learned protocol outlives any hint), a
+    clock step, or a history outside the model
     (more than 1024 hint sources, 10 initiations, or 540 s after the first, when a connected
     socket may expire). It assumes what the scenarios control: a client keeps its endpoint, and
     the server is not reconfigured during a history. Expiry of a hint can rarely be proven, so
@@ -2910,11 +2945,22 @@ explains its behaviour, and offers it only when the installed binary supports it
   the same port's client with DNS imitation (dns with the connected socket seen, matched by the
   binary; undecided without that evidence), a forged initiation and transport candidate,
   a first session hidden by a drop interval, and a hint that waited in a paused record's queue
-  (each undecided; the whole early-gap record decides stun, matched by the binary).
+  (each undecided; the whole early-gap record decides stun, matched by the binary). And the
+  server stopped while 5000 datagrams and then a SIP hint arrive from the client's port: the
+  record holds all of them, the server's listener drops most, the watch reports it, and the
+  outcome is undecided (the binary stays random); with 20 datagrams nothing is lost, the record
+  decides sip and the binary matches; that record without its watch is undecided.
 - `tests/test-boringtun-record-live.sh` checks the record on a real packet socket: a frame that
   waited 2.2 s in the queue is stamped at its arrival, 50 frames queued at a stop are recorded,
   a 4 KiB buffer overflowed just after readiness has every frame recorded or reported, a stop
   under continuing traffic ends within its budget, and an unauthorized stop ends interrupted.
+  With the record stopped right after a counter reset, the drops line still begins before the
+  reset; with a clock reading stopped 3 s between its realtime reads, every arrival still holds
+  its send. Its delivery watch reports a listener's and a connected socket's drops, and leaves
+  unknown what sockets closed after a reading, or never seen, may have lost. The client-side
+  capture, stopped after 20 STUN-shaped datagrams while two more and an unshaped one arrive,
+  records all 23 at its deadline or authorized stop and fails the STUN verdict; a clean control
+  passes; an overflowed capture ends `incomplete` and is not judged.
 - The planted hint is shorter than any AmneziaWG datagram (32 bytes: a transport behind an S4
   of 0), because BoringTun hands only datagrams that fit no packet kind to probe
   classification, the only door that records a hint. The live test shows, for the planted
