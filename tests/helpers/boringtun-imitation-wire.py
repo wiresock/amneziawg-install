@@ -59,10 +59,13 @@
       polled after every wakeup, into a 32 MiB receive buffer) as "<clock> -
       drops <count> <clock before the previous poll>". Several source
       addresses, any source port, and with "any" every interface of the
-      namespace, also one created later: what reached the server from its
-      clients, in arrival order. Its transcript is capture's, but its end is
-      "complete" or "stopped" in either case: whether the record is complete
-      is its last line's to say.
+      namespace, also one created later: what reached the namespace from the
+      server's clients, in arrival order. It also watches delivery from there
+      to the UDP sockets bound to DESTINATION PORT (a first line "<clock> -
+      delivery-watch <port>"; each loss "<clock> - delivery <count|unknown>
+      <since> <any|address:port>"; see Recorder and DeliveryWatch). Its
+      transcript is capture's, but its end is "complete" or "stopped" in
+      either case: whether the record is complete is its last line's to say.
 
   auto-expect <record> <address> <port> <layout> <server public key> <hp key file|-> <on|off> <epoch> <start> <end> [<establishments|-> [<connected|->]]
       From a finished record (its transcript checked) and the scenario's
@@ -86,11 +89,12 @@
       server's datagrams to that client between the clocks START and END
       (centiseconds of CLOCK_BOOTTIME) if every history gives it. EPOCH is
       when the server's state was last empty; the record must have been ready
-      before it and be complete through END. Otherwise "undecided <reason>"
-      (exit 1): histories that disagree, a clock step, frames the record
-      dropped or could not read from the epoch until the selection was
-      certainly pinned, no initiation, or a history the model does not
-      support (see auto_expect).
+      before it, be complete through END and have watched delivery to the
+      server's sockets. Otherwise "undecided <reason>" (exit 1): histories
+      that disagree, a clock step, frames the record dropped or could not
+      read, or a hint the server's sockets may have lost, from the epoch
+      until the selection was certainly pinned, no initiation, or a history
+      the model does not support (see auto_expect).
 
   classify <protocol> <file>
       For a capture without layout, print "<datagrams> <matching>": how many
@@ -155,6 +159,7 @@ The probe formats are those the pinned BoringTun classifies
 """
 
 import base64
+import errno
 import hashlib
 import hmac
 import os
@@ -678,10 +683,13 @@ RECORD_BATCH = 256
 # How long the shutdown drain may take before the record ends incomplete.
 RECORD_DRAIN_NS = 5 * 10 ** 9
 # The record's one timing assumption (not a kernel guarantee): the kernel
-# queues a frame to the record's packet socket within RECORD_SETTLE_NS of
-# its receive timestamp. The drain relies on it (the queue must be found
-# empty that long past the cutoff), and so does the lower bound of an
-# arrival without a usable stamp.
+# queues a frame to the record's packet socket, and delivers it to a UDP
+# socket, within RECORD_SETTLE_NS of its receive timestamp. The two happen
+# in the same receive path, in an order that depends on the kernel and on
+# how the packet socket is bound, so neither bounds the other. The drain
+# relies on it (the queue must be found empty that long past the cutoff),
+# and so do the bounds of an arrival without a usable stamp and of the
+# datagrams a delivery loss may have hit.
 RECORD_SETTLE_NS = 10 ** 8
 # The longest a wait lasts, so that drops and clocks are polled while idle.
 RECORD_IDLE_NS = 5 * 10 ** 8
@@ -773,6 +781,203 @@ class PacketSource:
         return struct.unpack("II", self.sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))[1]
 
 
+# sock_diag: the UDP sockets of the reader's network namespace, with their
+# drop counters (SK_MEMINFO_DROPS: every datagram the socket's receive path
+# discarded -- a full receive buffer, memory, a checksum or a filter), and
+# the destruction of any UDP socket there (needs CAP_NET_ADMIN).
+NETLINK_SOCK_DIAG = 4
+SOCK_DIAG_BY_FAMILY = 20
+NLMSG_ERROR, NLMSG_DONE = 2, 3
+NLM_F_REQUEST_DUMP = 0x301
+INET_DIAG_SKMEMINFO = 7
+SK_MEMINFO_DROPS = 8
+# SKNLGRP_INET_UDP_DESTROY (2) and SKNLGRP_INET6_UDP_DESTROY (4), as bits.
+UDP_DESTROY_GROUPS = (1 << 1) | (1 << 3)
+# The namespace's counters of IPv4 datagrams dropped after the packet tap and
+# before any UDP socket's queue: IP header, address and routing errors,
+# discards, reverse-path filtering, no socket on the port, checksums.
+NAMESPACE_LOSSES = (("Ip", "InHdrErrors"), ("Ip", "InAddrErrors"), ("Ip", "InUnknownProtos"), ("Ip", "InDiscards"),
+                    ("Udp", "NoPorts"), ("Udp", "InCsumErrors"), ("IpExt", "InNoRoutes"),
+                    ("IpExt", "InTruncatedPkts"), ("IpExt", "InCsumErrors"), ("TcpExt", "IPReversePathFilter"))
+
+
+def netlink_messages(data):
+    """(type, payload) of each netlink message in DATA."""
+    offset = 0
+    while offset + 16 <= len(data):
+        length, kind = struct.unpack_from("=IH", data, offset)
+        if length < 16 or offset + length > len(data):
+            raise OSError("a truncated netlink message")
+        yield kind, data[offset + 16:offset + length]
+        offset += (length + 3) & ~3
+
+
+def diag_socket(payload):
+    """(cookie, local port, peer, drops or None) of an inet_diag_msg; PEER
+    is "any" for a socket connected to no one, "<address>:<port>" for one
+    connected to an IPv4 endpoint (also IPv4-mapped), "v6" otherwise."""
+    if len(payload) < 72:
+        raise OSError("a short inet_diag message")
+    family = payload[0]
+    local_port, peer_port = struct.unpack_from(">HH", payload, 4)
+    low, high = struct.unpack_from("=II", payload, 44)
+    destination = payload[24:40]
+    if peer_port == 0:
+        peer = "any"
+    elif family == socket.AF_INET:
+        peer = "%s:%d" % (socket.inet_ntoa(destination[:4]), peer_port)
+    elif destination[:12] == bytes(10) + b"\xff\xff":
+        peer = "%s:%d" % (socket.inet_ntoa(destination[12:16]), peer_port)
+    else:
+        peer = "v6"
+    drops = None
+    offset = 72
+    while offset + 4 <= len(payload):
+        length, kind = struct.unpack_from("=HH", payload, offset)
+        if length < 4:
+            break
+        if kind == INET_DIAG_SKMEMINFO and length >= 4 + 4 * (SK_MEMINFO_DROPS + 1):
+            drops = struct.unpack_from("=I", payload, offset + 4 + 4 * SK_MEMINFO_DROPS)[0]
+        offset += (length + 3) & ~3
+    return low | high << 32, local_port, peer, drops
+
+
+def udp_sockets(port):
+    """{cookie: (peer, drops)} of the namespace's UDP sockets (IPv4 and
+    IPv6) bound to PORT."""
+    found = {}
+    for family in (socket.AF_INET, socket.AF_INET6):
+        request = struct.pack("=BBBBI", family, socket.IPPROTO_UDP, 1 << (INET_DIAG_SKMEMINFO - 1), 0, 0xFFFFFFFF) + bytes(48)
+        with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_SOCK_DIAG) as link:
+            link.send(struct.pack("=IHHII", 16 + len(request), SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST_DUMP, 1, 0) + request)
+            done = False
+            while not done:
+                for kind, payload in netlink_messages(link.recv(1 << 16)):
+                    if kind == NLMSG_DONE:
+                        done = True
+                        break
+                    if kind == NLMSG_ERROR:
+                        code = -struct.unpack_from("=i", payload)[0]
+                        if family == socket.AF_INET6 and code == errno.ENOENT:
+                            done = True  # no IPv6 in this kernel: no IPv6 socket either
+                            break
+                        raise OSError(code, "sock_diag refused the dump")
+                    if kind == SOCK_DIAG_BY_FAMILY:
+                        cookie, local_port, peer, drops = diag_socket(payload)
+                        if drops is None:
+                            raise OSError("sock_diag gave no drop counter")
+                        if local_port == port:
+                            found[cookie] = (peer, drops)
+    return found
+
+
+def namespace_losses():
+    """The sum of NAMESPACE_LOSSES in the reader's network namespace
+    (/proc/self/net/snmp and netstat)."""
+    values = {}
+    for path in ("/proc/self/net/snmp", "/proc/self/net/netstat"):
+        with open(path) as table:
+            rows = table.read().splitlines()
+        for names, numbers in zip(rows[::2], rows[1::2]):
+            section, _, names = names.partition(":")
+            if numbers.partition(":")[0] != section:
+                raise OSError("%s is not pairs of name and value rows" % path)
+            for name, number in zip(names.split(), numbers.partition(":")[2].split()):
+                values[(section, name)] = int(number)
+    missing = [name for name in NAMESPACE_LOSSES if name not in values]
+    if missing:
+        raise OSError("the namespace has no counter %s" % ", ".join("%s %s" % name for name in missing))
+    return sum(values[name] for name in NAMESPACE_LOSSES)
+
+
+class DeliveryWatch:
+    """What a complete record does not show: whether the datagrams it saw
+    reached the server's UDP sockets. In the record's network namespace,
+    every UDP socket bound to PORT -- the listener and each socket
+    connected to one endpoint, whichever process owns it -- by its cookie
+    and its drop counter, every UDP socket's destruction (sock_diag's
+    notifications), and the namespace's counters of datagrams dropped before
+    any socket's queue (NAMESPACE_LOSSES).
+
+    read() returns the losses since the last reading, as (count or None for
+    "cannot be ruled out", peer, since the watch began): a counter that
+    grew (a connected socket's for its endpoint, the others for any); a
+    socket gone since the last reading (it may have dropped datagrams after
+    it); a socket destroyed that no reading saw (its whole life is unknown:
+    since the watch began); lost notifications or a failed reading (for any
+    endpoint, since the watch began when notifications were lost)."""
+
+    def __init__(self, port):
+        self.port = port
+        self.watching = False
+        self.known = {}
+        self.gone = set()
+        self.counted = None
+        self.events = None
+
+    def subscribe(self):
+        self.events = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_SOCK_DIAG)
+        self.events.bind((0, UDP_DESTROY_GROUPS))
+        self.events.setblocking(False)
+
+    def begin(self):
+        """Subscribe to the notifications, then take the baseline; False if
+        any of it is unavailable (the record then does not watch)."""
+        try:
+            self.subscribe()
+            self.known = udp_sockets(self.port)
+            self.counted = namespace_losses()
+        except OSError:
+            return False
+        self.watching = True
+        return True
+
+    def destroyed(self):
+        """[(cookie, local port, peer)] of the UDP sockets destroyed since
+        the last call."""
+        found = []
+        while True:
+            try:
+                data = self.events.recv(1 << 16)
+            except BlockingIOError:
+                return found
+            for kind, payload in netlink_messages(data):
+                if kind == SOCK_DIAG_BY_FAMILY:
+                    found.append(diag_socket(payload)[:3])
+
+    def read(self):
+        losses = []
+        try:
+            destroyed = self.destroyed()
+        except OSError:
+            destroyed = None
+            losses.append((None, "any", True))
+        try:
+            current = udp_sockets(self.port)
+            counted = namespace_losses()
+        except OSError:
+            losses.append((None, "any", False))
+            return losses
+        for cookie, (peer, drops) in current.items():
+            # A socket first seen now, or connected since, may have taken
+            # datagrams from anyone before it was connected.
+            known_peer, before = self.known.get(cookie, ("any", 0))
+            if drops != before:
+                losses.append((drops - before if drops > before else None, peer if known_peer == peer else "any", False))
+        for cookie, (peer, _) in self.known.items():
+            if cookie not in current:
+                self.gone.add(cookie)
+                losses.append((None, peer, False))
+        for cookie, port, peer in destroyed or ():
+            if port == self.port and cookie not in self.known and cookie not in current and cookie not in self.gone:
+                self.gone.add(cookie)
+                losses.append((None, peer, True))
+        if counted != self.counted:
+            losses.append((counted - self.counted if counted > self.counted else None, "any", False))
+        self.known, self.counted = current, counted
+        return losses
+
+
 def centiseconds_down(nanoseconds):
     return nanoseconds // 10 ** 7
 
@@ -799,6 +1004,14 @@ class Recorder:
     was read. Without a timestamp: from RECORD_SETTLE_NS before the queue was
     last found empty until it was read. Markers:
 
+      "<clock> - delivery-watch <port>"   the first line, when the record
+                                          watches delivery to the UDP
+                                          sockets on PORT (DeliveryWatch)
+      "<clock> - delivery <count|unknown> <since> <any|address:port>"
+                                          datagrams the server's sockets may
+                                          have lost between SINCE and CLOCK:
+                                          for one endpoint (a socket
+                                          connected to it) or for any
       "<clock> - drops <count> <since>"   frames the packet socket dropped
                                           between SINCE and CLOCK
       "<clock> - clock-step <since>"      the realtime or the boottime clock
@@ -818,28 +1031,32 @@ class Recorder:
     in a poll widens it and never moves a loss outside it.
     """
 
-    def __init__(self, source, clocks, out, wanted_sources, wanted_port, destination_port, created):
+    def __init__(self, source, clocks, out, wanted_sources, wanted_port, destination_port, created, delivery=None):
         self.source, self.clocks, self.out = source, clocks, out
         self.wanted_sources, self.wanted_port, self.destination_port = wanted_sources, wanted_port, destination_port
+        self.delivery = delivery
         self.fragments = Fragments()
         self.records = 0
         # The reading taken before the read that last found the queue empty
         # (at first, the socket's creation).
         self.empty = created
         self.last = created
-        self.polled = created.boot
+        self.polled = self.watched = created.boot
 
     def write(self, line):
         self.out.write(line + "\n")
         self.records += 1
 
     def begin(self):
-        """Take the drop counters' baseline, then the reading at which the
-        record counts as ready: every drop after it is reported."""
+        """Take the counters' baselines, then the reading at which the record
+        counts as ready: every loss after the baselines is reported."""
         before = self.clocks.sample()
         self.source.drops()
+        watching = self.delivery is not None and self.delivery.begin()
         ready = self.clocks.sample()
-        self.polled = before.boot
+        self.polled = self.watched = before.boot
+        if watching:
+            self.write("%d - delivery-watch %d" % (centiseconds_up(ready.boot), self.destination_port))
         return ready
 
     def arrival(self, stamp, read, after):
@@ -901,6 +1118,9 @@ class Recorder:
     def lost(self, count, since, clock):
         self.write("%d - drops %d %d" % (clock, count, since))
 
+    def undelivered(self, count, since, clock, peer):
+        self.write("%d - delivery %s %d %s" % (clock, "unknown" if count is None else count, since, peer))
+
     def stepped(self, since, clock):
         self.write("%d - clock-step %d" % (clock, since))
 
@@ -908,13 +1128,17 @@ class Recorder:
         self.write("%d - %s %d" % (clock, "complete" if complete else "incomplete", cutoff))
 
     def poll(self):
-        """Report drops and clock steps since the last poll."""
+        """Report drops, delivery losses and clock steps since the last
+        poll."""
         before = self.clocks.sample()
         dropped = self.source.drops()
+        losses = self.delivery.read() if self.delivery is not None and self.delivery.watching else []
         now = self.clocks.sample()
         clock, since = centiseconds_up(now.boot), centiseconds_down(self.polled)
         if dropped:
             self.lost(dropped, since, clock)
+        for count, peer, whole in losses:
+            self.undelivered(count, centiseconds_down(self.watched) if whole else since, clock, peer)
         if not now.steady_since(self.last):
             self.stepped(centiseconds_down(self.last.boot), clock)
         self.polled, self.last = before.boot, now
@@ -1011,14 +1235,16 @@ def listen_for_stop():
     return stop, wake_read
 
 
-def record(destination_port, interface, sources_text, source_port, seconds, path, source=None, clocks=None):
+def record(destination_port, interface, sources_text, source_port, seconds, path, source=None, clocks=None, delivery=None):
     """The `record` command: every frame from SOURCES to DESTINATION_PORT
-    (Recorder), through a cutoff at the deadline or at an authorized stop.
-    PATH.state is capture's transcript ("ready ..."; "complete <records> <end
-    clock>" at the deadline, "stopped <records> <token>" after an authorized
-    SIGTERM, both status 0; "interrupted <records>", status 3). The records
-    count every line, markers included; whether the record is complete is its
-    last line's to say, and a reader must check it."""
+    (Recorder), and what the UDP sockets on that port may have lost
+    (DeliveryWatch), through a cutoff at the deadline or at an authorized
+    stop. PATH.state is capture's transcript ("ready ..."; "complete
+    <records> <end clock>" at the deadline, "stopped <records> <token>"
+    after an authorized SIGTERM, both status 0; "interrupted <records>",
+    status 3). The records count every line, markers included; whether the
+    record is complete is its last line's to say, and a reader must check
+    it."""
     sources = sources_text.split(",")
     wanted_sources = set()
     for address in sources:
@@ -1039,8 +1265,9 @@ def record(destination_port, interface, sources_text, source_port, seconds, path
     clocks = clocks or SystemClocks()
     created = clocks.sample()
     source = source or PacketSource(interface, buffer)
+    delivery = delivery or DeliveryWatch(wanted_destination)
     with open(path, "w") as out:
-        recorder = Recorder(source, clocks, out, wanted_sources, wanted_port, wanted_destination, created)
+        recorder = Recorder(source, clocks, out, wanted_sources, wanted_port, wanted_destination, created, delivery)
         end, token = observe(recorder, source, clocks, duration, state_path, stop_path, stop, wake_read, out)
     if end == "interrupted":
         write_state(state_path, "interrupted %d" % recorder.records)
@@ -1628,6 +1855,9 @@ RECORD_MALFORMED = re.compile(ARRIVAL + r" ([0-9.]{7,15}) - malformed (0|[1-9][0
 RECORD_DROPS = re.compile(CLOCK + r" - drops ([1-9][0-9]{0,9}) " + CLOCK)
 RECORD_STEP = re.compile(CLOCK + r" - clock-step " + CLOCK)
 RECORD_END = re.compile(CLOCK + r" - (complete|incomplete) " + CLOCK)
+RECORD_WATCH = re.compile(CLOCK + r" - delivery-watch (0|[1-9][0-9]{0,4})")
+RECORD_DELIVERY = re.compile(CLOCK + r" - delivery ([1-9][0-9]{0,9}|unknown) " + CLOCK +
+                             r" (any|v6|[0-9.]{7,15}:(?:0|[1-9][0-9]{0,4}))")
 
 
 class Frame:
@@ -1649,11 +1879,14 @@ class Frame:
 
 class Record:
     """A finished `record`: READY, its ready clock; FRAMES in queue order;
-    DROPS (since, clock, count) and STEPS (since, clock) intervals; END
-    ("complete" or "incomplete", cutoff), from its last line."""
+    DROPS (since, clock, count) and STEPS (since, clock) intervals; WATCH,
+    the port whose UDP sockets it watched (None if it did not), and
+    DELIVERY (since, clock, count or None, peer), what they may have lost;
+    END ("complete" or "incomplete", cutoff), from its last line."""
 
-    def __init__(self, ready, frames, drops, steps, end):
+    def __init__(self, ready, frames, drops, steps, end, watch=None, delivery=()):
         self.ready, self.frames, self.drops, self.steps, self.end = ready, frames, drops, steps, end
+        self.watch, self.delivery = watch, list(delivery)
 
 
 def read_record(path):
@@ -1667,7 +1900,7 @@ def read_record(path):
     ready = re.fullmatch(r"ready [0-9]+ [0-9]+ (0|[1-9][0-9]{0,17})", transcript[0]) if transcript else None
     if len(transcript) != 2 or not ready:
         raise InputError("%s.state is not a ready line and one end" % path)
-    frames, drops, steps, end = [], [], [], None
+    frames, drops, steps, end, watch, delivery = [], [], [], None, None, []
     lines = 0
     for number, line in capture_lines(path):
         lines += 1
@@ -1677,6 +1910,21 @@ def read_record(path):
         marker = RECORD_END.fullmatch(line)
         if marker:
             end = (marker.group(2), int(marker.group(3)))
+            continue
+        marker = RECORD_WATCH.fullmatch(line)
+        if marker:
+            if lines != 1:
+                raise InputError("%s: a delivery watch begins only on a record's first line" % where)
+            watch = int(marker.group(2))
+            continue
+        marker = RECORD_DELIVERY.fullmatch(line)
+        if marker:
+            if watch is None:
+                raise InputError("%s: a delivery loss in a record that watched no delivery" % where)
+            if int(marker.group(3)) > int(marker.group(1)):
+                raise InputError("%s: its interval goes back" % where)
+            count = None if marker.group(2) == "unknown" else int(marker.group(2))
+            delivery.append((int(marker.group(3)), int(marker.group(1)), count, marker.group(4)))
             continue
         marker = RECORD_DROPS.fullmatch(line)
         if marker:
@@ -1714,7 +1962,7 @@ def read_record(path):
     count = re.fullmatch(r"(?:stopped ([0-9]+) [0-9a-f]{32}|complete ([0-9]+) [0-9]+)", transcript[1])
     if not count or int(count.group(1) or count.group(2)) != lines:
         raise InputError("%s.state does not end with a stop or completion that counts its %d lines" % (path, lines))
-    return Record(int(ready.group(1)), frames, drops, steps, end)
+    return Record(int(ready.group(1)), frames, drops, steps, end, watch, delivery)
 
 
 class Undecided(Exception):
@@ -1915,7 +2163,10 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
     between the clocks START and END, or "undecided <reason>" (exit 1).
 
     EPOCH is when the server's state was last empty (its process start); the
-    record must have been ready before it and complete through END.
+    record must have been ready before it, complete through END, and must
+    have watched delivery to the server's UDP sockets (a complete record
+    shows what reached the namespace, not what reached the server): a hint
+    that a loss it reports may have hit counts as a gap.
     ESTABLISHMENTS ("START:UP,...", or "-") are the client-side evidence of
     acceptance: a client process started at START pinged through the tunnel
     by UP. Nothing in a datagram proves that the server accepted it, so every
@@ -1931,8 +2182,9 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
     bounds leave open (the server processes a datagram no earlier than its
     arrival; the only upper bound is an establishment's UP). The outcome is
     decided only if every history gives the same one. Undecided also: an
-    incomplete record, a clock step, frames the record dropped or could not
-    read (a malformed frame from the address, a fragment from the port) at a
+    incomplete or unwatched record, a clock step, frames the record dropped
+    or could not read (a malformed frame from the address, a fragment from
+    the port), or a hint the server's sockets may have lost, at a
     time they could have changed the outcome (from the epoch until the
     selection was pinned, or the window's end), more than MAX_HINT_SOURCES
     hint sources, more initiations than MAX_INITIATIONS, or a window ending
@@ -1976,6 +2228,9 @@ def decide(record, address, port, sizes, ranges, mac1_key, hp_key, trailers, epo
     if record.end is None or record.end[0] != "complete" or record.end[1] < window_end:
         raise Undecided("the record is not complete through the window's end at %d (%s)"
                         % (window_end, "no end marker" if record.end is None else "%s %d" % record.end))
+    if record.watch is None:
+        raise Undecided("the record did not watch delivery to the server's UDP sockets, so it cannot tell whether "
+                        "what it saw reached them")
     steps = [step for step in record.steps if step[1] >= epoch and step[0] <= window_end]
     # What the record cannot tell: frames it dropped (any source), a
     # malformed frame from the address (its port unknown), a fragment from
@@ -2002,6 +2257,22 @@ def decide(record, address, port, sizes, ranges, mac1_key, hp_key, trailers, epo
     if len(sources) >= MAX_HINT_SOURCES:
         raise Undecided("%d sources left hints, as many as the device keeps" % len(sources))
     datagrams = [Datagram(frame, sizes, ranges, mac1_key, hp_key, trailers) for frame in frames]
+    # What the record saw may still have been lost before the server's
+    # socket: a hint wherever a loss the watch reported, for this endpoint or
+    # for any, may have hit it (it reached the record and that socket within
+    # RECORD_SETTLE_NS of each other). A lost initiation is one the server
+    # did not accept, which the histories already include.
+    endpoint = "%s:%d" % (address, port)
+    settle = RECORD_SETTLE_NS // 10 ** 7
+    for since, clock, count, peer in record.delivery:
+        if peer not in ("any", endpoint):
+            continue
+        for index, datagram in enumerate(datagrams):
+            if datagram.kind == "hint" and datagram.high >= since - settle and datagram.low <= clock:
+                gaps.append((datagram.low, datagram.high, "the hint #%d (%d~%d) may not have reached the server: "
+                             "the server's sockets lost %s datagrams from %s between %d and %d"
+                             % (index + 1, datagram.low, datagram.high, "unknown" if count is None else count,
+                                "anyone" if peer == "any" else peer, since, clock)))
     initiations = [index for index, datagram in enumerate(datagrams) if datagram.kind == "initiation"]
     if not initiations:
         raise Undecided("no initiation from this client reached the server by the window's end")

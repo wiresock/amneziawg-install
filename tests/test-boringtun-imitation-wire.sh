@@ -426,12 +426,43 @@ elif cmd == "recorder":
                 self.hooks[self.calls]()
             return dropped
 
-    clocks, source, out = Clocks(), Source(), io.StringIO()
+    class Watch(wire.DeliveryWatch):
+        """DeliveryWatch on scripted sockets (SOCKETS, cookie: (peer,
+        drops)), namespace counter (COUNTER), destructions (DESTROYED) and
+        failures (FAIL: subscribe, dump, events)."""
+
+        def __init__(self):
+            super().__init__(40000)
+            self.sockets, self.counter, self.gone_events, self.fail = {}, 0, [], set()
+
+        def subscribe(self):
+            if "subscribe" in self.fail:
+                raise OSError(errno.EPERM, "no notifications")
+
+        def destroyed(self):
+            if "events" in self.fail:
+                self.fail.discard("events")
+                raise OSError(errno.ENOBUFS, "notifications lost")
+            found, self.gone_events = self.gone_events, []
+            return found
+
+    def scripted_sockets(port):
+        if "dump" in watch.fail:
+            watch.fail.discard("dump")
+            raise OSError(errno.EIO, "dump failed")
+        return dict(watch.sockets)
+
+    wire.udp_sockets = scripted_sockets
+    wire.namespace_losses = lambda: watch.counter
+    clocks, source, out, watch = Clocks(), Source(), io.StringIO(), Watch()
     source.dropped = 7  # before the record exists: not its business
+    CLIENT_PEER = "192.0.2.1:51820"
+    watch.sockets = {1: ("any", 0), 2: (CLIENT_PEER, 0)}
     if case.startswith("capture-"):
         recorder = wire.CaptureRecorder(source, clocks, out, SERVER, 51820, None, clocks.sample(), None, None, None)
     else:
-        recorder = wire.Recorder(source, clocks, out, {SERVER}, None, 40000, clocks.sample())
+        recorder = wire.Recorder(source, clocks, out, {SERVER}, None, 40000, clocks.sample(),
+                                 watch if case.startswith("delivery-") else None)
     def stamped(payload, before_ns):
         return (ipv4(payload), clocks.boot_ns - before_ns + clocks.real_offset)
     def preempted_after_reset():
@@ -444,7 +475,10 @@ elif cmd == "recorder":
         clocks.sleep(SECOND)
     if case == "begin-preempted":
         source.hooks[1] = preempted_after_reset
+    if case == "delivery-unavailable":
+        watch.fail.add("subscribe")
     ready = recorder.begin()
+    print("watch-cs %d" % (recorder.watched // 10 ** 7))
     if case == "delayed-ready":
         # Drops after readiness, before the first poll, are reported.
         source.dropped = 993
@@ -537,6 +571,38 @@ elif cmd == "recorder":
         else:
             source.hooks[source.calls + 1] = preempted_after_reset
             recorder.poll()
+        recorder.finish(clocks.boot())
+    elif case.startswith("delivery-"):
+        # The delivery watch on scripted sockets: the listener (cookie 1),
+        # the socket connected to the client (2), others as a case adds them,
+        # each change between the first and the second poll.
+        clocks.sleep(SECOND)
+        recorder.poll()
+        clocks.sleep(SECOND)
+        if case == "delivery-listener":
+            watch.sockets[1] = ("any", 5)
+        elif case == "delivery-connected":
+            watch.sockets[2] = (CLIENT_PEER, 3)
+        elif case == "delivery-new-socket":
+            watch.sockets[3] = (CLIENT_PEER, 2)
+        elif case == "delivery-reconnected":
+            watch.sockets[1] = (CLIENT_PEER, 4)
+        elif case == "delivery-retired":
+            del watch.sockets[2]
+        elif case == "delivery-unseen":
+            watch.gone_events = [(9, 40000, CLIENT_PEER)]
+        elif case == "delivery-other-port":
+            watch.gone_events = [(9, 40001, CLIENT_PEER)]
+        elif case == "delivery-namespace":
+            watch.counter = 4
+        elif case == "delivery-dump-fails":
+            watch.fail.add("dump")
+        elif case == "delivery-events-lost":
+            watch.fail.add("events")
+        elif case == "delivery-unavailable":
+            watch.sockets[1] = ("any", 5)
+        print("poll-cs %d" % (clocks.boot_ns // 10 ** 7))
+        recorder.poll()
         recorder.finish(clocks.boot())
     elif case in ("capture-queued", "capture-drops", "capture-endless"):
         # capture's records on the record's machinery: what is queued at the
@@ -888,6 +954,9 @@ def sequence(start, datagrams, address=A, port=41006):
         add(start + index, data, address, port)
 ready, epoch, window = 1000, 1500, (1900, 20000)
 layout, hp, connected = CLEAR, False, "-"
+# The record watched delivery to the server's sockets, and nothing was lost,
+# unless a case says otherwise.
+watched = True
 # A client process started at 1995 and pinged through the tunnel at 2040,
 # unless a case says otherwise.
 est = [(1995, 2040)]
@@ -1062,6 +1131,29 @@ elif case == "no-establishment":
     # processed, or whether the initiation was accepted.
     sequence(2000, [SIP_HINT, initiation(), transport()])
     est = []
+elif case in ("delivery-any", "delivery-endpoint", "delivery-unknown", "delivery-other-endpoint", "delivery-after-pin",
+              "delivery-initiation", "unwatched"):
+    # Finding 2 of the third review: a complete record shows what reached
+    # the namespace, not the server's socket. A SIP hint, then the client.
+    # A loss the watch reports for any endpoint, for this one, or unknown,
+    # while the hint arrived: it may never have reached the server (whose
+    # sockets, in the review, dropped 4780 datagrams while the record lost
+    # none): undecided. A loss for another endpoint, after the selection
+    # was pinned, or only around the initiation (a lost initiation is one
+    # not accepted, already a history): sip. A record that did not watch:
+    # undecided.
+    layout = NARROW
+    add(2000, SIP_HINT)
+    sequence(2030, [initiation(), transport()])
+    est = [(2025, 2060)]
+    lines.append({"delivery-any": "2002 - delivery 4780 1999 any",
+                  "delivery-endpoint": "2002 - delivery 1 1999 %s:41006" % A,
+                  "delivery-unknown": "2002 - delivery unknown 1999 any",
+                  "delivery-other-endpoint": "2002 - delivery 9 1999 %s:41007" % A,
+                  "delivery-after-pin": "2200 - delivery 3 2100 any",
+                  "delivery-initiation": "2032 - delivery 1 2029 any",
+                  "unwatched": None}[case] or "2001 %s 41007 2 abcd" % A)
+    watched = case != "unwatched"
 elif case == "poll-gap-hidden":
     # Finding 4 of the third review: a session (a STUN hint and an
     # initiation) whose frames the record's socket dropped at 19.2 s, after
@@ -1099,6 +1191,8 @@ elif case == "poll-gap-hidden":
     window = (2100, 2500)
 else:
     raise SystemExit("no case " + case)
+if watched:
+    lines.insert(0, "%d - delivery-watch 51998" % ready)
 # Complete through a cutoff after every window these cases use.
 lines.append("99999 - complete 99998")
 with open(path, "w") as out:
@@ -1120,20 +1214,29 @@ for CASE in "stun-colliding|0 expect random" "stun-clear|0 expect stun" "other-p
 	"other-address|0 expect random" "age-28|0 expect sip" "first-hint-wins|0 expect quic" "from-initiation|0 expect dns" \
 	"hp-sip-large|0 expect random" "hp-sip-small|0 expect sip" "policy-retry-connected|0 expect dns" \
 	"gap-full|0 expect stun" "gap-before-epoch|0 expect stun" "gap-after-pin|0 expect stun" "timing-fresh|0 expect sip" "timing-untimed-fresh|0 expect sip" \
-	"malformed-other-address|0 expect sip" "malformed-after-pin|0 expect sip" "fragment-other-port|0 expect sip"; do
+	"malformed-other-address|0 expect sip" "malformed-after-pin|0 expect sip" "fragment-other-port|0 expect sip" \
+	"delivery-other-endpoint|0 expect sip" "delivery-after-pin|0 expect sip" \
+	"delivery-initiation|0 expect sip"; do
 	assert_eq "${CASE#*|}" "$(auto_case "${CASE%%|*}" 2>&1)" "auto-expect, ${CASE%%|*}: ${CASE#*|}"
 done
 for CASE in age-30 age-32 hp-unmasked-initiation no-initiation policy-retry forgery gap-hidden timing-paused timing-untimed \
 	timing-step malformed malformed-early drops-during fragment late-record straddles-epoch retry retry-window-after \
-	no-establishment poll-gap-hidden; do
+	no-establishment delivery-any delivery-endpoint delivery-unknown unwatched \
+	poll-gap-hidden; do
 	GOT="$(auto_case "${CASE}" 2>&1)"
 	assert_true "auto-expect, ${CASE}: undecided, exit 1, never a guess (${GOT})" bash -c '[[ "$1" == "1 undecided "* ]]' _ "${GOT}"
 done
 # The reasons the third review's cases are undecided for: the evidence each
 # lacks, not a format the record no longer has.
-GOT="$(auto_case poll-gap-hidden 2>&1)"
-assert_true "auto-expect, poll-gap-hidden: undecided because of the frames the record dropped from 1900 (${GOT})" \
-	bash -c '[[ "$1" == "1 undecided 2 frames the record dropped between 1900 and 2300, before the selection was certainly pinned"* ]]' _ "${GOT}"
+for CASE in "delivery-any|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost 4780 datagrams from anyone" \
+	"delivery-endpoint|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost 1 datagrams from 192.0.2.2:41006" \
+	"delivery-unknown|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost unknown datagrams" \
+	"unwatched|the record did not watch delivery to the server's UDP sockets" \
+	"poll-gap-hidden|2 frames the record dropped between 1900 and 2300, before the selection was certainly pinned"; do
+	GOT="$(auto_case "${CASE%%|*}" 2>&1)"
+	assert_true "auto-expect, ${CASE%%|*}: undecided because ${CASE#*|} (${GOT})" \
+		bash -c '[[ "$1" == "1 undecided $2"* ]]' _ "${GOT}" "${CASE#*|}"
+done
 GOT="$(auto_case stun-clear 1500 1900 1950 2>&1)"
 assert_true "auto-expect, a window that ends before any initiation: undecided (${GOT})" \
 	bash -c '[[ "$1" == "1 undecided no initiation"* ]]' _ "${GOT}"
@@ -1164,7 +1267,9 @@ echo "=== The record's completeness and arrival times (Recorder, on a scripted s
 # core is the helper's own. The socket's clock is 100 s after boot when it is
 # created; frames come from 192.0.2.1 to port 40000.
 for CASE in delayed-ready queued-at-stop dequeue-delay no-stamp clock-step suspend endless wide-after wide-empty straddle \
-	narrow-boundary poll-preempted begin-preempted finish-preempted capture-queued capture-drops capture-endless; do
+	narrow-boundary poll-preempted begin-preempted finish-preempted delivery-quiet delivery-listener delivery-connected \
+	delivery-new-socket delivery-reconnected delivery-retired delivery-unseen delivery-other-port delivery-namespace \
+	delivery-dump-fails delivery-events-lost delivery-unavailable capture-queued capture-drops capture-endless; do
 	py recorder "${CASE}" >"${T}/recorder-${CASE}" 2>&1
 done
 # "<from>~<to>" or "<clock>" of the frame line (4 payload bytes) in a
@@ -1188,6 +1293,28 @@ for CASE in poll-preempted begin-preempted finish-preempted; do
 		bash -c 'read -r CLOCK _ _ _ SINCE <<<"$1"; [[ -n "${CLOCK}" ]] && ((SINCE <= $2 && $2 <= $3 && $3 <= CLOCK))' _ \
 		"${MARKER}" "$(cs_of "${CASE}" reset)" "$(cs_of "${CASE}" lost)"
 done
+# A delivery case's loss lines, "<count> <since> <peer>" with SINCE as
+# "watch" (the watch's start) or "poll" (the poll before).
+delivery_lines() { # <case>
+	awk -v watch="$(cs_of "$1" watch)" '$2 == "-" && $3 == "delivery" { print $4, ($5 == watch ? "watch" : "poll"), $6 }' "${T}/recorder-$1"
+}
+assert_true "the delivery watch is the record's first line, on the record's port" \
+	bash -c '[[ "$(sed -n "/^ready /{n;p}" "$1")" =~ ^[0-9]+\ -\ delivery-watch\ 40000$ ]]' _ "${T}/recorder-delivery-quiet"
+assert_eq "" "$(delivery_lines delivery-quiet)" "  with nothing lost, no loss is reported"
+assert_eq "5 poll any" "$(delivery_lines delivery-listener)" "a listener's drops are losses for any endpoint, since the poll before"
+assert_eq "3 poll 192.0.2.1:51820" "$(delivery_lines delivery-connected)" "a connected socket's drops are its endpoint's"
+assert_eq "2 poll any" "$(delivery_lines delivery-new-socket)" "a socket first seen with drops may have taken them before it was connected: any"
+assert_eq "4 poll any" "$(delivery_lines delivery-reconnected)" "  as may one connected since the last reading"
+assert_eq "unknown poll 192.0.2.1:51820" "$(delivery_lines delivery-retired)" \
+	"a socket gone since the last reading may have lost its endpoint's datagrams after it: unknown"
+assert_eq "unknown watch 192.0.2.1:51820" "$(delivery_lines delivery-unseen)" \
+	"a socket on the port destroyed before any reading saw it: unknown since the watch began"
+assert_eq "" "$(delivery_lines delivery-other-port)" "  one on another port is not the server's"
+assert_eq "4 poll any" "$(delivery_lines delivery-namespace)" "datagrams the namespace dropped before any socket are losses for any endpoint"
+assert_eq "unknown poll any" "$(delivery_lines delivery-dump-fails)" "a reading that fails leaves the interval unknown"
+assert_eq "unknown watch any" "$(delivery_lines delivery-events-lost)" "lost destruction notifications leave everything since the watch began unknown"
+assert_true "without notifications the record does not watch: no watch line, no loss lines" \
+	bash -c '! grep -q " - delivery" "$1"' _ "${T}/recorder-delivery-unavailable"
 assert_eq "capture records 23 losses 0 complete True" "$(grep '^capture ' "${T}/recorder-capture-queued")" \
 	"capture's records: the 22 good and the 1 bad datagram queued at the stop are all drained and recorded"
 assert_eq "capture records 23 losses 3 complete True" "$(grep '^capture ' "${T}/recorder-capture-drops")" \

@@ -543,6 +543,17 @@ echo "    (real STUN clients under the reviewed layout; the record decided:${OUT
 #     hint at its arrival, and the outcome is undecided (whether the server
 #     processed it more than 30 s before the initiation is not in the
 #     evidence). The binary's output is shown.
+# And what reached the namespace against what reached the server's socket
+# (review of 4af4bef, finding 2):
+#   udp-overflow: the server stopped (SIGSTOP), 5000 datagrams from the
+#     client's port, then a SIP hint; resumed, a client without imitation.
+#     The record holds every datagram, but the server's listener dropped
+#     most, the hint perhaps among them: the record's delivery watch reports
+#     the losses, and the outcome is undecided. The binary's output is shown.
+#   udp-clean: the same with 20 datagrams, which the listener's queue holds:
+#     no loss, sip, and the server's datagrams are sip.
+#   udp-unwatched: udp-clean's record without its delivery watch line, the
+#     evidence missing: undecided.
 CX_NAME="" CX_HP=0 CX_RECORD="" CX_EPOCH="" CX_EST="" CX_START="" CX_END="" CX_CAPTURE=""
 cx_begin() { # <name> <hp 0|1>
 	CX_NAME="$1" CX_HP="$2" CX_RECORD="${WORK}/$1.record" CX_EST=""
@@ -745,10 +756,64 @@ paused_record() {
 	cx_expect "a hint 32 s older than the initiation" "${CX_RECORD}" - undecided
 	cx_show kinds sip random
 }
+# Stop the server, send COUNT zero-filled datagrams from the client's port
+# and then the SIP hint, and resume it.
+udp_queue() { # <count>
+	local PID START RC
+	read -r PID START _ <<<"${PEERS[0]}"
+	python3 "${WIRE}" owned "${PID}" "${START}" STOP >/dev/null || return 1
+	sleep 0.1
+	ip netns exec "${NS_C}" python3 - "${ADDR_S}" "${PORT}" "${CLIENT_PORT}" "$1" <<'PY'
+import socket, sys
+sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sender.bind(("0.0.0.0", int(sys.argv[3])))
+for _ in range(int(sys.argv[4])):
+    sender.sendto(bytes(80), (sys.argv[1], int(sys.argv[2])))
+sender.sendto(b"OPTIONS sip:a@b SIP/2.0\r\n\r\n", (sys.argv[1], int(sys.argv[2])))
+PY
+	RC=$?
+	sleep 0.1
+	python3 "${WIRE}" owned "${PID}" "${START}" CONT >/dev/null || return 1
+	return "${RC}"
+}
+udp_overflow() {
+	cx_begin udp-overflow 0 || return
+	check "udp-overflow: 5000 datagrams and the SIP hint were sent to the stopped server" udp_queue 5000
+	sleep 0.5
+	cx_client none && cx_window kinds && cx_end || return
+	check "udp-overflow: the record has every datagram and dropped none ($(grep -c ' 41006 80 ' "${CX_RECORD}") of 5000)" \
+		bash -c '[[ "$(grep -c " 41006 80 " "$1")" == 5000 ]] && ! grep -q " - drops " "$1"' _ "${CX_RECORD}"
+	check "udp-overflow: its delivery watch reports the server's listener losing datagrams ($(grep ' - delivery ' "${CX_RECORD}" | head -n 3 | tr '\n' ';'))" \
+		grep -qE '^[0-9]+ - delivery [0-9]+ [0-9]+ any$' "${CX_RECORD}"
+	cx_expect "a SIP hint the server's listener may have dropped" "${CX_RECORD}" - undecided
+	cx_show kinds sip random
+}
+udp_clean() {
+	local BARE="${WORK}/udp-unwatched.record"
+	cx_begin udp-clean 0 || return
+	check "udp-clean: 20 datagrams and the SIP hint were sent to the stopped server" udp_queue 20
+	sleep 0.5
+	cx_client none && cx_window kinds && cx_end || return
+	check "udp-clean: its delivery watch reports no loss at the server's sockets" \
+		bash -c 'head -n 1 "$1" | grep -qE "^[0-9]+ - delivery-watch [0-9]+$" && ! grep -q " - delivery [0-9u]" "$1"' _ "${CX_RECORD}"
+	cx_expect "every datagram delivered" "${CX_RECORD}" - sip
+	if bt_wire_auto_verdict sip "${CX_CAPTURE}" kinds "${S_SIZES}"; then
+		ok "udp-clean: the server's datagrams to the client are sip, as the record decided (${BT_WIRE_REASON})"
+	else
+		bad "udp-clean: the server's datagrams to the client are sip, as the record decided (${BT_WIRE_REASON})"
+	fi
+	# The same record without the evidence of delivery.
+	sed 1d "${CX_RECORD}" >"${BARE}"
+	sed "s/^\(stopped\|complete\) [0-9]*/\1 $(wc -l <"${BARE}")/" "${CX_RECORD}.state" >"${BARE}.state"
+	CX_NAME=udp-unwatched
+	cx_expect "the record without its delivery watch" "${BARE}" - undecided
+}
 policy_retry
 forgery
 early_gap
 paused_record
+udp_overflow
+udp_clean
 
 echo
 echo "BoringTun auto hint test: ${PASSED} passed, ${FAILED} failed"

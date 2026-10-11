@@ -21,6 +21,9 @@
 #                   begins before the reset (third review, finding 4).
 #   clock-preempted-1, -2: a clock reading stopped 3 s between its realtime
 #                   reads; each arrival still holds its send (finding 3).
+#   delivery:       the UDP sockets on the record's port: a listener's and a
+#                   connected socket's drops, sockets closed after a reading
+#                   saw them, one no reading could see (finding 2).
 #   capture:        the client side's capture, stopped after 20 STUN-shaped
 #                   datagrams while 2 more and 1 unshaped arrive, ends at its
 #                   deadline or an authorized stop with all 23, and the STUN
@@ -80,12 +83,12 @@ def boot_cs():
     return time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 10 ** 7
 
 
-def start(name, buffer=None):
+def start(name, buffer=None, port="51998", source_port="41006"):
     path = WORK / (name + ".record")
     env = dict(os.environ)
     if buffer:
         env["BT_WIRE_RECORD_BUFFER"] = str(buffer)
-    process = subprocess.Popen([sys.executable, "-B", WIRE, "record", "51998", "any", "127.0.0.1", "41006", "120", str(path)],
+    process = subprocess.Popen([sys.executable, "-B", WIRE, "record", port, "any", "127.0.0.1", source_port, "120", str(path)],
                                env=env)
     state = pathlib.Path(str(path) + ".state")
     for _ in range(500):
@@ -313,6 +316,81 @@ for which, label in ((1, "the reading before the queue was found empty"), (2, "t
     check("it exits 0, both datagrams recorded (%d, %s)" % (rc, [row.split()[0] for row in rows]), rc == 0 and len(rows) == 2)
     check("preempting %s: each arrival holds its send (%d, %d) and is at most 4 s wide (%s)" % (label, first, second, bounds),
           len(bounds) == 2 and all(low - 1 <= at <= high and high - low <= 400 for (low, high), at in zip(bounds, (first, second))))
+
+print("--- delivery")
+DELIVERY_PORT = 51999
+
+
+def overflow(sock, sender_port, count=200):
+    """Send COUNT datagrams to SOCK's full queue from SENDER_PORT, then
+    drain it: how many the socket dropped."""
+    peer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    peer.bind(("127.0.0.1", sender_port))
+    for i in range(count):
+        peer.sendto(b"%08d" % i + bytes(504), ("127.0.0.1", DELIVERY_PORT))
+    peer.close()
+    sock.setblocking(False)
+    queued = 0
+    while True:
+        try:
+            sock.recv(2048)
+        except BlockingIOError:
+            return count - queued
+        queued += 1
+
+
+process, path = start("delivery", port=str(DELIVERY_PORT), source_port="any")
+time.sleep(0.6)
+listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+listener.bind(("127.0.0.1", DELIVERY_PORT))
+time.sleep(0.6)
+lost = overflow(listener, 41011)
+time.sleep(0.6)
+listener.close()
+time.sleep(0.6)
+connected = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+connected.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+connected.bind(("127.0.0.1", DELIVERY_PORT))
+connected.connect(("127.0.0.1", 41007))
+time.sleep(0.6)
+lost_connected = overflow(connected, 41007)
+time.sleep(0.6)
+connected.close()
+time.sleep(0.6)
+pause(process)
+brief = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+brief.bind(("127.0.0.1", DELIVERY_PORT))
+brief.connect(("127.0.0.1", 41012))
+brief.close()
+time.sleep(0.3)
+process.send_signal(signal.SIGCONT)
+time.sleep(0.6)
+rc = stop(process, path)
+rows = lines(path)
+found = [row.split() for row in rows if " - delivery " in row]
+watch = rows[0].split() if rows else ["0"]
+check("it exits 0, its first line the delivery watch of port %d (%s)" % (DELIVERY_PORT, " ".join(watch)),
+      rc == 0 and watch[1:] == ["-", "delivery-watch", str(DELIVERY_PORT)])
+
+
+def counted(peer):
+    return sum(int(row[3]) for row in found if row[5] == peer and row[3] != "unknown")
+
+
+def unknown(peer):
+    return [row for row in found if row[5] == peer and row[3] == "unknown"]
+
+
+check("the listener's %d drops are reported for any endpoint (%s)" % (lost, [" ".join(row[3:]) for row in found]),
+      lost > 0 and counted("any") == lost)
+check("the connected socket's %d drops for its endpoint, 127.0.0.1:41007 (%d)" % (lost_connected, counted("127.0.0.1:41007")),
+      lost_connected > 0 and counted("127.0.0.1:41007") == lost_connected)
+check("each socket closed after a reading saw it leaves what it lost after that reading unknown, once",
+      len(unknown("any")) == 1 and len(unknown("127.0.0.1:41007")) == 1)
+check("a socket created and closed while no reading could see it: unknown since the watch began",
+      len(unknown("127.0.0.1:41012")) == 1 and int(unknown("127.0.0.1:41012")[0][4]) <= int(watch[0]))
+check("and nothing for anyone else", all(row[5] in ("any", "127.0.0.1:41007", "127.0.0.1:41012") for row in found))
 
 print("--- capture")
 CAPTURE_PORT = 41010
