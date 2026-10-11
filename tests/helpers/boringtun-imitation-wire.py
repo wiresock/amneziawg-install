@@ -53,7 +53,7 @@
       IPv4/UDP as "<clock> <address> - malformed <length> <its first 40
       bytes>", and frames its packet socket dropped (PACKET_STATISTICS,
       polled after every wakeup, into a 32 MiB receive buffer) as "<clock> -
-      drops <count> <clock of the poll before>". Several source
+      drops <count> <clock before the previous poll>". Several source
       addresses, any source port, and with "any" every interface of the
       namespace, also one created later: what reached the server from its
       clients, in arrival order. Transcript and exit statuses are capture's.
@@ -669,31 +669,46 @@ PACKET_STATISTICS = 6
 SO_TIMESTAMPNS = getattr(socket, "SO_TIMESTAMPNS", 35)
 # Frames read per wakeup before drops and clocks are polled again.
 RECORD_BATCH = 256
-# How long the shutdown drain may take before the record ends incomplete,
-# and how long past the cutoff the queue must still be found empty: a frame
-# stamped just before the cutoff may be queued a moment later.
+# How long the shutdown drain may take before the record ends incomplete.
 RECORD_DRAIN_NS = 5 * 10 ** 9
+# The record's one timing assumption (not a kernel guarantee): the kernel
+# queues a frame to the record's packet socket within RECORD_SETTLE_NS of
+# its receive timestamp. The drain relies on it (the queue must be found
+# empty that long past the cutoff), and so does the lower bound of an
+# arrival without a usable stamp.
 RECORD_SETTLE_NS = 10 ** 8
 # The longest a wait lasts, so that drops and clocks are polled while idle.
 RECORD_IDLE_NS = 5 * 10 ** 8
-# How far two readings of a clock offset may differ without counting as a
-# step of the realtime clock or a suspend (boottime against monotonic).
+# How far two readings of a clock offset may differ beyond their brackets
+# without counting as a step of the realtime clock or a suspend (boottime
+# against monotonic).
 CLOCK_TOLERANCE_NS = 2 * 10 ** 6
 
 
 class ClockSample:
-    """One reading of the clocks: CLOCK_BOOTTIME (BOOT), the offset of
-    CLOCK_REALTIME from it (REAL_OFFSET, bracketed by two realtime readings,
-    whose spread is REAL_ERROR) and the offset of CLOCK_MONOTONIC from it
-    (MONO_OFFSET). Kernel receive timestamps are realtime; the shell's clock
-    is boottime (/proc/uptime); the server measures hint ages on monotonic."""
+    """One reading of the clocks: CLOCK_BOOTTIME (BOOT); the offset of
+    CLOCK_REALTIME from it, within REAL_ERROR of REAL_OFFSET (realtime is
+    read before and after BOOT, so the offset at BOOT lies between those two
+    readings' offsets: a reading preempted between them has a wide bracket,
+    and the bracket is kept, never narrowed to its middle); and the offset
+    of CLOCK_MONOTONIC from it (MONO_OFFSET). Kernel receive timestamps are
+    realtime; the shell's clock is boottime (/proc/uptime); the server
+    measures hint ages on monotonic."""
 
     def __init__(self, boot, real_offset, real_error, mono_offset):
         self.boot, self.real_offset, self.real_error, self.mono_offset = boot, real_offset, real_error, mono_offset
 
+    def offsets(self):
+        """The realtime offset's bounds, (low, high)."""
+        return self.real_offset - self.real_error, self.real_offset + self.real_error
+
     def steady_since(self, earlier):
-        """Whether neither offset moved between EARLIER and this reading."""
-        return (abs(self.real_offset - earlier.real_offset) <= CLOCK_TOLERANCE_NS + self.real_error + earlier.real_error
+        """Whether neither offset moved between EARLIER and this reading, as
+        far as the readings tell: the realtime offsets' brackets meet, within
+        CLOCK_TOLERANCE_NS, and the monotonic offsets agree within it."""
+        low, high = self.offsets()
+        earlier_low, earlier_high = earlier.offsets()
+        return (low <= earlier_high + CLOCK_TOLERANCE_NS and earlier_low <= high + CLOCK_TOLERANCE_NS
                 and abs(self.mono_offset - earlier.mono_offset) <= CLOCK_TOLERANCE_NS)
 
 
@@ -703,7 +718,7 @@ class SystemClocks:
         boot = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
         mono = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
         real_after = time.clock_gettime_ns(time.CLOCK_REALTIME)
-        return ClockSample(boot, (real_before + real_after) // 2 - boot, real_after - real_before, boot - mono)
+        return ClockSample(boot, (real_before + real_after) // 2 - boot, abs(real_after - real_before), boot - mono)
 
     def boot(self):
         return time.clock_gettime_ns(time.CLOCK_BOOTTIME)
@@ -769,24 +784,32 @@ class Recorder:
       "<arrival> <address> - malformed <length> <hex>" not valid IPv4/UDP,
                                                        its first 40 bytes
 
-    ARRIVAL is the kernel's receive time in centiseconds of CLOCK_BOOTTIME,
-    converted from the realtime timestamp with the offset read at the time it
-    was read, when the offsets did not move since the queue was last seen
-    empty; otherwise, or without a timestamp, "<from>~<to>": the frame arrived
-    after the queue was last seen empty and before it was read. Markers:
+    ARRIVAL bounds the kernel's receive time, in centiseconds of
+    CLOCK_BOOTTIME: "<clock>" when the bounds fall in one centisecond, else
+    "<from>~<to>". The realtime receive timestamp is converted with the
+    realtime offset's whole bracket over the two readings around the frame's
+    wait in the queue (the one before the queue was last found empty, and
+    the one after the frame was read), and a frame never arrived after it
+    was read. Without a timestamp: from RECORD_SETTLE_NS before the queue was
+    last found empty until it was read. Markers:
 
-      "<clock> - drops <count> <since>"   frames the socket dropped since the
-                                          poll at SINCE (polled after every
-                                          batch, from a baseline taken before
-                                          the record was ready)
+      "<clock> - drops <count> <since>"   frames the packet socket dropped
+                                          between SINCE and CLOCK
       "<clock> - clock-step <since>"      the realtime or the boottime clock
                                           stepped (or the system suspended)
                                           since the reading at SINCE
-      "<clock> - complete <cutoff>"       the last line: every frame that
-                                          arrived by CUTOFF is recorded or
+      "<clock> - complete <cutoff>"       the last line: every frame queued
+                                          to the record's socket before it
+                                          was found empty RECORD_SETTLE_NS
+                                          past CUTOFF is recorded or
                                           counted in a drops line
       "<clock> - incomplete <cutoff>"     the last line when the queue could
                                           not be drained to CUTOFF in time
+
+    Counters are read between two clock readings: each loss interval runs
+    from the reading taken before the previous poll's counters (before a
+    reset) to the reading taken after this poll's, so preemption anywhere
+    in a poll widens it and never moves a loss outside it.
     """
 
     def __init__(self, source, clocks, out, wanted_sources, wanted_port, destination_port, created):
@@ -794,8 +817,8 @@ class Recorder:
         self.wanted_sources, self.wanted_port, self.destination_port = wanted_sources, wanted_port, destination_port
         self.fragments = Fragments()
         self.records = 0
-        # Every queued frame arrived after this reading: the socket's
-        # creation, then each time the queue was found empty.
+        # The reading taken before the read that last found the queue empty
+        # (at first, the socket's creation).
         self.empty = created
         self.last = created
         self.polled = created.boot
@@ -813,24 +836,29 @@ class Recorder:
         self.polled = before.boot
         return ready
 
-    def arrival(self, stamp, now):
-        """The arrival field of a frame read at reading NOW."""
-        low, high = self.empty.boot, self.clocks.boot()
-        if stamp is not None and now.steady_since(self.empty):
-            boot = stamp - now.real_offset
-            slack = CLOCK_TOLERANCE_NS + now.real_error
-            if low - slack <= boot <= high + slack:
-                return "%d" % centiseconds_down(min(max(boot, low), high))
-        return "%d~%d" % (centiseconds_down(low), centiseconds_up(high))
+    def arrival(self, stamp, read, after):
+        """The arrival field of a frame with kernel receive STAMP, read
+        before the boottime reading READ, in a batch read before the reading
+        AFTER."""
+        bounds = self.empty.offsets() + after.offsets()
+        low, high = None, read
+        if stamp is not None:
+            low, high = stamp - max(bounds), min(stamp - min(bounds), read)
+        if low is None or low > high:
+            low, high = self.empty.boot - RECORD_SETTLE_NS, read
+        first, last = centiseconds_down(max(low, 0)), centiseconds_up(high)
+        if last <= first + 1:
+            return "%d" % first
+        return "%d~%d" % (first, last)
 
-    def frame(self, frame, stamp, now):
+    def frame(self, frame, stamp, read, after):
         if len(frame) < 16 or frame[12:16] not in self.wanted_sources:
             return
         status, length, data, fragmented = frame_payload(frame, frame[12:16], self.wanted_port,
                                                          destination_port=self.destination_port, fragments=self.fragments)
         if status in (IGNORE, CONTINUATION):
             return
-        at = self.arrival(stamp, now)
+        at = self.arrival(stamp, read, after)
         address = socket.inet_ntoa(frame[12:16])
         if status == MALFORMED:
             self.write("%s %s - malformed %d %s" % (at, address, length, frame[:MALFORMED_KEPT].hex()))
@@ -843,30 +871,44 @@ class Recorder:
             self.write("%s %s %d %d %s" % (at, address, sport, length, data.hex() or "-"))
 
     def batch(self, limit):
-        """Read up to LIMIT frames; True if the queue was found empty."""
-        now = self.clocks.sample()
+        """Read up to LIMIT frames, then write them; True if the queue was
+        found empty: by a read after a clock reading, so that every frame
+        queued later was queued after that reading."""
+        frames = []
+        empty = None
         for _ in range(limit):
             item = self.source.read()
             if item is None:
-                self.empty = self.clocks.sample()
-                return True
-            self.frame(item[0], item[1], now)
-        return False
+                mark = self.clocks.sample()
+                item = self.source.read()
+                if item is None:
+                    empty = mark
+                    break
+            frames.append((item[0], item[1], self.clocks.boot()))
+        after = self.clocks.sample()
+        for frame, stamp, read in frames:
+            self.frame(frame, stamp, read, after)
+        if empty is not None:
+            self.empty = empty
+        return empty is not None
 
     def poll(self):
         """Report drops and clock steps since the last poll."""
+        before = self.clocks.sample()
         dropped = self.source.drops()
         now = self.clocks.sample()
+        clock, since = centiseconds_up(now.boot), centiseconds_down(self.polled)
         if dropped:
-            self.write("%d - drops %d %d" % (centiseconds_up(now.boot), dropped, centiseconds_down(self.polled)))
+            self.write("%d - drops %d %d" % (clock, dropped, since))
         if not now.steady_since(self.last):
-            self.write("%d - clock-step %d" % (centiseconds_up(now.boot), centiseconds_down(self.last.boot)))
-        self.polled, self.last = now.boot, now
+            self.write("%d - clock-step %d" % (clock, centiseconds_down(self.last.boot)))
+        self.polled, self.last = before.boot, now
 
     def finish(self, cutoff):
         """Drain the queue through CUTOFF (a boottime reading), within
-        RECORD_DRAIN_NS, report the drops and write the end marker. True if
-        the record is complete through CUTOFF."""
+        RECORD_DRAIN_NS, report the losses and write the end marker. True if
+        the record is complete through CUTOFF: the queue was found empty
+        RECORD_SETTLE_NS past it."""
         give_up = self.clocks.boot() + RECORD_DRAIN_NS
         complete = False
         while self.clocks.boot() < give_up:

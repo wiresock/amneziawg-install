@@ -372,17 +372,31 @@ elif cmd == "chacha20":
 elif cmd == "recorder":
     # recorder <case>: the record's core (Recorder) on a scripted packet
     # source and scripted clocks, its lines printed with bytes abbreviated.
-    import io
+    import errno, io
     case = sys.argv[3]
     SECOND = 10 ** 9
 
     class Clocks:
+        """Realtime is boottime plus REAL_OFFSET. A reading is taken as
+        SystemClocks takes it: realtime, boottime, monotonic, realtime; the
+        reading numbered PAUSE_AT is preempted for PAUSE between its first
+        realtime read and its boottime read; SPREAD widens every reading's
+        realtime bracket."""
+
         def __init__(self):
             self.boot_ns, self.real_offset, self.mono_offset = 100 * SECOND, 1_700_000_000 * SECOND, 5 * SECOND
+            self.calls, self.pause_at, self.pause, self.spread = 0, None, 3 * SECOND, 0
 
         def sample(self):
+            self.calls += 1
             self.boot_ns += 1000
-            return wire.ClockSample(self.boot_ns, self.real_offset, 0, self.mono_offset)
+            real_before = self.boot_ns + self.real_offset
+            if self.calls == self.pause_at:
+                self.boot_ns += self.pause
+            boot = self.boot_ns
+            real_after = self.boot_ns + self.real_offset
+            return wire.ClockSample(boot, (real_before + real_after) // 2 - boot, real_after - real_before + self.spread,
+                                    self.mono_offset)
 
         def boot(self):
             self.boot_ns += 1000
@@ -393,10 +407,11 @@ elif cmd == "recorder":
 
     class Source:
         """Frames queued with their kernel stamps; DROPPED counts like
-        PACKET_STATISTICS and resets on reading; ENDLESS keeps the queue full."""
+        PACKET_STATISTICS and resets on reading; ENDLESS keeps the queue full;
+        HOOKS[n] runs right after the nth reading resets the count."""
 
         def __init__(self):
-            self.queue, self.dropped, self.endless = [], 0, False
+            self.queue, self.dropped, self.endless, self.calls, self.hooks = [], 0, False, 0, {}
 
         def read(self):
             if self.endless:
@@ -405,7 +420,10 @@ elif cmd == "recorder":
             return self.queue.pop(0) if self.queue else None
 
         def drops(self):
+            self.calls += 1
             dropped, self.dropped = self.dropped, 0
+            if self.calls in self.hooks:
+                self.hooks[self.calls]()
             return dropped
 
     clocks, source, out = Clocks(), Source(), io.StringIO()
@@ -413,6 +431,16 @@ elif cmd == "recorder":
     recorder = wire.Recorder(source, clocks, out, {SERVER}, None, 40000, clocks.sample())
     def stamped(payload, before_ns):
         return (ipv4(payload), clocks.boot_ns - before_ns + clocks.real_offset)
+    def preempted_after_reset():
+        # The counters were just reset; the recorder is preempted for 2 s,
+        # and 993 frames are dropped 1 s into it.
+        print("reset-cs %d" % (clocks.boot_ns // 10 ** 7))
+        clocks.sleep(SECOND)
+        source.dropped = 993
+        print("lost-cs %d" % (clocks.boot_ns // 10 ** 7))
+        clocks.sleep(SECOND)
+    if case == "begin-preempted":
+        source.hooks[1] = preempted_after_reset
     ready = recorder.begin()
     if case == "delayed-ready":
         # Drops after readiness, before the first poll, are reported.
@@ -455,6 +483,57 @@ elif cmd == "recorder":
     elif case == "endless":
         # Traffic that never lets the queue empty: the drain gives up in time.
         source.endless = True
+        recorder.finish(clocks.boot())
+    elif case in ("wide-after", "wide-empty"):
+        # A clock reading preempted for 3 s between its two realtime reads
+        # brackets the offset 3 s wide: the reading after the frame was read,
+        # or the one before the queue was last found empty. The frame's
+        # arrival is the interval that bracket allows, never its middle as
+        # an exact stamp.
+        clocks.sleep(SECOND)
+        if case == "wide-empty":
+            clocks.pause_at = clocks.calls + 1
+            recorder.batch(256)
+            clocks.sleep(SECOND)
+            arrived = clocks.boot_ns - SECOND // 2
+            source.queue = [(ipv4(b"wide"), arrived + clocks.real_offset)]
+        else:
+            arrived = clocks.boot_ns - SECOND // 2
+            source.queue = [(ipv4(b"wide"), arrived + clocks.real_offset)]
+            clocks.pause_at = clocks.calls + 2
+        recorder.batch(256)
+        print("arrived-cs %d" % (arrived // 10 ** 7))
+        recorder.finish(clocks.boot())
+    elif case in ("straddle", "narrow-boundary"):
+        # A stamp 1 ms past a centisecond: with every reading's bracket 6 ms
+        # wide, the arrival spans the boundary and is an interval; with
+        # exact readings it is that centisecond.
+        if case == "straddle":
+            clocks.spread = 6 * 10 ** 6
+        clocks.sleep(SECOND)
+        arrived = (clocks.boot_ns // 10 ** 7 - 10) * 10 ** 7 + 10 ** 6
+        source.queue = [(ipv4(b"edge"), arrived + clocks.real_offset)]
+        recorder.batch(256)
+        print("arrived-cs %d" % (arrived // 10 ** 7))
+        recorder.finish(clocks.boot())
+    elif case in ("poll-preempted", "begin-preempted", "finish-preempted"):
+        # The review's interleaving: the counters reset, the recorder is
+        # preempted before its next clock reading, and frames are dropped
+        # meanwhile. Their interval must contain when they were dropped:
+        # from the reading before the reset. At the first poll, at the
+        # baseline taken before readiness, or at the last regular poll
+        # before the stop's final collection.
+        clocks.sleep(SECOND)
+        if case == "poll-preempted":
+            source.hooks[source.calls + 1] = preempted_after_reset
+            recorder.poll()
+            clocks.sleep(SECOND)
+            recorder.poll()
+        elif case == "begin-preempted":
+            recorder.poll()
+        else:
+            source.hooks[source.calls + 1] = preempted_after_reset
+            recorder.poll()
         recorder.finish(clocks.boot())
     print("ready %d" % wire.centiseconds_down(ready.boot))
     for line in out.getvalue().splitlines():
@@ -968,6 +1047,41 @@ elif case == "no-establishment":
     # processed, or whether the initiation was accepted.
     sequence(2000, [SIP_HINT, initiation(), transport()])
     est = []
+elif case == "poll-gap-hidden":
+    # Finding 4 of the third review: a session (a STUN hint and an
+    # initiation) whose frames the record's socket dropped at 19.2 s, after
+    # the counters reset at 19 s, while the recorder was preempted until 21
+    # s before its next clock reading; then a SIP hint and the client. The
+    # drops line comes from the recorder's own poll on the review's scripted
+    # counters and clocks: it must reach back to 19 s, where the hidden
+    # session may have pinned the peer: undecided (the earlier recorder
+    # reported 21 s to 23 s, which looked like after the pin: sip).
+    layout = NARROW
+    class Clock:
+        def __init__(self):
+            self.ns = 1900 * 10 ** 7
+        def sample(self):
+            return wire.ClockSample(self.ns, 10 ** 15, 0, 0)
+        def boot(self):
+            return self.ns
+    class Counters:
+        def __init__(self, clock):
+            self.clock, self.count = clock, 0
+        def drops(self):
+            self.count += 1
+            if self.count == 1:
+                self.clock.ns = 2100 * 10 ** 7
+                return 0
+            return 2
+    clock, marker = Clock(), io.StringIO()
+    recorder = wire.Recorder(Counters(clock), clock, marker, {bytes([192, 0, 2, 2])}, None, 51998, clock.sample())
+    recorder.poll()
+    clock.ns = 2300 * 10 ** 7
+    recorder.poll()
+    add(2000, SIP_HINT)
+    sequence(2010, [initiation(), transport()])
+    lines.append(marker.getvalue().strip())
+    window = (2100, 2500)
 else:
     raise SystemExit("no case " + case)
 # Complete through a cutoff after every window these cases use.
@@ -996,10 +1110,15 @@ for CASE in "stun-colliding|0 expect random" "stun-clear|0 expect stun" "other-p
 done
 for CASE in age-30 age-32 hp-unmasked-initiation no-initiation policy-retry forgery gap-hidden timing-paused timing-untimed \
 	timing-step malformed malformed-early drops-during fragment late-record straddles-epoch retry retry-window-after \
-	no-establishment; do
+	no-establishment poll-gap-hidden; do
 	GOT="$(auto_case "${CASE}" 2>&1)"
 	assert_true "auto-expect, ${CASE}: undecided, exit 1, never a guess (${GOT})" bash -c '[[ "$1" == "1 undecided "* ]]' _ "${GOT}"
 done
+# The reasons the third review's cases are undecided for: the evidence each
+# lacks, not a format the record no longer has.
+GOT="$(auto_case poll-gap-hidden 2>&1)"
+assert_true "auto-expect, poll-gap-hidden: undecided because of the frames the record dropped from 1900 (${GOT})" \
+	bash -c '[[ "$1" == "1 undecided 2 frames the record dropped between 1900 and 2300, before the selection was certainly pinned"* ]]' _ "${GOT}"
 GOT="$(auto_case stun-clear 1500 1900 1950 2>&1)"
 assert_true "auto-expect, a window that ends before any initiation: undecided (${GOT})" \
 	bash -c '[[ "$1" == "1 undecided no initiation"* ]]' _ "${GOT}"
@@ -1029,8 +1148,30 @@ echo "=== The record's completeness and arrival times (Recorder, on a scripted s
 # The packet socket and the clocks are scripted (py recorder); the record's
 # core is the helper's own. The socket's clock is 100 s after boot when it is
 # created; frames come from 192.0.2.1 to port 40000.
-for CASE in delayed-ready queued-at-stop dequeue-delay no-stamp clock-step suspend endless; do
+for CASE in delayed-ready queued-at-stop dequeue-delay no-stamp clock-step suspend endless wide-after wide-empty straddle \
+	narrow-boundary poll-preempted begin-preempted finish-preempted; do
 	py recorder "${CASE}" >"${T}/recorder-${CASE}" 2>&1
+done
+# "<from>~<to>" or "<clock>" of the frame line (4 payload bytes) in a
+# recorder case, and the value of one of its "<name>-cs <clock>" lines.
+arrival_of() { awk '$2 == "192.0.2.1" && $5 == "<4" { print $1; exit }' "${T}/recorder-$1"; }
+cs_of() { awk -v name="$2-cs" '$1 == name { print $2; exit }' "${T}/recorder-$1"; }
+# Whether ARRIVAL is an interval that holds CLOCK and is at least WIDTH wide.
+interval_holds() { # <arrival> <clock> <width>
+	[[ "$1" =~ ^([0-9]+)~([0-9]+)$ ]] && ((BASH_REMATCH[1] <= $2 && $2 <= BASH_REMATCH[2] && BASH_REMATCH[2] - BASH_REMATCH[1] >= $3))
+}
+for CASE in wide-after wide-empty; do
+	assert_true "a reading preempted 3 s between its realtime reads (${CASE#wide-}): the arrival is an interval that holds the true one ($(cs_of "${CASE}" arrived)), not an exact stamp ($(arrival_of "${CASE}"))" \
+		interval_holds "$(arrival_of "${CASE}")" "$(cs_of "${CASE}" arrived)" 100
+done
+assert_true "a stamp 1 ms past a centisecond, read with 6 ms brackets: an interval across the boundary ($(arrival_of straddle))" \
+	interval_holds "$(arrival_of straddle)" "$(cs_of straddle arrived)" 2
+assert_eq "$(cs_of narrow-boundary arrived)" "$(arrival_of narrow-boundary)" "  with exact readings, that centisecond"
+for CASE in poll-preempted begin-preempted finish-preempted; do
+	MARKER="$(grep -E '^[0-9]+ - drops 993 [0-9]+$' "${T}/recorder-${CASE}")"
+	assert_true "counters reset and the recorder preempted 2 s before its next reading (${CASE%-preempted}): the drops line's interval (${MARKER}) begins before the reset ($(cs_of "${CASE}" reset)) and holds the loss ($(cs_of "${CASE}" lost))" \
+		bash -c 'read -r CLOCK _ _ _ SINCE <<<"$1"; [[ -n "${CLOCK}" ]] && ((SINCE <= $2 && $2 <= $3 && $3 <= CLOCK))' _ \
+		"${MARKER}" "$(cs_of "${CASE}" reset)" "$(cs_of "${CASE}" lost)"
 done
 assert_true "the drop counters' baseline comes before readiness: 993 drops after it, before the first poll, are reported, the 7 before the record existed are not ($(grep -c ' drops ' "${T}/recorder-delayed-ready"))" \
 	bash -c 'grep -qE "^[0-9]+ - drops 993 [0-9]+$" "$1" && ! grep -q " drops 7 " "$1" && [[ "$(tail -n 1 "$1")" =~ \ -\ complete\ [0-9]+$ ]]' _ "${T}/recorder-delayed-ready"
@@ -1040,7 +1181,7 @@ assert_true "a frame read 2.2 s after it arrived is recorded at its kernel arriv
 	bash -c 'grep -qx "arrival-error-cs 0" "$1"' _ "${T}/recorder-dequeue-delay"
 assert_true "a frame without a kernel stamp is recorded with the interval it must have arrived in ($(grep '<4 bytes>' "${T}/recorder-no-stamp"))" \
 	bash -c 'grep -qE "^[0-9]+~[0-9]+ 192\.0\.2\.1 51820 4 <4 bytes>$" "$1"' _ "${T}/recorder-no-stamp"
-assert_true "a realtime step while a frame waits: its stamp is not converted, it gets its interval, and the step is marked ($(grep -c clock-step "${T}/recorder-clock-step"))" \
+assert_true "a realtime step while a frame waits: its stamp converts under either offset, an interval, and the step is marked ($(grep -c clock-step "${T}/recorder-clock-step"))" \
 	bash -c 'grep -qE "^[0-9]+~[0-9]+ 192\.0\.2\.1 51820 4 <4 bytes>$" "$1" && grep -qE "^[0-9]+ - clock-step [0-9]+$" "$1"' _ "${T}/recorder-clock-step"
 assert_true "a suspend (boottime moving against monotonic, the server's clock) is marked as a clock step" \
 	bash -c 'grep -qE "^[0-9]+ - clock-step [0-9]+$" "$1"' _ "${T}/recorder-suspend"

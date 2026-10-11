@@ -16,6 +16,11 @@
 #   flood-at-stop:  datagrams keep coming while it stops: it still ends within
 #                   its drain budget, with an end marker.
 #   interrupted:    a SIGTERM nobody authorized ends it "interrupted" (status 3).
+#   poll-preempted: the record stopped right after its drop counters reset
+#                   while 1000 datagrams overflow it: the drops line's interval
+#                   begins before the reset (third review, finding 4).
+#   clock-preempted-1, -2: a clock reading stopped 3 s between its realtime
+#                   reads; each arrival still holds its send (finding 3).
 #
 # Requirements: root, ip (iproute2) with network namespaces, python3 and
 # AWG_DISPOSABLE_HOST_TEST=1.
@@ -188,6 +193,122 @@ rc = stop(process, path, authorized=False)
 transcript = pathlib.Path(str(path) + ".state").read_text().splitlines()
 check("a SIGTERM nobody authorized ends it with status 3 (%d)" % rc, rc == 3)
 check("and the transcript says interrupted (%s)" % transcript[-1:], len(transcript) == 2 and transcript[1].startswith("interrupted "))
+
+# The helper's record with one function patched to stop the process where a
+# scheduler would preempt it: PATCH names the function, ARM a file whose
+# presence arms it, PAUSED the file it writes (with the clock) when it stops.
+PATCHED = r'''
+import importlib.util, os, pathlib, signal, sys, time
+spec = importlib.util.spec_from_file_location("wire", sys.argv[1])
+wire = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wire)
+patch, arm, paused = sys.argv[2], pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4])
+def pause():
+    paused.write_text("%d\n" % (time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 10 ** 7))
+    os.kill(os.getpid(), signal.SIGSTOP)
+if patch.startswith("sample-"):
+    # The Nth clock reading a batch takes after arming stops between its
+    # first realtime read and its boottime read.
+    which, calls = int(patch.split("-")[1]), [0]
+    def sample(self):
+        real_before = time.clock_gettime_ns(time.CLOCK_REALTIME)
+        if sys._getframe(1).f_code.co_name == "batch" and arm.exists():
+            calls[0] += 1
+            if calls[0] == which:
+                arm.unlink()
+                pause()
+        boot = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        mono = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        real_after = time.clock_gettime_ns(time.CLOCK_REALTIME)
+        return wire.ClockSample(boot, (real_before + real_after) // 2 - boot, abs(real_after - real_before), boot - mono)
+    wire.SystemClocks.sample = sample
+elif patch == "drops":
+    # The first poll after arming stops right after the counters reset.
+    original = wire.PacketSource.drops
+    def drops(self):
+        count = original(self)
+        if arm.exists() and sys._getframe(1).f_code.co_name == "poll":
+            arm.unlink()
+            pause()
+        return count
+    wire.PacketSource.drops = drops
+sys.exit(wire.record(*sys.argv[5:]))
+'''
+
+
+def start_patched(name, patch, buffer=None):
+    path = WORK / (name + ".record")
+    arm, paused = WORK / (name + ".arm"), WORK / (name + ".paused")
+    env = dict(os.environ)
+    if buffer:
+        env["BT_WIRE_RECORD_BUFFER"] = str(buffer)
+    process = subprocess.Popen([sys.executable, "-B", "-c", PATCHED, WIRE, patch, str(arm), str(paused),
+                                "51998", "any", "127.0.0.1", "41006", "120", str(path)], env=env)
+    state = pathlib.Path(str(path) + ".state")
+    for _ in range(500):
+        if state.exists() and state.read_text().startswith("ready "):
+            return process, path, arm, paused
+        time.sleep(0.01)
+    process.kill()
+    raise SystemExit("the record did not become ready")
+
+
+def stopped(process, paused):
+    """The clock at which the armed record stopped itself."""
+    for _ in range(500):
+        if paused.exists() and pathlib.Path("/proc/%d/stat" % process.pid).read_text().rsplit(")", 1)[1].split()[0] == "T":
+            return int(paused.read_text())
+        time.sleep(0.01)
+    raise SystemExit("the record did not stop where it was armed to")
+
+
+def arrival(row):
+    """(low, high) centiseconds of a record line's arrival field."""
+    low, _, high = row.split()[0].partition("~")
+    return int(low), int(high) if high else int(low) + 1
+
+
+print("--- poll-preempted")
+process, path, arm, paused = start_patched("poll-preempted", "drops", buffer=4096)
+arm.touch()
+reset = stopped(process, paused)
+sent = boot_cs()
+send(1000, 512)
+sent_end = boot_cs()
+time.sleep(0.5)
+process.send_signal(signal.SIGCONT)
+rc = stop(process, path)
+markers = [row.split() for row in lines(path) if " - drops " in row]
+check("it exits 0 after its authorized stop (%d)" % rc, rc == 0)
+check("the datagrams sent while it was stopped after the reset (%d to %d) were dropped and reported (%s)"
+      % (sent, sent_end, [" ".join(marker) for marker in markers]), bool(markers))
+check("their interval begins no later than the reset (%d) and ends after the last send" % reset,
+      bool(markers) and int(markers[0][4]) <= reset <= sent and int(markers[0][0]) >= sent_end)
+
+for which, label in ((1, "the reading before the queue was found empty"), (2, "the reading after the batch")):
+    print("--- clock-preempted-%d" % which)
+    # The datagram is queued while the record is stopped, so that the batch
+    # that reads it takes the armed reading; the second comes right after
+    # the preempted reading, before an idle wakeup could replace it.
+    process, path, arm, paused = start_patched("clock-preempted-%d" % which, "sample-%d" % which)
+    pause(process)
+    first = boot_cs()
+    send(1)
+    arm.touch()
+    process.send_signal(signal.SIGCONT)
+    stopped(process, paused)
+    time.sleep(3)
+    process.send_signal(signal.SIGCONT)
+    second = boot_cs()
+    send(1)
+    time.sleep(0.3)
+    rc = stop(process, path)
+    rows = datagrams(lines(path))
+    bounds = [arrival(row) for row in rows]
+    check("it exits 0, both datagrams recorded (%d, %s)" % (rc, [row.split()[0] for row in rows]), rc == 0 and len(rows) == 2)
+    check("preempting %s: each arrival holds its send (%d, %d) and is at most 4 s wide (%s)" % (label, first, second, bounds),
+          len(bounds) == 2 and all(low - 1 <= at <= high and high - low <= 400 for (low, high), at in zip(bounds, (first, second))))
+
 
 print()
 print("BoringTun record live test: %d passed, %d failed" % (PASSED, FAILED))

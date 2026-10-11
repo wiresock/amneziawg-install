@@ -739,7 +739,9 @@ paused_record() {
 	cx_client none && cx_window kinds && cx_end || return
 	STAMP="$(awk -v hint="$(printf 'OPTIONS sip:a@b SIP/2.0\r\n\r\n' | od -An -tx1 | tr -d ' \n')" '$5 == hint { print $1; exit }' "${CX_RECORD}")"
 	check "paused-record: the hint is stamped at its arrival (${STAMP:-none}), not when the resumed record read it (planted at ${PLANTED})" \
-		bash -c '[[ "$1" =~ ^[0-9]+$ ]] && (($1 >= $2 && $1 <= $2 + 100))' _ "${STAMP}" "${PLANTED}"
+		bash -c '[[ "$1" =~ ^([0-9]+)(~([0-9]+))?$ ]] || exit 1
+			LOW="${BASH_REMATCH[1]}" HIGH="${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}"
+			((LOW >= $2 && HIGH <= $2 + 100))' _ "${STAMP}" "${PLANTED}"
 	cx_expect "a hint 32 s older than the initiation" "${CX_RECORD}" - undecided
 	cx_show kinds sip random
 }
