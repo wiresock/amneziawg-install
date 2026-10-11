@@ -2887,12 +2887,16 @@ explains its behaviour, and offers it only when the installed binary supports it
     saw it leaves its whole life unknown, for any endpoint, whatever it was connected to when
     destroyed. Lost, cut or malformed notifications, and any dump that does not complete with
     status 0 (an error reply, a failed or interrupted completion, a reply to another request, a
-    message cut short), leave their span unknown; an incomplete dump is never an empty table. The
+    message cut short), leave their span unknown; an incomplete dump is never an empty table, and
+    the notifications received by a failed reading are reconciled all the same. The
     namespace's counters of datagrams dropped before any socket (IP errors and discards, no
     socket on the port, checksums, reverse-path filtering) count for any endpoint.
     The final collection, after the drain, follows a fixed order: a reading, notifications read
     for 0.1 s while a canary socket's destruction must be notified (else everything is unknown),
-    and a last reading; the watch then ends with `delivery-end`, from the first of those readings
+    and a last reading, which must succeed (else, again, everything is unknown). The canary is
+    recognized by its socket cookie, read while it is open, never by its port: once the watched
+    port is free the canary may be given it, and every other notification on that port stays.
+    The watch then ends with `delivery-end`, from the first of those readings
     on, a time after the cutoff: a socket created after it may be in neither dump with its
     notification still on its way. A record without the watch, or whose watch did not end,
     decides nothing; a hint whose arrival such a loss, or the watch's end, may have hit is a gap.
@@ -2974,7 +2978,10 @@ explains its behaviour, and offers it only when the installed binary supports it
   unknown what sockets closed after a reading, or never seen, may have lost (a socket that
   dropped a client's datagrams, was then connected to another endpoint and closed unseen counts
   for any endpoint). A socket closed while the final collection's first dump runs reaches the
-  record as unknown and nothing is decided; with the socket left open the record decides sip.
+  record as unknown and nothing is decided; with the socket left open the record decides sip. The
+  same when that socket's notifications arrive during the wait and the last dump then fails, and
+  when the canary is given the watched port (the namespace's ephemeral range locked to it); a
+  canary not notified in time leaves the record undecided.
   The client-side
   capture, stopped after 20 STUN-shaped datagrams while two more and an unshaped one arrive,
   records all 23 at its deadline or authorized stop and fails the STUN verdict; a clean control
