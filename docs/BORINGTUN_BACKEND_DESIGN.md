@@ -2879,15 +2879,26 @@ explains its behaviour, and offers it only when the installed binary supports it
   - *Delivery.* A complete record shows what reached the namespace, not what reached the
     daemon: a datagram can still be dropped at a full UDP receive queue. The record therefore
     watches every UDP socket bound to the server's port in its namespace (`sock_diag`), by cookie
-    and drop counter: the listener's losses count for any endpoint, a connected socket's for its
-    endpoint. A socket gone since the last reading, or destroyed before any reading saw it
-    (`sock_diag`'s destruction notifications), leaves its losses unknown; so do lost
-    notifications and failed readings. The namespace's counters of datagrams dropped before any
-    socket (IP errors and discards, no socket on the port, checksums, reverse-path filtering)
-    count for any endpoint. A record without the watch decides nothing. A hint whose arrival
-    such a loss may have hit is a gap. Not covered: a datagram dropped by a netfilter rule (no
-    counter), or delivered to another process's socket on the port; the scenarios add no such
-    rule or socket.
+    and drop counter, reading destruction notifications before and after each dump so that one
+    sent during the dump is reconciled with it. The listener's losses count for any endpoint; a
+    socket's losses count for one endpoint only if it was connected to that endpoint at both
+    readings (the daemon connects a socket once, right after binding it). A socket gone since the
+    last reading leaves its losses after that reading unknown; one destroyed before any reading
+    saw it leaves its whole life unknown, for any endpoint, whatever it was connected to when
+    destroyed. Lost, cut or malformed notifications, and any dump that does not complete with
+    status 0 (an error reply, a failed or interrupted completion, a reply to another request, a
+    message cut short), leave their span unknown; an incomplete dump is never an empty table. The
+    namespace's counters of datagrams dropped before any socket (IP errors and discards, no
+    socket on the port, checksums, reverse-path filtering) count for any endpoint.
+    The final collection, after the drain, follows a fixed order: a reading, notifications read
+    for 0.1 s while a canary socket's destruction must be notified (else everything is unknown),
+    and a last reading; the watch then ends with `delivery-end`, from the first of those readings
+    on, a time after the cutoff: a socket created after it may be in neither dump with its
+    notification still on its way. A record without the watch, or whose watch did not end,
+    decides nothing; a hint whose arrival such a loss, or the watch's end, may have hit is a gap.
+    Assumed: a socket's destruction is notified within 0.1 s. Not covered: a datagram dropped by a
+    netfilter rule (no counter), or delivered to another process's socket on the port; the
+    scenarios add no such rule or socket.
   - *Client captures.* The client side's captures run on the same machinery: drops counted
     from a baseline before readiness, and at the deadline or an authorized stop, the same
     drain past the cutoff. Only a capture that drained and dropped nothing ends `complete` or
@@ -2909,9 +2920,12 @@ explains its behaviour, and offers it only when the installed binary supports it
     between was accepted and answered by then; that time is also the only upper bound on when
     the server processed anything (no earlier than its arrival). A socket connected to the
     client, seen in the server's socket table with the same cookie before and after an
-    observation, pins when the endpoint moved to it, and also shows an acceptance. That the
-    server accepted none of the client's initiations is one of the histories, so without such
-    evidence nothing is decided.
+    observation, pins when the endpoint moved to it. It also shows an acceptance, bounded in
+    time: one of the client's initiations arrived after the epoch and was accepted by the
+    observation (an establishment from the epoch to it, the record read through it even past the
+    window), never one inside an earlier window by itself; seen before the epoch, it is no
+    evidence. That the server accepted none of the client's initiations is one of the histories,
+    so without such evidence nothing is decided.
   - *Histories.* Every history this evidence allows is replayed: which initiations were
     accepted, where the endpoint moved to the connected socket, and each hint-lifetime
     comparison the bounds leave open, both ways. The outcome is decided only if every history
@@ -2957,7 +2971,11 @@ explains its behaviour, and offers it only when the installed binary supports it
   With the record stopped right after a counter reset, the drops line still begins before the
   reset; with a clock reading stopped 3 s between its realtime reads, every arrival still holds
   its send. Its delivery watch reports a listener's and a connected socket's drops, and leaves
-  unknown what sockets closed after a reading, or never seen, may have lost. The client-side
+  unknown what sockets closed after a reading, or never seen, may have lost (a socket that
+  dropped a client's datagrams, was then connected to another endpoint and closed unseen counts
+  for any endpoint). A socket closed while the final collection's first dump runs reaches the
+  record as unknown and nothing is decided; with the socket left open the record decides sip.
+  The client-side
   capture, stopped after 20 STUN-shaped datagrams while two more and an unshaped one arrive,
   records all 23 at its deadline or authorized stop and fails the STUN verdict; a clean control
   passes; an overflowed capture ends `incomplete` and is not judged.
