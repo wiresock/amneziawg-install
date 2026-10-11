@@ -428,12 +428,15 @@ elif cmd == "recorder":
 
     class Watch(wire.DeliveryWatch):
         """DeliveryWatch on scripted sockets (SOCKETS, cookie: (peer,
-        drops)), namespace counter (COUNTER), destructions (DESTROYED) and
-        failures (FAIL: subscribe, dump, events)."""
+        drops)), namespace counter (COUNTER), destructions (GONE_EVENTS, and
+        DURING_DUMP[n]: those notified while the nth dump runs), a canary
+        notified when it is closed unless FAIL holds "slow", and failures
+        (FAIL: subscribe, dump, events)."""
 
         def __init__(self):
             super().__init__(40000)
             self.sockets, self.counter, self.gone_events, self.fail = {}, 0, [], set()
+            self.dumps, self.during_dump = 0, {}
 
         def subscribe(self):
             if "subscribe" in self.fail:
@@ -446,7 +449,14 @@ elif cmd == "recorder":
             found, self.gone_events = self.gone_events, []
             return found
 
+        def canary(self):
+            if "slow" not in self.fail:
+                self.gone_events.append((99, 33333, "any"))
+            return 33333
+
     def scripted_sockets(port):
+        watch.dumps += 1
+        watch.gone_events.extend(watch.during_dump.pop(watch.dumps, []))
         if "dump" in watch.fail:
             watch.fail.discard("dump")
             raise OSError(errno.EIO, "dump failed")
@@ -601,9 +611,26 @@ elif cmd == "recorder":
             watch.fail.add("events")
         elif case == "delivery-unavailable":
             watch.sockets[1] = ("any", 5)
+        elif case == "delivery-during-dump":
+            # Notified while the second poll's dump runs: reconciled by it.
+            watch.during_dump[3] = [(7, 40000, CLIENT_PEER)]
+        elif case == "delivery-final-dump":
+            # A socket no reading saw, destroyed while the final collection's
+            # first dump runs (dumps: begin, two polls, then the final two).
+            watch.during_dump[4] = [(7, 40000, CLIENT_PEER)]
+        elif case == "delivery-final-last-dump":
+            watch.during_dump[5] = [(7, 40000, CLIENT_PEER)]
+        elif case == "delivery-final-settle":
+            # Notified only while the final collection waits.
+            canary = watch.canary
+            watch.canary = lambda: (watch.gone_events.append((7, 40000, CLIENT_PEER)), canary())[1]
+        elif case == "delivery-slow-notifications":
+            watch.fail.add("slow")
         print("poll-cs %d" % (clocks.boot_ns // 10 ** 7))
         recorder.poll()
-        recorder.finish(clocks.boot())
+        cutoff = clocks.boot()
+        print("cutoff-cs %d" % (cutoff // 10 ** 7))
+        recorder.finish(cutoff)
     elif case in ("capture-queued", "capture-drops", "capture-endless"):
         # capture's records on the record's machinery: what is queued at the
         # stop is drained; a dropped frame or an unfinished drain leaves it
@@ -956,7 +983,7 @@ ready, epoch, window = 1000, 1500, (1900, 20000)
 layout, hp, connected = CLEAR, False, "-"
 # The record watched delivery to the server's sockets, and nothing was lost,
 # unless a case says otherwise.
-watched = True
+watched = watch_end = True
 # A client process started at 1995 and pinged through the tunnel at 2040,
 # unless a case says otherwise.
 est = [(1995, 2040)]
@@ -1131,6 +1158,17 @@ elif case == "no-establishment":
     # processed, or whether the initiation was accepted.
     sequence(2000, [SIP_HINT, initiation(), transport()])
     est = []
+elif case in ("watch-not-ended", "watch-ended-early"):
+    # The watch must end with its final collection; where it ended, nothing
+    # after is covered. A SIP hint, then the client.
+    layout = NARROW
+    add(2000, SIP_HINT)
+    sequence(2030, [initiation(), transport()])
+    est = [(2025, 2060)]
+    if case == "watch-not-ended":
+        watch_end = False
+    else:
+        lines.append("2050 - delivery-end 1998")
 elif case in ("no-acceptance-evidence", "connected-acceptance", "establishment-elsewhere"):
     # Finding 5 of the third review: a lone initiation candidate, its mac1
     # consistent with the server's key (anyone can compute one) and its S1
@@ -1208,6 +1246,10 @@ else:
     raise SystemExit("no case " + case)
 if watched:
     lines.insert(0, "%d - delivery-watch 51998" % ready)
+    # The watch's final collection, after every window these cases use,
+    # unless a case ends it earlier or not at all.
+    if not any(" - delivery-end " in line for line in lines) and watch_end:
+        lines.append("99990 - delivery-end 99980")
 # Complete through a cutoff after every window these cases use.
 lines.append("99999 - complete 99998")
 with open(path, "w") as out:
@@ -1230,20 +1272,23 @@ for CASE in "stun-colliding|0 expect random" "stun-clear|0 expect stun" "other-p
 	"hp-sip-large|0 expect random" "hp-sip-small|0 expect sip" "policy-retry-connected|0 expect dns" \
 	"gap-full|0 expect stun" "gap-before-epoch|0 expect stun" "gap-after-pin|0 expect stun" "timing-fresh|0 expect sip" "timing-untimed-fresh|0 expect sip" \
 	"malformed-other-address|0 expect sip" "malformed-after-pin|0 expect sip" "fragment-other-port|0 expect sip" \
-	"connected-acceptance|0 expect dns" "delivery-other-endpoint|0 expect sip" "delivery-after-pin|0 expect sip" \
+	"connected-acceptance|0 expect dns" "delivery-other-endpoint|0 expect sip" \
+	"delivery-after-pin|0 expect sip" \
 	"delivery-initiation|0 expect sip"; do
 	assert_eq "${CASE#*|}" "$(auto_case "${CASE%%|*}" 2>&1)" "auto-expect, ${CASE%%|*}: ${CASE#*|}"
 done
 for CASE in age-30 age-32 hp-unmasked-initiation no-initiation policy-retry forgery gap-hidden timing-paused timing-untimed \
 	timing-step malformed malformed-early drops-during fragment late-record straddles-epoch retry retry-window-after \
 	no-establishment no-acceptance-evidence establishment-elsewhere delivery-any delivery-endpoint delivery-unknown unwatched \
-	poll-gap-hidden; do
+	poll-gap-hidden watch-not-ended watch-ended-early; do
 	GOT="$(auto_case "${CASE}" 2>&1)"
 	assert_true "auto-expect, ${CASE}: undecided, exit 1, never a guess (${GOT})" bash -c '[[ "$1" == "1 undecided "* ]]' _ "${GOT}"
 done
 # The reasons the third review's cases are undecided for: the evidence each
 # lacks, not a format the record no longer has.
-for CASE in "no-acceptance-evidence|nothing shows that the server accepted any of this client's initiations" \
+for CASE in "watch-not-ended|the record's delivery watch did not end with its final collection" \
+	"watch-ended-early|the hint #1 (2000~2001) may not have reached the server: the delivery watch covers nothing from 1998 on" \
+	"no-acceptance-evidence|nothing shows that the server accepted any of this client's initiations" \
 	"no-establishment|nothing shows that the server accepted any of this client's initiations" \
 	"establishment-elsewhere|no history agrees with the establishments" \
 	"delivery-any|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost 4780 datagrams from anyone" \
@@ -1296,7 +1341,8 @@ echo "=== The record's completeness and arrival times (Recorder, on a scripted s
 for CASE in delayed-ready queued-at-stop dequeue-delay no-stamp clock-step suspend endless wide-after wide-empty straddle \
 	narrow-boundary poll-preempted begin-preempted finish-preempted delivery-quiet delivery-listener delivery-connected \
 	delivery-new-socket delivery-reconnected delivery-retired delivery-unseen delivery-other-port delivery-namespace \
-	delivery-dump-fails delivery-events-lost delivery-unavailable capture-queued capture-drops capture-endless; do
+	delivery-dump-fails delivery-events-lost delivery-unavailable delivery-during-dump delivery-final-dump \
+	delivery-final-last-dump delivery-final-settle delivery-slow-notifications capture-queued capture-drops capture-endless; do
 	py recorder "${CASE}" >"${T}/recorder-${CASE}" 2>&1
 done
 # "<from>~<to>" or "<clock>" of the frame line (4 payload bytes) in a
@@ -1342,6 +1388,24 @@ assert_eq "unknown poll any" "$(delivery_lines delivery-dump-fails)" "a reading 
 assert_eq "unknown watch any" "$(delivery_lines delivery-events-lost)" "lost destruction notifications leave everything since the watch began unknown"
 assert_true "without notifications the record does not watch: no watch line, no loss lines" \
 	bash -c '! grep -q " - delivery" "$1"' _ "${T}/recorder-delivery-unavailable"
+assert_eq "unknown watch any" "$(delivery_lines delivery-during-dump)" \
+	"a destruction notified while a reading's dump runs is reconciled by that reading"
+# The final collection (finish): whenever an unseen socket's destruction is
+# notified -- during its first dump, while it waits, during its last dump --
+# it reaches the record before the end marker; a canary not notified in time
+# leaves everything unknown; and the watch's end marker follows the cutoff.
+for CASE in delivery-final-dump delivery-final-settle delivery-final-last-dump; do
+	assert_eq "unknown watch any" "$(delivery_lines "${CASE}")" \
+		"final collection, notified ${CASE#delivery-final-}: the unseen socket's lifetime is unknown, for any endpoint"
+done
+assert_eq "unknown watch any" "$(delivery_lines delivery-slow-notifications)" \
+	"final collection: a canary whose destruction is not notified in time leaves everything since the watch began unknown"
+assert_eq "" "$(delivery_lines delivery-quiet)" "  and a clean final collection reports nothing"
+for CASE in delivery-quiet delivery-final-dump delivery-slow-notifications; do
+	assert_true "the watch ends with delivery-end, just before the end marker, from a time after the cutoff (${CASE})" \
+		bash -c 'END="$(tail -n 2 "$1" | head -n 1)"; [[ "${END}" =~ ^[0-9]+\ -\ delivery-end\ ([0-9]+)$ ]] && ((BASH_REMATCH[1] >= $2))' _ \
+		"${T}/recorder-${CASE}" "$(cs_of "${CASE}" cutoff)"
+done
 assert_eq "capture records 23 losses 0 complete True" "$(grep '^capture ' "${T}/recorder-capture-queued")" \
 	"capture's records: the 22 good and the 1 bad datagram queued at the stop are all drained and recorded"
 assert_eq "capture records 23 losses 3 complete True" "$(grep '^capture ' "${T}/recorder-capture-drops")" \

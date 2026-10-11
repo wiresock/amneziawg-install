@@ -403,6 +403,8 @@ check("each socket closed after a reading saw it leaves what it lost after that 
 check("a socket created and closed while no reading could see it (connected to 127.0.0.1:41012 when closed): unknown "
       "since the watch began, for any endpoint", len(since_watch) == 1)
 check("and nothing for anyone else", all(row[5] in ("any", "127.0.0.1:41007") for row in found))
+check("the watch ends after the cutoff, before the end marker (%s)" % rows[-2:-1],
+      len(rows) >= 2 and " - delivery-end " in rows[-2])
 
 print("--- unseen-connect")
 # The fourth review's socket: bound to the watched port with a 4 KiB buffer,
@@ -501,6 +503,81 @@ check("a capture whose socket dropped frames ends incomplete with status 4, its 
       rc == 4 and transcript[-1].startswith("incomplete ") and int(transcript[-1].split()[2]) > 0)
 check("and no verdict judges it, however many good datagrams it holds (%s)" % reason, status == 1 and "not whole" in reason)
 
+print("--- final-collection")
+# The fourth review's race, in this process with real sockets: a socket on
+# the watched port, first created after the watch's baseline, is closed
+# while the final collection's first dump runs, so that no dump sees it.
+# A SIP hint and a mac1-consistent initiation reach it from 41006 before the
+# cutoff. Its unknown lifetime must reach the record, and auto-expect must
+# not decide; the clean control (the socket stays open) decides sip. The
+# review's own variant adds 200 datagrams into a 4 KiB buffer first.
+wire = load_wire()
+KEY = bytes(range(32, 64))
+NARROW = "40,40,40,40,100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100"
+SIP_HINT = b"OPTIONS sip:a@b SIP/2.0\r\n\r\n"
+BODY = struct.pack("<II", 100000007, 0x01020304) + bytes(108)
+INITIATION = bytes(40) + BODY + hashlib.blake2s(BODY, digest_size=16, key=hashlib.blake2s(b"mac1----" + KEY).digest()).digest() \
+    + bytes(16)
+
+
+def final_collection(name, port, close, flood):
+    clocks = wire.SystemClocks()
+    created = clocks.sample()
+    packets = wire.PacketSource("lo", 32 * 1024 * 1024)
+    watch, out = wire.DeliveryWatch(port), io.StringIO()
+    recorder = wire.Recorder(packets, clocks, out, {socket.inet_aton("127.0.0.1")}, None, port, created, watch)
+    ready = recorder.begin()
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if flood:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    server.bind(("127.0.0.1", port))
+    client = sender  # 127.0.0.1:41006
+    time.sleep(0.1)
+    for _ in range(200 if flood else 0):
+        client.sendto(bytes(80), ("127.0.0.1", port))
+    client.sendto(SIP_HINT, ("127.0.0.1", port))
+    time.sleep(0.02)
+    born = boot_cs()
+    client.sendto(INITIATION, ("127.0.0.1", port))
+    up = boot_cs() + 1
+    time.sleep(0.2)
+    cutoff = clocks.boot()
+    real_dump = wire.udp_sockets
+
+    def closing_dump(watched):
+        server.close()
+        time.sleep(0.05)
+        return real_dump(watched)
+
+    if close:
+        wire.udp_sockets = closing_dump
+    try:
+        recorder.finish(cutoff)
+    finally:
+        wire.udp_sockets = real_dump
+        server.close()
+        packets.sock.close()
+        watch.events.close()
+    path = WORK / (name + ".record")
+    path.write_text(out.getvalue())
+    pathlib.Path(str(path) + ".state").write_text("ready 1 1 %d\nstopped %d %s\n" % (wire.centiseconds_down(ready.boot),
+                                                                                     recorder.records, "a" * 32))
+    verdict = subprocess.run([sys.executable, "-B", WIRE, "auto-expect", str(path), "127.0.0.1", "41006", NARROW,
+                              base64.b64encode(KEY).decode(), "-", "off", str(wire.centiseconds_down(ready.boot) + 1),
+                              str(up + 2), str(wire.centiseconds_down(cutoff)), "%d:%d" % (born, up), "-"],
+                             capture_output=True, text=True).stdout.strip().splitlines()
+    markers = [line for line in out.getvalue().splitlines() if " - " in line]
+    return markers, verdict[-1] if verdict else "-"
+
+
+markers, verdict = final_collection("final-clean", 52130, close=False, flood=False)
+check("clean control: the socket stays open; no loss is reported and the record decides sip (%s; %s)" % (markers, verdict),
+      verdict == "expect sip" and not any(" - delivery unknown " in marker for marker in markers))
+for name, port, flood in (("final-closed", 52131, False), ("final-closed-flooded", 52129, True)):
+    markers, verdict = final_collection(name, port, close=True, flood=flood)
+    check("%s: closed during the final dump, its unknown lifetime reaches the record (%s)" % (name, markers),
+          any(marker.endswith(" any") and " - delivery unknown " in marker for marker in markers))
+    check("%s: and auto-expect does not decide (%s)" % (name, verdict), verdict.startswith("undecided the hint #"))
 
 print()
 print("BoringTun record live test: %d passed, %d failed" % (PASSED, FAILED))

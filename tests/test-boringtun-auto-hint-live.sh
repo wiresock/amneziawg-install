@@ -802,8 +802,8 @@ udp_clean() {
 	else
 		bad "udp-clean: the server's datagrams to the client are sip, as the record decided (${BT_WIRE_REASON})"
 	fi
-	# The same record without the evidence of delivery.
-	sed 1d "${CX_RECORD}" >"${BARE}"
+	# The same record without the evidence of delivery: its watch, end and loss lines.
+	grep -v " - delivery" "${CX_RECORD}" >"${BARE}"
 	sed "s/^\(stopped\|complete\) [0-9]*/\1 $(wc -l <"${BARE}")/" "${CX_RECORD}.state" >"${BARE}.state"
 	CX_NAME=udp-unwatched
 	cx_expect "the record without its delivery watch" "${BARE}" - undecided
