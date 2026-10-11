@@ -502,17 +502,28 @@ fi
 teardown
 
 echo "--- controls on the real captures"
+# A control capture keeps the transcript of the capture it was made from,
+# counting its own records, so that only its content can make it fail: a
+# capture is judged only whole (bt_wire_capture_whole).
+transcript_of() { # <source capture> <control capture>
+	sed "s/^\(complete\|stopped\) [0-9]*/\1 $(wc -l <"$2")/" "$1.state" >"$2.state"
+}
 # Evidence that is not a complete, classified capture fails the check: a
 # record of no kind, of two kinds, from a malformed frame, a truncated or
 # non-numeric record, or one in the legacy prefix format.
 for CONTROL in "unknown 77 -" "ambiguous 95 -" "unresolved 95 -" "malformed 41 -" "transport 77" \
 	"transport NOT_A_LENGTH 4f5054494f4e53207369703a75407820" "4f5054494f4e53207369703a75407820"; do
 	{ cat "${WORK}/at-31.capture"; printf '%s\n' "${CONTROL}"; } >"${WORK}/control.capture"
+	transcript_of "${WORK}/at-31.capture" "${WORK}/control.capture"
 	check "at-31 with the record '${CONTROL}' appended fails the per-kind check" \
 		check_fails "${WORK}/control.capture" 64,31,31,31 "${COOKIE_RULES[@]}"
 done
 check "at-31 as recorded passes the same check (the controls' baseline)" \
 	check_passes "${WORK}/at-31.capture" 64,31,31,31 "${COOKIE_RULES[@]}"
+cp "${WORK}/at-31.capture" "${WORK}/control.capture"
+sed 's/^\(complete\|stopped\) .*/incomplete 0 1 0/' "${WORK}/at-31.capture.state" >"${WORK}/control.capture.state"
+check "at-31's records under a transcript that does not end whole fail the same check" \
+	check_fails "${WORK}/control.capture" 64,31,31,31 "${COOKIE_RULES[@]}"
 # Signature accounting after classification: rewrite the recorded prefixes of
 # one kind; "strip" replaces them with zero bytes (a request line missing),
 # "sip" with the start of one (a request line where none belongs). Only that
@@ -525,6 +536,7 @@ tamper() { # <capture> <kind> <strip|sip> <output>
 			else { $3 = substr("4f5054494f4e53207369703a" "000000000000000000000000000000000000", 1, n) }
 		}
 		{ print }' "$1" >"$4"
+	transcript_of "$1" "$4"
 }
 verdicts() { # <capture> <S1,S2,S3,S4>: "response=<v> cookie=<v> transport=<v>"
 	bt_wire_kinds "$1" "$2" || { echo "invalid: ${BT_WIRE_REASON}"; return; }
