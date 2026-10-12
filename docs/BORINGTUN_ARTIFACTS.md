@@ -82,38 +82,57 @@ script, workflow or configuration file. The release contract restates it, as
 the provenance of the release it describes; the installer does not need it
 (see [Three contracts](#three-contracts)).
 
-The current pin is `b94943906b11641e274b3c950cc905aaf1631c59` (boringtun-cli
-0.7.1, tree `17458cfeb6fa19d7e37dc66d8a6895b77b57b1a8`), the source checkpoint
-that upstream tags `awg3.1-integration-2026-10-06` (tag object
-`1c91d92d950ea05b3f90dfe4a63112bba337a76d`); the tag is informational only, and
+The current pin is `e94c04f3f4fdb8b392f9586db07a269ea0bf7575` (boringtun-cli
+0.7.1, tree `06402779b8138f4e607b2469c1031e3e910122ca`), the source checkpoint
+that upstream tags `awg3.1-integration-2026-10-12` (tag object
+`ddb3c91915cf4742814ac4886f3ccb95fd8f7b55`); the tag is informational only, and
 builds and installer trust anchors use the commit. The previous pin,
-`ae2ab44e9a68ca1a3232d2e8b13f9db30a9b9dcf` (tree
+`b94943906b11641e274b3c950cc905aaf1631c59` (tree
+`17458cfeb6fa19d7e37dc66d8a6895b77b57b1a8`, upstream tag
+`awg3.1-integration-2026-10-06`), is the source of the published release
+`boringtun-cli-0.7.1-gb94943906b11-b1` that this installer embeds. The pin
+before it, `ae2ab44e9a68ca1a3232d2e8b13f9db30a9b9dcf` (tree
 `3bea8cdeefd5f55a1129db7d31481b9b3a8edde8`, upstream tag
 `awg3.1-integration-2026-10-02`), is the source of the published release
 `boringtun-cli-0.7.1-gae2ab44e9a68-b1` that the previous installer version
-embeds. The pin before it, `71d88784ad29dc95871c105e26cc62f6acdd565b` (tree
+embeds, and `71d88784ad29dc95871c105e26cc62f6acdd565b` (tree
 `6f0f0a32a197fe71fb66c074cb1e56caf7024dd8`, upstream tag
-`awg3.1-integration-2026-09-28`), is the source of the published release
+`awg3.1-integration-2026-09-28`) is the source of the published release
 `boringtun-cli-0.7.1-g71d88784ad29-b1` that earlier installer versions embed.
 
 The current pin is exactly one commit ahead of the previous pin, with none
-behind, on upstream `master`: upstream pull request #78, which adds the server
-imitation mode `auto` (`--imitate-protocol auto`). A responder in that mode
-learns DNS, QUIC, SIP or STUN imitation for each authenticated peer from the
-client's pre-handshake datagrams, so that clients with different imitation
-settings can share one server port; S and H framing stay explicitly
-configured. Fixed imitation modes and the header-protection policy are
-unchanged. `Cargo.toml`, `Cargo.lock`, `LICENSE.md`, `.cargo/` and the
-interop harnesses in `scripts/` are unchanged, so the build recipe, the
-dependency graph and the licenses are those of the previous pin; the only
-change to `boringtun-cli` itself is the help text of `--imitate-protocol`. The
-installer that adopts this pin's release offers `auto`. Its binary reports the
-same version, 0.7.1, as the releases before it, so the installer never infers
-`auto` from the version: it asks the verified binary itself whether it accepts
-`--imitate-protocol auto`, and refuses `auto` on an earlier release.
+behind, on upstream `master`: upstream pull request #82, a fix to the server
+imitation mode `auto`. A recognizable prelude (DNS, QUIC, SIP or STUN) can by
+chance also fit an AmneziaWG packet shape under the configured S and H framing,
+and is then tried as that packet first; `b94943906b11` never learned from such
+a datagram. Now, when every AmneziaWG reading of it is refused for a reason
+that establishes nothing (a failed mac1; an unknown peer, index or session; no
+matching handshake in flight; a failed AEAD), the datagram becomes imitation
+evidence for its source, provisional until an authenticated initiation from
+that source commits it. Accepted packets, cookie and under-load dispositions,
+timestamp and counter refusals and local failures keep their earlier handling;
+a colliding datagram is never answered as a probe; fixed imitation modes and
+the probe-response policy are unchanged. `Cargo.toml`, `Cargo.lock`,
+`LICENSE.md`, `.cargo/`, the interop harnesses in `scripts/` and the whole
+`boringtun-cli` crate are unchanged, so the build recipe, the dependency graph,
+the licenses and the command line are those of the previous pin.
 
-Between the two earlier pins, upstream rewrote its history. In the current
-history the `71d88784ad29` tree is commit
+The previous pin, in turn, was one commit ahead of `ae2ab44e9a68`: upstream
+pull request #78, which added the server imitation mode `auto`
+(`--imitate-protocol auto`). A responder in that mode learns DNS, QUIC, SIP or
+STUN imitation for each authenticated peer from the client's pre-handshake
+datagrams, so that clients with different imitation settings can share one
+server port; S and H framing stay explicitly configured. The installer that
+adopted that release offers `auto`. Its binary reports the same version, 0.7.1,
+as the releases before it, so the installer never infers `auto` from the
+version: it asks the verified binary itself whether it accepts
+`--imitate-protocol auto`, and refuses `auto` on an earlier release. The
+installer's live expectations for `auto` still model `b94943906b11`, where a
+colliding prelude never becomes a hint; they change only with the installer
+change that adopts a published release of the current pin.
+
+Between `71d88784ad29` and `ae2ab44e9a68`, upstream rewrote its history. In
+the current history the `71d88784ad29` tree is commit
 `8ba4d792dd071783d4864ef022258ff9d7c52bbd`, with exactly the same tree
 `6f0f0a32a197fe71fb66c074cb1e56caf7024dd8`, and `ae2ab44e9a68` descends from
 it by 15 commits with none behind: upstream pull requests
