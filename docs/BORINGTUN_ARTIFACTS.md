@@ -5,20 +5,22 @@ This repository builds static `boringtun-cli` binaries from a pinned commit of
 for a future userspace AmneziaWG backend (see
 [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
 
-**Status: three releases published; the installer embeds the newest.** The
-current pin `b94943906b11` is published as
-`boringtun-cli-0.7.1-gb94943906b11-b1` (release 405544565): BoringTun
+**Status: three releases published, one candidate prepared.** The current pin
+`e94c04f3f4fd` has a `candidate` release contract,
+`boringtun-cli-0.7.1-ge94c04f3f4fd-b1`: its archives are built and verified
+by runs of the preparation branch, not yet by a run of `main`, and it is not
+approved, published or used by any installer.
+`boringtun-cli-0.7.1-gb94943906b11-b1` (release 405544565), built from the
+previous pin `b94943906b11`, is what the installer downloads: BoringTun
 Artifacts run 37528826713 of `main` (installer commit
 `41fe7d903f1903fc5962baf53b551a2dc27aad15`) built and attested its archives,
 the BoringTun Release dry run 37531214445 of that run passed, and BoringTun
-Release run 37593959668 published it, with its tag on that commit. It is what
-the installer downloads, and the first release whose binary has the server
-imitation mode `auto`.
-`boringtun-cli-0.7.1-gae2ab44e9a68-b1`, built from the previous pin
-`ae2ab44e9a68`, and `boringtun-cli-0.7.1-g71d88784ad29-b1`, built from the pin
-before it, `71d88784ad29`, stay public for the installer versions that embed
-them. Four separate stages handle the artifacts, and only the first two run
-on their own:
+Release run 37593959668 published it, with its tag on that commit. It is the
+first release whose binary has the server imitation mode `auto`.
+`boringtun-cli-0.7.1-gae2ab44e9a68-b1`, built from `ae2ab44e9a68`, and
+`boringtun-cli-0.7.1-g71d88784ad29-b1`, built from `71d88784ad29`, stay public
+for the installer versions that embed them. Four separate stages handle the
+artifacts, and only the first two run on their own:
 
 | Stage | What happens | Where |
 |---|---|---|
@@ -48,19 +50,22 @@ the published release by changing its `AWG_BT_RELEASE_*` constants. Until that
 change the installer still names an earlier published release, so the
 installer's release may differ from the pin and the contract, while the
 contract is a candidate and also after it is approved and published.
-`release.env` always matches `pin.env`. No test compares the installer's
-constants with `pin.env` or `release.env`; each contract is checked on its own
+On `main`, `release.env` always matches `pin.env`. No test compares the
+installer's constants with `pin.env` or `release.env`; each contract is checked on its own
 terms, and the host tests and the public-release download use only the
-installer's constants. Today all three name the same build: the pin is
-`b94943906b11`, the contract its build 1, `approved` and published as
-`boringtun-cli-0.7.1-gb94943906b11-b1`, and the installer has adopted that
-release. Every stage in [From a pin to a release](#from-a-pin-to-a-release) is
-done: the BoringTun Artifacts run of `main` that reproduced its bytes and
-attested them under the `main` identity (run 37528826713, commit
-`41fe7d903f1903fc5962baf53b551a2dc27aad15`), the BoringTun Release dry run of
-that run (37531214445), the approval, the publication (BoringTun Release run
-37593959668, release 405544565) and the installer change that adopts it. They
-can differ again as soon as the next pin is prepared.
+installer's constants. Only a preparation commit on a branch may move the pin
+before the contract, so that the artifact workflow can build the real archives
+whose hashes the contract then records; `boringtun-release.sh contract`
+refuses such a commit, and the change is reviewed and merged only with a
+matching contract. Today they differ, as intended while a release is being
+prepared: the pin is `e94c04f3f4fd` and the contract its build 1, still a
+`candidate`, while the installer installs the published release of the
+previous pin, `boringtun-cli-0.7.1-gb94943906b11-b1`, which it adopted after
+every stage in [From a pin to a release](#from-a-pin-to-a-release). The
+candidate goes on through the same stages: a BoringTun Artifacts run of
+`main` that reproduces its bytes and attests them under the `main` identity,
+a BoringTun Release dry run of that run, approval, publication, and only then
+the separate installer change that adopts it.
 
 ## Source pin
 
@@ -428,10 +433,11 @@ strict grammar as `pin.env` and refuses any disagreement with the pin:
 A published tag is never reused or moved, so once a build is public, any other
 bytes need a new build number. The build number is scoped to one source commit:
 a new pin starts again at build 1. The contract holds build 1 of the current
-pin, `boringtun-cli-0.7.1-gb94943906b11-b1`, as `approved`, and it is
-published (release 405544565, its tag on
-`41fe7d903f1903fc5962baf53b551a2dc27aad15`). The published releases of the earlier pins,
-`boringtun-cli-0.7.1-gae2ab44e9a68-b1` and
+pin, `boringtun-cli-0.7.1-ge94c04f3f4fd-b1`, as a `candidate`: no tag or
+release of that name exists. The published releases of the earlier pins,
+`boringtun-cli-0.7.1-gb94943906b11-b1` (release 405544565, its tag on
+`41fe7d903f1903fc5962baf53b551a2dc27aad15`, the release the installer
+embeds), `boringtun-cli-0.7.1-gae2ab44e9a68-b1` and
 `boringtun-cli-0.7.1-g71d88784ad29-b1`, stay side by side and are never
 moved, edited or replaced. Nothing built from the
 earlier pin `e4e4dc85ec03` is ever to be published: its archives lacked the
@@ -514,12 +520,16 @@ top-level directory becomes a release in
 its `MANIFEST` (see §21.1 of [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
 `amneziawg-install.sh` embeds the tag, asset names and SHA-256 values of the
 release it installs, currently `boringtun-cli-0.7.1-gb94943906b11-b1`, built
-from the current pin `b94943906b11`. Moving
+from the previous pin `b94943906b11`, not the current pin's candidate. Moving
 the installer to a newer release is a separate change of those constants, with
 its own upgrade and rollback evidence; a candidate or even a published release
 of a newer pin does not change what the installer downloads. The change that
-adopted this release also made the installer offer the pin's server imitation
-mode `auto`. A host keeps the release it has until `--upgrade-boringtun`
+adopted this release also made the installer offer that pin's server imitation
+mode `auto`. The installer's expectations for `auto` (the live hint scenarios,
+the wire oracle and its model, and the guidance) describe that release, where
+a prelude that collides with the S/H framing never becomes a hint; the change
+that adopts a release of the current pin updates them together with the
+constants. A host keeps the release it has until `--upgrade-boringtun`
 moves it to the one its installer pins. The BoringTun Host workflow proves
 that move from the releases of two earlier installers, each a real, different
 binary: `9f5a1afb87f7` (`boringtun-cli-0.7.1-g71d88784ad29-b1`, x86_64) and
