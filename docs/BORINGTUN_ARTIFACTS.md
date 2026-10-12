@@ -5,11 +5,14 @@ This repository builds static `boringtun-cli` binaries from a pinned commit of
 for a future userspace AmneziaWG backend (see
 [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
 
-**Status: three releases published, one candidate prepared.** The current pin
-`e94c04f3f4fd` has a `candidate` release contract,
-`boringtun-cli-0.7.1-ge94c04f3f4fd-b1`: its archives are built and verified
-by runs of the preparation branch, not yet by a run of `main`, and it is not
-approved, published or used by any installer.
+**Status: three releases published, one approved and not yet published.** The
+current pin `e94c04f3f4fd` has an `approved` release contract,
+`boringtun-cli-0.7.1-ge94c04f3f4fd-b1`: BoringTun Artifacts run 38266658566
+of `main` (attempt 1, installer commit
+`8f426268955516845fc34427589dc37012eff71d`) reproduced the reviewed candidate
+bytes on both architectures and attested them, the BoringTun Release dry run
+38268697310 of that run passed, and no tag or release of that name exists
+yet. It is not used by any installer.
 `boringtun-cli-0.7.1-gb94943906b11-b1` (release 405544565), built from the
 previous pin `b94943906b11`, is what the installer downloads: BoringTun
 Artifacts run 37528826713 of `main` (installer commit
@@ -58,14 +61,16 @@ before the contract, so that the artifact workflow can build the real archives
 whose hashes the contract then records; `boringtun-release.sh contract`
 refuses such a commit, and the change is reviewed and merged only with a
 matching contract. Today they differ, as intended while a release is being
-prepared: the pin is `e94c04f3f4fd` and the contract its build 1, still a
-`candidate`, while the installer installs the published release of the
-previous pin, `boringtun-cli-0.7.1-gb94943906b11-b1`, which it adopted after
-every stage in [From a pin to a release](#from-a-pin-to-a-release). The
-candidate goes on through the same stages: a BoringTun Artifacts run of
-`main` that reproduces its bytes and attests them under the `main` identity,
-a BoringTun Release dry run of that run, approval, publication, and only then
-the separate installer change that adopts it.
+prepared: the pin is `e94c04f3f4fd` and the contract its build 1, `approved`
+and not yet published, while the installer installs the published release of
+the previous pin, `boringtun-cli-0.7.1-gb94943906b11-b1`, which it adopted
+after every stage in [From a pin to a release](#from-a-pin-to-a-release). Of
+those stages, for the current pin, the BoringTun Artifacts run of `main` that
+reproduced its bytes and attested them under the `main` identity (run
+38266658566, attempt 1, commit `8f426268955516845fc34427589dc37012eff71d`), the
+BoringTun Release dry run of that run (38268697310) and the approval are done;
+publication must be dispatched for exactly that run and commit, and only then
+comes the separate installer change that adopts it.
 
 ## Source pin
 
@@ -433,8 +438,9 @@ strict grammar as `pin.env` and refuses any disagreement with the pin:
 A published tag is never reused or moved, so once a build is public, any other
 bytes need a new build number. The build number is scoped to one source commit:
 a new pin starts again at build 1. The contract holds build 1 of the current
-pin, `boringtun-cli-0.7.1-ge94c04f3f4fd-b1`, as a `candidate`: no tag or
-release of that name exists. The published releases of the earlier pins,
+pin, `boringtun-cli-0.7.1-ge94c04f3f4fd-b1`, as `approved` and not yet
+published: no tag or release of that name exists. The published releases of
+the earlier pins,
 `boringtun-cli-0.7.1-gb94943906b11-b1` (release 405544565, its tag on
 `41fe7d903f1903fc5962baf53b551a2dc27aad15`, the release the installer
 embeds), `boringtun-cli-0.7.1-gae2ab44e9a68-b1` and
@@ -520,7 +526,8 @@ top-level directory becomes a release in
 its `MANIFEST` (see §21.1 of [BORINGTUN_BACKEND_DESIGN.md](BORINGTUN_BACKEND_DESIGN.md)).
 `amneziawg-install.sh` embeds the tag, asset names and SHA-256 values of the
 release it installs, currently `boringtun-cli-0.7.1-gb94943906b11-b1`, built
-from the previous pin `b94943906b11`, not the current pin's candidate. Moving
+from the previous pin `b94943906b11`, not the current pin's approved, not yet
+published release. Moving
 the installer to a newer release is a separate change of those constants, with
 its own upgrade and rollback evidence; a candidate or even a published release
 of a newer pin does not change what the installer downloads. The change that
