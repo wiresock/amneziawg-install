@@ -1332,19 +1332,48 @@ unset NIAC_ORIGINAL_WEB_PANEL_CONFIG_DIR NIAC_ORIGINAL_WEB_PANEL_ENV_FILE
 unset NIAC_ORIGINAL_WEB_PANEL_SYSTEMD_UNIT NIAC_HELD_LOCK_FD
 unset -f _client_lock_must_be_busy
 
-# Run nonInteractiveAddClient in a subshell; echo "<clientconf>|||<serverconf>".
-_run_niac() {  # $1=ENABLE_IPV6 (y/n) $2=client name
-	local dir; dir="$(mktemp -d)"
+# Load the actual backend dispatch and install completion blocks, omitting
+# package installation, host configuration writes and backend startup. This
+# keeps return propagation under test without installing anything on the host.
+_initial_client_install_functions() {
+	awk '
+		/^function installBoringtunHost\(\)/ {
+			bt_start++
+			mode = "boringtun"
+			print
+			print "\tlocal ACTIVE=1"
+			next
+		}
+		/^function installAmneziaWG\(\)/ { kernel_start++; mode = "kernel"; copying = 1 }
+		mode == "kernel" && /^\t# Run setup questions first$/ { kernel_gap++; copying = 0 }
+		mode == "kernel" && /^\tlocal MODULE_READY=0$/ { kernel_tail++; copying = 1 }
+		mode == "boringtun" && /^\tif \(\(ACTIVE\)\); then$/ { bt_tail++; copying = 1 }
+		mode != "" {
+			if (copying) print
+			if ($0 == "}") { ends++; mode = ""; copying = 0 }
+		}
+		END {
+			if (bt_start != 1 || bt_tail != 1 || kernel_start != 1 || kernel_gap != 1 || kernel_tail != 1 || ends != 2)
+				exit 1
+		}
+	' "${PROJECT_ROOT}/amneziawg-install.sh"
+}
+
+# Run allocation in a subshell; echo "<clientconf>|||<serverconf>".
+_run_niac() {  # $1=ENABLE_IPV6 $2=name $3=params IPv4 $4=extra config $5=mode $6=input $7=interface IPv4
+	local dir rc=0; dir="$(mktemp -d)"
 	mkdir -p "${dir}/amneziawg"
-	printf '%s\n' "[Interface]" "Address = 10.66.66.1/24" "ListenPort = 51820" \
+	printf '%s\n' "[Interface]" "Address = ${7:-${3:-10.66.66.1}}/24" "ListenPort = 51820" "${4:-}" \
 		> "${dir}/amneziawg/awg0.conf"
+	cp "${dir}/amneziawg/awg0.conf" "${dir}/server-before.conf"
 	(
 		PATH="${NIAC_BIN}:${PATH}"; export PATH
 		AMNEZIAWG_DIR="${dir}/amneziawg"
 		WEB_PANEL_CONFIG_DIR="${dir}/amneziawg/clients"
 		WEB_PANEL_ENV_FILE="${dir}/missing-env.conf"
 		WEB_PANEL_SYSTEMD_UNIT="${dir}/missing.service"
-		SERVER_AWG_NIC="awg0"; SERVER_AWG_IPV4="10.66.66.1"
+		SERVER_AWG_NIC="awg0"; SERVER_AWG_IPV4="${3:-10.66.66.1}"
+		SERVER_AWG_CONF="${AMNEZIAWG_DIR}/awg0.conf"
 		SERVER_AWG_IPV6="fd42:42:42:0:0:0:0:1"; SERVER_PORT="51820"
 		SERVER_PUB_IP="198.51.100.1"; SERVER_PUB_KEY="SRVPUB"
 		CLIENT_DNS_1="1.1.1.1"; CLIENT_DNS_2=""
@@ -1354,10 +1383,37 @@ _run_niac() {  # $1=ENABLE_IPV6 (y/n) $2=client name
 		ALLOWED_IPS="0.0.0.0/0,::/0"; ENABLE_IPV6="$1"
 		# Neutralize side-effecting helpers for the unit test.
 		loadParams() { :; }
-		ensureAmneziawgKernelModule() { :; }
+		ensureAwgBackendReady() { :; }
 		copyToWebPanelDir() { :; }
-		nonInteractiveAddClient "$2" >/dev/null 2>&1
-	)
+		case "${5:-noninteractive}" in
+			noninteractive) nonInteractiveAddClient "$2" >"${dir}/stdout" 2>"${dir}/stderr";;
+			*)
+				mkdir -p "${AMNEZIAWG_DIR}/clients"
+				getHomeDirForClient() { echo "${AMNEZIAWG_DIR}/clients"; }
+				CLIENT_AWG_IPV6=""
+				AUTO_INSTALL=y
+				[[ "$5" == interactive ]] && AUTO_INSTALL=n
+				case "$5" in
+					initial-*)
+						local install_functions
+						install_functions="$(_initial_client_install_functions)" || exit 1
+						unset -f installAmneziaWG installBoringtunHost
+						eval "${install_functions}" || exit 1
+						ensureSupportedInstallDistro() { :; }
+						selectFreshInstallBackend() { :; }
+						selectFreshInstallImitation() { :; }
+						modprobe() { :; }
+						systemctl() { :; }
+						AWG_BACKEND="${5#initial-}"
+						CREATE_INITIAL_CLIENT=y
+						installAmneziaWG >"${dir}/stdout" 2>"${dir}/stderr"
+						;;
+					*) newClient >"${dir}/stdout" 2>"${dir}/stderr" <<< "${6:-}" ;;
+				esac
+				;;
+		esac
+	) || rc=$?
+	printf '%s\n' "${rc}" > "${dir}/rc"
 	echo "${dir}/amneziawg/clients/awg0-client-$2.conf|||${dir}/amneziawg/awg0.conf"
 }
 
@@ -1377,6 +1433,85 @@ assert_not_contains "${NIAC_CC}" "::" "niac v4-only: client config has no IPv6"
 assert_not_contains "${NIAC_CC}" "/128" "niac v4-only: client config has no /128"
 assert_not_contains "${NIAC_SC_PEER}" "/128" "niac v4-only: server peer has no /128"
 assert_not_contains "${NIAC_SC_PEER}" "::" "niac v4-only: server peer has no IPv6"
+
+echo "=== client allocation reserves server IPv4 (#150) ==="
+# Exercise both CLI entry points using real allocation and config generation.
+# Only key generation/backend operations are mocked; all writes stay in mktemp.
+for ALLOC_MODE in noninteractive auto; do
+	for ALLOC_IPV6 in n y; do
+		NIAC_PATHS="$(_run_niac "${ALLOC_IPV6}" client 10.66.66.2 $'[Peer]\nAllowedIPs = 0.0.0.0/0,::/0' "${ALLOC_MODE}")"
+		NIAC_CC="$(cat "${NIAC_PATHS%%|||*}" 2>/dev/null)"
+		NIAC_SC_PEER="$(grep '^AllowedIPs' "${NIAC_PATHS##*|||}" | tail -1)"
+		assert_contains "${NIAC_CC}" "Address = 10.66.66.3/32" "${ALLOC_MODE} IPv6=${ALLOC_IPV6}: skip server .2"
+		assert_contains "${NIAC_SC_PEER}" "AllowedIPs = 10.66.66.3/32" "${ALLOC_MODE} IPv6=${ALLOC_IPV6}: peer uses free .3"
+	done
+	NIAC_PATHS="$(_run_niac n client 10.66.66.42 $'[Peer]\nAllowedIPs = 10.66.66.2/32' "${ALLOC_MODE}")"
+	assert_contains "$(cat "${NIAC_PATHS%%|||*}")" "Address = 10.66.66.3/32" "${ALLOC_MODE}: keep unmarked peer reservation"
+	NIAC_PATHS="$(_run_niac n client 10.66.66.2 $'Address = fd42:42:42::1/64, 10.66.66.3/24\nAddress = 10.66.66.4\n[Peer]\nAllowedIPs = 0.0.0.0/0' "${ALLOC_MODE}")"
+	assert_contains "$(cat "${NIAC_PATHS%%|||*}")" "Address = 10.66.66.5/32" "${ALLOC_MODE}: reserve every interface address"
+done
+NIAC_PATHS="$(_run_niac n client 10.66.66.42 '' interactive $'client\n42\n3')"
+assert_contains "$(cat "${NIAC_PATHS%%|||*}")" "Address = 10.66.66.3/32" "interactive: reject explicitly selected server .42"
+NIAC_PATHS="$(_run_niac n client 10.66.66.2 '' interactive $'client\n02\n3')"
+assert_contains "$(cat "${NIAC_PATHS%%|||*}")" "Address = 10.66.66.3/32" "interactive: leading zero cannot bypass server reservation"
+for ALLOC_ADDRESSES in '10.66.66.2/24 10.66.66.3/24' $'10.66.66.2\t10.66.66.3'; do
+	for ALLOC_MODE in noninteractive auto interactive; do
+		NIAC_PATHS="$(_run_niac n client 10.66.66.1 "Address = ${ALLOC_ADDRESSES}" "${ALLOC_MODE}" $'client\n2\n3\n4')"
+		assert_contains "$(cat "${NIAC_PATHS%%|||*}")" "Address = 10.66.66.4/32" "${ALLOC_MODE}: reserve whitespace-separated addresses (${ALLOC_ADDRESSES})"
+	done
+done
+unset ALLOC_ADDRESSES
+# Initial installation must report failed client creation to its caller and
+# suppress the success guidance, for both backends. Also exercise success so
+# extraction/setup failures cannot make the negative assertions pass alone.
+for ALLOC_MODE in initial-kernel initial-boringtun; do
+	NIAC_PATHS="$(_run_niac n client 10.66.66.02 '' "${ALLOC_MODE}")"
+	ALLOC_DIR="$(dirname "$(dirname "${NIAC_PATHS##*|||}")")"
+	assert_eq 1 "$(cat "${ALLOC_DIR}/rc")" "${ALLOC_MODE}: propagate initial allocation failure"
+	assert_contains "$(cat "${ALLOC_DIR}/stderr")" "canonical dotted-decimal" "${ALLOC_MODE}: preserve allocation diagnostic"
+	assert_not_contains "$(cat "${ALLOC_DIR}/stdout")" "If you want to add more clients" "${ALLOC_MODE}: suppress client success message on failure"
+	assert_rc 1 test -e "${NIAC_PATHS%%|||*}"
+	assert_rc 0 cmp -s "${ALLOC_DIR}/server-before.conf" "${NIAC_PATHS##*|||}"
+	NIAC_PATHS="$(_run_niac n client 10.66.66.2 '' "${ALLOC_MODE}")"
+	ALLOC_DIR="$(dirname "$(dirname "${NIAC_PATHS##*|||}")")"
+	assert_eq 0 "$(cat "${ALLOC_DIR}/rc")" "${ALLOC_MODE}: successful initial allocation"
+	assert_contains "$(cat "${ALLOC_DIR}/stdout")" "If you want to add more clients" "${ALLOC_MODE}: retain success guidance"
+	assert_contains "$(cat "${NIAC_PATHS%%|||*}")" "Address = 10.66.66.3/32" "${ALLOC_MODE}: initial client reserves server IPv4"
+done
+# Linux interprets leading-zero octets as octal. Refuse ambiguous server
+# configuration rather than allocating an address it may already own.
+ALLOC_PEERS=""
+for ALLOC_HOST in {2..7}; do
+	ALLOC_PEERS+=$'[Peer]\nAllowedIPs = 10.66.66.'"${ALLOC_HOST}"$'/32\n'
+done
+for ALLOC_SERVER_IP in 10.66.66.02 10.66.66.010 010.66.66.2; do
+	for ALLOC_MODE in noninteractive auto interactive; do
+		NIAC_PATHS="$(_run_niac n client "${ALLOC_SERVER_IP}" "${ALLOC_PEERS}" "${ALLOC_MODE}" $'client\n08')"
+		ALLOC_DIR="$(dirname "$(dirname "${NIAC_PATHS##*|||}")")"
+		assert_eq 1 "$(cat "${ALLOC_DIR}/rc")" "${ALLOC_MODE}: reject ambiguous server ${ALLOC_SERVER_IP}"
+		assert_contains "$(cat "${ALLOC_DIR}/stderr")" "canonical dotted-decimal" "${ALLOC_MODE}: explain invalid server ${ALLOC_SERVER_IP}"
+		assert_rc 1 test -e "${NIAC_PATHS%%|||*}"
+		assert_rc 0 cmp -s "${ALLOC_DIR}/server-before.conf" "${NIAC_PATHS##*|||}"
+	done
+done
+# The canonical interface address must not mask missing parameter-prefix
+# validation: Linux interprets 010.66.66.2 as the server-owned 8.66.66.2.
+for ALLOC_MODE in noninteractive auto interactive; do
+	NIAC_PATHS="$(_run_niac n client 010.66.66.1 '' "${ALLOC_MODE}" $'client\n2' 8.66.66.2)"
+	ALLOC_DIR="$(dirname "$(dirname "${NIAC_PATHS##*|||}")")"
+	assert_eq 1 "$(cat "${ALLOC_DIR}/rc")" "${ALLOC_MODE}: independently reject ambiguous pool prefix"
+	assert_contains "$(cat "${ALLOC_DIR}/stderr")" "canonical dotted-decimal" "${ALLOC_MODE}: explain ambiguous pool prefix"
+	assert_rc 1 test -e "${NIAC_PATHS%%|||*}"
+	assert_rc 0 cmp -s "${ALLOC_DIR}/server-before.conf" "${NIAC_PATHS##*|||}"
+done
+# Validation must inspect every Address entry, even after finding a reservation.
+NIAC_PATHS="$(_run_niac n client 10.66.66.2 'Address = 10.66.66.010/24' auto)"
+ALLOC_DIR="$(dirname "$(dirname "${NIAC_PATHS##*|||}")")"
+assert_contains "$(cat "${ALLOC_DIR}/stderr")" "canonical dotted-decimal" "auto: reject ambiguous secondary server address"
+assert_rc 1 test -e "${NIAC_PATHS%%|||*}"
+assert_rc 0 cmp -s "${ALLOC_DIR}/server-before.conf" "${NIAC_PATHS##*|||}"
+unset ALLOC_DIR ALLOC_HOST ALLOC_PEERS ALLOC_SERVER_IP
+unset ALLOC_MODE ALLOC_IPV6
 rm -rf "${NIAC_BIN}"
 unset NIAC_BIN NIAC_PATHS NIAC_CC NIAC_SC_PEER
 

@@ -7604,7 +7604,7 @@ function installBoringtunHost() {
 
 	if ((ACTIVE)); then
 		if shouldCreateInitialClient; then
-			newClient
+			newClient || return 1
 			echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
 		else
 			echo -e "${ORANGE}Skipping initial client generation. You can add users later from this script or the web panel.${NC}"
@@ -9285,7 +9285,7 @@ EOF
 
 	if [[ ${MODULE_READY} -eq 1 ]]; then
 		if shouldCreateInitialClient; then
-			newClient
+			newClient || return 1
 			echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
 		else
 			echo -e "${ORANGE}Skipping initial client generation. You can add users later from this script or the web panel.${NC}"
@@ -9325,6 +9325,71 @@ EOF
 	fi
 }
 
+# Reserve individual interface addresses as well as existing peer /32s. A
+# two-hop server need not use .1, and an upstream default route is not a lease
+# of every address in the client pool.
+# Return 0 if reserved, 1 if free, or 2 if configuration cannot be safely read.
+# Reject noncanonical IPv4: Linux can interpret leading-zero octets as octal.
+function clientIPv4InUse() {
+	local IPV4="$1" CONFIG_PATH="$2" STATUS=0
+	awk -v ip="${IPV4}" '
+		function trim(value) {
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+			return value
+		}
+		function canonical_ipv4(value, octets, n, j) {
+			n = split(value, octets, ".")
+			if (n != 4) return 0
+			for (j = 1; j <= n; j++) {
+				if (octets[j] !~ /^(0|[1-9][0-9]*)$/ || length(octets[j]) > 3 || octets[j] + 0 > 255)
+					return 0
+			}
+			return 1
+		}
+		BEGIN {
+			if (!canonical_ipv4(ip)) {
+				invalid = 1
+				exit
+			}
+		}
+		{
+			line = $0
+			sub(/[#;].*$/, "", line)
+			line = trim(line)
+			if (line ~ /^\[.*\]$/) {
+				in_interface = (tolower(line) == "[interface]")
+				next
+			}
+			separator = index(line, "=")
+			if (!in_interface || !separator || tolower(trim(substr(line, 1, separator - 1))) != "address")
+				next
+			count = split(trim(substr(line, separator + 1)), addresses, /[,[:space:]]+/)
+			for (i = 1; i <= count; i++) {
+				split(trim(addresses[i]), parts, "/")
+				if (parts[1] == "" || index(parts[1], ":")) continue
+				if (!canonical_ipv4(parts[1])) {
+					invalid = 1
+					exit
+				}
+				if (parts[1] == ip) found = 1
+			}
+		}
+		END {
+			if (invalid) {
+				print "ERROR: client allocation requires canonical dotted-decimal IPv4 in server Address entries and the client pool prefix (no leading zeros)" > "/dev/stderr"
+				exit 2
+			}
+			exit !found
+		}
+	' "${CONFIG_PATH}" || STATUS=$?
+	# Validate every interface address before accepting any reservation, including
+	# a peer match, so ambiguous later entries cannot be silently skipped.
+	if [[ ${STATUS} != 1 ]]; then
+		return "${STATUS}"
+	fi
+	grep -qF "${IPV4}/32" "${CONFIG_PATH}"
+}
+
 function newClient() {
 	ensureAwgBackendReady
 	# Reset variables to ensure clean state for each new client
@@ -9353,8 +9418,12 @@ function newClient() {
 
 	local FREE_DOT_IP_FOUND=0
 	for DOT_IP in {2..254}; do
-		# Check IPv4 address "${BASE_IP}.${DOT_IP}/32" is not already in use
-		DOT_EXISTS=$(grep -cF "${BASE_IP}.${DOT_IP}/32" "${SERVER_AWG_CONF}")
+		DOT_EXISTS=0
+		if clientIPv4InUse "${BASE_IP}.${DOT_IP}" "${SERVER_AWG_CONF}"; then
+			DOT_EXISTS=1
+		elif [[ $? != 1 ]]; then
+			return 1
+		fi
 
 		# Derive the would-be IPv6 client address in the same way as in AUTO_INSTALL
 		# and ensure the corresponding /128 is also not already present.
@@ -9423,7 +9492,7 @@ function newClient() {
 			read -rp "Client AmneziaWG IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
 
 			# Validate host number is between 2 and 254
-			if ! [[ ${DOT_IP} =~ ^[0-9]+$ ]] || (( DOT_IP < 2 )) || (( DOT_IP > 254 )); then
+			if ! [[ ${DOT_IP} =~ ^[0-9]{1,3}$ ]] || (( 10#${DOT_IP} < 2 )) || (( 10#${DOT_IP} > 254 )); then
 				echo ""
 				echo -e "${ORANGE}Invalid host number. Must be between 2 and 254.${NC}"
 				echo ""
@@ -9431,12 +9500,19 @@ function newClient() {
 				continue
 			fi
 
+			# Compare canonical decimal addresses, so e.g. 02 cannot bypass .2.
+			DOT_IP=$((10#${DOT_IP}))
 			CLIENT_AWG_IPV4="${BASE_IP}.${DOT_IP}"
-			IPV4_EXISTS=$(grep -cF "$CLIENT_AWG_IPV4/32" "${SERVER_AWG_CONF}")
+			IPV4_EXISTS=0
+			if clientIPv4InUse "${CLIENT_AWG_IPV4}" "${SERVER_AWG_CONF}"; then
+				IPV4_EXISTS=1
+			elif [[ $? != 1 ]]; then
+				return 1
+			fi
 
 			if [[ ${IPV4_EXISTS} != 0 ]]; then
 				echo ""
-				echo -e "${ORANGE}A client with the specified IPv4 was already created, please choose another IPv4.${NC}"
+				echo -e "${ORANGE}The specified IPv4 is already in use, please choose another IPv4.${NC}"
 				echo ""
 			fi
 		done
@@ -13007,7 +13083,12 @@ function nonInteractiveAddClient() (
 
 	local FREE_FOUND=0
 	for DOT_IP in {2..254}; do
-		DOT_EXISTS=$(grep -cF "${BASE_IP}.${DOT_IP}/32" "${SERVER_AWG_CONF}")
+		DOT_EXISTS=0
+		if clientIPv4InUse "${BASE_IP}.${DOT_IP}" "${SERVER_AWG_CONF}"; then
+			DOT_EXISTS=1
+		elif [[ $? != 1 ]]; then
+			return 1
+		fi
 		local CLIENT_IPV6_CANDIDATE
 		CLIENT_IPV6_CANDIDATE=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
 		IPV6_EXISTS=0

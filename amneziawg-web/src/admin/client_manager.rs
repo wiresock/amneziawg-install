@@ -25,7 +25,7 @@
 //! so that client config files can be created directly.
 
 use std::collections::HashSet;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
@@ -596,23 +596,58 @@ fn ipv4_base(server_ipv4: &str) -> &str {
     }
 }
 
-/// Find all host numbers (.2–.254) currently used in the server config
-/// based on IPv4 AllowedIPs entries.
+/// Find IPv4 host numbers reserved by the server config.
 ///
-/// Scans AllowedIPs in `[Peer]` sections for IPv4 addresses matching the
-/// given base prefix (e.g., `10.66.66.X/32`).  Returns a set of used host
-/// numbers.
+/// Reserve individual `[Interface]` addresses regardless of their prefix length,
+/// plus peer AllowedIPs /32 entries matching the given base prefix. An upstream
+/// default route must not reserve the entire client pool.
 ///
 /// IPv6 collision detection is handled separately via
 /// `find_existing_ipv6_normalized()` to avoid a mismatch between the hex
 /// representation of IPv6 host numbers and the decimal DOT_IP used by the
 /// allocator.
-fn find_used_ipv4_dots(server_config: &str, base_ipv4: &str) -> HashSet<u16> {
+fn find_used_ipv4_dots(
+    server_config: &str,
+    base_ipv4: &str,
+) -> Result<HashSet<u16>, CreateClientError> {
+    // iproute2 accepts aliases such as .010 meaning .8. Require canonical
+    // decimal spelling instead of silently skipping or misreading them.
+    format!("{base_ipv4}.0").parse::<Ipv4Addr>().map_err(|_| {
+        CreateClientError::ConfigParse(format!(
+            "client pool prefix '{base_ipv4}' must use canonical dotted-decimal IPv4 (no leading zeros)"
+        ))
+    })?;
     let mut used = HashSet::new();
     let prefix_with_dot = format!("{base_ipv4}.");
+    let mut in_interface = false;
 
     for line in server_config.lines() {
-        let trimmed = line.trim();
+        let trimmed = line.split(['#', ';']).next().unwrap_or_default().trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_interface = trimmed.eq_ignore_ascii_case("[Interface]");
+            continue;
+        }
+        if in_interface {
+            if let Some(val) = parse_kv(trimmed, "Address") {
+                for cidr in val
+                    .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                    .filter(|s| !s.is_empty())
+                {
+                    let address = cidr.trim().split('/').next().unwrap_or_default();
+                    if address.contains(':') {
+                        continue;
+                    }
+                    let ip = address.parse::<Ipv4Addr>().map_err(|_| {
+                        CreateClientError::ConfigParse(format!(
+                            "server Address '{address}' must use canonical dotted-decimal IPv4 (no leading zeros)"
+                        ))
+                    })?;
+                    if address.starts_with(&prefix_with_dot) {
+                        used.insert(u16::from(ip.octets()[3]));
+                    }
+                }
+            }
+        }
         if let Some(val) = parse_kv(trimmed, "AllowedIPs") {
             for cidr in val.split(',') {
                 let cidr = cidr.trim();
@@ -628,7 +663,7 @@ fn find_used_ipv4_dots(server_config: &str, base_ipv4: &str) -> HashSet<u16> {
         }
     }
 
-    used
+    Ok(used)
 }
 
 /// Collect all normalized `/128` IPv6 addresses present in the server config.
@@ -661,8 +696,8 @@ fn find_existing_ipv6_normalized(server_config: &str) -> HashSet<String> {
 
 /// Find the first available host number in the .2–.254 range.
 ///
-/// A DOT_IP is available when it is not in the `used_ipv4` set (from IPv4
-/// AllowedIPs) AND the candidate IPv6 address `{base_ipv6}::{dot}` does
+/// A DOT_IP is available when it is not in the `used_ipv4` set (from server
+/// addresses and peer IPv4 AllowedIPs) AND the candidate IPv6 `{base_ipv6}::{dot}` does
 /// not appear in `existing_ipv6s` (the set of normalized /128 addresses
 /// already in the config).
 fn find_available_dot(
@@ -741,7 +776,7 @@ fn resolve_client_ips(
     base_ipv6: Option<&str>,
     ip_override: &IpOverride,
 ) -> Result<(String, Option<String>), CreateClientError> {
-    let used_ipv4 = find_used_ipv4_dots(server_config, base_ipv4);
+    let used_ipv4 = find_used_ipv4_dots(server_config, base_ipv4)?;
 
     let ipv4_host = match &ip_override.ipv4_address {
         Some(addr) => Some(parse_ipv4_address(addr, base_ipv4)?),
@@ -836,7 +871,7 @@ pub fn suggest_next_ips() -> Result<SuggestedIps, CreateClientError> {
 
     let base_ipv4 = ipv4_base(&params.server_awg_ipv4);
 
-    let used_ipv4 = find_used_ipv4_dots(&server_config, base_ipv4);
+    let used_ipv4 = find_used_ipv4_dots(&server_config, base_ipv4)?;
     let server_ipv6_normalized = if server_interface_has_ipv6_address(&server_config) {
         Some(normalize_ipv6(&params.server_awg_ipv6)?)
     } else {
@@ -2261,7 +2296,7 @@ PublicKey = BOB_KEY=
 PresharedKey = BOB_PSK=
 AllowedIPs = 10.66.66.3/32,fd42:0042:0042:0000:0000:0000:0000:0003/128
 ";
-        let used = find_used_ipv4_dots(config, "10.66.66");
+        let used = find_used_ipv4_dots(config, "10.66.66").unwrap();
         assert!(used.contains(&2));
         assert!(used.contains(&3));
         assert!(!used.contains(&4));
@@ -2621,6 +2656,136 @@ AllowedIPs = 10.66.66.2/32
     }
 
     // ── IP override / resolve_client_ips tests ─────────────────────────
+
+    #[test]
+    fn resolve_client_ips_reserves_server_ipv4_with_upstream_default_route() {
+        let config = "[Interface]\nAddress = 10.66.66.2/24,fd42:42:42::1/64\n\
+                      [Peer]\nAllowedIPs = 0.0.0.0/0,::/0\n";
+        for base_ipv6 in [None, Some("fd42:0042:0042:0000")] {
+            let (ipv4, ipv6) =
+                resolve_client_ips(config, "10.66.66", base_ipv6, &IpOverride::default()).unwrap();
+            assert_eq!(ipv4, "10.66.66.3");
+            assert_eq!(ipv6.as_deref(), base_ipv6.map(|_| "fd42:0042:0042:0000::3"));
+        }
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_server_ipv4_override() {
+        let config = "[Interface]\nAddress = 10.66.66.42/24\n";
+        for base_ipv6 in [None, Some("fd42:0042:0042:0000")] {
+            for ipv6_address in [None, Some("fd42:42:42::ab".to_string())] {
+                if base_ipv6.is_none() && ipv6_address.is_some() {
+                    continue;
+                }
+                let ovr = IpOverride {
+                    ipv4_address: Some("10.66.66.42".to_string()),
+                    ipv6_address,
+                };
+                let err = resolve_client_ips(config, "10.66.66", base_ipv6, &ovr).unwrap_err();
+                assert!(matches!(err, CreateClientError::IpInUse(ip) if ip == "10.66.66.42"));
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_client_ips_ipv6_override_still_reserves_server_ipv4() {
+        let config = "[Interface]\nAddress = 10.66.66.2/24\n";
+        let ovr = IpOverride {
+            ipv4_address: None,
+            ipv6_address: Some("fd42:42:42::ab".to_string()),
+        };
+        let (ipv4, ipv6) =
+            resolve_client_ips(config, "10.66.66", Some("fd42:0042:0042:0000"), &ovr).unwrap();
+        assert_eq!(ipv4, "10.66.66.3");
+        assert_eq!(ipv6.as_deref(), Some("fd42:0042:0042:0000::ab"));
+    }
+
+    #[test]
+    fn resolve_client_ips_reserves_multiple_server_ipv4_addresses() {
+        let config = "[Interface]\n\
+                      Address = fd42:42:42::1/64, 10.66.66.2/24, 192.168.1.5/24\n\
+                      Address = 10.66.66.3 # secondary address\n\
+                      [Peer]\nAllowedIPs = 0.0.0.0/0,::/0\n\
+                      [Peer]\nAllowedIPs = 10.66.66.4/32\n";
+        let (ipv4, ipv6) =
+            resolve_client_ips(config, "10.66.66", None, &IpOverride::default()).unwrap();
+        assert_eq!(ipv4, "10.66.66.5");
+        assert_eq!(ipv6, None);
+    }
+
+    #[test]
+    fn resolve_client_ips_reserves_whitespace_separated_server_addresses() {
+        for addresses in ["10.66.66.2/24 10.66.66.3/24", "10.66.66.2\t10.66.66.3"] {
+            let config = format!("[Interface]\nAddress = {addresses}\n");
+            for base_ipv6 in [None, Some("fd42:0042:0042:0000")] {
+                let (ipv4, _) =
+                    resolve_client_ips(&config, "10.66.66", base_ipv6, &IpOverride::default())
+                        .unwrap();
+                assert_eq!(ipv4, "10.66.66.4", "{addresses}");
+                for host in [2, 3] {
+                    let ovr = IpOverride {
+                        ipv4_address: Some(format!("10.66.66.{host}")),
+                        ipv6_address: None,
+                    };
+                    let err = resolve_client_ips(&config, "10.66.66", base_ipv6, &ovr).unwrap_err();
+                    assert!(matches!(err, CreateClientError::IpInUse(_)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_noncanonical_server_ipv4() {
+        for address in [
+            "10.66.66.02/24",
+            "10.66.66.010",
+            "010.66.66.2/24",
+            "10.66.66.0x8/24",
+            "10.66.66/24",
+        ] {
+            // The valid first address and existing peers must not short-circuit
+            // validation of a later ambiguous interface address.
+            let mut config = format!("[Interface]\nAddress = 10.66.66.2/24 {address}\n");
+            for host in 2..8 {
+                config.push_str(&format!("[Peer]\nAllowedIPs = 10.66.66.{host}/32\n"));
+            }
+            for base_ipv6 in [None, Some("fd42:0042:0042:0000")] {
+                for ipv4_address in [None, Some("10.66.66.8".to_string())] {
+                    let ovr = IpOverride {
+                        ipv4_address,
+                        ipv6_address: None,
+                    };
+                    let err = resolve_client_ips(&config, "10.66.66", base_ipv6, &ovr).unwrap_err();
+                    assert!(
+                        matches!(err, CreateClientError::ConfigParse(ref msg)
+                            if msg.contains("canonical dotted-decimal")),
+                        "{address}: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_client_ips_rejects_noncanonical_pool_prefix() {
+        // Even canonical interface addresses cannot make an ambiguous prefix
+        // from SERVER_AWG_IPV4 safe for string-based pool membership checks.
+        let config = "[Interface]\nAddress = 8.66.66.2/24\n";
+        let err =
+            resolve_client_ips(config, "010.66.66", None, &IpOverride::default()).unwrap_err();
+        assert!(matches!(err, CreateClientError::ConfigParse(_)));
+    }
+
+    #[test]
+    fn resolve_client_ips_reports_exhaustion_when_server_owns_last_slot() {
+        let mut config = String::from("[Interface]\nAddress = 10.66.66.254/24\n");
+        for host in 2..254 {
+            config.push_str(&format!("[Peer]\nAllowedIPs = 10.66.66.{host}/32\n"));
+        }
+        let err =
+            resolve_client_ips(&config, "10.66.66", None, &IpOverride::default()).unwrap_err();
+        assert!(matches!(err, CreateClientError::NoFreeIp));
+    }
 
     #[test]
     fn resolve_client_ips_auto_allocates_when_no_override() {
