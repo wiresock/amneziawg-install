@@ -139,6 +139,11 @@ jobs:
       - name: Validate signed PPA selection, DKMS, module, and tools
         run: sudo bash tests/test-ubuntu-resolute-live.sh
 
+      - name: Reproduce DKMS build on the reported Azure kernel
+        run: |
+          sudo apt-get install -y linux-headers-7.0.0-1017-azure
+          sudo dkms build -m amneziawg -v 1.0.0 -k 7.0.0-1017-azure
+
       - name: Show DKMS build diagnostics
         if: failure()
         run: |
