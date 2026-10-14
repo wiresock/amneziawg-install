@@ -5,9 +5,10 @@
 # modes, client add/remove/regenerate, migrations) on the kernel backend, and
 # writes one normalized transcript per scenario: exit code, stdout, stderr, the
 # ordered external-command log and a hash of every file the scenario owns.
-# Params lose their AWG_BACKEND line before hashing: persisting it is the one
-# intended format change. Run by run-kernel-equivalence.sh against a base
-# revision and the working tree; the transcripts must be identical.
+# Params omit the AWG_BACKEND line and an empty CLIENT_MTU default before
+# hashing: these are intended schema additions. Configured MTU values remain
+# in the hash. Run by run-kernel-equivalence.sh against a base revision and the
+# working tree; the transcripts must be identical.
 #
 # Usage: kernel-scenarios.sh <amneziawg-install.sh> <output-dir>
 
@@ -149,13 +150,13 @@ normalize() {
 }
 
 snapshot() {
-	# Hash every regular file below the scenario state directory. Params lose the
-	# AWG_BACKEND line first: persisting it is the one intended format change.
+	# Hash every regular file below the scenario state directory. Normalize only
+	# intended params schema additions; a nonempty CLIENT_MTU remains observable.
 	local dir="$1" f
 	[[ -d "${dir}" ]] || return 0
 	while IFS= read -r f; do
 		if [[ "$(basename "${f}")" == params ]]; then
-			printf '%s %s\n' "$(grep -v '^AWG_BACKEND=' "${f}" | sha256sum | cut -c1-16)" "${f}"
+			printf '%s %s\n' "$(grep -v -e '^AWG_BACKEND=' -e "^CLIENT_MTU=''$" "${f}" | sha256sum | cut -c1-16)" "${f}"
 		else
 			printf '%s %s\n' "$(sha256sum <"${f}" | cut -c1-16)" "${f}"
 		fi

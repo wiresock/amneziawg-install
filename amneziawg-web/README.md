@@ -44,6 +44,11 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
   per-peer traffic snapshots in SQLite, keeps the `peers` table current.
 - **Config discovery** – scans `AWG_CONFIG_DIR` for `*.conf` files, correlates
   each config file with its live peer by public key.
+- **Client MTU** – newly generated clients use the optional `CLIENT_MTU` from
+  `/etc/amnezia/amneziawg/params`. A missing or empty value omits the MTU line;
+  otherwise use a decimal integer from 1280 to 65535 without leading zeros.
+  Changes apply to future configs. Update both the web binary and privileged
+  helper when upgrading to use this setting.
 - **Peer rename / comment** – `PATCH /api/peers/:id` (JSON) and
   `POST /peers/:id` (HTML form) with normalisation and field-level validation.
 - **Old-peer cleanup** – disabled peers with no linked client config can have

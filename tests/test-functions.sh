@@ -442,6 +442,105 @@ fi
 }
 rm -f "${SERIALIZE_TMP}"
 
+echo "=== optional client MTU persistence ==="
+MTU_PARAMS_DIR="$(mktemp -d)"
+MTU_PARAMS="${MTU_PARAMS_DIR}/params"
+for MTU_VALUE in '' 1280 1380 65535; do
+	CLIENT_MTU="${MTU_VALUE}" serializeParams "${MTU_PARAMS}"
+	assert_eq "${MTU_VALUE}" "$(unset CLIENT_MTU; source "${MTU_PARAMS}"; printf '%s' "${CLIENT_MTU-missing}")" "MTU round-trip: '${MTU_VALUE}'"
+done
+# Exercise the real privileged allow-list, with only its params path redirected.
+MTU_SAFE_PARAMS="$(
+	# Load all helper functions without dispatching main (which requires root).
+	# Only the fixed config root changes; real filtering and file checks run.
+	source <(sed -e '$d' -e "s|^readonly AWG_CONFIG_ROOT=.*|readonly AWG_CONFIG_ROOT='${MTU_PARAMS_DIR}'|" \
+		"${PROJECT_ROOT}/amneziawg-web/scripts/amneziawg-web-privileged")
+	emit_safe_params
+)"
+assert_eq "CLIENT_MTU='65535'" "$(printf '%s\n' "${MTU_SAFE_PARAMS}" | grep '^CLIENT_MTU=')" "web helper exposes client MTU"
+assert_eq 0 "$(printf '%s\n' "${MTU_SAFE_PARAMS}" | grep -c '^SERVER_PRIV_KEY=' || true)" "web helper keeps server private key hidden"
+
+# Legacy params must not inherit CLIENT_MTU from the process environment.
+_check_loaded_mtu() (
+	local dir; dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	AMNEZIAWG_DIR="${dir}"
+	CLIENT_MTU=1380 serializeParams "${dir}/params" || exit 1
+	case "$1" in
+		legacy|legacy-state) sed -i '/^CLIENT_MTU=/d' "${dir}/params";;
+		invalid) printf "CLIENT_MTU='1279'\n" >>"${dir}/params";;
+	esac
+	printf '[Interface]\nAddress = 10.66.66.1/24\n' >"${dir}/awg0.conf"
+	# This suite is unprivileged; fake ownership only, retaining real mode checks.
+	stat() { if [[ "$1" == -c && "$2" == %u ]]; then echo 0; else command stat "$@"; fi; }
+	CLIENT_MTU=1420
+	validateParamsFile >/dev/null || exit 1
+	if [[ "$1" == legacy-state ]]; then
+		local before; before="$(awgParamsStateDigest)"
+		serializeParams "${dir}/params" || exit 1
+		validateParamsFile >/dev/null || exit 1
+		[[ "$(awgParamsStateDigest)" == "${before}" ]] || exit 1
+		printf stable
+		return
+	fi
+	printf '%s' "${CLIENT_MTU:-}"
+)
+for MTU_LOAD_CASE in valid legacy legacy-state; do
+	MTU_RC=0
+	MTU_LOADED="$(_check_loaded_mtu "${MTU_LOAD_CASE}")" || MTU_RC=$?
+	assert_eq 0 "${MTU_RC}" "${MTU_LOAD_CASE}: MTU loading fixture succeeds"
+	case "${MTU_LOAD_CASE}" in
+		valid) assert_eq 1380 "${MTU_LOADED}" "load persisted client MTU";;
+		legacy) assert_eq '' "${MTU_LOADED}" "legacy params clear environment MTU";;
+		legacy-state) assert_eq stable "${MTU_LOADED}" "legacy params keep transaction state after serialization";;
+	esac
+done
+unset MTU_LOAD_CASE MTU_LOADED
+MTU_RC=0
+_check_loaded_mtu invalid >/dev/null 2>&1 || MTU_RC=$?
+assert_eq 1 "${MTU_RC}" "load rejects invalid persisted client MTU"
+MTU_RC=0
+( CLIENT_MTU=1279 AUTO_INSTALL=y installQuestions ) >/dev/null 2>&1 || MTU_RC=$?
+assert_eq 1 "${MTU_RC}" "automatic install rejects invalid MTU"
+_check_install_mtu() (
+	local mode="$1" value="$2" dir answers
+	dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	# Only host discovery is mocked; all prompts, validation and persistence run.
+	detectPublicIPv4() { echo 198.51.100.1; }
+	ip() { echo 'default via 198.51.100.254 dev eth0'; }
+	ipv6Available() { return 1; }
+	AUTO_INSTALL="${mode}"
+	CLIENT_MTU=""
+	if [[ "${mode}" == y ]]; then CLIENT_MTU="${value}"; fi
+	answers=$'198.51.100.1\neth0\nawg0\n10.66.66.1\nn\n51820\n1.1.1.1\n\n'
+	answers+="${value}"$'\n0.0.0.0/0\n4\n50\n1000\n30\n100\n45\n120\n5-10\n11-20\n21-30\n31-40\ny\n'
+	installQuestions >"${dir}/stdout" 2>"${dir}/stderr" <<<"${answers}" || exit 1
+	serializeParams "${dir}/params" || exit 1
+	unset CLIENT_MTU
+	source "${dir}/params"
+	printf '%s|%s' "${CLIENT_MTU:-}" "$(grep -c 'CLIENT_MTU must' "${dir}/stderr" || true)"
+)
+assert_eq '1380|0' "$(_check_install_mtu y 1380)" "automatic install persists requested MTU"
+assert_eq '1380|0' "$(_check_install_mtu n 1380)" "interactive install accepts valid MTU on first attempt"
+assert_eq '|0' "$(_check_install_mtu n '')" "interactive install accepts omitted MTU"
+assert_eq '1380|1' "$(_check_install_mtu n $'1279\n1380')" "interactive install retries invalid MTU and persists correction"
+for MTU_WHITESPACE in ' 1380' '1380 ' '   ' $'\t1380\t' $'\t'; do
+	MTU_RC=0
+	MTU_PROMPT_RESULT="$(_check_install_mtu n "${MTU_WHITESPACE}"$'\n1380')" || MTU_RC=$?
+	assert_eq 0 "${MTU_RC}" "interactive MTU whitespace fixture succeeds"
+	assert_eq '1380|1' "${MTU_PROMPT_RESULT}" "interactive install rejects MTU whitespace before accepting correction"
+done
+unset MTU_WHITESPACE MTU_PROMPT_RESULT
+printf 'unchanged\n' >"${MTU_PARAMS}"
+MTU_RC=0
+CLIENT_MTU=1279 serializeParams "${MTU_PARAMS}" 2>/dev/null || MTU_RC=$?
+assert_eq 1 "${MTU_RC}" "invalid MTU refuses serialization"
+assert_eq unchanged "$(cat "${MTU_PARAMS}")" "invalid MTU does not truncate params"
+rm -f "${MTU_PARAMS}"
+rmdir "${MTU_PARAMS_DIR}"
+unset MTU_PARAMS MTU_PARAMS_DIR MTU_VALUE MTU_RC MTU_SAFE_PARAMS
+
 echo "=== formatClientAllowedIPs ==="
 assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs "0.0.0.0/0,::/0")" "formatClientAllowedIPs adds space after comma"
 assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs " 0.0.0.0/0, ::/0 ")" "formatClientAllowedIPs trims entries"
@@ -1360,7 +1459,7 @@ _initial_client_install_functions() {
 }
 
 # Run allocation in a subshell; echo "<clientconf>|||<serverconf>".
-_run_niac() {  # $1=ENABLE_IPV6 $2=name $3=params IPv4 $4=extra config $5=mode $6=input $7=interface IPv4
+_run_niac() {  # $1=ENABLE_IPV6 $2=name $3=params IPv4 $4=extra config $5=mode $6=input $7=interface IPv4 $8=MTU
 	local dir rc=0; dir="$(mktemp -d)"
 	mkdir -p "${dir}/amneziawg"
 	printf '%s\n' "[Interface]" "Address = ${7:-${3:-10.66.66.1}}/24" "ListenPort = 51820" "${4:-}" \
@@ -1377,6 +1476,7 @@ _run_niac() {  # $1=ENABLE_IPV6 $2=name $3=params IPv4 $4=extra config $5=mode $
 		SERVER_AWG_IPV6="fd42:42:42:0:0:0:0:1"; SERVER_PORT="51820"
 		SERVER_PUB_IP="198.51.100.1"; SERVER_PUB_KEY="SRVPUB"
 		CLIENT_DNS_1="1.1.1.1"; CLIENT_DNS_2=""
+		CLIENT_MTU="${8:-}"
 		SERVER_AWG_JC=4; SERVER_AWG_JMIN=50; SERVER_AWG_JMAX=1000
 		SERVER_AWG_S1=30; SERVER_AWG_S2=100; SERVER_AWG_S3=45; SERVER_AWG_S4=120
 		SERVER_AWG_H1="5-10"; SERVER_AWG_H2="11-20"; SERVER_AWG_H3="21-30"; SERVER_AWG_H4="31-40"
@@ -1512,6 +1612,25 @@ assert_rc 1 test -e "${NIAC_PATHS%%|||*}"
 assert_rc 0 cmp -s "${ALLOC_DIR}/server-before.conf" "${NIAC_PATHS##*|||}"
 unset ALLOC_DIR ALLOC_HOST ALLOC_PEERS ALLOC_SERVER_IP
 unset ALLOC_MODE ALLOC_IPV6
+echo "=== optional client MTU generation ==="
+for MTU_MODE in noninteractive auto interactive initial-kernel initial-boringtun; do
+	for MTU_VALUE in '' 1280 1380 65535; do
+		NIAC_PATHS="$(_run_niac y client '' '' "${MTU_MODE}" $'client\n2\n2' '' "${MTU_VALUE}")"
+		MTU_DIR="$(dirname "$(dirname "${NIAC_PATHS##*|||}")")"
+		assert_eq 0 "$(cat "${MTU_DIR}/rc")" "${MTU_MODE}: valid MTU '${MTU_VALUE}'"
+		MTU_EXPECTED=""; [[ -z "${MTU_VALUE}" ]] || MTU_EXPECTED="MTU = ${MTU_VALUE}"
+		assert_eq "${MTU_EXPECTED}" "$(grep '^MTU' "${NIAC_PATHS%%|||*}" || true)" "${MTU_MODE}: generated MTU '${MTU_VALUE}'"
+	done
+	for MTU_VALUE in 0 1279 65536 01380 +1380 -1380 1380.5 '1380 ' '1+1380' 999999999999999999999 $'1380\nPostUp = false'; do
+		NIAC_PATHS="$(_run_niac n client '' '' "${MTU_MODE}" $'client\n2' '' "${MTU_VALUE}")"
+		MTU_DIR="$(dirname "$(dirname "${NIAC_PATHS##*|||}")")"
+		assert_eq 1 "$(cat "${MTU_DIR}/rc")" "${MTU_MODE}: reject invalid MTU"
+		assert_contains "$(cat "${MTU_DIR}/stderr")" 'CLIENT_MTU' "${MTU_MODE}: explain invalid MTU"
+		assert_rc 1 test -e "${NIAC_PATHS%%|||*}"
+		assert_rc 0 cmp -s "${MTU_DIR}/server-before.conf" "${NIAC_PATHS##*|||}"
+	done
+done
+unset MTU_MODE MTU_VALUE MTU_DIR MTU_EXPECTED
 rm -rf "${NIAC_BIN}"
 unset NIAC_BIN NIAC_PATHS NIAC_CC NIAC_SC_PEER
 
@@ -2726,6 +2845,7 @@ _run_regen_test() {
 		SERVER_PUB_KEY="SRVPUB"
 		CLIENT_DNS_1="1.1.1.1"
 		CLIENT_DNS_2=""
+		CLIENT_MTU="${2:-}"
 		SERVER_AWG_JC=4; SERVER_AWG_JMIN=50; SERVER_AWG_JMAX=1000
 		SERVER_AWG_S1=30; SERVER_AWG_S2=100; SERVER_AWG_S3=45; SERVER_AWG_S4=120
 		SERVER_AWG_H1="5-10"; SERVER_AWG_H2="11-20"; SERVER_AWG_H3="21-30"; SERVER_AWG_H4="31-40"
@@ -2788,6 +2908,12 @@ EOF
 		echo "FAIL: expected H1 5-10, got ${cur_h1}" >&2
 		return 1
 	fi
+	local expected_mtu=""
+	[[ -z "${CLIENT_MTU}" ]] || expected_mtu="MTU = ${CLIENT_MTU}"
+	if [[ "$(grep '^MTU' "${PANEL_DIR}/awg0-client-alice.conf" || true)" != "${expected_mtu}" ]]; then
+		echo "FAIL: regenerated config has incorrect MTU" >&2
+		return 1
+	fi
 	if ! echo "${out}" | grep -q "1 succeeded, 0 failed"; then
 		echo "FAIL: expected summary '1 succeeded, 0 failed', got: ${out}" >&2
 		return 1
@@ -2799,6 +2925,55 @@ EOF
 	echo "OK"
 }
 assert_eq "OK" "$(_run_regen_test _setup_panel_only)" "regenerateClients: preserves key when config exists only in web panel config dir"
+assert_eq "OK" "$(_run_regen_test _setup_panel_only 1380)" "regenerateClients: applies persisted client MTU"
+
+_setup_invalid_mtu_regen() {
+	local dir="$1" PANEL_DIR="$2" rc=0 diagnostic=no before after unchanged=no
+	cat >"${SERVER_AWG_CONF}" <<'EOF'
+[Interface]
+Address = 10.66.66.1/24
+PrivateKey = SRVPRIV
+
+### Client alice
+[Peer]
+PublicKey = PUB_ALICE
+PresharedKey = PSK_ALICE
+AllowedIPs = 10.66.66.2/32
+EOF
+	cat >"${PANEL_DIR}/awg0-client-alice.conf" <<'EOF'
+[Interface]
+PrivateKey = PRIV_ALICE
+Address = 10.66.66.2/32
+MTU = 1420
+
+[Peer]
+PublicKey = SRVPUB
+PresharedKey = PSK_ALICE
+Endpoint = 198.51.100.1:51820
+AllowedIPs = 0.0.0.0/0
+EOF
+	printf 'CLIENT_MTU=%s\n' "$(safeQuoteParam "${CLIENT_MTU}")" >"${dir}/amneziawg/params"
+	before="$(find "${dir}/amneziawg" "${PANEL_DIR}" -type f -exec sha256sum {} + | sort)"
+	: >"${dir}/awg-calls"
+	# Keep the existing key tool mock, but record every command across subshells.
+	awg() { printf '%s\n' "$*" >>"${dir}/awg-calls"; command awg "$@"; }
+	regenerateClients >"${dir}/stdout" 2>"${dir}/stderr" </dev/null || rc=$?
+	grep -q 'CLIENT_MTU must' "${dir}/stderr" && diagnostic=yes
+	after="$(find "${dir}/amneziawg" "${PANEL_DIR}" -type f -exec sha256sum {} + | sort)"
+	[[ "${before}" != "${after}" ]] || unchanged=yes
+	printf '%s|%s|%s|%s\n' "${rc}" "${diagnostic}" "$(wc -l <"${dir}/awg-calls")" "${unchanged}"
+}
+for MTU_INVALID in 1279 65536 '1380 ' $'1380\nPostUp = false'; do
+	MTU_RC=0
+	MTU_REGEN_RESULT="$(_run_regen_test _setup_invalid_mtu_regen "${MTU_INVALID}")" || MTU_RC=$?
+	assert_eq 0 "${MTU_RC}" "invalid-MTU regeneration fixture succeeds"
+	IFS='|' read -r MTU_REGEN_RC MTU_DIAGNOSTIC MTU_KEY_CALLS MTU_UNCHANGED <<<"${MTU_REGEN_RESULT}"
+	assert_eq 1 "${MTU_REGEN_RC}" "regeneration rejects invalid MTU"
+	assert_eq yes "${MTU_DIAGNOSTIC}" "regeneration explains invalid MTU"
+	assert_eq 0 "${MTU_KEY_CALLS}" "invalid MTU prevents key and interface commands"
+	assert_eq yes "${MTU_UNCHANGED}" "invalid MTU preserves all params, server and client files"
+done
+unset MTU_INVALID MTU_RC MTU_REGEN_RESULT MTU_REGEN_RC MTU_DIAGNOSTIC MTU_KEY_CALLS MTU_UNCHANGED
 
 # Test 2: Web panel installed, client config MISSING, non-interactive -> refuses to rotate key
 _setup_panel_missing_noninteractive() {

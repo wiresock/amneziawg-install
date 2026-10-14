@@ -243,6 +243,7 @@ pub struct ServerParams {
     pub server_pub_key: String,
     pub client_dns_1: String,
     pub client_dns_2: String,
+    pub client_mtu: Option<u16>,
     pub allowed_ips: String,
     pub jc: String,
     pub jmin: String,
@@ -454,6 +455,7 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
         server_pub_key: get("SERVER_PUB_KEY")?,
         client_dns_1: get("CLIENT_DNS_1")?,
         client_dns_2: get_opt("CLIENT_DNS_2"),
+        client_mtu: parse_client_mtu(&get_opt("CLIENT_MTU"))?,
         allowed_ips: get("ALLOWED_IPS")?,
         jc: get("SERVER_AWG_JC")?,
         jmin: get("SERVER_AWG_JMIN")?,
@@ -496,6 +498,22 @@ pub fn parse_params(content: &str) -> Result<ServerParams, CreateClientError> {
     }
 
     Ok(params)
+}
+
+fn parse_client_mtu(value: &str) -> Result<Option<u16>, CreateClientError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    // Match the installer's canonical decimal syntax and IPv6-safe minimum.
+    if !value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        if let Ok(mtu @ 1280..=65535) = value.parse::<u16>() {
+            return Ok(Some(mtu));
+        }
+    }
+    Err(CreateClientError::ParamsRead(
+        "CLIENT_MTU must be empty or a decimal integer from 1280 to 65535 without leading zeros"
+            .into(),
+    ))
 }
 
 /// Validate that a string is a safe AWG interface name.
@@ -1075,6 +1093,10 @@ fn build_client_config(
     };
     let allowed_ips =
         prepare_client_allowed_ips(&params.allowed_ips, client_ipv6_display.is_some())?;
+    let mtu_line = params
+        .client_mtu
+        .map(|mtu| format!("\nMTU = {mtu}"))
+        .unwrap_or_default();
     let protocol_fields = match params.protocol_version {
         AwgProtocolVersion::V2 => String::new(),
         AwgProtocolVersion::V3 | AwgProtocolVersion::V31 => {
@@ -1121,7 +1143,7 @@ fn build_client_config(
 [Interface]
 PrivateKey = {client_priv_key}
 Address = {address}
-DNS = {dns}
+DNS = {dns}{mtu_line}
 Jc = {jc}
 Jmin = {jmin}
 Jmax = {jmax}
@@ -1902,6 +1924,136 @@ SERVER_AWG_H4='1837068650'
         assert_eq!(params.protocol_version, AwgProtocolVersion::V2);
     }
 
+    // Exercise parsing and rendering together: dropping CLIENT_MTU at either
+    // boundary must not silently produce a configuration without the override.
+    fn mtu_test_params() -> &'static str {
+        "SERVER_PUB_IP='198.51.100.1'\nSERVER_AWG_NIC='awg0'\nSERVER_AWG_IPV4='10.66.66.1'\nSERVER_AWG_IPV6='fd42:42:42::1'\nSERVER_PORT='51820'\nSERVER_PUB_KEY='PUB'\nCLIENT_DNS_1='1.1.1.1'\nALLOWED_IPS='0.0.0.0/0, ::/0'\nSERVER_AWG_JC='4'\nSERVER_AWG_JMIN='50'\nSERVER_AWG_JMAX='1000'\nSERVER_AWG_S1='30'\nSERVER_AWG_S2='100'\nSERVER_AWG_S3='45'\nSERVER_AWG_S4='120'\nSERVER_AWG_H1='5-10'\nSERVER_AWG_H2='11-20'\nSERVER_AWG_H3='21-30'\nSERVER_AWG_H4='31-40'\n"
+    }
+
+    #[test]
+    fn client_mtu_is_optional_and_rendered_for_both_address_families() {
+        for mtu in [None, Some(""), Some("1280"), Some("1380"), Some("65535")] {
+            let mut content = mtu_test_params().to_string();
+            if let Some(value) = mtu {
+                content.push_str(&format!("CLIENT_MTU='{value}'\n"));
+            }
+            let params = parse_params(&content).unwrap();
+            for ipv6 in [None, Some("fd42:42:42::2")] {
+                let config = build_client_config(
+                    &params,
+                    "PRIVATE",
+                    "10.66.66.2",
+                    ipv6,
+                    "PSK",
+                    "1.1.1.1",
+                    "198.51.100.1:51820",
+                )
+                .unwrap();
+                let actual: Vec<_> = config
+                    .lines()
+                    .filter(|line| line.starts_with("MTU"))
+                    .collect();
+                let expected: Vec<_> = mtu
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("MTU = {value}"))
+                    .into_iter()
+                    .collect();
+                assert_eq!(actual, expected, "MTU {mtu:?}, IPv6 {ipv6:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn client_mtu_rejects_invalid_persisted_values() {
+        for value in [
+            "0",
+            "1279",
+            "65536",
+            "01380",
+            "+1380",
+            "-1380",
+            "1380.5",
+            "1380 ",
+            "1+1380",
+            "999999999999999999999",
+            "abc",
+        ] {
+            let content = format!("{}CLIENT_MTU='{value}'\n", mtu_test_params());
+            let error = parse_params(&content).expect_err(value);
+            assert!(error.to_string().contains("CLIENT_MTU"), "{error}");
+        }
+    }
+
+    // Run the real helper's file checks and allow-list before the Rust parser.
+    // Redirect only the configuration root and skip main's root-only dispatch.
+    fn filter_mtu_test_params(content: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("params"), content).unwrap();
+        let helper = include_str!("../../scripts/amneziawg-web-privileged").replace("\r\n", "\n");
+        let root = "readonly AWG_CONFIG_ROOT=\"/etc/amnezia/amneziawg\"";
+        assert_eq!(helper.matches(root).count(), 1);
+        let helper = helper.replace(root, "readonly AWG_CONFIG_ROOT=\"${MTU_TEST_ROOT}\"");
+        let helper = helper.strip_suffix("main \"$@\"\n").unwrap();
+        let helper_path = dir.path().join("helper.sh");
+        std::fs::write(&helper_path, format!("{helper}emit_safe_params\n")).unwrap();
+        let output = std::process::Command::new("bash")
+            .arg(helper_path)
+            .env("MTU_TEST_ROOT", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn client_mtu_helper_preserves_indented_assignments_without_secrets() {
+        for indent in [" ", "\t", " \t  "] {
+            let content = format!(
+                "{}{indent}CLIENT_MTU='1380'\n{indent}SERVER_PRIV_KEY='server-secret'\n{indent}UNRECOGNIZED='unknown-secret'\n",
+                mtu_test_params(),
+            );
+            let filtered = filter_mtu_test_params(&content);
+            assert!(!filtered.contains("server-secret"));
+            assert!(!filtered.contains("unknown-secret"));
+            let params = parse_params(&filtered).unwrap();
+            assert_eq!(params.client_mtu, Some(1380), "indent {indent:?}");
+            let config = build_client_config(
+                &params,
+                "PRIVATE",
+                "10.66.66.2",
+                None,
+                "PSK",
+                "1.1.1.1",
+                "198.51.100.1:51820",
+            )
+            .unwrap();
+            assert_eq!(
+                config.lines().filter(|line| *line == "MTU = 1380").count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn client_mtu_helper_does_not_hide_indented_invalid_assignments() {
+        for indent in [" ", "\t", " \t  "] {
+            for value in ["1279", "65536", "1380 ", "   "] {
+                // A later indented assignment overrides an earlier canonical one
+                // when sourced by the CLI, and must also reach web validation.
+                let content = format!(
+                    "{}CLIENT_MTU='1380'\n{indent}CLIENT_MTU='{value}'\n",
+                    mtu_test_params(),
+                );
+                let error = parse_params(&filter_mtu_test_params(&content)).unwrap_err();
+                assert!(error.to_string().contains("CLIENT_MTU"), "{error}");
+            }
+        }
+    }
+
     #[test]
     fn parse_params_accepts_and_validates_awg3_state() {
         let legacy = "\
@@ -2452,6 +2604,7 @@ AllowedIPs = 10.66.66.2/32
             server_pub_key: "SVR_PUB=".into(),
             client_dns_1: "1.1.1.1".into(),
             client_dns_2: "1.0.0.1".into(),
+            client_mtu: None,
             allowed_ips: "0.0.0.0/0, ::/0".into(),
             jc: "8".into(),
             jmin: "50".into(),
@@ -2568,6 +2721,7 @@ AllowedIPs = 10.66.66.2/32
             server_pub_key: "SVR_PUB=".into(),
             client_dns_1: "1.1.1.1".into(),
             client_dns_2: "".into(),
+            client_mtu: None,
             allowed_ips: "0.0.0.0/0, ::/0".into(),
             jc: "8".into(),
             jmin: "50".into(),
@@ -2618,6 +2772,7 @@ AllowedIPs = 10.66.66.2/32
             server_pub_key: "SVR_PUB=".into(),
             client_dns_1: "1.1.1.1".into(),
             client_dns_2: "".into(),
+            client_mtu: None,
             allowed_ips: "fd00::/8, ::/0".into(),
             jc: "8".into(),
             jmin: "50".into(),
