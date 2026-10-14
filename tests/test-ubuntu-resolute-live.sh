@@ -250,7 +250,7 @@ if ! grep -qF "ppa.launchpadcontent.net/amnezia/ppa/ubuntu ${SELECTED_SUITE}/mai
 	echo "ERROR: amneziawg-tools is not offered from the PPA's plain ${ARCHITECTURE} index" >&2
 	exit 1
 fi
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
+DEBIAN_FRONTEND=noninteractive installAwgDebianPackages apt-get install -y \
 	amneziawg \
 	amneziawg-dkms \
 	amneziawg-tools \

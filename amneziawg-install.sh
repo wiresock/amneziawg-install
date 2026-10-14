@@ -3559,6 +3559,57 @@ function sanitizeAwgDkmsConf() {
 	done
 }
 
+# Ubuntu can backport UDP tunnel API changes without changing the upstream
+# kernel version (7.0.0-1017-azure has the new setup API but the old release API).
+# Replace only the two known upstream compatibility macros, selecting pointers
+# by each function's actual type. The source stays usable by older kernels too.
+# Upstream: amnezia-vpn/amneziawg-linux-kernel-module commit 0bcc6dfaf9.
+# Prints the number of changed source trees; unknown/newer source is untouched.
+function patchAwgDkmsUdpTunnelCompat() {
+	local SOURCE_ROOT="${1:-/usr/src}" HEADER TEMP_FILE RC CHANGED=0
+	local SETUP_OLD='#define setup_udp_tunnel_sock(net, sk, sock_cfg) setup_udp_tunnel_sock(net, sk->sk_socket, sock_cfg)'
+	local RELEASE_OLD='#define udp_tunnel_sock_release(sk) udp_tunnel_sock_release(sk->sk_socket)'
+	for HEADER in "${SOURCE_ROOT}"/amneziawg-*/compat/compat.h; do
+		[[ -f "${HEADER}" ]] || continue
+		RC=0
+		grep -qFx -e "${SETUP_OLD}" -e "${RELEASE_OLD}" "${HEADER}" || RC=$?
+		[[ "${RC}" == 1 ]] && continue
+		[[ "${RC}" == 0 ]] || return 1
+		TEMP_FILE="$(mktemp "${HEADER}.XXXXXX")" || return 1
+		if ! awk -v setup="${SETUP_OLD}" -v release="${RELEASE_OLD}" '
+			$0 == setup {
+				print "#define setup_udp_tunnel_sock(awg_net, sk, sock_cfg) setup_udp_tunnel_sock(awg_net, __builtin_choose_expr(__builtin_types_compatible_p(__typeof__(&setup_udp_tunnel_sock), void (*)(struct net *, struct socket *, struct udp_tunnel_sock_cfg *)), (sk)->sk_socket, (sk)), sock_cfg)"
+				next
+			}
+			$0 == release {
+				print "#define udp_tunnel_sock_release(sk) udp_tunnel_sock_release(__builtin_choose_expr(__builtin_types_compatible_p(__typeof__(&udp_tunnel_sock_release), void (*)(struct socket *)), (sk)->sk_socket, (sk)))"
+				next
+			}
+			{ print }
+		' "${HEADER}" >"${TEMP_FILE}" || ! chmod --reference="${HEADER}" "${TEMP_FILE}" || ! mv -f "${TEMP_FILE}" "${HEADER}"; then
+			rm -f "${TEMP_FILE}"
+			return 1
+		fi
+		CHANGED=$((CHANGED + 1))
+	done
+	printf '%s\n' "${CHANGED}"
+}
+
+# Package postinst builds DKMS before apt returns. If that build fails, apply
+# the known compatibility fix and retry the same transaction once. Also patch
+# successful installs so future kernel upgrades can rebuild the same source.
+function installAwgDebianPackages() {
+	local RC=0 PATCHED
+	"$@" || RC=$?
+	PATCHED="$(patchAwgDkmsUdpTunnelCompat /usr/src)" || return 1
+	if [[ "${RC}" != 0 && "${PATCHED}" != 0 ]]; then
+		echo "Applied AmneziaWG UDP tunnel compatibility fix; retrying package configuration."
+		"$@"
+	else
+		return "${RC}"
+	fi
+}
+
 function aptPackageIsInstalled() {
 	dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q '^install ok installed$'
 }
@@ -4206,6 +4257,7 @@ function ensureAmneziawgKernelModule() {
 
 	echo -e "${ORANGE}amneziawg kernel module is not built or loaded for kernel ${KERNEL_VER}.${NC}"
 	echo -e "${ORANGE}Attempting automatic repair...${NC}"
+	patchAwgDkmsUdpTunnelCompat /usr/src >/dev/null || return 1
 
 	# Install missing kernel headers so DKMS can compile the module.
 	# installKernelHeaders() tries candidates in order and warns on failure.
@@ -9176,7 +9228,7 @@ function installAmneziaWG() {
 		prepareUbuntuAmneziaPpaForInstall
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
-		apt install -y dkms iptables nftables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		installAwgDebianPackages apt install -y dkms iptables nftables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
 			# Tag managed file with sentinel so uninstall can verify ownership
@@ -9190,7 +9242,7 @@ function installAmneziaWG() {
 		apt-get update || { echo -e "${RED}ERROR: Failed to update package index.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
-		apt-get install -y dkms amneziawg amneziawg-tools qrencode iptables nftables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		installAwgDebianPackages apt-get install -y dkms amneziawg amneziawg-tools qrencode iptables nftables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release

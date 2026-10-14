@@ -30,6 +30,7 @@ jobs:
           bash -n amneziawg-proxy/scripts/amneziawg-proxy-upgrade.sh
           bash -n tests/test-cargo-build-common.sh
           bash -n tests/test-awg3.sh
+          bash -n tests/test-dkms-compat.sh
           bash -n tests/test-backend.sh
           bash -n tests/test-web-backend-status.sh
           bash -n tests/test-web-imitation.sh
@@ -113,6 +114,7 @@ jobs:
           shellcheck --severity=warning amneziawg-proxy/scripts/amneziawg-proxy-upgrade.sh
           shellcheck --severity=warning tests/test-cargo-build-common.sh
           shellcheck --severity=warning tests/test-awg3.sh
+          shellcheck --severity=warning tests/test-dkms-compat.sh
           shellcheck --severity=warning tests/test-backend.sh
           shellcheck --severity=warning tests/test-web-backend-status.sh
           shellcheck --severity=warning tests/test-web-imitation.sh

@@ -124,7 +124,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y curl gnupg software-properties
 	die "cannot install the running kernel's headers"
 configureUbuntuAmneziaPpa "$(getUbuntuPpaCodename)" "${AMNEZIA_PPA_SOURCES_DIR}" "$(dpkg --print-architecture)" || die "cannot configure the PPA"
 apt-get -o APT::Update::Error-Mode=any update >/dev/null
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends dkms amneziawg-dkms >"${WORK}/dkms.log" 2>&1 ||
+DEBIAN_FRONTEND=noninteractive installAwgDebianPackages apt-get install -y --no-install-recommends dkms amneziawg-dkms >"${WORK}/dkms.log" 2>&1 ||
 	die "cannot install amneziawg-dkms"
 dkms autoinstall -k "$(uname -r)" >>"${WORK}/dkms.log" 2>&1
 depmod -a
