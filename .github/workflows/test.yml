@@ -139,6 +139,14 @@ jobs:
       - name: Validate signed PPA selection, DKMS, module, and tools
         run: sudo bash tests/test-ubuntu-resolute-live.sh
 
+      - name: Show DKMS build diagnostics
+        if: failure()
+        run: |
+          uname -a
+          gcc --version
+          sudo dkms status || true
+          sudo find /var/lib/dkms/amneziawg -type f -name make.log -print -exec cat {} \;
+
   ppa-architecture-variants:
     name: Ubuntu 26.04 PPA Architecture Variants
     runs-on: ubuntu-latest
