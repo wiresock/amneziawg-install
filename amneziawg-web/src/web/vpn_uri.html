@@ -1,0 +1,67 @@
+<div id="amnezia-export" class="edit-form" hidden>
+  <label for="amnezia-uri">AmneziaVPN import link</label>
+  <textarea id="amnezia-uri" rows="3" readonly spellcheck="false" autocomplete="off"></textarea>
+  <p id="amnezia-status" role="status" aria-live="polite"></p>
+  <a id="amnezia-open-link" hidden>Open in Amnezia</a>
+  <button type="button" onclick="hideAmneziaLink()">Hide link</button>
+  <p class="meta">This link contains the client credentials. Share it only with the intended user.</p>
+</div>
+<script>
+var _amneziaRequest=0;
+var _amneziaTrigger=null;
+function clearAmneziaLink(){
+  document.getElementById('amnezia-uri').value='';
+  var link=document.getElementById('amnezia-open-link');
+  link.removeAttribute('href');
+  link.hidden=true;
+}
+function hideAmneziaLink(){
+  ++_amneziaRequest;
+  clearAmneziaLink();
+  document.getElementById('amnezia-status').textContent='';
+  document.getElementById('amnezia-export').hidden=true;
+  if(_amneziaTrigger){_amneziaTrigger.focus();_amneziaTrigger=null;}
+}
+async function exportAmnezia(peerId,action){
+  var request=++_amneziaRequest;
+  _amneziaTrigger=document.activeElement;
+  clearAmneziaLink();
+  document.getElementById('amnezia-export').hidden=false;
+  var status=document.getElementById('amnezia-status');
+  var field=document.getElementById('amnezia-uri');
+  status.textContent='Preparing Amnezia link…';
+  try{
+    var response=await fetch('/api/peers/'+peerId+'/vpn-uri',{
+      credentials:'same-origin',cache:'no-store',redirect:'error'
+    });
+    if(!response.ok) throw new Error('export failed');
+    var uri=await response.text();
+    if(request!==_amneziaRequest) return;
+    if(!/^vpn:\/\/[A-Za-z0-9_-]+$/.test(uri)) throw new Error('invalid export');
+    field.value=uri;
+    var link=document.getElementById('amnezia-open-link');
+    link.href=uri;
+    link.hidden=false;
+    if(action==='copy'){
+      try{
+        if(!navigator.clipboard) throw new Error('clipboard unavailable');
+        await navigator.clipboard.writeText(uri);
+        if(request===_amneziaRequest) status.textContent='Link copied. Import it in AmneziaVPN.';
+      }catch(e){
+        if(request!==_amneziaRequest) return;
+        field.focus();
+        field.select();
+        status.textContent='Copy the selected link and import it in AmneziaVPN.';
+      }
+    }else{
+      status.textContent='Your browser may ask to open AmneziaVPN. If nothing happens, use Open in Amnezia below or copy the link.';
+      try{window.location.assign(uri);}
+      catch(e){status.textContent='Open AmneziaVPN manually and import this link.';}
+    }
+  }catch(e){
+    if(request!==_amneziaRequest) return;
+    clearAmneziaLink();
+    status.textContent='Could not export the Amnezia link. Check your session and try again, or download the .conf file.';
+  }
+}
+</script>

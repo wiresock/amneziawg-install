@@ -44,6 +44,14 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
   per-peer traffic snapshots in SQLite, keeps the `peers` table current.
 - **Config discovery** – scans `AWG_CONFIG_DIR` for `*.conf` files, correlates
   each config file with its live peer by public key.
+- **AmneziaVPN import links** – peer details offer **Copy Amnezia link** and
+  **Open in Amnezia**. Links are generated on demand from the saved client
+  config, preserving MTU, AWG 3.x fields, comments, and custom entries. Existing
+  `.conf` downloads and QR codes retain their original format. If clipboard
+  access is unavailable, copy the selected text manually; if the browser does
+  not launch the app, use the displayed link or import it in AmneziaVPN.
+  Native launching requires AmneziaVPN's `vpn://` handler to be installed.
+  Links contain client credentials; **Hide link** clears the displayed value.
 - **Client MTU** – newly generated clients use the optional `CLIENT_MTU` from
   `/etc/amnezia/amneziawg/params`. A missing or empty value omits the MTU line;
   otherwise use a decimal integer from 1280 to 65535 without leading zeros.
@@ -272,6 +280,7 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 | `GET` | `/api/health` | No | Liveness probe `{"status":"ok"}` |
 | `GET` | `/api/peers` | Yes | List normal peers; `?include_archived=true` also returns archived summaries with `archived: true`; proxied peers carry `proxy_remote_addr` |
 | `GET` | `/api/peers/:id` | Yes | Normal peer detail (50 recent snapshots, `proxy_remote_addr` when proxied); archived keys return `404` |
+| `GET` | `/api/peers/:id/vpn-uri` | Yes | Plain-text `vpn://` export of the saved client config; all responses use `Cache-Control: no-store` |
 | `PATCH` | `/api/peers/:id` | Yes | Update `display_name` and/or `comment` |
 | `GET` | `/api/peers/:id/history` | Yes | Traffic history (`?range=24h\|7d\|30d`) |
 | `GET` | `/api/system/status` | Yes | System time, boot time, and uptime context for current counters (`server_*` aliases are retained for compatibility) |
@@ -284,6 +293,13 @@ See [`.env.example`](.env.example) for a ready-to-copy template.
 ---
 
 ## Security model
+
+The AmneziaVPN export uses a four-byte big-endian uncompressed byte length,
+followed by a zlib stream and unpadded Base64URL encoding. This matches the
+`qUncompress` import path in [AmneziaVPN 5.0.3.0](https://github.com/amnezia-vpn/amnezia-client/blob/5.0.3.0/client/core/controllers/selfhosted/importController.cpp).
+It wraps the existing config instead of reconstructing its fields. Export uses
+the same authentication and validated file reader as config downloads, does
+not modify files or peers, and never includes link contents in application logs.
 
 | Measure | Detail |
 |---|---|

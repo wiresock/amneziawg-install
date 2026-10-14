@@ -1231,6 +1231,15 @@ pub fn router_with_lifecycle_lock_dir(
         .route("/admin/protocol/disable-awg3", post(post_disable_awg3_form))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
+    // Wrap authentication too: even rejected exports and extractor errors
+    // must not be cached. Existing config/QR routes keep their behavior.
+    let vpn_export = Router::new()
+        .route("/api/peers/:id/vpn-uri", get(get_peer_vpn_uri))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(middleware::map_response(|response: Response| async {
+            with_qr_no_cache(response)
+        }));
+
     Router::new()
         // Public routes (no auth required)
         .route("/api/health", get(health))
@@ -1238,6 +1247,7 @@ pub fn router_with_lifecycle_lock_dir(
         .route("/logout", post(post_logout))
         // Protected routes
         .merge(protected)
+        .merge(vpn_export)
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -2088,7 +2098,32 @@ async fn get_peer_config(
         .into_response())
 }
 
-/// No-cache headers applied to every QR response (success and error) so
+/// `GET /api/peers/:id/vpn-uri` – export the saved config for AmneziaVPN.
+/// The router adds no-cache headers to all responses, including auth failures.
+async fn get_peer_vpn_uri(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let (content, _) = match read_validated_config(&state, id).await {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    match crate::vpn_uri::encode(content.as_bytes()) {
+        Ok(uri) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            uri,
+        )
+            .into_response(),
+        // Do not include config contents or encoder input in diagnostics.
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "could not encode the Amnezia import link" })),
+        )
+            .into_response(),
+    }
+}
+
+/// No-cache headers applied to every QR/export response (success and error) so
 /// browsers / proxies do not cache private key material or stale errors.
 const QR_NO_CACHE_HEADERS: [(axum::http::header::HeaderName, &str); 2] = [
     (axum::http::header::CACHE_CONTROL, "no-store"),
@@ -4490,6 +4525,10 @@ fn render_peer_detail_inner(
              <a href=\"/api/peers/{id}/config\">&#x2B73; Download</a>\
              &nbsp; | &nbsp;\
              <button type=\"button\" class=\"qr-link\" onclick=\"showQr({id})\">&#x25A3; QR Code</button>\
+             &nbsp; | &nbsp;\
+             <button type=\"button\" class=\"qr-link\" onclick=\"exportAmnezia({id}, 'copy')\">Copy Amnezia link</button>\
+             &nbsp; | &nbsp;\
+             <button type=\"button\" class=\"qr-link\" onclick=\"exportAmnezia({id}, 'open')\">Open in Amnezia</button>\
              </td></tr>\n",
             id = dto.id
         ));
@@ -4508,6 +4547,10 @@ fn render_peer_detail_inner(
         render_expiration_cell(&dto.expiration_status, dto.expires_at, dto.expired)
     ));
     buf.push_str("</table>\n");
+
+    if dto.has_config {
+        buf.push_str(include_str!("vpn_uri.html"));
+    }
 
     // Edit form
     let current_display_name = dto.display_name.as_deref().unwrap_or("");
@@ -8284,6 +8327,285 @@ mod tests {
 
     // ── User lifecycle UI tests ──────────────────────────────────────────
 
+    async fn vpn_uri_fixture(content: &str) -> (Router, tempfile::TempDir, i64) {
+        let db = test_db().await;
+        let id = insert_peer(&db, "VPN_URI_KEY=", None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.conf");
+        std::fs::write(&path, content).unwrap();
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "VPN_URI_KEY=",
+            "client",
+            path.to_str().unwrap(),
+            "client",
+            None,
+        )
+        .await
+        .unwrap();
+        (
+            test_router_with_config_dir(db, dir.path().to_path_buf()),
+            dir,
+            id,
+        )
+    }
+
+    #[tokio::test]
+    async fn vpn_uri_export_preserves_complete_configs_and_existing_downloads() {
+        use base64::Engine;
+        use std::io::Read;
+        // A decoder checks the wire format, independently of the export helper.
+        // UTF-8, CRLF and a long comment catch character/16-bit length prefixes.
+        for extra in [
+            "",
+            "MTU = 1380\r\nHeaderProtectionKey = HEADER_KEY=\r\nContentPaddingAddition = 0-10\r\n",
+            "HeaderProtectionKey = HEADER_KEY=\r\nRandomTrailers = on\r\nDisableCookies = off\r\nMTU = 1280\r\n",
+        ] {
+            let content = format!(
+                "# café — телефон {}\r\n[Interface]\r\nPrivateKey = PRIVATE_KEY=\r\nAddress = 10.0.0.2/32, fd42::2/128\r\nDNS = 1.1.1.1\r\nS1 = 15\r\nS2 = 20\r\nS3 = 25\r\nS4 = 30\r\n{extra}CustomField = retain-me\r\n[Peer]\r\nPublicKey = SERVER_KEY=\r\nPresharedKey = PSK=\r\nAllowedIPs = 0.0.0.0/0, ::/0\r\nEndpoint = [2001:db8::1]:51820\r\n",
+                "x".repeat(65_536)
+            );
+            let (app, dir, id) = vpn_uri_fixture(&content).await;
+            let response = app.clone().oneshot(Request::builder()
+                .uri(format!("/api/peers/{id}/vpn-uri")).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(response.headers()["pragma"], "no-cache");
+            assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let uri = std::str::from_utf8(&body).unwrap();
+            let encoded = uri.strip_prefix("vpn://").expect("Amnezia scheme");
+            assert!(encoded.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded).unwrap();
+            assert_eq!(u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize, content.len());
+            let mut decoded = Vec::new();
+            flate2::read::ZlibDecoder::new(&payload[4..]).read_to_end(&mut decoded).unwrap();
+            assert_eq!(decoded, content.as_bytes());
+            let download = app.oneshot(Request::builder()
+                .uri(format!("/api/peers/{id}/config")).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(download.status(), StatusCode::OK);
+            assert_eq!(axum::body::to_bytes(download.into_body(), usize::MAX).await.unwrap().as_ref(), content.as_bytes());
+            assert_eq!(std::fs::read(dir.path().join("client.conf")).unwrap(), content.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn vpn_uri_requires_authentication_and_does_not_cache_errors() {
+        let (app, _) = test_router_with_auth(test_db().await);
+        for token in [None, Some("wrong-token"), Some("super-secret-token")] {
+            let mut request = Request::builder().uri("/api/peers/99999/vpn-uri");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let expected = if token == Some("super-secret-token") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            assert_eq!(response.status(), expected);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(response.headers()["pragma"], "no-cache");
+        }
+    }
+
+    #[tokio::test]
+    async fn vpn_uri_missing_config_fails_without_a_stale_export() {
+        let (app, dir, id) = vpn_uri_fixture("[Interface]\nPrivateKey = SECRET\n").await;
+        std::fs::remove_file(dir.path().join("client.conf")).unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/peers/{id}/vpn-uri"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn vpn_uri_exports_for_authenticated_sessions_and_bearer_tokens() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "AUTH_VPN_KEY=", None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.conf");
+        std::fs::write(&path, "[Interface]\nPrivateKey = TEST_KEY\n").unwrap();
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "AUTH_VPN_KEY=",
+            "client",
+            path.to_str().unwrap(),
+            "client",
+            None,
+        )
+        .await
+        .unwrap();
+        let auth = AuthConfig {
+            enabled: true,
+            username: "admin".into(),
+            password_hash: AuthConfig::hash_password_fast("testpassword"),
+            api_token: Some("export-token".into()),
+            secure_cookie: false,
+            session_ttl: std::time::Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
+        };
+        let app = router_with_proxy_sessions_file(
+            db,
+            auth,
+            dir.path().to_path_buf(),
+            missing_proxy_sessions_file(),
+        );
+        let login = do_login(app.clone(), "admin", "testpassword").await;
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        let cookie = session_cookie_value(&login);
+        for (header, value) in [
+            ("cookie", cookie.as_str()),
+            ("authorization", "Bearer export-token"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/peers/{id}/vpn-uri"))
+                        .header(header, value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.starts_with(b"vpn://"));
+        }
+    }
+
+    #[tokio::test]
+    async fn vpn_uri_unmapped_archived_and_malformed_peer_requests_fail_without_caching() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "UNMAPPED_VPN_KEY=", None).await;
+        let archived = insert_peer(&db, "ARCHIVED_VPN_KEY=", None).await;
+        sqlx::query("UPDATE peers SET archived = 1 WHERE id = ?")
+            .bind(archived)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let app = test_router(db);
+        for (peer, status) in [
+            (id.to_string(), StatusCode::NOT_FOUND),
+            (archived.to_string(), StatusCode::NOT_FOUND),
+            ("bad-id".into(), StatusCode::BAD_REQUEST),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/peers/{peer}/vpn-uri"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vpn_uri_rejects_symlinks_and_paths_outside_config_directory() {
+        for symlink in [false, true] {
+            let db = test_db().await;
+            let id = insert_peer(&db, "UNSAFE_VPN_KEY=", None).await;
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let secret = outside.path().join("secret.conf");
+            std::fs::write(&secret, "PrivateKey = SECRET").unwrap();
+            let path = if symlink {
+                let link = dir.path().join("client.conf");
+                std::os::unix::fs::symlink(&secret, &link).unwrap();
+                link
+            } else {
+                secret
+            };
+            crate::db::peers::apply_config_mapping(
+                &db.pool,
+                "UNSAFE_VPN_KEY=",
+                "client",
+                path.to_str().unwrap(),
+                "client",
+                None,
+            )
+            .await
+            .unwrap();
+            let app = test_router_with_config_dir(db, dir.path().to_path_buf());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/peers/{id}/vpn-uri"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+    }
+
+    #[tokio::test]
+    async fn vpn_uri_actions_are_available_only_for_peers_with_configs() {
+        let (app, _dir, id) = vpn_uri_fixture("[Interface]\nPrivateKey = SECRET\n").await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Copy Amnezia link"));
+        assert!(html.contains("Open in Amnezia"));
+        assert!(html.contains(&format!("/api/peers/{id}/config")));
+        assert!(html.contains(&format!("showQr({id})")));
+        assert!(!html.contains("SECRET"));
+
+        let db = test_db().await;
+        let id = insert_peer(&db, "NO_VPN_CONFIG=", None).await;
+        let response = test_router(db)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(!html.contains("Copy Amnezia link"));
+        assert!(!html.contains("Open in Amnezia"));
+    }
+
     #[tokio::test]
     async fn imitation_apply_refreshes_cache_and_audits_only_success_including_reapplication() {
         let dir = tempfile::tempdir().unwrap();
@@ -9541,7 +9863,8 @@ mod tests {
         // Create a temp config file inside the config directory.
         let dir = tempfile::tempdir().unwrap();
         let conf_path = dir.path().join("test-qr.conf");
-        std::fs::write(&conf_path, "[Interface]\nAddress = 10.0.0.2/32\n").unwrap();
+        let config = "# Raw QR payload: café\r\n[Interface]\r\nAddress = 10.0.0.2/32\r\nMTU = 1380\r\n\r\n[Peer]\r\nAllowedIPs = 0.0.0.0/0, ::/0";
+        std::fs::write(&conf_path, config).unwrap();
 
         crate::db::peers::apply_config_mapping(
             &db.pool,
@@ -9593,6 +9916,16 @@ mod tests {
             .unwrap();
         let svg = std::str::from_utf8(&body).unwrap();
         assert!(svg.contains("<svg"), "response should contain SVG markup");
+        let expected = qrcode::QrCode::new(config.as_bytes())
+            .unwrap()
+            .render::<qrcode::render::svg::Color>()
+            .quiet_zone(true)
+            .min_dimensions(256, 256)
+            .build();
+        assert_eq!(
+            svg, expected,
+            "QR must encode the original config bytes, not the vpn:// envelope"
+        );
     }
 
     #[tokio::test]

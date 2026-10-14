@@ -11,6 +11,7 @@ mod domain;
 mod imitation;
 mod poller;
 mod system_versions;
+mod vpn_uri;
 mod web;
 
 use anyhow::Context;
