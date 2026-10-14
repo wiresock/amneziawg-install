@@ -126,6 +126,63 @@ if declare -F patchAwgDkmsUdpTunnelCompat >/dev/null; then
 	rc=0
 	installAwgDebianPackages true || rc=$?
 	check 'patch write failure is propagated' test "${rc}" != 0
+
+	# Exercise the real kernel-install entry and Ubuntu prerequisite setup with
+	# an existing half-configured package. Stop at enable_apt_ipv4, before the
+	# installer's system-file writes, and run only mocked package operations.
+	run_interrupted_install() (
+		OS="$1"
+		# shellcheck disable=SC2034 # read by the sourced installAmneziaWG
+		AWG_BACKEND="$2"
+		# Preserve the scenario outside the patch helper's positional arguments.
+		local PATCH_RESULT="$3"
+		patchAwgDkmsUdpTunnelCompat() {
+			echo patch >>"${WORK}/calls"
+			[[ "${PATCH_RESULT}" != fail ]] || return 73
+			patch_fixture_source "${WORK}/packages"
+		}
+		ensureSupportedInstallDistro() { :; }
+		selectFreshInstallBackend() { :; }
+		selectFreshInstallImitation() { :; }
+		installQuestions() { :; }
+		installBoringtunHost() { echo boringtun >>"${WORK}/calls"; }
+		amneziaPpaSourceEntriesExist() { return 1; }
+		configureUbuntuAmneziaPpa() { :; }
+		checkAmneziaPpaToolsCandidate() { :; }
+		apt-get() { :; }
+		apt() { package_command "$@"; }
+		enable_apt_ipv4() {
+			if [[ "${OS}" == ubuntu ]]; then
+				prepareUbuntuAmneziaPpaForInstall
+			else
+				# Debian can also install key-import prerequisites before DKMS.
+				apt install -y gnupg || exit 1
+			fi
+			echo prerequisites-complete >>"${WORK}/calls"
+			exit 0
+		}
+		installAmneziaWG
+	)
+	FIRST_RC=100 SECOND_RC=0
+	for distro in ubuntu debian; do
+		make_source "${WORK}/packages"
+		: >"${WORK}/calls"
+		rc=0
+		run_interrupted_install "${distro}" kernel ok >"${WORK}/output" 2>&1 || rc=$?
+		check "${distro}: interrupted install recovers" test "${rc}" = 0
+		check "${distro}: patch precedes prerequisite packages" test "$(head -n 1 "${WORK}/calls")" = patch
+		check "${distro}: prerequisites compile the recovered source" grep -qx prerequisites-complete "${WORK}/calls"
+	done
+	: >"${WORK}/calls"
+	rc=0
+	run_interrupted_install ubuntu kernel fail >"${WORK}/output" 2>&1 || rc=$?
+	check 'early patch failure stops kernel installation' test "${rc}" != 0
+	check 'early patch failure runs no package commands' test "$(cat "${WORK}/calls")" = patch
+	: >"${WORK}/calls"
+	rc=0
+	run_interrupted_install ubuntu "${AWG_BACKEND_BORINGTUN}" fail >"${WORK}/output" 2>&1 || rc=$?
+	check 'BoringTun installation remains successful' test "${rc}" = 0
+	check 'BoringTun never patches kernel source' test "$(cat "${WORK}/calls")" = boringtun
 fi
 printf 'DKMS compatibility tests: %s passed, %s failed\n' "${PASSED}" "${FAILED}"
 [[ "${FAILED}" == 0 ]]

@@ -805,6 +805,8 @@ run_ensureModule() {
 		# Stub enable_apt_ipv4/disable_apt_ipv4 to avoid touching real system files
 		enable_apt_ipv4() { :; }
 		disable_apt_ipv4() { :; }
+		# The compiler regression exercises the real patch in a temporary tree.
+		patchAwgDkmsUdpTunnelCompat() { echo 0; }
 		ensureAmneziawgKernelModule "${START_AWG_QUICK}"
 	) 2>&1
 }
@@ -855,6 +857,7 @@ OUTPUT=$(
 		SERVER_AWG_NIC="awg0"
 		enable_apt_ipv4() { :; }
 		disable_apt_ipv4() { :; }
+		patchAwgDkmsUdpTunnelCompat() { echo 0; }
 		ensureAmneziawgKernelModule
 	) 2>&1)
 RC=$?

@@ -816,8 +816,11 @@ and Ubuntu kernel-backend installation or module repair, the installer replaces
 the two known compatibility macros in the installed DKMS source with checks of
 the actual function signatures. This supports both older and backported APIs.
 If package configuration failed before the fix was applied, the same package
-transaction is retried once. Unrecognized or newer upstream macros are left
-unchanged. CI builds against both the running kernel and the latest Azure headers.
+transaction is retried once. Rerunning an interrupted install patches existing
+source before prerequisite package operations. The patched source also supports
+later kernel rebuilds; replacing the DKMS package can replace that source.
+Unrecognized or newer upstream macros are left unchanged. CI builds against both
+the running kernel and the latest Azure headers.
 
 Temporarily disabled:
 

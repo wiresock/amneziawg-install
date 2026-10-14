@@ -9192,6 +9192,12 @@ function installAmneziaWG() {
 	# Run setup questions first
 	installQuestions
 
+	# A previous failed DKMS build can leave a half-configured package whose
+	# postinst runs again during prerequisite installs, before the module install.
+	if [[ "${OS}" == ubuntu || "${OS}" == debian ]]; then
+		patchAwgDkmsUdpTunnelCompat /usr/src >/dev/null || return 1
+	fi
+
 	# Install AmneziaWG tools and module
 	# Force IPv4 preference for all package-manager operations — IPv6 may be
 	# resolvable but unreachable on some VPS providers, causing apt, dnf,
