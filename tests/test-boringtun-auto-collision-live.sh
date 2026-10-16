@@ -106,7 +106,6 @@ REFUSAL='auto imitation refused by header-protection policy; retaining random pr
 WORK=""
 PEERS=()
 CREATED_NETNS=()
-EXPECT=""
 PASSED=0
 FAILED=0
 
@@ -322,14 +321,13 @@ refusals() {
 
 # One scenario on BIN: the server-side record, the server, the client-side
 # capture, the planted traffic, the client, then the record's premise
-# (`detected`, whose last line must be PREMISE, a pattern), and the
-# server's datagrams to the client held to EXPECTED. Returns 0 only if every
-# step succeeded; its files are removed first and written anew.
+# (`detected`, whose last line must be PREMISE, a pattern). Returns 0 only if
+# every step succeeded, and only then is the capture judged (scenario); its
+# files are removed first and written anew.
 run_scenario() { # <name> <plant> <hp 0|1> <client imitation> <server imitation> <expected> <premise pattern>
-	local NAME="$1" PLANT="$2" HP="$3" IMITATION="$4" SERVER_IMITATION="$5" WANT="$6" PREMISE="$7"
+	local NAME="$1" PLANT="$2" HP="$3" IMITATION="$4" SERVER_IMITATION="$5" PREMISE="$7"
 	local CAPTURE="${WORK}/$1.capture" RECORD="${WORK}/$1.record" SENT RC FAILED_BEFORE="${FAILED}" FORMAT=prefixes DETECTED HP_FILE=-
 	local -a LAYOUT=()
-	EXPECT=""
 	rm -f -- "${CAPTURE}" "${CAPTURE}".* "${RECORD}" "${RECORD}".* "${WORK}/${NAME}".{format,sizes}
 	# Per packet kind where sip is possible and the tags can be read.
 	if ((HP == 0)) && [[ "${PLANT}" =~ ^(hint|probe)$ || "${IMITATION}" == sip ]] && [[ "${SERVER_IMITATION}" == auto ]]; then
@@ -391,7 +389,6 @@ run_scenario() { # <name> <plant> <hp 0|1> <client imitation> <server imitation>
 		return 1
 	fi
 	((FAILED == FAILED_BEFORE)) || return 1
-	EXPECT="${WANT}"
 	printf '%s\n' "${FORMAT}" >"${WORK}/${NAME}.format"
 	printf '%s\n' "${S_SIZES}" >"${WORK}/${NAME}.sizes"
 }
