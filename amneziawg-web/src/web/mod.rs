@@ -11505,6 +11505,54 @@ mod tests {
         assert!(!html.contains("fetch('/api/system/versions'"));
     }
 
+    #[test]
+    fn base_path_reaches_imitation_script() {
+        let html = render_imitation_controls("/panel", "token");
+        assert!(html.contains("action=\"/panel/admin/imitation\""));
+        assert!(html.contains("var AWG_WEB_BASE='/panel';"));
+        assert!(!html.contains(JS_BASE_ASSIGNMENT));
+    }
+
+    #[tokio::test]
+    async fn base_path_reaches_peer_detail_scripts() {
+        let db = test_db().await;
+        let id = insert_peer(&db, "KEY_BASEJS=", None).await;
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "KEY_BASEJS=",
+            "test-basejs",
+            "/etc/awg/test-basejs.conf",
+            "test-basejs",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = test_router_at(db, "/panel")
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/panel/peers/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        // The VPN link and QR scripts each carry the marker; neither may keep
+        // the empty default.
+        assert_eq!(html.matches("var AWG_WEB_BASE='/panel';").count(), 2);
+        assert!(!html.contains(JS_BASE_ASSIGNMENT));
+        assert!(html.contains(&format!("href=\"/panel/api/peers/{id}/config\"")));
+        assert!(html.contains(&format!("fetch('/panel/api/peers/{id}/usage/summary'")));
+    }
+
     #[tokio::test]
     async fn base_path_scopes_login_redirects_and_cookie() {
         let app = test_auth_router_at(test_db().await, "/panel");

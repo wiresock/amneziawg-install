@@ -2147,6 +2147,17 @@ print_summary() {
     if [[ "${LISTEN_HOST}" == "127.0.0.1" || "${LISTEN_HOST}" == "localhost" ]]; then
         panel_url="http://127.0.0.1:${LISTEN_PORT}"
     fi
+    # nginx proxies the bare origin; a kept env file may mount the panel
+    # under AWG_WEB_BASE_PATH, which only the browser URL includes.
+    local proxy_target="${panel_url}"
+    local base_path=""
+    if [[ -r "${ENV_FILE}" ]]; then
+        base_path="$(grep -E '^AWG_WEB_BASE_PATH=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true)"
+        base_path="${base_path%/}"
+    fi
+    if [[ -n "${base_path}" ]]; then
+        panel_url="${panel_url}${base_path}/"
+    fi
 
     printf "\n${BOLD}${GREEN}══════════════════════════════════════════════════════${NC}\n"
     printf "${BOLD}${GREEN}  amneziawg-web installation complete!${NC}\n"
@@ -2175,7 +2186,7 @@ print_summary() {
     if [[ "${LISTEN_HOST}" == "127.0.0.1" || "${LISTEN_HOST}" == "localhost" ]]; then
         printf "${BOLD}${YELLOW}Reverse proxy:${NC}\n"
         printf "  The panel is listening on localhost only. To make it accessible\n"
-        printf "  from a browser, configure nginx or Caddy to proxy %s\n" "${panel_url}"
+        printf "  from a browser, configure nginx or Caddy to proxy %s\n" "${proxy_target}"
         printf "  and terminate TLS. Then set AUTH_SECURE_COOKIE=true in:\n"
         printf "  %s\n" "${ENV_FILE}"
         printf "  See docs/DEPLOYMENT.md for nginx and Caddy examples.\n"
