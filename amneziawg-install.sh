@@ -102,20 +102,20 @@ AWG_INSTALLER_CAPABILITY_PROTOCOL_DIAGNOSTICS="protocol-diagnostics-v1"
 # they name an earlier release. tests/test-boringtun-host.sh checks that they
 # are internally consistent, and tests/test-boringtun-public-release.sh that
 # the release is public with exactly these bytes.
-AWG_BT_RELEASE_TAG="boringtun-cli-0.7.1-gb94943906b11-b1"
-AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/awg-server-tools/releases/download/boringtun-cli-0.7.1-gb94943906b11-b1"
+AWG_BT_RELEASE_TAG="boringtun-cli-0.7.1-ge94c04f3f4fd-b1"
+AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/awg-server-tools/releases/download/boringtun-cli-0.7.1-ge94c04f3f4fd-b1"
 AWG_BT_RELEASE_VERSION="0.7.1"
 AWG_BT_RELEASE_SOURCE_REPOSITORY="https://github.com/Wiresock-Foundation/wiresock-boringtun"
-AWG_BT_RELEASE_SOURCE_COMMIT="b94943906b11641e274b3c950cc905aaf1631c59"
+AWG_BT_RELEASE_SOURCE_COMMIT="e94c04f3f4fdb8b392f9586db07a269ea0bf7575"
 # The release's build number (the tag's -b<build>). It is part of the store
 # identity of builds from 2 on (_awgBtReleaseStoreId).
 AWG_BT_RELEASE_BUILD="1"
-AWG_BT_RELEASE_ASSET_X86_64="boringtun-cli-0.7.1-gb94943906b11-linux-x86_64-musl.tar.gz"
-AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64="c6a39a50ccc89f6ac4107d3fe0d530a6f83badc11b405617195e65092e96e7fb"
-AWG_BT_RELEASE_BINARY_SHA256_X86_64="1210a3c6780948ea07f301c4fa022c0b4ab634da71db0053f65757c8683470d5"
-AWG_BT_RELEASE_ASSET_AARCH64="boringtun-cli-0.7.1-gb94943906b11-linux-aarch64-musl.tar.gz"
-AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64="cf65174fcb25095a2637544fda860d5d033cd4d271ee7ac40e8f457ece75ecce"
-AWG_BT_RELEASE_BINARY_SHA256_AARCH64="c6752410b3994007a9ace5f2d93c30c009b2d7478ebed27b01aacc6168a08629"
+AWG_BT_RELEASE_ASSET_X86_64="boringtun-cli-0.7.1-ge94c04f3f4fd-linux-x86_64-musl.tar.gz"
+AWG_BT_RELEASE_ARCHIVE_SHA256_X86_64="6614814d11cbec37cf65c40887822af9866ac5abc05929332968737c39c6af68"
+AWG_BT_RELEASE_BINARY_SHA256_X86_64="7c717357554a4d8022154fbdb1c40c92de8174ee064e81878fdf5f610651fb79"
+AWG_BT_RELEASE_ASSET_AARCH64="boringtun-cli-0.7.1-ge94c04f3f4fd-linux-aarch64-musl.tar.gz"
+AWG_BT_RELEASE_ARCHIVE_SHA256_AARCH64="a2d7c4a0cc702a7dfc146036e6bda6e341701a3609a6842462bfdbebf7490880"
+AWG_BT_RELEASE_BINARY_SHA256_AARCH64="cc1cdf215bb3d75f8a7006f8d424d698e9574dadb3e08becd8ace17a3c44cb08"
 
 # Where the BoringTun runtime lives. The generated helpers embed these values
 # when they are written, so a helper never reads a path from its environment.
@@ -2140,11 +2140,15 @@ function printBoringtunImitationWarnings() { # <protocol> <domain> <AWG protocol
 # claims it. The header-protection policy binds learned protocols as it binds
 # fixed ones: an incompatible sip is not activated (that peer stays unresolved
 # with random padding), and nothing is weakened or disabled automatically.
+# From wiresock-boringtun e94c04f3f4fd a recognizable datagram that also fits
+# the AmneziaWG framing can still be learned once every reading of it is
+# refused for a reason that establishes nothing; b94943906b11, which a host
+# keeps until --upgrade-boringtun, never learns from such a datagram.
 function printBoringtunAutoImitationWarnings() { # <AWG protocol version>
 	local VERSION="$1"
 	echo -e "${ORANGE}Protocol imitation: $(boringtunImitationDisplay auto "")${NC}"
 	echo "- BoringTun selects dns, quic, sip or stun separately for each authenticated peer, from the imitation that peer's client sends before its handshake, so clients with different imitation settings can share this server and its port. The protocol a peer learned is kept for that peer and survives roaming."
-	echo "- It is best effort and needs recognizable client traffic. A client without imitation sends no DNS, QUIC, SIP or STUN pre-handshake datagrams, and sent ones can be lost. Even one that arrives may not count: a datagram that also fits this server's AmneziaWG S/H framing is taken for AmneziaWG traffic, never as a hint, and a client's own imitation datagrams can, depending on the S1-S4 and H1-H4 values. A peer for which nothing was learned is unresolved and gets random S padding, as with none; it may still be learned at a later handshake."
+	echo "- It is best effort and needs recognizable client traffic. A client without imitation sends no DNS, QUIC, SIP or STUN pre-handshake datagrams, and sent ones can be lost. Even one that arrives may not count: a datagram that also fits this server's AmneziaWG S/H framing, as a client's own imitation datagrams can depending on the S1-S4 and H1-H4 values, is tried as AmneziaWG traffic first. The release this installer pins (${AWG_BT_RELEASE_TAG}) can still learn from it, but only when every such reading is refused for a reason that establishes nothing (such as a failed mac1 or an unknown session); after any other outcome, and always with the earlier release boringtun-cli-0.7.1-gb94943906b11-b1, it never counts as a hint. A peer for which nothing was learned is unresolved and gets random S padding, as with none; it may still be learned at a later handshake."
 	echo "- A working tunnel, and auto configured and running, do not show that any peer is imitated: BoringTun does not report which protocol each peer learned, so neither does this installer."
 	echo "- auto does not detect S1-S4, H1-H4 or any other AmneziaWG setting: clients still need this server's values. Client configs do not change."
 	echo "- Probes: the listen port may answer DNS, QUIC and STUN probes as those imitations do; SIP probes get no reply."

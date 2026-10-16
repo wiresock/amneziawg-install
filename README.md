@@ -77,7 +77,8 @@ prebuilt. See [VPN + web panel](#-advanced-setup--vpn--web-panel).
 
 BoringTun users can enable **Off / DNS / QUIC / SIP / STUN** directly under
 **Protocol imitation · BoringTun** in the panel. No standalone proxy is needed.
-The pinned BoringTun release has no per-client **Auto** mode; see
+**Auto** (per client, opt-in) is offered when the installed BoringTun binary
+supports it; see
 [native imitation and compatibility limits](#built-in-protocol-imitation-boringtun-only).
 
 **Add the obfuscation proxy (optional, kernel backend with AWG 2.0 only):**
@@ -572,8 +573,8 @@ architectures are refused before anything is changed.
   kernel module package (`amneziawg-dkms`) is not pulled in, plus `nftables`,
   `iptables` and `qrencode`. No `amneziawg`, DKMS, headers or `deb-src` sources.
 - `boringtun-cli` from this repository's immutable public release
-  [`boringtun-cli-0.7.1-gb94943906b11-b1`](https://github.com/wiresock/awg-server-tools/releases/tag/boringtun-cli-0.7.1-gb94943906b11-b1),
-  built from WireSock BoringTun `b94943906b11641e274b3c950cc905aaf1631c59`. The
+  [`boringtun-cli-0.7.1-ge94c04f3f4fd-b1`](https://github.com/wiresock/awg-server-tools/releases/tag/boringtun-cli-0.7.1-ge94c04f3f4fd-b1),
+  built from WireSock BoringTun `e94c04f3f4fdb8b392f9586db07a269ea0bf7575`. The
   installer downloads the archive for its architecture from that exact URL and
   checks it against SHA-256 values embedded in the script before extracting
   anything; then it checks the archive's layout, its `MANIFEST`, the binary's
@@ -641,11 +642,14 @@ sudo ./amneziawg-install.sh --rollback-boringtun
 **Explicit only.** Running a newer `amneziawg-install.sh` never switches the binary, and
 neither does anything else it does: clients, protocol changes, imitation changes and the menu
 leave the installed release alone. A host installed by an earlier version, with
-`boringtun-cli-0.7.1-g71d88784ad29-b1` or `boringtun-cli-0.7.1-gae2ab44e9a68-b1`, keeps running
-that release until `--upgrade-boringtun` moves it to the one this version pins; until then
-`--backend-status` reports `upgrade_available=yes`. Those releases have no imitation mode
-`auto`, although they report the same version (`0.7.1`): the installer asks the binary itself
-and refuses `auto` on them (see [Built-in protocol imitation](#built-in-protocol-imitation-boringtun-only)).
+`boringtun-cli-0.7.1-g71d88784ad29-b1`, `boringtun-cli-0.7.1-gae2ab44e9a68-b1` or
+`boringtun-cli-0.7.1-gb94943906b11-b1`, keeps running that release until `--upgrade-boringtun`
+moves it to the one this version pins; until then `--backend-status` reports
+`upgrade_available=yes`. The first two have no imitation mode `auto`, although they report the
+same version (`0.7.1`) as the others: the installer asks the binary itself and refuses `auto` on
+them (see [Built-in protocol imitation](#built-in-protocol-imitation-boringtun-only)).
+`gb94943906b11` has `auto`, so a rollback to it keeps `auto`, without the newer learning from
+datagrams that also fit the AmneziaWG framing.
 
 **What each command targets.**
 - **Upgrade:** only the release pinned in the installer itself, never a "latest" lookup.
@@ -748,11 +752,17 @@ share one server and port. What to know:
   that sends no DNS, QUIC, SIP or STUN pre-handshake datagrams (a standard
   AmneziaWG client, for example), or whose datagrams are lost, leaves its peer
   unresolved. Even a datagram that arrives may not count: one that also fits
-  this server's AmneziaWG S/H framing is taken for AmneziaWG traffic, never as
-  a hint, and a client's own imitation datagrams can, depending on the S1–S4
-  and H1–H4 values. A peer for which nothing was learned is padded with random
-  S padding, as with `none`; it may still be learned at a later handshake. A
-  learned protocol is kept for the peer and survives roaming.
+  this server's AmneziaWG S/H framing, as a client's own imitation datagrams
+  can depending on the S1–S4 and H1–H4 values, is tried as AmneziaWG traffic
+  first. The release this installer pins
+  (`boringtun-cli-0.7.1-ge94c04f3f4fd-b1`) still learns from it, but only when
+  every such reading is refused for a reason that establishes nothing (a failed
+  mac1, an unknown peer, index or session, no matching handshake, a failed
+  decryption); after any other outcome it never counts as a hint, and the
+  earlier release `boringtun-cli-0.7.1-gb94943906b11-b1` never does. Such a
+  datagram is never answered as a probe. A peer for which nothing was learned is
+  padded with random S padding, as with `none`; it may still be learned at a
+  later handshake. A learned protocol is kept for the peer and survives roaming.
 - A working tunnel, and `auto` configured and running, do not show that any
   peer is imitated. The status shows `auto` as configured and running, and
   nothing per peer: BoringTun does not report which protocol a peer learned.
@@ -766,8 +776,9 @@ share one server and port. What to know:
   while any of S1–S4 is 31 bytes or more: that peer stays unresolved with random
   padding. Nothing is disabled and the S/H framing is never changed
   automatically, so `auto`, unlike `sip`, is accepted at any S size.
-- It needs the BoringTun release this installer pins
-  (`boringtun-cli-0.7.1-gb94943906b11-b1`) or a later one. Earlier releases report
+- It needs a BoringTun release that has it: the one this installer pins
+  (`boringtun-cli-0.7.1-ge94c04f3f4fd-b1`) or the earlier
+  `boringtun-cli-0.7.1-gb94943906b11-b1`. Earlier releases report
   the same version but refuse `auto`; the installer asks the installed binary,
   and refuses `auto` before changing anything, pointing to
   `--upgrade-boringtun`. `--backend-status` reports this as

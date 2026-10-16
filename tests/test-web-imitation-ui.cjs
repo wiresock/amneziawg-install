@@ -73,7 +73,9 @@ test('configured and running auto are shown as such, without per-peer claims', a
     assert.match(hint, /recognizable/);
     assert.match(hint, /does not detect S1–S4 or H1–H4/);
     assert.match(hint, /best effort/);
-    assert.match(hint, /also fits this server's AWG S\/H framing counts as AWG traffic, not as a hint/);
+    assert.match(hint, /also fits this server's AWG S\/H framing, as a client's own imitation traffic can depending on the S1–S4 and H1–H4 values, is tried as AWG traffic first/);
+    assert.match(hint, /learns from it only when every such reading is refused without establishing anything/);
+    assert.match(hint, /the earlier Auto release \(b94943906b11\) never does/);
     assert.match(hint, /A working connection, and Auto shown as running, do not show that a client is imitated/);
     assert.doesNotMatch(hint, /%|guarantee/);
 });

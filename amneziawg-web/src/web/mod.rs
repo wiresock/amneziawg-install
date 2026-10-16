@@ -9145,7 +9145,9 @@ mod tests {
         assert!(html.contains("authenticated"));
         assert!(html.contains("does not detect"));
         assert!(html.contains("Auto is best effort"));
-        assert!(html.contains("AWG S/H framing counts as AWG traffic, not as a hint"));
+        assert!(html.contains("is tried as AWG traffic first"));
+        assert!(html.contains("learns from it only when every such reading is refused without establishing anything"));
+        assert!(html.contains("the earlier Auto release (b94943906b11) never does"));
         assert!(html.contains("do not show that a client is imitated"));
     }
 

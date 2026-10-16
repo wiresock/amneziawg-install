@@ -764,8 +764,12 @@ assert_contains "recognizable" "${OUT}" "  and needs recognizable client traffic
 assert_contains "does not detect" "${OUT}" "  and auto does not detect the client's S1-S4 or H1-H4"
 assert_contains "random S padding" "${OUT}" "  an unresolved peer gets random padding"
 assert_contains "best effort" "${OUT}" "  auto is best effort"
-assert_contains "also fits this server's AmneziaWG S/H framing is taken for AmneziaWG traffic" "${OUT}" \
-	"  a datagram that arrives but fits the configured S/H framing is no hint"
+assert_contains "also fits this server's AmneziaWG S/H framing, as a client's own imitation datagrams can depending on the S1-S4 and H1-H4 values, is tried as AmneziaWG traffic first" "${OUT}" \
+	"  a datagram that arrives but fits the configured S/H framing is tried as AmneziaWG traffic first"
+assert_contains "The release this installer pins (${AWG_BT_RELEASE_TAG}) can still learn from it, but only when every such reading is refused for a reason that establishes nothing" "${OUT}" \
+	"  the pinned release learns from it only after refusals that establish nothing"
+assert_contains "always with the earlier release boringtun-cli-0.7.1-gb94943906b11-b1, it never counts as a hint" "${OUT}" \
+	"  the earlier auto release never learns from it"
 assert_contains "A working tunnel, and auto configured and running, do not show that any peer is imitated" "${OUT}" \
 	"  neither a working tunnel nor a running auto shows successful imitation"
 assert_not_contains "%" "${OUT}" "  no per-datagram share is offered as a chance of anything"
@@ -774,7 +778,11 @@ assert_not_contains "guarantee" "${OUT}" "  nothing is said to guarantee learnin
 README_AUTO="$(sed -n '/^\*\*`auto` (opt-in)\.\*\*/,/^A change is one transaction/p' "${PROJECT_ROOT}/README.md" | tr -s ' \r\n' ' ')"
 assert_contains "best effort" "${README_AUTO}" "README: auto is best effort"
 assert_contains "fits this server's AmneziaWG S/H framing" "${README_AUTO}" \
-	"README: a delivered datagram that fits the configured S/H framing is no hint"
+	"README: a delivered datagram can fit the configured S/H framing"
+assert_contains "every such reading is refused for a reason that establishes nothing" "${README_AUTO}" \
+	"README: the pinned release learns from it only after refusals that establish nothing"
+assert_contains "boringtun-cli-0.7.1-gb94943906b11-b1\` never does" "${README_AUTO}" \
+	"README: the earlier auto release never learns from it"
 assert_contains "do not show that any peer is imitated" "${README_AUTO}" \
 	"README: neither a working tunnel nor a running auto shows successful imitation"
 assert_not_contains "16 random bits" "${OUT}" "  AWG 2.0 has no header-protection warning"
