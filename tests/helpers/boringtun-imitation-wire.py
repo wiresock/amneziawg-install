@@ -71,8 +71,12 @@
   auto-expect <record> <address> <port> <layout> <server public key> <hp key file|-> <on|off> <epoch> <start> <end> [<establishments|-> [<connected|->]]
       From a finished record (its transcript checked) and the scenario's
       evidence, derive what an imitation auto server selects for the client
-      at ADDRESS:PORT, by the pinned BoringTun's own rules restated here (see
-      "Imitation auto" below): which of its datagrams fit an AmneziaWG packet
+      at ADDRESS:PORT, by the rules of BoringTun b94943906b11 restated here
+      (see "Imitation auto" below). It models that release only: it is no
+      model of e94c04f3f4fd, which can also learn from a datagram that fits
+      an AmneziaWG packet kind once every reading of it is refused, and the
+      live tests use it only against the b94943906b11 binary. The rules:
+      which of its datagrams fit an AmneziaWG packet
       kind under LAYOUT (through the header-protection mask when HP KEY FILE
       holds the base64 key; "on" for RandomTrailers), which protocol each of
       the others is detected as, the listener's hints and a connected
@@ -128,7 +132,26 @@
       Print "<length> <kinds>": the length of the datagram that send (or
       probe) sends for KIND, and the AmneziaWG packet kinds it fits under
       LAYOUT without header protection ("none" if it fits none). A datagram
-      that fits a kind is AmneziaWG traffic to the server, never a hint.
+      that fits a kind is tried as AmneziaWG traffic first: b94943906b11
+      never takes it for a hint; e94c04f3f4fd may, once every reading of it
+      is refused for a reason that establishes nothing.
+
+  detected <record> <address> <port> <layout> <hp key file|-> <on|off>
+      What a finished record holds from ADDRESS:PORT that an imitation auto
+      server could learn from, by observation alone: one line per datagram
+      from that source, "<arrival> <length> <protocol|-> <kinds|->" (the
+      protocol upstream's detect() recognizes in it, and the AmneziaWG packet
+      kinds it fits under LAYOUT, read through the header-protection mask
+      when HP KEY FILE holds the base64 key; "on" for RandomTrailers), then
+      "detected <protocols|none> clear <protocols|none>": every protocol some
+      datagram is detected as, and those detected in a datagram that fits no
+      kind. Every BoringTun release with auto learns a protocol only from a
+      datagram detect() recognizes, and detect() is the same in b94943906b11
+      and e94c04f3f4fd, so no protocol outside DETECTED can be learned from
+      this source while this record covers it; which one is learned, if any,
+      is not decided here. The record must be whole: its end marker
+      "complete", no frames dropped, and no malformed frame from ADDRESS or
+      fragment from PORT; otherwise "incomplete <reason>" (exit 1).
 
   kinds sip <file> <S1,S2,S3,S4>
       For a LAYOUT capture, after validating every record against the sizes
@@ -1807,9 +1830,13 @@ def kinds(protocol, path, sizes_text):
 
 
 # ── Imitation auto: what the server can learn, from what reached it ─────────
-# A restatement of the pinned BoringTun's rules (b94943906b11), so that the
-# protocol an auto server must select for a peer is derived from the
-# datagrams that reached it, never from what it sent:
+# A restatement of the rules of BoringTun b94943906b11, the first release
+# with auto, so that the protocol such a server must select for a peer is
+# derived from the datagrams that reached it, never from what it sent. It is
+# not a model of e94c04f3f4fd, whose listener can also learn from a datagram
+# that fits an AmneziaWG packet kind once every reading of it is refused for
+# a reason that establishes nothing; detect() and inbound_candidates() are
+# the same in both, which is all `detected` uses. The rules:
 #   - inbound_candidates: amnezia.rs candidates_under_mask, header protection
 #     included (header_protection.rs type_mask);
 #   - detect: noise/imitation/detect.rs with quic/version_negotiation.rs
@@ -2394,6 +2421,58 @@ def auto_expect(path, address, port_text, layout, server_key, hp_key_path, trail
     return 0
 
 
+def detected(path, address, port_text, layout, hp_key_path, trailers_text):
+    """Print what the finished `record` at PATH holds from ADDRESS:PORT that an
+    auto server could learn from, then "detected <protocols|none> clear
+    <protocols|none>" (see the usage). No model of any release: only
+    detect() and inbound_candidates(), which every release with auto shares,
+    applied to each whole datagram from that source. A record that may have
+    missed one of them (no "complete" end marker, frames it dropped, a
+    malformed frame from the address, a fragment from the port) prints
+    "incomplete <reason>" (exit 1), so that a gap never narrows the set."""
+    sizes, ranges = parse_layout(layout)
+    port = parse_number(port_text, "port", 65535)
+    hp_key = None
+    if hp_key_path != "-":
+        with open(hp_key_path) as source:
+            hp_key = parse_public_key(source.read().strip())
+    if trailers_text not in ("on", "off"):
+        raise InputError("RandomTrailers is on or off, not %r" % trailers_text)
+    trailers = trailers_text == "on"
+    try:
+        socket.inet_aton(address)
+    except OSError:
+        raise InputError("%r is not an IPv4 address" % address) from None
+    record = read_record(path)
+    gaps = []
+    if record.end is None or record.end[0] != "complete":
+        gaps.append("the record has no complete end marker (%s)" % ("none" if record.end is None else "%s %d" % record.end))
+    gaps.extend("%d frames the record dropped between %d and %d" % (count, since, clock)
+                for since, clock, count in record.drops)
+    found, clear, lines = set(), set(), []
+    for frame in record.frames:
+        if frame.address != address:
+            continue
+        if frame.kind == "malformed" or (frame.kind == "fragment" and frame.port == port):
+            gaps.append("a %s frame from %s at %d~%d" % (frame.kind, address, frame.low, frame.high))
+        elif frame.kind == "datagram" and frame.port == port:
+            protocol = detect(frame.data)
+            kinds = inbound_candidates(frame.data, sizes, ranges, hp_key, trailers)
+            arrival = str(frame.low) if frame.high == frame.low + 1 else "%d~%d" % (frame.low, frame.high)
+            lines.append("%s %d %s %s" % (arrival, len(frame.data), protocol or "-", ",".join(kinds) or "-"))
+            if protocol:
+                found.add(protocol)
+                if not kinds:
+                    clear.add(protocol)
+    if lines:
+        print("\n".join(lines))
+    if gaps:
+        print("incomplete %s" % gaps[0])
+        return 1
+    print("detected %s clear %s" % (",".join(sorted(found)) or "none", ",".join(sorted(clear)) or "none"))
+    return 0
+
+
 def decide(record, address, port, sizes, ranges, mac1_key, hp_key, trailers, epoch, window_start, window_end,
            establishments, connected):
     """(outcome, notes of one history) or Undecided."""
@@ -2548,6 +2627,8 @@ def main(argv):
             return record(*argv[1:])
         elif len(argv) in (11, 12, 13) and argv[0] == "auto-expect":
             return auto_expect(*argv[1:])
+        elif len(argv) == 7 and argv[0] == "detected":
+            return detected(*argv[1:])
         elif len(argv) == 3 and argv[0] == "classify":
             classify(argv[1], argv[2])
         elif len(argv) == 3 and argv[0] == "classify-auto":

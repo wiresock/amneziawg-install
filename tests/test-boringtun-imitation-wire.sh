@@ -1085,7 +1085,7 @@ done
 "${REAL_PYTHON}" "${WIRE_REAL}" candidates send dns "${CLEAR}" >/dev/null 2>&1
 assert_eq 2 "$?" "candidates knows only the datagrams send and probe send (usage)"
 
-echo "=== Auto: what the server can learn, from what reached it (detect, inbound_candidates, auto-expect) ==="
+echo "=== Auto: what the server can learn, from what reached it (detect, inbound_candidates; auto-expect models b94943906b11) ==="
 # The pre-initiation datagrams of real BoringTun clients (the published
 # b94943906b11 binary, --imitate-protocol dns, quic, sip and stun), recorded
 # whole on the server's side under S1-S4 40 and narrow H ranges: imitation
@@ -1161,8 +1161,10 @@ assert_eq "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826
 # evidence: when each client process started and when it first pinged
 # through the tunnel (an establishment), and, where a case says so, when a
 # connected socket to the client was seen. CASE names what it builds; the
-# helper's verdict is compared with what upstream's rules give for every
-# history that evidence allows, worked out in the comment of each case.
+# helper's verdict is compared with what the rules of b94943906b11 give for
+# every history that evidence allows, worked out in the comment of each case.
+# These are checks of that earlier release's semantics, which auto-expect
+# restates; they say nothing about e94c04f3f4fd.
 STUN_CLEAR="110,57,133,36,66166068-166166067,862271148-962271147,1349667297-1449667296,2030000000-2129999999"
 auto_case() { # <case> [<epoch> <window start> <window end>]
 	"${REAL_PYTHON}" - "${WIRE_REAL}" "${PRELUDES}" "${T}/auto-record" "$@" <<'PY'
@@ -1219,7 +1221,9 @@ est = [(1995, 2040)]
 if case == "stun-colliding":
     # Both STUN requests are transport candidates under H4 (their bytes at 36
     # are in it), the junk is detected as nothing: no hint; the initiation's
-    # random S1 prefix is no protocol either. Unresolved: random.
+    # random S1 prefix is no protocol either. Unresolved under b94943906b11:
+    # random (e94c04f3f4fd learns stun from such a request once its readings
+    # are refused: tests/test-boringtun-auto-collision-live.sh).
     layout = COLLIDING
     sequence(2000, recorded("stun") + [initiation(), transport()])
 elif case == "stun-clear":
@@ -1590,6 +1594,46 @@ assert_eq 1 "$?" "auto-expect refuses a record whose transcript does not count i
 printf 'ready 1 1 900\n' >"${T}/bad-record.state"
 "${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
 assert_eq 1 "$?" "auto-expect refuses a record that has not ended"
+
+# detected over the same synthetic records: what each source sent that an
+# auto server could learn from, by detect() and inbound_candidates() alone,
+# no release's rules. The live checks of e94c04f3f4fd bound outcomes with it.
+STUN_COLLIDING="110,57,133,36,66166068-166166067,862271148-962271147,1349667297-1449667296,1917290954-2017290953"
+NARROW_AUTO="40,40,40,40,100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100"
+detected_case() { # <case> <layout> <port> [hp]: "<exit status> <last line>"
+	local OUT RC HP_FILE=-
+	auto_case "$1" >/dev/null 2>&1
+	[[ -z "${4:-}" ]] || HP_FILE="${T}/auto-record.hp"
+	OUT="$("${REAL_PYTHON}" "${WIRE_REAL}" detected "${T}/auto-record" 192.0.2.2 "$3" "$2" "${HP_FILE}" off 2>&1)"
+	RC=$?
+	printf '%s\n' "${OUT}" >"${T}/detected.out"
+	echo "${RC} ${OUT##*$'\n'}"
+}
+assert_eq "0 detected stun clear none" "$(detected_case stun-colliding "${STUN_COLLIDING}" 41006)" \
+	"detected: the recorded STUN client under the colliding H4: stun, but in no datagram that fits no AmneziaWG kind"
+assert_eq "2" "$(grep -c '^[0-9]* [0-9]* stun transport$' "${T}/detected.out")" \
+	"  both STUN requests are listed as stun and as transport candidates"
+assert_eq "0 detected stun clear stun" "$(detected_case stun-clear "${STUN_CLEAR}" 41006)" \
+	"detected: the same datagrams with only H4 changed: stun, clear"
+assert_eq "0 detected none clear none" "$(detected_case other-port "${STUN_CLEAR}" 41006)" \
+	"detected: a source that sent only its initiation and transport: none"
+assert_eq "0 detected stun clear stun" "$(detected_case other-port "${STUN_CLEAR}" 41007)" \
+	"  and the other port of the same address, which sent the STUN client's datagrams: stun"
+assert_eq "0 detected sip clear sip" "$(detected_case hp-sip-large "${NARROW_AUTO}" 41006 hp)" \
+	"detected: the 27-byte SIP hint under header protection: sip, which fits no kind (detected says nothing of the policy)"
+for CASE in drops-during malformed fragment; do
+	GOT="$(detected_case "${CASE}" "${STUN_CLEAR}" 41006)"
+	assert_true "detected, ${CASE}: a record that may have missed a datagram is incomplete, exit 1, never a narrower set (${GOT})" \
+		bash -c '[[ "$1" == "1 incomplete "* ]]' _ "${GOT}"
+done
+printf '1000 192.0.2.2 41006 27 %s\n' "$(printf 'OPTIONS sip:a@b SIP/2.0\r\n\r\n' | od -An -tx1 | tr -d ' \n')" >"${T}/bad-record"
+printf 'ready 1 1 900\nstopped 1 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
+GOT="$("${REAL_PYTHON}" "${WIRE_REAL}" detected "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" - off 2>&1)"
+RC=$?
+assert_eq "1 incomplete the record has no complete end marker (none)" "${RC} ${GOT##*$'\n'}" \
+	"detected: a record without its complete end marker is incomplete, exit 1, although its one datagram is a SIP hint"
+"${REAL_PYTHON}" "${WIRE_REAL}" detected "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" - maybe >/dev/null 2>&1
+assert_eq 1 "$?" "detected refuses RandomTrailers other than on or off"
 echo "=== The record's completeness and arrival times (Recorder, on a scripted socket and clocks) ==="
 # The packet socket and the clocks are scripted (py recorder); the record's
 # core is the helper's own. The socket's clock is 100 s after boot when it is
