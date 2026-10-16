@@ -43,7 +43,10 @@
 # installer's release with this installer's --upgrade-boringtun, a real
 # version transition, and checks the switch, the restarted daemon and
 # --backend-status; only then does it hold the host to this installer's
-# release.
+# release. Later it rolls back to the earlier release and upgrades again
+# (with imitation auto configured: refused where the earlier binary lacks
+# auto, kept running where it has it), and, where that release is
+# b94943906b11, compares the two binaries' auto behaviour.
 #
 # Requirements: root, systemd as PID 1, network access to the Amnezia PPA and
 # GitHub, no AmneziaWG kernel module, python3, and AWG_DISPOSABLE_HOST_TEST=1.
@@ -118,6 +121,10 @@ CLIENT_IF="awgc0"
 SERVER_TUNNEL_ADDR="10.66.66.1"
 WORK="/var/tmp/awg-host-live"
 CLIENT_BIN="${WORK}/boringtun-client"
+# With an earlier installer whose release has auto: a copy of that release's
+# verified binary, outside the store.
+PREV_BIN="${WORK}/boringtun-previous"
+PREV_AUTO=0
 PASSED=0
 FAILED=0
 
@@ -474,10 +481,11 @@ RELEASE_LOG="${WORK}/install.log"
 if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 	echo "=== The earlier installer's release"
 	PREVIOUS="${AWG_LIVE_PREVIOUS_INSTALLER}"
-	# Two earlier installers are covered: the last one without protocol
+	# Three earlier installers are covered: the last one without protocol
 	# imitation (9f5a1afb87f7), whose release constants predate the build
-	# number, and the one that embedded the release before this one
-	# (c7cd737c221a), with a build number and imitation none.
+	# number; the one that embedded ae2ab44e9a68 (c7cd737c221a), with a build
+	# number and imitation none; and the one that embedded b94943906b11
+	# (4a6f6656ea14), the first release with imitation auto.
 	if grep -q '^AWG_BT_RELEASE_BUILD=' "${PREVIOUS}"; then
 		PROBLEMS="$(btc_embedded_release_problems "${PREVIOUS}")"
 		PREV_FORMAT="with a build number"
@@ -496,7 +504,15 @@ if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 	PREV_ARCHIVE_SHA256="$(btc_embedded_value "${PREVIOUS}" "ARCHIVE_SHA256_${ARCH_KEY}")"
 	PREV_BINARY_SHA256="$(btc_embedded_value "${PREVIOUS}" "BINARY_SHA256_${ARCH_KEY}")"
 	PREV_ID="${PREV_ASSET%.tar.gz}"
-	echo "    earlier installer's release: ${PREV_TAG}, ${ARCH} binary ${PREV_BINARY_SHA256}"
+	# Whether the earlier release's binary has imitation auto, by its tag:
+	# every one of them reports version 0.7.1, so the version never tells.
+	# The binary's own answer is then checked against this.
+	case "${PREV_TAG}" in
+		boringtun-cli-0.7.1-g71d88784ad29-b1 | boringtun-cli-0.7.1-gae2ab44e9a68-b1) PREV_AUTO=0 ;;
+		boringtun-cli-0.7.1-gb94943906b11-b1) PREV_AUTO=1 ;;
+		*) die "the earlier installer's release ${PREV_TAG} is not one whose auto support this test knows" ;;
+	esac
+	echo "    earlier installer's release: ${PREV_TAG}, ${ARCH} binary ${PREV_BINARY_SHA256}, auto $( ((PREV_AUTO)) && echo supported || echo unsupported)"
 	echo "    this installer's release:    ${RELEASE_TAG}, ${ARCH} binary ${BINARY_SHA256}"
 	check "  it is another release than this installer's, so the upgrade below crosses versions" \
 		test "${PREV_TAG}" != "${RELEASE_TAG}" -a "${PREV_ID}" != "${RELEASE_ID}" \
@@ -534,8 +550,18 @@ if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 		check "upgrade: its daemon was started without --imitate-protocol" bash -c '[[ "$1" != *--imitate-protocol* ]]' _ "${PREV_ARGS}"
 	fi
 	check "upgrade: its runtime file is FORMAT=1 alone" test "$(grep -v '^#' "/etc/amnezia/amneziawg/${IF}.boringtun")" = "FORMAT=1"
-	check "upgrade: the earlier binary does not support imitation auto, as its own answer says" \
-		bash -c 'source "$1" && _awgBtBinaryImitationSupport "$2" auto; [[ $? == 1 ]]' _ "${INSTALLER}" "${STORE}/${PREV_ID}/boringtun-cli"
+	if ((PREV_AUTO)); then
+		check "upgrade: the earlier binary supports imitation auto, as its own answer says" \
+			bash -c 'source "$1" && _awgBtBinaryImitationSupport "$2" auto' _ "${INSTALLER}" "${STORE}/${PREV_ID}/boringtun-cli"
+		# A copy of the earlier binary outside the store, for the auto checks
+		# below that compare the two releases.
+		cp -- "${STORE}/${PREV_ID}/boringtun-cli" "${PREV_BIN}"
+		check "  a copy of it for the comparison of the two releases has the earlier installer's embedded SHA-256" \
+			test "$(sha256sum "${PREV_BIN}" 2>/dev/null | cut -d' ' -f1)" = "${PREV_BINARY_SHA256}"
+	else
+		check "upgrade: the earlier binary does not support imitation auto, as its own answer says" \
+			bash -c 'source "$1" && _awgBtBinaryImitationSupport "$2" auto; [[ $? == 1 ]]' _ "${INSTALLER}" "${STORE}/${PREV_ID}/boringtun-cli"
+	fi
 	check "  although it reports the same version as this installer's release" \
 		test "$("${STORE}/${PREV_ID}/boringtun-cli" --version 2>/dev/null)" = "boringtun $(installer_value AWG_BT_RELEASE_VERSION)"
 fi
@@ -1107,21 +1133,85 @@ datapath "auto, after the mixed clients left"
 
 # ── Across releases: auto, a rollback to the earlier release, re-upgrade ────
 # With an earlier installer, previous is the earlier installer's own
-# published release, whose binary has no auto: a real version transition,
-# never a relabelled copy. The rollback must refuse auto and change nothing;
-# with a fixed imitation it must move the service onto that binary, keep
-# traffic and configuration, and refuse auto there; the upgrade back must
-# restore this release without a download, after which auto applies again.
-if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
+# published release: a real version transition, never a relabelled copy.
+# Its binary may or may not have auto (PREV_AUTO, by its tag, checked
+# against the binary's own answer above).
+#
+# Without auto: the rollback must refuse auto and change nothing; with a
+# fixed imitation it must move the service onto that binary, keep traffic
+# and configuration, and refuse auto there; the upgrade back must restore
+# this release without a download, after which auto applies again.
+#
+# With auto (b94943906b11): the rollback with auto configured is offered and
+# must move the service onto the earlier binary still running auto, with
+# traffic and an unchanged configuration; the upgrade back must restore this
+# release, still running auto, without a download. With the upgrade above
+# that is the sequence earlier, this, earlier, this, each stage checked by
+# the running daemon's executable and its SHA-256, the unit, the store's
+# current and previous, --backend-status, the configuration and traffic.
+lifecycle_log() { # <flag> <log>
+	bash "${INSTALLER}" "$1" >"${WORK}/$2" 2>&1 </dev/null
+}
+# daemon_is <release id> <binary SHA-256> <imitation>: the unit is active and
+# its daemon executes that store release's binary, with that SHA-256, running
+# that imitation.
+daemon_is() {
+	local PID
+	PID="$(main_pid)"
+	systemctl is-active --quiet "${UNIT}" && [[ -n "${PID}" && "${PID}" != 0 ]] &&
+		[[ "$(readlink "/proc/${PID}/exe" 2>/dev/null)" == "$(readlink -f "${STORE}/$1/boringtun-cli" 2>/dev/null)" ]] &&
+		[[ "$(sha256sum "/proc/${PID}/exe" 2>/dev/null | cut -d' ' -f1)" == "$2" ]] &&
+		[[ "$(tr '\0' ' ' <"/proc/${PID}/cmdline")" == *" --imitate-protocol $3 ${IF} "* ]]
+}
+if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]] && ((PREV_AUTO)); then
+	echo "=== Across releases: auto kept through a rollback to ${PREV_ID} and the upgrade back"
+	check "current is this installer's release, previous the earlier one" test "$(store_links)" = "${RELEASE_ID} ${PREV_ID}"
+	check "this release's daemon runs auto" daemon_is "${RELEASE_ID}" "${BINARY_SHA256}" auto
+	check "status: with auto configured, the rollback to a previous binary that has it is offered" \
+		release_status_is "installed_release=${RELEASE_ID} pinned_release=${RELEASE_ID} previous_release=${PREV_ID} rollback_available=yes upgrade_available=no daemon_release=${RELEASE_ID} "
+	installation_baseline
+	PID="$(main_pid)"
+	lifecycle_log --rollback-boringtun rollback-auto.log
+	RC=$?
+	tail -n 6 "${WORK}/rollback-auto.log" | sed 's/^/    | /'
+	check "--rollback-boringtun with auto configured succeeds" test "${RC}" -eq 0
+	check "  current is the earlier release and previous this installer's" test "$(store_links)" = "${PREV_ID} ${RELEASE_ID}"
+	check "  the daemon was restarted" test "$(main_pid)" != "${PID}" -a "$(main_pid)" != 0
+	check "  ${UNIT} is active and executes the earlier binary, with the earlier installer's embedded SHA-256, still running auto" \
+		daemon_is "${PREV_ID}" "${PREV_BINARY_SHA256}" auto
+	check "  ${UNIT} runs the earlier release by store name" test "$(bt_unit_release "${UNIT}" "${STORE}")" = "${PREV_ID}"
+	check "  status: the earlier release installed and running, this one previous and offered as the upgrade" \
+		release_status_is "installed_release=${PREV_ID} pinned_release=${RELEASE_ID} previous_release=${RELEASE_ID} rollback_available=yes upgrade_available=yes daemon_release=${PREV_ID} "
+	check "  status: auto configured and running, and the installed binary supports it" \
+		test "$(auto_status)" = "imitation_protocol=auto imitation_domain= imitation_domain_mode=none daemon_state=running daemon_imitation_protocol=auto daemon_imitation_domain= imitation_auto_support=supported "
+	check "  params, the runtime file and every config are byte for byte the same" installation_unchanged
+	check "  the active instance is the one its start recorded" \
+		bash -c 'source "$1" && _awgBtCheckServedByBoringtun "$2"' _ "${INSTALLER}" "${IF}"
+	datapath "auto, rolled back to ${PREV_ID}"
+	PID="$(main_pid)"
+	lifecycle_log --upgrade-boringtun reupgrade-auto.log
+	RC=$?
+	tail -n 6 "${WORK}/reupgrade-auto.log" | sed 's/^/    | /'
+	check "--upgrade-boringtun back to this release succeeds" test "${RC}" -eq 0
+	check "  without downloading it again" bash -c '! grep -q "Downloading" "$1"' _ "${WORK}/reupgrade-auto.log"
+	check "  current is this installer's release and previous the earlier one" test "$(store_links)" = "${RELEASE_ID} ${PREV_ID}"
+	check "  the daemon was restarted" test "$(main_pid)" != "${PID}" -a "$(main_pid)" != 0
+	check "  ${UNIT} is active and executes this release's binary, with this installer's embedded SHA-256, still running auto" \
+		daemon_is "${RELEASE_ID}" "${BINARY_SHA256}" auto
+	check "  status: back where the upgrade left it" status_upgraded
+	check "  params, the runtime file and every config are byte for byte the same" installation_unchanged
+	check "  the active instance is the one its start recorded" \
+		bash -c 'source "$1" && _awgBtCheckServedByBoringtun "$2"' _ "${INSTALLER}" "${IF}"
+	datapath "auto, re-upgraded from ${PREV_ID}"
+	bash "${INSTALLER}" --set-boringtun-imitation none >/dev/null 2>&1 </dev/null
+	check "back to imitation none" test "$(status_line daemon_imitation_protocol)" = "daemon_imitation_protocol=none"
+elif [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 	echo "=== Across releases: auto, rollback to ${PREV_ID} and re-upgrade"
 	check "current is this installer's release, previous the earlier one" test "$(store_links)" = "${RELEASE_ID} ${PREV_ID}"
 	check "status: with auto configured, no rollback is offered to a previous binary without it" \
 		release_status_is "installed_release=${RELEASE_ID} pinned_release=${RELEASE_ID} previous_release=${PREV_ID} rollback_available=no upgrade_available=no daemon_release=${RELEASE_ID} "
 	installation_baseline
 	PID="$(main_pid)"
-	lifecycle_log() { # <flag> <log>
-		bash "${INSTALLER}" "$1" >"${WORK}/$2" 2>&1 </dev/null
-	}
 	lifecycle_log --rollback-boringtun rollback-auto.log
 	RC=$?
 	tail -n 4 "${WORK}/rollback-auto.log" | sed 's/^/    | /'
@@ -1199,20 +1289,35 @@ bash "${SCRIPT_DIR}/test-boringtun-sip-wire-live.sh" "${CLIENT_BIN}" 2>&1 | sed 
 SIP_WIRE_RC="${PIPESTATUS[0]}"
 check "the fixed-size SIP wire test passes" test "${SIP_WIRE_RC}" -eq 0
 
-# ── Auto hints, fixed layout ────────────────────────────────────────────────
-# What an auto server learns, on the same verified binary with fixed layouts
-# (tests/test-boringtun-auto-hint-live.sh): a SIP datagram long enough to be
-# an AmneziaWG candidate is never a hint, the 27-byte hint is learned, under
-# AWG 3.0 BoringTun's own warning shows the header-protection refusal of that
-# hint, a recorded STUN client's datagrams are or are not learned by H4 alone,
-# and real dns, quic, sip and stun clients are learned under a layout their
-# datagrams do not fit; each outcome derived from what reached the server.
-echo "=== Auto hints (fixed layout)"
-check "the auto hint test runs the embedded release's binary" \
+# ── Auto, fixed layouts ─────────────────────────────────────────────────────
+# What an auto server of the embedded release learns in fixed, reproducible
+# scenarios (tests/test-boringtun-auto-collision-live.sh): the SIP probe and
+# the recorded STUN client's datagrams that also fit an AmneziaWG kind are
+# learned, real dns, quic, sip and stun clients are learned under a layout
+# their datagrams do not fit, a client that sends no hint stays random, under
+# header protection BoringTun's own warning shows the refusal of a SIP hint,
+# and a fixed mode stays fixed. With an earlier installer whose release is
+# b94943906b11, its binary runs the two collisions too, where it stays
+# random, and the suite that holds that binary to its own model
+# (tests/test-boringtun-auto-hint-live.sh) runs on it.
+echo "=== Auto (fixed layouts)"
+check "the auto collision test runs the embedded release's binary" \
 	test "$(sha256sum "${CLIENT_BIN}" | cut -d' ' -f1)" = "${BINARY_SHA256}"
-bash "${SCRIPT_DIR}/test-boringtun-auto-hint-live.sh" "${CLIENT_BIN}" 2>&1 | sed 's/^/    | /'
-AUTO_HINT_RC="${PIPESTATUS[0]}"
-check "the auto hint test passes" test "${AUTO_HINT_RC}" -eq 0
+COMPARE_BIN=()
+if ((PREV_AUTO)); then
+	check "  and compares it with the earlier release's binary, a copy with the earlier installer's embedded SHA-256" \
+		test "$(sha256sum "${PREV_BIN}" 2>/dev/null | cut -d' ' -f1)" = "${PREV_BINARY_SHA256}"
+	COMPARE_BIN=("${PREV_BIN}")
+fi
+bash "${SCRIPT_DIR}/test-boringtun-auto-collision-live.sh" "${CLIENT_BIN}" "${COMPARE_BIN[@]}" 2>&1 | sed 's/^/    | /'
+AUTO_COLLISION_RC="${PIPESTATUS[0]}"
+check "the auto collision test passes" test "${AUTO_COLLISION_RC}" -eq 0
+if ((PREV_AUTO)); then
+	echo "=== Auto hints, the earlier release's semantics, on ${PREV_ID}"
+	bash "${SCRIPT_DIR}/test-boringtun-auto-hint-live.sh" "${PREV_BIN}" 2>&1 | sed 's/^/    | /'
+	AUTO_HINT_RC="${PIPESTATUS[0]}"
+	check "the auto hint test of the earlier release's semantics passes on its binary" test "${AUTO_HINT_RC}" -eq 0
+fi
 
 # ── The server-side record's completeness ───────────────────────────────────
 # The record the auto checks derive their expectations from, on a real

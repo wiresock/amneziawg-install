@@ -11,15 +11,20 @@ name: BoringTun Host
 # and uninstalls. Every job also runs the imitation mode auto: clients with
 # different imitation settings, several behind one address on different ports,
 # share the server port, and the server's datagrams to each are checked on the
-# wire. Two earlier installers start the upgrade paths: the last version
+# wire. Three earlier installers start the upgrade paths: the last version
 # without protocol imitation (9f5a1afb87f7, release 71d88784 build 1; x86_64),
-# and the version that embedded the published ae2ab44e9a68 build 1 (c7cd737c221a;
-# x86_64 and aarch64). Each installs its own release, which the test checks,
-# upgrades to this installer's release with this installer's
-# --upgrade-boringtun, then proves on those real, different binaries that a
-# rollback refuses auto, rolls back with a fixed imitation, refuses auto on the
-# earlier binary and upgrades again, with traffic and an unchanged
-# configuration; the aarch64 fresh and the Debian jobs install with this one.
+# the version that embedded the published ae2ab44e9a68 build 1 (c7cd737c221a;
+# x86_64 and aarch64), and the version that embedded the published
+# b94943906b11 build 1, the first release with imitation auto (4a6f6656ea14;
+# x86_64). Each installs its own release, which the test checks, upgrades to
+# this installer's release with this installer's --upgrade-boringtun, then
+# proves on those real, different binaries that a rollback refuses auto, rolls
+# back with a fixed imitation, refuses auto on the earlier binary and upgrades
+# again (from the first two), or that a rollback with auto configured keeps
+# auto running on the earlier binary and the upgrade back restores this
+# release (from b94943906b11, whose binary also runs the auto collision
+# scenarios for comparison), with traffic and an unchanged configuration; the
+# aarch64 fresh and the Debian jobs install with this one.
 # A separate job
 # downloads the public release that the installer embeds anonymously, and one
 # proves coexistence with an installed AmneziaWG kernel module. Every job uses
@@ -35,6 +40,7 @@ on:
       - tests/test-boringtun-host-live.sh
       - tests/test-boringtun-sip-wire-live.sh
       - tests/test-boringtun-auto-hint-live.sh
+      - tests/test-boringtun-auto-collision-live.sh
       - tests/test-boringtun-record-live.sh
       - tests/test-boringtun-public-release.sh
       - tests/test-boringtun-kernel-coexistence.sh
@@ -53,6 +59,7 @@ on:
       - tests/test-boringtun-host-live.sh
       - tests/test-boringtun-sip-wire-live.sh
       - tests/test-boringtun-auto-hint-live.sh
+      - tests/test-boringtun-auto-collision-live.sh
       - tests/test-boringtun-record-live.sh
       - tests/test-boringtun-public-release.sh
       - tests/test-boringtun-kernel-coexistence.sh
@@ -120,6 +127,13 @@ jobs:
             runner: ubuntu-24.04-arm
             path: upgrade from ae2ab44 b1
             previous: c7cd737c221a7357a4d5be74d972dabf02fa11db
+            base: false
+          # The installer that embedded boringtun-cli-0.7.1-gb94943906b11-b1,
+          # the first release with imitation auto.
+          - arch: x86_64
+            runner: ubuntu-24.04
+            path: upgrade from b949439 b1
+            previous: 4a6f6656ea149e80d981e44e4cf243326d721274
             base: false
     steps:
       - uses: actions/checkout@v6
