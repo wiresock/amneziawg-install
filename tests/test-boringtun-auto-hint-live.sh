@@ -1,7 +1,13 @@
 #!/bin/bash
-# Live test of what an imitation auto server learns, on the given
-# boringtun-cli (the verified binary of the release under test), with layouts
-# fixed so that the outcome is known. A server with --imitate-protocol auto
+# Live test of the EARLIER semantics of imitation auto: what a server of the
+# published boringtun-cli b94943906b11 learns, held to that release's model
+# (the helper's auto-expect), with layouts fixed so that the outcome is
+# known. It runs only that release's binaries (by SHA-256, below): the
+# model is no model of e94c04f3f4fd, which can also learn from a datagram
+# that fits an AmneziaWG packet kind once every reading of it is refused, so
+# its collision, stun-replay-colliding and reviewed-stun outcomes differ.
+# e94c04f3f4fd's own behaviour, and the difference, are checked by
+# tests/test-boringtun-auto-collision-live.sh. A server with --imitate-protocol auto
 # (at --verbosity info, so that its warnings are visible) and one client
 # (listen port 41006) run in fresh network namespaces. Before the client
 # starts, a scenario may send datagrams to the server from the client's
@@ -13,7 +19,7 @@
 # (the helper's record, ready before the server starts), and the helper's
 # auto-expect derives the selection from that record and the client side's
 # evidence of acceptance (the client's start and its first ping) by the
-# pinned BoringTun's own rules, over every history that evidence allows:
+# rules of b94943906b11, over every history that evidence allows:
 # which datagrams fit an AmneziaWG packet kind (never a hint), which protocol
 # each other one is detected as, the 30 s hints of the listener and of a
 # connected socket, which initiations were accepted and the
@@ -60,7 +66,7 @@
 # (amneziawg-tools), ping, python3 and AWG_DISPOSABLE_HOST_TEST=1. With
 # AWG_LIVE_SECRET_SCAN set, the keys generated here join that output scan.
 #
-# Usage: AWG_DISPOSABLE_HOST_TEST=1 bash tests/test-boringtun-auto-hint-live.sh <boringtun-cli>
+# Usage: AWG_DISPOSABLE_HOST_TEST=1 bash tests/test-boringtun-auto-hint-live.sh <b94943906b11 boringtun-cli>
 
 set -uo pipefail
 
@@ -131,7 +137,13 @@ source "${SCRIPT_DIR}/helpers/boringtun-wire-checks.sh"
 
 [[ "${AWG_DISPOSABLE_HOST_TEST:-}" == 1 ]] || die "this test creates network namespaces and interfaces; set AWG_DISPOSABLE_HOST_TEST=1 on a disposable host"
 [[ "${EUID}" -eq 0 ]] || die "must run as root"
-[[ -n "${BIN}" && -x "${BIN}" ]] || die "usage: $0 <boringtun-cli>"
+[[ -n "${BIN}" && -x "${BIN}" ]] || die "usage: $0 <b94943906b11 boringtun-cli>"
+# The published b94943906b11 binaries (x86_64, aarch64), the release
+# auto-expect models.
+case "$(sha256sum -- "${BIN}" 2>/dev/null | cut -d' ' -f1)" in
+	1210a3c6780948ea07f301c4fa022c0b4ab634da71db0053f65757c8683470d5 | c6752410b3994007a9ace5f2d93c30c009b2d7478ebed27b01aacc6168a08629) ;;
+	*) die "${BIN} is not a published b94943906b11 boringtun-cli: this suite holds that release to its own model, which describes no other" ;;
+esac
 for TOOL in ip awg ping python3; do
 	command -v "${TOOL}" >/dev/null 2>&1 || die "${TOOL} is required"
 done
@@ -479,7 +491,7 @@ refusals() {
 	sed 's/\x1b\[[0-9;]*m//g' "${WORK}/server.log" | grep -cF "${REFUSAL}"
 }
 
-echo "=== Auto hints on $("${BIN}" --version 2>/dev/null) ($(sha256sum "${BIN}" | cut -d' ' -f1))"
+echo "=== Auto hints, the b94943906b11 semantics, on $("${BIN}" --version 2>/dev/null) ($(sha256sum "${BIN}" | cut -d' ' -f1))"
 use_layout "${LAYOUT_SIP}"
 check "the 247-byte SIP probe is an AmneziaWG transport candidate under S ${S_SIZES}, H4 ${H_RANGES##*,}" \
 	test "$(python3 "${WIRE}" candidates probe sip "${S_SIZES},${H_RANGES}")" = "247 transport"
@@ -816,5 +828,5 @@ udp_overflow
 udp_clean
 
 echo
-echo "BoringTun auto hint test: ${PASSED} passed, ${FAILED} failed"
+echo "BoringTun auto hint test (b94943906b11 semantics): ${PASSED} passed, ${FAILED} failed"
 ((FAILED == 0))

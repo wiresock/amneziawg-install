@@ -49,6 +49,7 @@ jobs:
           bash -n tests/test-boringtun-install-mock.sh
           bash -n tests/test-boringtun-host-live.sh
           bash -n tests/test-boringtun-sip-wire-live.sh
+          bash -n tests/test-boringtun-auto-collision-live.sh
           bash -n tests/test-boringtun-imitation-wire.sh
           bash -n tests/helpers/boringtun-wire-checks.sh
           bash -n tests/test-boringtun-public-release.sh
@@ -140,6 +141,7 @@ jobs:
           shellcheck --severity=warning tests/test-boringtun-install-mock.sh
           shellcheck --severity=warning tests/test-boringtun-host-live.sh
           shellcheck --severity=warning tests/test-boringtun-sip-wire-live.sh
+          shellcheck --severity=warning tests/test-boringtun-auto-collision-live.sh
           shellcheck --severity=warning tests/test-boringtun-imitation-wire.sh
           shellcheck --severity=warning tests/helpers/boringtun-wire-checks.sh
           shellcheck --severity=warning -x tests/test-boringtun-public-release.sh
