@@ -22,7 +22,7 @@
 # refuses the sip it selects; BoringTun as a client refuses SIP with header
 # protection there itself, which is why the hint is planted. The installed
 # daemon logs at error level only, so the header-protection refusal itself is
-# shown by tests/test-boringtun-auto-hint-live.sh, which reads BoringTun's
+# shown by tests/test-boringtun-auto-collision-live.sh, which reads BoringTun's
 # warning.
 #
 # The planted hint is evidence only if it is one. bt_auto_plant shows that it
@@ -37,14 +37,15 @@
 # Each client's stream is recorded on its side, from the server's address
 # and port to that client's port only (capture-to), before the client starts
 # and until its traffic has passed. What the server selected for each peer is
-# derived from what reached the server (bt_auto_judge_stage, below), never
-# from what it sent, and each stream is held to that: a learned dns, quic or
+# bounded by what reached the server (bt_auto_judge_stage, below), never by
+# what it sent, and each stream is held to that: a learned dns, quic or
 # stun shapes every datagram but that protocol's probe replies, a learned sip
 # follows the per-kind SIP rule (bt_wire_assert_sip), and an unresolved peer
 # gets no dns, stun or sip shape. Whether a real client's own imitation
-# datagrams are eligible hints depends on the random layout, so no real
-# client is assumed to be learned here; tests/test-boringtun-auto-hint-live.sh
-# shows each protocol learned under a fixed layout. BoringTun does not report
+# datagrams are learned depends on the random layout and on the release, so
+# no real client is assumed to be learned here;
+# tests/test-boringtun-auto-collision-live.sh shows each protocol learned
+# under a fixed layout. BoringTun does not report
 # what it learned, and neither does the installer.
 #
 # Requires from the caller: INSTALLER, IF, PORT, HOST_ADDR, NS, CLIENT_ADDR,
@@ -209,23 +210,19 @@ bt_auto_ping() { # <name> [count]
 	ip netns exec "${BT_AUTO_NS[$1]}" ping -I "$1" -c "${2:-1}" -i 0.2 -W 2 "${SERVER_TUNNEL_ADDR}" >/dev/null 2>&1
 }
 
-# What the server must have selected for a peer is never read from what it
+# What the server could have selected for a peer is never read from what it
 # sent. For each stage, a record runs on the host from before the daemon that
 # serves the stage started until the stage's last observation ended: every
 # datagram that reaches the host from either client address to the server
 # port, whole, with its kernel arrival time (the helper's record). At the
-# stage's end the helper's auto-expect derives, for each observation of a
-# client, what the server selected for that peer from that record and the
-# client side's evidence of acceptance (when each of its processes started
-# and first pinged through the tunnel), by the pinned BoringTun's own rules
-# replayed over every history that evidence allows: which of the client's
-# datagrams fit an AmneziaWG packet kind under the server's layout (never a
-# hint), which protocol each other one is detected as, the listener's and a
-# connected socket's hints and their 30 s, which initiations were accepted,
-# and the header-protection policy. Each capture is then held to that
-# expectation (bt_wire_auto_verdict, or the per-kind SIP rule for a learned
-# sip); a record that cannot decide fails the observation, and so does one
-# not complete through it.
+# stage's end the helper's `detected` lists, for each client, which protocols
+# its datagrams in that record are detected as, and which of them fit an
+# AmneziaWG packet kind under the server's layout; bt_auto_judge_stage bounds
+# each peer's outcome by that alone, with no model of any release's hint
+# rules (the b94943906b11 model, auto-expect, is no model of e94c04f3f4fd).
+# Each capture is then held to that bound (bt_wire_auto_verdict, or the
+# per-kind SIP rule for a required sip); a record that is not whole fails the
+# observation.
 BT_AUTO_STAGE=""
 BT_AUTO_RECORD=""
 BT_AUTO_RECORD_READY=""
@@ -233,14 +230,9 @@ BT_AUTO_EPOCH=""
 BT_AUTO_EPOCH_PID=""
 BT_AUTO_SEQ=0
 BT_AUTO_PENDING=()
-# The client side's evidence of acceptance, per client and stage: when each of
-# its processes started (BT_AUTO_BORN) and "<started>:<first ping>" for every
-# observation (BT_AUTO_EST), so that some initiation it sent between them was
-# accepted and answered by then.
-declare -gA BT_AUTO_BORN=() BT_AUTO_EST=()
 
 # Header protection is on (AWG 3.0 and 3.1) and its key, from params; the key
-# goes only to a file of mode 0600 that auto-expect reads.
+# goes only to a file of mode 0600 that `detected` reads.
 bt_auto_protected() {
 	[[ "$(sed -n "s/^AWG_PROTOCOL_VERSION='\\(.*\\)'\$/\\1/p" /etc/amnezia/amneziawg/params)" =~ ^3 ]]
 }
@@ -270,8 +262,6 @@ bt_auto_record_start() { # <stage>
 	BT_AUTO_EPOCH=""
 	BT_AUTO_EPOCH_PID=""
 	BT_AUTO_PENDING=()
-	BT_AUTO_BORN=()
-	BT_AUTO_EST=()
 	if BT_WIRE_CAPTURE_RECORD=1 BT_WIRE_CAPTURE_TO_PORT="${PORT}" bt_wire_capture_start - any \
 		"${CLIENT_ADDR},${BT_AUTO_CLIENT_ADDR2}" any 3600 "${BT_AUTO_RECORD}" &&
 		BT_AUTO_RECORD_READY="${BT_WIRE_CAPTURE_READY_CLOCK}" && bt_wire_capture_park auto-record; then
@@ -318,7 +308,6 @@ bt_auto_observe() { # <label> <name> <start 1|0>
 		return
 	fi
 	BEGIN="${BT_WIRE_CAPTURE_READY_CLOCK}"
-	((START)) && BT_AUTO_BORN[${NAME}]="$(bt_auto_uptime)"
 	if ((START)) && ! bt_auto_start "${NAME}"; then
 		bad "${LABEL}: ${NAME} starts with its installer-generated config (imitation ${BT_AUTO_IMITATE[${NAME}]}${BT_AUTO_INJECT[${NAME}]:+, a planted ${BT_AUTO_INJECT[${NAME}]} hint})"
 	fi
@@ -340,20 +329,34 @@ bt_auto_observe() { # <label> <name> <start 1|0>
 	fi
 	bt_wire_now
 	END="${BT_WIRE_NOW}"
-	if [[ -n "${UP}" && -n "${BT_AUTO_BORN[${NAME}]:-}" ]]; then
-		BT_AUTO_EST[${NAME}]+="${BT_AUTO_EST[${NAME}]:+,}${BT_AUTO_BORN[${NAME}]}:${UP}"
-	fi
 	BT_AUTO_PENDING+=("${LABEL}|${NAME}|${CAPTURE}|${FORMAT}|${BEGIN}|${END}|${START}")
 }
 
-# End the stage's record and judge each observation against what the record
-# decides. A capture whose peer learned is also held to random, and one whose
-# peer stayed unresolved to the protocols a prefix capture shows: each must
-# fail, so the verdict tells the two apart on these very captures.
+# End the stage's record and judge each observation by what its client's own
+# datagrams could teach the server, by observation alone (the helper's
+# `detected`: detect() and the AmneziaWG candidates, no release's rules).
+# Every release with auto learns a protocol for a peer only from a datagram
+# of that peer's source that detect() recognizes, so:
+#   - a client none of whose datagrams is detected as anything stays
+#     unresolved: its stream is random, exactly;
+#   - acsipinj, whose only detected datagram is the planted SIP hint, proven
+#     to fit no AmneziaWG kind and to have come within a hint's lifetime
+#     before its handshake, is sip, exactly, unless header protection with an
+#     S prefix of 31 bytes or more refuses sip: then random, exactly;
+#   - any other client may or may not be learned, depending on the layout
+#     and, from e94c04f3f4fd, on how the readings of its datagrams that also
+#     fit an AmneziaWG kind were refused: its stream must fit random or a
+#     protocol detected from it, and a prefix capture must fail as every
+#     protocol nothing from it was detected as.
+# This bounds the outcome; it does not decide which one a release selects
+# (tests/test-boringtun-auto-collision-live.sh shows that per scenario). An
+# exact outcome is cross-checked as before: a learned peer's capture must
+# fail as random, an unresolved one's as dns, quic and stun.
 bt_auto_judge_stage() {
-	local ENTRY LABEL NAME CAPTURE FORMAT BEGIN END START ORACLE EXPECT HP_FILE=- SERVER_KEY SIZES OTHER
-	local LEARNED="" UNRESOLVED=""
-	echo "--- auto, ${BT_AUTO_STAGE}: what the server selected, from what reached it"
+	local ENTRY LABEL NAME CAPTURE FORMAT BEGIN END START DETECTED EXPECT HP_FILE=- SIZES OTHER FOUND CLEAR LARGEST=0 S
+	local LEARNED="" UNRESOLVED="" BOUNDED=""
+	local -a ALLOWED=()
+	echo "--- auto, ${BT_AUTO_STAGE}: what the server could select, from what reached it"
 	if [[ -z "${BT_AUTO_RECORD}" || -z "${BT_AUTO_EPOCH}" ]]; then
 		bad "auto, ${BT_AUTO_STAGE}: the stage has a record and a daemon start, so that its observations can be judged"
 		bt_wire_capture_resume auto-record >/dev/null 2>&1 && bt_wire_capture_finish "${BT_AUTO_RECORD}" stop 10 >/dev/null 2>&1
@@ -368,34 +371,74 @@ bt_auto_judge_stage() {
 		BT_AUTO_PENDING=()
 		return
 	fi
-	# The installer's record of the server's public key: BoringTun's UAPI
-	# reports none. A wrong key would leave every record undecided.
-	SERVER_KEY="$(sed -n "s/^SERVER_PUB_KEY='\\([A-Za-z0-9+\\/]*=\\)'\$/\\1/p" /etc/amnezia/amneziawg/params)"
 	SIZES="$(params_s S1),$(params_s S2),$(params_s S3),$(params_s S4)"
+	for S in S1 S2 S3 S4; do
+		(($(params_s "${S}") > LARGEST)) && LARGEST="$(params_s "${S}")"
+	done
 	if bt_auto_protected; then
 		HP_FILE="${WORK}/auto-hp.key"
 		(umask 077 && bt_auto_hp_key >"${HP_FILE}")
 	fi
 	for ENTRY in "${BT_AUTO_PENDING[@]}"; do
 		IFS='|' read -r LABEL NAME CAPTURE FORMAT BEGIN END START <<<"${ENTRY}"
-		ORACLE="$(python3 "${WIRE}" auto-expect "${BT_AUTO_RECORD}" "${BT_AUTO_ADDR[${NAME}]}" "${BT_AUTO_PORT[${NAME}]}" \
-			"$(params_layout)" "${SERVER_KEY}" "${HP_FILE}" "$(bt_auto_trailers)" "${BT_AUTO_EPOCH}" "${BEGIN}" "${END}" \
-			"${BT_AUTO_EST[${NAME}]:--}" - 2>&1)"
-		sed "s/^/    ${NAME} record | /" <<<"${ORACLE}"
-		if [[ ! "${ORACLE##*$'\n'}" =~ ^expect\ (dns|quic|sip|stun|random)$ ]]; then
-			bad "${LABEL}: what reached the server from ${NAME} decides what it selected (${ORACLE##*$'\n'})"
+		DETECTED="$(python3 "${WIRE}" detected "${BT_AUTO_RECORD}" "${BT_AUTO_ADDR[${NAME}]}" "${BT_AUTO_PORT[${NAME}]}" \
+			"$(params_layout)" "${HP_FILE}" "$(bt_auto_trailers)" 2>&1)"
+		sed "s/^/    ${NAME} record | /" <<<"${DETECTED}"
+		if [[ ! "${DETECTED##*$'\n'}" =~ ^detected\ ([a-z,]+)\ clear\ ([a-z,]+)$ ]]; then
+			bad "${LABEL}: the whole record shows what ${NAME}'s datagrams could teach the server (${DETECTED##*$'\n'})"
 			continue
 		fi
-		EXPECT="${BASH_REMATCH[1]}"
-		ok "${LABEL}: what reached the server from ${NAME} decides what it selected: ${EXPECT}"
+		FOUND="${BASH_REMATCH[1]}" CLEAR="${BASH_REMATCH[2]}"
+		ok "${LABEL}: ${NAME}'s datagrams are detected as ${FOUND} (in a datagram that fits no AmneziaWG kind: ${CLEAR})"
+		EXPECT=""
+		ALLOWED=()
+		if [[ "${BT_AUTO_INJECT[${NAME}]}" == sip ]]; then
+			if [[ "${FOUND} ${CLEAR}" != "sip sip" ]]; then
+				bad "${LABEL}: the only protocol ${NAME}'s datagrams are detected as is its planted sip, in a datagram that fits no AmneziaWG kind"
+				continue
+			fi
+			ok "${LABEL}: the only protocol ${NAME}'s datagrams are detected as is its planted sip, in a datagram that fits no AmneziaWG kind"
+			EXPECT=sip
+			bt_auto_protected && ((LARGEST >= 31)) && EXPECT=random
+			ok "${LABEL}: so ${NAME}'s peer is ${EXPECT}$([[ "${EXPECT}" == random ]] && echo ": header protection refuses sip with an S prefix of ${LARGEST} bytes")"
+		elif [[ "${FOUND}" == none ]]; then
+			EXPECT=random
+			ok "${LABEL}: nothing from ${NAME} is detected as any protocol, so its peer stays unresolved: random"
+		else
+			IFS=, read -r -a ALLOWED <<<"random,${FOUND}"
+			OTHER=""
+			for S in "${ALLOWED[@]}"; do
+				if bt_wire_auto_verdict "${S}" "${CAPTURE}" "${FORMAT}" "${SIZES}"; then
+					OTHER="${S}"
+					break
+				fi
+			done
+			if [[ -n "${OTHER}" ]]; then
+				ok "${LABEL}: the server's datagrams to ${NAME} fit one of ${ALLOWED[*]}, the outcomes its datagrams allow: ${OTHER} (${BT_WIRE_REASON})"
+				BOUNDED+=" ${NAME}:${OTHER}"
+			else
+				bad "${LABEL}: the server's datagrams to ${NAME} fit one of ${ALLOWED[*]}, the outcomes its datagrams allow"
+				continue
+			fi
+			[[ "${FORMAT}" == prefixes ]] || continue
+			for OTHER in dns quic stun; do
+				[[ ",${FOUND}," == *",${OTHER},"* ]] && continue
+				if bt_wire_auto_verdict "${OTHER}" "${CAPTURE}" prefixes; then
+					bad "${LABEL}: ${NAME}'s capture passes as ${OTHER}, which nothing from it was detected as (${BT_WIRE_REASON})"
+				else
+					ok "${LABEL}: ${NAME}'s capture fails as ${OTHER}, which nothing from it was detected as (${BT_WIRE_REASON})"
+				fi
+			done
+			continue
+		fi
 		if [[ "${EXPECT}" == sip && "${FORMAT}" == kinds ]]; then
 			bt_wire_assert_sip "${LABEL}: ${NAME}" "${CAPTURE}" "${SIZES}" \
 				init:optional "response:$( ((START)) && echo required || echo optional)" cookie:optional transport:required &&
 				echo "    (${LABEL}: $(bt_wire_pooled_shaped) server datagrams to ${NAME} carry a SIP request line)"
 		elif bt_wire_auto_verdict "${EXPECT}" "${CAPTURE}" "${FORMAT}" "${SIZES}"; then
-			ok "${LABEL}: the server's datagrams to ${NAME} are ${EXPECT}, as the record decided (${BT_WIRE_REASON})"
+			ok "${LABEL}: the server's datagrams to ${NAME} are ${EXPECT}, as its datagrams allow and no other (${BT_WIRE_REASON})"
 		else
-			bad "${LABEL}: the server's datagrams to ${NAME} are ${EXPECT}, as the record decided (${BT_WIRE_REASON})"
+			bad "${LABEL}: the server's datagrams to ${NAME} are ${EXPECT}, as its datagrams allow and no other (${BT_WIRE_REASON})"
 			continue
 		fi
 		if [[ "${EXPECT}" == random ]]; then
@@ -423,8 +466,8 @@ bt_auto_judge_stage() {
 		fi
 	done
 	[[ "${HP_FILE}" == - ]] || rm -f -- "${HP_FILE}"
-	echo "    (auto, ${BT_AUTO_STAGE}: learned, per the record:${LEARNED:- none}; unresolved:${UNRESOLVED:- none})"
-	echo "    (a real client left unresolved here sent no eligible datagram under this layout; test-boringtun-auto-hint-live.sh shows each protocol learned under a fixed layout)"
+	echo "    (auto, ${BT_AUTO_STAGE}: learned, as its datagrams require:${LEARNED:- none}; unresolved, as they require:${UNRESOLVED:- none}; within the bounds they allow:${BOUNDED:- none})"
+	echo "    (whether a real client's own imitation is learned depends on the layout and the release; tests/test-boringtun-auto-collision-live.sh shows each protocol learned under a fixed layout)"
 	BT_AUTO_PENDING=()
 }
 
@@ -516,15 +559,14 @@ bt_auto_mixed_clients() {
 
 # Under AWG 3.0 the clients reconnect with their regenerated configs, to the
 # daemon the protocol change restarted (the caller started the stage's record
-# before that). The record decides each peer under header protection: the
+# before that). The record bounds each peer under header protection: the
 # tags are read through the mask, and a learned sip is refused while an S
-# prefix is 31 bytes or more. acsipinj's hint is planted and proven as under
-# AWG 2.0, where this server learned it from the same datagram when the record
-# said so. That an unresolved acsipinj is BoringTun's header-protection
-# refusal, and not a hint that never counted, is not visible here (the
-# installed daemon logs errors only): the evidence is the record, the proven
-# hint, and the refusal warning that tests/test-boringtun-auto-hint-live.sh
-# reads from the same binary. BoringTun clients cannot run sip with header
+# prefix is 31 bytes or more, so acsipinj, whose hint is planted and proven
+# as under AWG 2.0, must stay random. That an unresolved acsipinj is
+# BoringTun's header-protection refusal, and not a hint that never counted,
+# is not visible here (the installed daemon logs errors only): the evidence
+# is the record, the proven hint, and the refusal warning that
+# tests/test-boringtun-auto-collision-live.sh reads from the same binary. BoringTun clients cannot run sip with header
 # protection at those sizes, so acsip does not take part.
 bt_auto_header_protection() {
 	local NAME LARGEST=0 SIZE
