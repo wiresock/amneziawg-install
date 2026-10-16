@@ -23,7 +23,7 @@ use crate::auth::AuthConfig;
 use crate::db::Database;
 use crate::managed_interface::InterfaceSelector;
 use crate::poller::Poller;
-use crate::web::router_with_lifecycle_lock_dir;
+use crate::web::{normalize_base_path, router_with_base_path};
 
 /// CLI arguments / environment variable configuration.
 #[derive(Parser, Debug)]
@@ -32,6 +32,13 @@ pub struct Config {
     /// TCP address the HTTP server will listen on.
     #[arg(long, env = "AWG_WEB_LISTEN", default_value = "0.0.0.0:8080")]
     pub listen: std::net::SocketAddr,
+
+    /// Public URL prefix for every panel route, link, redirect, and session cookie.
+    ///
+    /// Empty serves the panel at `/`. A value such as `/321abrakadabra123` mounts
+    /// it at that path. nginx must forward the prefix unchanged.
+    #[arg(long, env = "AWG_WEB_BASE_PATH", default_value = "")]
+    pub base_path: String,
 
     /// Path to the SQLite database file.
     #[arg(long, env = "AWG_WEB_DB", default_value = "awg-web.db")]
@@ -148,7 +155,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
-    info!(listen = %config.listen, db = %config.database_url, "starting amneziawg-web");
+    let base_path = normalize_base_path(&config.base_path).map_err(|err| {
+        anyhow::anyhow!("invalid AWG_WEB_BASE_PATH '{}': {err}", config.base_path)
+    })?;
+    info!(
+        listen = %config.listen,
+        db = %config.database_url,
+        base_path = %if base_path.is_empty() { "/" } else { base_path.as_str() },
+        "starting amneziawg-web"
+    );
 
     // --- Validate config-dir path early --------------------------------------
     // AWG_CONFIG_DIR ends up in systemd ReadWritePaths= directives and is used
@@ -275,14 +290,16 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // --- HTTP server --------------------------------------------------------
-    let app = router_with_lifecycle_lock_dir(
+    let app = router_with_base_path(
         db,
         auth,
         config_dir,
         lifecycle_lock_dir,
         config.proxy_sessions_file,
         interface,
-    );
+        &base_path,
+    )
+    .map_err(|err| anyhow::anyhow!("invalid AWG_WEB_BASE_PATH '{}': {err}", base_path))?;
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .context("failed to bind TCP listener")?;
@@ -326,6 +343,20 @@ mod tests {
             Config::try_parse_from(["amneziawg-web", "--snapshot-retention-days", "200000",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn config_defaults_base_path_to_empty() {
+        let cfg = Config::try_parse_from(["amneziawg-web"]).expect("parse defaults");
+        assert_eq!(cfg.base_path, "");
+        assert_eq!(normalize_base_path(&cfg.base_path).unwrap(), "");
+    }
+
+    #[test]
+    fn config_accepts_base_path_from_flag() {
+        let cfg = Config::try_parse_from(["amneziawg-web", "--base-path", "/panel"])
+            .expect("parse base path");
+        assert_eq!(normalize_base_path(&cfg.base_path).unwrap(), "/panel");
     }
 
     #[test]

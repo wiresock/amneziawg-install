@@ -7,6 +7,7 @@
   <p class="meta">This link contains the client credentials. Share it only with the intended user.</p>
 </div>
 <script>
+var AWG_WEB_BASE='';
 var _amneziaRequest=0;
 var _amneziaTrigger=null;
 function clearAmneziaLink(){
@@ -31,7 +32,7 @@ async function exportAmnezia(peerId,action){
   var field=document.getElementById('amnezia-uri');
   status.textContent='Preparing Amnezia link…';
   try{
-    var response=await fetch('/api/peers/'+peerId+'/vpn-uri',{
+    var response=await fetch(AWG_WEB_BASE+'/api/peers/'+peerId+'/vpn-uri',{
       credentials:'same-origin',cache:'no-store',redirect:'error'
     });
     if(!response.ok) throw new Error('export failed');

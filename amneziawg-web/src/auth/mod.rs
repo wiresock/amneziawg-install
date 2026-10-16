@@ -282,20 +282,38 @@ pub fn csrf_eq(a: &str, b: &str) -> bool {
 
 // ── Cookie helpers ────────────────────────────────────────────────────────────
 
+/// Cookie `Path` for a normalized panel base path.
+///
+/// An empty base path covers the whole host. A configured prefix such as
+/// `/panel` limits the session cookie to that path and its children.
+pub fn session_cookie_path(base_path: &str) -> &str {
+    if base_path.is_empty() {
+        "/"
+    } else {
+        base_path
+    }
+}
+
 /// Build the `Set-Cookie` header value for a new session.
-pub fn make_session_cookie(token: &str, secure: bool, ttl: Duration) -> String {
+///
+/// `path` is the cookie `Path` attribute, normally from [`session_cookie_path`].
+pub fn make_session_cookie(token: &str, secure: bool, ttl: Duration, path: &str) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
     format!(
-        "{name}={token}; HttpOnly; SameSite=Lax; Max-Age={max_age}; Path=/{secure_flag}",
+        "{name}={token}; HttpOnly; SameSite=Lax; Max-Age={max_age}; Path={path}{secure_flag}",
         name = SESSION_COOKIE,
         max_age = ttl.as_secs(),
     )
 }
 
 /// Build the `Set-Cookie` header value that clears the session cookie.
-pub fn clear_session_cookie() -> String {
+///
+/// `path` must match the `Path` used when the cookie was set. `secure` must
+/// match too, or the browser keeps the old `Secure` cookie.
+pub fn clear_session_cookie(path: &str, secure: bool) -> String {
+    let secure_flag = if secure { "; Secure" } else { "" };
     format!(
-        "{name}=; HttpOnly; SameSite=Lax; Max-Age=0; Path=/",
+        "{name}=; HttpOnly; SameSite=Lax; Max-Age=0; Path={path}{secure_flag}",
         name = SESSION_COOKIE,
     )
 }
@@ -536,7 +554,8 @@ mod tests {
     #[test]
     fn make_session_cookie_contains_required_attrs() {
         let ttl = Duration::from_secs(86400);
-        let c = make_session_cookie("mytoken", false, ttl);
+        let c = make_session_cookie("mytoken", false, ttl, "/");
+        assert!(c.contains("Path=/"));
         assert!(c.contains("awg_session=mytoken"));
         assert!(c.contains("HttpOnly"));
         assert!(c.contains("SameSite=Lax"));
@@ -546,22 +565,36 @@ mod tests {
     #[test]
     fn make_session_cookie_secure_flag() {
         let ttl = Duration::from_secs(3600);
-        let c = make_session_cookie("tok", true, ttl);
+        let c = make_session_cookie("tok", true, ttl, "/");
         assert!(c.contains("Secure"));
-        let c_no = make_session_cookie("tok", false, ttl);
+        let c_no = make_session_cookie("tok", false, ttl, "/");
         assert!(!c_no.contains("Secure"));
     }
 
     #[test]
     fn make_session_cookie_uses_ttl() {
-        let c = make_session_cookie("tok", false, Duration::from_secs(7200));
+        let c = make_session_cookie("tok", false, Duration::from_secs(7200), "/");
         assert!(c.contains("Max-Age=7200"));
     }
 
     #[test]
+    fn make_session_cookie_scopes_path_to_base() {
+        let c = make_session_cookie("tok", false, Duration::from_secs(60), "/panel");
+        assert!(c.contains("Path=/panel"));
+        assert!(!c.contains("Path=/;"));
+        assert_eq!(session_cookie_path(""), "/");
+        assert_eq!(session_cookie_path("/panel"), "/panel");
+    }
+
+    #[test]
     fn clear_session_cookie_has_max_age_zero() {
-        let c = clear_session_cookie();
+        let c = clear_session_cookie("/panel", false);
         assert!(c.contains("Max-Age=0"));
         assert!(c.contains("awg_session=;"));
+        assert!(c.contains("Path=/panel"));
+        assert!(!c.contains("Secure"));
+        let secure = clear_session_cookie("/", true);
+        assert!(secure.split(';').any(|part| part.trim() == "Path=/"));
+        assert!(secure.contains("Secure"));
     }
 }

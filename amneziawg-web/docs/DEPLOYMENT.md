@@ -66,6 +66,8 @@ AUTH_SECURE_COOKIE=true
 AUTH_API_TOKEN=
 
 AWG_WEB_LISTEN=127.0.0.1:8080
+# Optional. Example: /321abrakadabra123
+# AWG_WEB_BASE_PATH=
 AWG_WEB_DB=/var/lib/amneziawg-web/awg-web.db
 AWG_CONFIG_DIR=/etc/amnezia/amneziawg/clients
 AWG_POLL_INTERVAL=30
@@ -168,6 +170,8 @@ server {
 
 ### Caddy equivalent
 
+The server block above is a dedicated host. Caddy proxies that whole host:
+
 ```caddy
 awg.example.com {
     @allowed remote_ip 10.0.0.0/8
@@ -175,6 +179,51 @@ awg.example.com {
         reverse_proxy 127.0.0.1:8080
     }
     respond "Forbidden" 403
+}
+```
+
+### Serving the panel under a path
+
+To publish the panel on an existing site at a hard-to-guess path, set
+`AWG_WEB_BASE_PATH=/321abrakadabra123` and forward that prefix unchanged.
+`proxy_pass` must not include a URI path, or nginx will strip the prefix
+before it reaches the panel. Match the bare path and the slash prefix
+separately: a prefix `location` that ends in `/` does not match
+`/321abrakadabra123`, and `^~` keeps a regex `location` from taking the
+prefixed URLs. The panel issues the redirect from the bare path.
+
+```nginx
+location = /321abrakadabra123 {
+    proxy_pass         http://127.0.0.1:8080;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+}
+
+location ^~ /321abrakadabra123/ {
+    proxy_pass         http://127.0.0.1:8080;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+}
+```
+
+A request to `/321abrakadabra123` redirects to `/321abrakadabra123/`.
+Paths outside the prefix, including `/` and `/api/health` on the public
+site, are not the panel. The local probe moves to
+`http://127.0.0.1:8080/321abrakadabra123/api/health`. Bearer clients use the
+same prefix. Keep `AUTH_ENABLED=true`; the path only hides the panel.
+
+On Caddy, `handle` keeps the path. `handle_path` would strip it:
+
+```caddy
+handle /321abrakadabra123 {
+    reverse_proxy 127.0.0.1:8080
+}
+handle /321abrakadabra123/* {
+    reverse_proxy 127.0.0.1:8080
 }
 ```
 

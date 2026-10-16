@@ -3,7 +3,7 @@
 <p>Imitate DNS, QUIC, SIP or STUN directly in BoringTun, or let Auto choose one for each client. No proxy is required. This changes the server's outgoing packet prefixes; it does not change the AWG version or client configurations.</p>
 <p id="imitation-configured" class="meta" role="status">Configured: loading…</p>
 <p id="imitation-running" class="meta" role="status">Running: loading…</p>
-<form method="POST" action="/admin/imitation" id="imitation-form">
+<form method="POST" action="{{base}}/admin/imitation" id="imitation-form">
   <input type="hidden" name="csrf_token" value="{{csrf}}">
   <fieldset id="imitation-fields" disabled>
     <label for="imitation-mode">Imitation mode</label>
@@ -84,7 +84,8 @@
     }
   }
   mode.addEventListener('change', updateChoice);
-  fetch('/api/admin/imitation', { credentials: 'same-origin' })
+  var AWG_WEB_BASE='';
+  fetch(AWG_WEB_BASE+'/api/admin/imitation', { credentials: 'same-origin' })
     .then(function(response) { if (!response.ok) throw new Error('unavailable'); return response.json(); })
     .then(function(data) {
       if (data.backend === 'kernel') return;

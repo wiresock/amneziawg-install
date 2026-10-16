@@ -1897,6 +1897,10 @@ AUTH_SECURE_COOKIE=false
 
 # ── Server ────────────────────────────────────────────────────────────────────
 AWG_WEB_LISTEN=${LISTEN_HOST}:${LISTEN_PORT}
+# Optional public URL prefix. Empty serves the panel at /.
+# Example: /321abrakadabra123
+# nginx must forward this prefix unchanged. This does not replace authentication.
+# AWG_WEB_BASE_PATH=
 AWG_WEB_DB=${DATA_DIR}/awg-web.db
 
 # ── AWG integration ───────────────────────────────────────────────────────────

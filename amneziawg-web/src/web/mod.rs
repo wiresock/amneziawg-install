@@ -22,8 +22,8 @@ use crate::auth::{
     add_session, check_and_record_login_attempt, clear_session_cookie, consume_login_csrf, csrf_eq,
     extract_session_token, generate_login_csrf, generate_session_id, get_session_csrf,
     is_session_valid, make_session_cookie, new_login_csrf_store, new_login_rate_limiter,
-    new_session_store, remove_session, AuthConfig, LoginCsrfStore, LoginRateLimiter, SessionStore,
-    RATE_LIMIT_MAX_ATTEMPTS, RATE_LIMIT_WINDOW,
+    new_session_store, remove_session, session_cookie_path, AuthConfig, LoginCsrfStore,
+    LoginRateLimiter, SessionStore, RATE_LIMIT_MAX_ATTEMPTS, RATE_LIMIT_WINDOW,
 };
 use crate::db::events::{
     list_events, log_event, EVT_AWG_PROTOCOL_CHANGED, EVT_AWG_PROTOCOL_CHANGE_FAILED,
@@ -59,6 +59,8 @@ pub struct AppState {
     pub lifecycle_lock_dir: PathBuf,
     /// Local JSON file written by amneziawg-proxy with active session status.
     pub proxy_sessions_file: PathBuf,
+    /// Public URL prefix. Empty mounts the panel at `/`.
+    pub base_path: String,
     /// Which AWG interface the enforcement helpers and one-shot syncs act on.
     pub interface: InterfaceSelector,
     /// Lazily-canonicalized `config_dir` for safe `starts_with` comparisons.
@@ -155,6 +157,7 @@ impl AppState {
             config_dir,
             lifecycle_lock_dir,
             proxy_sessions_file,
+            base_path: String::new(),
             interface: InterfaceSelector::from_params(),
             canonical_config_dir: std::sync::Arc::new(cell),
             logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -169,6 +172,17 @@ impl AppState {
     fn with_interface(mut self, interface: InterfaceSelector) -> Self {
         self.interface = interface;
         self
+    }
+
+    /// Mount the panel under a normalized public prefix.
+    fn with_base_path(mut self, base_path: String) -> Self {
+        self.base_path = base_path;
+        self
+    }
+
+    /// Prefix an absolute panel path with the configured base path.
+    fn url(&self, path: &str) -> String {
+        join_base(&self.base_path, path)
     }
 
     /// Return the canonicalized config directory, computing it lazily if
@@ -1196,6 +1210,98 @@ fn normalize_period(period: &str) -> &'static str {
     }
 }
 
+// ── Base path ───────────────────────────────────────────────────────────────
+
+/// Longest accepted `AWG_WEB_BASE_PATH`, including the leading slash.
+const MAX_BASE_PATH_LEN: usize = 128;
+
+/// Assignment replaced in shipped scripts so an empty prefix stays literal
+/// in the source files exercised by the UI tests.
+const JS_BASE_ASSIGNMENT: &str = "var AWG_WEB_BASE='';";
+
+/// Normalize `AWG_WEB_BASE_PATH`.
+///
+/// `""` and `"/"` mount the panel at the host root. Any other value is an
+/// absolute path with no trailing slash, such as `/321abrakadabra123`.
+pub fn normalize_base_path(raw: &str) -> Result<String, &'static str> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "/" {
+        return Ok(String::new());
+    }
+    if raw.len() > MAX_BASE_PATH_LEN {
+        return Err("AWG_WEB_BASE_PATH is too long");
+    }
+    if !raw.starts_with('/') {
+        return Err("AWG_WEB_BASE_PATH must start with '/'");
+    }
+    if raw.ends_with('/') {
+        return Err("AWG_WEB_BASE_PATH must not have a trailing '/'");
+    }
+    if raw.contains("//") {
+        return Err("AWG_WEB_BASE_PATH must not contain an empty segment");
+    }
+    for segment in raw[1..].split('/') {
+        if segment == "." || segment == ".." {
+            return Err("AWG_WEB_BASE_PATH must not contain '.' or '..'");
+        }
+        if !segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+        {
+            return Err(
+                "AWG_WEB_BASE_PATH may contain only ASCII letters, digits, '-', '_', '.', and '~'",
+            );
+        }
+    }
+    Ok(raw.to_string())
+}
+
+/// Prefix `path` with a normalized base path.
+///
+/// `path` is an absolute panel path, including an optional query string.
+fn join_base(base: &str, path: &str) -> String {
+    debug_assert!(
+        path.starts_with('/') && !path.starts_with("//"),
+        "panel path must be absolute"
+    );
+    format!("{base}{path}")
+}
+
+/// Point shipped browser scripts at the configured prefix.
+fn with_js_base(source: &str, base: &str) -> String {
+    source.replace(JS_BASE_ASSIGNMENT, &format!("var AWG_WEB_BASE='{base}';"))
+}
+
+/// Serve the panel under `base`. An empty base returns `inner` unchanged.
+///
+/// `nest_service` also matches the bare prefix and strips it before the inner
+/// router runs, so this layer redirects only that exact path. The query is
+/// kept because a cached 308 would otherwise drop it.
+fn mount_at_base(inner: Router, base: &str) -> Router {
+    if base.is_empty() {
+        return inner;
+    }
+    let bare = base.to_string();
+    Router::new()
+        .nest_service(base, inner)
+        .layer(middleware::from_fn(
+            move |req: Request<axum::body::Body>, next: Next| {
+                let bare = bare.clone();
+                async move {
+                    if req.uri().path() == bare {
+                        let target = match req.uri().query() {
+                            Some(query) => format!("{bare}/?{query}"),
+                            None => format!("{bare}/"),
+                        };
+                        Redirect::permanent(&target).into_response()
+                    } else {
+                        next.run(req).await
+                    }
+                }
+            },
+        ))
+}
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /// Build the application router with an explicit proxy session status file.
@@ -1220,6 +1326,7 @@ pub fn router_with_proxy_sessions_file(
 }
 
 /// Build the application router with an independent persistent lifecycle lock directory.
+#[cfg(test)]
 pub fn router_with_lifecycle_lock_dir(
     db: Database,
     auth: AuthConfig,
@@ -1228,6 +1335,48 @@ pub fn router_with_lifecycle_lock_dir(
     proxy_sessions_file: PathBuf,
     interface: InterfaceSelector,
 ) -> Router {
+    build_router(
+        db,
+        auth,
+        config_dir,
+        lifecycle_lock_dir,
+        proxy_sessions_file,
+        interface,
+        String::new(),
+    )
+}
+
+/// Build the application router mounted at `base_path`.
+pub fn router_with_base_path(
+    db: Database,
+    auth: AuthConfig,
+    config_dir: PathBuf,
+    lifecycle_lock_dir: PathBuf,
+    proxy_sessions_file: PathBuf,
+    interface: InterfaceSelector,
+    base_path: &str,
+) -> Result<Router, &'static str> {
+    let base_path = normalize_base_path(base_path)?;
+    Ok(build_router(
+        db,
+        auth,
+        config_dir,
+        lifecycle_lock_dir,
+        proxy_sessions_file,
+        interface,
+        base_path,
+    ))
+}
+
+fn build_router(
+    db: Database,
+    auth: AuthConfig,
+    config_dir: PathBuf,
+    lifecycle_lock_dir: PathBuf,
+    proxy_sessions_file: PathBuf,
+    interface: InterfaceSelector,
+    base_path: String,
+) -> Router {
     let state = AppState::new(
         db,
         auth,
@@ -1235,7 +1384,8 @@ pub fn router_with_lifecycle_lock_dir(
         lifecycle_lock_dir,
         proxy_sessions_file,
     )
-    .with_interface(interface);
+    .with_interface(interface)
+    .with_base_path(base_path.clone());
 
     // Protected routes – all require a valid session.
     let protected = Router::new()
@@ -1278,7 +1428,7 @@ pub fn router_with_lifecycle_lock_dir(
             with_qr_no_cache(response)
         }));
 
-    Router::new()
+    let inner = Router::new()
         // Public routes (no auth required)
         .route("/api/health", get(health))
         .route("/login", get(page_login).post(post_login))
@@ -1287,7 +1437,8 @@ pub fn router_with_lifecycle_lock_dir(
         .merge(protected)
         .merge(vpn_export)
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http());
+    mount_at_base(inner, &base_path)
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -1349,7 +1500,7 @@ async fn require_auth(
         )
             .into_response()
     } else {
-        Redirect::to("/login").into_response()
+        Redirect::to(&state.url("/login")).into_response()
     }
 }
 
@@ -1362,7 +1513,7 @@ async fn page_login(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         String::new()
     };
-    Html(render_login_page(false, &csrf))
+    Html(render_login_page(&state.base_path, false, &csrf))
 }
 
 /// `POST /login` – validate CSRF, check rate limit, then validate credentials.
@@ -1373,7 +1524,7 @@ async fn post_login(
 ) -> Response {
     // When auth is disabled, redirect straight to home.
     if !state.auth.enabled {
-        return Redirect::to("/").into_response();
+        return Redirect::to(&state.url("/")).into_response();
     }
 
     // ── Pre-login CSRF check ─────────────────────────────────────────────
@@ -1383,6 +1534,7 @@ async fn post_login(
         return (
             StatusCode::FORBIDDEN,
             Html(render_login_page_with_msg(
+                &state.base_path,
                 "Request validation failed. Please try again.",
                 &new_csrf,
             )),
@@ -1402,6 +1554,7 @@ async fn post_login(
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Html(render_login_page_with_msg(
+                &state.base_path,
                 "Too many login attempts. Please wait a few minutes and try again.",
                 &new_csrf,
             )),
@@ -1425,7 +1578,7 @@ async fn post_login(
         )
         .await;
         let new_csrf = generate_login_csrf(&state.login_csrf);
-        return Html(render_login_page(true, &new_csrf)).into_response();
+        return Html(render_login_page(&state.base_path, true, &new_csrf)).into_response();
     }
 
     // Issue a new session.
@@ -1443,17 +1596,50 @@ async fn post_login(
     )
     .await;
 
-    let cookie = make_session_cookie(
-        &session_id,
-        state.auth.secure_cookie,
-        state.auth.session_ttl,
-    );
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(
-        SET_COOKIE,
-        cookie.parse().expect("valid cookie header value"),
+    append_session_cookie(&mut resp_headers, &state, &session_id);
+    (resp_headers, Redirect::to(&state.url("/"))).into_response()
+}
+
+/// Set the scoped session cookie. A configured prefix also expires a leftover
+/// `Path=/` cookie, which the browser would still send and which logout cannot
+/// clear with only the scoped path.
+fn append_session_cookie(headers: &mut HeaderMap, state: &AppState, session_id: &str) {
+    append_cookie(
+        headers,
+        make_session_cookie(
+            session_id,
+            state.auth.secure_cookie,
+            state.auth.session_ttl,
+            session_cookie_path(&state.base_path),
+        ),
     );
-    (resp_headers, Redirect::to("/")).into_response()
+    expire_host_cookie(headers, state);
+}
+
+fn append_logout_cookies(headers: &mut HeaderMap, state: &AppState) {
+    append_cookie(
+        headers,
+        clear_session_cookie(
+            session_cookie_path(&state.base_path),
+            state.auth.secure_cookie,
+        ),
+    );
+    expire_host_cookie(headers, state);
+}
+
+fn expire_host_cookie(headers: &mut HeaderMap, state: &AppState) {
+    if state.base_path.is_empty() {
+        return;
+    }
+    append_cookie(headers, clear_session_cookie("/", state.auth.secure_cookie));
+}
+
+fn append_cookie(headers: &mut HeaderMap, value: String) {
+    headers.append(
+        SET_COOKIE,
+        value.parse().expect("valid cookie header value"),
+    );
 }
 
 /// `POST /logout` – validate session CSRF, invalidate the session, clear cookie.
@@ -1491,13 +1677,8 @@ async fn post_logout(
     .await;
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(
-        SET_COOKIE,
-        clear_session_cookie()
-            .parse()
-            .expect("valid cookie header value"),
-    );
-    (resp_headers, Redirect::to("/login")).into_response()
+    append_logout_cookies(&mut resp_headers, &state);
+    (resp_headers, Redirect::to(&state.url("/login"))).into_response()
 }
 
 // ── API Handlers ─────────────────────────────────────────────────────────────
@@ -2493,6 +2674,7 @@ async fn page_peer_list(
         },
         show_archived,
         monitoring_only.as_deref(),
+        &state.base_path,
     ))
     .into_response())
 }
@@ -2524,6 +2706,7 @@ async fn page_peer_detail(
                 &csrf,
                 &events,
                 monitoring_only.as_deref(),
+                &state.base_path,
             ))
             .into_response())
         }
@@ -2542,7 +2725,13 @@ async fn page_archived_peer_detail(
         Some(peer) if peer.archived != 0 => {
             let events = list_events(&state.db.pool, Some(id), None, 20).await?;
             let csrf = session_csrf_from_headers(&state, &headers);
-            Ok(Html(render_archived_peer_detail(&peer, &csrf, &events)).into_response())
+            Ok(Html(render_archived_peer_detail(
+                &peer,
+                &csrf,
+                &events,
+                &state.base_path,
+            ))
+            .into_response())
         }
         _ => Ok((
             StatusCode::NOT_FOUND,
@@ -2595,7 +2784,7 @@ async fn post_archive_peer_form(
             // launching another delayed removal that could race a later
             // return-and-enable action; the poller continues enforcing the
             // retained disabled key.
-            Ok(Redirect::to("/?peer_notice=peer_archived").into_response())
+            Ok(Redirect::to(&state.url("/?peer_notice=peer_archived")).into_response())
         }
         crate::db::peers::ArchivePeerOutcome::NotFound => Ok((
             StatusCode::NOT_FOUND,
@@ -2642,7 +2831,7 @@ async fn post_restore_peer_form(
 
     match crate::db::peers::restore_archived_peer(&state.db.pool, id, &state.auth.username).await? {
         crate::db::peers::RestorePeerOutcome::Restored { .. } => {
-            Ok(Redirect::to(&format!("/peers/{id}")).into_response())
+            Ok(Redirect::to(&state.url(&format!("/peers/{id}"))).into_response())
         }
         crate::db::peers::RestorePeerOutcome::NotFound => Ok((
             StatusCode::NOT_FOUND,
@@ -2719,6 +2908,7 @@ async fn post_peer_edit(
                     &events,
                     &message,
                     Some(&reason),
+                    &state.base_path,
                 )),
             )
                 .into_response());
@@ -2851,7 +3041,7 @@ async fn post_peer_edit(
     .await;
 
     // Redirect back to the detail page (PRG pattern).
-    Ok(Redirect::to(&format!("/peers/{id}")).into_response())
+    Ok(Redirect::to(&state.url(&format!("/peers/{id}"))).into_response())
 }
 
 // ── User lifecycle handlers ──────────────────────────────────────────────────
@@ -3028,7 +3218,7 @@ async fn post_imitation_change(
         tracing::error!("BoringTun imitation change failed");
         "failed"
     };
-    Ok(Redirect::to(&format!("/?imitation_notice={notice}")).into_response())
+    Ok(Redirect::to(&state.url(&format!("/?imitation_notice={notice}"))).into_response())
 }
 
 async fn post_protocol_change(
@@ -3100,7 +3290,7 @@ async fn post_protocol_change(
             PROTOCOL_NOTICE_FAILED
         }
     };
-    Ok(Redirect::to(&format!("/?protocol_notice={notice}")).into_response())
+    Ok(Redirect::to(&state.url(&format!("/?protocol_notice={notice}"))).into_response())
 }
 
 /// Remember a failed migration for the redirected page and audit it. The
@@ -3397,7 +3587,12 @@ async fn post_add_user_form(
         let message = create_user_diagnostic_message(&e);
         let status = system_status(&state);
         return Ok(Html(render_peer_list_with_error(
-            &peers, &csrf, &status, &message, None,
+            &peers,
+            &csrf,
+            &status,
+            &message,
+            None,
+            &state.base_path,
         ))
         .into_response());
     }
@@ -3424,6 +3619,7 @@ async fn post_add_user_form(
             &status,
             &reason,
             Some(&reason),
+            &state.base_path,
         ))
         .into_response());
     }
@@ -3445,7 +3641,12 @@ async fn post_add_user_form(
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             return Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, &message, None,
+                &peers,
+                &csrf,
+                &status,
+                &message,
+                None,
+                &state.base_path,
             ))
             .into_response());
         }
@@ -3458,7 +3659,12 @@ async fn post_add_user_form(
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             return Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, &message, None,
+                &peers,
+                &csrf,
+                &status,
+                &message,
+                None,
+                &state.base_path,
             ))
             .into_response());
         }
@@ -3484,8 +3690,8 @@ async fn post_add_user_form(
         Ok(result) => {
             refresh_peer_state_after_lifecycle(&state).await;
             let location = create_user_notice_code(&result)
-                .map(|notice| format!("/?create_notice={notice}"))
-                .unwrap_or_else(|| "/".to_string());
+                .map(|notice| state.url(&format!("/?create_notice={notice}")))
+                .unwrap_or_else(|| state.url("/"));
             Ok(Redirect::to(&location).into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::InvalidName(msg)) => {
@@ -3495,7 +3701,12 @@ async fn post_add_user_form(
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, &msg, None,
+                &peers,
+                &csrf,
+                &status,
+                &msg,
+                None,
+                &state.base_path,
             ))
             .into_response())
         }
@@ -3505,7 +3716,12 @@ async fn post_add_user_form(
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, msg, None,
+                &peers,
+                &csrf,
+                &status,
+                msg,
+                None,
+                &state.base_path,
             ))
             .into_response())
         }
@@ -3516,7 +3732,12 @@ async fn post_add_user_form(
             let message = format!("IP address already in use: {ip}");
             let status = system_status(&state);
             Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, &message, None,
+                &peers,
+                &csrf,
+                &status,
+                &message,
+                None,
+                &state.base_path,
             ))
             .into_response())
         }
@@ -3528,7 +3749,12 @@ async fn post_add_user_form(
                 "Another add/remove operation is already in progress; please try again later.";
             let status = system_status(&state);
             Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, message, None,
+                &peers,
+                &csrf,
+                &status,
+                message,
+                None,
+                &state.base_path,
             ))
             .into_response())
         }
@@ -3540,7 +3766,12 @@ async fn post_add_user_form(
             let message = create_user_diagnostic_message(&e);
             let status = system_status(&state);
             Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, &message, None,
+                &peers,
+                &csrf,
+                &status,
+                &message,
+                None,
+                &state.base_path,
             ))
             .into_response())
         }
@@ -3567,7 +3798,7 @@ async fn post_remove_user_form(
 
     // Require explicit confirmation.
     if form.confirm.as_deref() != Some("yes") {
-        return Ok(Redirect::to(&format!("/peers/{id}")).into_response());
+        return Ok(Redirect::to(&state.url(&format!("/peers/{id}"))).into_response());
     }
 
     let peer = match crate::db::peers::find_visible_by_id(&state.db.pool, id).await? {
@@ -3584,7 +3815,7 @@ async fn post_remove_user_form(
     let client_name = match managed_client_name_for_lifecycle(&peer) {
         Some(name) => name.to_string(),
         _ => {
-            return Ok(Redirect::to(&format!("/peers/{id}")).into_response());
+            return Ok(Redirect::to(&state.url(&format!("/peers/{id}"))).into_response());
         }
     };
 
@@ -3604,6 +3835,7 @@ async fn post_remove_user_form(
                 &events,
                 &message,
                 Some(&reason),
+                &state.base_path,
             )),
         )
             .into_response());
@@ -3618,7 +3850,12 @@ async fn post_remove_user_form(
         let csrf = session_csrf_from_headers(&state, &headers);
         let message = format!("Remove failed: peer is not managed by installer: {e}");
         return Ok(Html(render_peer_detail_with_error(
-            &dto, &csrf, &events, &message, None,
+            &dto,
+            &csrf,
+            &events,
+            &message,
+            None,
+            &state.base_path,
         ))
         .into_response());
     }
@@ -3635,7 +3872,7 @@ async fn post_remove_user_form(
     {
         Ok(()) => {
             refresh_peer_state_after_lifecycle(&state).await;
-            Ok(Redirect::to("/").into_response())
+            Ok(Redirect::to(&state.url("/")).into_response())
         }
         Err(e) => {
             let message: &str = match &e {
@@ -3651,7 +3888,7 @@ async fn post_remove_user_form(
             let peer_row = match crate::db::peers::find_visible_by_id(&state.db.pool, id).await? {
                 Some(p) => p,
                 None => {
-                    return Ok(Redirect::to("/").into_response());
+                    return Ok(Redirect::to(&state.url("/")).into_response());
                 }
             };
             let public_key = peer_row.public_key.clone();
@@ -3662,7 +3899,12 @@ async fn post_remove_user_form(
             annotate_peer_detail_with_proxy_remote(&mut dto, &proxy_sessions_status(&state).await);
             let csrf = session_csrf_from_headers(&state, &headers);
             Ok(Html(render_peer_detail_with_error(
-                &dto, &csrf, &events, message, None,
+                &dto,
+                &csrf,
+                &events,
+                message,
+                None,
+                &state.base_path,
             ))
             .into_response())
         }
@@ -4118,7 +4360,7 @@ fn render_system_status(status: &SystemStatusDto) -> String {
     )
 }
 
-fn render_proxy_sessions(status: &ProxySessionsDto) -> String {
+fn render_proxy_sessions(base: &str, status: &ProxySessionsDto) -> String {
     if !status.available && status.error.is_none() {
         return String::new();
     }
@@ -4161,7 +4403,7 @@ fn render_proxy_sessions(status: &ProxySessionsDto) -> String {
     buf.push_str(&format!(
         "<p class=\"meta\">{} session(s) &nbsp;·&nbsp; listen: <code>{}</code> \
          &nbsp;·&nbsp; target: <code>{}</code> &nbsp;·&nbsp; protocol: {} \
-         &nbsp;·&nbsp; updated: {}{} &nbsp;·&nbsp; <a href=\"/api/proxy/sessions\">JSON API</a></p>\n",
+         &nbsp;·&nbsp; updated: {}{} &nbsp;·&nbsp; <a href=\"{base}/api/proxy/sessions\">JSON API</a></p>\n",
         status.sessions.len(),
         listen,
         target,
@@ -4181,7 +4423,10 @@ fn render_proxy_sessions(status: &ProxySessionsDto) -> String {
         for session in &status.sessions {
             let user = match (session.peer_id, session.peer_name.as_deref()) {
                 (Some(id), Some(name)) => {
-                    format!(r#"<a href="/peers/{id}">{name}</a>"#, name = esc(name))
+                    format!(
+                        r#"<a href="{base}/peers/{id}">{name}</a>"#,
+                        name = esc(name)
+                    )
                 }
                 (None, Some(name)) => esc(name),
                 _ => "–".to_string(),
@@ -4295,14 +4540,14 @@ fn html_head(title: &str) -> String {
 /// Render the top navigation bar with a logout button.
 ///
 /// `csrf_token` is embedded as a hidden field in the logout form.
-fn nav_bar(csrf_token: &str) -> String {
+fn nav_bar(base: &str, csrf_token: &str) -> String {
     format!(
         r#"<nav class="nav">
   <div class="nav-brand">
-    <a class="nav-title" href="/">AmneziaWG Server Tools</a>
+    <a class="nav-title" href="{base}/">AmneziaWG Server Tools</a>
     <span class="nav-byline">by <a href="https://www.wiresock.net/" target="_blank" rel="noopener noreferrer" aria-label="WireSock website (opens in a new tab)">WireSock <span aria-hidden="true">↗</span></a></span>
   </div>
-  <form class="nav-logout" method="POST" action="/logout">
+  <form class="nav-logout" method="POST" action="{base}/logout">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <button type="submit">Log out</button>
   </form>
@@ -4313,7 +4558,7 @@ fn nav_bar(csrf_token: &str) -> String {
   var el = document.getElementById('system-versions');
   if (!el || !window.fetch) return;
 
-  fetch('/api/system/versions', {{ credentials: 'same-origin' }})
+  fetch('{base}/api/system/versions', {{ credentials: 'same-origin' }})
     .then(function(response) {{
       if (!response.ok) throw new Error('version request failed');
       return response.json();
@@ -4337,27 +4582,27 @@ fn nav_bar(csrf_token: &str) -> String {
 ///
 /// `show_error`: when `true`, a generic "invalid credentials" message is shown.
 /// `csrf_token`: the pre-login CSRF token to embed in the form.
-fn render_login_page(show_error: bool, csrf_token: &str) -> String {
+fn render_login_page(base: &str, show_error: bool, csrf_token: &str) -> String {
     let error_html = if show_error {
         "  <p class=\"error\">Invalid username or password.</p>\n"
     } else {
         ""
     };
-    render_login_page_inner(error_html, csrf_token)
+    render_login_page_inner(base, error_html, csrf_token)
 }
 
 /// Render the login page with a custom message string.
-fn render_login_page_with_msg(msg: &str, csrf_token: &str) -> String {
+fn render_login_page_with_msg(base: &str, msg: &str, csrf_token: &str) -> String {
     let error_html = format!("  <p class=\"error\">{}</p>\n", esc(msg));
-    render_login_page_inner(&error_html, csrf_token)
+    render_login_page_inner(base, &error_html, csrf_token)
 }
 
-fn render_login_page_inner(error_html: &str, csrf_token: &str) -> String {
+fn render_login_page_inner(base: &str, error_html: &str, csrf_token: &str) -> String {
     let mut buf = html_head("AmneziaWG – Login");
     buf.push_str(&format!(
         r#"<div class="edit-form" style="max-width:340px;margin:4rem auto">
 <h2>AmneziaWG Login</h2>
-<form method="POST" action="/login">
+<form method="POST" action="{base}/login">
   <input type="hidden" name="csrf_token" value="{csrf}">
   <label for="username">Username</label>
   <input type="text" id="username" name="username" autocomplete="username" required>
@@ -4416,6 +4661,7 @@ fn render_expiration_cell(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_peer_list(
     peers: &[PeerSummaryDto],
     csrf_token: &str,
@@ -4424,6 +4670,7 @@ fn render_peer_list(
     notice: PageNotice<'_>,
     show_archived: bool,
     monitoring_only: Option<&str>,
+    base: &str,
 ) -> String {
     render_peer_list_inner(
         peers,
@@ -4434,6 +4681,7 @@ fn render_peer_list(
         None,
         show_archived,
         monitoring_only,
+        base,
     )
 }
 
@@ -4443,6 +4691,7 @@ fn render_peer_list_with_error(
     system_status: &SystemStatusDto,
     error: &str,
     monitoring_only: Option<&str>,
+    base: &str,
 ) -> String {
     render_peer_list_inner(
         peers,
@@ -4453,6 +4702,7 @@ fn render_peer_list_with_error(
         Some(error),
         false,
         monitoring_only,
+        base,
     )
 }
 
@@ -4496,18 +4746,23 @@ fn render_protocol_failure(failure: &ProtocolFailure) -> String {
     buf
 }
 
-fn render_imitation_controls(csrf_token: &str) -> String {
-    include_str!("imitation.html").replace("{{csrf}}", &esc(csrf_token))
+fn render_imitation_controls(base: &str, csrf_token: &str) -> String {
+    with_js_base(
+        &include_str!("imitation.html")
+            .replace("{{csrf}}", &esc(csrf_token))
+            .replace("{{base}}", base),
+        base,
+    )
 }
 
-fn render_protocol_controls(csrf_token: &str) -> String {
+fn render_protocol_controls(base: &str, csrf_token: &str) -> String {
     format!(
         r#"<details class="edit-form protocol-panel">
 <summary>AWG protocol</summary>
 <p id="protocol-current" class="meta" role="status">Current mode: loading…</p>
 <section id="protocol-enable-awg31">
   <p class="creation-warning"><strong>AWG 3.1 requires compatible client software.</strong> The server checks backend support, then updates the interface and every recoverable client config together. Redistribute the regenerated configurations before clients reconnect.</p>
-  <form method="POST" action="/admin/protocol/enable-awg31">
+  <form method="POST" action="{base}/admin/protocol/enable-awg31">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
     <button type="submit">Enable AWG 3.1</button>
@@ -4515,7 +4770,7 @@ fn render_protocol_controls(csrf_token: &str) -> String {
 </section>
 <section id="protocol-disable-awg3">
   <p>Downgrade the interface and all recoverable client configs to AWG 2.0. AWG 3.x-only fields and the shared header-protection key are removed.</p>
-  <form method="POST" action="/admin/protocol/disable-awg3">
+  <form method="POST" action="{base}/admin/protocol/disable-awg3">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
     <button type="submit">Return to AWG 2.0</button>
@@ -4527,7 +4782,7 @@ fn render_protocol_controls(csrf_token: &str) -> String {
   var current = document.getElementById('protocol-current');
   var enable31 = document.getElementById('protocol-enable-awg31');
   var disable = document.getElementById('protocol-disable-awg3');
-  fetch('/api/admin/protocol', {{ credentials: 'same-origin' }})
+  fetch('{base}/api/admin/protocol', {{ credentials: 'same-origin' }})
     .then(function(response) {{
       if (!response.ok) throw new Error('status unavailable');
       return response.json();
@@ -4560,21 +4815,22 @@ fn render_peer_list_inner(
     error: Option<&str>,
     show_archived: bool,
     monitoring_only: Option<&str>,
+    base: &str,
 ) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
     let now = Utc::now();
-    buf.push_str(&nav_bar(csrf_token));
+    buf.push_str(&nav_bar(base, csrf_token));
     buf.push_str("<h1>Peers</h1>\n");
     buf.push_str(&render_system_status(system_status));
     let archive_toggle = if show_archived {
-        r#"<a href="/">Hide archived keys</a>"#
+        format!(r#"<a href="{base}/">Hide archived keys</a>"#)
     } else {
-        r#"<a href="/?show_archived=true">Show archived keys</a>"#
+        format!(r#"<a href="{base}/?show_archived=true">Show archived keys</a>"#)
     };
     let api_href = if show_archived {
-        "/api/peers?include_archived=true"
+        format!("{base}/api/peers?include_archived=true")
     } else {
-        "/api/peers"
+        format!("{base}/api/peers")
     };
     buf.push_str(&format!(
         "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"{api_href}\">JSON API</a>\
@@ -4597,8 +4853,8 @@ fn render_peer_list_inner(
             buf.push_str(&format!("<p class=\"error\">{}</p>\n", esc(err)));
         }
     } else {
-        buf.push_str(&render_protocol_controls(csrf_token));
-        buf.push_str(&render_imitation_controls(csrf_token));
+        buf.push_str(&render_protocol_controls(base, csrf_token));
+        buf.push_str(&render_imitation_controls(base, csrf_token));
     }
 
     if peers.is_empty() {
@@ -4612,9 +4868,9 @@ fn render_peer_list_inner(
         );
         for p in peers {
             let detail_href = if p.archived {
-                format!("/archived/peers/{}", p.id)
+                format!("{base}/archived/peers/{}", p.id)
             } else {
-                format!("/peers/{}", p.id)
+                format!("{base}/peers/{}", p.id)
             };
             let archived_note = if p.archived {
                 r#" <span class="warning">archived</span>"#
@@ -4651,7 +4907,7 @@ fn render_peer_list_inner(
     }
 
     if let Some(proxy_sessions) = proxy_sessions {
-        buf.push_str(&render_proxy_sessions(proxy_sessions));
+        buf.push_str(&render_proxy_sessions(base, proxy_sessions));
     }
 
     if monitoring_only.is_some() {
@@ -4668,7 +4924,7 @@ fn render_peer_list_inner(
         r#"<details class="edit-form add-user-panel"{open}>
 <summary>Add user</summary>
 {error}
-<form method="POST" action="/admin/users/add">
+<form method="POST" action="{base}/admin/users/add">
   <input type="hidden" name="csrf_token" value="{csrf}">
   <label for="add_user_name">Client name</label>
   <input type="text" id="add_user_name" name="name" required
@@ -4716,7 +4972,7 @@ fn render_peer_list_inner(
     if (nextIpsRequested) return;
     nextIpsRequested = true;
 
-    fetch('/api/admin/next-ips', {{ credentials: 'same-origin' }})
+    fetch('{base}/api/admin/next-ips', {{ credentials: 'same-origin' }})
       .then(function(response) {{
         if (!response.ok) throw new Error('Failed to fetch next IPs');
         return response.json();
@@ -4753,15 +5009,16 @@ fn render_archived_peer_detail(
     peer: &PeerRow,
     csrf_token: &str,
     events: &[crate::db::events::EventRow],
+    base: &str,
 ) -> String {
     let mut buf = html_head("Archived disabled key");
-    buf.push_str(&nav_bar(csrf_token));
-    buf.push_str(
-        "<a class=\"back\" href=\"/?show_archived=true\">&larr; All peers</a>\n\
+    buf.push_str(&nav_bar(base, csrf_token));
+    buf.push_str(&format!(
+        "<a class=\"back\" href=\"{base}/?show_archived=true\">&larr; All peers</a>\n\
          <h1>Archived disabled key</h1>\n\
          <p class=\"creation-warning\" role=\"status\">The saved peer metadata and traffic history were deleted. \
          The disabled public key remains so the web service can continue removing it from the running interface.</p>\n",
-    );
+    ));
     buf.push_str(&format!(
         "<table>\n\
          <tr><th>Public key</th><td><code>{}</code></td></tr>\n\
@@ -4777,7 +5034,7 @@ fn render_archived_peer_detail(
         r#"<div class="edit-form">
 <h2>Return key to peer list</h2>
 <p>This creates a blank, still-disabled row in the normal peer list. Deleted data and traffic history are not restored.</p>
-<form method="POST" action="/admin/peers/{id}/restore">
+<form method="POST" action="{base}/admin/peers/{id}/restore">
   <input type="hidden" name="csrf_token" value="{csrf}">
   <button type="submit">Return key to peer list</button>
 </form>
@@ -4817,8 +5074,9 @@ fn render_peer_detail(
     csrf_token: &str,
     events: &[crate::db::events::EventRow],
     monitoring_only: Option<&str>,
+    base: &str,
 ) -> String {
-    render_peer_detail_inner(dto, csrf_token, events, None, monitoring_only)
+    render_peer_detail_inner(dto, csrf_token, events, None, monitoring_only, base)
 }
 
 fn render_peer_detail_with_error(
@@ -4827,8 +5085,9 @@ fn render_peer_detail_with_error(
     events: &[crate::db::events::EventRow],
     error: &str,
     monitoring_only: Option<&str>,
+    base: &str,
 ) -> String {
-    render_peer_detail_inner(dto, csrf_token, events, Some(error), monitoring_only)
+    render_peer_detail_inner(dto, csrf_token, events, Some(error), monitoring_only, base)
 }
 
 fn render_peer_detail_inner(
@@ -4837,10 +5096,11 @@ fn render_peer_detail_inner(
     events: &[crate::db::events::EventRow],
     error: Option<&str>,
     monitoring_only: Option<&str>,
+    base: &str,
 ) -> String {
     let mut buf = html_head(&format!("Peer – {}", dto.name));
     let now = Utc::now();
-    buf.push_str(&nav_bar(csrf_token));
+    buf.push_str(&nav_bar(base, csrf_token));
     if let Some(err) = error {
         buf.push_str(&format!("<p class=\"error\">{}</p>\n", esc(err)));
     }
@@ -4848,7 +5108,7 @@ fn render_peer_detail_inner(
         buf.push_str(&render_monitoring_only_banner(reason));
     }
     buf.push_str(&format!(
-        "<a class=\"back\" href=\"/\">&larr; All peers</a>\n\
+        "<a class=\"back\" href=\"{base}/\">&larr; All peers</a>\n\
          <h1>{name}</h1>\n",
         name = esc(&dto.name)
     ));
@@ -4908,7 +5168,7 @@ fn render_peer_detail_inner(
     if dto.has_config {
         buf.push_str(&format!(
             "<tr><th>Config</th><td>\
-             <a href=\"/api/peers/{id}/config\">&#x2B73; Download</a>\
+             <a href=\"{base}/api/peers/{id}/config\">&#x2B73; Download</a>\
              &nbsp; | &nbsp;\
              <button type=\"button\" class=\"qr-link\" onclick=\"showQr({id})\">&#x25A3; QR Code</button>\
              &nbsp; | &nbsp;\
@@ -4935,7 +5195,7 @@ fn render_peer_detail_inner(
     buf.push_str("</table>\n");
 
     if dto.has_config {
-        buf.push_str(include_str!("vpn_uri.html"));
+        buf.push_str(&with_js_base(include_str!("vpn_uri.html"), base));
     }
 
     // Edit form.  Expiration and enable/disable act on the interface and the
@@ -4975,7 +5235,7 @@ fn render_peer_detail_inner(
     buf.push_str(&format!(
         r#"<div class="edit-form">
 <h2>Edit peer</h2>
-<form method="POST" action="/peers/{id}">
+<form method="POST" action="{base}/peers/{id}">
   <input type="hidden" name="csrf_token" value="{csrf}">
   <label for="display_name">Display name</label>
   <input type="text" id="display_name" name="display_name"
@@ -5004,7 +5264,7 @@ fn render_peer_detail_inner(
 <p>This removes the peer from the normal list and permanently deletes its saved name, comment, endpoint, counters, and traffic history from the panel database.
 AmneziaWG configuration files are not changed. The panel keeps a minimal disabled-key record, including the public key and record timestamps, so the web service can continue blocking it and removing it from the running interface.
 Audit-log entries are retained and may still contain earlier values.</p>
-<form method="POST" action="/admin/peers/{id}/archive">
+<form method="POST" action="{base}/admin/peers/{id}/archive">
   <input type="hidden" name="csrf_token" value="{csrf}">
   <label for="confirm_forget" style="display:flex;align-items:center;gap:.4rem;margin-top:.5rem">
     <input type="checkbox" id="confirm_forget" name="confirm" value="yes" required>
@@ -5031,7 +5291,7 @@ Audit-log entries are retained and may still contain earlier values.</p>
 <h2 style="color:#c00">Remove user</h2>
 <p>This will permanently revoke the client <strong>{name}</strong> and delete its config file.
 Historical data (snapshots, events) will be preserved.</p>
-<form method="POST" action="/admin/users/{id}/remove">
+<form method="POST" action="{base}/admin/users/{id}/remove">
   <input type="hidden" name="csrf_token" value="{csrf}">
   <label for="confirm_remove" style="display:flex;align-items:center;gap:.4rem;margin-top:.5rem">
     <input type="checkbox" id="confirm_remove" name="confirm" value="yes" required>
@@ -5063,7 +5323,7 @@ Historical data (snapshots, events) will be preserved.</p>
             "<tr><td>{label}</td>\
              <td id=\"usage-rx-{param}\">…</td>\
              <td id=\"usage-tx-{param}\">…</td>\
-             <td><a href=\"/api/peers/{id}/usage?period={param}\">JSON</a></td></tr>\n",
+             <td><a href=\"{base}/api/peers/{id}/usage?period={param}\">JSON</a></td></tr>\n",
             id = dto.id,
         ));
     }
@@ -5079,7 +5339,7 @@ Historical data (snapshots, events) will be preserved.</p>
     if(b<G) return (Number(b*BigInt(10)/M)/10).toFixed(1)+' MiB';
     return (Number(b*BigInt(100)/G)/100).toFixed(2)+' GiB';
   }}
-  fetch('/api/peers/{id}/usage/summary',{{credentials:'same-origin'}})
+  fetch('{base}/api/peers/{id}/usage/summary',{{credentials:'same-origin'}})
     .then(function(r){{
       if(!r.ok) throw new Error('HTTP '+r.status);
       return r.json();
@@ -5135,7 +5395,7 @@ Historical data (snapshots, events) will be preserved.</p>
     }
 
     buf.push_str(&format!(
-        "<p class=\"meta\"><a href=\"/api/peers/{id}/history\">JSON history (24h)</a></p>\n",
+        "<p class=\"meta\"><a href=\"{base}/api/peers/{id}/history\">JSON history (24h)</a></p>\n",
         id = dto.id
     ));
 
@@ -5167,7 +5427,7 @@ Historical data (snapshots, events) will be preserved.</p>
 
     // QR code modal overlay (only when config exists)
     if dto.has_config {
-        buf.push_str(
+        buf.push_str(&with_js_base(
             r#"<div id="qr-overlay" class="qr-modal-overlay" onclick="hideQr(event)">
   <div class="qr-modal" role="dialog" aria-modal="true" aria-labelledby="qr-title">
     <button type="button" class="qr-modal-close" onclick="event.stopPropagation(); hideQr(event)" aria-label="Close">&times;</button>
@@ -5176,6 +5436,7 @@ Historical data (snapshots, events) will be preserved.</p>
   </div>
 </div>
 <script>
+var AWG_WEB_BASE='';
 var _qrTrigger=null;
 function showQr(peerId){
   _qrTrigger=document.activeElement;
@@ -5201,7 +5462,7 @@ function showQr(peerId){
     p.textContent='Failed to load QR code';
     content.appendChild(p);
   };
-  img.src='/api/peers/'+peerId+'/qr';
+  img.src=AWG_WEB_BASE+'/api/peers/'+peerId+'/qr';
 }
 function _closeQrModal(){
   document.getElementById('qr-overlay').classList.remove('active');
@@ -5227,7 +5488,8 @@ document.addEventListener('keydown',function(e){
 });
 </script>
 "#,
-        );
+            base,
+        ));
     }
 
     buf.push_str("</body></html>");
@@ -5707,7 +5969,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Extract the session cookie value from a `Set-Cookie` header.
+    /// Extract the session cookie value from the first `Set-Cookie` header.
     fn session_cookie_value(response: &axum::response::Response) -> String {
         response
             .headers()
@@ -5720,6 +5982,22 @@ mod tests {
             .unwrap()
             .trim()
             .to_string()
+    }
+
+    fn set_cookie_values(response: &axum::response::Response) -> Vec<String> {
+        response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn cookie_path(cookie: &str) -> Option<&str> {
+        cookie
+            .split(';')
+            .map(str::trim)
+            .find_map(|part| part.strip_prefix("Path="))
     }
 
     /// Insert a minimal peer row for testing and return its rowid.
@@ -6575,7 +6853,7 @@ mod tests {
 
     #[test]
     fn nav_bar_does_not_guess_proxy_while_loading() {
-        let html = nav_bar("test-csrf");
+        let html = nav_bar("", "test-csrf");
         assert!(html.contains("Protocol: checking"));
         assert!(!html.contains("Proxy: checking"));
         assert!(!html.contains("Proxy: unknown"));
@@ -7267,7 +7545,7 @@ mod tests {
 
     #[test]
     fn login_page_renders_form() {
-        let html = render_login_page(false, "test_csrf_token");
+        let html = render_login_page("", false, "test_csrf_token");
         assert!(html.contains(r#"action="/login""#));
         assert!(html.contains(r#"name="username""#));
         assert!(html.contains(r#"name="password""#));
@@ -7277,13 +7555,13 @@ mod tests {
 
     #[test]
     fn login_page_shows_error() {
-        let html = render_login_page(true, "tok");
+        let html = render_login_page("", true, "tok");
         assert!(html.contains("Invalid username or password"));
     }
 
     #[test]
     fn login_page_embeds_csrf_token() {
-        let html = render_login_page(false, "mytoken123");
+        let html = render_login_page("", false, "mytoken123");
         assert!(html.contains("name=\"csrf_token\" value=\"mytoken123\""));
     }
 
@@ -9140,13 +9418,15 @@ mod tests {
 
     #[test]
     fn imitation_controls_offer_auto_without_a_hostname() {
-        let html = render_imitation_controls("token");
+        let html = render_imitation_controls("", "token");
         assert!(html.contains("<option value=\"auto\" id=\"imitation-mode-auto\" disabled>"));
         assert!(html.contains("authenticated"));
         assert!(html.contains("does not detect"));
         assert!(html.contains("Auto is best effort"));
         assert!(html.contains("is tried as AWG traffic first"));
-        assert!(html.contains("learns from it only when every such reading is refused without establishing anything"));
+        assert!(html.contains(
+            "learns from it only when every such reading is refused without establishing anything"
+        ));
         assert!(html.contains("the earlier Auto release (b94943906b11) never does"));
         assert!(html.contains("do not show that a client is imitated"));
     }
@@ -9241,7 +9521,7 @@ mod tests {
 
     #[test]
     fn imitation_controls_escape_csrf_and_start_disabled() {
-        let html = render_imitation_controls("test\"<token>");
+        let html = render_imitation_controls("", "test\"<token>");
         assert!(html.contains("test&quot;&lt;token&gt;"));
         assert!(html.contains("id=\"imitation-fields\" disabled"));
         assert!(html.contains("name=\"confirm\" value=\"yes\" required"));
@@ -9251,7 +9531,7 @@ mod tests {
 
     #[test]
     fn protocol_controls_require_confirmation_and_never_render_key_state() {
-        let html = render_protocol_controls("protocol-csrf");
+        let html = render_protocol_controls("", "protocol-csrf");
         assert!(!html.contains("/admin/protocol/enable-awg3\""));
         assert!(html.contains("/admin/protocol/enable-awg31"));
         assert!(html.contains("/admin/protocol/disable-awg3"));
@@ -11067,5 +11347,294 @@ mod tests {
             StatusCode::NOT_FOUND,
             "symlinked config file must be rejected for QR endpoint"
         );
+    }
+
+    fn test_interface() -> InterfaceSelector {
+        InterfaceSelector::from_params().with_params_reader(|| {
+            Ok(crate::managed_interface::test_params("awg0")
+                .replace("SERVER_PUB_KEY='PUB'", "SERVER_PUB_KEY='SERVER_KEY='"))
+        })
+    }
+
+    fn test_router_at(db: Database, base_path: &str) -> Router {
+        router_with_base_path(
+            db,
+            AuthConfig::disabled(),
+            PathBuf::from("/tmp/test-configs"),
+            PathBuf::from("/tmp/test-configs"),
+            missing_proxy_sessions_file(),
+            test_interface(),
+            base_path,
+        )
+        .expect("base path")
+    }
+
+    fn test_auth_router_at(db: Database, base_path: &str) -> Router {
+        let auth = AuthConfig {
+            enabled: true,
+            username: "admin".to_string(),
+            password_hash: AuthConfig::hash_password_fast("testpassword"),
+            api_token: Some("super-secret-token".to_string()),
+            secure_cookie: false,
+            session_ttl: std::time::Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
+        };
+        router_with_base_path(
+            db,
+            auth,
+            PathBuf::from("/tmp/test-configs"),
+            PathBuf::from("/tmp/test-configs"),
+            missing_proxy_sessions_file(),
+            test_interface(),
+            base_path,
+        )
+        .expect("base path")
+    }
+
+    #[test]
+    fn normalize_base_path_accepts_root_and_prefixes() {
+        assert_eq!(normalize_base_path("").unwrap(), "");
+        assert_eq!(normalize_base_path("  /  ").unwrap(), "");
+        assert_eq!(normalize_base_path("/").unwrap(), "");
+        assert_eq!(
+            normalize_base_path("/321abrakadabra123").unwrap(),
+            "/321abrakadabra123"
+        );
+        assert_eq!(
+            normalize_base_path("/panel/secret").unwrap(),
+            "/panel/secret"
+        );
+        assert_eq!(normalize_base_path("/a.b_c-d~e").unwrap(), "/a.b_c-d~e");
+    }
+
+    #[test]
+    fn normalize_base_path_rejects_unsafe_values() {
+        for raw in [
+            "panel",
+            "/panel/",
+            "//panel",
+            "/panel//secret",
+            "/../etc",
+            "/./panel",
+            "/panel/..",
+            "/panel?x=1",
+            "/panel#secret",
+            "/panel secret",
+            "/%2Fpanel",
+            "/панель",
+            &format!("/{}", "a".repeat(MAX_BASE_PATH_LEN)),
+        ] {
+            assert!(normalize_base_path(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn base_path_hides_root_and_prefixes_links() {
+        let app = test_router_at(test_db().await, "/panel");
+
+        for path in ["/", "/login", "/api/health", "/api/peers"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        let slash = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/panel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(slash.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(slash.headers().get("location").unwrap(), "/panel/");
+
+        let with_query = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/panel?show_archived=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(with_query.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            with_query.headers().get("location").unwrap(),
+            "/panel/?show_archived=true"
+        );
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/panel/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let page = app
+            .oneshot(
+                Request::builder()
+                    .uri("/panel/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            axum::body::to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("fetch('/panel/api/system/versions'"));
+        assert!(html.contains("action=\"/panel/logout\""));
+        assert!(html.contains("href=\"/panel/\""));
+        assert!(html.contains("action=\"/panel/admin/users/add\""));
+        assert!(!html.contains("fetch('/api/system/versions'"));
+    }
+
+    #[tokio::test]
+    async fn base_path_scopes_login_redirects_and_cookie() {
+        let app = test_auth_router_at(test_db().await, "/panel");
+
+        let api = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/panel/api/peers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+
+        let page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/panel/peers/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::SEE_OTHER);
+        assert_eq!(page.headers().get("location").unwrap(), "/panel/login");
+
+        let login_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/panel/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let login_html = String::from_utf8(
+            axum::body::to_bytes(login_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(login_html.contains("action=\"/panel/login\""));
+        let csrf = extract_hidden_csrf(&login_html);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/panel/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "username=admin&password=testpassword&csrf_token={csrf}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        assert_eq!(login.headers().get("location").unwrap(), "/panel/");
+        let login_cookies = set_cookie_values(&login);
+        assert!(login_cookies.iter().any(|cookie| {
+            cookie.contains("awg_session=")
+                && !cookie.contains("Max-Age=0")
+                && cookie_path(cookie) == Some("/panel")
+        }));
+        assert!(login_cookies
+            .iter()
+            .any(|cookie| { cookie.contains("Max-Age=0") && cookie_path(cookie) == Some("/") }));
+        let session = session_cookie_value(&login);
+
+        let home = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/panel/")
+                    .header("cookie", &session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let home_html = String::from_utf8(
+            axum::body::to_bytes(home.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let logout_csrf = extract_hidden_csrf(&home_html);
+        let logout = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/panel/logout")
+                    .header("cookie", &session)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf_token={logout_csrf}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+        assert_eq!(logout.headers().get("location").unwrap(), "/panel/login");
+        let logout_cookies = set_cookie_values(&logout);
+        assert!(logout_cookies.iter().any(|cookie| {
+            cookie.contains("Max-Age=0") && cookie_path(cookie) == Some("/panel")
+        }));
+        assert!(logout_cookies
+            .iter()
+            .any(|cookie| cookie.contains("Max-Age=0") && cookie_path(cookie) == Some("/")));
+    }
+
+    #[tokio::test]
+    async fn router_with_base_path_rejects_relative_prefix() {
+        let err = router_with_base_path(
+            test_db().await,
+            AuthConfig::disabled(),
+            PathBuf::from("/tmp/test-configs"),
+            PathBuf::from("/tmp/test-configs"),
+            missing_proxy_sessions_file(),
+            test_interface(),
+            "panel",
+        )
+        .expect_err("relative prefix");
+        assert_eq!(err, "AWG_WEB_BASE_PATH must start with '/'");
     }
 }

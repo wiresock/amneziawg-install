@@ -259,6 +259,8 @@ AUTH_SECURE_COOKIE=true
 
 # Server
 AWG_WEB_LISTEN=127.0.0.1:8080
+# Optional. Example: /321abrakadabra123
+# AWG_WEB_BASE_PATH=
 AWG_WEB_DB=/var/lib/amneziawg-web/awg-web.db
 AWG_CONFIG_DIR=/etc/amnezia/amneziawg/clients
 AWG_POLL_INTERVAL=30
@@ -367,6 +369,17 @@ awg.example.com {
 
 After adding a reverse proxy, set `AUTH_SECURE_COOKIE=true` in your environment file and restart the service.
 
+To serve the panel under a path on an existing site, set `AWG_WEB_BASE_PATH`
+to that path without a trailing slash, for example `/321abrakadabra123`.
+Match both the exact path and the slash prefix
+(`location = /321abrakadabra123` and `location ^~ /321abrakadabra123/`).
+Each uses `proxy_pass http://127.0.0.1:8080;` with no URI path, so nginx
+forwards the prefix unchanged and the panel can redirect the bare path to
+`/321abrakadabra123/`. The local probe is
+`http://127.0.0.1:8080/321abrakadabra123/api/health`. The path hides the
+panel; leave `AUTH_ENABLED=true`. See `docs/DEPLOYMENT.md` for the full
+snippet.
+
 ---
 
 ## 10. Docker (optional)
@@ -400,6 +413,7 @@ docker run -d \
 | Variable | Default | Description |
 |---|---|---|
 | `AWG_WEB_LISTEN` | `0.0.0.0:8080` | TCP bind address |
+| `AWG_WEB_BASE_PATH` | *(empty)* | Public URL prefix, such as `/321abrakadabra123`. Empty serves the panel at `/`. nginx must forward the prefix unchanged. |
 | `AWG_WEB_DB` | `awg-web.db` | SQLite database path |
 | `AWG_CONFIG_DIR` | `/etc/amnezia/amneziawg/clients` | Client `.conf` directory |
 | `AWG_POLL_INTERVAL` | `30` | Poll interval in seconds |

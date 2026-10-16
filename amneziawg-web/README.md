@@ -248,6 +248,7 @@ All settings are read from environment variables (or a `.env`-style file via sys
 | Variable | Default | Description |
 |---|---|---|
 | `AWG_WEB_LISTEN` | `0.0.0.0:8080` | TCP bind address |
+| `AWG_WEB_BASE_PATH` | *(empty)* | Public URL prefix, for example `/321abrakadabra123`. Empty serves the panel at `/`. nginx must forward the prefix unchanged. The prefix is not a substitute for `AUTH_ENABLED`. |
 | `AWG_WEB_DB` | `awg-web.db` | Path to SQLite database file (created automatically) |
 | `AWG_CONFIG_DIR` | `/etc/amnezia/amneziawg/clients` | Directory of client `.conf` files |
 | `AWG_POLL_INTERVAL` | `30` | Polling interval in seconds |
