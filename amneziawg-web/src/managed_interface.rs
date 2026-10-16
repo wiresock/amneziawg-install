@@ -294,6 +294,9 @@ impl InterfaceSelector {
             .observed
             .as_ref()
             .map(|iface| &iface.public_key.0)
+            // BoringTun does not expose its private key, so awg can report
+            // "(none)" here. Only a usable live key overrides installer identity.
+            .filter(|key| !key.is_empty() && key.as_str() != "(none)")
             .or_else(|| {
                 resolved
                     .mode
@@ -572,6 +575,73 @@ mod tests {
             .expect("off-thread resolution");
         assert_eq!(off_thread, first);
         assert_eq!(selector.current_mode().await.expect("cached"), first);
+    }
+
+    #[tokio::test]
+    async fn config_scope_uses_installer_key_when_managed_dump_omits_public_key() {
+        for unavailable in ["(none)", ""] {
+            let selector =
+                InterfaceSelector::from_params().with_params_reader(|| Ok(test_params("awg0")));
+            selector.resolve_mode().expect("managed interface");
+            let mut observed = iface("awg0", &["CLIENT="]);
+            observed.public_key = PublicKey(unavailable.into());
+            selector.observe_interfaces(&[observed]);
+
+            let scope = selector
+                .config_scope()
+                .await
+                .expect("scope lookup")
+                .expect("managed BoringTun interface must retain its installer identity");
+            assert_eq!(scope.server_public_key, "PUB");
+            let config = crate::config_store::ClientConfig::from_content(
+                "/clients/awg0-client-alice.conf".into(),
+                "[Interface]\nAddress = 10.66.66.2/32\n[Peer]\nPublicKey = PUB\n",
+            );
+            assert!(
+                config.belongs_to(&scope),
+                "{unavailable}: own client stays linked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_scope_does_not_lend_installer_key_to_unidentified_monitored_interface() {
+        for unavailable in ["(none)", ""] {
+            let selector = InterfaceSelector::from_override(Some("awg1"))
+                .expect("valid override")
+                .with_params_reader(|| Ok(test_params("awg0")));
+            selector.resolve_mode().expect("monitoring interface");
+            let mut observed = iface("awg1", &["FOREIGN="]);
+            observed.public_key = PublicKey(unavailable.into());
+            selector.observe_interfaces(&[observed]);
+            assert!(selector
+                .config_scope()
+                .await
+                .expect("scope lookup")
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn config_scope_prefers_observed_key_over_installer_key() {
+        let selector =
+            InterfaceSelector::from_params().with_params_reader(|| Ok(test_params("awg0")));
+        selector.resolve_mode().expect("managed interface");
+        selector.observe_interfaces(&[iface("awg0", &["CLIENT="])]);
+        let scope = selector
+            .config_scope()
+            .await
+            .expect("scope lookup")
+            .expect("live identity");
+        assert_eq!(scope.server_public_key, "awg0_SERVER_KEY=");
+        let stale = crate::config_store::ClientConfig::from_content(
+            "/clients/awg0-client-alice.conf".into(),
+            "[Interface]\nAddress = 10.66.66.2/32\n[Peer]\nPublicKey = PUB\n",
+        );
+        assert!(
+            !stale.belongs_to(&scope),
+            "a real observed key must remain authoritative"
+        );
     }
 
     #[test]
