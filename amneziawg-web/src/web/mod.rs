@@ -4241,33 +4241,39 @@ fn esc_js(s: &str) -> String {
     out
 }
 
+fn status_dot(class: &str, label: &str) -> String {
+    format!(
+        r#"<span class="status {class}"><span class="status-dot" aria-hidden="true"></span> {label}</span>"#
+    )
+}
+
 /// Render legacy combined status badge (used by tests).
 #[allow(dead_code)]
-fn status_badge(status: &PeerStatus) -> &'static str {
+fn status_badge(status: &PeerStatus) -> String {
     match status {
-        PeerStatus::Online => r#"<span style="color:green">&#x25CF; online</span>"#,
-        PeerStatus::Inactive => r#"<span style="color:gray">&#x25CF; inactive</span>"#,
-        PeerStatus::Disabled => r#"<span style="color:red">&#x25CF; disabled</span>"#,
-        PeerStatus::Unlinked => r#"<span style="color:orange">&#x25CF; unlinked</span>"#,
+        PeerStatus::Online => status_dot("status-online", "online"),
+        PeerStatus::Inactive => status_dot("status-inactive", "inactive"),
+        PeerStatus::Disabled => status_dot("status-disabled", "disabled"),
+        PeerStatus::Unlinked => status_dot("status-unlinked", "unlinked"),
     }
 }
 
-fn connection_badge(status: &ConnectionStatus) -> &'static str {
+fn connection_badge(status: &ConnectionStatus) -> String {
     match status {
-        ConnectionStatus::Online => r#"<span style="color:green">&#x25CF; online</span>"#,
-        ConnectionStatus::Inactive => r#"<span style="color:gray">&#x25CF; inactive</span>"#,
-        ConnectionStatus::Never => r#"<span style="color:gray">&#x25CB; never connected</span>"#,
-        ConnectionStatus::Disabled => r#"<span style="color:red">&#x25CF; disabled</span>"#,
+        ConnectionStatus::Online => status_dot("status-online", "online"),
+        ConnectionStatus::Inactive => status_dot("status-inactive", "inactive"),
+        ConnectionStatus::Never => status_dot("status-never", "never connected"),
+        ConnectionStatus::Disabled => status_dot("status-disabled", "disabled"),
     }
 }
 
-fn identity_badge(status: &IdentityStatus) -> &'static str {
+fn identity_badge(status: &IdentityStatus) -> String {
     match status {
         IdentityStatus::Linked => {
-            r#"<span style="color:#0a0" title="Peer matched to a config file">&#x1F517; linked</span>"#
+            r#"<span class="status status-linked" title="Peer matched to a config file"><span class="status-dot" aria-hidden="true"></span> linked</span>"#.to_string()
         }
         IdentityStatus::Unlinked => {
-            r#"<span style="color:orange" title="No matching config file found">&#x26A0; unlinked</span>"#
+            r#"<span class="status status-unlinked" title="No matching config file found"><span class="status-dot" aria-hidden="true"></span> unlinked</span>"#.to_string()
         }
     }
 }
@@ -4339,18 +4345,18 @@ fn fmt_last_handshake(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
     format!("{} - {}", fmt_time_ago(ts, now), fmt_local_timestamp(ts))
 }
 
-fn render_system_status(status: &SystemStatusDto) -> String {
+fn render_system_status(status: &SystemStatusDto, peers: usize, online: usize) -> String {
     let uptime = status
         .system_uptime_seconds
         .map(fmt_duration_hms)
         .unwrap_or_else(|| "unknown".to_string());
     let booted_at = fmt_optional_local_timestamp(status.system_booted_at, "unknown");
     format!(
-        r#"<section class="system-status" aria-label="System status">
-  <div class="system-status-grid">
-    <div><span class="status-label">System uptime:</span> {uptime}</div>
-    <div><span class="status-label">System boot time:</span> {booted_at}</div>
-  </div>
+        r#"<section class="spec-strip system-status" aria-label="System status">
+  <div class="spec"><span class="spec-label">System uptime:</span> <span class="spec-value">{uptime}</span></div>
+  <div class="spec"><span class="spec-label">System boot time:</span> <span class="spec-value">{booted_at}</span></div>
+  <div class="spec"><span class="spec-label">Online</span> <span class="spec-value">{online}</span></div>
+  <div class="spec"><span class="spec-label">Peers</span> <span class="spec-value">{peers}</span></div>
   <p class="meta">{note}</p>
 </section>
 "#,
@@ -4416,9 +4422,9 @@ fn render_proxy_sessions(base: &str, status: &ProxySessionsDto) -> String {
         buf.push_str("<p class=\"meta\">No active proxy sessions reported.</p>\n");
     } else {
         buf.push_str(
-            "<table class=\"proxy-session-table\">\n\
+            "<div class=\"table-scroll\"><table class=\"proxy-session-table\">\n\
              <tr><th>User</th><th>Remote client</th><th>Proxy port</th><th>Target port</th>\
-             <th>Protocol</th><th>Last activity</th><th>RX</th><th>TX</th></tr>\n",
+             <th>Protocol</th><th>Last activity</th><th class=\"num\">RX</th><th class=\"num\">TX</th></tr>\n",
         );
         for session in &status.sessions {
             let user = match (session.peer_id, session.peer_name.as_deref()) {
@@ -4448,7 +4454,7 @@ fn render_proxy_sessions(base: &str, status: &ProxySessionsDto) -> String {
             buf.push_str(&format!(
                 "<tr><td>{user}</td><td><code>{remote}</code></td><td>{proxy_port}</td>\
                  <td>{target_port}</td><td>{protocol}</td><td>{last_activity}</td>\
-                 <td title=\"{title}\">{rx}</td><td title=\"{title}\">{tx}</td></tr>\n",
+                 <td class=\"num\" title=\"{title}\">{rx}</td><td class=\"num\" title=\"{title}\">{tx}</td></tr>\n",
                 remote = esc(&session.remote_addr),
                 proxy_port = session.local_proxy_port,
                 target_port = session.target_port,
@@ -4459,7 +4465,7 @@ fn render_proxy_sessions(base: &str, status: &ProxySessionsDto) -> String {
                 tx = fmt_bytes(session.tx_bytes),
             ));
         }
-        buf.push_str("</table>\n");
+        buf.push_str("</table></div>\n");
     }
 
     buf.push_str("</section>\n");
@@ -4468,72 +4474,9 @@ fn render_proxy_sessions(base: &str, status: &ProxySessionsDto) -> String {
 
 fn html_head(title: &str) -> String {
     format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<style>
-  body {{ font-family: sans-serif; margin: 2rem; color: #222; }}
-  h1 {{ margin-bottom: 1rem; }}
-  table {{ border-collapse: collapse; width: 100%; }}
-  th, td {{ border: 1px solid #ccc; padding: .4rem .7rem; text-align: left; }}
-  th {{ background: #f0f0f0; }}
-  tr:nth-child(even) {{ background: #fafafa; }}
-  a {{ color: #0066cc; text-decoration: none; }}
-  a:hover {{ text-decoration: underline; }}
-  .meta {{ font-size: .85rem; color: #666; margin-bottom: 1.5rem; }}
-  .system-status {{ margin: 0 0 1.25rem; padding: .75rem 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f8fbff; }}
-  .system-status-grid {{ display: flex; flex-wrap: wrap; gap: .35rem 2rem; }}
-  .status-label {{ font-weight: 700; }}
-  .system-status .meta {{ margin: .45rem 0 0; }}
-  .proxy-sessions {{ margin: 1.5rem 0 0; }}
-  .proxy-sessions h2 {{ margin: 0 0 .45rem; font-size: 1.1rem; }}
-  .proxy-sessions .meta {{ margin: 0 0 .6rem; }}
-  .proxy-session-table {{ margin-bottom: 1rem; }}
-  .warning {{ color: #9a5a00; font-weight: 700; }}
-  .creation-warning {{ margin: 0 0 1rem; padding: .65rem .8rem; border: 1px solid #d6a947; border-radius: 4px; background: #fff8e6; color: #6e4800; }}
-  .counter-scope {{ display: inline-block; margin-left: .35rem; padding: .1rem .45rem; border: 1px solid #d6e2f0; border-radius: 999px; background: #f4f8fd; color: #496277; font-size: .78rem; }}
-  .proxy-hint {{ display: inline-block; margin-left: .25rem; padding: 0 .4rem; border: 1px solid #d6e2f0; border-radius: 999px; background: #f4f8fd; color: #496277; font-size: .72rem; vertical-align: .05rem; }}
-  .th-hint {{ display: block; margin-top: .1rem; color: #777; font-size: .72rem; font-weight: 400; }}
-  .comment-cell {{ max-width: 24rem; overflow-wrap: anywhere; }}
-  .back {{ margin-bottom: 1rem; display: block; }}
-  .edit-form {{ margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 4px; background: #f9f9f9; max-width: 480px; }}
-  .edit-form h2 {{ margin-top: 0; font-size: 1.1rem; }}
-  #imitation-panel {{ margin-bottom: 2rem; }}
-  .add-user-panel {{ max-width: 440px; padding: .75rem 1rem; }}
-  .add-user-panel summary {{ cursor: pointer; font-weight: 700; font-size: 1.05rem; }}
-  .add-user-panel[open] summary {{ margin-bottom: .75rem; }}
-  .protocol-panel section:not([hidden]) ~ section:not([hidden]) {{ margin-top: 1.5rem; }}
-  .edit-form label {{ display: block; font-weight: bold; margin-bottom: .25rem; margin-top: .75rem; }}
-  .edit-form input[type=text], .edit-form input[type=password], .edit-form input[type=number], .edit-form textarea {{ width: 100%; padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 3px; font-family: inherit; font-size: .95rem; box-sizing: border-box; }}
-  .edit-form textarea {{ resize: vertical; min-height: 4rem; }}
-  .edit-form button[type=submit] {{ margin-top: 1rem; padding: .4rem 1.1rem; background: #0066cc; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .95rem; }}
-  .edit-form button[type=submit]:hover {{ background: #0055aa; }}
-  .nav {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: .75rem 1rem; margin-bottom: 1.5rem; padding-bottom: .75rem; border-bottom: 1px solid #ddd; }}
-  .nav-brand {{ display: flex; flex-direction: column; gap: .2rem; min-width: 0; }}
-  .nav-title {{ color: inherit; font-size: 1.375rem; font-weight: 700; line-height: 1.2; overflow-wrap: anywhere; }}
-  .nav-byline {{ font-size: .8rem; color: #666; }}
-  .versions {{ grid-column: 1 / -1; min-width: 0; font-size: .78rem; line-height: 1.5; color: #666; overflow-wrap: anywhere; }}
-  .nav-logout {{ margin: 0; white-space: nowrap; }}
-  .nav-logout button {{ padding: .3rem .8rem; background: #e55; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .85rem; }}
-  .nav-logout button:hover {{ background: #c33; }}
-  .error {{ color: #c00; margin-top: .5rem; font-size: .95rem; }}
-  .qr-modal-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:1000; justify-content:center; align-items:center; }}
-  .qr-modal-overlay.active {{ display:flex; }}
-  .qr-modal {{ background:#fff; border-radius:8px; padding:1.5rem; max-width:360px; width:90%; text-align:center; position:relative; }}
-  .qr-modal h3 {{ margin:0 0 1rem; font-size:1.1rem; }}
-  .qr-modal svg, .qr-modal img {{ max-width:100%; height:auto; }}
-  .qr-modal-close {{ position:absolute; top:.5rem; right:.75rem; background:none; border:none; font-size:1.3rem; cursor:pointer; color:#666; }}
-  .qr-modal-close:hover {{ color:#222; }}
-  .qr-link {{ cursor:pointer; background:none; border:none; color:#0066cc; font:inherit; padding:0; text-decoration:none; }}
-  .qr-link:hover {{ text-decoration:underline; }}
-</style>
-</head>
-<body>
-"#,
-        title = esc(title)
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{title}</title>\n<style>\n{css}\n</style>\n</head>\n<body>\n",
+        title = esc(title),
+        css = include_str!("panel.css"),
     )
 }
 
@@ -4600,7 +4543,8 @@ fn render_login_page_with_msg(base: &str, msg: &str, csrf_token: &str) -> String
 fn render_login_page_inner(base: &str, error_html: &str, csrf_token: &str) -> String {
     let mut buf = html_head("AmneziaWG – Login");
     buf.push_str(&format!(
-        r#"<div class="edit-form" style="max-width:340px;margin:4rem auto">
+        r#"<main class="login-screen">
+<div class="login-card edit-form">
 <h2>AmneziaWG Login</h2>
 <form method="POST" action="{base}/login">
   <input type="hidden" name="csrf_token" value="{csrf}">
@@ -4611,6 +4555,7 @@ fn render_login_page_inner(base: &str, error_html: &str, csrf_token: &str) -> St
 {error}  <button type="submit">Log in</button>
 </form>
 </div>
+</main>
 </body></html>
 "#,
         csrf = esc(csrf_token),
@@ -4764,16 +4709,16 @@ fn render_protocol_controls(base: &str, csrf_token: &str) -> String {
   <p class="creation-warning"><strong>AWG 3.1 requires compatible client software.</strong> The server checks backend support, then updates the interface and every recoverable client config together. Redistribute the regenerated configurations before clients reconnect.</p>
   <form method="POST" action="{base}/admin/protocol/enable-awg31">
     <input type="hidden" name="csrf_token" value="{csrf}">
-    <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
-    <button type="submit">Enable AWG 3.1</button>
+    <label class="choice"><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
+    <button type="submit" class="btn-danger">Enable AWG 3.1</button>
   </form>
 </section>
 <section id="protocol-disable-awg3">
   <p>Downgrade the interface and all recoverable client configs to AWG 2.0. AWG 3.x-only fields and the shared header-protection key are removed.</p>
   <form method="POST" action="{base}/admin/protocol/disable-awg3">
     <input type="hidden" name="csrf_token" value="{csrf}">
-    <label><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
-    <button type="submit">Return to AWG 2.0</button>
+    <label class="choice"><input type="checkbox" name="confirm" value="yes" required> I will redistribute every regenerated client config.</label>
+    <button type="submit" class="btn-danger">Return to AWG 2.0</button>
   </form>
 </section>
 </details>
@@ -4819,9 +4764,11 @@ fn render_peer_list_inner(
 ) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
     let now = Utc::now();
+    let online = peers
+        .iter()
+        .filter(|peer| peer.connection_status == ConnectionStatus::Online)
+        .count();
     buf.push_str(&nav_bar(base, csrf_token));
-    buf.push_str("<h1>Peers</h1>\n");
-    buf.push_str(&render_system_status(system_status));
     let archive_toggle = if show_archived {
         format!(r#"<a href="{base}/">Hide archived keys</a>"#)
     } else {
@@ -4832,12 +4779,24 @@ fn render_peer_list_inner(
     } else {
         format!("{base}/api/peers")
     };
+    let add_user = if monitoring_only.is_some() {
+        String::new()
+    } else {
+        render_add_user_panel(base, csrf_token, error)
+    };
     buf.push_str(&format!(
-        "<p class=\"meta\">{} peer(s) known &nbsp;·&nbsp; <a href=\"{api_href}\">JSON API</a>\
-         &nbsp;·&nbsp; {archive_toggle}\
-         <span class=\"counter-scope\">Traffic period: since boot/interface restart</span></p>\n",
-        peers.len()
+        r#"<header class="page-head">
+  <div>
+    <p class="eyebrow">Interface</p>
+    <h1>Peers</h1>
+    <p class="meta">{count} peer(s) known &nbsp;·&nbsp; <a href="{api_href}">JSON API</a> &nbsp;·&nbsp; {archive_toggle} <span class="counter-scope">Traffic period: since boot/interface restart</span></p>
+  </div>
+  {add_user}
+</header>
+"#,
+        count = peers.len(),
     ));
+    buf.push_str(&render_system_status(system_status, peers.len(), online));
     if let Some(message) = notice.message {
         buf.push_str(&format!(
             "<p class=\"creation-warning\" role=\"status\">{}</p>\n",
@@ -4852,19 +4811,33 @@ fn render_peer_list_inner(
         if let Some(err) = error {
             buf.push_str(&format!("<p class=\"error\">{}</p>\n", esc(err)));
         }
-    } else {
-        buf.push_str(&render_protocol_controls(base, csrf_token));
-        buf.push_str(&render_imitation_controls(base, csrf_token));
     }
+    let server_tools = if monitoring_only.is_some() {
+        String::new()
+    } else {
+        format!(
+            "<aside class=\"server-tools\" aria-label=\"Server tools\">\n<h2>Server</h2>\n{}{}</aside>\n",
+            render_protocol_controls(base, csrf_token),
+            render_imitation_controls(base, csrf_token),
+        )
+    };
 
+    let workspace_class = if server_tools.is_empty() {
+        "workspace workspace-solo"
+    } else {
+        "workspace"
+    };
+    buf.push_str(&format!(
+        "<div class=\"{workspace_class}\">\n<div class=\"workspace-main\">\n"
+    ));
     if peers.is_empty() {
-        buf.push_str("<p>No peers found. The poller may not have run yet.</p>\n");
+        buf.push_str("<p class=\"empty\">No peers found. The poller may not have run yet.</p>\n");
     } else {
         buf.push_str(
-            "<table>\n\
+            "<div class=\"table-scroll\"><table class=\"peer-table\">\n\
              <tr><th>Name</th><th>Connection</th><th>Identity</th><th>Endpoint</th>\
-             <th>Comment</th><th>Expiration</th><th>Last handshake</th><th>RX<span class=\"th-hint\">current period</span></th>\
-             <th>TX<span class=\"th-hint\">current period</span></th></tr>\n",
+             <th>Comment</th><th>Expiration</th><th>Last handshake</th><th class=\"num\">RX<span class=\"th-hint\">current period</span></th>\
+             <th class=\"num\">TX<span class=\"th-hint\">current period</span></th></tr>\n",
         );
         for p in peers {
             let detail_href = if p.archived {
@@ -4894,33 +4867,45 @@ fn render_peer_list_inner(
                 .map(esc)
                 .unwrap_or_else(|| "–".to_string());
             let expiration = render_expiration_cell(&p.expiration_status, p.expires_at, p.expired);
+            let row_class = match p.connection_status {
+                ConnectionStatus::Online => "is-online",
+                ConnectionStatus::Disabled => "is-disabled",
+                ConnectionStatus::Inactive => "is-inactive",
+                ConnectionStatus::Never => "is-never",
+            };
             buf.push_str(&format!(
-                "<tr><td>{name_link}</td><td>{conn}</td><td>{ident}</td><td>{endpoint}</td>\
-                 <td class=\"comment-cell\">{comment}</td><td>{expiration}</td><td>{handshake}</td><td>{rx}</td><td>{tx}</td></tr>\n",
+                "<tr class=\"{row_class}\"><td data-label=\"Name\">{name_link}</td>\
+                 <td data-label=\"Connection\">{conn}</td><td data-label=\"Identity\">{ident}</td>\
+                 <td data-label=\"Endpoint\">{endpoint}</td>\
+                 <td class=\"comment-cell\" data-label=\"Comment\">{comment}</td>\
+                 <td data-label=\"Expiration\">{expiration}</td>\
+                 <td data-label=\"Last handshake\">{handshake}</td>\
+                 <td class=\"num\" data-label=\"RX\">{rx}</td>\
+                 <td class=\"num\" data-label=\"TX\">{tx}</td></tr>\n",
                 conn = connection_badge(&p.connection_status),
                 ident = identity_badge(&p.identity_status),
                 rx = fmt_bytes(p.rx_bytes),
                 tx = fmt_bytes(p.tx_bytes),
             ));
         }
-        buf.push_str("</table>\n");
+        buf.push_str("</table></div>\n");
     }
 
     if let Some(proxy_sessions) = proxy_sessions {
         buf.push_str(&render_proxy_sessions(base, proxy_sessions));
     }
+    buf.push_str("</div>\n");
+    buf.push_str(&server_tools);
+    buf.push_str("</div>\n</body></html>");
+    buf
+}
 
-    if monitoring_only.is_some() {
-        // Client creation is unavailable; the banner above says why.
-        buf.push_str("</body></html>");
-        return buf;
-    }
-
+fn render_add_user_panel(base: &str, csrf_token: &str, error: Option<&str>) -> String {
     let add_user_open = if error.is_some() { " open" } else { "" };
     let add_user_error = error
         .map(|err| format!("<p class=\"error\">Add user failed: {}</p>\n", esc(err)))
         .unwrap_or_default();
-    buf.push_str(&format!(
+    format!(
         r#"<details class="edit-form add-user-panel"{open}>
 <summary>Add user</summary>
 {error}
@@ -4999,10 +4984,7 @@ fn render_peer_list_inner(
         csrf = esc(csrf_token),
         error = add_user_error,
         open = add_user_open,
-    ));
-
-    buf.push_str("</body></html>");
-    buf
+    )
 }
 
 fn render_archived_peer_detail(
@@ -5015,14 +4997,15 @@ fn render_archived_peer_detail(
     buf.push_str(&nav_bar(base, csrf_token));
     buf.push_str(&format!(
         "<a class=\"back\" href=\"{base}/?show_archived=true\">&larr; All peers</a>\n\
-         <h1>Archived disabled key</h1>\n\
+         <header class=\"peer-head\">\n  <div>\n    <p class=\"eyebrow\">Archive</p>\n    \
+         <h1>Archived disabled key</h1>\n  </div>\n</header>\n\
          <p class=\"creation-warning\" role=\"status\">The saved peer metadata and traffic history were deleted. \
          The disabled public key remains so the web service can continue removing it from the running interface.</p>\n",
     ));
     buf.push_str(&format!(
-        "<table>\n\
+        "<table class=\"facts\">\n\
          <tr><th>Public key</th><td><code>{}</code></td></tr>\n\
-         <tr><th>State</th><td><span style=\"color:red\">&#x25CF; archived and disabled</span></td></tr>\n\
+         <tr><th>State</th><td><span class=\"status status-archived\"><span class=\"status-dot\" aria-hidden=\"true\"></span> archived and disabled</span></td></tr>\n\
          <tr><th>Originally recorded</th><td>{}</td></tr>\n\
          <tr><th>Last changed</th><td>{}</td></tr>\n\
          </table>\n",
@@ -5109,12 +5092,26 @@ fn render_peer_detail_inner(
     }
     buf.push_str(&format!(
         "<a class=\"back\" href=\"{base}/\">&larr; All peers</a>\n\
-         <h1>{name}</h1>\n",
-        name = esc(&dto.name)
+         <header class=\"peer-head\">\n  <div>\n    <h1>{name}</h1>\n    \
+         <div class=\"peer-pills\">{conn}{ident}</div>\n  </div>\n</header>\n",
+        name = esc(&dto.name),
+        conn = connection_badge(&dto.connection_status),
+        ident = identity_badge(&dto.identity_status),
     ));
+    if dto.has_config {
+        buf.push_str(&format!(
+            "<div class=\"actions\">\
+             <a class=\"btn\" href=\"{base}/api/peers/{id}/config\">Download</a>\
+             <button type=\"button\" class=\"qr-link\" onclick=\"showQr({id})\">QR Code</button>\
+             <button type=\"button\" class=\"qr-link\" onclick=\"exportAmnezia({id}, 'copy')\">Copy Amnezia link</button>\
+             <button type=\"button\" class=\"qr-link\" onclick=\"exportAmnezia({id}, 'open')\">Open in Amnezia</button>\
+             </div>\n",
+            id = dto.id,
+        ));
+        buf.push_str(&with_js_base(include_str!("vpn_uri.html"), base));
+    }
 
-    // Identity block
-    buf.push_str("<table>\n");
+    buf.push_str("<div class=\"detail-layout\">\n<table class=\"facts\">\n");
     buf.push_str(&format!(
         "<tr><th>Public key</th><td><code>{}</code></td></tr>\n",
         esc(&dto.public_key)
@@ -5165,20 +5162,7 @@ fn render_peer_detail_inner(
             esc(cp)
         ));
     }
-    if dto.has_config {
-        buf.push_str(&format!(
-            "<tr><th>Config</th><td>\
-             <a href=\"{base}/api/peers/{id}/config\">&#x2B73; Download</a>\
-             &nbsp; | &nbsp;\
-             <button type=\"button\" class=\"qr-link\" onclick=\"showQr({id})\">&#x25A3; QR Code</button>\
-             &nbsp; | &nbsp;\
-             <button type=\"button\" class=\"qr-link\" onclick=\"exportAmnezia({id}, 'copy')\">Copy Amnezia link</button>\
-             &nbsp; | &nbsp;\
-             <button type=\"button\" class=\"qr-link\" onclick=\"exportAmnezia({id}, 'open')\">Open in Amnezia</button>\
-             </td></tr>\n",
-            id = dto.id
-        ));
-    }
+
     if let Some(ref dn) = dto.display_name {
         buf.push_str(&format!(
             "<tr><th>Display name</th><td>{}</td></tr>\n",
@@ -5193,10 +5177,6 @@ fn render_peer_detail_inner(
         render_expiration_cell(&dto.expiration_status, dto.expires_at, dto.expired)
     ));
     buf.push_str("</table>\n");
-
-    if dto.has_config {
-        buf.push_str(&with_js_base(include_str!("vpn_uri.html"), base));
-    }
 
     // Edit form.  Expiration and enable/disable act on the interface and the
     // installer's lifecycle, so a monitoring-only instance only offers the
@@ -5224,7 +5204,7 @@ fn render_peer_detail_inner(
     <option value="365" label="1 year from now"></option>
   </datalist>
   <p class="meta" style="margin-top:.25rem">Current: {expiration_status}. Leave blank to keep it, use 0 for permanent, or enter a new lifetime from now.</p>
-  <label style="margin-top:.75rem;display:flex;align-items:center;gap:.4rem;font-weight:bold">
+  <label class="choice">
     <input type="checkbox" name="disabled" value="1"{disabled_checked}> Disabled
   </label>
 "#,
@@ -5246,6 +5226,7 @@ fn render_peer_detail_inner(
 {lifecycle_controls}  <button type="submit">Save</button>
 </form>
 </div>
+</div>
 "#,
         id = dto.id,
         csrf = esc(csrf_token),
@@ -5259,18 +5240,18 @@ fn render_peer_detail_inner(
     // reconciled, and retains the public key as a hidden disabled tombstone.
     if dto.disabled && !dto.has_config && !dto.sync_pending {
         buf.push_str(&format!(
-            r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
-<h2 style="color:#c00">Forget old peer data</h2>
+            r#"<div class="edit-form danger-panel">
+<h2>Forget old peer data</h2>
 <p>This removes the peer from the normal list and permanently deletes its saved name, comment, endpoint, counters, and traffic history from the panel database.
 AmneziaWG configuration files are not changed. The panel keeps a minimal disabled-key record, including the public key and record timestamps, so the web service can continue blocking it and removing it from the running interface.
 Audit-log entries are retained and may still contain earlier values.</p>
 <form method="POST" action="{base}/admin/peers/{id}/archive">
   <input type="hidden" name="csrf_token" value="{csrf}">
-  <label for="confirm_forget" style="display:flex;align-items:center;gap:.4rem;margin-top:.5rem">
+  <label class="choice" for="confirm_forget">
     <input type="checkbox" id="confirm_forget" name="confirm" value="yes" required>
     I understand that the saved peer metadata and traffic history will be permanently deleted.
   </label>
-  <button type="submit" style="background:#c00;margin-top:.5rem">Forget old peer data</button>
+  <button type="submit" class="btn-danger">Forget old peer data</button>
 </form>
 </div>
 "#,
@@ -5287,19 +5268,17 @@ Audit-log entries are retained and may still contain earlier values.</p>
         .filter(|_| monitoring_only.is_none())
     {
         buf.push_str(&format!(
-            r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
-<h2 style="color:#c00">Remove user</h2>
+            r#"<div class="edit-form danger-panel">
+<h2>Remove user</h2>
 <p>This will permanently revoke the client <strong>{name}</strong> and delete its config file.
 Historical data (snapshots, events) will be preserved.</p>
 <form method="POST" action="{base}/admin/users/{id}/remove">
   <input type="hidden" name="csrf_token" value="{csrf}">
-  <label for="confirm_remove" style="display:flex;align-items:center;gap:.4rem;margin-top:.5rem">
+  <label class="choice" for="confirm_remove">
     <input type="checkbox" id="confirm_remove" name="confirm" value="yes" required>
     I understand this action will permanently remove this user and cannot be undone.
   </label>
-  <button type="submit" style="background:#c00;margin-top:.5rem">
-    Remove user
-  </button>
+  <button type="submit" class="btn-danger">Remove user</button>
 </form>
 </div>
 "#,
@@ -5316,13 +5295,13 @@ Historical data (snapshots, events) will be preserved.</p>
     );
     buf.push_str(
         "<table>\n\
-         <tr><th>Period</th><th>RX</th><th>TX</th><th>JSON</th></tr>\n",
+         <tr><th>Period</th><th class=\"num\">RX</th><th class=\"num\">TX</th><th>JSON</th></tr>\n",
     );
     for (label, param) in &[("Day", "day"), ("Week", "week"), ("Month", "month")] {
         buf.push_str(&format!(
             "<tr><td>{label}</td>\
-             <td id=\"usage-rx-{param}\">…</td>\
-             <td id=\"usage-tx-{param}\">…</td>\
+             <td class=\"num\" id=\"usage-rx-{param}\">…</td>\
+             <td class=\"num\" id=\"usage-tx-{param}\">…</td>\
              <td><a href=\"{base}/api/peers/{id}/usage?period={param}\">JSON</a></td></tr>\n",
             id = dto.id,
         ));
@@ -5375,7 +5354,7 @@ Historical data (snapshots, events) will be preserved.</p>
     } else {
         buf.push_str(
             "<table>\n\
-             <tr><th>Captured at</th><th>RX</th><th>TX</th><th>Endpoint</th></tr>\n",
+             <tr><th>Captured at</th><th class=\"num\">RX</th><th class=\"num\">TX</th><th>Endpoint</th></tr>\n",
         );
         for s in &dto.recent_snapshots {
             let ep = s
@@ -5384,7 +5363,7 @@ Historical data (snapshots, events) will be preserved.</p>
                 .map(esc)
                 .unwrap_or_else(|| "–".to_string());
             buf.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td></tr>\n",
                 esc(&s.captured_at),
                 fmt_bytes(s.rx_bytes),
                 fmt_bytes(s.tx_bytes),
@@ -5458,7 +5437,7 @@ function showQr(peerId){
   img.onerror=function(){
     while(content.firstChild) content.removeChild(content.firstChild);
     var p=document.createElement('p');
-    p.style.color='#c00';
+    p.className='error';
     p.textContent='Failed to load QR code';
     content.appendChild(p);
   };
@@ -10643,7 +10622,7 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&page_body).unwrap();
         assert!(html.contains(">bob</a>"));
-        assert!(html.contains("<td class=\"comment-cell\">–</td>"));
+        assert!(html.contains("<td class=\"comment-cell\" data-label=\"Comment\">–</td>"));
     }
 
     #[tokio::test]
